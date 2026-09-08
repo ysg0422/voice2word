@@ -37,42 +37,6 @@ impl MainWindow {
                     .gap_2()
                     .child(
                         div()
-                            .id("tab-btn-generate")
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .bg(if active == WorkspaceTab::Generate {
-                                Theme::bg_card()
-                            } else {
-                                rgb(0x00000000)
-                            })
-                            .border_1()
-                            .border_color(if active == WorkspaceTab::Generate {
-                                Theme::border()
-                            } else {
-                                rgb(0x00000000)
-                            })
-                            .text_size(px(12.0))
-                            .font_weight(if active == WorkspaceTab::Generate {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .text_color(if active == WorkspaceTab::Generate {
-                                Theme::accent_mint()
-                            } else {
-                                Theme::text_secondary()
-                            })
-                            .hover(|s| s.bg(Theme::bg_hover()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.active_tab = WorkspaceTab::Generate;
-                                cx.notify();
-                            }))
-                            .child("⚡ 智能生成管线"),
-                    )
-                    .child(
-                        div()
                             .id("tab-btn-editor")
                             .px_3()
                             .py_1()
@@ -107,9 +71,89 @@ impl MainWindow {
                                 cx.notify();
                             }))
                             .child(format!(
-                                "🎬 剪辑校对工作台{}",
+                                "🎬 剪辑校对 (主工作台){}",
                                 if seg_count > 0 {
                                     format!(" ({}句)", seg_count)
+                                } else {
+                                    "".to_string()
+                                }
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("tab-btn-generate")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(if active == WorkspaceTab::Generate {
+                                Theme::bg_card()
+                            } else {
+                                rgb(0x00000000)
+                            })
+                            .border_1()
+                            .border_color(if active == WorkspaceTab::Generate {
+                                Theme::border()
+                            } else {
+                                rgb(0x00000000)
+                            })
+                            .text_size(px(12.0))
+                            .font_weight(if active == WorkspaceTab::Generate {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if active == WorkspaceTab::Generate {
+                                Theme::accent_mint()
+                            } else {
+                                Theme::text_secondary()
+                            })
+                            .hover(|s| s.bg(Theme::bg_hover()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.active_tab = WorkspaceTab::Generate;
+                                cx.notify();
+                            }))
+                            .child("⚡ 转写生成"),
+                    )
+                    .child(
+                        div()
+                            .id("tab-btn-library")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(if active == WorkspaceTab::Library {
+                                Theme::bg_card()
+                            } else {
+                                rgb(0x00000000)
+                            })
+                            .border_1()
+                            .border_color(if active == WorkspaceTab::Library {
+                                Theme::border()
+                            } else {
+                                rgb(0x00000000)
+                            })
+                            .text_size(px(12.0))
+                            .font_weight(if active == WorkspaceTab::Library {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if active == WorkspaceTab::Library {
+                                Theme::accent_mint()
+                            } else {
+                                Theme::text_secondary()
+                            })
+                            .hover(|s| s.bg(Theme::bg_hover()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.active_tab = WorkspaceTab::Library;
+                                this.state.refresh_recent_tasks();
+                                cx.notify();
+                            }))
+                            .child(format!(
+                                "📚 历史视频库{}",
+                                if !self.state.recent_tasks.is_empty() {
+                                    format!(" ({})", self.state.recent_tasks.len())
                                 } else {
                                     "".to_string()
                                 }

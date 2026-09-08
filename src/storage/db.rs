@@ -110,4 +110,11 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// 删除指定历史任务记录
+    pub fn delete_task(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
 }

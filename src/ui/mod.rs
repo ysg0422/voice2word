@@ -13,7 +13,7 @@ use tracing::info;
 use crate::app::state::{AppState, ProcessStatus, WorkspaceTab};
 use crate::core::PipelineEvent;
 use crate::subtitle::SubtitleWriter;
-use crate::utils::time::{format_duration_short, seconds_to_srt_time};
+use crate::utils::time::format_duration_short;
 use theme::Theme;
 
 use tokio::sync::watch;
@@ -517,7 +517,7 @@ impl Render for MainWindow {
             self.state.metrics = self.metrics_rx.borrow_and_update().clone();
         }
 
-        let is_editor = self.state.active_tab == WorkspaceTab::Editor;
+        let tab = self.state.active_tab;
 
         div()
             .flex()
@@ -528,7 +528,7 @@ impl Render for MainWindow {
             .text_color(Theme::text_primary())
             // 1. 顶部自定义标题栏
             .child(self.render_titlebar(cx))
-            // 2. Tab 模式切换栏 (智能生成 vs 剪辑校对)
+            // 2. Tab 模式切换栏 (剪辑校对 vs 转写生成 vs 历史视频库)
             .child(self.render_tab_bar(cx))
             // 3. 核心布局切换
             .child(
@@ -536,16 +536,339 @@ impl Render for MainWindow {
                     .flex_1()
                     .w_full()
                     .overflow_hidden()
-                    .child(if is_editor {
-                        self.render_editor_layout(cx).into_any_element()
-                    } else {
-                        self.render_generate_layout(cx).into_any_element()
+                    .child(match tab {
+                        WorkspaceTab::Editor => self.render_editor_layout(cx).into_any_element(),
+                        WorkspaceTab::Generate => self.render_generate_layout(cx).into_any_element(),
+                        WorkspaceTab::Library => self.render_library_layout(cx).into_any_element(),
                     }),
             )
     }
 }
 
 impl MainWindow {
+    /// 渲染历史视频库 (视频资产管理与一键载入工作台)
+    fn render_library_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tasks = self.state.recent_tasks.clone();
+        let total_count = tasks.len();
+
+        div()
+            .id("library-workspace-layout")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .w_full()
+            .h_full()
+            .bg(Theme::bg_app())
+            .p_6()
+            .gap_4()
+            .overflow_hidden()
+            // 顶部标头栏
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(20.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child("📚 历史视频资产库"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_md()
+                                            .bg(Theme::bg_card())
+                                            .text_size(px(11.0))
+                                            .text_color(Theme::accent_mint())
+                                            .child(format!("共 {} 个视频工程", total_count)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(Theme::text_muted())
+                                    .child("本地 SQLite 数据库持久保存的所有历史任务。点击任意项目直接载入剪辑工作台进行音画核对或一键导出字幕。"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("library-import-btn")
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .bg(Theme::accent_mint())
+                                    .cursor_pointer()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0x09090b))
+                                    .hover(|s| s.opacity(0.9))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.active_tab = WorkspaceTab::Generate;
+                                        cx.notify();
+                                    }))
+                                    .child("➕ 导入新视频转写"),
+                            )
+                            .child(
+                                div()
+                                    .id("library-refresh-btn")
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .bg(Theme::bg_sidebar())
+                                    .border_1()
+                                    .border_color(Theme::border())
+                                    .cursor_pointer()
+                                    .text_size(px(12.0))
+                                    .text_color(Theme::text_secondary())
+                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.refresh_recent_tasks();
+                                        cx.notify();
+                                    }))
+                                    .child("🔄 刷新列表"),
+                            ),
+                    ),
+            )
+            // 视频卡片列表区域
+            .child(
+                if tasks.is_empty() {
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_size(px(40.0))
+                                .child("🎬"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(16.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("视频库暂无解析历史"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(Theme::text_muted())
+                                .child("您转写过的所有视频与字幕工程都会自动保存在这里，随时可再次打开精修"),
+                        )
+                        .child(
+                            div()
+                                .id("empty-lib-goto-gen")
+                                .mt_2()
+                                .px_4()
+                                .py_2()
+                                .rounded_md()
+                                .bg(Theme::accent_mint())
+                                .cursor_pointer()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(0x09090b))
+                                .hover(|s| s.opacity(0.9))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.active_tab = WorkspaceTab::Generate;
+                                    cx.notify();
+                                }))
+                                .child("立即导入第一个视频进行转写"),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .id("library-cards-scroll")
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .children(tasks.into_iter().map(|task| {
+                            let task_id = task.id;
+                            let task_clone = task.clone();
+                            let task_export = task.clone();
+                            let seg_len = task.segments.len();
+                            let dur_str = format_duration_short(task.duration);
+                            let sample_text = task.segments.first()
+                                .map(|s| s.display_text().to_string())
+                                .unwrap_or_else(|| "无字幕内容".to_string());
+
+                            div()
+                                .id(("lib-card", task_id as usize))
+                                .p_4()
+                                .rounded_lg()
+                                .bg(Theme::bg_card())
+                                .border_1()
+                                .border_color(Theme::border())
+                                .hover(|s| s.border_color(Theme::border_light()))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_3()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .w(px(52.0))
+                                                .h(px(52.0))
+                                                .rounded_md()
+                                                .bg(rgb(0x18181c))
+                                                .border_1()
+                                                .border_color(Theme::border())
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(24.0))
+                                                .child("🎬"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_2()
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(14.0))
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .text_color(Theme::text_primary())
+                                                                .child(task.file_name),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .px_1p5()
+                                                                .py_0p5()
+                                                                .rounded(px(3.0))
+                                                                .bg(rgba(0x2dd4bf20))
+                                                                .text_size(px(10.0))
+                                                                .text_color(Theme::accent_mint())
+                                                                .child("已就绪"),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_3()
+                                                        .text_size(px(11.0))
+                                                        .text_color(Theme::text_muted())
+                                                        .child(format!("⏱️ 时长: {}", dur_str))
+                                                        .child(format!("📝 字幕: {} 句", seg_len))
+                                                        .child(format!("📅 解析时间: {}", task.created_at)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.0))
+                                                        .text_color(Theme::text_secondary())
+                                                        .child(format!("首句预览: \"{}\"", sample_text)),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id(("lib-edit-btn", task_id as usize))
+                                                .px_3()
+                                                .py_1p5()
+                                                .rounded_md()
+                                                .bg(Theme::accent_mint())
+                                                .cursor_pointer()
+                                                .text_size(px(11.0))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(0x09090b))
+                                                .hover(|s| s.opacity(0.9))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.state.load_task(&task_clone);
+                                                    this.trigger_extract_frame(cx);
+                                                    cx.notify();
+                                                }))
+                                                .child("🎬 进入剪辑工作台"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("lib-export-btn", task_id as usize))
+                                                .px_3()
+                                                .py_1p5()
+                                                .rounded_md()
+                                                .bg(Theme::bg_sidebar())
+                                                .border_1()
+                                                .border_color(Theme::border())
+                                                .cursor_pointer()
+                                                .text_size(px(11.0))
+                                                .text_color(Theme::text_secondary())
+                                                .hover(|s| s.bg(Theme::bg_hover()))
+                                                .on_click(cx.listener(move |_this, _, _, _cx| {
+                                                    if let Some(save_path) = rfd::FileDialog::new()
+                                                        .set_file_name(&format!("{}.srt", task_export.file_name))
+                                                        .add_filter("SubRip Subtitle", &["srt"])
+                                                        .save_file()
+                                                    {
+                                                        let _ = SubtitleWriter::write_srt(&task_export.segments, &save_path);
+                                                    }
+                                                }))
+                                                .child("💾 导出 SRT"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("lib-del-btn", task_id as usize))
+                                                .px_2()
+                                                .py_1p5()
+                                                .rounded_md()
+                                                .bg(Theme::bg_sidebar())
+                                                .border_1()
+                                                .border_color(Theme::border())
+                                                .cursor_pointer()
+                                                .text_size(px(11.0))
+                                                .text_color(Theme::accent_red())
+                                                .hover(|s| s.bg(Theme::bg_hover()))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.state.delete_task_record(task_id);
+                                                    cx.notify();
+                                                }))
+                                                .child("🗑️ 删除"),
+                                        )
+                                )
+                        }))
+                        .into_any_element()
+                }
+            )
+    }
+
     /// 渲染智能生成模式主体布局
     fn render_generate_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -1107,13 +1430,18 @@ impl MainWindow {
             .child(label)
     }
 
-    /// 渲染中央字幕工作区：紧凑字幕清单，而非逐条日志卡片。
-    fn render_main_workspace(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
+    /// 渲染中央处理工作区：轻量化实时看板，彻底告别庞大表格卡顿
+    fn render_main_workspace(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
+        let is_completed = self.state.status == ProcessStatus::Completed;
+        let seg_count = self.state.segments.len();
+        let last_seg_text = self.state.segments.last().map(|s| s.display_text().to_string());
+
         div()
             .flex_1()
             .h_full()
             .bg(Theme::bg_panel())
-            .p_5()
+            .p_6()
             .flex()
             .flex_col()
             .gap_4()
@@ -1124,205 +1452,379 @@ impl MainWindow {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(18.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("字幕工作区"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(Theme::text_muted())
-                            .child(format!("共 {} 条字幕片段", self.state.segments.len())),
-                    ),
-            )
-            .child(if matches!(self.state.status, ProcessStatus::Processing { .. }) {
-                let (stage, progress, detail) = match &self.state.status {
-                    ProcessStatus::Processing { stage, progress, detail } => {
-                        (stage.clone(), *progress, detail.clone())
-                    }
-                    _ => ("处理中".to_string(), 0.5, "".to_string()),
-                };
-                div()
-                    .id("processing-progress-view")
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap_4()
-                    .child(
-                        div()
-                            .text_size(px(20.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(Theme::text_primary())
-                            .child(stage),
-                    )
-                    .child(
-                        div()
-                            .w(px(460.0))
-                            .h(px(8.0))
-                            .rounded(px(4.0))
-                            .bg(Theme::bg_card())
+                            .flex()
+                            .flex_col()
+                            .gap_1()
                             .child(
                                 div()
-                                    .h_full()
-                                    .rounded(px(4.0))
-                                    .w(relative(progress.clamp(0.0, 1.0) as f32))
-                                    .bg(Theme::accent_mint()),
+                                    .text_size(px(18.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("⚡ 智能语音转写生成"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(Theme::text_muted())
+                                    .child("Silero VAD 静音切片加速 + Whisper ASR + 本地大模型标点纠错"),
                             ),
                     )
                     .child(
-                        div()
-                            .text_size(px(13.0))
-                            .text_color(Theme::text_secondary())
-                            .child(format!("{:.1}% · {} 条字幕", progress * 100.0, self.state.segments.len())),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(Theme::text_muted())
-                            .child(detail),
-                    )
-            } else if self.state.segments.is_empty() {
-                if matches!(self.state.status, ProcessStatus::Processing { .. }) {
-                    // 正在转写但第一句尚未吐出时的等待引导
-                    div()
-                        .id("processing-guide-view")
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap_3()
-                        .child(
+                        if let Some(ref file) = self.state.selected_file {
                             div()
-                                .text_size(px(16.0))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(Theme::bg_card())
+                                .border_1()
+                                .border_color(Theme::border())
+                                .text_size(px(11.0))
                                 .text_color(Theme::accent_mint())
-                                .child("⚡ Whisper ASR 全速转写中，正在捕获语音..."),
-                        )
-                        .child(
+                                .child(format!("目标: {}", file.file_name().and_then(|s| s.to_str()).unwrap_or("视频")))
+                        } else {
                             div()
-                                .text_size(px(12.0))
-                                .text_color(Theme::text_muted())
-                                .child("每识别出一句字幕将立即实时跳出显示在下方列表，请稍候"),
-                        )
-                } else {
-                    // 空状态引导
+                        }
+                    ),
+            )
+            // 核心状态展示区 (完全不渲染庞大表格，保证极致丝滑零卡顿)
+            .child(
+                if is_processing {
+                    let (stage, progress, detail) = match &self.state.status {
+                        ProcessStatus::Processing { stage, progress, detail } => {
+                            (stage.clone(), *progress, detail.clone())
+                        }
+                        _ => ("正在全速转写中...".to_string(), 0.0, "".to_string()),
+                    };
+
                     div()
-                        .id("empty-guide-view")
+                        .id("lightweight-processing-dashboard")
                         .flex_1()
                         .flex()
                         .flex_col()
                         .items_center()
                         .justify_center()
-                        .gap_3()
+                        .gap_5()
                         .child(
                             div()
-                                .text_size(px(15.0))
+                                .w(px(64.0))
+                                .h(px(64.0))
+                                .rounded_full()
+                                .bg(rgba(0x2dd4bf20))
+                                .border_2()
+                                .border_color(Theme::accent_mint())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(28.0))
+                                .child("⚡"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(22.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(Theme::text_primary())
+                                .child(stage),
+                        )
+                        // 大进度条
+                        .child(
+                            div()
+                                .w(px(520.0))
+                                .h(px(10.0))
+                                .rounded(px(5.0))
+                                .bg(rgb(0x18181c))
+                                .border_1()
+                                .border_color(Theme::border())
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .rounded(px(5.0))
+                                        .w(relative(progress.clamp(0.0, 1.0) as f32))
+                                        .bg(Theme::accent_mint()),
+                                ),
+                        )
+                        // 3个实时关键指标
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .px_4()
+                                        .py_2()
+                                        .rounded_md()
+                                        .bg(Theme::bg_card())
+                                        .border_1()
+                                        .border_color(Theme::border())
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .child(div().text_size(px(10.0)).text_color(Theme::text_muted()).child("总体进度"))
+                                        .child(div().text_size(px(16.0)).font_weight(FontWeight::BOLD).text_color(Theme::accent_mint()).child(format!("{:.1}%", progress * 100.0))),
+                                )
+                                .child(
+                                    div()
+                                        .px_4()
+                                        .py_2()
+                                        .rounded_md()
+                                        .bg(Theme::bg_card())
+                                        .border_1()
+                                        .border_color(Theme::border())
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .child(div().text_size(px(10.0)).text_color(Theme::text_muted()).child("已识别字幕"))
+                                        .child(div().text_size(px(16.0)).font_weight(FontWeight::BOLD).text_color(Theme::text_primary()).child(format!("{} 句", seg_count))),
+                                )
+                                .child(
+                                    div()
+                                        .px_4()
+                                        .py_2()
+                                        .rounded_md()
+                                        .bg(Theme::bg_card())
+                                        .border_1()
+                                        .border_color(Theme::border())
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .child(div().text_size(px(10.0)).text_color(Theme::text_muted()).child("CPU 线程并发"))
+                                        .child(div().text_size(px(16.0)).font_weight(FontWeight::BOLD).text_color(Theme::accent_blue()).child(format!("{} 核心", self.state.whisper_threads))),
+                                ),
+                        )
+                        // 实时最新识别语句滚动跑马灯 (只渲染最新 1 句，毫秒级更新，0 卡顿)
+                        .child(
+                            div()
+                                .w(px(520.0))
+                                .p_3()
+                                .rounded_md()
+                                .bg(Theme::bg_sidebar())
+                                .border_1()
+                                .border_color(Theme::border())
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(Theme::accent_mint())
+                                        .child("🟢 实时捕获最新语句 (剪辑区可查看全量):"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .text_color(Theme::text_primary())
+                                        .child(if let Some(text) = last_seg_text {
+                                            format!("\"{}\"", text)
+                                        } else {
+                                            "正在倾听与切片语音中...".to_string()
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(Theme::text_muted())
+                                .child("💡 提示：转写完成后将自动切入「剪辑校对工作台」，您可直接拖动时间轴核对与修改错别字"),
+                        )
+                        .into_any_element()
+                } else if is_completed || seg_count > 0 {
+                    // 转写已完成大卡片
+                    div()
+                        .id("lightweight-completed-dashboard")
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_5()
+                        .child(
+                            div()
+                                .w(px(64.0))
+                                .h(px(64.0))
+                                .rounded_full()
+                                .bg(rgba(0x2dd4bf20))
+                                .border_2()
+                                .border_color(Theme::accent_mint())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(28.0))
+                                .child("🎉"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(22.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(Theme::text_primary())
+                                .child("转写处理已圆满完成！"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.0))
                                 .text_color(Theme::text_secondary())
-                                .child("未导入或未开始处理"),
+                                .child(format!(
+                                    "共为您生成 {} 条精炼字幕，总时长 {}，已自动保存至本地视频库。",
+                                    seg_count,
+                                    format_duration_short(self.state.total_duration)
+                                )),
+                        )
+                        // 大号行动按钮组
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_4()
+                                .mt_2()
+                                .child(
+                                    div()
+                                        .id("goto-editor-main-btn")
+                                        .px_6()
+                                        .py_3()
+                                        .rounded_lg()
+                                        .bg(Theme::accent_mint())
+                                        .cursor_pointer()
+                                        .text_size(px(14.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(rgb(0x09090b))
+                                        .hover(|s| s.opacity(0.9))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.state.active_tab = WorkspaceTab::Editor;
+                                            this.trigger_extract_frame(cx);
+                                            cx.notify();
+                                        }))
+                                        .child("🎬 立即进入剪辑校对工作台 (主界面)"),
+                                )
+                                .child(
+                                    div()
+                                        .id("quick-export-main-btn")
+                                        .px_5()
+                                        .py_3()
+                                        .rounded_lg()
+                                        .bg(Theme::bg_sidebar())
+                                        .border_1()
+                                        .border_color(Theme::border())
+                                        .cursor_pointer()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(Theme::text_primary())
+                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.export_subtitles(cx);
+                                        }))
+                                        .child("💾 导出字幕 (SRT / ASS)"),
+                                )
+                                .child(
+                                    div()
+                                        .id("goto-library-btn")
+                                        .px_5()
+                                        .py_3()
+                                        .rounded_lg()
+                                        .bg(Theme::bg_sidebar())
+                                        .border_1()
+                                        .border_color(Theme::border())
+                                        .cursor_pointer()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(Theme::text_secondary())
+                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.state.active_tab = WorkspaceTab::Library;
+                                            this.state.refresh_recent_tasks();
+                                            cx.notify();
+                                        }))
+                                        .child("📚 打开视频库"),
+                                ),
+                        )
+                        .into_any_element()
+                } else {
+                    // 空闲就绪引导卡片
+                    div()
+                        .id("lightweight-idle-dashboard")
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_4()
+                        .child(
+                            div()
+                                .w(px(64.0))
+                                .h(px(64.0))
+                                .rounded_full()
+                                .bg(Theme::bg_card())
+                                .border_1()
+                                .border_color(Theme::border())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(28.0))
+                                .child("📁"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(18.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(Theme::text_primary())
+                                .child(if self.state.selected_file.is_some() {
+                                    "已选定文件，点击下方「开始生成」启动转写"
+                                } else {
+                                    "请在左侧面板选择音视频文件"
+                                }),
                         )
                         .child(
                             div()
                                 .text_size(px(12.0))
                                 .text_color(Theme::text_muted())
-                                .child("在左侧面板选择音视频，点击底部「开始生成」启动离线转写管线"),
+                                .child("支持 MP4, MKV, MOV, FLV, MP3, WAV 等主流格式，全本地离线高速解析"),
                         )
-                }
-            } else {
-                div()
-                    .id("subtitle-table")
-                    .flex_1()
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(Theme::border())
-                    .child(
-                        div()
-                            .h(px(36.0))
-                            .px_3()
-                            .bg(Theme::bg_sidebar())
-                            .border_b_1()
-                            .border_color(Theme::border())
-                            .flex()
-                            .items_center()
-                            .text_size(px(10.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(Theme::text_muted())
-                            .child(div().w(px(54.0)).child("序号"))
-                            .child(div().w(px(190.0)).child("时间范围"))
-                            .child(div().flex_1().child("字幕文本"))
-                            .child(div().w(px(42.0)).child("状态")),
-                    )
-                    .child(
-                        div()
-                            .id("segments-table-scroll")
-                            .h_full()
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .children(self.state.segments.iter().map(|seg| {
-                                let is_polished = !seg.polished.trim().is_empty();
-                                div()
-                                    .id(("subtitle-row", seg.index))
-                                    .min_h(px(54.0))
-                                    .px_3()
-                                    .py_2()
-                                    .border_b_1()
-                                    .border_color(Theme::border())
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .hover(|style| style.bg(Theme::bg_hover()))
-                                    .child(
-                                        div()
-                                            .w(px(54.0))
-                                            .text_size(px(11.0))
-                                            .font_family("Consolas")
-                                            .text_color(Theme::text_muted())
-                                            .child(format!("{:03}", seg.index)),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(180.0))
-                                            .text_size(px(11.0))
-                                            .font_family("Consolas")
-                                            .text_color(Theme::text_code())
-                                            .child(format!(
-                                                "{} - {}",
-                                                seconds_to_srt_time(seg.start),
-                                                seconds_to_srt_time(seg.end)
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .pr_2()
-                                            .text_size(px(14.0))
-                                            .line_height(relative(1.35))
-                                            .text_color(Theme::text_primary())
-                                            .child(seg.display_text().to_string()),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(32.0))
-                                            .flex()
-                                            .justify_center()
-                                            .child(
-                                                div()
-                                                    .w(px(7.0))
-                                                    .h(px(7.0))
-                                                    .rounded(px(3.5))
-                                                    .bg(if is_polished {
-                                                        Theme::accent_mint()
-                                                    } else {
-                                                        Theme::text_muted()
-                                                    }),
-                                            ),
-                                    )
-                            })),
-                    )
-            })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .mt_2()
+                                .child(
+                                    div()
+                                        .id("idle-pick-file-btn")
+                                        .px_4()
+                                        .py_2()
+                                        .rounded_md()
+                                        .bg(Theme::accent_mint())
+                                        .cursor_pointer()
+                                        .text_size(px(12.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0x09090b))
+                                        .hover(|s| s.opacity(0.9))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.choose_file(cx);
+                                        }))
+                                        .child("📁 选择音视频文件"),
+                                )
+                                .child(
+                                    div()
+                                        .id("idle-goto-library-btn")
+                                        .px_4()
+                                        .py_2()
+                                        .rounded_md()
+                                        .bg(Theme::bg_card())
+                                        .border_1()
+                                        .border_color(Theme::border())
+                                        .cursor_pointer()
+                                        .text_size(px(12.0))
+                                        .text_color(Theme::text_secondary())
+                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.state.active_tab = WorkspaceTab::Library;
+                                            this.state.refresh_recent_tasks();
+                                            cx.notify();
+                                        }))
+                                        .child("📚 从历史视频库打开"),
+                                ),
+                        )
+                        .into_any_element()
+                },
+            )
     }
 
     /// 渲染底部状态与时间轴操作区

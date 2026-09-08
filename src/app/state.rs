@@ -43,8 +43,9 @@ impl ResourceMetrics {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceTab {
-    Generate, // 智能生成管线
-    Editor,   // 类似剪映/Premiere的剪辑校对工作台
+    Editor,   // 🎬 剪辑校对工作台 (主界面，默认)
+    Generate, // ⚡ 智能转写生成 (轻量化无卡顿进度)
+    Library,  // 📚 历史解析视频库 (视频资产库)
 }
 
 #[derive(Clone)]
@@ -67,7 +68,7 @@ pub struct AppState {
     // 硬件与模型资源监控
     pub metrics: ResourceMetrics,
 
-    // 剪辑校对工作台状态 (类似剪映 / Premiere)
+    // 剪辑校对工作台状态 (主界面)
     pub active_tab: WorkspaceTab,
     pub current_time: f64,
     pub total_duration: f64,
@@ -80,7 +81,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: AppConfig, db: Database, pipeline: Arc<TaskPipeline>) -> Self {
-        let recent_tasks = db.list_recent_tasks(20).unwrap_or_default();
+        let recent_tasks = db.list_recent_tasks(50).unwrap_or_default();
         let lang = config.pipeline.language.clone();
         let fmt = config.pipeline.output_format.clone();
         let polish = config.pipeline.enable_polish;
@@ -100,7 +101,7 @@ impl AppState {
             whisper_threads: threads,
             metrics: ResourceMetrics::default(),
 
-            active_tab: WorkspaceTab::Generate,
+            active_tab: WorkspaceTab::Editor, // 默认主界面为剪辑校对工作台
             current_time: 0.0,
             total_duration: 0.0,
             is_playing: false,
@@ -116,9 +117,36 @@ impl AppState {
     }
 
     pub fn refresh_recent_tasks(&mut self) {
-        if let Ok(tasks) = self.db.list_recent_tasks(20) {
+        if let Ok(tasks) = self.db.list_recent_tasks(50) {
             self.recent_tasks = tasks;
         }
+    }
+
+    /// 载入历史任务并无缝切换至剪辑工作台
+    pub fn load_task(&mut self, task: &TaskRecord) {
+        self.selected_file = Some(PathBuf::from(&task.file_path));
+        self.status = ProcessStatus::Completed;
+        self.segments = task.segments.clone();
+        let dur = if task.duration > 0.0 {
+            task.duration
+        } else {
+            task.segments.last().map(|s| s.end).unwrap_or(0.0)
+        };
+        self.total_duration = dur;
+        if let Some(first) = self.segments.first() {
+            self.select_segment(first.index);
+        } else {
+            self.current_time = 0.0;
+            self.selected_segment_index = None;
+            self.editing_text.clear();
+        }
+        self.active_tab = WorkspaceTab::Editor;
+    }
+
+    /// 删除历史任务记录
+    pub fn delete_task_record(&mut self, id: i64) {
+        let _ = self.db.delete_task(id);
+        self.refresh_recent_tasks();
     }
 
     /// 获取当前播放时间对应的有效字幕片段
