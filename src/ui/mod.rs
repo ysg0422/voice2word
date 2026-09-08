@@ -585,21 +585,32 @@ impl Render for MainWindow {
             .h_full()
             .bg(Theme::bg_app())
             .text_color(Theme::text_primary())
-            // 1. 顶部自定义标题栏
+            // 1. 顶部自定义标题栏 (极简沉浸式，包含窗口拖拽与控制按钮)
             .child(self.render_titlebar(cx))
-            // 2. Tab 模式切换栏 (剪辑校对 vs 转写生成 vs 历史视频库)
-            .child(self.render_tab_bar(cx))
-            // 3. 核心布局切换
+            // 2. 左中右专业工作台架构
             .child(
                 div()
+                    .flex()
+                    .flex_row()
                     .flex_1()
                     .w_full()
                     .overflow_hidden()
-                    .child(match tab {
-                        WorkspaceTab::Editor => self.render_editor_layout(cx).into_any_element(),
-                        WorkspaceTab::Generate => self.render_generate_layout(cx).into_any_element(),
-                        WorkspaceTab::Library => self.render_library_layout(cx).into_any_element(),
-                    }),
+                    // 左侧主导航侧边栏 (左中右之「左」)
+                    .child(self.render_navigation_sidebar(cx))
+                    // 中间与右侧根据当前工作台呈现
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_1()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(match tab {
+                                WorkspaceTab::Editor => self.render_editor_layout(cx).into_any_element(),
+                                WorkspaceTab::Generate => self.render_generate_layout(cx).into_any_element(),
+                                WorkspaceTab::Library => self.render_library_layout(cx).into_any_element(),
+                            }),
+                    ),
             )
     }
 }
@@ -910,7 +921,297 @@ impl MainWindow {
             )
     }
 
-    /// 渲染智能生成模式主体布局
+    /// 渲染左侧主导航侧边栏 (Left Navigation Sidebar: 左中右架构之「左」)
+    fn render_navigation_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.state.active_tab;
+        let seg_count = self.state.segments.len();
+        let current_file_name = self.state.selected_file.as_ref().map(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        });
+
+        div()
+            .id("app-navigation-sidebar")
+            .w(px(180.0))
+            .h_full()
+            .bg(Theme::bg_sidebar())
+            .border_r_1()
+            .border_color(Theme::border())
+            .p_3()
+            .flex()
+            .flex_col()
+            .justify_between()
+            // 顶部导航区
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    // 栏目标题
+                    .child(
+                        div()
+                            .px_2()
+                            .pb_1()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(Theme::text_muted())
+                            .child("工作台"),
+                    )
+                    // 1. 剪辑校对
+                    .child(
+                        div()
+                            .id("nav-tab-editor")
+                            .h(px(36.0))
+                            .px_3()
+                            .rounded_lg()
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap_2p5()
+                            .bg(if active == WorkspaceTab::Editor {
+                                rgb(0x282832)
+                            } else {
+                                rgba(0x00000000)
+                            })
+                            .border_1()
+                            .border_color(if active == WorkspaceTab::Editor {
+                                rgb(0x383848)
+                            } else {
+                                rgba(0x00000000)
+                            })
+                            .text_size(px(12.5))
+                            .font_weight(if active == WorkspaceTab::Editor {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if active == WorkspaceTab::Editor {
+                                rgb(0xffffff)
+                            } else {
+                                Theme::text_secondary()
+                            })
+                            .hover(move |s| {
+                                if active != WorkspaceTab::Editor {
+                                    s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
+                                } else {
+                                    s
+                                }
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.active_tab = WorkspaceTab::Editor;
+                                this.trigger_extract_frame(cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .child("🎬"),
+                            )
+                            .child("剪辑校对"),
+                    )
+                    // 2. 语音转写
+                    .child(
+                        div()
+                            .id("nav-tab-generate")
+                            .h(px(36.0))
+                            .px_3()
+                            .rounded_lg()
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap_2p5()
+                            .bg(if active == WorkspaceTab::Generate {
+                                rgb(0x282832)
+                            } else {
+                                rgba(0x00000000)
+                            })
+                            .border_1()
+                            .border_color(if active == WorkspaceTab::Generate {
+                                rgb(0x383848)
+                            } else {
+                                rgba(0x00000000)
+                            })
+                            .text_size(px(12.5))
+                            .font_weight(if active == WorkspaceTab::Generate {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if active == WorkspaceTab::Generate {
+                                rgb(0xffffff)
+                            } else {
+                                Theme::text_secondary()
+                            })
+                            .hover(move |s| {
+                                if active != WorkspaceTab::Generate {
+                                    s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
+                                } else {
+                                    s
+                                }
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.active_tab = WorkspaceTab::Generate;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .child("⚡"),
+                            )
+                            .child("语音转写"),
+                    )
+                    // 3. 视频库
+                    .child(
+                        div()
+                            .id("nav-tab-library")
+                            .h(px(36.0))
+                            .px_3()
+                            .rounded_lg()
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap_2p5()
+                            .bg(if active == WorkspaceTab::Library {
+                                rgb(0x282832)
+                            } else {
+                                rgba(0x00000000)
+                            })
+                            .border_1()
+                            .border_color(if active == WorkspaceTab::Library {
+                                rgb(0x383848)
+                            } else {
+                                rgba(0x00000000)
+                            })
+                            .text_size(px(12.5))
+                            .font_weight(if active == WorkspaceTab::Library {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if active == WorkspaceTab::Library {
+                                rgb(0xffffff)
+                            } else {
+                                Theme::text_secondary()
+                            })
+                            .hover(move |s| {
+                                if active != WorkspaceTab::Library {
+                                    s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
+                                } else {
+                                    s
+                                }
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.active_tab = WorkspaceTab::Library;
+                                this.state.refresh_recent_tasks();
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .child("📚"),
+                            )
+                            .child("视频库"),
+                    ),
+            )
+            // 底部操作与工程状态
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("nav-quick-export-btn")
+                            .h(px(32.0))
+                            .px_3()
+                            .rounded_full()
+                            .bg(if seg_count > 0 {
+                                rgb(0x242430)
+                            } else {
+                                rgb(0x18181e)
+                            })
+                            .border_1()
+                            .border_color(rgb(0x30303c))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if seg_count > 0 {
+                                Theme::accent_mint()
+                            } else {
+                                Theme::text_muted()
+                            })
+                            .hover(|s| s.bg(rgb(0x2e2e3c)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_subtitles(cx);
+                            }))
+                            .child("💾 导出字幕"),
+                    )
+                    .child(
+                        if let Some(name) = current_file_name {
+                            div()
+                                .p_2()
+                                .rounded_lg()
+                                .bg(rgb(0x141418))
+                                .border_1()
+                                .border_color(rgb(0x22222a))
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(Theme::text_muted())
+                                        .child("当前工程"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(Theme::text_primary())
+                                        .overflow_hidden()
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(Theme::accent_mint())
+                                        .child(format!("{} 句字幕", seg_count)),
+                                )
+                        } else {
+                            div()
+                                .p_2()
+                                .rounded_lg()
+                                .bg(rgb(0x141418))
+                                .border_1()
+                                .border_color(rgb(0x22222a))
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(6.0))
+                                        .rounded_full()
+                                        .bg(Theme::accent_mint()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(Theme::text_muted())
+                                        .child("Vulkan GPU 就绪"),
+                                )
+                        }
+                    ),
+            )
+    }
+
+    /// 渲染智能生成模式主体布局 (中间是工作区，右侧是配置和选项)
     fn render_generate_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -919,31 +1220,54 @@ impl MainWindow {
             .w_full()
             .h_full()
             .overflow_hidden()
-            .child(self.render_sidebar(cx))
+            // 中间：主工作台与底部控制
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .h_full()
+                    .overflow_hidden()
                     .child(self.render_main_workspace(cx))
                     .child(self.render_bottom_timeline(cx)),
             )
+            // 右侧：配置和选项面板
+            .child(self.render_sidebar(cx))
     }
 
-    /// 渲染左侧边栏 (Codex / Zed 风格极简深灰)
+    /// 渲染右侧配置面板 (转写配置与选项：左中右架构之「右」)
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("sidebar")
-            .w(px(280.0))
+            .w(px(310.0))
             .h_full()
             .bg(Theme::bg_sidebar())
-            .border_r_1()
+            .border_l_1()
             .border_color(Theme::border())
             .p_4()
             .flex()
             .flex_col()
             .gap_3()
+            // 面板标头
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(Theme::text_primary())
+                            .child("转写配置"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(Theme::text_muted())
+                            .child("Whisper + LLM"),
+                    ),
+            )
             // 媒体文件卡片 (iOS Inset Card)
             .child(
                 div()

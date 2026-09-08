@@ -14,6 +14,7 @@ use super::MainWindow;
 
 impl MainWindow {
     /// 渲染顶部模式切换栏 (Tab 导航器)
+    #[allow(dead_code)]
     pub(crate) fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.state.active_tab;
         let seg_count = self.state.segments.len();
@@ -183,28 +184,29 @@ impl MainWindow {
             )
     }
 
-    /// 渲染类似剪映 / Premiere 风格的剪辑工作区布局
+    /// 渲染类似剪映 / Premiere 风格的剪辑工作区布局 (左中右之 中：视频与时间轴，右：字幕属性)
     pub(crate) fn render_editor_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("editor-workspace-layout")
             .flex()
-            .flex_col()
+            .flex_row()
+            .flex_1()
             .w_full()
             .h_full()
             .overflow_hidden()
-            // 上半区：视频监视器 (左侧 58%) + 字幕属性检查器 (右侧 42%)
+            // 中间区：视频监视器 (flex_1) + 多轨时间轴 (固定高度 230px)
             .child(
                 div()
                     .flex()
-                    .flex_row()
+                    .flex_col()
                     .flex_1()
-                    .w_full()
+                    .h_full()
                     .overflow_hidden()
                     .child(self.render_video_monitor(cx))
-                    .child(self.render_subtitle_inspector(cx)),
+                    .child(self.render_multitrack_timeline(cx)),
             )
-            // 下半区：专业多轨时间轴 (固定高度 230px)
-            .child(self.render_multitrack_timeline(cx))
+            // 右侧区：字幕属性与错字编辑检查器 (配置和选项)
+            .child(self.render_subtitle_inspector(cx))
     }
 
     /// 渲染专业视频监视器 (Preview Monitor)
@@ -216,11 +218,9 @@ impl MainWindow {
 
         div()
             .id("editor-video-monitor")
-            .w(relative(0.58))
-            .h_full()
+            .w_full()
+            .flex_1()
             .bg(rgb(0x09090b))
-            .border_r_1()
-            .border_color(Theme::border())
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -515,9 +515,11 @@ impl MainWindow {
 
         div()
             .id("editor-subtitle-inspector")
-            .w(relative(0.42))
+            .w(px(380.0))
             .h_full()
             .bg(Theme::bg_sidebar())
+            .border_l_1()
+            .border_color(Theme::border())
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -1658,13 +1660,18 @@ impl MainWindow {
         if self.state.total_duration <= 0.0 {
             return;
         }
+        let nav_w = px(180.0); // 左侧导航侧边栏占用宽度
+        let inspector_w = px(380.0); // 右侧属性检查器占用宽度
         let left_pad = px(70.0); // 左侧轨道名称标签占用宽度
         let right_pad = px(16.0); // 右侧留白边距
-        let track_w = window_width - left_pad - right_pad;
+
+        let center_w = window_width - nav_w - inspector_w;
+        let track_w = center_w - left_pad - right_pad;
         if track_w <= px(10.0) {
             return;
         }
-        let ratio = ((mouse_x - left_pad) / track_w).clamp(0.0, 1.0) as f64;
+        let relative_x = mouse_x - nav_w - left_pad;
+        let ratio = (relative_x / track_w).clamp(0.0, 1.0) as f64;
         let target_time = ratio * self.state.total_duration;
         self.state.seek_to(target_time);
 
