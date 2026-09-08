@@ -152,33 +152,37 @@ impl MainWindow {
                                     this.state.segments.push(seg);
                                 }
                                 PipelineEvent::Finished(segments) => {
-                                    this.state.status = ProcessStatus::Completed;
-                                    this.state.segments = segments.clone();
-                                    if let Some(first) = segments.first() {
-                                        this.state.select_segment(first.index);
+                                    if segments.is_empty() {
+                                        this.state.status = ProcessStatus::Failed("未能识别出任何有效字幕，请检查音频音量或识别语言设置".to_string());
+                                    } else {
+                                        this.state.status = ProcessStatus::Completed;
+                                        this.state.segments = segments.clone();
+                                        if let Some(first) = segments.first() {
+                                            this.state.select_segment(first.index);
+                                        }
+                                        if this.state.total_duration <= 0.0 {
+                                            this.state.total_duration =
+                                                segments.last().map(|s| s.end).unwrap_or(0.0);
+                                        }
+                                        if let Some(ref input_file) = this.state.selected_file {
+                                            let filename = input_file
+                                                .file_name()
+                                                .and_then(|s| s.to_str())
+                                                 .unwrap_or("media")
+                                                .to_string();
+                                            let total_dur = this.state.total_duration;
+                                            let _ = this.state.db.insert_task(
+                                                &input_file.to_string_lossy(),
+                                                &filename,
+                                                total_dur,
+                                                "completed",
+                                                &segments,
+                                            );
+                                            this.state.refresh_recent_tasks();
+                                        }
+                                        this.state.active_tab = WorkspaceTab::Editor;
+                                        this.trigger_extract_frame(cx);
                                     }
-                                    if this.state.total_duration <= 0.0 {
-                                        this.state.total_duration =
-                                            segments.last().map(|s| s.end).unwrap_or(0.0);
-                                    }
-                                    if let Some(ref input_file) = this.state.selected_file {
-                                        let filename = input_file
-                                            .file_name()
-                                            .and_then(|s| s.to_str())
-                                             .unwrap_or("media")
-                                            .to_string();
-                                        let total_dur = this.state.total_duration;
-                                        let _ = this.state.db.insert_task(
-                                            &input_file.to_string_lossy(),
-                                            &filename,
-                                            total_dur,
-                                            "completed",
-                                            &segments,
-                                        );
-                                        this.state.refresh_recent_tasks();
-                                    }
-                                    this.state.active_tab = WorkspaceTab::Editor;
-                                    this.trigger_extract_frame(cx);
                                 }
                                 PipelineEvent::Error(err) => {
                                     this.state.status = ProcessStatus::Failed(err);
@@ -1806,7 +1810,6 @@ impl MainWindow {
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
         let is_completed = self.state.status == ProcessStatus::Completed;
         let seg_count = self.state.segments.len();
-        let last_seg_text = self.state.segments.last().map(|s| s.display_text().to_string());
 
         div()
             .flex_1()
@@ -1949,34 +1952,238 @@ impl MainWindow {
                                         .child(div().text_size(px(15.0)).font_weight(FontWeight::BOLD).text_color(Theme::accent_blue()).child(format!("{} 核", self.state.whisper_threads))),
                                 ),
                         )
-                        // 实时最新识别语句
+                        // 实时字幕流滚动终端视窗 (Live Subtitle Stream Rolling Window)
                         .child(
                             div()
-                                .w(px(480.0))
-                                .p_3()
-                                .rounded_xl()
+                                .w(px(580.0))
+                                .h(px(250.0))
+                                .rounded_2xl()
                                 .bg(Theme::bg_sidebar())
                                 .border_1()
                                 .border_color(Theme::border())
+                                .p_4()
                                 .flex()
                                 .flex_col()
-                                .gap_1()
+                                .justify_between()
+                                // 视窗顶部状态栏
                                 .child(
                                     div()
-                                        .text_size(px(10.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(Theme::accent_mint())
-                                        .child("实时字幕:"),
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .pb_2()
+                                        .border_b_1()
+                                        .border_color(Theme::border())
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .w(px(8.0))
+                                                        .h(px(8.0))
+                                                        .rounded_full()
+                                                        .bg(Theme::accent_mint()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.0))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(Theme::text_primary())
+                                                        .child("实时识别字幕流"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py_0p5()
+                                                        .rounded_full()
+                                                        .bg(rgba(0x10b98118))
+                                                        .text_size(px(10.0))
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(Theme::accent_mint())
+                                                        .child("Vulkan GPU 加速"),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_2p5()
+                                                .py_0p5()
+                                                .rounded_full()
+                                                .bg(Theme::bg_card())
+                                                .border_1()
+                                                .border_color(Theme::border())
+                                                .text_size(px(10.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(Theme::text_secondary())
+                                                .child(format!("已流式输出 {} 句", seg_count)),
+                                        ),
                                 )
+                                // 视窗滚动主体：展示最近字幕流，新字幕从底部涌入向上推移，实现自然滚动感
                                 .child(
                                     div()
-                                        .text_size(px(13.0))
-                                        .text_color(Theme::text_primary())
-                                        .child(if let Some(text) = last_seg_text {
-                                            format!("\"{}\"", text)
-                                        } else {
-                                            "正在倾听与切片语音中...".to_string()
-                                        }),
+                                        .flex_1()
+                                        .py_2()
+                                        .flex()
+                                        .flex_col()
+                                        .justify_end()
+                                        .gap_2()
+                                        .overflow_hidden()
+                                        .child(
+                                            if seg_count == 0 {
+                                                div()
+                                                    .flex_1()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(24.0))
+                                                            .child("🎙️"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(13.0))
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(Theme::text_secondary())
+                                                            .child("正在倾听与切片语音中..."),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.0))
+                                                            .text_color(Theme::text_muted())
+                                                            .child("Silero VAD 正在智能切片语音区间，首句字幕即将生成"),
+                                                    )
+                                            } else {
+                                                // 获取最近 4 条字幕
+                                                let recent = self.state.segments.iter().rev().take(4).cloned().collect::<Vec<_>>();
+                                                let mut display_segs = recent;
+                                                display_segs.reverse();
+                                                let last_idx = display_segs.len().saturating_sub(1);
+
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_1p5()
+                                                    .children(
+                                                        display_segs.into_iter().enumerate().map(|(idx, seg)| {
+                                                            let is_latest = idx == last_idx;
+                                                            let time_str = format!(
+                                                                "{:02}:{:02} -> {:02}:{:02}",
+                                                                (seg.start / 60.0) as u32,
+                                                                (seg.start % 60.0) as u32,
+                                                                (seg.end / 60.0) as u32,
+                                                                (seg.end % 60.0) as u32
+                                                            );
+
+                                                            if is_latest {
+                                                                // 最新生成字幕：高亮薄荷绿微发光背景、边框、加粗与光标
+                                                                div()
+                                                                    .px_3()
+                                                                    .py_1p5()
+                                                                    .rounded_xl()
+                                                                    .bg(rgba(0x10b98114))
+                                                                    .border_1()
+                                                                    .border_color(rgba(0x10b98133))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_between()
+                                                                    .gap_3()
+                                                                    .child(
+                                                                        div()
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .gap_2()
+                                                                            .child(
+                                                                                div()
+                                                                                    .px_1p5()
+                                                                                    .py_0p5()
+                                                                                    .rounded_md()
+                                                                                    .bg(rgba(0x10b98124))
+                                                                                    .text_size(px(9.0))
+                                                                                    .font_weight(FontWeight::BOLD)
+                                                                                    .text_color(Theme::accent_mint())
+                                                                                    .child(time_str),
+                                                                            )
+                                                                            .child(
+                                                                                div()
+                                                                                    .text_size(px(13.0))
+                                                                                    .font_weight(FontWeight::BOLD)
+                                                                                    .text_color(Theme::text_primary())
+                                                                                    .child(format!("{} ▋", seg.display_text())),
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .px_1p5()
+                                                                            .py_0p5()
+                                                                            .rounded_full()
+                                                                            .bg(Theme::accent_mint())
+                                                                            .text_size(px(8.0))
+                                                                            .font_weight(FontWeight::BOLD)
+                                                                            .text_color(rgb(0x000000))
+                                                                            .child("最新"),
+                                                                    )
+                                                            } else {
+                                                                // 历史字幕（依次向上滚动推移）：等宽时间码与次级文字
+                                                                div()
+                                                                    .px_3()
+                                                                    .py_1()
+                                                                    .rounded_lg()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .gap_2()
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(9.0))
+                                                                            .text_color(Theme::text_muted())
+                                                                            .child(time_str),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(12.0))
+                                                                            .text_color(Theme::text_secondary())
+                                                                            .child(seg.display_text().to_string()),
+                                                                    )
+                                                            }
+                                                        })
+                                                    )
+                                            }
+                                        ),
+                                )
+                                // 底部状态提示条
+                                .child(
+                                    div()
+                                        .pt_2()
+                                        .border_t_1()
+                                        .border_color(Theme::border())
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .text_size(px(10.0))
+                                        .text_color(Theme::text_muted())
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .child("●")
+                                                .child(if let ProcessStatus::Processing { detail, .. } = &self.state.status {
+                                                    if detail.is_empty() {
+                                                        "Whisper 语音切片与识别引擎活跃中...".to_string()
+                                                    } else {
+                                                        detail.clone()
+                                                    }
+                                                } else {
+                                                    "Whisper 语音切片与识别引擎活跃中...".to_string()
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .child(format!("{} 线程并发运算", self.state.whisper_threads)),
+                                        ),
                                 ),
                         )
                         .into_any_element()

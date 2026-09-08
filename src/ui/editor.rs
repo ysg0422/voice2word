@@ -7,7 +7,7 @@
 
 use gpui::prelude::*;
 use gpui::*;
-use crate::app::state::WorkspaceTab;
+use crate::app::state::{WorkspaceTab, ProcessStatus};
 use crate::utils::time::{format_duration_short, seconds_to_srt_time};
 use super::theme::Theme;
 use super::MainWindow;
@@ -186,27 +186,88 @@ impl MainWindow {
 
     /// 渲染类似剪映 / Premiere 风格的剪辑工作区布局 (左中右之 中：视频与时间轴，右：字幕属性)
     pub(crate) fn render_editor_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
+        let seg_count = self.state.segments.len();
+
         div()
             .id("editor-workspace-layout")
             .flex()
-            .flex_row()
+            .flex_col()
             .flex_1()
             .w_full()
             .h_full()
             .overflow_hidden()
-            // 中间区：视频监视器 (flex_1) + 多轨时间轴 (固定高度 230px)
+            .child(
+                if is_processing {
+                    div()
+                        .w_full()
+                        .h(px(34.0))
+                        .px_4()
+                        .bg(rgba(0x10b98118))
+                        .border_b_1()
+                        .border_color(rgba(0x10b98133))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(Theme::accent_mint()))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(Theme::accent_mint())
+                                        .child(format!("⚡ 语音转写正在后台高速进行中 (已实时流式生成 {} 句)... 转写完成后将自动完整同步", seg_count)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("switch-to-generator-banner-btn")
+                                .cursor_pointer()
+                                .px_3()
+                                .py_0p5()
+                                .rounded_full()
+                                .bg(Theme::bg_card())
+                                .border_1()
+                                .border_color(Theme::border())
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(Theme::text_primary())
+                                .hover(|s| s.bg(Theme::bg_hover()))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.active_tab = WorkspaceTab::Generate;
+                                    cx.notify();
+                                }))
+                                .child("查看实时转写看板 ➜"),
+                        )
+                } else {
+                    div()
+                }
+            )
             .child(
                 div()
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .flex_1()
-                    .h_full()
+                    .w_full()
                     .overflow_hidden()
-                    .child(self.render_video_monitor(cx))
-                    .child(self.render_multitrack_timeline(cx)),
+                    // 中间区：视频监视器 (flex_1) + 多轨时间轴 (固定高度 230px)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(self.render_video_monitor(cx))
+                            .child(self.render_multitrack_timeline(cx)),
+                    )
+                    // 右侧区：字幕属性与错字编辑检查器 (配置和选项)
+                    .child(self.render_subtitle_inspector(cx))
             )
-            // 右侧区：字幕属性与错字编辑检查器 (配置和选项)
-            .child(self.render_subtitle_inspector(cx))
     }
 
     /// 渲染专业视频监视器 (Preview Monitor)

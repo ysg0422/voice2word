@@ -86,15 +86,8 @@ impl WhisperEngine {
 
         let lang = language.unwrap_or("auto");
         let th = threads.unwrap_or(self.threads);
-        // 在 16 逻辑核心机器上以 2 个 8 线程处理器并行执行，避免单个
-        // Whisper 上下文限制整机吞吐量。最多两个以限制模型内存占用。
-        let processors = if self.processors > 0 {
-            self.processors as usize
-        } else {
-            std::thread::available_parallelism()
-                .map(|count| (count.get() / th.max(1) as usize).clamp(1, 2))
-                .unwrap_or(1)
-        };
+        // 保持 1 个主处理器顺序流式推理，确保字幕按时间自然流式吐出且不破坏切分边界上下文
+        let processors = 1usize;
         info!(
             "Whisper 开始转写: {:?}, 语言: {}, 线程数: {}, 并行处理器: {}, 模型: {:?}, VAD: {:?}",
             audio_path, lang, th, processors, self.model_path, self.vad_model_path
@@ -156,10 +149,27 @@ impl WhisperEngine {
             format!("调用 whisper-cli 失败: {:?}", self.cli_path)
         })?;
 
-        // 逐行异步读取 stdout，实时提取时间戳回传进度与字幕片段
+        // 异步读取 stdout 与 stderr
+        // 关键点：长视频或开启 VAD 时，whisper-cli 会输出海量日志到 stderr，
+        // 必须异步并行消费 stderr，防止 Windows 64KB 管道缓冲区打满导致子进程永久死锁挂起！
         let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
         let cb_shared = std::sync::Arc::new(progress_cb);
         let cb_clone = cb_shared.clone();
+
+        let stderr_handle = std::thread::spawn(move || {
+            let mut captured_err = Vec::new();
+            if let Some(err) = stderr {
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(err);
+                for line_res in reader.lines() {
+                    if let Ok(line) = line_res {
+                        captured_err.push(line);
+                    }
+                }
+            }
+            captured_err.join("\n")
+        });
 
         let stdout_handle = std::thread::spawn(move || {
             let mut captured_lines = Vec::new();
@@ -172,39 +182,39 @@ impl WhisperEngine {
                         let trimmed = line.trim();
                         if trimmed.contains("-->") {
                             // 示例: [00:01:23.450 --> 00:01:28.900]   切比雪夫不等式
-                            let parts: Vec<&str> = trimmed.split(']').collect();
-                            let time_info = parts.first().map(|s| s.trim_start_matches('[')).unwrap_or("");
-                            let text_part = parts.get(1).map(|s| s.trim()).unwrap_or("");
-                            let time_parts: Vec<&str> = time_info.split("-->").collect();
-                            let (start_sec, end_sec) = if time_parts.len() == 2 {
-                                (Self::parse_time_str(time_parts[0].trim()), Self::parse_time_str(time_parts[1].trim()))
-                            } else {
-                                (0.0, 0.0)
-                            };
-
-                            let ratio = if let Some(tot) = total_duration {
-                                if tot > 0.0 { (end_sec / tot).clamp(0.0, 1.0) } else { 0.5 }
-                            } else {
-                                0.5
-                            };
-
-                            let opt_seg = if !text_part.is_empty() {
-                                let seg = Segment {
-                                    index: seg_index,
-                                    start: start_sec,
-                                    end: end_sec,
-                                    text: text_part.to_string(),
-                                    polished: String::new(),
-                                    language: None,
+                            if let Some((time_bracket, text_rest)) = trimmed.split_once(']') {
+                                let time_info = time_bracket.trim_start_matches('[').trim();
+                                let text_part = text_rest.trim();
+                                let (start_sec, end_sec) = if let Some((t_start, t_end)) = time_info.split_once("-->") {
+                                    (Self::parse_time_str(t_start.trim()), Self::parse_time_str(t_end.trim()))
+                                } else {
+                                    (0.0, 0.0)
                                 };
-                                seg_index += 1;
-                                Some(seg)
-                            } else {
-                                None
-                            };
 
-                            if let Some(cb) = cb_clone.as_ref() {
-                                cb(ratio, &format!("[{}] {}", time_info, text_part), opt_seg);
+                                let ratio = if let Some(tot) = total_duration {
+                                    if tot > 0.0 { (end_sec / tot).clamp(0.0, 1.0) } else { 0.5 }
+                                } else {
+                                    0.5
+                                };
+
+                                let opt_seg = if !text_part.is_empty() {
+                                    let seg = Segment {
+                                        index: seg_index,
+                                        start: start_sec,
+                                        end: end_sec,
+                                        text: text_part.to_string(),
+                                        polished: String::new(),
+                                        language: None,
+                                    };
+                                    seg_index += 1;
+                                    Some(seg)
+                                } else {
+                                    None
+                                };
+
+                                if let Some(cb) = cb_clone.as_ref() {
+                                    cb(ratio, &format!("[{}] {}", time_info, text_part), opt_seg);
+                                }
                             }
                         }
                         captured_lines.push(line);
@@ -216,13 +226,9 @@ impl WhisperEngine {
 
         let output_status = child.wait().with_context(|| "等待 whisper-cli 进程结束失败")?;
         let stdout_str = stdout_handle.join().unwrap_or_default();
+        let stderr_str = stderr_handle.join().unwrap_or_default();
 
         if !output_status.success() {
-            let mut stderr_str = String::new();
-            if let Some(mut err) = child.stderr.take() {
-                use std::io::Read;
-                let _ = err.read_to_string(&mut stderr_str);
-            }
             error!("whisper-cli 运行报错 (退出码 {:?}): {}", output_status.code(), stderr_str);
             anyhow::bail!("Whisper 转写失败: {}", stderr_str.trim());
         }
