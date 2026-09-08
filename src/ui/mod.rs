@@ -333,11 +333,19 @@ impl MainWindow {
                     cache_clone.get_or_extract(&video_clone, time, &ffmpeg_clone)
                 }).await;
 
-                if let Ok(frame_path) = frame_result {
-                    let _ = this.update(cx, |this, cx| {
-                        this.state.preview_frame_path = Some(frame_path);
-                        cx.notify();
-                    });
+                let is_latest = {
+                    let lock = pending_time.lock().unwrap();
+                    lock.is_none()
+                };
+
+                // 仅当当前抽取结果依然是最新位置时才提交 UI 渲染，杜绝旧帧闪现与滞后延迟感
+                if is_latest {
+                    if let Ok(frame_path) = frame_result {
+                        let _ = this.update(cx, |this, cx| {
+                            this.state.preview_frame_path = Some(frame_path);
+                            cx.notify();
+                        });
+                    }
                 }
             }
         }).detach();

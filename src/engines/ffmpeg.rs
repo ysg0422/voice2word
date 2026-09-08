@@ -123,7 +123,7 @@ impl FFmpegEngine {
             .arg("-frames:v")
             .arg("1")
             .arg("-vf")
-            .arg("scale=640:-1") // 缩放至预览尺寸，提速 10 倍且大幅降低内存
+            .arg("scale='min(960,iw)':-1") // 缩放至高清预览尺寸（960px宽），放大窗口清晰锐利，依然毫秒级响应
             .arg("-threads")
             .arg("1") // 严格限制单线程，杜绝 CPU 占用暴涨卡死
             .arg("-an") // 跳过音频流解析

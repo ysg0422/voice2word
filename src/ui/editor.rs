@@ -302,8 +302,7 @@ impl MainWindow {
                                     .justify_center()
                                     .child(
                                         img(frame_path.clone())
-                                            .max_w_full()
-                                            .max_h_full()
+                                            .size_full()
                                     )
                             } else {
                                 div()
@@ -1670,8 +1669,8 @@ impl MainWindow {
         self.state.seek_to(target_time);
 
         if is_drag {
-            // 拖拽过程中节流：每 80ms 最多发起一次单帧抽取请求，保持绝对流畅
-            if self.last_drag_extract.elapsed().as_millis() >= 80 {
+            // 拖拽过程中节流：每 40ms（25帧极速高刷）发起一次单帧抽取请求，极致跟手零延迟
+            if self.last_drag_extract.elapsed().as_millis() >= 40 {
                 self.last_drag_extract = std::time::Instant::now();
                 self.trigger_extract_frame(cx);
             }
