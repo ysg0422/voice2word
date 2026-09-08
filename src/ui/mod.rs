@@ -910,6 +910,9 @@ impl MainWindow {
                                                 .hover(|s| s.bg(Theme::bg_hover()))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.state.delete_task_record(task_id);
+                                                    if this.state.selected_file.is_some() {
+                                                        this.trigger_extract_frame(cx);
+                                                    }
                                                     cx.notify();
                                                 }))
                                                 .child("🗑"),

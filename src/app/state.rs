@@ -154,10 +154,39 @@ impl AppState {
         self.active_tab = WorkspaceTab::Editor;
     }
 
-    /// 删除历史任务记录
+    /// 删除历史任务记录（若当前工作区正显示该工程，则无缝切换至下一个或彻底清空）
     pub fn delete_task_record(&mut self, id: i64) {
+        let deleted_task = self.recent_tasks.iter().find(|t| t.id == id).cloned();
         let _ = self.db.delete_task(id);
         self.refresh_recent_tasks();
+
+        if let Some(task) = deleted_task {
+            let is_current = self.selected_file.as_ref().map(|p| {
+                p == &PathBuf::from(&task.file_path)
+                    || p.to_string_lossy().replace('\\', "/") == task.file_path.replace('\\', "/")
+            }).unwrap_or(false);
+
+            if is_current {
+                if let Some(next_task) = self.recent_tasks.first().cloned() {
+                    self.load_task(&next_task);
+                } else {
+                    self.clear_current_workspace();
+                }
+            }
+        }
+    }
+
+    /// 彻底清空当前工作区工程状态（重置为空闲初始状态）
+    pub fn clear_current_workspace(&mut self) {
+        self.selected_file = None;
+        self.status = ProcessStatus::Idle;
+        self.segments.clear();
+        self.current_time = 0.0;
+        self.total_duration = 0.0;
+        self.selected_segment_index = None;
+        self.preview_frame_path = None;
+        self.editing_text.clear();
+        self.is_playing = false;
     }
 
     /// 获取当前播放时间对应的有效字幕片段
