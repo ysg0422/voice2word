@@ -918,17 +918,85 @@ impl MainWindow {
                             div()
                         }
                     )
-                    // 3. 字幕速查微缩列表
-                    .child(
+                    // 3. 字幕速查微缩列表 (滑动窗口轻量化渲染，消除卡顿)
+                    .child({
+                        let total_segs = self.state.segments.len();
+                        let focus_idx = sel_idx.or_else(|| self.state.get_active_segment().map(|s| s.index)).unwrap_or(1);
+                        let window_size = 6usize;
+                        let start_idx = focus_idx.saturating_sub(2).max(1);
+                        let end_idx = (start_idx + window_size).min(total_segs);
+                        let visible_segments: Vec<_> = self.state.segments.iter()
+                            .filter(|s| s.index >= start_idx && s.index <= end_idx)
+                            .cloned()
+                            .collect();
+
                         div()
                             .flex()
                             .flex_col()
-                            .gap_1()
+                            .gap_1p5()
                             .child(
                                 div()
-                                    .text_size(px(11.0))
-                                    .text_color(Theme::text_muted())
-                                    .child("SUBTITLE LIST · 字幕速查列表"),
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::text_muted())
+                                            .child(format!(
+                                                "SUBTITLE LIST · 速查 (第 {}-{} 句 / 共 {} 句)",
+                                                start_idx, end_idx, total_segs
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .id("list-jump-prev-10")
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded(px(3.0))
+                                                    .bg(Theme::bg_card())
+                                                    .border_1()
+                                                    .border_color(Theme::border())
+                                                    .cursor_pointer()
+                                                    .text_size(px(10.0))
+                                                    .text_color(Theme::text_secondary())
+                                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        let target = focus_idx.saturating_sub(10).max(1);
+                                                        this.state.select_segment(target);
+                                                        this.trigger_extract_frame(cx);
+                                                        cx.notify();
+                                                    }))
+                                                    .child("◀ 前10句"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("list-jump-next-10")
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded(px(3.0))
+                                                    .bg(Theme::bg_card())
+                                                    .border_1()
+                                                    .border_color(Theme::border())
+                                                    .cursor_pointer()
+                                                    .text_size(px(10.0))
+                                                    .text_color(Theme::text_secondary())
+                                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        let target = (focus_idx + 10).min(total_segs);
+                                                        this.state.select_segment(target);
+                                                        this.trigger_extract_frame(cx);
+                                                        cx.notify();
+                                                    }))
+                                                    .child("后10句 ▶"),
+                                            ),
+                                    ),
                             )
                             .child(
                                 div()
@@ -941,7 +1009,7 @@ impl MainWindow {
                                     .bg(Theme::bg_card())
                                     .flex()
                                     .flex_col()
-                                    .children(self.state.segments.iter().map(|seg| {
+                                    .children(visible_segments.into_iter().map(|seg| {
                                         let seg_idx = seg.index;
                                         let is_selected = sel_idx == Some(seg_idx);
                                         let is_playing_here = self.state.current_time >= seg.start && self.state.current_time <= seg.end;
@@ -1004,8 +1072,8 @@ impl MainWindow {
                                                     .child(seg.display_text().to_string()),
                                             )
                                     })),
-                            ),
-                    ),
+                            )
+                    }),
             )
     }
 
@@ -1035,6 +1103,8 @@ impl MainWindow {
         let cur_time = self.state.current_time;
         let progress_ratio = (cur_time / total_dur).clamp(0.0, 1.0) as f32;
         let sel_idx = self.state.selected_segment_index;
+        let active_seg = self.state.get_active_segment().cloned();
+        let cur_seg = sel_idx.and_then(|idx| self.state.segments.iter().find(|s| s.index == idx)).cloned();
 
         div()
             .id("editor-multitrack-timeline")
@@ -1085,9 +1155,11 @@ impl MainWindow {
                             .items_center()
                             .gap_1()
                             .child(self.render_jump_btn("0%", 0.0, cx))
+                            .child(self.render_jump_btn("10%", total_dur * 0.10, cx))
                             .child(self.render_jump_btn("25%", total_dur * 0.25, cx))
                             .child(self.render_jump_btn("50%", total_dur * 0.50, cx))
                             .child(self.render_jump_btn("75%", total_dur * 0.75, cx))
+                            .child(self.render_jump_btn("90%", total_dur * 0.90, cx))
                             .child(self.render_jump_btn("100%", total_dur, cx)),
                     ),
             )
@@ -1192,10 +1264,10 @@ impl MainWindow {
                                     ),
                             ),
                     )
-                    // 2. 字幕专用轨道 (T1 Subtitle Track)
+                    // 2. 字幕专用轨道 (T1 Subtitle Track - 轻量化智能按需渲染，消除卡顿)
                     .child(
                         div()
-                            .h(px(58.0))
+                            .h(px(46.0))
                             .w_full()
                             .flex()
                             .items_center()
@@ -1219,55 +1291,101 @@ impl MainWindow {
                                     .border_color(Theme::border())
                                     .relative()
                                     .overflow_hidden()
-                                    // 渲染每个字幕片段作为时间轴胶囊色块
-                                    .children(self.state.segments.iter().map(|seg| {
-                                        let seg_idx = seg.index;
-                                        let start_r = (seg.start / total_dur).clamp(0.0, 1.0) as f32;
-                                        let width_r = (((seg.end - seg.start) / total_dur).clamp(0.01, 1.0) as f32).max(0.015);
-                                        let is_selected = sel_idx == Some(seg_idx);
-                                        let is_active = cur_time >= seg.start && cur_time <= seg.end;
+                                    // 进度指示底色
+                                    .child(
                                         div()
-                                            .id(("timeline-clip", seg_idx))
+                                            .h_full()
+                                            .w(relative(progress_ratio))
+                                            .bg(rgba(0x10b98115)),
+                                    )
+                                    // 轨道概览文字标签 (实时显示当前字幕信息)
+                                    .child(
+                                        div()
                                             .absolute()
-                                            .top(px(4.0))
-                                            .bottom(px(4.0))
-                                            .left(relative(start_r))
-                                            .w(relative(width_r))
-                                            .min_w(px(24.0))
-                                            .rounded(px(3.0))
-                                            .bg(if is_selected {
-                                                rgb(0x2563eb)
-                                            } else if is_active {
-                                                rgb(0x059669)
+                                            .top_1()
+                                            .left_2()
+                                            .text_size(px(10.0))
+                                            .text_color(Theme::text_muted())
+                                            .child(if let Some(ref seg) = active_seg {
+                                                format!(
+                                                    "字幕轨 · 共 {} 句 · 当前播放: #{:03} [{}] {}",
+                                                    self.state.segments.len(),
+                                                    seg.index,
+                                                    seconds_to_srt_time(seg.start),
+                                                    seg.display_text()
+                                                )
+                                            } else if let Some(ref seg) = cur_seg {
+                                                format!(
+                                                    "字幕轨 · 共 {} 句 · 当前选中: #{:03} [{}] {}",
+                                                    self.state.segments.len(),
+                                                    seg.index,
+                                                    seconds_to_srt_time(seg.start),
+                                                    seg.display_text()
+                                                )
                                             } else {
-                                                rgb(0x2d3748)
-                                            })
-                                            .border_1()
-                                            .border_color(if is_selected {
-                                                rgb(0xffffff)
-                                            } else if is_active {
-                                                Theme::accent_mint()
-                                            } else {
-                                                rgba(0xffffff15)
-                                            })
-                                            .cursor_pointer()
-                                            .px_1()
-                                            .flex()
-                                            .items_center()
-                                            .overflow_hidden()
-                                            .hover(|s| s.opacity(0.85))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.state.select_segment(seg_idx);
-                                                this.trigger_extract_frame(cx);
-                                                cx.notify();
-                                            }))
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.0))
-                                                    .text_color(rgb(0xffffff))
-                                                    .child(seg.display_text().to_string()),
-                                            )
-                                    })),
+                                                format!("字幕轨 · 共 {} 句字幕", self.state.segments.len())
+                                            }),
+                                    )
+                                    // 仅渲染当前时间附近/选中的核心字幕色块 (彻底消除 1400 句密集堆叠卡顿)
+                                    .children({
+                                        let relevant_segments: Vec<_> = if self.state.segments.len() <= 20 {
+                                            self.state.segments.iter().collect()
+                                        } else {
+                                            self.state.segments.iter().filter(|seg| {
+                                                sel_idx == Some(seg.index)
+                                                    || (cur_time >= seg.start - 8.0 && cur_time <= seg.end + 8.0)
+                                            }).collect()
+                                        };
+
+                                        relevant_segments.into_iter().map(|seg| {
+                                            let seg_idx = seg.index;
+                                            let start_r = (seg.start / total_dur).clamp(0.0, 1.0) as f32;
+                                            let width_r = (((seg.end - seg.start) / total_dur).clamp(0.015, 1.0) as f32).max(0.02);
+                                            let is_selected = sel_idx == Some(seg_idx);
+                                            let is_active = cur_time >= seg.start && cur_time <= seg.end;
+                                            div()
+                                                .id(("timeline-clip", seg_idx))
+                                                .absolute()
+                                                .top(px(18.0))
+                                                .bottom(px(3.0))
+                                                .left(relative(start_r))
+                                                .w(relative(width_r))
+                                                .min_w(px(50.0))
+                                                .rounded(px(3.0))
+                                                .bg(if is_selected {
+                                                    rgb(0x2563eb)
+                                                } else if is_active {
+                                                    rgb(0x059669)
+                                                } else {
+                                                    rgb(0x374151)
+                                                })
+                                                .border_1()
+                                                .border_color(if is_selected {
+                                                    rgb(0xffffff)
+                                                } else if is_active {
+                                                    Theme::accent_mint()
+                                                } else {
+                                                    rgba(0xffffff20)
+                                                })
+                                                .cursor_pointer()
+                                                .px_1p5()
+                                                .flex()
+                                                .items_center()
+                                                .overflow_hidden()
+                                                .hover(|s| s.opacity(0.85))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.state.select_segment(seg_idx);
+                                                    this.trigger_extract_frame(cx);
+                                                    cx.notify();
+                                                }))
+                                                .child(
+                                                    div()
+                                                        .text_size(px(10.0))
+                                                        .text_color(rgb(0xffffff))
+                                                        .child(seg.display_text().to_string()),
+                                                )
+                                        })
+                                    }),
                             ),
                     )
                     // 3. 贯穿全轨的红色/青色播放游标指针 (Playhead / CTI)
