@@ -1,173 +1,103 @@
-﻿# Voice2Word — 音视频智能字幕生成器 (Rust + GPUI)
+﻿# Voice2Word — 音视频智能字幕生成与校对工具
 
-<div align="center">
-
-**基于 Rust 与 GPUI 打造的现代、轻量、高颜值的音视频本地智能字幕生成工具**
-
-[![Language](https://img.shields.io/badge/Language-Rust_1.80+-orange.svg)](https://www.rust-lang.org/)
-[![UI Framework](https://img.shields.io/badge/UI-GPUI_(Zed)-6366f1.svg)](https://github.com/zed-industries/zed)
-[![Audio](https://img.shields.io/badge/Audio-FFmpeg_6+-007800.svg)](https://ffmpeg.org/)
-[![ASR](https://img.shields.io/badge/ASR-Whisper.cpp-black.svg)](https://github.com/ggerganov/whisper.cpp)
-[![LLM](https://img.shields.io/badge/LLM-Qwen2.5_(llama.cpp)-blue.svg)](https://github.com/ggerganov/llama.cpp)
-
-</div>
+Voice2Word 是一款本地运行的音视频字幕自动生成与精修桌面应用。无需联网上传音视频，100% 本地完成语音识别、标点润色错别字纠错、多轨时间轴画面对齐以及字幕导出。
 
 ---
 
-## 📖 项目简介
+## 🌟 主要功能
 
-**Voice2Word** 是一款面向视频创作者、会议记录者与字幕编辑者的本地桌面应用。项目使用 **Rust** 进行系统级状态编排与数据管线调度，界面采用来自 Zed 编辑器的 GPU 加速图形库 **GPUI**，视觉风格深度参考 **Codex / Zed** 的极简暗黑美学。
-
-外部计算引擎秉承“各司其职、成熟为先”原则，无缝集成工业级 **FFmpeg**、**whisper.cpp** 和 **llama.cpp**，全程离线运行，保护隐私，无须消耗任何付费 API。
-
----
-
-## ✨ 核心特性
-
-- 🎨 **Zed 现代极简桌面美学**：彻底告别传统“表单软件”与 Qt 风格，拥有高质感的深灰背景、极细分界、大留白排版与平滑流畅的 GPU 加速渲染体验。
-- ⚡ **毫秒级全链路自动化**：
-  $$\text{音视频输入} \xrightarrow{\text{FFmpeg}} \text{16kHz WAV} \xrightarrow{\text{Whisper}} \text{带时间戳片段} \xrightarrow{\text{Qwen}} \text{标点/错字润色} \xrightarrow{\text{Writer}} \text{SRT / ASS / TXT}$$
-- 🧵 **绝对丝滑响应**：基于 **Tokio** 异步执行后端，主界面采用帧驱动事件轮询，高负载模型推理全程**零卡顿**。
-- 🧠 **大模型智能标点恢复**：针对 Whisper 输出的无标点文本，通过内置的 **Qwen2.5 Few-Shot** 引擎精准恢复标点符号（逗号、句号、感叹号、问号）并修正同音近音错别字。
-- 📦 **主流音视频格式支持**：兼容 MP4、MKV、MOV、AVI、FLV、WebM、MP3、WAV、FLAC、M4A 等。
-- 💾 **本地任务持久化**：内置 SQLite 数据库，自动沉淀处理历史记录与字幕草稿，支持一键载入与回放。
-- 📤 **多字幕规范导出**：一键导出为 **SRT**（标准外挂字幕）、**ASS**（高级特效样式字幕）以及 **TXT**（纯文本记录）。
+- **本地一键转写**：支持 MP4、MKV、MOV、FLV、MP3、WAV 等主流音视频格式，自动提取音频并转写为带时间戳的字幕。
+- **静音加速检测**：内置语音活动检测（VAD），自动跳过空白静音段，长视频转写速度大幅提升。
+- **智能标点与错别字纠错**：转写完成后自动补全标点符号，纠正常见同音字与语音识别错别字。
+- **可视化时间轴校对工作台**：
+  - **音画对齐预览**：拖动或点击时间轴刻度，实时预览对应视频画面与字幕叠层。
+  - **字幕快捷精修**：直接在界面上修改错字，支持常用标点一键插入。
+  - **毫秒级微调与编辑**：支持字幕起止时间微调（±0.1s / ±0.5s）、长句拆分、短句合并与片段删除。
+- **多格式导出**：一键重新生成并导出为标准 **SRT**、**ASS** 或 **TXT** 字幕文件。
+- **历史记录保存**：内置本地数据库，处理过的任务自动保存，随时点击恢复并二次编辑。
 
 ---
 
-## 🖥 界面概览
+## 📖 使用教程
 
-```text
-┌───────────────────────────────────────────────────────────────┐
-│ Voice2Word                                                    │
-├───────────────────┬───────────────────────────────────────────┤
-│                   │                                           │
-│  [INPUT MEDIA]    │          字 幕 工 作 区                    │
-│  📁 sample.mp4     │                                           │
-│                   │  #001  [00:00:00,000 ➔ 00:00:04,960] ✦已润色│
-│  [CONFIG]         │  你好，欢迎使用音视频智能字幕生成器，      │
-│  语言: 中文 / 英文 │  这是一个测试。                           │
-│  格式: SRT / ASS  │                                           │
-│  Qwen 润色: 已启用 │                                           │
-│                   │                                           │
-│  [RECENT TASKS]   │                                           │
-│  • 会议录音.mp4    │                                           │
-│  • 课程讲座.mp4    │                                           │
-├───────────────────┴───────────────────────────────────────────┤
-│ 状态: 完成 100%  [████████████████████]   [💾 导出] [▶ 开始处理] │
-└───────────────────────────────────────────────────────────────┘
-```
+1. **选择音视频**：打开软件后，在左侧点击「选择音视频文件」载入目标文件。
+2. **一键生成字幕**：确认语言和导出格式，点击「开始智能处理」。界面会实时展示识别进度与转写出来的文字。
+3. **校对与精修**：
+   - 转写完成后，应用会自动进入「剪辑校对工作台」。
+   - 点击底部时间轴上的任意字幕色块或时间刻度，上方监视器会同步展示当前画面的视频帧。
+   - 在右侧「字幕属性」面板中直接修改错别字、微调时间或拆分/合并句子。
+4. **导出成品**：在右上角点击「重新导出 SRT / ASS」，即可保存最终字幕。
 
 ---
 
-## 🛠 代码架构
-
-```text
-Voice2Word/
-├── Cargo.toml               # Rust 依赖声明与优化配置
-├── config.toml              # 路径与超参数配置 (TOML)
-├── voice2word.db            # SQLite 本地任务数据库
-├── models/                  # 本地 GGUF / GGML 模型目录
-│   ├── whisper/             # ggml-large-v3-turbo-q8_0.bin
-│   └── llm/                 # Qwen2.5-3B-Instruct-Q4_K_M.gguf
-│
-├── tests/
-│   └── test_pipeline.rs     # 端到端全链路自动化集成测试
-│
-└── src/
-    ├── main.rs              # 入口：配置加载、数据库初始化、GPUI 窗口创建
-    ├── lib.rs               # 模块库定义
-    ├── app/
-    │   └── state.rs         # 全局应用状态 AppState (选定文件/处理状态/字幕列表)
-    ├── core/
-    │   └── pipeline.rs      # Tokio 异步任务管线 (Channel 驱动，阶段流转)
-    ├── engines/
-    │   ├── ffmpeg.rs        # FFmpeg 音频提取与时长检测
-    │   ├── whisper.rs       # whisper.cpp 命令行适配与时间戳解析
-    │   └── llm.rs           # llama.cpp 标点恢复引擎 (UTF-8 传参 + Few-Shot)
-    ├── subtitle/
-    │   ├── segment.rs       # Segment 数据模型 (秒作为标准时间单位)
-    │   └── writer.rs        # SRT / ASS / TXT 规范导出器
-    ├── storage/
-    │   └── db.rs            # SQLite 任务历史与片段持久化
-    ├── ui/
-    │   ├── mod.rs           # GPUI 主视图布局与帧驱动事件消费
-    │   └── theme.rs         # 配色规范 (Slate 深灰体系、细分界、Mint 强调色)
-    └── utils/
-        ├── config.rs        # TOML 配置文件读写与路径自动解析
-        └── time.rs          # 秒数 ↔ SRT/ASS 标准时间格式相互转换
-```
-
----
-
-## 🚀 快速开始
+## 🛠️ 个人部署与运行指南
 
 ### 1. 环境准备
-- **Rust 工具链**：Rust 1.80+ (推荐使用 `rustup` 安装)
-- **C/C++ 构建工具**：Windows 平台需要 Visual Studio C++ 工具链（MSVC）
-- **外部原生依赖**：
-  - [FFmpeg](https://ffmpeg.org/download.html)
-  - [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
-  - [llama.cpp](https://github.com/ggerganov/llama.cpp)
 
-### 2. 检查配置
-打开项目根目录下的 `config.toml`，确认外部组件和模型文件路径正确：
+- **操作系统**：Windows 10 / 11 (x64)
+- **Rust 环境**：安装 [Rust 1.80+](https://www.rust-lang.org/tools/install)
+- **C/C++ 编译环境**：Visual Studio（勾选“使用 C++ 的桌面开发”）
+
+### 2. 克隆仓库
+
+```bash
+git clone https://github.com/ysg0422/voice2word.git
+cd voice2word
+```
+
+### 3. 准备模型与组件
+
+为保证离线高效运行，本应用调用以下本地组件与模型文件：
+
+1. **FFmpeg**：
+   - 下载 Windows 版 FFmpeg，解压得到 `ffmpeg.exe`。
+2. **语音识别组件**：
+   - 准备 `whisper-cli.exe` 识别程序。
+   - 下载语音识别模型（如 `ggml-base.bin`）以及静音检测模型（如 `ggml-silero-v6.2.0.bin`）放入 `models/whisper/` 目录。
+3. **大语言模型（可选，用于纠错）**：
+   - 准备 `llama-completion.exe` 推理程序。
+   - 下载语言模型（如 `qwen2.5-0.5b-instruct-q4_k_m.gguf`）放入 `models/llm/` 目录。
+
+### 4. 配置路径
+
+打开根目录下的 `config.toml`，将工具路径和模型路径配置为您本地的实际存放路径：
 
 ```toml
 [paths]
-ffmpeg = "A:\\cppsoft\\ffmpeg-6.9\\bin\\ffmpeg.exe"
-whisper_cli = "A:\\cppsoft\\whisper\\Release\\whisper-cli.exe"
-whisper_model = "models/whisper/ggml-large-v3-turbo-q8_0.bin"
-llama_cli = "A:\\cppsoft\\llama.cpp\\build\\bin\\Release\\llama-completion.exe"
-llm_model = "models/llm/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+ffmpeg = "tools/ffmpeg.exe"
+whisper_cli = "tools/whisper-cli.exe"
+whisper_model = "models/whisper/ggml-base.bin"
+vad_model = "models/whisper/ggml-silero-v6.2.0.bin"
+llama_cli = "tools/llama-completion.exe"
+llm_model = "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf"
 
 [pipeline]
-language = "zh"           # 默认识别语言 (zh / en / ja / auto)
-output_format = "srt"     # 默认导出格式 (srt / ass / txt)
-enable_polish = true      # 默认开启大模型润色
-whisper_threads = 4       # Whisper 计算线程
-llm_threads = 4           # LLM 计算线程
+language = "zh"           # 默认识别语言 (zh / en / auto)
+output_format = "srt"     # 默认导出格式 (srt / ass)
+enable_polish = true      # 是否开启智能润色与纠错
+enable_vad = true         # 是否开启静音加速检测
+whisper_threads = 8       # Whisper CPU 线程数
+llm_threads = 8           # 大模型 CPU 线程数
 llm_ctx = 4096            # 上下文大小
 ```
 
-### 3. 运行桌面客户端
+### 5. 编译与启动
+
+在项目根目录下执行以下命令即可启动桌面客户端：
+
 ```powershell
 cargo run
 ```
-也可以直接运行已编译生成的独立二进制程序：
+
+如需编译为发布版独立可执行文件：
+
 ```powershell
-target/debug/voice2word.exe
+cargo build --release
 ```
+编译成功后，产物位于 `target/release/voice2word.exe`，直接双击运行即可。
 
 ---
 
-## 🧪 自动化测试
+## 📄 许可证
 
-项目内置完整的端到端集成测试，可自动运行 `FFmpeg -> Whisper -> Qwen -> SRT` 整个流水线并校验生成结果：
-
-```powershell
-cargo test --test test_pipeline -- --nocapture
-```
-
-测试输出示例：
-```text
-running 1 test
-[1/4] FFmpeg 提取音频...
-      音频提取完成: sample_voice2word.wav (16000Hz, mono, s16le)
-[2/4] Whisper 识别语音...
-      转写完成，片段数: 1
-      #1: [0.00 -> 4.96] 你好欢迎使用音视频智能字幕生成器这是一个测试
-[3/4] Qwen LLM 润色...
-      #1: 原文='你好欢迎使用音视频智能字幕生成器这是一个测试'
-          润色='你好，欢迎使用音视频智能字幕生成器，这是一个测试。'
-[4/4] 导出标准 SRT 文件...
-      字幕成功生成，时间戳格式 00:00:00,000 --> 00:00:04,960。
-
-test test_full_pipeline_run ... ok
-```
-
----
-
-## 📄 开源许可证
-
-本项目基于 [MIT License](LICENSE) 开源发布。
+本项目基于 [MIT License](LICENSE) 协议发布。
