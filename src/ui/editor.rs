@@ -761,40 +761,149 @@ impl MainWindow {
                                 .gap_2()
                                 .child(
                                     div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(Theme::text_muted())
+                                                    .child("字幕文本修改"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.0))
+                                                    .text_color(Theme::text_muted())
+                                                    .child("（点击输入框直接打字，或点击弹窗编辑）"),
+                                            ),
+                                    )
+                                    .child(
                                             div()
-                                                .text_size(px(11.0))
-                                                .text_color(Theme::text_muted())
-                                                .child("字幕文本修改"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(10.0))
-                                                .text_color(Theme::accent_mint())
-                                                .child("实时预览与修改"),
+                                                .flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(
+                                                    div()
+                                                        .id("btn-popup-edit-text")
+                                                        .px_2()
+                                                        .py_0p5()
+                                                        .rounded(px(3.0))
+                                                        .bg(rgba(0x10b98122))
+                                                        .border_1()
+                                                        .border_color(Theme::accent_mint())
+                                                        .cursor_pointer()
+                                                        .text_size(px(10.0))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(Theme::accent_mint())
+                                                        .hover(|s| s.bg(rgba(0x10b98144)))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.prompt_edit_text(cx);
+                                                        }))
+                                                        .child("✏️ 弹窗输入 (支持中文)"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("btn-paste-clipboard")
+                                                        .px_2()
+                                                        .py_0p5()
+                                                        .rounded(px(3.0))
+                                                        .bg(Theme::bg_sidebar())
+                                                        .border_1()
+                                                        .border_color(Theme::border())
+                                                        .cursor_pointer()
+                                                        .text_size(px(10.0))
+                                                        .text_color(Theme::text_secondary())
+                                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            if let Some(item) = cx.read_from_clipboard() {
+                                                                if let Some(text) = item.text() {
+                                                                    this.state.editing_text = text;
+                                                                    this.state.save_selected_text();
+                                                                    cx.notify();
+                                                                }
+                                                            }
+                                                        }))
+                                                        .child("📋 粘贴"),
+                                                ),
                                         ),
                                 )
-                                // 字幕文本显示容器
-                                .child(
+                                // 字幕文本显示与键盘直接键入容器
+                                .child({
+                                    let is_focused = self.is_text_focused;
                                     div()
+                                        .id("subtitle-text-editor-box")
+                                        .track_focus(&self.text_focus)
                                         .min_h(px(60.0))
                                         .p_2p5()
                                         .rounded_md()
                                         .bg(Theme::bg_sidebar())
                                         .border_1()
-                                        .border_color(Theme::border())
+                                        .border_color(if is_focused { Theme::accent_mint() } else { Theme::border() })
+                                        .cursor_text()
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                            window.focus(&this.text_focus);
+                                            this.is_text_focused = true;
+                                            cx.notify();
+                                        }))
+                                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                            let key = &event.keystroke.key;
+                                            if event.keystroke.modifiers.control {
+                                                if key == "v" {
+                                                    if let Some(item) = cx.read_from_clipboard() {
+                                                        if let Some(text) = item.text() {
+                                                            this.state.editing_text.push_str(&text);
+                                                            this.state.save_selected_text();
+                                                            cx.notify();
+                                                        }
+                                                    }
+                                                } else if key == "c" {
+                                                    let item = ClipboardItem::new_string(this.state.editing_text.clone());
+                                                    cx.write_to_clipboard(item);
+                                                }
+                                                return;
+                                            }
+
+                                            if key == "backspace" {
+                                                this.state.editing_text.pop();
+                                                this.state.save_selected_text();
+                                                cx.notify();
+                                            } else if key == "enter" {
+                                                this.state.save_selected_text();
+                                                this.is_text_focused = false;
+                                                cx.notify();
+                                            } else if key == "space" {
+                                                this.state.editing_text.push(' ');
+                                                this.state.save_selected_text();
+                                                cx.notify();
+                                            } else if key.chars().count() == 1 {
+                                                this.state.editing_text.push_str(key);
+                                                this.state.save_selected_text();
+                                                cx.notify();
+                                            }
+                                        }))
                                         .text_size(px(14.0))
                                         .line_height(relative(1.4))
                                         .text_color(Theme::text_primary())
                                         .child(if cur_text.is_empty() {
-                                            "（空）".to_string()
+                                            if is_focused {
+                                                "▌".to_string()
+                                            } else {
+                                                "（点击此处直接打字，或点击右上角弹窗输入）".to_string()
+                                            }
                                         } else {
-                                            cur_text
-                                        }),
-                                )
+                                            if is_focused {
+                                                format!("{}▌", cur_text)
+                                            } else {
+                                                cur_text
+                                            }
+                                        })
+                                })
                                 // 标点与文字快捷修正栏
                                 .child(
                                     div()
@@ -922,8 +1031,15 @@ impl MainWindow {
                     .child({
                         let total_segs = self.state.segments.len();
                         let focus_idx = sel_idx.or_else(|| self.state.get_active_segment().map(|s| s.index)).unwrap_or(1);
-                        let window_size = 6usize;
-                        let start_idx = focus_idx.saturating_sub(2).max(1);
+                        // 动态调整窗口大小：超长视频显示更少，短视频显示更多
+                        let window_size = if total_segs > 1000 {
+                            4  // 超长视频（>1000句）只显示 4 条
+                        } else if total_segs > 100 {
+                            6  // 中等视频保持 6 条
+                        } else {
+                            10 // 短视频可以显示 10 条
+                        };
+                        let start_idx = focus_idx.saturating_sub(window_size / 2).max(1);
                         let end_idx = (start_idx + window_size).min(total_segs);
                         let visible_segments: Vec<_> = self.state.segments.iter()
                             .filter(|s| s.index >= start_idx && s.index <= end_idx)
@@ -1526,5 +1642,53 @@ impl MainWindow {
         self.state.seek_to(target_time);
         self.trigger_extract_frame(cx);
         cx.notify();
+    }
+
+    /// 弹出原生 Windows 输入对话框进行字幕文本修改（完美支持搜狗/微软等中文输入法）
+    pub(crate) fn prompt_edit_text(&mut self, cx: &mut Context<Self>) {
+        let current_text = self.state.editing_text.clone();
+        let prompt_title = "Voice2Word - 修改字幕文本";
+        let prompt_msg = "请输入修改后的字幕内容（支持中文输入法/粘贴）：";
+
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move {
+                use std::process::Command;
+                let safe_msg = prompt_msg.replace('\'', "''");
+                let safe_title = prompt_title.replace('\'', "''");
+                let safe_default = current_text.replace('\'', "''");
+
+                let script = format!(
+                    "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::InputBox('{}', '{}', '{}')",
+                    safe_msg, safe_title, safe_default
+                );
+
+                let output = Command::new("powershell")
+                    .arg("-NoProfile")
+                    .arg("-NonInteractive")
+                    .arg("-Command")
+                    .arg(&script)
+                    .output();
+
+                match output {
+                    Ok(out) if out.status.success() => {
+                        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        if !text.is_empty() {
+                            Some(text)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }).await;
+
+            if let Some(new_text) = res {
+                let _ = this.update(cx, |this, cx| {
+                    this.state.editing_text = new_text;
+                    this.state.save_selected_text();
+                    cx.notify();
+                });
+            }
+        }).detach();
     }
 }

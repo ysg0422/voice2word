@@ -21,14 +21,19 @@ use tokio::sync::watch;
 pub struct MainWindow {
     state: AppState,
     metrics_rx: watch::Receiver<crate::app::ResourceMetrics>,
+    pub(crate) text_focus: FocusHandle,
+    pub(crate) is_text_focused: bool,
 }
 
 impl MainWindow {
-    pub fn new(state: AppState, _cx: &mut Context<Self>) -> Self {
+    pub fn new(state: AppState, cx: &mut Context<Self>) -> Self {
         let metrics_rx = crate::utils::SystemMonitor::spawn_background_monitor();
+        let text_focus = cx.focus_handle();
         Self {
             state,
             metrics_rx,
+            text_focus,
+            is_text_focused: false,
         }
     }
 
@@ -257,14 +262,17 @@ impl MainWindow {
         }
         let time = self.state.current_time;
         let ffmpeg_path = crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
-        let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
+        let ffmpeg = std::sync::Arc::new(crate::engines::FFmpegEngine::new(ffmpeg_path));
         let cache = self.state.frame_cache.clone();
 
         // 使用缓存系统获取帧（缓存命中时 <10ms，未命中时 200-500ms）
         let video_clone = video_path.clone();
+        let ffmpeg_clone = ffmpeg.clone();
+        let cache_clone = cache.clone();
+
         cx.spawn(async move |this, cx| {
             let frame_result = cx.background_executor().spawn(async move {
-                cache.get_or_extract(&video_clone, time, &ffmpeg)
+                cache_clone.get_or_extract(&video_clone, time, &ffmpeg_clone)
             })
             .await;
 
@@ -276,10 +284,6 @@ impl MainWindow {
             }
         })
         .detach();
-
-        // 异步预加载周围帧（前后 10 秒），提升后续拖动流畅度
-        let ffmpeg_arc = std::sync::Arc::new(ffmpeg);
-        cache.preload_surrounding_frames(video_path, time, ffmpeg_arc);
     }
 
     /// 上一句字幕

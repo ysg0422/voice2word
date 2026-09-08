@@ -72,62 +72,6 @@ impl FrameCache {
         Ok(out_jpg)
     }
 
-    /// 异步预加载周围帧（前后各 10 秒）
-    pub fn preload_surrounding_frames(
-        &self,
-        video_path: PathBuf,
-        current_time: f64,
-        ffmpeg: Arc<FFmpegEngine>,
-    ) {
-        let cache_clone = self.cache.clone();
-        let max_size = self.max_size;
-
-        std::thread::spawn(move || {
-            let temp_dir = std::env::temp_dir().join("v2w_frames");
-            let _ = std::fs::create_dir_all(&temp_dir);
-
-            // 预加载前后 10 秒，每 0.5 秒一帧（共 40 帧）
-            for offset in -20..=20 {
-                let t = current_time + (offset as f64 * 0.5);
-                if t < 0.0 {
-                    continue;
-                }
-
-                let key = Self::cache_key(&video_path, t);
-
-                // 检查是否已缓存
-                {
-                    let cache = cache_clone.lock().unwrap();
-                    if cache.len() >= max_size {
-                        break; // 缓存已满，停止预加载
-                    }
-                    if cache.contains_key(&key) {
-                        continue;
-                    }
-                }
-
-                // 生成缓存帧
-                let stem = video_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("vid");
-                let sec_key = (t * 2.0).round() as i64;
-                let out_jpg = temp_dir.join(format!("{}_{}.jpg", stem, sec_key));
-
-                if !out_jpg.exists() {
-                    if let Ok(_) = ffmpeg.extract_frame(&video_path, t, &out_jpg) {
-                        let mut cache = cache_clone.lock().unwrap();
-                        if cache.len() < max_size {
-                            cache.insert(key, out_jpg);
-                        }
-                    }
-                }
-            }
-
-            info!("视频帧预加载完成，缓存大小: {}", cache_clone.lock().unwrap().len());
-        });
-    }
-
     /// 清理所有缓存
     pub fn clear(&self) {
         self.cache.lock().unwrap().clear();
