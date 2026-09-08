@@ -252,11 +252,15 @@ impl MainWindow {
     /// 异步根据当前播放时间抽取单帧画面用于监视器显示
     fn trigger_extract_frame(&mut self, cx: &mut Context<Self>) {
         let Some(video_path) = self.state.selected_file.clone() else { return; };
+        if !video_path.exists() {
+            return;
+        }
         let time = self.state.current_time;
         let ffmpeg_path = crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
         let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
 
         let temp_dir = std::env::temp_dir().join("v2w_frames");
+        let _ = std::fs::create_dir_all(&temp_dir);
         let stem = video_path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -272,12 +276,12 @@ impl MainWindow {
         }
 
         cx.spawn(async move |this, cx| {
-            let res = tokio::task::spawn_blocking(move || {
+            let res = cx.background_executor().spawn(async move {
                 ffmpeg.extract_frame(&video_path, time, &out_jpg)
             })
             .await;
 
-            if let Ok(Ok(frame_path)) = res {
+            if let Ok(frame_path) = res {
                 let _ = this.update(cx, |this, cx| {
                     this.state.preview_frame_path = Some(frame_path);
                     cx.notify();
@@ -761,8 +765,18 @@ impl MainWindow {
                                         this.state.selected_file = Some(PathBuf::from(&task_clone.file_path));
                                         this.state.status = ProcessStatus::Completed;
                                         this.state.segments = task_clone.segments.clone();
+                                        let duration = if task_clone.duration > 0.0 {
+                                            task_clone.duration
+                                        } else {
+                                            task_clone.segments.last().map(|s| s.end).unwrap_or(0.0)
+                                        };
+                                        this.state.total_duration = duration;
                                         if let Some(first) = this.state.segments.first() {
                                             this.state.select_segment(first.index);
+                                        } else {
+                                            this.state.current_time = 0.0;
+                                            this.state.selected_segment_index = None;
+                                            this.state.editing_text.clear();
                                         }
                                         this.state.active_tab = WorkspaceTab::Editor;
                                         this.trigger_extract_frame(cx);
