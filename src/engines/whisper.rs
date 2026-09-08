@@ -138,11 +138,18 @@ impl WhisperEngine {
             .arg("1") // 仅保留最佳候选，配合单束搜索降低解码计算量
             .arg("-bs")
             .arg("1") // 单束搜索：快速模式
-            .arg("-nf") // 不在低置信片段上执行温度回退重试
             .arg("-oj") // 输出 JSON 结果
             .arg("-of")
-            .arg(&prefix)
-            .stdout(std::process::Stdio::piped())
+            .arg(&prefix);
+
+        // 中文普通话强提示词与上下文携带：锚定中文词表，严禁漂移幻读为英文
+        if lang == "zh" || lang == "auto" {
+            cmd.arg("--prompt")
+                .arg("以下是普通话中文语音识别，包含学术概念与数学公式，请全部使用简体中文输出。")
+                .arg("--carry-initial-prompt");
+        }
+
+        cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn().with_context(|| {

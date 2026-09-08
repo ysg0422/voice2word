@@ -46,7 +46,7 @@ impl Default for AppConfig {
             paths: PathsConfig {
                 ffmpeg: "A:\\cppsoft\\ffmpeg-6.9\\bin\\ffmpeg.exe".to_string(),
                 whisper_cli: "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe".to_string(),
-                whisper_model: "models/whisper/ggml-base.bin".to_string(),
+                whisper_model: "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string(),
                 vad_model: Some("models/whisper/ggml-silero-v6.2.0.bin".to_string()),
                 llama_cli: "A:\\cppsoft\\llama.cpp\\build\\bin\\Release\\llama-completion.exe".to_string(),
                 llm_model: "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string(),

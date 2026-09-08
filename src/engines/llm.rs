@@ -277,7 +277,7 @@ impl LLMEngine {
             .collect::<Vec<_>>()
             .join("\n");
         let prompt = format!(
-            "<|im_start|>system\n你是严格的字幕润色工具。为每条语音识别字幕添加标点并修正明显错字，保持原意。必须逐行输出，格式为 [序号] 润色文本；不解释，不合并，不遗漏。<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\n你是严格的字幕润色工具。为每条字幕添加标点并修正错别字，保持原意。若文本为中文语境下误识别出的英文幻读（如数学公式读音被识为英文句子），请将其修正翻译为地道的简体中文。必须逐行输出，格式为 [序号] 润色文本；不解释，不合并，不遗漏。<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
             source
         );
         let max_tokens = (source_segments.len() as u32 * 32).clamp(96, 512);
