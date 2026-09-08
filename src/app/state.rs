@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::core::TaskPipeline;
 use crate::storage::{Database, TaskRecord};
 use crate::subtitle::Segment;
-use crate::utils::AppConfig;
+use crate::utils::{AppConfig, FrameCache};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProcessStatus {
@@ -77,6 +77,9 @@ pub struct AppState {
     pub preview_frame_path: Option<PathBuf>,
     pub timeline_zoom: f64,
     pub editing_text: String,
+
+    // 视频帧缓存（优化拖动时间轴性能）
+    pub frame_cache: Arc<FrameCache>,
 }
 
 impl AppState {
@@ -109,6 +112,7 @@ impl AppState {
             preview_frame_path: None,
             timeline_zoom: 1.0,
             editing_text: String::new(),
+            frame_cache: Arc::new(FrameCache::new(100)), // 缓存 100 帧（约占 5-10MB）
         }
     }
 

@@ -1163,9 +1163,10 @@ impl MainWindow {
                             .child(self.render_jump_btn("100%", total_dur, cx)),
                     ),
             )
-            // 时间刻度标尺 (Time Ruler)
+            // 时间刻度标尺 (Time Ruler - 点击/拖拽任意位置精确定位)
             .child(
                 div()
+                    .id("timeline-time-ruler")
                     .h(px(24.0))
                     .w_full()
                     .bg(rgb(0x131316))
@@ -1175,6 +1176,17 @@ impl MainWindow {
                     .items_center()
                     .pl(px(70.0)) // 留出左侧轨道标号宽度
                     .relative()
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        let win_w = window.viewport_size().width;
+                        this.seek_by_mouse_x(event.position.x, win_w, cx);
+                    }))
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                        if event.pressed_button == Some(MouseButton::Left) {
+                            let win_w = window.viewport_size().width;
+                            this.seek_by_mouse_x(event.position.x, win_w, cx);
+                        }
+                    }))
                     .children((0usize..=10).map(|i| {
                         let ratio = i as f64 / 10.0;
                         let t = total_dur * ratio;
@@ -1331,9 +1343,11 @@ impl MainWindow {
                                         let relevant_segments: Vec<_> = if self.state.segments.len() <= 20 {
                                             self.state.segments.iter().collect()
                                         } else {
+                                            // 优化过滤条件：扩大可见范围到 ±15 秒，提升预加载效果
                                             self.state.segments.iter().filter(|seg| {
                                                 sel_idx == Some(seg.index)
-                                                    || (cur_time >= seg.start - 8.0 && cur_time <= seg.end + 8.0)
+                                                    || (cur_time >= seg.start && cur_time <= seg.end)
+                                                    || (cur_time >= seg.start - 15.0 && cur_time <= seg.end + 15.0)
                                             }).collect()
                                         };
 
@@ -1388,14 +1402,26 @@ impl MainWindow {
                                     }),
                             ),
                     )
-                    // 3. 贯穿全轨的红色/青色播放游标指针 (Playhead / CTI)
+                    // 3. 贯穿全轨的交互响应层与播放游标指针 (Playhead / CTI & 点击/拖拽任意位置精确定位)
                     .child(
                         div()
+                            .id("timeline-playhead-interactive-surface")
                             .absolute()
                             .top_0()
                             .bottom_0()
                             .left(px(70.0)) // 避开左侧轨道标号
                             .right(px(16.0)) // 避开右侧边距
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                let win_w = window.viewport_size().width;
+                                this.seek_by_mouse_x(event.position.x, win_w, cx);
+                            }))
+                            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                                if event.pressed_button == Some(MouseButton::Left) {
+                                    let win_w = window.viewport_size().width;
+                                    this.seek_by_mouse_x(event.position.x, win_w, cx);
+                                }
+                            }))
                             .child(
                                 div()
                                     .absolute()
@@ -1482,5 +1508,23 @@ impl MainWindow {
                 cx.notify();
             }))
             .child(label)
+    }
+
+    /// 统一的时间轴鼠标点击与拖拽精确定位逻辑
+    pub(crate) fn seek_by_mouse_x(&mut self, mouse_x: Pixels, window_width: Pixels, cx: &mut Context<Self>) {
+        if self.state.total_duration <= 0.0 {
+            return;
+        }
+        let left_pad = px(70.0); // 左侧轨道名称标签占用宽度
+        let right_pad = px(16.0); // 右侧留白边距
+        let track_w = window_width - left_pad - right_pad;
+        if track_w <= px(10.0) {
+            return;
+        }
+        let ratio = ((mouse_x - left_pad) / track_w).clamp(0.0, 1.0) as f64;
+        let target_time = ratio * self.state.total_duration;
+        self.state.seek_to(target_time);
+        self.trigger_extract_frame(cx);
+        cx.notify();
     }
 }

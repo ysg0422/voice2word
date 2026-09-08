@@ -249,7 +249,7 @@ impl MainWindow {
         }
     }
 
-    /// 异步根据当前播放时间抽取单帧画面用于监视器显示
+    /// 异步根据当前播放时间抽取单帧画面用于监视器显示（带智能缓存预加载）
     fn trigger_extract_frame(&mut self, cx: &mut Context<Self>) {
         let Some(video_path) = self.state.selected_file.clone() else { return; };
         if !video_path.exists() {
@@ -258,30 +258,17 @@ impl MainWindow {
         let time = self.state.current_time;
         let ffmpeg_path = crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
         let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
+        let cache = self.state.frame_cache.clone();
 
-        let temp_dir = std::env::temp_dir().join("v2w_frames");
-        let _ = std::fs::create_dir_all(&temp_dir);
-        let stem = video_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("vid");
-        // 按 0.5s 量化时间作为缓存 key，极大提高反复跳转命中率与流畅度
-        let sec_key = (time * 2.0).round() as i64;
-        let out_jpg = temp_dir.join(format!("{}_{}.jpg", stem, sec_key));
-
-        if out_jpg.exists() {
-            self.state.preview_frame_path = Some(out_jpg);
-            cx.notify();
-            return;
-        }
-
+        // 使用缓存系统获取帧（缓存命中时 <10ms，未命中时 200-500ms）
+        let video_clone = video_path.clone();
         cx.spawn(async move |this, cx| {
-            let res = cx.background_executor().spawn(async move {
-                ffmpeg.extract_frame(&video_path, time, &out_jpg)
+            let frame_result = cx.background_executor().spawn(async move {
+                cache.get_or_extract(&video_clone, time, &ffmpeg)
             })
             .await;
 
-            if let Ok(frame_path) = res {
+            if let Ok(frame_path) = frame_result {
                 let _ = this.update(cx, |this, cx| {
                     this.state.preview_frame_path = Some(frame_path);
                     cx.notify();
@@ -289,6 +276,10 @@ impl MainWindow {
             }
         })
         .detach();
+
+        // 异步预加载周围帧（前后 10 秒），提升后续拖动流畅度
+        let ffmpeg_arc = std::sync::Arc::new(ffmpeg);
+        cache.preload_surrounding_frames(video_path, time, ffmpeg_arc);
     }
 
     /// 上一句字幕
