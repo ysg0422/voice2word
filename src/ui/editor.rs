@@ -296,22 +296,42 @@ impl MainWindow {
                         if let Some(ref frame_path) = self.state.preview_frame_path {
                             if frame_path.exists() {
                                 div()
-                                    .w_full()
-                                    .h_full()
+                                    .size_full()
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .child(
                                         img(frame_path.clone())
-                                            .w_full()
-                                            .h_full()
+                                            .max_w_full()
+                                            .max_h_full()
                                     )
                             } else {
                                 div()
-                                    .text_size(px(12.0))
-                                    .text_color(Theme::text_muted())
-                                    .child("正在提取对应视频帧...")
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().text_size(px(24.0)).child("⏳"))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .text_color(Theme::text_muted())
+                                            .child("正在提取对应视频帧..."),
+                                    )
                             }
+                        } else if self.state.selected_file.is_some() {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_2()
+                                .child(div().text_size(px(28.0)).child("🎞️"))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(Theme::accent_mint())
+                                        .child("正在同步视频预览画面..."),
+                                )
                         } else {
                             div()
                                 .flex()
@@ -1295,13 +1315,17 @@ impl MainWindow {
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                         let win_w = window.viewport_size().width;
-                        this.seek_by_mouse_x(event.position.x, win_w, cx);
+                        this.seek_by_mouse_x(event.position.x, win_w, false, cx);
                     }))
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                         if event.pressed_button == Some(MouseButton::Left) {
                             let win_w = window.viewport_size().width;
-                            this.seek_by_mouse_x(event.position.x, win_w, cx);
+                            this.seek_by_mouse_x(event.position.x, win_w, true, cx);
                         }
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                        let win_w = window.viewport_size().width;
+                        this.seek_by_mouse_x(event.position.x, win_w, false, cx);
                     }))
                     .children((0usize..=10).map(|i| {
                         let ratio = i as f64 / 10.0;
@@ -1530,13 +1554,17 @@ impl MainWindow {
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                                 let win_w = window.viewport_size().width;
-                                this.seek_by_mouse_x(event.position.x, win_w, cx);
+                                this.seek_by_mouse_x(event.position.x, win_w, false, cx);
                             }))
                             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                                 if event.pressed_button == Some(MouseButton::Left) {
                                     let win_w = window.viewport_size().width;
-                                    this.seek_by_mouse_x(event.position.x, win_w, cx);
+                                    this.seek_by_mouse_x(event.position.x, win_w, true, cx);
                                 }
+                            }))
+                            .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                                let win_w = window.viewport_size().width;
+                                this.seek_by_mouse_x(event.position.x, win_w, false, cx);
                             }))
                             .child(
                                 div()
@@ -1627,7 +1655,7 @@ impl MainWindow {
     }
 
     /// 统一的时间轴鼠标点击与拖拽精确定位逻辑
-    pub(crate) fn seek_by_mouse_x(&mut self, mouse_x: Pixels, window_width: Pixels, cx: &mut Context<Self>) {
+    pub(crate) fn seek_by_mouse_x(&mut self, mouse_x: Pixels, window_width: Pixels, is_drag: bool, cx: &mut Context<Self>) {
         if self.state.total_duration <= 0.0 {
             return;
         }
@@ -1640,7 +1668,18 @@ impl MainWindow {
         let ratio = ((mouse_x - left_pad) / track_w).clamp(0.0, 1.0) as f64;
         let target_time = ratio * self.state.total_duration;
         self.state.seek_to(target_time);
-        self.trigger_extract_frame(cx);
+
+        if is_drag {
+            // 拖拽过程中节流：每 80ms 最多发起一次单帧抽取请求，保持绝对流畅
+            if self.last_drag_extract.elapsed().as_millis() >= 80 {
+                self.last_drag_extract = std::time::Instant::now();
+                self.trigger_extract_frame(cx);
+            }
+        } else {
+            // 单击或拖动松手：立刻发起抽取
+            self.last_drag_extract = std::time::Instant::now();
+            self.trigger_extract_frame(cx);
+        }
         cx.notify();
     }
 

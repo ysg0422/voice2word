@@ -7,6 +7,7 @@ pub mod theme;
 use gpui::prelude::*;
 use gpui::*;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -23,18 +24,31 @@ pub struct MainWindow {
     metrics_rx: watch::Receiver<crate::app::ResourceMetrics>,
     pub(crate) text_focus: FocusHandle,
     pub(crate) is_text_focused: bool,
+    pub(crate) is_extracting_frame: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) pending_extract_time: Arc<std::sync::Mutex<Option<f64>>>,
+    pub(crate) last_drag_extract: std::time::Instant,
 }
 
 impl MainWindow {
     pub fn new(state: AppState, cx: &mut Context<Self>) -> Self {
         let metrics_rx = crate::utils::SystemMonitor::spawn_background_monitor();
         let text_focus = cx.focus_handle();
-        Self {
+        let mut window = Self {
             state,
             metrics_rx,
             text_focus,
             is_text_focused: false,
+            is_extracting_frame: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_extract_time: Arc::new(std::sync::Mutex::new(None)),
+            last_drag_extract: std::time::Instant::now(),
+        };
+
+        // 若启动已载入历史视频工程，立即触发首帧提取
+        if window.state.selected_file.is_some() {
+            window.trigger_extract_frame(cx);
         }
+
+        window
     }
 
     /// 打开系统原生文件对话框选择音视频
@@ -254,36 +268,79 @@ impl MainWindow {
         }
     }
 
-    /// 异步根据当前播放时间抽取单帧画面用于监视器显示（带智能缓存预加载）
-    fn trigger_extract_frame(&mut self, cx: &mut Context<Self>) {
+    /// 异步根据当前播放时间抽取单帧画面（单飞队列：最多 1 个 FFmpeg 实例并发，合并多余拖动请求）
+    pub(crate) fn trigger_extract_frame(&mut self, cx: &mut Context<Self>) {
         let Some(video_path) = self.state.selected_file.clone() else { return; };
         if !video_path.exists() {
             return;
         }
-        let time = self.state.current_time;
+        let target_time = self.state.current_time;
+
+        // 记录最新期望的时间戳
+        {
+            let mut pending = self.pending_extract_time.lock().unwrap();
+            *pending = Some(target_time);
+        }
+
+        // 如果当前已有后台抽帧 worker 在运行，直接返回！运行中的 worker 抽完后会自动接取 pending_time
+        if self.is_extracting_frame.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ).is_err() {
+            return;
+        }
+
         let ffmpeg_path = crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
         let ffmpeg = std::sync::Arc::new(crate::engines::FFmpegEngine::new(ffmpeg_path));
         let cache = self.state.frame_cache.clone();
-
-        // 使用缓存系统获取帧（缓存命中时 <10ms，未命中时 200-500ms）
-        let video_clone = video_path.clone();
-        let ffmpeg_clone = ffmpeg.clone();
-        let cache_clone = cache.clone();
+        let is_extracting = self.is_extracting_frame.clone();
+        let pending_time = self.pending_extract_time.clone();
 
         cx.spawn(async move |this, cx| {
-            let frame_result = cx.background_executor().spawn(async move {
-                cache_clone.get_or_extract(&video_clone, time, &ffmpeg_clone)
-            })
-            .await;
+            loop {
+                // 取出当前最新的目标时间
+                let next_time = {
+                    let mut lock = pending_time.lock().unwrap();
+                    lock.take()
+                };
 
-            if let Ok(frame_path) = frame_result {
-                let _ = this.update(cx, |this, cx| {
-                    this.state.preview_frame_path = Some(frame_path);
-                    cx.notify();
-                });
+                let time = match next_time {
+                    Some(t) => t,
+                    None => {
+                        // 无待处理请求，释放锁并退出
+                        is_extracting.store(false, std::sync::atomic::Ordering::SeqCst);
+                        // 双重检查避免竞态退出
+                        let has_more = pending_time.lock().unwrap().is_some();
+                        if has_more && is_extracting.compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        ).is_ok() {
+                            continue;
+                        }
+                        break;
+                    }
+                };
+
+                let video_clone = video_path.clone();
+                let ffmpeg_clone = ffmpeg.clone();
+                let cache_clone = cache.clone();
+
+                let frame_result = cx.background_executor().spawn(async move {
+                    cache_clone.get_or_extract(&video_clone, time, &ffmpeg_clone)
+                }).await;
+
+                if let Ok(frame_path) = frame_result {
+                    let _ = this.update(cx, |this, cx| {
+                        this.state.preview_frame_path = Some(frame_path);
+                        cx.notify();
+                    });
+                }
             }
-        })
-        .detach();
+        }).detach();
     }
 
     /// 上一句字幕

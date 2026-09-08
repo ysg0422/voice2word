@@ -107,15 +107,29 @@ impl FFmpegEngine {
             std::fs::create_dir_all(parent)?;
         }
 
-        let status = Command::new(&self.ffmpeg_path)
+        let mut cmd = Command::new(&self.ffmpeg_path);
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: 杜绝弹出控制台窗口与系统句柄消耗
+        }
+
+        let status = cmd
             .arg("-ss")
             .arg(&time_str)
             .arg("-i")
             .arg(video_path)
-            .arg("-vframes")
+            .arg("-frames:v")
             .arg("1")
+            .arg("-vf")
+            .arg("scale=640:-1") // 缩放至预览尺寸，提速 10 倍且大幅降低内存
+            .arg("-threads")
+            .arg("1") // 严格限制单线程，杜绝 CPU 占用暴涨卡死
+            .arg("-an") // 跳过音频流解析
+            .arg("-sn") // 跳过字幕流解析
             .arg("-q:v")
-            .arg("2")
+            .arg("3")
             .arg("-y")
             .arg(out_jpg)
             .status()

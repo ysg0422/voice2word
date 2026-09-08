@@ -58,6 +58,13 @@ impl FrameCache {
         let sec_key = (time_sec * 2.0).round() as i64;
         let out_jpg = temp_dir.join(format!("{}_{}.jpg", stem, sec_key));
 
+        // 检查磁盘是否已存在抽取过的帧，存在则直接复用
+        if out_jpg.exists() {
+            let mut cache = self.cache.lock().unwrap();
+            cache.insert(key, out_jpg.clone());
+            return Ok(out_jpg);
+        }
+
         ffmpeg.extract_frame(video_path, time_sec, &out_jpg)?;
 
         // 限制缓存大小，FIFO 淘汰

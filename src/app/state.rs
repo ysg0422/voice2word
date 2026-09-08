@@ -90,7 +90,7 @@ impl AppState {
         let polish = config.pipeline.enable_polish;
         let threads = config.pipeline.whisper_threads.max(8);
 
-        Self {
+        let mut state = Self {
             config,
             db,
             pipeline,
@@ -113,7 +113,14 @@ impl AppState {
             timeline_zoom: 1.0,
             editing_text: String::new(),
             frame_cache: Arc::new(FrameCache::new(100)), // 缓存 100 帧（约占 5-10MB）
+        };
+
+        // 如果存在历史记录，启动时自动加载最近一次的工程，避免开屏黑屏或空数据
+        if let Some(recent) = state.recent_tasks.first().cloned() {
+            state.load_task(&recent);
         }
+
+        state
     }
 
     pub fn set_selected_file(&mut self, path: PathBuf) {
