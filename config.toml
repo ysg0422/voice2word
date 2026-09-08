@@ -1,0 +1,17 @@
+[paths]
+ffmpeg = "A:\\cppsoft\\ffmpeg-6.9\\bin\\ffmpeg.exe"
+whisper_cli = "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"
+whisper_model = "models/whisper/ggml-base.bin"
+vad_model = "models/whisper/ggml-silero-v6.2.0.bin"
+llama_cli = "A:\\cppsoft\\llama.cpp\\build\\bin\\Release\\llama-completion.exe"
+llm_model = "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+
+[pipeline]
+language = "zh"
+output_format = "srt"
+enable_polish = true
+enable_vad = true
+whisper_threads = 8
+whisper_processors = 1
+llm_threads = 8
+llm_ctx = 4096

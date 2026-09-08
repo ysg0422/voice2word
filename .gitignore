@@ -1,0 +1,47 @@
+﻿# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Heavyweight models and binaries
+models/
+tools/
+*.bin
+*.gguf
+*.onnx
+
+# Test videos and temporary media
+testVideo/
+test_vad.wav
+gpui_test/
+resources/
+*.tmp
+
+# Database & Runtime logs
+*.db
+*.db-journal
+*.sqlite
+logs/
+
+# Documents & Presentations
+*.pptx
+*.docx
+*.pdf
+*开发文档*
+*项目更新历程*
+
+# Legacy Python Prototype & scripts
+legacy_python/
+requirements.txt
+test_engines.py
+ffmpeg-path.txt
+watch.ps1
+
+# IDE & Editor
+.idea/
+.vscode/
+.claude/
+
+# Windows OS generated
+Thumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/

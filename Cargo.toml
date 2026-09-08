@@ -1,0 +1,36 @@
+[package]
+name = "voice2word"
+version = "0.1.0"
+edition = "2021"
+description = "Voice2Word - 音视频智能字幕生成器 (Rust + GPUI)"
+
+[lib]
+name = "voice2word"
+path = "src/lib.rs"
+
+[[bin]]
+name = "voice2word"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2.2"
+tokio = { version = "1.43", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+rusqlite = { version = "0.33", features = ["bundled"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+rfd = "0.15"
+chrono = "0.4"
+open = "5.3"
+sysinfo = "0.31"
+
+[profile.dev]
+opt-level = 0
+debug = 1
+
+# 仅对外部依赖库（GPUI、Tokio等）开启优化以保证运行流畅，本地业务代码开启 0 优化极速增量编译
+[profile.dev.package."*"]
+opt-level = 2
