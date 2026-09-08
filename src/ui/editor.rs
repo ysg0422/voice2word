@@ -44,14 +44,17 @@ impl MainWindow {
                     .child(
                         div()
                             .id("tab-btn-editor")
+                            .h(px(28.0))
                             .px_3p5()
-                            .py_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .rounded_md()
                             .cursor_pointer()
                             .bg(if active == WorkspaceTab::Editor {
                                 rgb(0x2c2c36)
                             } else {
-                                rgb(0x00000000)
+                                rgba(0x00000000)
                             })
                             .text_size(px(12.0))
                             .font_weight(if active == WorkspaceTab::Editor {
@@ -64,7 +67,13 @@ impl MainWindow {
                             } else {
                                 Theme::text_secondary()
                             })
-                            .hover(|s| s.text_color(Theme::text_primary()))
+                            .hover(move |s| {
+                                if active != WorkspaceTab::Editor {
+                                    s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
+                                } else {
+                                    s
+                                }
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.state.active_tab = WorkspaceTab::Editor;
                                 this.trigger_extract_frame(cx);
@@ -75,14 +84,17 @@ impl MainWindow {
                     .child(
                         div()
                             .id("tab-btn-generate")
+                            .h(px(28.0))
                             .px_3p5()
-                            .py_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .rounded_md()
                             .cursor_pointer()
                             .bg(if active == WorkspaceTab::Generate {
                                 rgb(0x2c2c36)
                             } else {
-                                rgb(0x00000000)
+                                rgba(0x00000000)
                             })
                             .text_size(px(12.0))
                             .font_weight(if active == WorkspaceTab::Generate {
@@ -95,7 +107,13 @@ impl MainWindow {
                             } else {
                                 Theme::text_secondary()
                             })
-                            .hover(|s| s.text_color(Theme::text_primary()))
+                            .hover(move |s| {
+                                if active != WorkspaceTab::Generate {
+                                    s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
+                                } else {
+                                    s
+                                }
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.state.active_tab = WorkspaceTab::Generate;
                                 cx.notify();
@@ -105,14 +123,17 @@ impl MainWindow {
                     .child(
                         div()
                             .id("tab-btn-library")
+                            .h(px(28.0))
                             .px_3p5()
-                            .py_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .rounded_md()
                             .cursor_pointer()
                             .bg(if active == WorkspaceTab::Library {
                                 rgb(0x2c2c36)
                             } else {
-                                rgb(0x00000000)
+                                rgba(0x00000000)
                             })
                             .text_size(px(12.0))
                             .font_weight(if active == WorkspaceTab::Library {
@@ -125,7 +146,13 @@ impl MainWindow {
                             } else {
                                 Theme::text_secondary()
                             })
-                            .hover(|s| s.text_color(Theme::text_primary()))
+                            .hover(move |s| {
+                                if active != WorkspaceTab::Library {
+                                    s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
+                                } else {
+                                    s
+                                }
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.state.active_tab = WorkspaceTab::Library;
                                 this.state.refresh_recent_tasks();
@@ -961,14 +988,16 @@ impl MainWindow {
                                             div()
                                                 .id("btn-save-text")
                                                 .flex_1()
-                                                .py_1p5()
+                                                .h(px(30.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
                                                 .rounded_full()
                                                 .bg(Theme::accent_mint())
                                                 .cursor_pointer()
                                                 .text_size(px(12.0))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(rgb(0x09090b))
-                                                .text_align(TextAlign::Center)
                                                 .hover(|s| s.opacity(0.9))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.state.save_selected_text();
@@ -980,7 +1009,10 @@ impl MainWindow {
                                             div()
                                                 .id("btn-split-seg")
                                                 .px_3p5()
-                                                .py_1p5()
+                                                .h(px(30.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
                                                 .rounded_full()
                                                 .bg(Theme::bg_sidebar())
                                                 .border_1()
@@ -1000,7 +1032,10 @@ impl MainWindow {
                                             div()
                                                 .id("btn-merge-seg")
                                                 .px_3p5()
-                                                .py_1p5()
+                                                .h(px(30.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
                                                 .rounded_full()
                                                 .bg(Theme::bg_sidebar())
                                                 .border_1()
@@ -1020,7 +1055,10 @@ impl MainWindow {
                                             div()
                                                 .id("btn-del-seg")
                                                 .px_3()
-                                                .py_1p5()
+                                                .h(px(30.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
                                                 .rounded_full()
                                                 .bg(rgba(0xf43f5e15))
                                                 .border_1()
@@ -1154,7 +1192,7 @@ impl MainWindow {
                                             } else if is_playing_here {
                                                 rgba(0x10b98118)
                                             } else {
-                                                rgb(0x00000000)
+                                                rgba(0x00000000)
                                             })
                                             .hover(|s| s.bg(Theme::bg_hover()))
                                             .on_click(cx.listener(move |this, _, _, cx| {

@@ -1029,10 +1029,13 @@ impl MainWindow {
                             )
                             .child(
                                 div()
-                                    .bg(rgb(0x141418))
-                                    .p(px(2.0))
+                                    .bg(rgb(0x131317))
+                                    .p(px(2.5))
                                     .rounded_lg()
+                                    .border_1()
+                                    .border_color(rgb(0x22222a))
                                     .flex()
+                                    .items_center()
                                     .gap(px(2.0))
                                     .child(self.render_option_pill("zh", "中文", cx))
                                     .child(self.render_option_pill("en", "英文", cx))
@@ -1055,10 +1058,13 @@ impl MainWindow {
                             )
                             .child(
                                 div()
-                                    .bg(rgb(0x141418))
-                                    .p(px(2.0))
+                                    .bg(rgb(0x131317))
+                                    .p(px(2.5))
                                     .rounded_lg()
+                                    .border_1()
+                                    .border_color(rgb(0x22222a))
                                     .flex()
+                                    .items_center()
                                     .gap(px(2.0))
                                     .child(self.render_format_pill("srt", "SRT", cx))
                                     .child(self.render_format_pill("ass", "ASS", cx))
@@ -1080,10 +1086,13 @@ impl MainWindow {
                             )
                             .child(
                                 div()
-                                    .bg(rgb(0x141418))
-                                    .p(px(2.0))
+                                    .bg(rgb(0x131317))
+                                    .p(px(2.5))
                                     .rounded_lg()
+                                    .border_1()
+                                    .border_color(rgb(0x22222a))
                                     .flex()
+                                    .items_center()
                                     .gap(px(2.0))
                                     .child(self.render_thread_pill(4, "4核", cx))
                                     .child(self.render_thread_pill(8, "8核", cx))
@@ -1337,15 +1346,17 @@ impl MainWindow {
         div()
             .id(val)
             .flex_1()
-            .py_1()
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .justify_center()
             .rounded_md()
             .text_size(px(11.0))
-            .text_align(TextAlign::Center)
             .cursor_pointer()
             .bg(if is_selected {
                 rgb(0x2c2c36)
             } else {
-                rgb(0x00000000)
+                rgba(0x00000000)
             })
             .font_weight(if is_selected {
                 FontWeight::SEMIBOLD
@@ -1357,7 +1368,13 @@ impl MainWindow {
             } else {
                 Theme::text_secondary()
             })
-            .hover(|s| s.text_color(Theme::text_primary()))
+            .hover(move |s| {
+                if !is_selected {
+                    s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
+                } else {
+                    s
+                }
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.state.language = val.to_string();
                 cx.notify();
@@ -1375,15 +1392,17 @@ impl MainWindow {
         div()
             .id(val)
             .flex_1()
-            .py_1()
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .justify_center()
             .rounded_md()
             .text_size(px(11.0))
-            .text_align(TextAlign::Center)
             .cursor_pointer()
             .bg(if is_selected {
                 rgb(0x2c2c36)
             } else {
-                rgb(0x00000000)
+                rgba(0x00000000)
             })
             .font_weight(if is_selected {
                 FontWeight::SEMIBOLD
@@ -1395,7 +1414,13 @@ impl MainWindow {
             } else {
                 Theme::text_secondary()
             })
-            .hover(|s| s.text_color(Theme::text_primary()))
+            .hover(move |s| {
+                if !is_selected {
+                    s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
+                } else {
+                    s
+                }
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.state.output_format = val.to_string();
                 cx.notify();
@@ -1413,15 +1438,17 @@ impl MainWindow {
         div()
             .id(label)
             .flex_1()
-            .py_1()
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .justify_center()
             .rounded_md()
             .text_size(px(11.0))
-            .text_align(TextAlign::Center)
             .cursor_pointer()
             .bg(if is_selected {
                 rgb(0x2c2c36)
             } else {
-                rgb(0x00000000)
+                rgba(0x00000000)
             })
             .font_weight(if is_selected {
                 FontWeight::SEMIBOLD
@@ -1433,7 +1460,13 @@ impl MainWindow {
             } else {
                 Theme::text_secondary()
             })
-            .hover(|s| s.text_color(Theme::text_primary()))
+            .hover(move |s| {
+                if !is_selected {
+                    s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
+                } else {
+                    s
+                }
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.state.whisper_threads = val;
                 cx.notify();
