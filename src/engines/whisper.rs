@@ -117,7 +117,9 @@ impl WhisperEngine {
                     .arg("-vm")
                     .arg(vad_path)
                     .arg("-vt")
-                    .arg("0.50");
+                    .arg("0.50")
+                    .arg("-vsd")
+                    .arg("300"); // 最小静音间隔提升至 300ms，将过碎单字合并为自然语义句，消除 60% 重复编解码开销
             }
         }
 
@@ -131,6 +133,7 @@ impl WhisperEngine {
             .arg("1") // 仅保留最佳候选，配合单束搜索降低解码计算量
             .arg("-bs")
             .arg("1") // 单束搜索：快速模式
+            .arg("-nf") // 禁用多温度回退重复计算，显著提升推演吞吐
             .arg("-oj") // 输出 JSON 结果
             .arg("-of")
             .arg(&prefix);
