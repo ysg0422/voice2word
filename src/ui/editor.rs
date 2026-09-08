@@ -70,14 +70,7 @@ impl MainWindow {
                                 this.trigger_extract_frame(cx);
                                 cx.notify();
                             }))
-                            .child(format!(
-                                "🎬 剪辑校对 (主工作台){}",
-                                if seg_count > 0 {
-                                    format!(" ({}句)", seg_count)
-                                } else {
-                                    "".to_string()
-                                }
-                            )),
+                            .child("🎬 剪辑校对"),
                     )
                     .child(
                         div()
@@ -150,14 +143,7 @@ impl MainWindow {
                                 this.state.refresh_recent_tasks();
                                 cx.notify();
                             }))
-                            .child(format!(
-                                "📚 历史视频库{}",
-                                if !self.state.recent_tasks.is_empty() {
-                                    format!(" ({})", self.state.recent_tasks.len())
-                                } else {
-                                    "".to_string()
-                                }
-                            )),
+                            .child("📚 视频库"),
                     ),
             )
             .child(
@@ -258,7 +244,7 @@ impl MainWindow {
                             .text_size(px(11.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(Theme::text_muted())
-                            .child("PREVIEW MONITOR · 视频画面校对监视器"),
+                            .child("视频预览"),
                     )
                     .child(
                         div()
@@ -276,7 +262,7 @@ impl MainWindow {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.play_video(cx);
                             }))
-                            .child("▶ 原生全画质播放"),
+                            .child("▶ 系统播放"),
                     ),
             )
             // 16:9 监视器视口屏幕
@@ -544,16 +530,16 @@ impl MainWindow {
                             .text_size(px(11.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(Theme::text_muted())
-                            .child("INSPECTOR · 字幕属性与错字编辑"),
+                            .child("字幕编辑"),
                     )
                     .child(
                         div()
                             .text_size(px(11.0))
                             .text_color(Theme::text_muted())
                             .child(if let Some(idx) = sel_idx {
-                                format!("选中第 {} 句 / 共 {} 句", idx, self.state.segments.len())
+                                format!("{} / {} 句", idx, self.state.segments.len())
                             } else {
-                                format!("共 {} 句字幕", self.state.segments.len())
+                                format!("{} 句", self.state.segments.len())
                             }),
                     ),
             )
@@ -582,7 +568,7 @@ impl MainWindow {
                                     div()
                                         .text_size(px(11.0))
                                         .text_color(Theme::text_muted())
-                                        .child("时间戳微调 (对齐音画)"),
+                                        .child("时间微调"),
                                 )
                                 // 开始时间微调
                                 .child(
@@ -793,13 +779,7 @@ impl MainWindow {
                                                     .text_size(px(11.0))
                                                     .font_weight(FontWeight::BOLD)
                                                     .text_color(Theme::text_muted())
-                                                    .child("字幕文本修改"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.0))
-                                                    .text_color(Theme::text_muted())
-                                                    .child("（点击输入框直接打字，或点击弹窗编辑）"),
+                                                    .child("字幕文本"),
                                             ),
                                     )
                                     .child(
@@ -824,7 +804,7 @@ impl MainWindow {
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             this.prompt_edit_text(cx);
                                                         }))
-                                                        .child("✏️ 弹窗输入 (支持中文)"),
+                                                        .child("✏️ 中文输入"),
                                                 )
                                                 .child(
                                                     div()
@@ -848,7 +828,7 @@ impl MainWindow {
                                                                 }
                                                             }
                                                         }))
-                                                        .child("📋 粘贴"),
+                                                        .child("粘贴"),
                                                 ),
                                         ),
                                 )
@@ -913,7 +893,7 @@ impl MainWindow {
                                             if is_focused {
                                                 "▌".to_string()
                                             } else {
-                                                "（点击此处直接打字，或点击右上角弹窗输入）".to_string()
+                                                "点击直接输入字幕...".to_string()
                                             }
                                         } else {
                                             if is_focused {
@@ -1080,7 +1060,7 @@ impl MainWindow {
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(Theme::text_muted())
                                             .child(format!(
-                                                "SUBTITLE LIST · 速查 (第 {}-{} 句 / 共 {} 句)",
+                                                "字幕列表 ({}-{} / {})",
                                                 start_idx, end_idx, total_segs
                                             )),
                                     )
@@ -1272,7 +1252,7 @@ impl MainWindow {
                                     .text_size(px(11.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(Theme::text_muted())
-                                    .child("TIMELINE · 多轨时间轴"),
+                                    .child("时间轴"),
                             )
                             .child(
                                 div()
@@ -1280,7 +1260,7 @@ impl MainWindow {
                                     .font_family("Consolas")
                                     .text_color(Theme::accent_mint())
                                     .font_weight(FontWeight::BOLD)
-                                    .child(format!("指针位置: {}", seconds_to_srt_time(cur_time))),
+                                    .child(seconds_to_srt_time(cur_time)),
                             ),
                     )
                     // 快捷跳转预设点
@@ -1586,48 +1566,6 @@ impl MainWindow {
                                             .flex_1()
                                             .bg(Theme::accent_mint()),
                                     ),
-                            ),
-                    ),
-            )
-            // 底部细微步进交互操作条
-            .child(
-                div()
-                    .h(px(28.0))
-                    .px_4()
-                    .bg(rgb(0x111114))
-                    .border_t_1()
-                    .border_color(Theme::border())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(Theme::text_muted())
-                            .child("💡 提示：点击任意字幕色块或预设时间快速跳转，右侧属性区支持直接修改错别字与微调对齐"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("zoom-fit-btn")
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded(px(3.0))
-                                    .bg(Theme::bg_sidebar())
-                                    .cursor_pointer()
-                                    .text_size(px(10.0))
-                                    .text_color(Theme::text_secondary())
-                                    .hover(|s| s.bg(Theme::bg_hover()))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.state.seek_to(0.0);
-                                        this.trigger_extract_frame(cx);
-                                        cx.notify();
-                                    }))
-                                    .child("⏪ 回到开头"),
                             ),
                     ),
             )
