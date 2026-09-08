@@ -6,7 +6,6 @@ pub mod theme;
 
 use gpui::prelude::*;
 use gpui::*;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -1113,77 +1112,6 @@ impl MainWindow {
             )
             // 硬件与本地模型资源监控对比卡片
             .child(self.render_hardware_monitor_card(cx))
-            // 最近历史
-            .child(
-                        div()
-                            .flex_1()
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(Theme::text_muted())
-                            .child("RECENT TASKS"),
-                    )
-                    .child(
-                        div()
-                            .id("task-history-scroll")
-                            .flex_1()
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .children(self.state.recent_tasks.iter().enumerate().map(|(idx, task)| {
-                                let task_clone = task.clone();
-                                div()
-                                    .id(("task-item", idx))
-                                    .p_2()
-                                    .rounded_md()
-                                    .bg(Theme::bg_card())
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(Theme::bg_hover()))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.state.selected_file = Some(PathBuf::from(&task_clone.file_path));
-                                        this.state.status = ProcessStatus::Completed;
-                                        this.state.segments = task_clone.segments.clone();
-                                        let duration = if task_clone.duration > 0.0 {
-                                            task_clone.duration
-                                        } else {
-                                            task_clone.segments.last().map(|s| s.end).unwrap_or(0.0)
-                                        };
-                                        this.state.total_duration = duration;
-                                        if let Some(first) = this.state.segments.first() {
-                                            this.state.select_segment(first.index);
-                                        } else {
-                                            this.state.current_time = 0.0;
-                                            this.state.selected_segment_index = None;
-                                            this.state.editing_text.clear();
-                                        }
-                                        this.state.active_tab = WorkspaceTab::Editor;
-                                        this.trigger_extract_frame(cx);
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        div()
-                                            .text_size(px(12.0))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(task.file_name.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.0))
-                                            .text_color(Theme::text_muted())
-                                            .child(format!(
-                                                "{} · {} 段",
-                                                format_duration_short(task.duration),
-                                                task.segments.len()
-                                            )),
-                                    )
-                            })),
-                    ),
-            )
     }
 
     /// 渲染硬件与模型资源监控对比卡片 (CPU / 内存实时对比)
