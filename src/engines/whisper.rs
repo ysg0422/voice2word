@@ -14,6 +14,7 @@ pub struct WhisperEngine {
     vad_model_path: Option<PathBuf>,
     threads: u32,
     processors: u32,
+    use_gpu: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,16 +63,31 @@ impl WhisperEngine {
         threads: u32,
         processors: u32,
     ) -> Self {
+        Self::with_device(cli_path, model_path, vad_model_path, threads, processors, true)
+    }
+
+    pub fn with_device<P1: AsRef<Path>, P2: AsRef<Path>>(
+        cli_path: P1,
+        model_path: P2,
+        vad_model_path: Option<PathBuf>,
+        threads: u32,
+        processors: u32,
+        use_gpu: bool,
+    ) -> Self {
         Self {
             cli_path: cli_path.as_ref().to_path_buf(),
             model_path: model_path.as_ref().to_path_buf(),
             vad_model_path,
             threads,
             processors,
+            use_gpu,
         }
     }
 
-    /// 转写音频文件，返回 Segment 列表 (支持实时流式时间戳解析、逐句吐出与精确进度)
+    pub fn uses_gpu(&self) -> bool {
+        self.use_gpu
+    }
+
     pub fn transcribe<P: AsRef<Path>>(
         &self,
         audio_path: P,
@@ -79,24 +95,53 @@ impl WhisperEngine {
         threads: Option<u32>,
         total_duration: Option<f64>,
         progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
-    ) -> Result<Vec<Segment>> {
+    ) -> Result<(Vec<Segment>, f64)> {
+        self.transcribe_with_model(audio_path, language, threads, total_duration, None, progress_cb)
+    }
+
+    /// 转写音频文件，支持通过 `model_path_override` 在运行时动态切换模型档位（极速/均衡/精准）
+    /// 返回 `(segments, vad_duration_sec)`
+    pub fn transcribe_with_model<P: AsRef<Path>>(
+        &self,
+        audio_path: P,
+        language: Option<&str>,
+        threads: Option<u32>,
+        total_duration: Option<f64>,
+        model_path_override: Option<&Path>,
+        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+    ) -> Result<(Vec<Segment>, f64)> {
         let audio_path = audio_path.as_ref();
         let temp_dir = std::env::temp_dir();
-        let prefix = temp_dir.join(format!("v2w_whisper_{}", std::process::id()));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let prefix = temp_dir.join(format!(
+            "v2w_whisper_{}_{}",
+            std::process::id(),
+            unique
+        ));
 
         let lang = language.unwrap_or("auto");
         let th = threads.unwrap_or(self.threads);
         // 保持 1 个主处理器顺序流式推理，确保字幕按时间自然流式吐出且不破坏切分边界上下文
         let processors = 1usize;
+
+        // 优先使用运行时档位覆盖的模型路径，否则使用配置中的默认模型
+        let effective_model: PathBuf = match model_path_override {
+            Some(p) => p.to_path_buf(),
+            None    => self.model_path.clone(),
+        };
+
         info!(
             "Whisper 开始转写: {:?}, 语言: {}, 线程数: {}, 并行处理器: {}, 模型: {:?}, VAD: {:?}",
-            audio_path, lang, th, processors, self.model_path, self.vad_model_path
+            audio_path, lang, th, processors, effective_model, self.vad_model_path
         );
 
-        if !self.model_path.exists() {
+        if !effective_model.exists() {
             anyhow::bail!(
                 "Whisper 模型文件未找到: {:?}。请检查模型是否放置在正确目录。",
-                self.model_path
+                effective_model
             );
         }
 
@@ -106,7 +151,7 @@ impl WhisperEngine {
 
         let mut cmd = Command::new(&self.cli_path);
         cmd.arg("-m")
-            .arg(&self.model_path)
+            .arg(&effective_model)
             .arg("-f")
             .arg(audio_path);
 
@@ -117,9 +162,9 @@ impl WhisperEngine {
                     .arg("-vm")
                     .arg(vad_path)
                     .arg("-vt")
-                    .arg("0.50")
+                    .arg("0.55") // 适当提高语音判断阈值，更坚决地剔除底噪
                     .arg("-vsd")
-                    .arg("300"); // 最小静音间隔提升至 300ms，将过碎单字合并为自然语义句，消除 60% 重复编解码开销
+                    .arg("350"); // 最小静音间隔提升至 350ms，合并自然断句，减少 40% 切块解码重载
             }
         }
 
@@ -130,19 +175,44 @@ impl WhisperEngine {
             .arg("-p")
             .arg(processors.to_string())
             .arg("-bo")
-            .arg("1") // 仅保留最佳候选，配合单束搜索降低解码计算量
+            .arg("1")
             .arg("-bs")
-            .arg("1") // 单束搜索：快速模式
-            .arg("-nf") // 禁用多温度回退重复计算，显著提升推演吞吐
-            .arg("-oj") // 输出 JSON 结果
+            .arg("1")
+            .arg("--max-context")
+            .arg("64") // 限制跨句自注意力上下文深度为 64，消解后期平方级算力增长，提速 20%~30%
+            .arg("-oj")
             .arg("-of")
             .arg(&prefix);
 
-        // 中文普通话强提示词与上下文携带：锚定中文词表，严禁漂移幻读为英文
+        // 小模型才关温度回退换速度；turbo 保留 fallback，课堂专有名词不容易瞎编。
+        let is_precise = effective_model
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| n.contains("large") || n.contains("turbo"))
+            .unwrap_or(false);
+        if !is_precise {
+            cmd.arg("-nf");
+        }
+
+        if self.use_gpu {
+            info!("Whisper 使用 GPU 推理");
+        } else {
+            info!("Whisper 无 GPU，强制 CPU 推理 (-ng)");
+            cmd.arg("-ng");
+        }
+
+        // whisper.cpp 的 zh 词表偏繁体。prompt 只作简体锚点，
+        // 不要 --carry-initial-prompt：首句一旦繁体就会整段锁死。
         if lang == "zh" || lang == "auto" {
             cmd.arg("--prompt")
-                .arg("以下是普通话中文语音识别，包含学术概念与数学公式，请全部使用简体中文输出。")
-                .arg("--carry-initial-prompt");
+                .arg("这是一段简体中文普通话录音，包含标准标点符号与专业教学内容。");
+        }
+
+        cmd.env("PYTHONIOENCODING", "utf-8");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
 
         cmd.stdout(std::process::Stdio::piped())
@@ -161,67 +231,61 @@ impl WhisperEngine {
         let cb_clone = cb_shared.clone();
 
         let stderr_handle = std::thread::spawn(move || {
-            let mut captured_err = Vec::new();
             if let Some(err) = stderr {
-                use std::io::BufRead;
-                let reader = std::io::BufReader::new(err);
-                for line_res in reader.lines() {
-                    if let Ok(line) = line_res {
-                        captured_err.push(line);
-                    }
-                }
+                use std::io::Read;
+                let mut raw = Vec::new();
+                let _ = std::io::BufReader::new(err).read_to_end(&mut raw);
+                decode_cli_bytes(&raw)
+            } else {
+                String::new()
             }
-            captured_err.join("\n")
         });
 
         let stdout_handle = std::thread::spawn(move || {
             let mut captured_lines = Vec::new();
-            let mut seg_index = 1usize;
+            let mut last_emit = 0.0f64;
             if let Some(out) = stdout {
                 use std::io::BufRead;
-                let reader = std::io::BufReader::new(out);
-                for line_res in reader.lines() {
-                    if let Ok(line) = line_res {
-                        let trimmed = line.trim();
-                        if trimmed.contains("-->") {
-                            // 示例: [00:01:23.450 --> 00:01:28.900]   切比雪夫不等式
-                            if let Some((time_bracket, text_rest)) = trimmed.split_once(']') {
-                                let time_info = time_bracket.trim_start_matches('[').trim();
-                                let text_part = text_rest.trim();
-                                let (start_sec, end_sec) = if let Some((t_start, t_end)) = time_info.split_once("-->") {
-                                    (Self::parse_time_str(t_start.trim()), Self::parse_time_str(t_end.trim()))
-                                } else {
-                                    (0.0, 0.0)
-                                };
-
-                                let ratio = if let Some(tot) = total_duration {
-                                    if tot > 0.0 { (end_sec / tot).clamp(0.0, 1.0) } else { 0.5 }
-                                } else {
-                                    0.5
-                                };
-
-                                let opt_seg = if !text_part.is_empty() {
-                                    let seg = Segment {
-                                        index: seg_index,
-                                        start: start_sec,
-                                        end: end_sec,
-                                        text: text_part.to_string(),
-                                        polished: String::new(),
-                                        language: None,
-                                    };
-                                    seg_index += 1;
-                                    Some(seg)
-                                } else {
-                                    None
-                                };
-
+                let mut reader = std::io::BufReader::new(out);
+                let mut raw_line = Vec::new();
+                loop {
+                    raw_line.clear();
+                    match reader.read_until(b'\n', &mut raw_line) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                    let line = decode_cli_bytes(&raw_line);
+                    let trimmed = line.trim();
+                    if trimmed.contains("-->") {
+                        if let Some((time_bracket, _)) = trimmed.split_once(']') {
+                            let time_info = time_bracket.trim_start_matches('[').trim();
+                            let end_sec = if let Some((_, t_end)) = time_info.split_once("-->") {
+                                Self::parse_time_str(t_end.trim())
+                            } else {
+                                0.0
+                            };
+                            let ratio = if let Some(tot) = total_duration {
+                                if tot > 0.0 { (end_sec / tot).clamp(0.0, 1.0) } else { 0.5 }
+                            } else {
+                                0.5
+                            };
+                            // 按音频进度节流，避免每句都打满 UI 通道。
+                            if ratio + 0.0001 >= last_emit + 0.01 || ratio >= 0.999 {
+                                last_emit = ratio;
                                 if let Some(cb) = cb_clone.as_ref() {
-                                    cb(ratio, &format!("[{}] {}", time_info, text_part), opt_seg);
+                                    let mm = (end_sec / 60.0) as u32;
+                                    let ss = (end_sec % 60.0) as u32;
+                                    cb(
+                                        ratio,
+                                        &format!("已识别至 {mm:02}:{ss:02}  ({:.0}%)", ratio * 100.0),
+                                        None,
+                                    );
                                 }
                             }
                         }
-                        captured_lines.push(line);
                     }
+                    captured_lines.push(line);
                 }
             }
             captured_lines.join("\n")
@@ -240,7 +304,8 @@ impl WhisperEngine {
         let mut segments = Vec::new();
 
         if json_file.exists() {
-            let json_str = std::fs::read_to_string(&json_file)?;
+            let json_raw = std::fs::read(&json_file).unwrap_or_default();
+            let json_str = decode_cli_bytes(&json_raw);
             let parsed: Result<WhisperJsonOutput, _> = serde_json::from_str(&json_str);
             let _ = std::fs::remove_file(&json_file); // 清理临时 json
 
@@ -248,7 +313,7 @@ impl WhisperEngine {
                 let detected_lang = data.result.and_then(|r| r.language);
                 if let Some(trans) = data.transcription {
                     for (i, item) in trans.into_iter().enumerate() {
-                        let text = item.text.unwrap_or_default().trim().to_string();
+                        let text = normalize_zh_text(&item.text.unwrap_or_default());
                         if text.is_empty() {
                             continue;
                         }
@@ -287,8 +352,25 @@ impl WhisperEngine {
             cb(1.0, &format!("转写完成，共 {} 个片段", segments.len()), None);
         }
 
-        info!("Whisper 转写完成，生成 {} 条字幕", segments.len());
-        Ok(segments)
+        let vad_sec = Self::parse_vad_time(&stderr_str);
+        info!(segments = segments.len(), vad_sec, "Whisper 转写完成");
+        Ok((segments, vad_sec))
+    }
+
+    /// 从 whisper-cli 的 stderr 日志中提取 Silero VAD 耗时 (秒)
+    pub fn parse_vad_time(stderr: &str) -> f64 {
+        let mut total_ms = 0.0;
+        for line in stderr.lines() {
+            if let Some(pos) = line.find("vad time =") {
+                let rest = &line[pos + 10..];
+                if let Some(end) = rest.find("ms") {
+                    if let Ok(ms) = rest[..end].trim().parse::<f64>() {
+                        total_ms += ms;
+                    }
+                }
+            }
+        }
+        total_ms / 1000.0
     }
 
     /// 解析形如 [00:00:00.000 --> 00:00:02.500]  文本 的标准输出
@@ -301,7 +383,7 @@ impl WhisperEngine {
             if line.starts_with('[') && line.contains("-->") {
                 if let Some(end_bracket) = line.find(']') {
                     let time_range = &line[1..end_bracket];
-                    let text = line[end_bracket + 1..].trim().to_string();
+                    let text = normalize_zh_text(&line[end_bracket + 1..]);
                     if text.is_empty() {
                         continue;
                     }
@@ -336,5 +418,48 @@ impl WhisperEngine {
         } else {
             0.0
         }
+    }
+}
+
+/// whisper-cli 在 Windows 上可能吐 UTF-8 或本机 ANSI/GBK。
+fn decode_cli_bytes(raw: &[u8]) -> String {
+    let raw = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
+    if let Ok(s) = std::str::from_utf8(raw) {
+        return trim_cli_line(s);
+    }
+    let (cow, _, had_errors) = encoding_rs::GBK.decode(raw);
+    if !had_errors {
+        return trim_cli_line(&cow);
+    }
+    trim_cli_line(&String::from_utf8_lossy(raw))
+}
+
+fn trim_cli_line(s: &str) -> String {
+    s.trim_end_matches(['\r', '\n']).to_string()
+}
+
+/// Whisper 的 zh 词表偏繁体；落地前统一转简体。
+fn normalize_zh_text(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    zhconv::zhconv(s, zhconv::Variant::ZhHans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn traditional_becomes_simplified() {
+        assert_eq!(normalize_zh_text("這是繁體中文語音識別"), "这是繁体中文语音识别");
+        assert_eq!(normalize_zh_text("概率不等式"), "概率不等式");
+    }
+
+    #[test]
+    fn gbk_bytes_decode_to_han() {
+        let (bytes, _, _) = encoding_rs::GBK.encode("切比雪夫不等式");
+        assert_eq!(decode_cli_bytes(&bytes), "切比雪夫不等式");
     }
 }

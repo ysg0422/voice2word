@@ -17,6 +17,8 @@ pub struct PathsConfig {
     pub whisper_model: String,
     #[serde(default)]
     pub vad_model: Option<String>,
+    #[serde(default = "default_punc_model")]
+    pub punc_model: Option<String>,
     pub llama_cli: String,
     pub llm_model: String,
 }
@@ -25,11 +27,22 @@ fn default_true() -> bool {
     true
 }
 
+fn default_punc_model() -> Option<String> {
+    Some("models/punc/model.int8.onnx".to_string())
+}
+
+fn default_polish_mode() -> String {
+    "punc".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
     pub language: String,
     pub output_format: String,
     pub enable_polish: bool,
+    /// 润色模式："punc" (CT-Punc 极速标点, 默认) | "qwen" (大模型润色) | "none" (关闭)
+    #[serde(default = "default_polish_mode")]
+    pub polish_mode: String,
     #[serde(default = "default_true")]
     pub enable_vad: bool,
     pub whisper_threads: u32,
@@ -40,6 +53,7 @@ pub struct PipelineConfig {
     pub llm_ctx: u32,
 }
 
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -48,6 +62,7 @@ impl Default for AppConfig {
                 whisper_cli: "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe".to_string(),
                 whisper_model: "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string(),
                 vad_model: Some("models/whisper/ggml-silero-v6.2.0.bin".to_string()),
+                punc_model: Some("models/punc/model.int8.onnx".to_string()),
                 llama_cli: "A:\\cppsoft\\llama.cpp\\build\\bin\\Release\\llama-completion.exe".to_string(),
                 llm_model: "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string(),
             },
@@ -55,7 +70,8 @@ impl Default for AppConfig {
                 language: "zh".to_string(),
                 output_format: "srt".to_string(),
                 enable_polish: true,
-                enable_vad: true,
+                polish_mode: "punc".to_string(),
+                enable_vad: false,
                 whisper_threads: 8,
                 whisper_processors: 1,
                 llm_threads: 8,

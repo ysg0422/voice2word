@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::engines::{FFmpegEngine, LLMEngine, WhisperEngine};
+use crate::engines::{transcribe_chunked, FFmpegEngine, LLMEngine, PunctuationEngine, WhisperEngine};
 use crate::subtitle::{Segment, SubtitleWriter};
 
 #[derive(Debug, Clone)]
@@ -16,7 +16,7 @@ pub enum PipelineEvent {
     StageChanged(String),
     Progress { stage: String, progress: f64, detail: String },
     SegmentStream(Segment),
-    Finished(Vec<Segment>),
+    Finished(Vec<Segment>, crate::core::PipelinePerformanceMetrics),
     Error(String),
 }
 
@@ -24,6 +24,7 @@ pub struct TaskPipeline {
     ffmpeg: Arc<FFmpegEngine>,
     whisper: Arc<WhisperEngine>,
     llm: Arc<LLMEngine>,
+    punc: Option<Arc<PunctuationEngine>>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -32,11 +33,13 @@ impl TaskPipeline {
         ffmpeg: Arc<FFmpegEngine>,
         whisper: Arc<WhisperEngine>,
         llm: Arc<LLMEngine>,
+        punc: Option<Arc<PunctuationEngine>>,
     ) -> Self {
         Self {
             ffmpeg,
             whisper,
             llm,
+            punc,
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -46,10 +49,10 @@ impl TaskPipeline {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.cancelled.load(Ordering::Relaxed)
     }
 
-    /// 执行完整任务管线
+    /// 运行完整流水线：提取音频 -> Whisper 转写 -> 标点/LLM 润色 -> 写入字幕
     pub async fn run(
         &self,
         input_file: PathBuf,
@@ -57,10 +60,13 @@ impl TaskPipeline {
         language: Option<String>,
         output_format: String,
         enable_polish: bool,
+        polish_mode: Option<String>,
         threads: Option<u32>,
+        model_override: Option<PathBuf>, // 可选：覆盖 whisper 模型路径（供 UI 档位切换传入）
         tx: UnboundedSender<PipelineEvent>,
     ) -> Result<Vec<Segment>> {
-        self.cancelled.store(false, Ordering::SeqCst);
+
+        self.cancelled.store(false, Ordering::Relaxed);
         let pipeline_started = Instant::now();
 
         let out_path = output_file.unwrap_or_else(|| {
@@ -90,6 +96,7 @@ impl TaskPipeline {
         let extraction_started = Instant::now();
         let wav_path = tokio::task::spawn_blocking(move || ffmpeg.extract_audio(&in_file, None))
             .await??;
+        let ffmpeg_audio_sec = extraction_started.elapsed().as_secs_f64();
         info!(elapsed = ?extraction_started.elapsed(), "FFmpeg 音频提取完成");
 
         let _ = tx.send(PipelineEvent::Progress {
@@ -121,86 +128,205 @@ impl TaskPipeline {
         .unwrap_or(None);
 
         let whisper = self.whisper.clone();
+        let ffmpeg_chunks = self.ffmpeg.clone();
         let wav_clone = wav_path.clone();
         let lang_clone = language.clone();
         let tx_whisper = tx.clone();
+        // 关闭润色时，识别阶段占满进度条，避免卡在旧的 60%「等待润色」区间。
+        let whisper_span = if enable_polish { 0.45 } else { 0.80 };
+        let use_gpu = whisper.uses_gpu();
+        let duration_for_chunks = total_dur.unwrap_or(0.0);
 
         let transcription_started = Instant::now();
-        let mut segments = tokio::task::spawn_blocking(move || {
-            whisper.transcribe(
+        let (mut segments, vad_sec) = tokio::task::spawn_blocking(move || {
+            transcribe_chunked(
+                ffmpeg_chunks.as_ref(),
+                whisper.as_ref(),
                 &wav_clone,
+                duration_for_chunks,
                 lang_clone.as_deref(),
                 threads,
-                total_dur,
-                Some(Box::new(move |p, info, opt_seg| {
+                model_override.as_deref(),
+                use_gpu,
+                Some(Box::new(move |p, info, _opt_seg| {
                     let _ = tx_whisper.send(PipelineEvent::Progress {
                         stage: "语音识别".into(),
-                        progress: 0.15 + p * 0.45,
+                        progress: 0.15 + p * whisper_span,
                         detail: info.to_string(),
                     });
-                    if let Some(seg) = opt_seg {
-                        let _ = tx_whisper.send(PipelineEvent::SegmentStream(seg));
-                    }
                 })),
             )
         })
         .await??;
-        info!(elapsed = ?transcription_started.elapsed(), segments = segments.len(), "Whisper 转写完成");
+        let total_transcribe_elapsed = transcription_started.elapsed().as_secs_f64();
+        let pure_whisper_sec = (total_transcribe_elapsed - vad_sec).max(0.0);
+        info!(elapsed = ?transcription_started.elapsed(), vad_sec, pure_whisper_sec, segments = segments.len(), "Whisper 转写完成");
 
         // 清理临时 wav
         let _ = std::fs::remove_file(&wav_path);
 
         if self.is_cancelled() {
+            let _ = tx.send(PipelineEvent::Finished(segments.clone(), Default::default()));
             return Ok(segments);
         }
 
-        // ── 阶段 3: LLM 润色 ──
+        // ── 阶段 3: 标点与语法润色（可跳过）──
+        let mut qwen_sec = 0.0;
+        let mut polish_engine_name = None;
         if enable_polish && !segments.is_empty() {
-            let _ = tx.send(PipelineEvent::StageChanged("智能润色".into()));
-            let _ = tx.send(PipelineEvent::Progress {
-                stage: "智能润色".into(),
-                progress: 0.6,
-                detail: "本地 Qwen 正在优化标点与语法...".into(),
-            });
+            let mode = polish_mode.unwrap_or_else(|| "punc".to_string());
+            let use_punc = (mode == "punc") && self.punc.as_ref().map(|p| p.is_available()).unwrap_or(false);
 
-            let llm = self.llm.clone();
-            let segs_clone = segments.clone();
-            let tx_llm = tx.clone();
+            if use_punc {
+                polish_engine_name = Some("CT-Punc 极速标点".to_string());
+                let _ = tx.send(PipelineEvent::StageChanged("极速标点".into()));
+                let _ = tx.send(PipelineEvent::Progress {
+                    stage: "极速标点".into(),
+                    progress: 0.85,
+                    detail: "CT-Transformer 正在毫秒级恢复标点与断句...".into(),
+                });
 
-            let polishing_started = Instant::now();
-            segments = tokio::task::spawn_blocking(move || {
-                llm.polish(
-                    segs_clone,
-                    Some(Box::new(move |p, info| {
-                        let _ = tx_llm.send(PipelineEvent::Progress {
+                let punc = self.punc.as_ref().unwrap().clone();
+                let segs_clone = segments.clone();
+                let tx_punc = tx.clone();
+                let punc_started = Instant::now();
+
+                match tokio::task::spawn_blocking(move || {
+                    punc.add_punctuation(
+                        segs_clone,
+                        Some(Box::new(move |p, info| {
+                            let _ = tx_punc.send(PipelineEvent::Progress {
+                                stage: "极速标点".into(),
+                                progress: 0.85 + p * 0.1,
+                                detail: info.to_string(),
+                            });
+                        })),
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(polished)) => {
+                        segments = polished;
+                        qwen_sec = punc_started.elapsed().as_secs_f64();
+                        info!(elapsed = ?punc_started.elapsed(), segments = segments.len(), "CT-Punc 极速标点完成");
+                    }
+                    Ok(Err(err)) => {
+                        warn!(error = %err, "极速标点失败，保留识别原文并继续收尾");
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "极速标点任务异常，保留识别原文");
+                    }
+                }
+            } else if mode == "qwen" {
+                polish_engine_name = Some("Qwen 字幕润色".to_string());
+                let _ = tx.send(PipelineEvent::StageChanged("智能润色".into()));
+                let _ = tx.send(PipelineEvent::Progress {
+                    stage: "智能润色".into(),
+                    progress: 0.6,
+                    detail: "本地 Qwen 正在优化标点与语法...".into(),
+                });
+
+                let llm = self.llm.clone();
+                let segs_clone = segments.clone();
+                let tx_llm = tx.clone();
+
+                let polishing_started = Instant::now();
+                match tokio::task::spawn_blocking(move || {
+                    llm.polish(
+                        segs_clone,
+                        Some(Box::new(move |p, info| {
+                            let _ = tx_llm.send(PipelineEvent::Progress {
+                                stage: "智能润色".into(),
+                                progress: 0.6 + p * 0.35,
+                                detail: info.to_string(),
+                            });
+                        })),
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(polished)) => {
+                        segments = polished;
+                        qwen_sec = polishing_started.elapsed().as_secs_f64();
+                        info!(elapsed = ?polishing_started.elapsed(), segments = segments.len(), "Qwen 润色完成");
+                    }
+                    Ok(Err(err)) => {
+                        warn!(error = %err, "润色失败，保留识别原文并继续收尾");
+                        let _ = tx.send(PipelineEvent::Progress {
                             stage: "智能润色".into(),
-                            progress: 0.6 + p * 0.35,
-                            detail: info.to_string(),
+                            progress: 0.95,
+                            detail: format!("润色失败，已跳过：{err}"),
                         });
-                    })),
-                )
-            })
-            .await??;
-            info!(elapsed = ?polishing_started.elapsed(), segments = segments.len(), "Qwen 润色完成");
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "润色任务崩溃，保留识别原文");
+                    }
+                }
+            } else {
+                info!("润色模式为关闭或未知: {}", mode);
+            }
+        } else {
+            let _ = tx.send(PipelineEvent::StageChanged("生成字幕".into()));
+            let _ = tx.send(PipelineEvent::Progress {
+                stage: "生成字幕".into(),
+                progress: 0.96,
+                detail: "已关闭 AI 润色，正在写出字幕...".into(),
+            });
+            info!("已跳过标点润色");
         }
 
         if self.is_cancelled() {
+            let _ = tx.send(PipelineEvent::Finished(segments.clone(), Default::default()));
             return Ok(segments);
         }
 
-        // ── 阶段 4: 输出字幕文件 ──
+        // ── 阶段 4: 输出字幕文件（失败也不阻塞 Finished，避免界面一直转圈）──
         let _ = tx.send(PipelineEvent::StageChanged("生成字幕".into()));
         let writing_started = Instant::now();
-        SubtitleWriter::write_to_file(&segments, &out_path, &output_format)?;
-        info!(elapsed = ?writing_started.elapsed(), "字幕文件写入完成");
+        match SubtitleWriter::write_to_file(&segments, &out_path, &output_format) {
+            Ok(()) => {
+                info!(elapsed = ?writing_started.elapsed(), "字幕文件写入完成");
+                let _ = tx.send(PipelineEvent::Progress {
+                    stage: "生成字幕".into(),
+                    progress: 1.0,
+                    detail: format!("字幕已写入 {:?}", out_path.file_name().unwrap_or_default()),
+                });
+            }
+            Err(err) => {
+                warn!(error = %err, path = %out_path.display(), "字幕写入失败，识别结果仍会交给工作台");
+                let _ = tx.send(PipelineEvent::Progress {
+                    stage: "生成字幕".into(),
+                    progress: 1.0,
+                    detail: format!("识别完成（自动保存失败：{err}）"),
+                });
+            }
+        }
+        let srt_export_sec = writing_started.elapsed().as_secs_f64();
+        let total_elapsed_sec = pipeline_started.elapsed().as_secs_f64();
 
-        let _ = tx.send(PipelineEvent::Progress {
-            stage: "生成字幕".into(),
-            progress: 1.0,
-            detail: format!("字幕已写入 {:?}", out_path.file_name().unwrap_or_default()),
-        });
+        // ── 阶段 5: 性能基准指标归档与打印 ──
+        let video_duration = if let Some(d) = total_dur {
+            d
+        } else {
+            segments.last().map(|s| s.end).unwrap_or(0.0)
+        };
 
-        let _ = tx.send(PipelineEvent::Finished(segments.clone()));
+        let metrics = crate::core::PipelinePerformanceMetrics {
+            video_duration,
+            ffmpeg_audio_sec,
+            vad_sec,
+            whisper_sec: pure_whisper_sec,
+            qwen_sec,
+            polish_engine_name,
+            srt_export_sec,
+            total_elapsed_sec,
+        };
+
+        let summary = metrics.format_summary_block();
+        println!("{summary}");
+        info!("{}", summary);
+
+        let _ = tx.send(PipelineEvent::Finished(segments.clone(), metrics));
         info!(elapsed = ?pipeline_started.elapsed(), "管线全部执行完成，输出文件: {:?}", out_path);
         Ok(segments)
     }

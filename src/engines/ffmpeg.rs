@@ -41,17 +41,23 @@ impl FFmpegEngine {
             target_wav.file_name().unwrap_or_default()
         );
 
-        let status = Command::new(&self.ffmpeg_path)
-            .arg("-i")
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let status = cmd
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(input_path)
-            .arg("-vn") // 去除视频流
-            .arg("-acodec")
-            .arg("pcm_s16le")
-            .arg("-ar")
-            .arg("16000") // 16kHz 适合 Whisper
-            .arg("-ac")
-            .arg("1") // 单声道
-            .arg("-y") // 覆盖输出
+            .args([
+                "-map", "0:a:0?",
+                "-vn", "-sn", "-dn",
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                "-threads", "0",
+            ])
             .arg(&target_wav)
             .status()
             .with_context(|| format!("执行 FFmpeg 失败: {:?}", self.ffmpeg_path))?;
@@ -125,7 +131,7 @@ impl FFmpegEngine {
             .arg("-vf")
             .arg("scale='min(960,iw)':-1") // 缩放至高清预览尺寸（960px宽），放大窗口清晰锐利，依然毫秒级响应
             .arg("-threads")
-            .arg("1") // 严格限制单线程，杜绝 CPU 占用暴涨卡死
+            .arg("0") // 软解多线程；代理已是 720p H.264，CPU 压力可控
             .arg("-an") // 跳过音频流解析
             .arg("-sn") // 跳过字幕流解析
             .arg("-q:v")
@@ -140,5 +146,41 @@ impl FFmpegEngine {
         }
 
         Ok(out_jpg.to_path_buf())
+    }
+
+    /// 从已提取的 16kHz WAV 切出一段（秒）。用于 Whisper 切块并行。
+    pub fn slice_wav(
+        &self,
+        wav_path: &Path,
+        start_sec: f64,
+        duration_sec: f64,
+        out_wav: &Path,
+    ) -> Result<PathBuf> {
+        let out_wav = out_wav.to_path_buf();
+        if let Some(parent) = out_wav.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let status = cmd
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .arg("-ss")
+            .arg(format!("{:.3}", start_sec.max(0.0)))
+            .arg("-t")
+            .arg(format!("{:.3}", duration_sec.max(0.1)))
+            .arg("-i")
+            .arg(wav_path)
+            .args(["-c", "copy"]) // 原音频已经是 16kHz s16le WAV，直接流复制，毫秒级完成切片，零 CPU 损耗！
+            .arg(&out_wav)
+            .status()
+            .with_context(|| format!("切分 WAV 失败: {:?}", self.ffmpeg_path))?;
+        if !status.success() {
+            anyhow::bail!("FFmpeg 切分 WAV 返回非零退出码");
+        }
+        Ok(out_wav)
     }
 }

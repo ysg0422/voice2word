@@ -1,10 +1,11 @@
-﻿# Rust build artifacts
+# Rust build artifacts
 target/
 **/*.rs.bk
 
 # Heavyweight models and binaries
 models/
-tools/
+tools/*
+!tools/punc_runner.py
 *.bin
 *.gguf
 *.onnx
@@ -35,6 +36,8 @@ requirements.txt
 test_engines.py
 ffmpeg-path.txt
 watch.ps1
+run_build.bat
+compile_output.txt
 
 # IDE & Editor
 .idea/

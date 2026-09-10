@@ -55,6 +55,7 @@ async fn test_real_video_pipeline() {
             "srt".to_string(),
             true, // 开启 0.5B 标点纠错润色
             Some(12), // 充分释放 16 核心 CPU 算力（12 线程并发）
+            None,
             tx,
         )
         .await

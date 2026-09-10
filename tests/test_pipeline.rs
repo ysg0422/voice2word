@@ -41,8 +41,8 @@ async fn test_full_pipeline_run() {
     // 2. Whisper 转写
     println!("\n[2/4] Whisper 识别语音...");
     let whisper = voice2word::engines::WhisperEngine::new(whisper_cli, &whisper_model, 4, 0);
-    let segments = whisper.transcribe(&wav, Some("zh"), None, None, None).expect("转写失败");
-    println!("转写完成，片段数: {}", segments.len());
+    let (segments, vad_sec) = whisper.transcribe(&wav, Some("zh"), None, None, None).expect("转写失败");
+    println!("转写完成，片段数: {}，VAD 耗时: {:.2}s", segments.len(), vad_sec);
     for seg in &segments {
         println!("  #{}: [{:.2} -> {:.2}] {}", seg.index, seg.start, seg.end, seg.text);
     }

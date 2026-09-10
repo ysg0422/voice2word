@@ -1,4 +1,4 @@
-﻿//! Zed / Codex 极简暗黑主题规范
+//! Zed / Codex 极简暗黑主题规范
 
 use gpui::{rgb, Rgba};
 
@@ -24,6 +24,7 @@ impl Theme {
     #[inline] pub fn text_code() -> Rgba { rgb(0x38bdf8) }      // 等宽代码/时间戳蓝色
 
     // 状态与重音色
+    #[inline] pub fn accent_primary() -> Rgba { rgb(0x6366f1) } // 主重音紫蓝
     #[inline] pub fn accent_mint() -> Rgba { rgb(0x10b981) }    // 成功/开始/进度条绿
     #[inline] pub fn accent_blue() -> Rgba { rgb(0x6366f1) }    // 标识与重音紫蓝
     #[inline] pub fn accent_red() -> Rgba { rgb(0xf43f5e) }     // 取消/错误粉红

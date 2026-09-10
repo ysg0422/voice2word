@@ -26,6 +26,13 @@ rfd = "0.15"
 chrono = "0.4"
 open = "5.3"
 sysinfo = "0.31"
+image = "0.25"
+smallvec = "1.13"
+wgpu = "0.20"
+pollster = "0.3"
+encoding_rs = "0.8"
+zhconv = "0.3"
+rayon = "1.10"
 
 [profile.dev]
 opt-level = 0

@@ -7,7 +7,11 @@
 
 use gpui::prelude::*;
 use gpui::*;
+use image::{Frame, ImageBuffer, Rgba};
+use smallvec::SmallVec;
+use std::sync::Arc;
 use crate::app::state::{WorkspaceTab, ProcessStatus};
+use crate::engines::{PLAYER_HEIGHT, PLAYER_WIDTH};
 use crate::utils::time::{format_duration_short, seconds_to_srt_time};
 use super::theme::Theme;
 use super::MainWindow;
@@ -80,7 +84,7 @@ impl MainWindow {
                                 this.trigger_extract_frame(cx);
                                 cx.notify();
                             }))
-                            .child("🎬 剪辑校对"),
+                            .child("剪辑校对"),
                     )
                     .child(
                         div()
@@ -119,7 +123,7 @@ impl MainWindow {
                                 this.state.active_tab = WorkspaceTab::Generate;
                                 cx.notify();
                             }))
-                            .child("⚡ 语音转写"),
+                            .child("语音转写"),
                     )
                     .child(
                         div()
@@ -159,7 +163,7 @@ impl MainWindow {
                                 this.state.refresh_recent_tasks();
                                 cx.notify();
                             }))
-                            .child("📚 视频库"),
+                            .child("视频库"),
                     ),
             )
             // 右侧极简导出胶囊按钮
@@ -180,14 +184,13 @@ impl MainWindow {
                             this.export_subtitles(cx);
                         }
                     }))
-                    .child("💾 导出字幕"),
+                    .child("导出字幕"),
             )
     }
 
     /// 渲染类似剪映 / Premiere 风格的剪辑工作区布局 (左中右之 中：视频与时间轴，右：字幕属性)
     pub(crate) fn render_editor_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
-        let seg_count = self.state.segments.len();
 
         div()
             .id("editor-workspace-layout")
@@ -214,13 +217,13 @@ impl MainWindow {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(Theme::accent_mint()))
+                                .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(Theme::accent_mint()))
                                 .child(
                                     div()
                                         .text_size(px(12.0))
-                                        .font_weight(FontWeight::BOLD)
+                                        .font_weight(FontWeight::MEDIUM)
                                         .text_color(Theme::accent_mint())
-                                        .child(format!("⚡ 语音转写正在后台高速进行中 (已实时流式生成 {} 句)... 转写完成后将自动完整同步", seg_count)),
+                                        .child("语音转写进行中，完成后自动同步到剪辑工作台"),
                                 ),
                         )
                         .child(
@@ -234,14 +237,14 @@ impl MainWindow {
                                 .border_1()
                                 .border_color(Theme::border())
                                 .text_size(px(11.0))
-                                .font_weight(FontWeight::BOLD)
+                                .font_weight(FontWeight::MEDIUM)
                                 .text_color(Theme::text_primary())
                                 .hover(|s| s.bg(Theme::bg_hover()))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.state.active_tab = WorkspaceTab::Generate;
                                     cx.notify();
                                 }))
-                                .child("查看实时转写看板 ➜"),
+                                .child("查看进度"),
                         )
                 } else {
                     div()
@@ -261,6 +264,7 @@ impl MainWindow {
                             .flex_col()
                             .flex_1()
                             .h_full()
+                            .min_w(px(420.0))
                             .overflow_hidden()
                             .child(self.render_video_monitor(cx))
                             .child(self.render_multitrack_timeline(cx)),
@@ -281,6 +285,7 @@ impl MainWindow {
             .id("editor-video-monitor")
             .w_full()
             .flex_1()
+            .min_h(px(280.0))
             .bg(rgb(0x09090b))
             .flex()
             .flex_col()
@@ -298,10 +303,85 @@ impl MainWindow {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(Theme::text_primary())
-                            .child("视频预览"),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(Theme::text_primary())
+                                    .child("视频预览"),
+                            )
+                            .child(
+                                if is_playing {
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_full()
+                                        .bg(rgba(0x10b98118))
+                                        .border_1()
+                                        .border_color(rgba(0x10b98144))
+                                        .text_size(px(10.0))
+                                        .text_color(Theme::accent_mint())
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("播放中 · 25fps")
+                                } else {
+                                    div()
+                                }
+                            )
+                            .child({
+                                let gpu = self.state.hardware.use_gpu_pipeline();
+                                let adapter = self.state.hardware.adapter_name.chars().take(18).collect::<String>();
+                                let label = if gpu {
+                                    format!("GPU · {}", adapter)
+                                } else {
+                                    "CPU · 软件渲染".to_string()
+                                };
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .bg(if gpu { rgba(0x10b98118) } else { rgba(0xf59e0b18) })
+                                    .text_size(px(10.0))
+                                    .text_color(if gpu { Theme::accent_mint() } else { Theme::accent_orange() })
+                                    .child(label)
+                            })
+                            .child({
+                                let proxy_on = self.state.proxy_enabled;
+                                let busy = self.state.proxy_busy;
+                                let label = if busy {
+                                    "代理生成中…"
+                                } else if proxy_on {
+                                    "代理: 开"
+                                } else {
+                                    "代理: 关"
+                                };
+                                div()
+                                    .id("monitor-proxy-toggle")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .bg(if proxy_on { rgba(0x38bdf822) } else { Theme::bg_card() })
+                                    .border_1()
+                                    .border_color(Theme::border())
+                                    .text_size(px(10.0))
+                                    .text_color(Theme::text_secondary())
+                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.proxy_enabled = !this.state.proxy_enabled;
+                                        if this.state.proxy_enabled {
+                                            this.ensure_preview_proxy(cx);
+                                        } else {
+                                            this.state.preview_source = this.state.selected_file.clone();
+                                            this.state.proxy_busy = false;
+                                            this.trigger_extract_frame(cx);
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(label)
+                            }),
                     )
                     .child(
                         div()
@@ -319,7 +399,7 @@ impl MainWindow {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.play_video(cx);
                             }))
-                            .child("▶ 外部播放"),
+                            .child("独立窗口"),
                     ),
             )
             // 16:9 监视器视口屏幕
@@ -328,15 +408,31 @@ impl MainWindow {
                     .id("monitor-viewport-screen")
                     .flex_1()
                     .w_full()
+                    .min_h(px(180.0))
                     .relative()
                     .bg(rgb(0x050507))
                     .flex()
                     .items_center()
                     .justify_center()
                     .overflow_hidden()
-                    // 视频画面展示
-                    .child(
-                        if let Some(ref frame_path) = self.state.preview_frame_path {
+                    // 视频画面展示 (实时内嵌播放 vs 静态时间轴帧)
+                    .child({
+                        let live_frame = self.state.video_player.get_frame();
+
+                        if let Some(bgra_data) = live_frame {
+                            // GPUI RenderImage 底层纹理严格要求 BGRA 格式（wgpu::TextureFormat::Bgra8Unorm），FFmpeg 已按 bgra 直出
+                            if let Some(buffer) = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(PLAYER_WIDTH, PLAYER_HEIGHT, bgra_data) {
+                                let render_img = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
+                                div()
+                                    .size_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(img(render_img).size_full())
+                            } else {
+                                div().size_full()
+                            }
+                        } else if let Some(ref frame_path) = self.state.preview_frame_path {
                             if frame_path.exists() {
                                 div()
                                     .size_full()
@@ -352,13 +448,12 @@ impl MainWindow {
                                     .flex()
                                     .flex_col()
                                     .items_center()
-                                    .gap_2()
-                                    .child(div().text_size(px(24.0)).child("⏳"))
+                                    .gap_1p5()
                                     .child(
                                         div()
                                             .text_size(px(12.0))
                                             .text_color(Theme::text_muted())
-                                            .child("正在提取对应视频帧..."),
+                                            .child("正在提取视频帧..."),
                                     )
                             }
                         } else if self.state.selected_file.is_some() {
@@ -366,33 +461,27 @@ impl MainWindow {
                                 .flex()
                                 .flex_col()
                                 .items_center()
-                                .gap_2()
-                                .child(div().text_size(px(28.0)).child("🎞️"))
+                                .gap_1p5()
                                 .child(
                                     div()
                                         .text_size(px(12.0))
                                         .text_color(Theme::accent_mint())
-                                        .child("正在同步视频预览画面..."),
+                                        .child("正在同步视频画面..."),
                                 )
                         } else {
                             div()
                                 .flex()
                                 .flex_col()
                                 .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_size(px(32.0))
-                                        .child("🎬"),
-                                )
+                                .gap_1p5()
                                 .child(
                                     div()
                                         .text_size(px(12.0))
                                         .text_color(Theme::text_muted())
-                                        .child("拖动下方时间轴指针，画面与字幕将在此实时同步"),
+                                        .child("拖动时间轴或点击播放，画面将在此实时呈现"),
                                 )
                         }
-                    )
+                    })
                     // 电影级高对比度字幕覆盖居中层
                     .child(
                         div()
@@ -459,7 +548,7 @@ impl MainWindow {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.jump_prev_segment(cx);
                                     }))
-                                    .child("⏮ 上句"),
+                                    .child("上句"),
                             )
                             // 快退 1 秒
                             .child(
@@ -473,14 +562,15 @@ impl MainWindow {
                                     .text_color(Theme::text_secondary())
                                     .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
                                     .on_click(cx.listener(|this, _, _, cx| {
+                                        this.halt_preview_playback();
                                         let target = (this.state.current_time - 1.0).max(0.0);
                                         this.state.seek_to(target);
                                         this.trigger_extract_frame(cx);
                                         cx.notify();
                                     }))
-                                    .child("◀ 1s"),
+                                    .child("-1s"),
                             )
-                            // 走帧播放 / 暂停 (主要突出胶囊)
+                            // 实时播放 / 暂停 (主要突出胶囊)
                             .child(
                                 div()
                                     .id("ctrl-play-pause")
@@ -496,7 +586,7 @@ impl MainWindow {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.toggle_play_preview(cx);
                                     }))
-                                    .child(if is_playing { "⏸ 暂停" } else { "▶ 走帧" }),
+                                    .child(if is_playing { "暂停" } else { "播放" }),
                             )
                             // 快进 1 秒
                             .child(
@@ -510,12 +600,13 @@ impl MainWindow {
                                     .text_color(Theme::text_secondary())
                                     .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
                                     .on_click(cx.listener(|this, _, _, cx| {
+                                        this.halt_preview_playback();
                                         let target = this.state.current_time + 1.0;
                                         this.state.seek_to(target);
                                         this.trigger_extract_frame(cx);
                                         cx.notify();
                                     }))
-                                    .child("1s ▶"),
+                                    .child("+1s"),
                             )
                             // 下一句
                             .child(
@@ -531,7 +622,7 @@ impl MainWindow {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.jump_next_segment(cx);
                                     }))
-                                    .child("下句 ⏭"),
+                                    .child("下句"),
                             ),
                     )
                     // 右侧时间码 (iOS 胶囊卡片)
@@ -901,7 +992,7 @@ impl MainWindow {
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.prompt_edit_text(cx);
                                                     }))
-                                                    .child("✏️ 中文输入"),
+                                                    .child("输入文本"),
                                             )
                                             .child(
                                                 div()
@@ -1037,7 +1128,7 @@ impl MainWindow {
                                                     this.state.save_selected_text();
                                                     cx.notify();
                                                 }))
-                                                .child("⌫ 删末字"),
+                                                .child("删末字"),
                                         ),
                                 )
                                 // 片段操作操作栏：保存、拆分、合并、删除 (iOS 胶囊组)
@@ -1066,7 +1157,7 @@ impl MainWindow {
                                                     this.state.save_selected_text();
                                                     cx.notify();
                                                 }))
-                                                .child("💾 保存修改"),
+                                                .child("保存修改"),
                                         )
                                         .child(
                                             div()
@@ -1089,7 +1180,7 @@ impl MainWindow {
                                                     this.trigger_extract_frame(cx);
                                                     cx.notify();
                                                 }))
-                                                .child("✂ 拆分"),
+                                                .child("拆分"),
                                         )
                                         .child(
                                             div()
@@ -1112,7 +1203,7 @@ impl MainWindow {
                                                     this.trigger_extract_frame(cx);
                                                     cx.notify();
                                                 }))
-                                                .child("🔗 合并"),
+                                                .child("合并"),
                                         )
                                         .child(
                                             div()
@@ -1135,7 +1226,7 @@ impl MainWindow {
                                                     this.trigger_extract_frame(cx);
                                                     cx.notify();
                                                 }))
-                                                .child("🗑"),
+                                                .child("删除"),
                                         ),
                                 )
                         } else {
@@ -1203,7 +1294,7 @@ impl MainWindow {
                                                         this.trigger_extract_frame(cx);
                                                         cx.notify();
                                                     }))
-                                                    .child("◀ 10句"),
+                                                    .child("-10句"),
                                             )
                                             .child(
                                                 div()
@@ -1224,7 +1315,7 @@ impl MainWindow {
                                                         this.trigger_extract_frame(cx);
                                                         cx.notify();
                                                     }))
-                                                    .child("10句 ▶"),
+                                                    .child("+10句"),
                                             ),
                                     ),
                             )
@@ -1340,7 +1431,8 @@ impl MainWindow {
 
         div()
             .id("editor-multitrack-timeline")
-            .h(px(230.0))
+            .h(px(188.0))
+            .flex_shrink_0()
             .w_full()
             .bg(Theme::bg_sidebar())
             .border_t_1()
@@ -1709,6 +1801,7 @@ impl MainWindow {
             .text_color(Theme::text_secondary())
             .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
             .on_click(cx.listener(move |this, _, _, cx| {
+                this.halt_preview_playback();
                 this.state.seek_to(target_time);
                 this.trigger_extract_frame(cx);
                 cx.notify();
@@ -1721,6 +1814,7 @@ impl MainWindow {
         if self.state.total_duration <= 0.0 {
             return;
         }
+        self.halt_preview_playback();
         let nav_w = px(180.0); // 左侧导航侧边栏占用宽度
         let inspector_w = px(380.0); // 右侧属性检查器占用宽度
         let left_pad = px(70.0); // 左侧轨道名称标签占用宽度
