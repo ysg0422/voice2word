@@ -73,7 +73,7 @@ impl Default for AppConfig {
                 polish_mode: "punc".to_string(),
                 enable_vad: false,
                 whisper_threads: 8,
-                whisper_processors: 1,
+                whisper_processors: 2,
                 llm_threads: 8,
                 llm_ctx: 4096,
             },

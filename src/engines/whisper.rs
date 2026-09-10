@@ -124,8 +124,16 @@ impl WhisperEngine {
 
         let lang = language.unwrap_or("auto");
         let th = threads.unwrap_or(self.threads);
-        // 保持 1 个主处理器顺序流式推理，确保字幕按时间自然流式吐出且不破坏切分边界上下文
-        let processors = 1usize;
+        // 读取配置的处理单元并发数，启用多处理器并行解码
+        let processors = self.processors.max(1) as usize;
+
+        // 线程保护机制：多处理器并行时，单处理器线程数等额下调，
+        // 保证所有处理器的总 CPU 线程受控在配额内，防止 CPU 线程超售抢占桌面资源。
+        let effective_th = if processors > 1 {
+            (th / (processors as u32)).max(2)
+        } else {
+            th
+        };
 
         // 优先使用运行时档位覆盖的模型路径，否则使用配置中的默认模型
         let effective_model: PathBuf = match model_path_override {
@@ -134,8 +142,8 @@ impl WhisperEngine {
         };
 
         info!(
-            "Whisper 开始转写: {:?}, 语言: {}, 线程数: {}, 并行处理器: {}, 模型: {:?}, VAD: {:?}",
-            audio_path, lang, th, processors, effective_model, self.vad_model_path
+            "Whisper 开始转写: {:?}, 语言: {}, 线程数: {} (单实例 {}), 并行处理器: {}, 模型: {:?}, VAD: {:?}",
+            audio_path, lang, th, effective_th, processors, effective_model, self.vad_model_path
         );
 
         if !effective_model.exists() {
@@ -171,7 +179,7 @@ impl WhisperEngine {
         cmd.arg("-l")
             .arg(lang)
             .arg("-t")
-            .arg(th.to_string())
+            .arg(effective_th.to_string())
             .arg("-p")
             .arg(processors.to_string())
             .arg("-bo")
@@ -212,7 +220,10 @@ impl WhisperEngine {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            // 0x08000000 (CREATE_NO_WINDOW) | 0x00004000 (BELOW_NORMAL_PRIORITY_CLASS)
+            // 降低 whisper-cli 进程优先级，确保 Windows 桌面管理器(DWM)、鼠标光标、前台窗口与输入法
+            // 拥有最高响应调度优先权，并发计算跑满时桌面依然绝对流畅、丝滑不卡顿。
+            cmd.creation_flags(0x08000000 | 0x00004000);
         }
 
         cmd.stdout(std::process::Stdio::piped())
@@ -241,9 +252,18 @@ impl WhisperEngine {
             }
         });
 
+        let proc_count = processors;
         let stdout_handle = std::thread::spawn(move || {
             let mut captured_lines = Vec::new();
             let mut last_emit = 0.0f64;
+            let mut proc_progress = vec![0.0f64; proc_count];
+            let dur = total_duration.unwrap_or(0.0);
+            let chunk_dur = if dur > 0.0 && proc_count > 0 {
+                dur / (proc_count as f64)
+            } else {
+                0.0
+            };
+
             if let Some(out) = stdout {
                 use std::io::BufRead;
                 let mut reader = std::io::BufReader::new(out);
@@ -265,22 +285,37 @@ impl WhisperEngine {
                             } else {
                                 0.0
                             };
-                            let ratio = if let Some(tot) = total_duration {
+                            let ratio = if chunk_dur > 0.0 {
+                                let p_idx = ((end_sec / chunk_dur) as usize).min(proc_count - 1);
+                                let c_start = p_idx as f64 * chunk_dur;
+                                let p = ((end_sec - c_start) / chunk_dur).clamp(0.0, 1.0);
+                                if p > proc_progress[p_idx] {
+                                    proc_progress[p_idx] = p;
+                                }
+                                proc_progress.iter().sum::<f64>() / (proc_count as f64)
+                            } else if let Some(tot) = total_duration {
                                 if tot > 0.0 { (end_sec / tot).clamp(0.0, 1.0) } else { 0.5 }
                             } else {
                                 0.5
                             };
+
                             // 按音频进度节流，避免每句都打满 UI 通道。
                             if ratio + 0.0001 >= last_emit + 0.01 || ratio >= 0.999 {
                                 last_emit = ratio;
                                 if let Some(cb) = cb_clone.as_ref() {
-                                    let mm = (end_sec / 60.0) as u32;
-                                    let ss = (end_sec % 60.0) as u32;
-                                    cb(
-                                        ratio,
-                                        &format!("已识别至 {mm:02}:{ss:02}  ({:.0}%)", ratio * 100.0),
-                                        None,
-                                    );
+                                    let display_sec = if proc_count > 1 && dur > 0.0 {
+                                        ratio * dur
+                                    } else {
+                                        end_sec
+                                    };
+                                    let mm = (display_sec / 60.0) as u32;
+                                    let ss = (display_sec % 60.0) as u32;
+                                    let label = if proc_count > 1 {
+                                        format!("双核并行已识别至 {mm:02}:{ss:02}  ({:.0}%)", ratio * 100.0)
+                                    } else {
+                                        format!("已识别至 {mm:02}:{ss:02}  ({:.0}%)", ratio * 100.0)
+                                    };
+                                    cb(ratio, &label, None);
                                 }
                             }
                         }
@@ -341,6 +376,12 @@ impl WhisperEngine {
                     }
                 }
             }
+        }
+
+        // 多处理器并行后，按起始时间戳精准排序并重新编排连续序号，消除可能存在的跨块微小乱序
+        segments.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+        for (i, seg) in segments.iter_mut().enumerate() {
+            seg.index = i + 1;
         }
 
         // 回退逻辑：如果 json 没产出，从捕获的 stdout 解析

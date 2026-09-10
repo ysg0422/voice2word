@@ -14,6 +14,6 @@ enable_polish = true
 polish_mode = "punc"
 enable_vad = true
 whisper_threads = 8
-whisper_processors = 1
+whisper_processors = 2
 llm_threads = 8
 llm_ctx = 4096
