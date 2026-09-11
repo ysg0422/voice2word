@@ -1,7 +1,6 @@
 //! MainWindow 异步与后台业务动作逻辑
 
 use gpui::prelude::*;
-use gpui::*;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -87,6 +86,26 @@ impl MainWindow {
         .detach();
     }
 
+    /// 智能缓存命中处理：直接 0 秒载入已缓存的解析结果
+    pub(crate) fn load_cached_result(&mut self, cx: &mut Context<Self>, cached: crate::storage::TaskRecord) {
+        let filename = cached.file_name.clone();
+        let seg_count = cached.segments.len();
+        let total_dur = cached.duration;
+        let metrics = cached.metrics.clone();
+
+        info!("智能缓存命中: 0 秒载入 {:?}", filename);
+        self.state.load_from_cache(cached);
+        self.state.active_tab = crate::app::state::WorkspaceTab::Editor;
+
+        self.completion_dialog = Some(CompletionDialogInfo {
+            file_name: filename,
+            segment_count: seg_count,
+            total_duration: total_dur,
+            metrics,
+        });
+        cx.notify();
+    }
+
     /// 触发流水线处理
     pub(crate) fn start_processing(&mut self, cx: &mut Context<Self>) {
         if matches!(self.state.status, ProcessStatus::Processing { .. }) {
@@ -98,6 +117,7 @@ impl MainWindow {
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
+        self.state.clear_streaming();
         self.state.status = ProcessStatus::Processing {
             stage: "准备中...".to_string(),
             progress: 0.0,
@@ -170,8 +190,11 @@ impl MainWindow {
                                         detail,
                                     };
                                 }
-                                PipelineEvent::SegmentStream(_) => {}
+                                PipelineEvent::SegmentStream(seg) => {
+                                    this.state.push_stream_segment(seg);
+                                }
                                 PipelineEvent::Finished(segments, metrics) => {
+                                    this.state.clear_streaming();
                                     if segments.is_empty() {
                                         this.state.status = ProcessStatus::Failed("未能识别出任何有效字幕，请检查音频音量或识别语言设置".to_string());
                                     } else {

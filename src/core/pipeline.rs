@@ -1,6 +1,6 @@
 //! 异步任务流水线：调度 FFmpeg -> Whisper -> LLM -> SubtitleWriter
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -80,7 +80,7 @@ impl TaskPipeline {
                 .join(format!("{}.{}", stem, output_format))
         });
 
-        // ── 阶段 1: 音频提取 ──
+        // ── 阶段 1: 探测时长与音频管道准备 ──
         if self.is_cancelled() {
             return Ok(Vec::new());
         }
@@ -88,34 +88,7 @@ impl TaskPipeline {
         let _ = tx.send(PipelineEvent::Progress {
             stage: "提取音频".into(),
             progress: 0.1,
-            detail: "正在使用 FFmpeg 抽取 16kHz 音频...".into(),
-        });
-
-        let ffmpeg = self.ffmpeg.clone();
-        let in_file = input_file.clone();
-        let extraction_started = Instant::now();
-        let wav_path = tokio::task::spawn_blocking(move || ffmpeg.extract_audio(&in_file, None))
-            .await??;
-        let ffmpeg_audio_sec = extraction_started.elapsed().as_secs_f64();
-        info!(elapsed = ?extraction_started.elapsed(), "FFmpeg 音频提取完成");
-
-        let _ = tx.send(PipelineEvent::Progress {
-            stage: "提取音频".into(),
-            progress: 1.0,
-            detail: "音频提取成功".into(),
-        });
-
-        // ── 阶段 2: 语音转写 ──
-        if self.is_cancelled() {
-            let _ = std::fs::remove_file(&wav_path);
-            return Ok(Vec::new());
-        }
-
-        let _ = tx.send(PipelineEvent::StageChanged("语音识别".into()));
-        let _ = tx.send(PipelineEvent::Progress {
-            stage: "语音识别".into(),
-            progress: 0.15,
-            detail: "Whisper 模型正在转写语音...".into(),
+            detail: "正在探测媒体时长并准备音频通道...".into(),
         });
 
         let ffmpeg_for_dur = self.ffmpeg.clone();
@@ -127,43 +100,148 @@ impl TaskPipeline {
         .await
         .unwrap_or(None);
 
+        let duration_for_chunks = total_dur.unwrap_or(0.0);
         let whisper = self.whisper.clone();
-        let ffmpeg_chunks = self.ffmpeg.clone();
-        let wav_clone = wav_path.clone();
+        let ffmpeg = self.ffmpeg.clone();
+        let use_gpu = whisper.uses_gpu();
+
+        // 判断是否启用纯内存管道推流 (In-Memory PCM Streaming Pipe):
+        // 当启用 GPU 推理，或音频时长无需多进程切块时，直接以 0 磁盘 I/O 管道推流
+        let can_stream = use_gpu || duration_for_chunks <= 405.0;
+
+        let mut ffmpeg_audio_sec = 0.0;
+        let mut temp_wav_path: Option<PathBuf> = None;
+
+        if can_stream {
+            info!("音频通道就绪：启用纯内存管道推流 (In-Memory PCM Streaming Pipe，0 磁盘 I/O)");
+            let _ = tx.send(PipelineEvent::Progress {
+                stage: "提取音频".into(),
+                progress: 1.0,
+                detail: "已建立纯内存音频推流管道 (0 磁盘 I/O，毫秒级就绪)".into(),
+            });
+        } else {
+            // CPU 多核切块模式回退：提前抽取完整临时 WAV 以供多进程随机 seek 切块
+            let in_file = input_file.clone();
+            let ffmpeg_extract = ffmpeg.clone();
+            let extraction_started = Instant::now();
+            let wav_path = tokio::task::spawn_blocking(move || ffmpeg_extract.extract_audio(&in_file, None))
+                .await??;
+            ffmpeg_audio_sec = extraction_started.elapsed().as_secs_f64();
+            info!(elapsed = ?extraction_started.elapsed(), "FFmpeg 临时 WAV 提取完成 (CPU 切块模式)");
+            let _ = tx.send(PipelineEvent::Progress {
+                stage: "提取音频".into(),
+                progress: 1.0,
+                detail: "音频提取成功".into(),
+            });
+            temp_wav_path = Some(wav_path);
+        }
+
+        // ── 阶段 2: 语音转写 ──
+        if self.is_cancelled() {
+            if let Some(ref p) = temp_wav_path {
+                let _ = std::fs::remove_file(p);
+            }
+            return Ok(Vec::new());
+        }
+
+        let _ = tx.send(PipelineEvent::StageChanged("语音识别".into()));
+        let _ = tx.send(PipelineEvent::Progress {
+            stage: "语音识别".into(),
+            progress: 0.15,
+            detail: if can_stream {
+                "Whisper 正在通过纯内存管道流式转写语音...".into()
+            } else {
+                "Whisper 模型正在转写语音...".into()
+            },
+        });
+
         let lang_clone = language.clone();
         let tx_whisper = tx.clone();
         // 关闭润色时，识别阶段占满进度条，避免卡在旧的 60%「等待润色」区间。
         let whisper_span = if enable_polish { 0.45 } else { 0.80 };
-        let use_gpu = whisper.uses_gpu();
-        let duration_for_chunks = total_dur.unwrap_or(0.0);
 
         let transcription_started = Instant::now();
-        let (mut segments, vad_sec) = tokio::task::spawn_blocking(move || {
-            transcribe_chunked(
-                ffmpeg_chunks.as_ref(),
-                whisper.as_ref(),
-                &wav_clone,
-                duration_for_chunks,
-                lang_clone.as_deref(),
-                threads,
-                model_override.as_deref(),
-                use_gpu,
-                Some(Box::new(move |p, info, _opt_seg| {
-                    let _ = tx_whisper.send(PipelineEvent::Progress {
-                        stage: "语音识别".into(),
-                        progress: 0.15 + p * whisper_span,
-                        detail: info.to_string(),
-                    });
-                })),
-            )
-        })
-        .await??;
+        let (mut segments, vad_sec) = if can_stream {
+            let in_file_stream = input_file.clone();
+            let ffmpeg_stream = ffmpeg.clone();
+            let whisper_engine = whisper.clone();
+            let model_override_stream = model_override.clone();
+
+            tokio::task::spawn_blocking(move || -> Result<(Vec<Segment>, f64)> {
+                let mut ffmpeg_child = ffmpeg_stream.spawn_audio_stream(&in_file_stream)?;
+                let ffmpeg_stdout = ffmpeg_child.stdout.take()
+                    .context("获取 FFmpeg 内存管道输出失败")?;
+
+                struct ChildReaper(std::process::Child);
+                impl Drop for ChildReaper {
+                    fn drop(&mut self) {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+                let mut reaper = ChildReaper(ffmpeg_child);
+
+                let tx_cb = tx_whisper.clone();
+                let res = whisper_engine.transcribe_stream(
+                    Box::new(ffmpeg_stdout),
+                    lang_clone.as_deref(),
+                    threads,
+                    if duration_for_chunks > 0.0 { Some(duration_for_chunks) } else { None },
+                    model_override_stream.as_deref(),
+                    Some(Box::new(move |p, info, opt_seg| {
+                        if let Some(seg) = opt_seg {
+                            let _ = tx_cb.send(PipelineEvent::SegmentStream(seg));
+                        }
+                        let _ = tx_cb.send(PipelineEvent::Progress {
+                            stage: "语音识别".into(),
+                            progress: 0.15 + p * whisper_span,
+                            detail: info.to_string(),
+                        });
+                    })),
+                );
+                let _ = reaper.0.wait();
+                res
+            })
+            .await??
+        } else {
+            let wav_path = temp_wav_path.as_ref().unwrap().clone();
+            let ffmpeg_chunks = ffmpeg.clone();
+            let whisper_engine = whisper.clone();
+            let model_override_clone = model_override.clone();
+
+            tokio::task::spawn_blocking(move || {
+                transcribe_chunked(
+                    ffmpeg_chunks.as_ref(),
+                    whisper_engine.as_ref(),
+                    &wav_path,
+                    duration_for_chunks,
+                    lang_clone.as_deref(),
+                    threads,
+                    model_override_clone.as_deref(),
+                    use_gpu,
+                    Some(Box::new(move |p, info, opt_seg| {
+                        if let Some(seg) = opt_seg {
+                            let _ = tx_whisper.send(PipelineEvent::SegmentStream(seg));
+                        }
+                        let _ = tx_whisper.send(PipelineEvent::Progress {
+                            stage: "语音识别".into(),
+                            progress: 0.15 + p * whisper_span,
+                            detail: info.to_string(),
+                        });
+                    })),
+                )
+            })
+            .await??
+        };
+
         let total_transcribe_elapsed = transcription_started.elapsed().as_secs_f64();
         let pure_whisper_sec = (total_transcribe_elapsed - vad_sec).max(0.0);
         info!(elapsed = ?transcription_started.elapsed(), vad_sec, pure_whisper_sec, segments = segments.len(), "Whisper 转写完成");
 
-        // 清理临时 wav
-        let _ = std::fs::remove_file(&wav_path);
+        // 清理临时 wav (仅当存在时清理)
+        if let Some(ref p) = temp_wav_path {
+            let _ = std::fs::remove_file(p);
+        }
 
         if self.is_cancelled() {
             let _ = tx.send(PipelineEvent::Finished(segments.clone(), Default::default()));

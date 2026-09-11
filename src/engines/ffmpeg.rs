@@ -70,6 +70,39 @@ impl FFmpegEngine {
         Ok(target_wav)
     }
 
+    /// 纯内存管道推流：以 16kHz 单声道 s16le PCM WAV 格式将音频输出到 stdout 匿名管道 (0 磁盘 I/O)
+    pub fn spawn_audio_stream<P: AsRef<Path>>(&self, input_path: P) -> Result<std::process::Child> {
+        let input_path = input_path.as_ref();
+        info!(
+            "FFmpeg 启动纯内存音频推流管道: {:?}",
+            input_path.file_name().unwrap_or_default()
+        );
+
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(input_path)
+            .args([
+                "-map", "0:a:0?",
+                "-vn", "-sn", "-dn",
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                "-threads", "0",
+                "-f", "wav",
+                "pipe:1",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+
+        let child = cmd.spawn().with_context(|| format!("启动 FFmpeg 内存管道失败: {:?}", self.ffmpeg_path))?;
+        Ok(child)
+    }
+
     /// 获取视频/音频的时长 (秒)
     pub fn get_duration<P: AsRef<Path>>(&self, input_path: P) -> f64 {
         let output = Command::new(&self.ffmpeg_path)

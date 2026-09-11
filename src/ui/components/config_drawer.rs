@@ -160,10 +160,26 @@ impl MainWindow {
                                         cx,
                                     ))
                                     .child(self.render_model_tier_pill(
+                                        crate::app::WhisperModelTier::TurboSpeed,
+                                        "极速 Turbo",
+                                        cx,
+                                    ))
+                                    .child(self.render_model_tier_pill(
                                         crate::app::WhisperModelTier::Precise,
                                         "高精 Turbo",
                                         cx,
                                     )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(Theme::text_muted())
+                                    .child(match self.state.whisper_model_tier {
+                                        crate::app::WhisperModelTier::TurboSpeed => "Q5 量化：减小显存带宽瓶颈，提速 25%~30%，适合标准普通话",
+                                        crate::app::WhisperModelTier::Precise => "Q8 旗舰：无损高精，专治口音、吞音、方言与教学专有名词",
+                                        crate::app::WhisperModelTier::Balanced => "Small 模型：资源消耗适中，适合日常普通对话",
+                                        crate::app::WhisperModelTier::Fast => "Base 模型：极小体积，适合极速生成粗略草稿",
+                                    }),
                             )
                     })
                     // 语言分段器

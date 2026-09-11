@@ -122,6 +122,45 @@ impl Database {
         Ok(())
     }
 
+    /// 查找指定文件的历史已完成转写记录 (用于 0 秒智能缓存命中)
+    pub fn find_cached_task(&self, file_path: &str) -> Result<Option<TaskRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let normalized_1 = file_path.replace('\\', "/");
+        let normalized_2 = file_path.replace('/', "\\");
+        let mut stmt = conn.prepare(
+            "SELECT id, file_path, file_name, duration, status, segments_json, created_at, metrics_json 
+             FROM tasks 
+             WHERE (file_path = ?1 OR file_path = ?2) AND status = 'completed' 
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![normalized_1, normalized_2], |row| {
+            let segments_json: String = row.get(5)?;
+            let segments: Vec<Segment> = serde_json::from_str(&segments_json).unwrap_or_default();
+            let metrics_json: Option<String> = row.get(7).unwrap_or(None);
+            let metrics: Option<crate::core::PipelinePerformanceMetrics> = metrics_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
+            Ok(TaskRecord {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                file_name: row.get(2)?,
+                duration: row.get(3)?,
+                status: row.get(4)?,
+                segments,
+                created_at: row.get(6)?,
+                metrics,
+            })
+        })?;
+
+        if let Some(r) = rows.next() {
+            let record = r?;
+            if !record.segments.is_empty() {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
     /// 删除指定历史任务记录
     pub fn delete_task(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();

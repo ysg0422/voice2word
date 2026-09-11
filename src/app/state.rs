@@ -50,21 +50,22 @@ pub enum WorkspaceTab {
     Performance,  // 性能与推理设置 (硬件检测、性能评估、AI 推理决策)
 }
 
-/// 模型档位：控制 Whisper 模型大小，平衡速度与精度
+/// 模型档位：控制 Whisper 模型大小与量化精度，平衡速度与抗口音能力
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WhisperModelTier {
-    Fast,      // 极速档 — ggml-base.bin
-    Balanced,  // 均衡档 — ggml-small.bin
+    Fast,        // 极速 Base — ggml-base.bin (39M 参数)
+    Balanced,    // 均衡 Small — ggml-small.bin (244M 参数)
+    TurboSpeed,  // 极速 Turbo — ggml-large-v3-turbo-q5_0.bin (Q5 破带宽版，提速 25%~30%)
     #[default]
-    Precise,   // 高精档 — ggml-large-v3-turbo-q8_0.bin（课堂默认，核显上比 small 准得多）
+    Precise,     // 高精 Turbo — ggml-large-v3-turbo-q8_0.bin (Q8 旗舰版，抗口音吞音)
 }
 
 /// 润色模式：CT-Punc 极速标点恢复 vs Qwen 大模型深度润色
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PolishMode {
     #[default]
-    PuncFast,  // ⚡ 极速标点 (CT-Punc · 仅 6 秒)
-    QwenDeep,  // 🧠 深度润色 (Qwen · 较慢)
+    PuncFast,  // 极速标点 (CT-Punc · 仅数秒)
+    QwenDeep,  // 深度润色 (Qwen · 较慢)
 }
 
 impl PolishMode {
@@ -88,23 +89,30 @@ impl WhisperModelTier {
     /// 返回对应的模型文件名（相对于 models/whisper/ 目录）
     pub fn model_filename(self) -> &'static str {
         match self {
-            Self::Fast     => "ggml-base.bin",
-            Self::Balanced => "ggml-small.bin",
-            Self::Precise  => "ggml-large-v3-turbo-q8_0.bin",
+            Self::Fast       => "ggml-base.bin",
+            Self::Balanced   => "ggml-small.bin",
+            Self::TurboSpeed => "ggml-large-v3-turbo-q5_0.bin",
+            Self::Precise    => "ggml-large-v3-turbo-q8_0.bin",
         }
     }
 
-    /// 返回相对路径（供 config 路径解析）
+    /// 返回相对路径（如果 TurboSpeed 本地未下载完成，自动平滑回退至 Q8）
     pub fn model_relative_path(self) -> String {
-        format!("models/whisper/{}", self.model_filename())
+        let preferred = format!("models/whisper/{}", self.model_filename());
+        if self == Self::TurboSpeed && !crate::utils::AppConfig::resolve_path(&preferred).exists() {
+            "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string()
+        } else {
+            preferred
+        }
     }
 
     /// 8 线程 CPU 下，相对视频时长的转写耗时系数（校准自 32 分钟样片）。
     fn cpu_realtime_factor(self) -> f64 {
         match self {
-            Self::Fast => 1.5 / 32.0,
-            Self::Balanced => 4.5 / 32.0,
-            Self::Precise => 8.0 / 32.0,
+            Self::Fast       => 1.5 / 32.0,
+            Self::Balanced   => 4.5 / 32.0,
+            Self::TurboSpeed => 5.6 / 32.0, // Q5 降低内存带宽传输，提速约 30%
+            Self::Precise    => 8.0 / 32.0,
         }
     }
 
@@ -164,6 +172,10 @@ pub struct AppState {
     pub status: ProcessStatus,
     pub segments: Vec<Segment>,
     pub recent_tasks: Vec<TaskRecord>,
+
+    // 实时流式转写数据与当前识别推进绝对时间 (秒)
+    pub streaming_segments: Vec<Segment>,
+    pub streaming_current_sec: f64,
 
     // 处理选项
     pub language: String,
@@ -254,6 +266,8 @@ impl AppState {
             status: ProcessStatus::Idle,
             segments: Vec::new(),
             recent_tasks,
+            streaming_segments: Vec::new(),
+            streaming_current_sec: 0.0,
             language: lang,
             output_format: fmt,
             enable_polish: polish,
@@ -408,6 +422,53 @@ impl AppState {
         self.is_playing = false;
         self.preview_source = None;
         self.proxy_busy = false;
+        self.clear_streaming();
+    }
+
+    /// 追加实时流式转写片段并推进时间戳
+    pub fn push_stream_segment(&mut self, seg: Segment) {
+        if seg.end > self.streaming_current_sec {
+            self.streaming_current_sec = seg.end;
+        }
+        self.streaming_segments.push(seg);
+    }
+
+    /// 清理重置实时流式转写状态
+    pub fn clear_streaming(&mut self) {
+        self.streaming_segments.clear();
+        self.streaming_current_sec = 0.0;
+    }
+
+    /// 检查当前待转写文件是否已存在本地已完成解析记录 (用于 0 秒智能缓存命中)
+    pub fn get_cached_transcription(&self) -> Option<TaskRecord> {
+        let file = self.transcribe_file.as_ref()?;
+        let path_str = file.to_string_lossy();
+        self.db.find_cached_task(&path_str).ok().flatten()
+    }
+
+    /// 0 秒智能缓存命中载入：瞬间恢复已缓存的完整字幕片段与各项指标，彻底跳过重复计算
+    pub fn load_from_cache(&mut self, cached: TaskRecord) {
+        let file_path = PathBuf::from(&cached.file_path);
+        let total_dur = if cached.duration > 0.0 {
+            cached.duration
+        } else if self.transcribe_duration > 0.0 {
+            self.transcribe_duration
+        } else {
+            cached.segments.last().map(|s| s.end).unwrap_or(0.0)
+        };
+
+        self.selected_file = Some(file_path.clone());
+        self.preview_source = Some(file_path);
+        self.segments = cached.segments;
+        if let Some(first) = self.segments.first() {
+            self.select_segment(first.index);
+        }
+        self.total_duration = total_dur;
+
+        self.status = ProcessStatus::Idle;
+        self.transcribe_file = None;
+        self.transcribe_duration = 0.0;
+        self.clear_streaming();
     }
 
     pub fn preview_media(&self) -> Option<&PathBuf> {

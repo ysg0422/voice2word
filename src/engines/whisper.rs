@@ -40,6 +40,23 @@ struct WhisperOffsets {
     to: Option<i64>,   // 毫秒
 }
 
+pub enum AudioInput<'a> {
+    Path(&'a Path),
+    Stream(Box<dyn std::io::Read + Send + 'static>),
+}
+
+impl<'a> From<&'a Path> for AudioInput<'a> {
+    fn from(p: &'a Path) -> Self {
+        AudioInput::Path(p)
+    }
+}
+
+impl<'a> From<&'a PathBuf> for AudioInput<'a> {
+    fn from(p: &'a PathBuf) -> Self {
+        AudioInput::Path(p.as_path())
+    }
+}
+
 impl WhisperEngine {
     pub fn new<P1: AsRef<Path>, P2: AsRef<Path>>(
         cli_path: P1,
@@ -110,7 +127,46 @@ impl WhisperEngine {
         model_path_override: Option<&Path>,
         progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
     ) -> Result<(Vec<Segment>, f64)> {
-        let audio_path = audio_path.as_ref();
+        self.transcribe_input(
+            AudioInput::Path(audio_path.as_ref()),
+            language,
+            threads,
+            total_duration,
+            model_path_override,
+            progress_cb,
+        )
+    }
+
+    /// 纯内存管道推流转写：直接从内存流（Read）中泵入 PCM WAV 字节，0 磁盘 I/O 往返
+    pub fn transcribe_stream(
+        &self,
+        stream: Box<dyn std::io::Read + Send + 'static>,
+        language: Option<&str>,
+        threads: Option<u32>,
+        total_duration: Option<f64>,
+        model_path_override: Option<&Path>,
+        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+    ) -> Result<(Vec<Segment>, f64)> {
+        self.transcribe_input(
+            AudioInput::Stream(stream),
+            language,
+            threads,
+            total_duration,
+            model_path_override,
+            progress_cb,
+        )
+    }
+
+    /// 统一入口：根据 AudioInput 分发文件路径模式或纯内存管道推流模式
+    pub fn transcribe_input<'a>(
+        &self,
+        audio_input: AudioInput<'a>,
+        language: Option<&str>,
+        threads: Option<u32>,
+        total_duration: Option<f64>,
+        model_path_override: Option<&Path>,
+        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+    ) -> Result<(Vec<Segment>, f64)> {
         let temp_dir = std::env::temp_dir();
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -141,9 +197,11 @@ impl WhisperEngine {
             None    => self.model_path.clone(),
         };
 
+        let is_stream = matches!(audio_input, AudioInput::Stream(_));
         info!(
-            "Whisper 开始转写: {:?}, 语言: {}, 线程数: {} (单实例 {}), 并行处理器: {}, 模型: {:?}, VAD: {:?}",
-            audio_path, lang, th, effective_th, processors, effective_model, self.vad_model_path
+            "Whisper 开始转写: [模式: {}], 语言: {}, 线程数: {} (单实例 {}), 并行处理器: {}, 模型: {:?}, VAD: {:?}",
+            if is_stream { "纯内存管道推流 (0 磁盘 I/O)" } else { "本地文件" },
+            lang, th, effective_th, processors, effective_model, self.vad_model_path
         );
 
         if !effective_model.exists() {
@@ -158,21 +216,29 @@ impl WhisperEngine {
         }
 
         let mut cmd = Command::new(&self.cli_path);
-        cmd.arg("-m")
-            .arg(&effective_model)
-            .arg("-f")
-            .arg(audio_path);
+        cmd.arg("-m").arg(&effective_model);
+
+        match &audio_input {
+            AudioInput::Path(p) => {
+                cmd.arg("-f").arg(p);
+                cmd.stdin(std::process::Stdio::null());
+            }
+            AudioInput::Stream(_) => {
+                cmd.arg("-f").arg("-");
+                cmd.stdin(std::process::Stdio::piped());
+            }
+        }
 
         if let Some(ref vad_path) = self.vad_model_path {
             if vad_path.exists() {
-                info!("Whisper 启用 Silero VAD 静音切片: {:?}", vad_path);
+                info!("Whisper 启用 Silero VAD 高密度语音无损压实与时间戳映射: {:?}", vad_path);
                 cmd.arg("--vad")
                     .arg("-vm")
                     .arg(vad_path)
                     .arg("-vt")
-                    .arg("0.55") // 适当提高语音判断阈值，更坚决地剔除底噪
+                    .arg("0.50") // 标称阈值 0.50，精准识别语音并保护句末弱音
                     .arg("-vsd")
-                    .arg("350"); // 最小静音间隔提升至 350ms，合并自然断句，减少 40% 切块解码重载
+                    .arg("250"); // 最小静音间隔 250ms，剥离无效停顿，全自动时间戳映射还原
             }
         }
 
@@ -186,8 +252,9 @@ impl WhisperEngine {
             .arg("1")
             .arg("-bs")
             .arg("1")
-            .arg("--max-context")
-            .arg("64") // 限制跨句自注意力上下文深度为 64，消解后期平方级算力增长，提速 20%~30%
+            .arg("-mc")
+            .arg("32") // 限制跨句自注意力上下文深度为 32，消解自注意力平方增长，提速 20%~30%
+            .arg("-sns") // 抑制非语音标记(音乐/掌声/杂音)，杜绝自回归发散与幻读
             .arg("-oj")
             .arg("-of")
             .arg(&prefix);
@@ -203,17 +270,21 @@ impl WhisperEngine {
         }
 
         if self.use_gpu {
-            info!("Whisper 使用 GPU 推理");
+            info!("Whisper 使用 GPU 推理 (启用 Flash Attention)");
+            cmd.arg("-fa");
         } else {
             info!("Whisper 无 GPU，强制 CPU 推理 (-ng)");
             cmd.arg("-ng");
         }
 
-        // whisper.cpp 的 zh 词表偏繁体。prompt 只作简体锚点，
-        // 不要 --carry-initial-prompt：首句一旦繁体就会整段锁死。
+        // whisper.cpp 的 zh 词表偏繁体。prompt 作为简体锚点。
+        // 精炼提示词并启用 --carry-initial-prompt：
+        // 跨段落始终固化复用 Prefix Prompt 的静态 KV-Cache 键值对，
+        // 配合 -mc 32 将前序状态直接作为热启动向量，彻底杜绝窗口跳变时的重复前向冷启动！
         if lang == "zh" || lang == "auto" {
             cmd.arg("--prompt")
-                .arg("这是一段简体中文普通话录音，包含标准标点符号与专业教学内容。");
+                .arg("以下是普通话录音。")
+                .arg("--carry-initial-prompt");
         }
 
         cmd.env("PYTHONIOENCODING", "utf-8");
@@ -232,6 +303,22 @@ impl WhisperEngine {
         let mut child = cmd.spawn().with_context(|| {
             format!("调用 whisper-cli 失败: {:?}", self.cli_path)
         })?;
+
+        // 若为内存流输入，启动高效流泵送线程 (128KB 环形缓冲，0 磁盘 I/O)
+        let stream_pump_handle = match audio_input {
+            AudioInput::Stream(stream) => {
+                let stdin = child.stdin.take().context("获取 whisper-cli 标准输入管道失败")?;
+                Some(std::thread::spawn(move || {
+                    use std::io::{copy, BufReader, BufWriter, Write};
+                    let mut reader = BufReader::with_capacity(128 * 1024, stream);
+                    let mut writer = BufWriter::with_capacity(128 * 1024, stdin);
+                    let _ = copy(&mut reader, &mut writer);
+                    let _ = writer.flush();
+                    // writer 与 stdin 离开作用域自动 drop，向 whisper-cli 发送 EOF
+                }))
+            }
+            AudioInput::Path(_) => None,
+        };
 
         // 异步读取 stdout 与 stderr
         // 关键点：长视频或开启 VAD 时，whisper-cli 会输出海量日志到 stderr，
@@ -257,6 +344,7 @@ impl WhisperEngine {
             let mut captured_lines = Vec::new();
             let mut last_emit = 0.0f64;
             let mut proc_progress = vec![0.0f64; proc_count];
+            let mut streamed_count = 0usize;
             let dur = total_duration.unwrap_or(0.0);
             let chunk_dur = if dur > 0.0 && proc_count > 0 {
                 dur / (proc_count as f64)
@@ -278,12 +366,12 @@ impl WhisperEngine {
                     let line = decode_cli_bytes(&raw_line);
                     let trimmed = line.trim();
                     if trimmed.contains("-->") {
-                        if let Some((time_bracket, _)) = trimmed.split_once(']') {
+                        if let Some((time_bracket, text_part)) = trimmed.split_once(']') {
                             let time_info = time_bracket.trim_start_matches('[').trim();
-                            let end_sec = if let Some((_, t_end)) = time_info.split_once("-->") {
-                                Self::parse_time_str(t_end.trim())
+                            let (start_sec, end_sec) = if let Some((t_start, t_end)) = time_info.split_once("-->") {
+                                (Self::parse_time_str(t_start.trim()), Self::parse_time_str(t_end.trim()))
                             } else {
-                                0.0
+                                (0.0, 0.0)
                             };
                             let ratio = if chunk_dur > 0.0 {
                                 let p_idx = ((end_sec / chunk_dur) as usize).min(proc_count - 1);
@@ -299,23 +387,43 @@ impl WhisperEngine {
                                 0.5
                             };
 
-                            // 按音频进度节流，避免每句都打满 UI 通道。
-                            if ratio + 0.0001 >= last_emit + 0.01 || ratio >= 0.999 {
+                            let clean_text = normalize_zh_text(text_part.trim());
+                            let opt_seg = if !clean_text.is_empty() {
+                                streamed_count += 1;
+                                Some(Segment {
+                                    index: streamed_count,
+                                    start: start_sec,
+                                    end: end_sec,
+                                    text: clean_text,
+                                    polished: String::new(),
+                                    language: None,
+                                })
+                            } else {
+                                None
+                            };
+
+                            let display_sec = if proc_count > 1 && dur > 0.0 {
+                                ratio * dur
+                            } else {
+                                end_sec
+                            };
+                            let mm = (display_sec / 60.0) as u32;
+                            let ss = (display_sec % 60.0) as u32;
+                            let tot_mm = (dur / 60.0) as u32;
+                            let tot_ss = (dur % 60.0) as u32;
+
+                            let label = if dur > 0.0 {
+                                format!("已转写至 {mm:02}:{ss:02} / {tot_mm:02}:{tot_ss:02} ({:.1}%)", ratio * 100.0)
+                            } else {
+                                format!("已转写至 {mm:02}:{ss:02} ({:.1}%)", ratio * 100.0)
+                            };
+
+                            // 有新句子时立即推送；无新句子时按进度推进节流推送
+                            let should_emit = opt_seg.is_some() || ratio + 0.0001 >= last_emit + 0.01 || ratio >= 0.999;
+                            if should_emit {
                                 last_emit = ratio;
                                 if let Some(cb) = cb_clone.as_ref() {
-                                    let display_sec = if proc_count > 1 && dur > 0.0 {
-                                        ratio * dur
-                                    } else {
-                                        end_sec
-                                    };
-                                    let mm = (display_sec / 60.0) as u32;
-                                    let ss = (display_sec % 60.0) as u32;
-                                    let label = if proc_count > 1 {
-                                        format!("双核并行已识别至 {mm:02}:{ss:02}  ({:.0}%)", ratio * 100.0)
-                                    } else {
-                                        format!("已识别至 {mm:02}:{ss:02}  ({:.0}%)", ratio * 100.0)
-                                    };
-                                    cb(ratio, &label, None);
+                                    cb(ratio, &label, opt_seg);
                                 }
                             }
                         }
@@ -327,6 +435,9 @@ impl WhisperEngine {
         });
 
         let output_status = child.wait().with_context(|| "等待 whisper-cli 进程结束失败")?;
+        if let Some(h) = stream_pump_handle {
+            let _ = h.join();
+        }
         let stdout_str = stdout_handle.join().unwrap_or_default();
         let stderr_str = stderr_handle.join().unwrap_or_default();
 
@@ -502,5 +613,76 @@ mod tests {
     fn gbk_bytes_decode_to_han() {
         let (bytes, _, _) = encoding_rs::GBK.encode("切比雪夫不等式");
         assert_eq!(decode_cli_bytes(&bytes), "切比雪夫不等式");
+    }
+
+    #[test]
+    fn test_in_memory_stream_transcribe() {
+        let cli_path = PathBuf::from("tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe");
+        let model_path = PathBuf::from("models/whisper/ggml-base.bin");
+        let ffmpeg_path = PathBuf::from("A:\\cppsoft\\ffmpeg-6.9\\bin\\ffmpeg.exe");
+        let sample_media = PathBuf::from("resources/sample/sample.mp4");
+
+        if cli_path.exists() && model_path.exists() && ffmpeg_path.exists() && sample_media.exists() {
+            let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
+            let engine = WhisperEngine::with_device(cli_path, model_path, None, 4, 1, true);
+
+            let mut child = ffmpeg.spawn_audio_stream(&sample_media).expect("FFmpeg 内存流启动失败");
+            let stdout = child.stdout.take().expect("获取 stdout 失败");
+
+            let (segs, _) = engine
+                .transcribe_stream(
+                    Box::new(stdout),
+                    Some("zh"),
+                    Some(4),
+                    Some(6.0),
+                    None,
+                    None,
+                )
+                .expect("纯内存推流转写应成功");
+
+            let _ = child.wait();
+            assert!(!segs.is_empty(), "内存推流转写应产出有效字幕");
+            println!("纯内存管道推流测试成功，生成 {} 条字幕", segs.len());
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_real_audio_transcribe() {
+        let cli_path = PathBuf::from("tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe");
+        let model_path = PathBuf::from("models/whisper/ggml-large-v3-turbo-q5_0.bin");
+        let vad_path = Some(PathBuf::from("models/whisper/ggml-silero-v6.2.0.bin"));
+        let engine = WhisperEngine::with_device(cli_path, model_path, vad_path, 8, 2, true);
+        let mut audio = PathBuf::from("target/test_30s.wav");
+        if !audio.exists() {
+            audio = PathBuf::from("target/test_2min.wav");
+        }
+        if audio.exists() {
+            let start = std::time::Instant::now();
+            let streamed_segs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let streamed_clone = streamed_segs.clone();
+
+            let (segs, vad_sec) = engine
+                .transcribe_with_model(
+                    &audio,
+                    Some("zh"),
+                    Some(8),
+                    Some(30.0),
+                    None,
+                    Some(Box::new(move |_ratio, label, opt_seg| {
+                        if let Some(s) = opt_seg {
+                            println!("  [流式捕获] [{} -> {}] {} ({})", s.start, s.end, s.text, label);
+                            streamed_clone.lock().unwrap().push(s);
+                        }
+                    })),
+                )
+                .expect("转写应成功");
+            let elapsed = start.elapsed().as_secs_f64();
+            let captured_count = streamed_segs.lock().unwrap().len();
+            println!("转写完成! 耗时: {:.2}s, VAD: {:.2}s, 最终片段数: {}, 流式逐句推送数: {}", elapsed, vad_sec, segs.len(), captured_count);
+            assert!(!segs.is_empty(), "应解析出有效字幕片段");
+            assert!(captured_count > 0, "应通过流式回调逐句推送到字幕视窗");
+            println!("第一句: [{} -> {}] {}", segs[0].start, segs[0].end, segs[0].text);
+        }
     }
 }

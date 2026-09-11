@@ -41,6 +41,18 @@ impl MainWindow {
                     .gap_3()
                     .child(
                         if is_processing {
+                            let total_dur = self.state.transcribe_duration;
+                            let cur_sec = self.state.streaming_current_sec;
+                            let cur_mm = (cur_sec / 60.0) as u32;
+                            let cur_ss = (cur_sec % 60.0) as u32;
+                            let tot_mm = (total_dur / 60.0) as u32;
+                            let tot_ss = (total_dur % 60.0) as u32;
+                            let display_ratio = if total_dur > 0.0 && cur_sec > 0.0 {
+                                (cur_sec / total_dur).clamp(0.0, 1.0)
+                            } else {
+                                progress_val.clamp(0.0, 1.0)
+                            };
+
                             div()
                                 .flex()
                                 .flex_col()
@@ -58,6 +70,16 @@ impl MainWindow {
                                                 .child(stage_text.to_string()),
                                         )
                                         .child(
+                                            if total_dur > 0.0 {
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .text_color(Theme::text_secondary())
+                                                    .child(format!("{cur_mm:02}:{cur_ss:02} / {tot_mm:02}:{tot_ss:02}"))
+                                            } else {
+                                                div()
+                                            }
+                                        )
+                                        .child(
                                             div()
                                                 .px_2()
                                                 .py_0p5()
@@ -66,7 +88,7 @@ impl MainWindow {
                                                 .text_size(px(11.0))
                                                 .font_weight(FontWeight::BOLD)
                                                 .text_color(Theme::accent_mint())
-                                                .child(format!("{:.1}%", progress_val * 100.0)),
+                                                .child(format!("{:.1}%", display_ratio * 100.0)),
                                         ),
                                 )
                                 .child(
@@ -79,7 +101,7 @@ impl MainWindow {
                                         .child(
                                             div()
                                                 .h_full()
-                                                .w(relative(progress_val.clamp(0.0, 1.0) as f32))
+                                                .w(relative(display_ratio as f32))
                                                 .rounded_full()
                                                 .bg(Theme::accent_mint()),
                                         ),
