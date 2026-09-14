@@ -1,4 +1,6 @@
-﻿pub mod app;
+#![recursion_limit = "512"]
+
+pub mod app;
 pub mod core;
 pub mod engines;
 pub mod storage;

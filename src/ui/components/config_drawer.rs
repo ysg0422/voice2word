@@ -3,6 +3,7 @@
 use gpui::prelude::*;
 use gpui::*;
 
+use crate::app::state::ProcessStatus;
 use crate::utils::time::format_duration_short;
 use super::super::theme::Theme;
 use super::super::MainWindow;
@@ -10,10 +11,22 @@ use super::super::MainWindow;
 impl MainWindow {
     /// 渲染右侧配置面板 (转写配置与选项：左中右架构之「右」)
     pub(crate) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_sv = self.state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
+        let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
+        let has_file = self.state.transcribe_file.is_some();
+        let fname = self.state.transcribe_file.as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("未选择文件")
+            .to_string();
+        let dur_str = format_duration_short(self.state.transcribe_duration);
+
         div()
             .id("sidebar")
-            .w(px(310.0))
+            .w(px(350.0))
+            .flex_shrink_0()
             .h_full()
+            .overflow_y_scroll()
             .bg(Theme::bg_sidebar())
             .border_l_1()
             .border_color(Theme::border())
@@ -21,37 +34,58 @@ impl MainWindow {
             .flex()
             .flex_col()
             .gap_3()
-            // 面板标头
+            // ── 1. 顶栏标头与引擎指示 ──
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .pb_0p5()
                     .child(
                         div()
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(Theme::text_primary())
-                            .child("转写配置"),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(8.0))
+                                    .h(px(8.0))
+                                    .rounded_full()
+                                    .bg(if is_processing { Theme::accent_orange() } else { Theme::accent_mint() }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(Theme::text_primary())
+                                    .child("转写配置"),
+                            ),
                     )
                     .child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(Theme::text_muted())
-                            .child("Whisper + LLM"),
+                            .px_2()
+                            .py_0p5()
+                            .rounded_full()
+                            .bg(rgb(0x1a1a24))
+                            .border_1()
+                            .border_color(rgb(0x2d2d3a))
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(Theme::text_secondary())
+                            .child(if is_sv { "SenseVoice" } else { "Whisper" }),
                     ),
             )
-            // 媒体文件卡片 (iOS Inset Card)
+            // ── 2. 媒体文件选择与状态卡片 ──
             .child(
                 div()
                     .id("media-select-card")
                     .p_3()
                     .rounded_xl()
-                    .bg(Theme::bg_card())
+                    .bg(rgb(0x181820))
                     .border_1()
-                    .border_color(Theme::border())
+                    .border_color(if has_file { rgba(0x10b98144) } else { Theme::border() })
                     .cursor_pointer()
-                    .hover(|s| s.bg(Theme::bg_hover()))
+                    .hover(|s| s.bg(rgb(0x1f1f2a)).border_color(Theme::border_light()))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.choose_file(cx);
                     }))
@@ -60,17 +94,19 @@ impl MainWindow {
                     .gap_3()
                     .child(
                         div()
-                            .w(px(36.0))
-                            .h(px(36.0))
+                            .w(px(38.0))
+                            .h(px(38.0))
                             .rounded_lg()
-                            .bg(rgb(0x18181e))
+                            .bg(if has_file { rgba(0x38bdf818) } else { rgba(0x10b98114) })
+                            .border_1()
+                            .border_color(if has_file { rgba(0x38bdf833) } else { rgba(0x10b98133) })
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(11.0))
+                            .text_size(px(12.0))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(Theme::text_muted())
-                            .child(if self.state.transcribe_file.is_some() { "FILE" } else { "+" }),
+                            .text_color(if has_file { Theme::accent_blue() } else { Theme::accent_mint() })
+                            .child(if has_file { "FILE" } else { "+" }),
                     )
                     .child(
                         div()
@@ -78,31 +114,37 @@ impl MainWindow {
                             .overflow_hidden()
                             .child(
                                 div()
-                                    .text_size(px(13.0))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::BOLD)
                                     .text_color(Theme::text_primary())
-                                    .child(match &self.state.transcribe_file {
-                                        Some(path) => path
-                                            .file_name()
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("已选择文件")
-                                            .to_string(),
-                                        None => "选择音视频文件".to_string(),
-                                    }),
+                                    .child(if has_file { fname } else { "选择音视频文件".to_string() }),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(Theme::text_muted())
-                                    .child(if self.state.transcribe_file.is_some() {
-                                        format_duration_short(self.state.transcribe_duration)
-                                    } else {
-                                        "点击导入媒体文件".to_string()
-                                    }),
-                            ),
+                            .children(if has_file {
+                                Some(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(Theme::accent_mint())
+                                        .child(format!("时长: {}", dur_str)),
+                                )
+                            } else {
+                                None
+                            }),
+                    )
+                    .child(
+                        div()
+                            .px_2p5()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if has_file { rgb(0x252532) } else { Theme::accent_mint() })
+                            .border_1()
+                            .border_color(if has_file { rgb(0x363646) } else { rgba(0x10b98166) })
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if has_file { Theme::text_secondary() } else { rgb(0x09090b) })
+                            .child(if has_file { "更换" } else { "浏览" }),
                     ),
             )
-            // 转写配置分组卡片 (iOS Inset Group)
+            // ── 3. 核心配置组合面板 ──
             .child(
                 div()
                     .p_3()
@@ -113,13 +155,63 @@ impl MainWindow {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    // ── 模型档位分段器 ──
+                    // ── 3.1 识别引擎与架构选择 ──
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::text_secondary())
+                                            .child("识别引擎与模型架构"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_full()
+                                            .bg(if is_sv { rgba(0x10b98118) } else { rgba(0x6366f118) })
+                                            .border_1()
+                                            .border_color(if is_sv { rgba(0x10b98133) } else { rgba(0x6366f133) })
+                                            .text_size(px(10.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(if is_sv { Theme::accent_mint() } else { Theme::accent_primary() })
+                                            .child(self.state.whisper_model_tier.speed_label()),
+                                    ),
+                            )
+                    // ── 3.3 高级引擎与模型参数卡片 (引导至性能与推理设置) ──
                     .child({
-                        let eta = self.state.whisper_eta_label();
+                        let tier_label = match self.state.whisper_model_tier {
+                            crate::app::WhisperModelTier::SenseVoice => "SenseVoice 42x 极速",
+                            crate::app::WhisperModelTier::Fast => "Whisper Base",
+                            crate::app::WhisperModelTier::Balanced => "Whisper Small",
+                            crate::app::WhisperModelTier::TurboSpeed => "Whisper Turbo Q5",
+                            crate::app::WhisperModelTier::Precise => "Whisper Turbo Q8",
+                        };
+                        let thread_label = format!("{} 线程", self.state.whisper_threads);
+                        let polish_label = if self.state.enable_polish {
+                            if self.state.polish_mode == crate::app::PolishMode::PuncFast { "极速标点" } else { "Qwen 润色" }
+                        } else {
+                            "标点关闭"
+                        };
+
                         div()
+                            .p_3()
+                            .rounded_xl()
+                            .bg(rgb(0x131318))
+                            .border_1()
+                            .border_color(rgb(0x22222c))
                             .flex()
                             .flex_col()
-                            .gap_1p5()
+                            .gap_2()
                             .child(
                                 div()
                                     .flex()
@@ -128,289 +220,131 @@ impl MainWindow {
                                     .child(
                                         div()
                                             .text_size(px(11.0))
-                                            .font_weight(FontWeight::MEDIUM)
+                                            .font_weight(FontWeight::BOLD)
                                             .text_color(Theme::text_secondary())
-                                            .child("识别档位"),
+                                            .child("当前引擎与并发配置"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(10.0))
+                                            .id("btn-nav-to-performance")
+                                            .cursor_pointer()
+                                            .text_size(px(10.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(Theme::accent_mint())
-                                            .child(format!("预估 {eta}")),
+                                            .hover(|s| s.text_color(Theme::accent_primary()))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.state.active_tab = crate::app::WorkspaceTab::Performance;
+                                                cx.notify();
+                                            }))
+                                            .child("调整高级参数 →"),
                                     ),
                             )
                             .child(
                                 div()
-                                    .bg(rgb(0x131317))
-                                    .p(px(2.5))
-                                    .rounded_lg()
-                                    .border_1()
-                                    .border_color(rgb(0x22222a))
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
-                                    .gap(px(2.0))
-                                    .child(self.render_model_tier_pill(
-                                        crate::app::WhisperModelTier::Fast,
-                                        "极速 Base",
-                                        cx,
-                                    ))
-                                    .child(self.render_model_tier_pill(
-                                        crate::app::WhisperModelTier::Balanced,
-                                        "均衡 Small",
-                                        cx,
-                                    ))
-                                    .child(self.render_model_tier_pill(
-                                        crate::app::WhisperModelTier::TurboSpeed,
-                                        "极速 Turbo",
-                                        cx,
-                                    ))
-                                    .child(self.render_model_tier_pill(
-                                        crate::app::WhisperModelTier::Precise,
-                                        "高精 Turbo",
-                                        cx,
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(Theme::text_muted())
-                                    .child(match self.state.whisper_model_tier {
-                                        crate::app::WhisperModelTier::TurboSpeed => "Q5 量化：减小显存带宽瓶颈，提速 25%~30%，适合标准普通话",
-                                        crate::app::WhisperModelTier::Precise => "Q8 旗舰：无损高精，专治口音、吞音、方言与教学专有名词",
-                                        crate::app::WhisperModelTier::Balanced => "Small 模型：资源消耗适中，适合日常普通对话",
-                                        crate::app::WhisperModelTier::Fast => "Base 模型：极小体积，适合极速生成粗略草稿",
-                                    }),
-                            )
-                    })
-                    // 语言分段器
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1p5()
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(Theme::text_secondary())
-                                    .child("识别语言"),
-                            )
-                            .child(
-                                div()
-                                    .bg(rgb(0x131317))
-                                    .p(px(2.5))
-                                    .rounded_lg()
-                                    .border_1()
-                                    .border_color(rgb(0x22222a))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(2.0))
-                                    .child(self.render_option_pill("zh", "中文", cx))
-                                    .child(self.render_option_pill("en", "英文", cx))
-                                    .child(self.render_option_pill("ja", "日文", cx))
-                                    .child(self.render_option_pill("auto", "自动", cx)),
-                            ),
-                    )
-                    // 导出格式分段器
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1p5()
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(Theme::text_secondary())
-                                    .child("导出格式"),
-                            )
-                            .child(
-                                div()
-                                    .bg(rgb(0x131317))
-                                    .p(px(2.5))
-                                    .rounded_lg()
-                                    .border_1()
-                                    .border_color(rgb(0x22222a))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(2.0))
-                                    .child(self.render_format_pill("srt", "SRT", cx))
-                                    .child(self.render_format_pill("ass", "ASS", cx))
-                                    .child(self.render_format_pill("txt", "TXT", cx)),
-                            ),
-                    )
-                    // CPU 线程分段器
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1p5()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
+                                    .gap_1p5()
                                     .child(
                                         div()
-                                            .text_size(px(11.0))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(Theme::text_secondary())
-                                            .child("并发核心"),
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_md()
+                                            .bg(rgb(0x1a1a24))
+                                            .border_1()
+                                            .border_color(rgb(0x282836))
+                                            .text_size(px(10.5))
+                                            .text_color(Theme::text_primary())
+                                            .child(tier_label),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(10.0))
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_md()
+                                            .bg(rgb(0x1a1a24))
+                                            .border_1()
+                                            .border_color(rgb(0x282836))
+                                            .text_size(px(10.5))
+                                            .text_color(Theme::text_primary())
+                                            .child(thread_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_md()
+                                            .bg(rgb(0x1a1a24))
+                                            .border_1()
+                                            .border_color(rgb(0x282836))
+                                            .text_size(px(10.5))
                                             .text_color(Theme::text_muted())
-                                            .child(if self.state.hardware.use_gpu_pipeline() {
-                                                "GPU 推理时线程收益较小"
-                                            } else {
-                                                "更多线程会缩短预估时间"
-                                            }),
+                                            .child(polish_label),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .bg(rgb(0x131317))
-                                    .p(px(2.5))
-                                    .rounded_lg()
-                                    .border_1()
-                                    .border_color(rgb(0x22222a))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(2.0))
-                                    .child(self.render_thread_pill(4, "4核", cx))
-                                    .child(self.render_thread_pill(8, "8核", cx))
-                                    .child(self.render_thread_pill(12, "12核", cx))
-                                    .child(self.render_thread_pill(16, "16核", cx)),
-                            ),
-                    )
-                    // AI 润色开关行 (iOS Switch Row)
-                    .child(
-                        div()
-                            .id("toggle-polish-btn")
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .pt_1()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.enable_polish = !this.state.enable_polish;
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(Theme::text_secondary())
-                                    .child("标点与文本润色"),
-                            )
-                            .child(
-                                div()
-                                    .px_2p5()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(if self.state.enable_polish { Theme::accent_mint() } else { rgb(0x27272a) })
-                                    .text_size(px(10.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(if self.state.enable_polish { rgb(0x09090b) } else { Theme::text_muted() })
-                                    .child(if self.state.enable_polish { "开启" } else { "关闭" }),
-                            ),
-                    )
-                    // 润色模式选择胶囊组 (CT-Punc 极速标点 vs Qwen 大模型深度润色)
-                    .children(if self.state.enable_polish {
-                        let is_punc = self.state.polish_mode == crate::app::PolishMode::PuncFast;
-                        Some(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1p5()
-                                .pt_1()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .text_size(px(11.0))
-                                                .text_color(Theme::text_muted())
-                                                .child("润色引擎模式"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(10.0))
-                                                .text_color(if is_punc { Theme::accent_mint() } else { rgb(0x38bdf8) })
-                                                .child(if is_punc { "约 6 秒" } else { "约 5~6 分钟" }),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .p(px(2.0))
-                                        .rounded_lg()
-                                        .bg(rgb(0x131317))
-                                        .border_1()
-                                        .border_color(rgb(0x22222a))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(2.0))
-                                        .child(
-                                            div()
-                                                .id("select-punc-fast-btn")
-                                                .flex_1()
-                                                .py_1()
-                                                .rounded(px(5.0))
-                                                .bg(if is_punc { rgb(0x1e2e28) } else { rgba(0x00000000) })
-                                                .border_1()
-                                                .border_color(if is_punc { rgba(0x10b98160) } else { rgba(0x00000000) })
-                                                .cursor_pointer()
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.polish_mode = crate::app::PolishMode::PuncFast;
-                                                    cx.notify();
-                                                }))
-                                                .child(
-                                                    div()
-                                                        .text_size(px(11.0))
-                                                        .font_weight(if is_punc { FontWeight::BOLD } else { FontWeight::NORMAL })
-                                                        .text_color(if is_punc { Theme::accent_mint() } else { Theme::text_muted() })
-                                                        .child("极速标点 (推荐)"),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("select-qwen-deep-btn")
-                                                .flex_1()
-                                                .py_1()
-                                                .rounded(px(5.0))
-                                                .bg(if !is_punc { rgb(0x1e2433) } else { rgba(0x00000000) })
-                                                .border_1()
-                                                .border_color(if !is_punc { rgba(0x38bdf860) } else { rgba(0x00000000) })
-                                                .cursor_pointer()
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.polish_mode = crate::app::PolishMode::QwenDeep;
-                                                    cx.notify();
-                                                }))
-                                                .child(
-                                                    div()
-                                                        .text_size(px(11.0))
-                                                        .font_weight(if !is_punc { FontWeight::BOLD } else { FontWeight::NORMAL })
-                                                        .text_color(if !is_punc { rgb(0x38bdf8) } else { Theme::text_muted() })
-                                                        .child("Qwen 润色"),
-                                                ),
-                                        ),
-                                ),
-                        )
-                    } else {
-                        None
                     }),
             )
-            // 硬件与本地模型资源监控对比卡片
+            )
+            // ── 4. 硬件监控看板 ──
             .child(self.render_hardware_monitor_card(cx))
+            // ── 5. 底部主操作 CTA 按钮 (工程级突出呈现) ──
+            .child(
+                div()
+                    .id("sidebar-primary-cta-btn")
+                    .w_full()
+                    .h(px(42.0))
+                    .rounded_xl()
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .bg(if is_processing {
+                        rgb(0xe11d48)
+                    } else if has_file {
+                        Theme::accent_mint()
+                    } else {
+                        rgb(0x23232f)
+                    })
+                    .border_1()
+                    .border_color(if is_processing {
+                        rgba(0xf43f5e66)
+                    } else if has_file {
+                        rgba(0x10b98188)
+                    } else {
+                        rgb(0x323242)
+                    })
+                    .text_size(px(13.5))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(if is_processing {
+                        rgb(0xffffff)
+                    } else if has_file {
+                        rgb(0x09090b)
+                    } else {
+                        Theme::text_muted()
+                    })
+                    .hover(move |s| {
+                        if has_file || is_processing { s.opacity(0.9) } else { s }
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let processing = matches!(this.state.status, ProcessStatus::Processing { .. });
+                        if processing {
+                            this.state.status = ProcessStatus::Idle;
+                            cx.notify();
+                        } else if this.state.transcribe_file.is_some() {
+                            this.start_processing(cx);
+                        } else {
+                            this.choose_file(cx);
+                        }
+                    }))
+                    .child(if is_processing {
+                        "终止转写"
+                    } else if has_file {
+                        "开始转写"
+                    } else {
+                        "选择文件并转写"
+                    }),
+            )
     }
 
     /// 渲染硬件与模型资源监控对比卡片 (CPU / 内存实时对比)
@@ -622,16 +556,18 @@ impl MainWindow {
         div()
             .id(label)
             .flex_1()
-            .h(px(26.0))
+            .h(px(24.0))
             .flex()
             .items_center()
             .justify_center()
             .rounded_md()
-            .text_size(px(11.0))
+            .border_1()
+            .border_color(if is_selected { rgba(0x38bdf888) } else { rgba(0x00000000) })
+            .bg(if is_selected { rgba(0x38bdf826) } else { rgba(0x00000000) })
+            .text_size(px(10.5))
             .cursor_pointer()
-            .bg(if is_selected { rgb(0x2c2c36) } else { rgba(0x00000000) })
-            .font_weight(if is_selected { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
-            .text_color(if is_selected { rgb(0xffffff) } else { Theme::text_secondary() })
+            .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::NORMAL })
+            .text_color(if is_selected { Theme::accent_blue() } else { Theme::text_secondary() })
             .hover(move |s| {
                 if !is_selected { s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary()) } else { s }
             })
@@ -683,52 +619,6 @@ impl MainWindow {
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.state.language = val.to_string();
-                cx.notify();
-            }))
-            .child(label)
-    }
-
-    pub(crate) fn render_format_pill(
-        &mut self,
-        val: &'static str,
-        label: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_selected = self.state.output_format == val;
-        div()
-            .id(val)
-            .flex_1()
-            .h(px(26.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .text_size(px(11.0))
-            .cursor_pointer()
-            .bg(if is_selected {
-                rgb(0x2c2c36)
-            } else {
-                rgba(0x00000000)
-            })
-            .font_weight(if is_selected {
-                FontWeight::SEMIBOLD
-            } else {
-                FontWeight::NORMAL
-            })
-            .text_color(if is_selected {
-                rgb(0xffffff)
-            } else {
-                Theme::text_secondary()
-            })
-            .hover(move |s| {
-                if !is_selected {
-                    s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
-                } else {
-                    s
-                }
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.state.output_format = val.to_string();
                 cx.notify();
             }))
             .child(label)

@@ -27,8 +27,10 @@ pub struct VideoPlayerEngine {
     generation: Arc<AtomicU64>,
     video_proc: Arc<Mutex<Option<Child>>>,
     audio_proc: Arc<Mutex<Option<Child>>>,
+    audio_feeder_proc: Arc<Mutex<Option<Child>>>,
     play_start_instant: Arc<Mutex<Option<Instant>>>,
     play_start_seconds: Arc<Mutex<f64>>,
+    current_frame_index: Arc<AtomicU64>,
 }
 
 impl VideoPlayerEngine {
@@ -59,8 +61,10 @@ impl VideoPlayerEngine {
             generation: Arc::new(AtomicU64::new(0)),
             video_proc: Arc::new(Mutex::new(None)),
             audio_proc: Arc::new(Mutex::new(None)),
+            audio_feeder_proc: Arc::new(Mutex::new(None)),
             play_start_instant: Arc::new(Mutex::new(None)),
             play_start_seconds: Arc::new(Mutex::new(0.0)),
+            current_frame_index: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -85,12 +89,16 @@ impl VideoPlayerEngine {
         if !self.is_playing() {
             return base;
         }
+        let frame_idx = self.current_frame_index.load(Ordering::SeqCst);
         if let Some(instant) = *self
             .play_start_instant
             .lock()
             .unwrap_or_else(|e| e.into_inner())
         {
-            base + instant.elapsed().as_secs_f64()
+            let wall_sec = instant.elapsed().as_secs_f64();
+            let frame_sec = (frame_idx as f64) / 25.0;
+            // 毫秒级锁定画面与字幕：以真实出帧进度为基准，杜绝启动延迟导致的跑飞
+            base + frame_sec.min(wall_sec)
         } else {
             base
         }
@@ -134,6 +142,12 @@ impl VideoPlayerEngine {
                 let _ = child.wait();
             }
         }
+        if let Ok(mut lock) = self.audio_feeder_proc.lock() {
+            if let Some(mut child) = lock.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 
     pub fn play<P: AsRef<Path>>(&self, video_path: P, start_seconds: f64) {
@@ -147,7 +161,6 @@ impl VideoPlayerEngine {
 
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let start_sec_str = format!("{:.3}", start_seconds.max(0.0));
-        let start_instant = Instant::now();
         *self
             .play_start_seconds
             .lock()
@@ -155,25 +168,68 @@ impl VideoPlayerEngine {
         *self
             .play_start_instant
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(start_instant);
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.current_frame_index.store(0, Ordering::SeqCst);
         self.is_playing.store(true, Ordering::SeqCst);
 
+        // 启动音频管线：通过 FFmpeg 容器级关键帧快速寻轨 (100ms 响应，杜绝原生 ffplay 耗费 9.7 秒解码卡死的严重音画脱节)
         if self.ffplay_path.exists() {
-            let mut audio_cmd = Command::new(&self.ffplay_path);
-            audio_cmd
-                .arg("-ss")
-                .arg(&start_sec_str)
-                .arg("-nodisp")
-                .arg("-vn")
-                .arg("-autoexit")
-                .arg("-loglevel")
-                .arg("quiet")
-                .arg("-nostats")
-                .arg(&video_path);
-            apply_no_window(&mut audio_cmd);
-            if let Ok(audio_child) = audio_cmd.spawn() {
-                if let Ok(mut lock) = self.audio_proc.lock() {
-                    *lock = Some(audio_child);
+            let mut feeder_cmd = Command::new(&self.ffmpeg_path);
+            apply_no_window(&mut feeder_cmd);
+            feeder_cmd.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-ss",
+                &start_sec_str,
+                "-i",
+            ])
+            .arg(&video_path)
+            .args([
+                "-vn",
+                "-sn",
+                "-dn",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                "-f",
+                "wav",
+                "pipe:1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+            if let Ok(mut feeder_child) = feeder_cmd.spawn() {
+                if let Some(feeder_stdout) = feeder_child.stdout.take() {
+                    let mut player_cmd = Command::new(&self.ffplay_path);
+                    apply_no_window(&mut player_cmd);
+                    player_cmd.args([
+                        "-nodisp",
+                        "-autoexit",
+                        "-loglevel",
+                        "quiet",
+                        "-nostats",
+                        "-f",
+                        "wav",
+                        "-i",
+                        "pipe:0",
+                    ])
+                    .stdin(feeder_stdout)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+
+                    if let Ok(player_child) = player_cmd.spawn() {
+                        if let Ok(mut lock) = self.audio_proc.lock() {
+                            *lock = Some(player_child);
+                        }
+                        if let Ok(mut lock) = self.audio_feeder_proc.lock() {
+                            *lock = Some(feeder_child);
+                        }
+                    }
                 }
             }
         }
@@ -212,12 +268,15 @@ impl VideoPlayerEngine {
         let frame_target = self.current_frame.clone();
         let is_playing_flag = self.is_playing.clone();
         let generation = self.generation.clone();
+        let play_instant_target = self.play_start_instant.clone();
+        let frame_index_target = self.current_frame_index.clone();
 
         std::thread::Builder::new()
             .name(format!("v2w-preview-{gen}"))
             .spawn(move || {
                 let mut buf = vec![0u8; FRAME_BYTES];
                 let mut frame_index: u64 = 0;
+                let mut active_start: Option<Instant> = None;
                 const FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(40);
 
                 while is_playing_flag.load(Ordering::SeqCst)
@@ -228,8 +287,15 @@ impl VideoPlayerEngine {
                             if generation.load(Ordering::SeqCst) != gen {
                                 break;
                             }
-                            // 墙钟 pacing：解码快了就睡，慢了丢帧追上时钟，避免连点后越播越滞后。
-                            let target_time = start_instant + FRAME_DURATION * (frame_index as u32);
+                            if active_start.is_none() {
+                                let now = Instant::now();
+                                active_start = Some(now);
+                                if let Ok(mut lock) = play_instant_target.lock() {
+                                    *lock = Some(now);
+                                }
+                            }
+                            let start_inst = active_start.unwrap();
+                            let target_time = start_inst + FRAME_DURATION * (frame_index as u32);
                             let now = Instant::now();
                             if target_time > now {
                                 std::thread::sleep(target_time - now);
@@ -237,12 +303,14 @@ impl VideoPlayerEngine {
                                 > FRAME_DURATION * 2
                             {
                                 frame_index += 1;
+                                frame_index_target.store(frame_index, Ordering::SeqCst);
                                 continue;
                             }
                             if let Ok(mut lock) = frame_target.lock() {
                                 *lock = Some(buf.clone());
                             }
                             frame_index += 1;
+                            frame_index_target.store(frame_index, Ordering::SeqCst);
                         }
                         Err(_) => break,
                     }

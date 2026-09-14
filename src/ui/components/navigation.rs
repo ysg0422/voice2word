@@ -16,6 +16,7 @@ impl MainWindow {
         div()
             .id("app-navigation-sidebar")
             .w(px(180.0))
+            .flex_shrink_0()
             .h_full()
             .bg(Theme::bg_sidebar())
             .border_r_1()
@@ -222,45 +223,7 @@ impl MainWindow {
                                 cx.notify();
                             }))
                             .child("性能设置"),
-                    ),
-            )
-            // 底部操作与工程状态
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("nav-quick-export-btn")
-                            .h(px(32.0))
-                            .px_3()
-                            .rounded_full()
-                            .bg(if seg_count > 0 {
-                                rgb(0x242430)
-                            } else {
-                                rgb(0x18181e)
-                            })
-                            .border_1()
-                            .border_color(rgb(0x30303c))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap_2()
-                            .text_size(px(11.5))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(if seg_count > 0 {
-                                Theme::accent_mint()
-                            } else {
-                                Theme::text_muted()
-                            })
-                            .hover(|s| s.bg(rgb(0x2e2e3c)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.export_subtitles(cx);
-                            }))
-                            .child("导出字幕"),
-                    ),
+                    )
             )
     }
 }

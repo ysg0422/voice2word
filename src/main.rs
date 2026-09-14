@@ -1,6 +1,8 @@
 //! Voice2Word — 音视频智能字幕生成器 (Rust + GPUI)
 //! 遵循 Codex / Zed 极简现代设计风格
 
+#![recursion_limit = "512"]
+
 mod app;
 mod core;
 mod engines;
@@ -81,6 +83,35 @@ fn main() -> Result<()> {
         config.pipeline.llm_threads,
     ));
 
+    let sensevoice = {
+        let runner = AppConfig::resolve_path("tools/sensevoice_runner.py");
+        let model = config.paths.sensevoice_model.as_ref().map(|p| AppConfig::resolve_path(p))
+            .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/model.int8.onnx"));
+        let tokens = config.paths.sensevoice_tokens.as_ref().map(|p| AppConfig::resolve_path(p))
+            .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/tokens.txt"));
+        let vad = config.paths.sensevoice_vad.as_ref().map(|p| AppConfig::resolve_path(p))
+            .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/silero_vad.onnx"));
+        if runner.exists() && model.exists() && tokens.exists() && vad.exists() {
+            info!("SenseVoice 极速非自回归语音识别引擎已就绪: {:?}", model);
+            Some(Arc::new(engines::SenseVoiceEngine::new(
+                runner,
+                model,
+                tokens,
+                vad,
+                config.pipeline.whisper_threads,
+            )))
+        } else {
+            warn!(
+                "SenseVoice 引擎未就绪 (runner={}, model={}, tokens={}, vad={})",
+                runner.exists(),
+                model.exists(),
+                tokens.exists(),
+                vad.exists()
+            );
+            None
+        }
+    };
+
     let punc = {
         let runner = AppConfig::resolve_path("tools/punc_runner.py");
         let model = config.paths.punc_model.as_ref().map(|p| AppConfig::resolve_path(p))
@@ -95,7 +126,7 @@ fn main() -> Result<()> {
     };
 
     // 5. 编排流水线管线
-    let pipeline = Arc::new(TaskPipeline::new(ffmpeg, whisper, llm, punc));
+    let pipeline = Arc::new(TaskPipeline::new(ffmpeg, whisper, sensevoice, llm, punc));
 
 
     // 6. 初始化全局应用状态
@@ -108,6 +139,7 @@ fn main() -> Result<()> {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(1080.0), px(720.0))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Voice2Word — 音视频智能字幕生成器".into()),
                     appears_transparent: true,

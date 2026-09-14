@@ -1,11 +1,11 @@
-﻿//! 字幕生成与导出器 (SRT / ASS / TXT)
+//! 字幕生成与导出器 (SRT / ASS / TXT)
 
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use super::segment::Segment;
+use super::segment::{ExportMode, Segment};
 use crate::utils::time::{seconds_to_ass_time, seconds_to_srt_time};
 
 pub struct SubtitleWriter;
@@ -16,26 +16,54 @@ impl SubtitleWriter {
         path: P,
         format: &str,
     ) -> Result<()> {
+        let mode = if segments.iter().any(|s| s.translation.is_some()) {
+            ExportMode::Bilingual
+        } else {
+            ExportMode::RawOnly
+        };
+        Self::write_to_file_with_mode(segments, path, format, mode)
+    }
+
+    pub fn write_to_file_with_mode<P: AsRef<Path>>(
+        segments: &[Segment],
+        path: P,
+        format: &str,
+        mode: ExportMode,
+    ) -> Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         match format.to_lowercase().as_str() {
-            "srt" => Self::write_srt(segments, path),
-            "ass" => Self::write_ass(segments, path),
-            "txt" => Self::write_txt(segments, path),
+            "srt" => Self::write_srt_with_mode(segments, path, mode),
+            "ass" => Self::write_ass_with_mode(segments, path, mode),
+            "txt" => Self::write_txt_with_mode(segments, path, mode),
+            "fcpxml" => super::fcpxml::FcpXmlExporter::write_to_file(segments, path, "Voice2Word Subtitles"),
+            "xml" | "premiere" => super::premiere::PremiereXmlExporter::write_to_file(segments, path, "Voice2Word Subtitles"),
+            "jianying" => {
+                let _ = super::jianying::JianYingExporter::export_to_folder(segments, None, path, "Voice2Word Draft")?;
+                Ok(())
+            }
             other => anyhow::bail!("不支持的字幕格式: {}", other),
         }
     }
 
     /// 生成标准 SRT 格式
     pub fn write_srt<P: AsRef<Path>>(segments: &[Segment], path: P) -> Result<()> {
+        Self::write_srt_with_mode(segments, path, ExportMode::RawOnly)
+    }
+
+    pub fn write_srt_with_mode<P: AsRef<Path>>(
+        segments: &[Segment],
+        path: P,
+        mode: ExportMode,
+    ) -> Result<()> {
         let mut file = File::create(path).with_context(|| "创建 SRT 文件失败")?;
         for (i, seg) in segments.iter().enumerate() {
             let start = seconds_to_srt_time(seg.start);
             let end = seconds_to_srt_time(seg.end);
-            let text = seg.display_text();
+            let text = seg.export_text(mode);
             writeln!(file, "{}", i + 1)?;
             writeln!(file, "{} --> {}", start, end)?;
             writeln!(file, "{}", text)?;
@@ -46,6 +74,14 @@ impl SubtitleWriter {
 
     /// 生成标准 ASS 高级字幕格式
     pub fn write_ass<P: AsRef<Path>>(segments: &[Segment], path: P) -> Result<()> {
+        Self::write_ass_with_mode(segments, path, ExportMode::RawOnly)
+    }
+
+    pub fn write_ass_with_mode<P: AsRef<Path>>(
+        segments: &[Segment],
+        path: P,
+        mode: ExportMode,
+    ) -> Result<()> {
         let mut file = File::create(path).with_context(|| "创建 ASS 文件失败")?;
         let header = r#"[Script Info]
 Title: Voice2Word Subtitle
@@ -65,7 +101,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for seg in segments {
             let start = seconds_to_ass_time(seg.start);
             let end = seconds_to_ass_time(seg.end);
-            let text = seg.display_text().replace('\n', "\\N");
+            let text = seg.export_text(mode).replace('\n', "\\N");
             writeln!(
                 file,
                 "Dialogue: 0,{},{},Default,,0,0,0,,{}",
@@ -77,9 +113,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     /// 生成 TXT 纯文本 (每行一句)
     pub fn write_txt<P: AsRef<Path>>(segments: &[Segment], path: P) -> Result<()> {
+        Self::write_txt_with_mode(segments, path, ExportMode::RawOnly)
+    }
+
+    pub fn write_txt_with_mode<P: AsRef<Path>>(
+        segments: &[Segment],
+        path: P,
+        mode: ExportMode,
+    ) -> Result<()> {
         let mut file = File::create(path).with_context(|| "创建 TXT 文件失败")?;
         for seg in segments {
-            writeln!(file, "{}", seg.display_text())?;
+            writeln!(file, "{}", seg.export_text(mode))?;
         }
         Ok(())
     }

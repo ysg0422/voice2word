@@ -10,7 +10,7 @@ llm_model = "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf"
 [pipeline]
 language = "zh"
 output_format = "srt"
-enable_polish = true
+enable_polish = false
 polish_mode = "punc"
 enable_vad = true
 whisper_threads = 8

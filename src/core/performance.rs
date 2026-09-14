@@ -58,17 +58,17 @@ pub enum UserStrategy {
 impl UserStrategy {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Speed => "速度优先 (Speed)",
-            Self::Balanced => "平衡模式 (Balanced)",
-            Self::Quality => "精度优先 (Quality)",
+            Self::Speed => "速度优先",
+            Self::Balanced => "平衡模式",
+            Self::Quality => "精度优先",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Speed => "适合长视频快速粗剪、会议快速纪要。优先选用轻量模型，大幅缩短耗时。",
-            Self::Balanced => "日常推荐模式。在识别速度与错字准确率之间取得最佳平衡。",
-            Self::Quality => "适合专业课程、公开演讲与高要求字幕制作。选用高精大模型与深度标点纠错。",
+            Self::Speed => "轻量模型 · 优先转写耗时",
+            Self::Balanced => "日常推荐 · 兼顾速度与准确度",
+            Self::Quality => "大模型 · 深度标点与纠错",
         }
     }
 }

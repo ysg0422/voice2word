@@ -53,10 +53,11 @@ pub enum WorkspaceTab {
 /// 模型档位：控制 Whisper 模型大小与量化精度，平衡速度与抗口音能力
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WhisperModelTier {
+    #[default]
+    SenseVoice,  // 阿里 SenseVoice 极速 — model.int8.onnx (非自回归单次出字，极致提速 5~8 倍)
     Fast,        // 极速 Base — ggml-base.bin (39M 参数)
     Balanced,    // 均衡 Small — ggml-small.bin (244M 参数)
     TurboSpeed,  // 极速 Turbo — ggml-large-v3-turbo-q5_0.bin (Q5 破带宽版，提速 25%~30%)
-    #[default]
     Precise,     // 高精 Turbo — ggml-large-v3-turbo-q8_0.bin (Q8 旗舰版，抗口音吞音)
 }
 
@@ -86,9 +87,10 @@ impl PolishMode {
 
 impl WhisperModelTier {
 
-    /// 返回对应的模型文件名（相对于 models/whisper/ 目录）
+    /// 返回对应的模型文件名（相对于 models/whisper/ 或 models/sensevoice/ 目录）
     pub fn model_filename(self) -> &'static str {
         match self {
+            Self::SenseVoice => "model.int8.onnx",
             Self::Fast       => "ggml-base.bin",
             Self::Balanced   => "ggml-small.bin",
             Self::TurboSpeed => "ggml-large-v3-turbo-q5_0.bin",
@@ -98,17 +100,36 @@ impl WhisperModelTier {
 
     /// 返回相对路径（如果 TurboSpeed 本地未下载完成，自动平滑回退至 Q8）
     pub fn model_relative_path(self) -> String {
-        let preferred = format!("models/whisper/{}", self.model_filename());
-        if self == Self::TurboSpeed && !crate::utils::AppConfig::resolve_path(&preferred).exists() {
-            "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string()
-        } else {
-            preferred
+        match self {
+            Self::SenseVoice => "models/sensevoice/model.int8.onnx".to_string(),
+            Self::Fast       => "models/whisper/ggml-base.bin".to_string(),
+            Self::Balanced   => "models/whisper/ggml-small.bin".to_string(),
+            Self::TurboSpeed => {
+                let preferred = "models/whisper/ggml-large-v3-turbo-q5_0.bin".to_string();
+                if !crate::utils::AppConfig::resolve_path(&preferred).exists() {
+                    "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string()
+                } else {
+                    preferred
+                }
+            }
+            Self::Precise    => "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string(),
+        }
+    }
+
+    pub fn speed_label(self) -> &'static str {
+        match self {
+            Self::SenseVoice => "42x 极速",
+            Self::Fast       => "20x 倍速",
+            Self::Balanced   => "7x 倍速",
+            Self::TurboSpeed => "6x 倍速",
+            Self::Precise    => "4x 倍速",
         }
     }
 
     /// 8 线程 CPU 下，相对视频时长的转写耗时系数（校准自 32 分钟样片）。
     fn cpu_realtime_factor(self) -> f64 {
         match self {
+            Self::SenseVoice => 0.4 / 32.0, // 32 分钟实测约 20~25 秒
             Self::Fast       => 1.5 / 32.0,
             Self::Balanced   => 4.5 / 32.0,
             Self::TurboSpeed => 5.6 / 32.0, // Q5 降低内存带宽传输，提速约 30%
@@ -130,23 +151,25 @@ impl WhisperModelTier {
         use_gpu: bool,
         enable_polish: bool,
     ) -> f64 {
-        let media = if duration_sec > 1.0 { duration_sec } else { 32.0 * 60.0 };
+        let media = duration_sec.max(1.0);
         let mut secs = media * self.cpu_realtime_factor();
         let thread_f = Self::thread_time_factor(threads);
-        if use_gpu {
+        if self == Self::SenseVoice {
+            secs *= (4.0 / (threads.max(1) as f64)).powf(0.3).clamp(0.7, 1.3);
+        } else if use_gpu {
             secs *= 0.28 * (0.72 + 0.28 * thread_f);
         } else {
             secs *= thread_f;
         }
-        if enable_polish {
+        if enable_polish && self != Self::SenseVoice {
             secs += (media / 60.0) * 2.4;
         }
-        secs.max(8.0)
+        secs.max(1.0)
     }
 
     pub fn format_eta(seconds: f64) -> String {
         if seconds < 60.0 {
-            format!("约 {:.0} 秒", seconds.max(5.0))
+            format!("约 {:.0} 秒", seconds.max(1.0))
         } else if seconds < 3600.0 {
             let mins = seconds / 60.0;
             if mins < 10.0 {
@@ -185,6 +208,12 @@ pub struct AppState {
     pub whisper_threads: u32,
     pub whisper_model_tier: WhisperModelTier,
 
+    // 字幕翻译相关状态
+    pub is_translating: bool,
+    pub translate_progress: f32,
+    pub translate_status_msg: String,
+    pub translate_target_lang: String,
+
     // 硬件与模型资源监控
     pub metrics: ResourceMetrics,
 
@@ -218,6 +247,32 @@ pub struct AppState {
     pub recommended_profile: crate::core::InferenceProfile,
     pub benchmark_result: Option<crate::core::BenchmarkResult>,
     pub is_benchmarking: bool,
+
+    // 字幕全局样式与排版配置 (模仿 SmartSub & VideoCaptioner)
+    pub subtitle_style: SubtitleStyleConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubtitleStyleConfig {
+    pub font_size: u32,          // 字号 px (18, 24, 28, 32, 36)
+    pub letter_spacing: u32,     // 字间距 px (0, 1, 2, 4, 6)
+    pub line_spacing: f32,       // 行间距 (1.0, 1.2, 1.4, 1.6)
+    pub max_chars_per_line: u32, // 单行最大字数 (12, 16, 20, 24, 28)
+    pub bottom_margin: u32,      // 画面底边距 px (20, 40, 60, 80)
+    pub preset_name: String,     // 预设名称 ("白字黑影", "黄字黑边", "半透明黑框", "电影沉浸")
+}
+
+impl Default for SubtitleStyleConfig {
+    fn default() -> Self {
+        Self {
+            font_size: 24,
+            letter_spacing: 1,
+            line_spacing: 1.2,
+            max_chars_per_line: 16,
+            bottom_margin: 40,
+            preset_name: "白字黑影".to_string(),
+        }
+    }
 }
 
 impl AppState {
@@ -273,7 +328,11 @@ impl AppState {
             enable_polish: polish,
             polish_mode,
             whisper_threads: threads,
-            whisper_model_tier: WhisperModelTier::Precise, // 默认精准档 (turbo)
+            whisper_model_tier: WhisperModelTier::SenseVoice, // 默认阿里 SenseVoice 极速引擎 (42x 极速，32分钟仅约45秒)
+            is_translating: false,
+            translate_progress: 0.0,
+            translate_status_msg: String::new(),
+            translate_target_lang: "简体中文".to_string(),
             metrics: ResourceMetrics::default(),
 
             active_tab: WorkspaceTab::Editor, // 默认主界面为剪辑校对工作台
@@ -298,6 +357,7 @@ impl AppState {
             recommended_profile,
             benchmark_result: None,
             is_benchmarking: false,
+            subtitle_style: SubtitleStyleConfig::default(),
         };
 
         // 如果存在历史记录，启动时自动加载最近一次的工程，避免开屏黑屏或空数据
@@ -361,6 +421,7 @@ impl AppState {
         self.selected_file = Some(PathBuf::from(&task.file_path));
         self.status = ProcessStatus::Idle;
         self.segments = task.segments.clone();
+        crate::subtitle::optimize_segments(&mut self.segments);
         let dur = if task.duration > 0.0 {
             task.duration
         } else {
@@ -476,8 +537,18 @@ impl AppState {
     }
 
     pub fn whisper_eta_label(&self) -> String {
+        let dur = if self.transcribe_duration > 0.0 {
+            self.transcribe_duration
+        } else if self.total_duration > 0.0 {
+            self.total_duration
+        } else {
+            0.0
+        };
+        if dur <= 0.0 {
+            return "--".to_string();
+        }
         let secs = self.whisper_model_tier.estimate_seconds(
-            self.total_duration,
+            dur,
             self.whisper_threads,
             self.hardware.use_gpu_pipeline(),
             self.enable_polish,
@@ -530,10 +601,9 @@ impl AppState {
         let Some(idx) = self.selected_segment_index else { return; };
         let new_text = self.editing_text.trim().to_string();
         if let Some(seg) = self.segments.iter_mut().find(|s| s.index == idx) {
+            seg.text = new_text.clone();
             if !seg.polished.is_empty() {
                 seg.polished = new_text;
-            } else {
-                seg.text = new_text;
             }
         }
         self.sync_segments_to_db();
@@ -549,7 +619,7 @@ impl AppState {
         self.sync_segments_to_db();
     }
 
-    /// 拆分当前选中的字幕片段为两段
+    /// 拆分当前选中的字幕片段为前后两段
     pub fn split_selected_segment(&mut self) {
         let Some(idx) = self.selected_segment_index else { return; };
         let Some(pos) = self.segments.iter().position(|s| s.index == idx) else { return; };
@@ -558,6 +628,9 @@ impl AppState {
 
         let cur_text = orig.display_text().to_string();
         let char_count = cur_text.chars().count();
+        if char_count <= 1 {
+            return;
+        }
         let split_pos = (char_count / 2).max(1);
         let part1: String = cur_text.chars().take(split_pos).collect();
         let part2: String = cur_text.chars().skip(split_pos).collect();
@@ -574,6 +647,7 @@ impl AppState {
             start: mid_time,
             end: orig.end,
             text: part2.clone(),
+            translation: orig.translation.clone(),
             polished: if !orig.polished.is_empty() { part2 } else { String::new() },
             language: orig.language.clone(),
         };

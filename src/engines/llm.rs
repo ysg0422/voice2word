@@ -257,6 +257,98 @@ impl LLMEngine {
         Ok(segments)
     }
 
+    /// 批量翻译字幕片段（从外语/多语言翻译为目标语言，例如简体中文）
+    pub fn translate(
+        &self,
+        mut segments: Vec<Segment>,
+        target_lang: &str,
+        progress_cb: Option<Box<dyn Fn(f64, &str) + Send>>,
+    ) -> Result<Vec<Segment>> {
+        let total = segments.len();
+        info!("LLM 开始将 {} 个字幕片段翻译为 {}", total, target_lang);
+        if let Some(ref cb) = progress_cb {
+            cb(0.0, "正在加载 Qwen 翻译模型，首次启动需要几秒...");
+        }
+        let mut server = self.start_server();
+        if server.is_some() {
+            info!("Qwen 常驻服务已就绪，复用模型进行批量字幕翻译");
+        } else {
+            warn!("Qwen 常驻服务不可用，回退到命令行批量翻译");
+        }
+
+        let mut completed = 0usize;
+        for group in segments.chunks_mut(MAX_SEGMENTS_PER_BATCH) {
+            let group_len = group.len();
+            let batches: Vec<&mut [Segment]> = if group.iter().map(|seg| seg.text.len()).sum::<usize>() > MAX_BATCH_CHARS {
+                group.chunks_mut(MAX_SEGMENTS_PER_BATCH / 2).collect()
+            } else {
+                vec![group]
+            };
+
+            for batch in batches {
+                let results = self.translate_batch(batch, target_lang, server.as_mut());
+                for seg in batch.iter_mut() {
+                    if let Some(trans) = results.get(&seg.index) {
+                        seg.translation = Some(trans.clone());
+                    }
+                }
+            }
+
+            completed += group_len;
+            if let Some(ref cb) = progress_cb {
+                let progress = completed as f64 / total.max(1) as f64;
+                cb(progress, &format!("Qwen 批量翻译中: {}/{}", completed, total));
+            }
+        }
+
+        info!("LLM 全部字幕翻译完成");
+        Ok(segments)
+    }
+
+    fn translate_batch(
+        &self,
+        segments: &[Segment],
+        target_lang: &str,
+        server: Option<&mut LlamaServer>,
+    ) -> std::collections::HashMap<usize, String> {
+        let source_segments = segments
+            .iter()
+            .filter(|seg| !seg.text.trim().is_empty())
+            .collect::<Vec<_>>();
+        if source_segments.is_empty() {
+            return Default::default();
+        }
+
+        let source = source_segments
+            .iter()
+            .map(|seg| format!("[{}] {}", seg.index, seg.text.replace(['\r', '\n'], " ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!(
+            "<|im_start|>system\n你是一个专业字幕翻译专家。将给出的字幕文本准确翻译为地道的{}。保持原意，语言通顺紧凑。必须逐行输出，格式为 [序号] 翻译文本；不解释，不合并，不遗漏。<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            target_lang,
+            source
+        );
+        let max_tokens = (source_segments.len() as u32 * 48).clamp(128, 768);
+        let output = server
+            .and_then(|server| server.complete(&prompt, max_tokens))
+            .or_else(|| self.run_prompt(&prompt, max_tokens));
+        let Some(output) = output else {
+            return Default::default();
+        };
+
+        let expected = source_segments
+            .iter()
+            .map(|seg| seg.index)
+            .collect::<std::collections::HashSet<_>>();
+        let result = Self::parse_batch_response(&output, &expected);
+        if result.len() != source_segments.len() {
+            warn!("Qwen 翻译批量输出不完整 ({}/{} 条)，未匹配条目保持未翻译", result.len(), source_segments.len());
+        }
+        result
+    }
+
+
     /// 通过常驻服务处理一组字幕；服务故障时回退到命令行进程。
     fn polish_batch(
         &self,

@@ -8,7 +8,7 @@ use crate::app::state::ProcessStatus;
 use crate::core::PipelineEvent;
 use crate::subtitle::SubtitleWriter;
 use super::types::CompletionDialogInfo;
-use super::MainWindow;
+use super::{EditorExportFormat, MainWindow};
 
 impl MainWindow {
     /// CPU 机器强制走 H.264 代理；有 GPU 默认原片，用户仍可手动打开。
@@ -301,6 +301,163 @@ impl MainWindow {
         .detach();
     }
 
+    /// 剪映专业版草稿一键直接注入（自动写入本机剪映草稿库，打开剪映即可见）
+    pub(crate) fn export_jianying_local(&mut self, cx: &mut Context<Self>) {
+        if self.state.segments.is_empty() {
+            return;
+        }
+
+        let segments = self.state.segments.clone();
+        let video_path = self.state.selected_file.clone();
+        let stem = self.state.selected_file.as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("Voice2Word")
+            .to_string();
+
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move {
+                crate::subtitle::JianYingExporter::inject_to_local_jianying(
+                    &segments,
+                    video_path.as_deref(),
+                    &stem,
+                )
+            }).await;
+
+            let _ = this.update(cx, |this, cx| {
+                match res {
+                    Ok(draft_path) => {
+                        info!("成功注入剪映草稿: {:?}", draft_path);
+                        let _ = std::process::Command::new("explorer").arg(&draft_path).spawn();
+                        this.state.status = ProcessStatus::Idle;
+                    }
+                    Err(e) => {
+                        tracing::error!("剪映草稿注入失败: {:?}", e);
+                        this.state.status = ProcessStatus::Failed(format!("剪映草稿注入失败: {}", e));
+                    }
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    /// 导出剪映草稿至指定独立文件夹
+    #[allow(dead_code)]
+    pub(crate) fn export_jianying_folder(&mut self, cx: &mut Context<Self>) {
+        if self.state.segments.is_empty() {
+            return;
+        }
+
+        let segments = self.state.segments.clone();
+        let video_path = self.state.selected_file.clone();
+        let stem = self.state.selected_file.as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("Voice2Word")
+            .to_string();
+
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("选择剪映草稿保存目录")
+                .pick_folder()
+                .await;
+            if let Some(folder_handle) = handle {
+                let target_dir = folder_handle.path().join(&stem);
+                let res = cx.background_executor().spawn(async move {
+                    crate::subtitle::JianYingExporter::export_to_folder(
+                        &segments,
+                        video_path.as_deref(),
+                        &target_dir,
+                        &stem,
+                    )
+                }).await;
+
+                let _ = this.update(cx, |this, cx| {
+                    match res {
+                        Ok(p) => {
+                            info!("剪映草稿文件夹导出成功: {:?}", p);
+                            let _ = std::process::Command::new("explorer").arg(&p).spawn();
+                        }
+                        Err(e) => {
+                            this.state.status = ProcessStatus::Failed(format!("剪映草稿导出失败: {}", e));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        }).detach();
+    }
+
+    /// 导出 FCPXML (Final Cut Pro / 达芬奇) 工程文件
+    pub(crate) fn export_fcpxml(&mut self, cx: &mut Context<Self>) {
+        if self.state.segments.is_empty() {
+            return;
+        }
+
+        let segments = self.state.segments.clone();
+        let stem = self.state.selected_file.as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("subtitle")
+            .to_string();
+        let default_name = format!("{}.fcpxml", stem);
+
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_file_name(&default_name)
+                .add_filter("Final Cut Pro XML (*.fcpxml)", &["fcpxml"])
+                .save_file()
+                .await;
+            if let Some(save_handle) = handle {
+                let save_path = save_handle.path().to_path_buf();
+                let res = crate::subtitle::FcpXmlExporter::write_to_file(&segments, &save_path, &stem);
+                let _ = this.update(cx, |this, cx| {
+                    if let Err(e) = res {
+                        this.state.status = ProcessStatus::Failed(format!("导出 FCPXML 失败: {}", e));
+                    } else {
+                        info!("FCPXML 成功导出至: {:?}", save_path);
+                    }
+                    cx.notify();
+                });
+            }
+        }).detach();
+    }
+
+    /// 导出 Adobe Premiere Pro XML (FCP7 XML / xmeml) 工程文件
+    pub(crate) fn export_premiere_xml(&mut self, cx: &mut Context<Self>) {
+        if self.state.segments.is_empty() {
+            return;
+        }
+
+        let segments = self.state.segments.clone();
+        let stem = self.state.selected_file.as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("subtitle")
+            .to_string();
+        let default_name = format!("{}.xml", stem);
+
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_file_name(&default_name)
+                .add_filter("Premiere Pro XML (*.xml)", &["xml"])
+                .save_file()
+                .await;
+            if let Some(save_handle) = handle {
+                let save_path = save_handle.path().to_path_buf();
+                let res = crate::subtitle::PremiereXmlExporter::write_to_file(&segments, &save_path, &stem);
+                let _ = this.update(cx, |this, cx| {
+                    if let Err(e) = res {
+                        this.state.status = ProcessStatus::Failed(format!("导出 Premiere XML 失败: {}", e));
+                    } else {
+                        info!("Premiere XML 成功导出至: {:?}", save_path);
+                    }
+                    cx.notify();
+                });
+            }
+        }).detach();
+    }
+
     /// 使用 FFplay 播放当前视频，并通过 subtitles 滤镜叠加已生成字幕。
     pub(crate) fn play_video(&mut self, cx: &mut Context<Self>) {
         let Some(input_file) = self.state.selected_file.clone() else {
@@ -528,5 +685,101 @@ impl MainWindow {
             }).detach();
             cx.notify();
         }
+    }
+
+    /// 根据当前剪辑工作台选中的格式执行统一导出
+    pub(crate) fn perform_editor_export(&mut self, cx: &mut Context<Self>) {
+        match self.editor_export_format {
+            EditorExportFormat::JianYing => self.export_jianying_local(cx),
+            EditorExportFormat::Fcpxml => self.export_fcpxml(cx),
+            EditorExportFormat::PremiereXml => self.export_premiere_xml(cx),
+            EditorExportFormat::Srt => {
+                self.state.output_format = "srt".to_string();
+                self.export_subtitles(cx);
+            }
+            EditorExportFormat::Ass => {
+                self.state.output_format = "ass".to_string();
+                self.export_subtitles(cx);
+            }
+            EditorExportFormat::Txt => {
+                self.state.output_format = "txt".to_string();
+                self.export_subtitles(cx);
+            }
+            EditorExportFormat::Vtt => {
+                self.state.output_format = "vtt".to_string();
+                self.export_subtitles(cx);
+            }
+        }
+    }
+
+    /// 触发大模型多语言字幕后台流式翻译
+    pub(crate) fn trigger_llm_translation(&mut self, cx: &mut Context<Self>) {
+        if self.state.segments.is_empty() || self.state.is_translating {
+            return;
+        }
+
+        self.state.is_translating = true;
+        self.state.translate_progress = 0.0;
+        self.state.translate_status_msg = "正在初始化 Qwen 翻译引擎...".to_string();
+        cx.notify();
+
+        let segments = self.state.segments.clone();
+        let target_lang = self.state.translate_target_lang.clone();
+        let llama_cli = crate::utils::config::AppConfig::resolve_path(&self.state.config.paths.llama_cli);
+        let llm_model = crate::utils::config::AppConfig::resolve_path(&self.state.config.paths.llm_model);
+        let llm_ctx = self.state.config.pipeline.llm_ctx;
+        let llm_threads = self.state.config.pipeline.llm_threads;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(f64, String)>();
+
+        cx.spawn(async move |this, cx| {
+            let handle = cx.background_executor().spawn(async move {
+                let llm_engine = crate::engines::LLMEngine::new(
+                    llama_cli,
+                    llm_model,
+                    llm_ctx,
+                    llm_threads,
+                );
+                let translate_engine = crate::engines::TranslateEngine::new(llm_engine);
+                let tx_clone = tx.clone();
+                let res = translate_engine.translate_subtitles(
+                    segments,
+                    &target_lang,
+                    Some(Box::new(move |p, msg| {
+                        let _ = tx_clone.send((p, msg.to_string()));
+                    })),
+                );
+                res
+            });
+
+            let progress_this = this.clone();
+            cx.spawn(async move |cx| {
+                while let Some((progress, msg)) = rx.recv().await {
+                    let _ = progress_this.update(cx, |this, cx| {
+                        this.state.translate_progress = progress as f32;
+                        this.state.translate_status_msg = msg;
+                        cx.notify();
+                    });
+                }
+            }).detach();
+
+            let result = handle.await;
+            let _ = this.update(cx, |this, cx| {
+                this.state.is_translating = false;
+                match result {
+                    Ok(translated_segs) => {
+                        info!("字幕多语言翻译成功完成");
+                        this.state.segments = translated_segs;
+                        this.state.translate_status_msg = "翻译已完成".to_string();
+                    }
+                    Err(e) => {
+                        tracing::warn!("字幕多语言翻译过程报错: {}", e);
+                        this.state.translate_status_msg = format!("翻译失败: {}", e);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }

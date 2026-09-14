@@ -56,8 +56,22 @@ async fn test_real_video_pipeline() {
             None
         }
     };
+    let sensevoice = {
+        let runner = AppConfig::resolve_path("tools/sensevoice_runner.py");
+        let model = config.paths.sensevoice_model.as_ref().map(|p| AppConfig::resolve_path(p))
+            .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/model.int8.onnx"));
+        let tokens = config.paths.sensevoice_tokens.as_ref().map(|p| AppConfig::resolve_path(p))
+            .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/tokens.txt"));
+        let vad = config.paths.sensevoice_vad.as_ref().map(|p| AppConfig::resolve_path(p))
+            .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/silero_vad.onnx"));
+        if runner.exists() && model.exists() && tokens.exists() && vad.exists() {
+            Some(Arc::new(voice2word::engines::SenseVoiceEngine::new(runner, model, tokens, vad, 4)))
+        } else {
+            None
+        }
+    };
 
-    let pipeline = Arc::new(TaskPipeline::new(ffmpeg, whisper, llm, punc));
+    let pipeline = Arc::new(TaskPipeline::new(ffmpeg, whisper, sensevoice, llm, punc));
     let video_path = PathBuf::from("testVideo/03.1.3概率不等式.mp4");
     assert!(video_path.exists(), "测试视频必须存在！");
 

@@ -12,16 +12,16 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 use crate::app::state::{WorkspaceTab, ProcessStatus};
 use crate::engines::{PLAYER_HEIGHT, PLAYER_WIDTH};
-use crate::utils::time::{format_duration_short, seconds_to_srt_time};
+use crate::utils::time::{format_duration_short, seconds_to_hms, seconds_to_timestamp};
 use super::theme::Theme;
-use super::MainWindow;
+use super::{EditorExportFormat, MainWindow};
 
 impl MainWindow {
     /// 渲染顶部模式切换栏 (Tab 导航器)
     #[allow(dead_code)]
     pub(crate) fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.state.active_tab;
-        let seg_count = self.state.segments.len();
+        let _seg_count = self.state.segments.len();
 
         div()
             .id("app-tab-bar")
@@ -166,26 +166,6 @@ impl MainWindow {
                             .child("视频库"),
                     ),
             )
-            // 右侧极简导出胶囊按钮
-            .child(
-                div()
-                    .id("quick-export-srt-btn")
-                    .px_3p5()
-                    .py_1()
-                    .rounded_full()
-                    .bg(if seg_count > 0 { Theme::accent_mint() } else { Theme::bg_card() })
-                    .text_color(if seg_count > 0 { rgb(0x09090b) } else { Theme::text_muted() })
-                    .text_size(px(11.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .cursor_pointer()
-                    .hover(|s| s.opacity(0.9))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if !this.state.segments.is_empty() {
-                            this.export_subtitles(cx);
-                        }
-                    }))
-                    .child("导出字幕"),
-            )
     }
 
     /// 渲染类似剪映 / Premiere 风格的剪辑工作区布局 (左中右之 中：视频与时间轴，右：字幕属性)
@@ -257,21 +237,33 @@ impl MainWindow {
                     .flex_1()
                     .w_full()
                     .overflow_hidden()
-                    // 中间区：视频监视器 (flex_1) + 多轨时间轴 (固定高度 230px)
+                    // 左侧：视频监视器 (二分之左 50%)
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .flex_1()
                             .h_full()
-                            .min_w(px(420.0))
+                            .min_w(px(380.0))
+                            .border_r_1()
+                            .border_color(Theme::border())
                             .overflow_hidden()
-                            .child(self.render_video_monitor(cx))
-                            .child(self.render_multitrack_timeline(cx)),
+                            .child(self.render_video_monitor(cx)),
                     )
-                    // 右侧区：字幕属性与错字编辑检查器 (配置和选项)
-                    .child(self.render_subtitle_inspector(cx))
+                    // 右侧：字幕配置与多语言列表 (二分之右 50%)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .h_full()
+                            .min_w(px(460.0))
+                            .overflow_hidden()
+                            .child(self.render_subtitle_inspector(cx)),
+                    ),
             )
+            // 底部：时间轴 (全宽横跨)
+            .child(self.render_multitrack_timeline(cx))
     }
 
     /// 渲染专业视频监视器 (Preview Monitor)
@@ -325,63 +317,11 @@ impl MainWindow {
                                         .text_size(px(10.0))
                                         .text_color(Theme::accent_mint())
                                         .font_weight(FontWeight::MEDIUM)
-                                        .child("播放中 · 25fps")
+                                        .child("播放中")
                                 } else {
                                     div()
                                 }
-                            )
-                            .child({
-                                let gpu = self.state.hardware.use_gpu_pipeline();
-                                let adapter = self.state.hardware.adapter_name.chars().take(18).collect::<String>();
-                                let label = if gpu {
-                                    format!("GPU · {}", adapter)
-                                } else {
-                                    "CPU · 软件渲染".to_string()
-                                };
-                                div()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(if gpu { rgba(0x10b98118) } else { rgba(0xf59e0b18) })
-                                    .text_size(px(10.0))
-                                    .text_color(if gpu { Theme::accent_mint() } else { Theme::accent_orange() })
-                                    .child(label)
-                            })
-                            .child({
-                                let proxy_on = self.state.proxy_enabled;
-                                let busy = self.state.proxy_busy;
-                                let label = if busy {
-                                    "代理生成中…"
-                                } else if proxy_on {
-                                    "代理: 开"
-                                } else {
-                                    "代理: 关"
-                                };
-                                div()
-                                    .id("monitor-proxy-toggle")
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .cursor_pointer()
-                                    .bg(if proxy_on { rgba(0x38bdf822) } else { Theme::bg_card() })
-                                    .border_1()
-                                    .border_color(Theme::border())
-                                    .text_size(px(10.0))
-                                    .text_color(Theme::text_secondary())
-                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.state.proxy_enabled = !this.state.proxy_enabled;
-                                        if this.state.proxy_enabled {
-                                            this.ensure_preview_proxy(cx);
-                                        } else {
-                                            this.state.preview_source = this.state.selected_file.clone();
-                                            this.state.proxy_busy = false;
-                                            this.trigger_extract_frame(cx);
-                                        }
-                                        cx.notify();
-                                    }))
-                                    .child(label)
-                            }),
+                            ),
                     )
                     .child(
                         div()
@@ -515,7 +455,7 @@ impl MainWindow {
             // 监视器底部播放控制器与时间码显示
             .child(
                 div()
-                    .h(px(48.0))
+                    .h(px(52.0))
                     .px_4()
                     .bg(Theme::bg_sidebar())
                     .border_t_1()
@@ -523,162 +463,184 @@ impl MainWindow {
                     .flex()
                     .items_center()
                     .justify_between()
-                    // iOS 紧凑媒体控制条
+                    // 左侧占位 (保证正中间对齐)
                     .child(
                         div()
-                            .bg(rgb(0x16161c))
-                            .p(px(2.5))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(rgb(0x282832))
+                            .flex_1()
                             .flex()
                             .items_center()
-                            .gap(px(2.0))
-                            // 上一句
+                            .justify_start(),
+                    )
+                    // 中间：iOS 紧凑媒体控制条 (居中 + 放大主要播放按钮)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .child(
                                 div()
-                                    .id("ctrl-prev-seg")
-                                    .px_3()
-                                    .py_1()
+                                    .bg(rgb(0x16161c))
+                                    .p(px(3.0))
                                     .rounded_full()
-                                    .cursor_pointer()
-                                    .text_size(px(11.0))
-                                    .text_color(Theme::text_secondary())
-                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.jump_prev_segment(cx);
-                                    }))
-                                    .child("上句"),
-                            )
-                            // 快退 1 秒
-                            .child(
-                                div()
-                                    .id("ctrl-step-back")
-                                    .px_2p5()
-                                    .py_1()
-                                    .rounded_full()
-                                    .cursor_pointer()
-                                    .text_size(px(11.0))
-                                    .text_color(Theme::text_secondary())
-                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.halt_preview_playback();
-                                        let target = (this.state.current_time - 1.0).max(0.0);
-                                        this.state.seek_to(target);
-                                        this.trigger_extract_frame(cx);
-                                        cx.notify();
-                                    }))
-                                    .child("-1s"),
-                            )
-                            // 实时播放 / 暂停 (主要突出胶囊)
-                            .child(
-                                div()
-                                    .id("ctrl-play-pause")
-                                    .px_4()
-                                    .py_1()
-                                    .rounded_full()
-                                    .bg(if is_playing { Theme::accent_orange() } else { Theme::accent_mint() })
-                                    .text_color(rgb(0x09090b))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .cursor_pointer()
-                                    .text_size(px(11.0))
-                                    .hover(|s| s.opacity(0.9))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_play_preview(cx);
-                                    }))
-                                    .child(if is_playing { "暂停" } else { "播放" }),
-                            )
-                            // 快进 1 秒
-                            .child(
-                                div()
-                                    .id("ctrl-step-fwd")
-                                    .px_2p5()
-                                    .py_1()
-                                    .rounded_full()
-                                    .cursor_pointer()
-                                    .text_size(px(11.0))
-                                    .text_color(Theme::text_secondary())
-                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.halt_preview_playback();
-                                        let target = this.state.current_time + 1.0;
-                                        this.state.seek_to(target);
-                                        this.trigger_extract_frame(cx);
-                                        cx.notify();
-                                    }))
-                                    .child("+1s"),
-                            )
-                            // 下一句
-                            .child(
-                                div()
-                                    .id("ctrl-next-seg")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_full()
-                                    .cursor_pointer()
-                                    .text_size(px(11.0))
-                                    .text_color(Theme::text_secondary())
-                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.jump_next_segment(cx);
-                                    }))
-                                    .child("下句"),
+                                    .border_1()
+                                    .border_color(rgb(0x282832))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    // 上一句
+                                    .child(
+                                        div()
+                                            .id("ctrl-prev-seg")
+                                            .px_3p5()
+                                            .py_1p5()
+                                            .rounded_full()
+                                            .cursor_pointer()
+                                            .text_size(px(11.5))
+                                            .text_color(Theme::text_secondary())
+                                            .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.jump_prev_segment(cx);
+                                            }))
+                                            .child("上句"),
+                                    )
+                                    // 快退 1 秒
+                                    .child(
+                                        div()
+                                            .id("ctrl-step-back")
+                                            .px_3()
+                                            .py_1p5()
+                                            .rounded_full()
+                                            .cursor_pointer()
+                                            .text_size(px(11.5))
+                                            .text_color(Theme::text_secondary())
+                                            .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.halt_preview_playback();
+                                                let target = (this.state.current_time - 1.0).max(0.0);
+                                                this.state.seek_to(target);
+                                                this.trigger_extract_frame(cx);
+                                                cx.notify();
+                                            }))
+                                            .child("-1s"),
+                                    )
+                                    // 实时播放 / 暂停 (高亮突出放大按钮)
+                                    .child(
+                                        div()
+                                            .id("ctrl-play-pause")
+                                            .px_6()
+                                            .py_1p5()
+                                            .rounded_full()
+                                            .bg(if is_playing { Theme::accent_orange() } else { Theme::accent_mint() })
+                                            .text_color(rgb(0x09090b))
+                                            .font_weight(FontWeight::BOLD)
+                                            .cursor_pointer()
+                                            .text_size(px(13.0))
+                                            .hover(|s| s.opacity(0.9))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_play_preview(cx);
+                                            }))
+                                            .child(if is_playing { "暂停" } else { "播放" }),
+                                    )
+                                    // 快进 1 秒
+                                    .child(
+                                        div()
+                                            .id("ctrl-step-fwd")
+                                            .px_3()
+                                            .py_1p5()
+                                            .rounded_full()
+                                            .cursor_pointer()
+                                            .text_size(px(11.5))
+                                            .text_color(Theme::text_secondary())
+                                            .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.halt_preview_playback();
+                                                let target = this.state.current_time + 1.0;
+                                                this.state.seek_to(target);
+                                                this.trigger_extract_frame(cx);
+                                                cx.notify();
+                                            }))
+                                            .child("+1s"),
+                                    )
+                                    // 下一句
+                                    .child(
+                                        div()
+                                            .id("ctrl-next-seg")
+                                            .px_3p5()
+                                            .py_1p5()
+                                            .rounded_full()
+                                            .cursor_pointer()
+                                            .text_size(px(11.5))
+                                            .text_color(Theme::text_secondary())
+                                            .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.jump_next_segment(cx);
+                                            }))
+                                            .child("下句"),
+                                    ),
                             ),
                     )
-                    // 右侧时间码 (iOS 胶囊卡片)
+                    // 右侧时间码 (iOS 胶囊卡片，右对齐)
                     .child(
                         div()
-                            .px_3()
-                            .py_1()
-                            .rounded_full()
-                            .bg(rgb(0x16161c))
-                            .border_1()
-                            .border_color(rgb(0x282832))
+                            .flex_1()
                             .flex()
                             .items_center()
-                            .gap_1()
-                            .font_family("Consolas")
-                            .text_size(px(11.0))
+                            .justify_end()
                             .child(
                                 div()
-                                    .text_color(Theme::accent_mint())
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(seconds_to_srt_time(cur_time)),
-                            )
-                            .child(
-                                div()
-                                    .text_color(Theme::text_muted())
-                                    .child("/"),
-                            )
-                            .child(
-                                div()
-                                    .text_color(Theme::text_secondary())
-                                    .child(seconds_to_srt_time(tot_time)),
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_full()
+                                    .bg(rgb(0x16161c))
+                                    .border_1()
+                                    .border_color(rgb(0x282832))
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .font_family("Consolas")
+                                    .text_size(px(11.0))
+                                    .child(
+                                        div()
+                                            .text_color(Theme::accent_mint())
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(seconds_to_hms(cur_time)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(Theme::text_muted())
+                                            .child("/"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(Theme::text_secondary())
+                                            .child(seconds_to_hms(tot_time)),
+                                    ),
                             ),
                     ),
             )
     }
 
     /// 渲染字幕属性检查器与错别字编辑区 (Inspector)
+    /// 渲染字幕属性检查器与多语言配置表格 (Inspector & Table)
     pub(crate) fn render_subtitle_inspector(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let sel_idx = self.state.selected_segment_index;
         let cur_seg = sel_idx.and_then(|idx| self.state.segments.iter().find(|s| s.index == idx)).cloned();
         let cur_text = self.state.editing_text.clone();
+        let is_style_open = self.is_subtitle_style_open;
 
         div()
             .id("editor-subtitle-inspector")
-            .w(px(380.0))
+            .flex_1()
+            .min_w(px(460.0))
             .h_full()
             .bg(Theme::bg_sidebar())
-            .border_l_1()
-            .border_color(Theme::border())
             .flex()
             .flex_col()
             .overflow_hidden()
-            // 标头
+            // ── 顶部标头栏 ──
             .child(
                 div()
-                    .h(px(36.0))
+                    .h(px(40.0))
                     .px_4()
                     .bg(Theme::bg_sidebar())
                     .border_b_1()
@@ -688,410 +650,85 @@ impl MainWindow {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(Theme::text_primary())
-                            .child("字幕编辑"),
+                            .flex()
+                            .items_center()
+                            .gap_2p5()
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(Theme::text_primary())
+                                    .child("字幕配置与多语言列表"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .bg(rgb(0x181820))
+                                    .border_1()
+                                    .border_color(rgb(0x282832))
+                                    .text_size(px(11.0))
+                                    .text_color(Theme::text_secondary())
+                                    .child(if let Some(idx) = sel_idx {
+                                        format!("已选 #{}/共 {} 句", idx, self.state.segments.len())
+                                    } else {
+                                        format!("共 {} 句", self.state.segments.len())
+                                    }),
+                            ),
                     )
                     .child(
                         div()
-                            .px_2p5()
-                            .py_0p5()
-                            .rounded_full()
-                            .bg(rgb(0x181820))
-                            .border_1()
-                            .border_color(rgb(0x282832))
-                            .text_size(px(11.0))
-                            .text_color(Theme::text_secondary())
-                            .child(if let Some(idx) = sel_idx {
-                                format!("{} / {} 句", idx, self.state.segments.len())
-                            } else {
-                                format!("{} 句", self.state.segments.len())
-                            }),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            // 样式排版设置切换开关
+                            .child(
+                                div()
+                                    .id("btn-toggle-subtitle-style")
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(if is_style_open { rgba(0x6366f122) } else { Theme::bg_card() })
+                                    .border_1()
+                                    .border_color(if is_style_open { Theme::accent_primary() } else { Theme::border() })
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(if is_style_open { Theme::accent_primary() } else { Theme::text_secondary() })
+                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.is_subtitle_style_open = !this.is_subtitle_style_open;
+                                        cx.notify();
+                                    }))
+                                    .child(if is_style_open { "收起样式配置" } else { "样式排版配置" }),
+                            ),
                     ),
             )
-            // 属性面板主体
+            // ── 属性面板主体 ──
             .child(
                 div()
                     .flex_1()
                     .overflow_hidden()
-                    .p_4()
+                    .p_3()
                     .flex()
                     .flex_col()
-                    .gap_3()
-                    // 1. 时间戳精确微调卡片 (iOS Inset Card)
+                    .gap_2p5()
+                    // 1. 折叠式全局字幕样式与排版配置卡片
                     .child(
-                        if let Some(ref seg) = cur_seg {
-                            div()
-                                .p_3p5()
-                                .rounded_xl()
-                                .bg(Theme::bg_card())
-                                .border_1()
-                                .border_color(Theme::border())
-                                .flex()
-                                .flex_col()
-                                .gap_2p5()
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(Theme::text_muted())
-                                        .child("时间微调"),
-                                )
-                                // 开始时间微调
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .text_size(px(12.0))
-                                                .text_color(Theme::text_secondary())
-                                                .child(format!("开始: {}", seconds_to_srt_time(seg.start))),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .id("btn-adj-start-m5")
-                                                        .px_2()
-                                                        .py_0p5()
-                                                        .rounded_full()
-                                                        .bg(rgb(0x181820))
-                                                        .border_1()
-                                                        .border_color(rgb(0x282832))
-                                                        .cursor_pointer()
-                                                        .text_size(px(10.0))
-                                                        .text_color(Theme::text_secondary())
-                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.adjust_selected_times(-0.5, 0.0);
-                                                            this.trigger_extract_frame(cx);
-                                                            cx.notify();
-                                                        }))
-                                                        .child("-0.5s"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("btn-adj-start-m1")
-                                                        .px_2()
-                                                        .py_0p5()
-                                                        .rounded_full()
-                                                        .bg(rgb(0x181820))
-                                                        .border_1()
-                                                        .border_color(rgb(0x282832))
-                                                        .cursor_pointer()
-                                                        .text_size(px(10.0))
-                                                        .text_color(Theme::text_secondary())
-                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.adjust_selected_times(-0.1, 0.0);
-                                                            this.trigger_extract_frame(cx);
-                                                            cx.notify();
-                                                        }))
-                                                        .child("-0.1s"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("btn-adj-start-p1")
-                                                        .px_2()
-                                                        .py_0p5()
-                                                        .rounded_full()
-                                                        .bg(rgb(0x181820))
-                                                        .border_1()
-                                                        .border_color(rgb(0x282832))
-                                                        .cursor_pointer()
-                                                        .text_size(px(10.0))
-                                                        .text_color(Theme::text_secondary())
-                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.adjust_selected_times(0.1, 0.0);
-                                                            this.trigger_extract_frame(cx);
-                                                            cx.notify();
-                                                        }))
-                                                        .child("+0.1s"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("btn-adj-start-p5")
-                                                        .px_2()
-                                                        .py_0p5()
-                                                        .rounded_full()
-                                                        .bg(rgb(0x181820))
-                                                        .border_1()
-                                                        .border_color(rgb(0x282832))
-                                                        .cursor_pointer()
-                                                        .text_size(px(10.0))
-                                                        .text_color(Theme::text_secondary())
-                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.adjust_selected_times(0.5, 0.0);
-                                                            this.trigger_extract_frame(cx);
-                                                            cx.notify();
-                                                        }))
-                                                        .child("+0.5s"),
-                                                ),
-                                        ),
-                                )
-                                // 结束时间微调
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .text_size(px(12.0))
-                                                .text_color(Theme::text_secondary())
-                                                .child(format!("结束: {}", seconds_to_srt_time(seg.end))),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .id("btn-adj-end-m5")
-                                                        .px_2()
-                                                        .py_0p5()
-                                                        .rounded_full()
-                                                        .bg(rgb(0x181820))
-                                                        .border_1()
-                                                        .border_color(rgb(0x282832))
-                                                        .cursor_pointer()
-                                                        .text_size(px(10.0))
-                                                        .text_color(Theme::text_secondary())
-                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.adjust_selected_times(0.0, -0.5);
-                                                            this.trigger_extract_frame(cx);
-                                                            cx.notify();
-                                                        }))
-                                                        .child("-0.5s"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("btn-adj-end-m1")
-                                                        .px_2()
-                                                        .py_0p5()
-                                                        .rounded_full()
-                                                        .bg(rgb(0x181820))
-                                                        .border_1()
-                                                        .border_color(rgb(0x282832))
-                                                        .cursor_pointer()
-                                                        .text_size(px(10.0))
-                                                        .text_color(Theme::text_secondary())
-                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.adjust_selected_times(0.0, -0.1);
-                                                            this.trigger_extract_frame(cx);
-                                                            cx.notify();
-                                                        }))
-                                                        .child("-0.1s"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("btn-adj-end-p1")
-                                                        .px_2()
-                                                        .py_0p5()
-                                                        .rounded_full()
-                                                        .bg(rgb(0x181820))
-                                                        .border_1()
-                                                        .border_color(rgb(0x282832))
-                                                        .cursor_pointer()
-                                                        .text_size(px(10.0))
-                                                        .text_color(Theme::text_secondary())
-                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.adjust_selected_times(0.0, 0.1);
-                                                            this.trigger_extract_frame(cx);
-                                                            cx.notify();
-                                                        }))
-                                                        .child("+0.1s"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("btn-adj-end-p5")
-                                                        .px_2()
-                                                        .py_0p5()
-                                                        .rounded_full()
-                                                        .bg(rgb(0x181820))
-                                                        .border_1()
-                                                        .border_color(rgb(0x282832))
-                                                        .cursor_pointer()
-                                                        .text_size(px(10.0))
-                                                        .text_color(Theme::text_secondary())
-                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.adjust_selected_times(0.0, 0.5);
-                                                            this.trigger_extract_frame(cx);
-                                                            cx.notify();
-                                                        }))
-                                                        .child("+0.5s"),
-                                                ),
-                                        ),
-                                )
-                        } else {
-                            div()
-                                .p_4()
-                                .rounded_xl()
-                                .bg(Theme::bg_card())
-                                .border_1()
-                                .border_color(Theme::border())
-                                .text_size(px(12.0))
-                                .text_color(Theme::text_muted())
-                                .child("点击下方时间轴或列表任选一句字幕进行编辑")
-                        }
-                    )
-                    // 2. 文本内容编辑与错字校正卡片 (iOS Inset Card)
-                    .child(
-                        if cur_seg.is_some() {
-                            div()
-                                .p_3p5()
-                                .rounded_xl()
-                                .bg(Theme::bg_card())
-                                .border_1()
-                                .border_color(Theme::border())
-                                .flex()
-                                .flex_col()
-                                .gap_2p5()
-                                .child(
-                                    div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_size(px(11.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(Theme::text_muted())
-                                            .child("字幕文本"),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1p5()
-                                            .child(
-                                                div()
-                                                    .id("btn-popup-edit-text")
-                                                    .px_3()
-                                                    .py_0p5()
-                                                    .rounded_full()
-                                                    .bg(rgba(0x10b98120))
-                                                    .border_1()
-                                                    .border_color(Theme::accent_mint())
-                                                    .cursor_pointer()
-                                                    .text_size(px(11.0))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(Theme::accent_mint())
-                                                    .hover(|s| s.bg(rgba(0x10b98135)))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.prompt_edit_text(cx);
-                                                    }))
-                                                    .child("输入文本"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("btn-paste-clipboard")
-                                                    .px_3()
-                                                    .py_0p5()
-                                                    .rounded_full()
-                                                    .bg(rgb(0x181820))
-                                                    .border_1()
-                                                    .border_color(rgb(0x282832))
-                                                    .cursor_pointer()
-                                                    .text_size(px(11.0))
-                                                    .text_color(Theme::text_secondary())
-                                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        if let Some(item) = cx.read_from_clipboard() {
-                                                            if let Some(text) = item.text() {
-                                                                this.state.editing_text = text;
-                                                                this.state.save_selected_text();
-                                                                cx.notify();
-                                                            }
-                                                        }
-                                                    }))
-                                                    .child("粘贴"),
-                                            ),
-                                    ),
-                                )
-                                // 字幕文本显示与键盘直接键入容器
-                                .child({
-                                    let is_focused = self.is_text_focused;
-                                    div()
-                                        .id("subtitle-text-editor-box")
-                                        .track_focus(&self.text_focus)
-                                        .min_h(px(60.0))
-                                        .p_3()
-                                        .rounded_lg()
-                                        .bg(Theme::bg_sidebar())
-                                        .border_1()
-                                        .border_color(if is_focused { Theme::accent_mint() } else { Theme::border() })
-                                        .cursor_text()
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                            window.focus(&this.text_focus);
-                                            this.is_text_focused = true;
-                                            cx.notify();
-                                        }))
-                                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                                            let key = &event.keystroke.key;
-                                            if event.keystroke.modifiers.control {
-                                                if key == "v" {
-                                                    if let Some(item) = cx.read_from_clipboard() {
-                                                        if let Some(text) = item.text() {
-                                                            this.state.editing_text.push_str(&text);
-                                                            this.state.save_selected_text();
-                                                            cx.notify();
-                                                        }
-                                                    }
-                                                } else if key == "c" {
-                                                    let item = ClipboardItem::new_string(this.state.editing_text.clone());
-                                                    cx.write_to_clipboard(item);
-                                                }
-                                                return;
-                                            }
+                        if is_style_open {
+                            let cur_style = self.state.subtitle_style.clone();
 
-                                            if key == "backspace" {
-                                                this.state.editing_text.pop();
-                                                this.state.save_selected_text();
-                                                cx.notify();
-                                            } else if key == "enter" {
-                                                this.state.save_selected_text();
-                                                this.is_text_focused = false;
-                                                cx.notify();
-                                            } else if key == "space" {
-                                                this.state.editing_text.push(' ');
-                                                this.state.save_selected_text();
-                                                cx.notify();
-                                            } else if key.chars().count() == 1 {
-                                                this.state.editing_text.push_str(key);
-                                                this.state.save_selected_text();
-                                                cx.notify();
-                                            }
-                                        }))
-                                        .text_size(px(14.0))
-                                        .line_height(relative(1.4))
-                                        .text_color(Theme::text_primary())
-                                        .child(if cur_text.is_empty() {
-                                            if is_focused {
-                                                "▌".to_string()
-                                            } else {
-                                                "点击直接输入字幕...".to_string()
-                                            }
-                                        } else {
-                                            if is_focused {
-                                                format!("{}▌", cur_text)
-                                            } else {
-                                                cur_text
-                                            }
-                                        })
-                                })
-                                // 标点快捷修正栏
+                            div()
+                                .p_3()
+                                .rounded_xl()
+                                .bg(Theme::bg_card())
+                                .border_1()
+                                .border_color(Theme::border())
+                                .flex()
+                                .flex_col()
+                                .gap_2p5()
+                                // 卡片标题
                                 .child(
                                     div()
                                         .flex()
@@ -1099,256 +736,687 @@ impl MainWindow {
                                         .justify_between()
                                         .child(
                                             div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(self.render_punct_btn("，", cx))
-                                                .child(self.render_punct_btn("。", cx))
-                                                .child(self.render_punct_btn("？", cx))
-                                                .child(self.render_punct_btn("！", cx))
-                                                .child(self.render_punct_btn("、", cx))
-                                                .child(self.render_punct_btn("“", cx))
-                                                .child(self.render_punct_btn("”", cx)),
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(Theme::text_muted())
+                                                .child("全局字幕样式与排版"),
                                         )
                                         .child(
                                             div()
-                                                .id("btn-del-last-char")
-                                                .px_2p5()
-                                                .py_0p5()
-                                                .rounded_full()
-                                                .bg(rgb(0x181820))
-                                                .border_1()
-                                                .border_color(rgb(0x282832))
-                                                .cursor_pointer()
-                                                .text_size(px(10.0))
-                                                .text_color(Theme::accent_orange())
-                                                .hover(|s| s.bg(Theme::bg_hover()))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.editing_text.pop();
-                                                    this.state.save_selected_text();
-                                                    cx.notify();
-                                                }))
-                                                .child("删末字"),
+                                                .text_size(px(11.0))
+                                                .text_color(Theme::accent_mint())
+                                                .child(format!("当前: {}", cur_style.preset_name)),
                                         ),
                                 )
-                                // 片段操作操作栏：保存、拆分、合并、删除 (iOS 胶囊组)
+                                // 1) 风格预设切牌
                                 .child(
                                     div()
-                                        .pt_1()
                                         .flex()
                                         .items_center()
                                         .gap_2()
                                         .child(
                                             div()
-                                                .id("btn-save-text")
+                                                .text_size(px(11.0))
+                                                .text_color(Theme::text_secondary())
+                                                .child("视觉预设:"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
                                                 .flex_1()
-                                                .h(px(30.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_full()
-                                                .bg(Theme::accent_mint())
-                                                .cursor_pointer()
-                                                .text_size(px(12.0))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(0x09090b))
-                                                .hover(|s| s.opacity(0.9))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.save_selected_text();
-                                                    cx.notify();
+                                                .gap_1p5()
+                                                .children([
+                                                    ("白字黑影", "白字黑影"),
+                                                    ("黄字黑边", "黄字黑边"),
+                                                    ("半透明黑框", "半透明黑框"),
+                                                    ("电影沉浸", "电影沉浸"),
+                                                ].into_iter().enumerate().map(|(idx, (_id_name, label))| {
+                                                    let is_sel = cur_style.preset_name == label;
+                                                    div()
+                                                        .id(("preset-btn", idx))
+                                                        .flex_1()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .cursor_pointer()
+                                                        .text_size(px(11.0))
+                                                        .text_center()
+                                                        .bg(if is_sel { Theme::accent_mint() } else { rgb(0x181820) })
+                                                        .border_1()
+                                                        .border_color(if is_sel { Theme::accent_mint() } else { rgb(0x282832) })
+                                                        .text_color(if is_sel { rgb(0x0a0a0f) } else { Theme::text_secondary() })
+                                                        .hover(|s| if !is_sel { s.bg(Theme::bg_hover()).text_color(Theme::text_primary()) } else { s })
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.state.subtitle_style.preset_name = label.to_string();
+                                                            cx.notify();
+                                                        }))
+                                                        .child(label)
                                                 }))
-                                                .child("保存修改"),
                                         )
-                                        .child(
-                                            div()
-                                                .id("btn-split-seg")
-                                                .px_3p5()
-                                                .h(px(30.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_full()
-                                                .bg(Theme::bg_sidebar())
-                                                .border_1()
-                                                .border_color(Theme::border())
-                                                .cursor_pointer()
-                                                .text_size(px(11.0))
-                                                .text_color(Theme::text_secondary())
-                                                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.split_selected_segment();
-                                                    this.trigger_extract_frame(cx);
-                                                    cx.notify();
-                                                }))
-                                                .child("拆分"),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("btn-merge-seg")
-                                                .px_3p5()
-                                                .h(px(30.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_full()
-                                                .bg(Theme::bg_sidebar())
-                                                .border_1()
-                                                .border_color(Theme::border())
-                                                .cursor_pointer()
-                                                .text_size(px(11.0))
-                                                .text_color(Theme::text_secondary())
-                                                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.merge_selected_with_next();
-                                                    this.trigger_extract_frame(cx);
-                                                    cx.notify();
-                                                }))
-                                                .child("合并"),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("btn-del-seg")
-                                                .px_3()
-                                                .h(px(30.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_full()
-                                                .bg(rgba(0xf43f5e15))
-                                                .border_1()
-                                                .border_color(rgba(0xf43f5e30))
-                                                .cursor_pointer()
-                                                .text_size(px(11.0))
-                                                .text_color(rgb(0xf43f5e))
-                                                .hover(|s| s.bg(rgba(0xf43f5e30)))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.delete_selected_segment();
-                                                    this.trigger_extract_frame(cx);
-                                                    cx.notify();
-                                                }))
-                                                .child("删除"),
-                                        ),
                                 )
+                                // 2) 参数快捷组 (字间距, 字号, 底边距, 单行字数)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_3()
+                                        // 字号
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(div().text_size(px(10.5)).text_color(Theme::text_secondary()).child("字号:"))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .flex()
+                                                        .gap_1()
+                                                        .children([18, 24, 28, 32].into_iter().map(|val| {
+                                                            let is_sel = cur_style.font_size == val;
+                                                            div()
+                                                                .id(("font-sz", val))
+                                                                .flex_1()
+                                                                .py_0p5()
+                                                                .rounded_md()
+                                                                .cursor_pointer()
+                                                                .text_size(px(10.5))
+                                                                .text_center()
+                                                                .bg(if is_sel { Theme::accent_mint() } else { rgb(0x181820) })
+                                                                .border_1()
+                                                                .border_color(if is_sel { Theme::accent_mint() } else { rgb(0x282832) })
+                                                                .text_color(if is_sel { rgb(0x0a0a0f) } else { Theme::text_secondary() })
+                                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                                    this.state.subtitle_style.font_size = val;
+                                                                    cx.notify();
+                                                                }))
+                                                                .child(format!("{}", val))
+                                                        }))
+                                                )
+                                        )
+                                        // 字间距
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(div().text_size(px(10.5)).text_color(Theme::text_secondary()).child("间距:"))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .flex()
+                                                        .gap_1()
+                                                        .children([0, 1, 2, 4].into_iter().map(|val| {
+                                                            let is_sel = cur_style.letter_spacing == val;
+                                                            div()
+                                                                .id(("letter-sp", val))
+                                                                .flex_1()
+                                                                .py_0p5()
+                                                                .rounded_md()
+                                                                .cursor_pointer()
+                                                                .text_size(px(10.5))
+                                                                .text_center()
+                                                                .bg(if is_sel { Theme::accent_mint() } else { rgb(0x181820) })
+                                                                .border_1()
+                                                                .border_color(if is_sel { Theme::accent_mint() } else { rgb(0x282832) })
+                                                                .text_color(if is_sel { rgb(0x0a0a0f) } else { Theme::text_secondary() })
+                                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                                    this.state.subtitle_style.letter_spacing = val;
+                                                                    cx.notify();
+                                                                }))
+                                                                .child(format!("{}px", val))
+                                                        }))
+                                                )
+                                        )
+                                        // 底边距
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(div().text_size(px(10.5)).text_color(Theme::text_secondary()).child("底距:"))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .flex()
+                                                        .gap_1()
+                                                        .children([20, 40, 60, 80].into_iter().map(|val| {
+                                                            let is_sel = cur_style.bottom_margin == val;
+                                                            div()
+                                                                .id(("bot-mg", val))
+                                                                .flex_1()
+                                                                .py_0p5()
+                                                                .rounded_md()
+                                                                .cursor_pointer()
+                                                                .text_size(px(10.5))
+                                                                .text_center()
+                                                                .bg(if is_sel { Theme::accent_mint() } else { rgb(0x181820) })
+                                                                .border_1()
+                                                                .border_color(if is_sel { Theme::accent_mint() } else { rgb(0x282832) })
+                                                                .text_color(if is_sel { rgb(0x0a0a0f) } else { Theme::text_secondary() })
+                                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                                    this.state.subtitle_style.bottom_margin = val;
+                                                                    cx.notify();
+                                                                }))
+                                                                .child(format!("{}", val))
+                                                        }))
+                                                )
+                                        )
+                                )
+                                .into_any_element()
                         } else {
-                            div()
+                            div().into_any_element()
                         }
                     )
-                    // 3. 字幕速查微缩列表 (iOS Inset List)
-                    .child({
-                        let total_segs = self.state.segments.len();
-                        let focus_idx = sel_idx.or_else(|| self.state.get_active_segment().map(|s| s.index)).unwrap_or(1);
-                        let window_size = if total_segs > 1000 {
-                            4
-                        } else if total_segs > 100 {
-                            6
-                        } else {
-                            10
-                        };
-                        let start_idx = focus_idx.saturating_sub(window_size / 2).max(1);
-                        let end_idx = (start_idx + window_size).min(total_segs);
-                        let visible_segments: Vec<_> = self.state.segments.iter()
-                            .filter(|s| s.index >= start_idx && s.index <= end_idx)
-                            .cloned()
-                            .collect();
+                    // 2. 选中文段快速编辑与微调条 (选中时呈现)
+                    .child(
+                        if let Some(ref seg) = cur_seg {
+                            let seg_idx = seg.index;
+                            let start_ts = seconds_to_timestamp(seg.start);
+                            let end_ts = seconds_to_timestamp(seg.end);
+                            let dur = seg.duration();
 
+                            div()
+                                .p_3()
+                                .rounded_xl()
+                                .bg(Theme::bg_card())
+                                .border_1()
+                                .border_color(Theme::border())
+                                .flex()
+                                .flex_col()
+                                .gap_2p5()
+                                // 第一行：文段编号、时间范围与右侧主操作按钮组 (保存修改、弹窗编辑、删除)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py_0p5()
+                                                        .rounded_md()
+                                                        .bg(rgba(0x10b98120))
+                                                        .text_size(px(11.0))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(Theme::accent_mint())
+                                                        .child(format!("#{:03}", seg_idx)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family("Consolas")
+                                                        .text_size(px(11.5))
+                                                        .text_color(Theme::text_secondary())
+                                                        .child(format!("{} - {} ({:.2}s)", start_ts, end_ts, dur)),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .flex_shrink_0()
+                                                .child(
+                                                    div()
+                                                        .id("btn-open-prompt-edit")
+                                                        .px_2p5()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .bg(rgb(0x181820))
+                                                        .border_1()
+                                                        .border_color(rgb(0x282832))
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.prompt_edit_text(cx);
+                                                        }))
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(11.0))
+                                                                .text_color(Theme::text_secondary())
+                                                                .child("弹窗编辑"),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("btn-save-text-top")
+                                                        .px_3()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .bg(Theme::accent_mint())
+                                                        .cursor_pointer()
+                                                        .text_size(px(11.0))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(rgb(0x09090b))
+                                                        .hover(|s| s.opacity(0.9))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.state.save_selected_text();
+                                                            cx.notify();
+                                                        }))
+                                                        .child("保存修改"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("btn-del-seg")
+                                                        .px_2p5()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .bg(rgba(0xf43f5e15))
+                                                        .border_1()
+                                                        .border_color(rgba(0xf43f5e30))
+                                                        .cursor_pointer()
+                                                        .text_size(px(11.0))
+                                                        .text_color(rgb(0xf43f5e))
+                                                        .hover(|s| s.bg(rgba(0xf43f5e30)))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.state.delete_selected_segment();
+                                                            this.trigger_extract_frame(cx);
+                                                            cx.notify();
+                                                        }))
+                                                        .child("删除"),
+                                                ),
+                                        ),
+                                )
+                                // 第二行：全宽行内交互输入框 (宽敞易读，不拥挤)
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .child({
+                                            let is_focused = self.is_text_focused;
+                                            let total_chars = cur_text.chars().count();
+                                            let cursor_pos = self.text_cursor_pos.min(total_chars);
+
+                                            div()
+                                                .id("subtitle-text-editor-box")
+                                                .w_full()
+                                                .track_focus(&self.text_focus)
+                                                .min_h(px(34.0))
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_lg()
+                                                .bg(Theme::bg_sidebar())
+                                                .border_1()
+                                                .border_color(if is_focused { Theme::accent_mint() } else { Theme::border() })
+                                                .cursor_text()
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                    window.focus(&this.text_focus);
+                                                    this.is_text_focused = true;
+                                                    cx.notify();
+                                                }))
+                                                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                                    let key = &event.keystroke.key;
+                                                    let total_chars = this.state.editing_text.chars().count();
+                                                    let cursor = this.text_cursor_pos.min(total_chars);
+
+                                                    if event.keystroke.modifiers.control {
+                                                        if key == "v" {
+                                                            if let Some(item) = cx.read_from_clipboard() {
+                                                                if let Some(text) = item.text() {
+                                                                    let mut chars: Vec<char> = this.state.editing_text.chars().collect();
+                                                                    let insert_chars: Vec<char> = text.chars().collect();
+                                                                    let ins_len = insert_chars.len();
+                                                                    chars.splice(cursor..cursor, insert_chars);
+                                                                    this.state.editing_text = chars.into_iter().collect();
+                                                                    this.text_cursor_pos = cursor + ins_len;
+                                                                    this.state.save_selected_text();
+                                                                    cx.notify();
+                                                                }
+                                                            }
+                                                        } else if key == "c" {
+                                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(this.state.editing_text.clone()));
+                                                            return;
+                                                        } else if key == "a" {
+                                                            this.text_cursor_pos = total_chars;
+                                                            cx.notify();
+                                                            return;
+                                                        }
+                                                        return;
+                                                    }
+
+                                                    if key == "backspace" {
+                                                        if cursor > 0 && total_chars > 0 {
+                                                            let mut chars: Vec<char> = this.state.editing_text.chars().collect();
+                                                            chars.remove(cursor - 1);
+                                                            this.state.editing_text = chars.into_iter().collect();
+                                                            this.text_cursor_pos = cursor - 1;
+                                                            this.state.save_selected_text();
+                                                            cx.notify();
+                                                        }
+                                                    } else if key == "delete" {
+                                                        if cursor < total_chars {
+                                                            let mut chars: Vec<char> = this.state.editing_text.chars().collect();
+                                                            chars.remove(cursor);
+                                                            this.state.editing_text = chars.into_iter().collect();
+                                                            this.state.save_selected_text();
+                                                            cx.notify();
+                                                        }
+                                                    } else if key == "left" {
+                                                        if cursor > 0 {
+                                                            this.text_cursor_pos = cursor - 1;
+                                                            cx.notify();
+                                                        }
+                                                    } else if key == "right" {
+                                                        if cursor < total_chars {
+                                                            this.text_cursor_pos = cursor + 1;
+                                                            cx.notify();
+                                                        }
+                                                    } else if key == "home" {
+                                                        this.text_cursor_pos = 0;
+                                                        cx.notify();
+                                                    } else if key == "end" {
+                                                        this.text_cursor_pos = total_chars;
+                                                        cx.notify();
+                                                    } else if key == "enter" {
+                                                        this.state.save_selected_text();
+                                                        cx.notify();
+                                                    } else if key.chars().count() == 1 {
+                                                        let ch = key.chars().next().unwrap();
+                                                        if !ch.is_control() {
+                                                            let mut chars: Vec<char> = this.state.editing_text.chars().collect();
+                                                            chars.insert(cursor, ch);
+                                                            this.state.editing_text = chars.into_iter().collect();
+                                                            this.text_cursor_pos = cursor + 1;
+                                                            this.state.save_selected_text();
+                                                            cx.notify();
+                                                        }
+                                                    }
+                                                }))
+                                                .flex()
+                                                .flex_wrap()
+                                                .items_center()
+                                                .text_size(px(13.0))
+                                                .text_color(Theme::text_primary())
+                                                .child(if cur_text.is_empty() {
+                                                    div().child(if is_focused { "▌".to_string() } else { "点击直接输入字幕...".to_string() })
+                                                } else {
+                                                    div()
+                                                        .flex()
+                                                        .flex_wrap()
+                                                        .items_center()
+                                                        .children(cur_text.chars().enumerate().map(|(idx, ch)| {
+                                                            let show_cursor = is_focused && cursor_pos == idx;
+                                                            let ch_str = ch.to_string();
+                                                            div()
+                                                                .id(("text-char", idx))
+                                                                .cursor_text()
+                                                                .flex()
+                                                                .items_center()
+                                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                                                    window.focus(&this.text_focus);
+                                                                    this.is_text_focused = true;
+                                                                    this.text_cursor_pos = idx;
+                                                                    cx.notify();
+                                                                }))
+                                                                .child(if show_cursor {
+                                                                    div()
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .child(
+                                                                            div()
+                                                                                .text_color(Theme::accent_mint())
+                                                                                .font_weight(FontWeight::BOLD)
+                                                                                .child("▌"),
+                                                                        )
+                                                                        .child(ch_str)
+                                                                } else {
+                                                                    div().child(ch_str)
+                                                                })
+                                                        }))
+                                                        .child(if is_focused && cursor_pos == total_chars {
+                                                            div()
+                                                                .cursor_text()
+                                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                                                    window.focus(&this.text_focus);
+                                                                    this.is_text_focused = true;
+                                                                    this.text_cursor_pos = total_chars;
+                                                                    cx.notify();
+                                                                }))
+                                                                .text_color(Theme::accent_mint())
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .child("▌")
+                                                        } else {
+                                                            div()
+                                                        })
+                                                })
+                                        })
+                                )
+                                // 第三行：时间微调按钮组与快捷标点注入 (紧凑规整，不遮挡)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        // 左侧：时间微调
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(10.5))
+                                                        .text_color(Theme::text_muted())
+                                                        .child("微调:"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("fine-tune-start-minus")
+                                                        .px_1p5()
+                                                        .py_0p5()
+                                                        .rounded(px(4.0))
+                                                        .bg(rgb(0x1a1a24))
+                                                        .border_1()
+                                                        .border_color(rgb(0x282836))
+                                                        .cursor_pointer()
+                                                        .text_size(px(10.5))
+                                                        .text_color(Theme::text_muted())
+                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.state.adjust_selected_times(-0.1, 0.0);
+                                                            cx.notify();
+                                                        }))
+                                                        .child("起-0.1s"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("fine-tune-start-plus")
+                                                        .px_1p5()
+                                                        .py_0p5()
+                                                        .rounded(px(4.0))
+                                                        .bg(rgb(0x1a1a24))
+                                                        .border_1()
+                                                        .border_color(rgb(0x282836))
+                                                        .cursor_pointer()
+                                                        .text_size(px(10.5))
+                                                        .text_color(Theme::text_muted())
+                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.state.adjust_selected_times(0.1, 0.0);
+                                                            cx.notify();
+                                                        }))
+                                                        .child("起+0.1s"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("fine-tune-end-minus")
+                                                        .px_1p5()
+                                                        .py_0p5()
+                                                        .rounded(px(4.0))
+                                                        .bg(rgb(0x1a1a24))
+                                                        .border_1()
+                                                        .border_color(rgb(0x282836))
+                                                        .cursor_pointer()
+                                                        .text_size(px(10.5))
+                                                        .text_color(Theme::text_muted())
+                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.state.adjust_selected_times(0.0, -0.1);
+                                                            cx.notify();
+                                                        }))
+                                                        .child("止-0.1s"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("fine-tune-end-plus")
+                                                        .px_1p5()
+                                                        .py_0p5()
+                                                        .rounded(px(4.0))
+                                                        .bg(rgb(0x1a1a24))
+                                                        .border_1()
+                                                        .border_color(rgb(0x282836))
+                                                        .cursor_pointer()
+                                                        .text_size(px(10.5))
+                                                        .text_color(Theme::text_muted())
+                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.state.adjust_selected_times(0.0, 0.1);
+                                                            cx.notify();
+                                                        }))
+                                                        .child("止+0.1s"),
+                                                ),
+                                        )
+                                        // 右侧：快捷标点注入
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(10.5))
+                                                        .text_color(Theme::text_muted())
+                                                        .child("标点:"),
+                                                )
+                                                .child(self.render_punct_btn("，", cx))
+                                                .child(self.render_punct_btn("。", cx))
+                                                .child(self.render_punct_btn("？", cx))
+                                                .child(self.render_punct_btn("！", cx))
+                                                .child(self.render_punct_btn("、", cx)),
+                                        ),
+                                )
+                                .into_any_element()
+                        } else {
+                            div().into_any_element()
+                        }
+                    )
+                    // 3. 多语言字幕配置与对照大表格 (图二风格)
+                    .child(
                         div()
+                            .flex_1()
+                            .min_h(px(200.0))
+                            .rounded_xl()
+                            .bg(Theme::bg_card())
+                            .border_1()
+                            .border_color(Theme::border())
                             .flex()
                             .flex_col()
-                            .gap_1p5()
+                            .overflow_hidden()
+                            // 表头 (图二标准规格)
                             .child(
                                 div()
+                                    .w_full()
+                                    .h(px(36.0))
+                                    .bg(rgb(0x16161d))
+                                    .border_b_1()
+                                    .border_color(Theme::border())
                                     .flex()
                                     .items_center()
-                                    .justify_between()
+                                    .px_3()
+                                    .gap_3()
+                                    // 序号
                                     .child(
                                         div()
-                                            .text_size(px(11.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .w(px(36.0))
+                                            .text_center()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::BOLD)
                                             .text_color(Theme::text_muted())
-                                            .child(format!(
-                                                "字幕列表 ({}-{} / {})",
-                                                start_idx, end_idx, total_segs
-                                            )),
+                                            .child("#"),
                                     )
+                                    // 开始时间
                                     .child(
                                         div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .id("list-jump-prev-10")
-                                                    .px_2p5()
-                                                    .py_0p5()
-                                                    .rounded_full()
-                                                    .bg(rgb(0x181820))
-                                                    .border_1()
-                                                    .border_color(rgb(0x282832))
-                                                    .cursor_pointer()
-                                                    .text_size(px(10.0))
-                                                    .text_color(Theme::text_secondary())
-                                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        let target = focus_idx.saturating_sub(10).max(1);
-                                                        this.state.select_segment(target);
-                                                        this.trigger_extract_frame(cx);
-                                                        cx.notify();
-                                                    }))
-                                                    .child("-10句"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("list-jump-next-10")
-                                                    .px_2p5()
-                                                    .py_0p5()
-                                                    .rounded_full()
-                                                    .bg(rgb(0x181820))
-                                                    .border_1()
-                                                    .border_color(rgb(0x282832))
-                                                    .cursor_pointer()
-                                                    .text_size(px(10.0))
-                                                    .text_color(Theme::text_secondary())
-                                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        let target = (focus_idx + 10).min(total_segs);
-                                                        this.state.select_segment(target);
-                                                        this.trigger_extract_frame(cx);
-                                                        cx.notify();
-                                                    }))
-                                                    .child("+10句"),
-                                            ),
+                                            .w(px(92.0))
+                                            .text_center()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::text_muted())
+                                            .child("开始时间"),
+                                    )
+                                    // 结束时间
+                                    .child(
+                                        div()
+                                            .w(px(92.0))
+                                            .text_center()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::text_muted())
+                                            .child("结束时间"),
+                                    )
+                                    // 字幕内容
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(110.0))
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::text_muted())
+                                            .child("字幕内容"),
+                                    )
+                                    // 翻译字幕
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(110.0))
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::text_muted())
+                                            .child("翻译字幕"),
                                     ),
                             )
+                            // 表格行内容 (可流畅上下滚动)
                             .child(
                                 div()
                                     .id("inspector-segments-scroll")
-                                    .h(px(180.0))
-                                    .overflow_hidden()
-                                    .border_1()
-                                    .border_color(Theme::border())
-                                    .rounded_xl()
-                                    .bg(Theme::bg_card())
-                                    .flex()
-                                    .flex_col()
-                                    .children(visible_segments.into_iter().map(|seg| {
+                                    .flex_1()
+                                    .overflow_y_scroll()
+                                    .w_full()
+                                    .children(self.state.segments.iter().map(|seg| {
                                         let seg_idx = seg.index;
                                         let is_selected = sel_idx == Some(seg_idx);
                                         let is_playing_here = self.state.current_time >= seg.start && self.state.current_time <= seg.end;
+                                        let start_ts = seconds_to_timestamp(seg.start);
+                                        let end_ts = seconds_to_timestamp(seg.end);
+                                        let raw_text = seg.text.clone();
+                                        let trans_text = seg.translation.as_deref().unwrap_or("—").to_string();
+
                                         div()
-                                            .id(("insp-seg-item", seg_idx))
-                                            .px_2p5()
-                                            .py_1p5()
+                                            .id(("table-row-seg", seg_idx))
+                                            .w_full()
+                                            .min_h(px(40.0))
+                                            .px_3()
+                                            .py_2()
                                             .border_b_1()
-                                            .border_color(Theme::border())
+                                            .border_color(rgb(0x1e1e26))
                                             .cursor_pointer()
                                             .bg(if is_selected {
-                                                Theme::bg_hover()
+                                                rgba(0x10b9811c)
                                             } else if is_playing_here {
-                                                rgba(0x10b98118)
+                                                rgba(0x6366f116)
                                             } else {
                                                 rgba(0x00000000)
                                             })
-                                            .hover(|s| s.bg(Theme::bg_hover()))
+                                            .hover(|s| s.bg(if is_selected { rgba(0x10b98128) } else { Theme::bg_hover() }))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.state.select_segment(seg_idx);
                                                 this.trigger_extract_frame(cx);
@@ -1356,45 +1424,207 @@ impl MainWindow {
                                             }))
                                             .flex()
                                             .items_center()
-                                            .gap_2()
+                                            .gap_3()
+                                            // 序号
                                             .child(
                                                 div()
-                                                    .w(px(32.0))
-                                                    .text_size(px(10.0))
-                                                    .font_family("Consolas")
-                                                    .text_color(if is_selected {
-                                                        Theme::accent_mint()
-                                                    } else {
-                                                        Theme::text_muted()
-                                                    })
-                                                    .child(format!("#{:03}", seg_idx)),
+                                                    .w(px(36.0))
+                                                    .text_center()
+                                                    .text_size(px(12.5))
+                                                    .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                                    .text_color(if is_selected { Theme::accent_mint() } else { Theme::text_muted() })
+                                                    .child(format!("{}", seg_idx)),
                                             )
+                                            // 开始时间 (图二高精时间戳)
                                             .child(
                                                 div()
-                                                    .w(px(110.0))
-                                                    .text_size(px(10.0))
+                                                    .w(px(92.0))
+                                                    .text_center()
                                                     .font_family("Consolas")
-                                                    .text_color(Theme::text_secondary())
-                                                    .child(format!(
-                                                        "{}-{}",
-                                                        seconds_to_srt_time(seg.start),
-                                                        seconds_to_srt_time(seg.end)
-                                                    )),
+                                                    .text_size(px(12.0))
+                                                    .text_color(if is_selected { Theme::accent_mint() } else { Theme::text_secondary() })
+                                                    .child(start_ts),
                                             )
+                                            // 结束时间 (图二高精时间戳)
+                                            .child(
+                                                div()
+                                                    .w(px(92.0))
+                                                    .text_center()
+                                                    .font_family("Consolas")
+                                                    .text_size(px(12.0))
+                                                    .text_color(if is_selected { Theme::accent_mint() } else { Theme::text_secondary() })
+                                                    .child(end_ts),
+                                            )
+                                            // 字幕内容 (原文，清晰中文字体)
                                             .child(
                                                 div()
                                                     .flex_1()
-                                                    .text_size(px(12.0))
+                                                    .min_w(px(110.0))
+                                                    .text_size(px(13.0))
+                                                    .font_weight(if is_selected { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                                                    .text_color(if is_selected { Theme::text_primary() } else { rgb(0xe2e8f0) })
+                                                    .child(raw_text),
+                                            )
+                                            // 翻译字幕 (多语言对照)
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(110.0))
+                                                    .text_size(px(12.5))
                                                     .text_color(if is_selected {
-                                                        Theme::text_primary()
+                                                        rgb(0xd1d5db)
+                                                    } else if trans_text == "—" {
+                                                        Theme::text_muted()
                                                     } else {
                                                         Theme::text_secondary()
                                                     })
-                                                    .child(seg.display_text().to_string()),
+                                                    .child(trans_text),
                                             )
                                     })),
+                            ),
+                    )
+            )
+            // ── 底部固定：统一导出控制底栏 ──
+            .child(self.render_editor_export_dock(cx))
+    }
+
+    /// 渲染剪辑工作台右侧底部的统一导出控制底栏
+    pub(crate) fn render_editor_export_dock(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_open = self.is_export_dropdown_open;
+        let cur_fmt = self.editor_export_format;
+
+        div()
+            .id("editor-export-dock")
+            .w_full()
+            .bg(Theme::bg_sidebar())
+            .border_t_1()
+            .border_color(Theme::border())
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                if is_open {
+                    div()
+                        .id("export-format-menu")
+                        .rounded_lg()
+                        .bg(Theme::bg_card())
+                        .border_1()
+                        .border_color(Theme::border())
+                        .p_1()
+                        .max_h(px(200.0))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .children(EditorExportFormat::all().iter().enumerate().map(|(idx, fmt)| {
+                            let fmt = *fmt;
+                            let is_selected = fmt == cur_fmt;
+                            div()
+                                .id(("export-fmt-opt", idx))
+                                .px_2p5()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(if is_selected {
+                                    rgba(0x10b98120)
+                                } else {
+                                    rgba(0x00000000)
+                                })
+                                .hover(|s| s.bg(Theme::bg_hover()))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.editor_export_format = fmt;
+                                    this.is_export_dropdown_open = false;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .font_weight(if is_selected { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                                        .text_color(if is_selected { Theme::accent_mint() } else { Theme::text_primary() })
+                                        .child(fmt.label()),
+                                )
+                                .child(
+                                    if is_selected {
+                                        div()
+                                            .text_size(px(10.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::accent_mint())
+                                            .child("[当前]")
+                                    } else {
+                                        div()
+                                    }
+                                )
+                        }))
+                } else {
+                    div().id("export-format-menu-closed")
+                }
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .id("export-format-dropdown-trigger")
+                            .flex_1()
+                            .h(px(38.0))
+                            .px_3p5()
+                            .rounded_xl()
+                            .bg(Theme::bg_card())
+                            .border_1()
+                            .border_color(if is_open { Theme::accent_mint() } else { Theme::border() })
+                            .cursor_pointer()
+                            .hover(|s| s.border_color(Theme::accent_mint()))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.is_export_dropdown_open = !this.is_export_dropdown_open;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(Theme::text_primary())
+                                    .child(cur_fmt.label()),
                             )
-                    }),
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(Theme::text_secondary())
+                                    .child(if is_open { "▲" } else { "▼" }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("editor-do-export-btn")
+                            .h(px(38.0))
+                            .px_6()
+                            .rounded_xl()
+                            .bg(Theme::accent_mint())
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.9))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.is_export_dropdown_open = false;
+                                this.perform_editor_export(cx);
+                            }))
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(0x09090b))
+                                    .child("导出"),
+                            ),
+                    ),
             )
     }
 
@@ -1413,7 +1643,14 @@ impl MainWindow {
             .text_color(Theme::text_primary())
             .hover(|s| s.bg(Theme::bg_hover()))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.state.editing_text.push_str(punct);
+                let total_chars = this.state.editing_text.chars().count();
+                let cursor = this.text_cursor_pos.min(total_chars);
+                let mut chars: Vec<char> = this.state.editing_text.chars().collect();
+                let punct_chars: Vec<char> = punct.chars().collect();
+                let p_len = punct_chars.len();
+                chars.splice(cursor..cursor, punct_chars);
+                this.state.editing_text = chars.into_iter().collect();
+                this.text_cursor_pos = cursor + p_len;
                 this.state.save_selected_text();
                 cx.notify();
             }))
@@ -1431,7 +1668,7 @@ impl MainWindow {
 
         div()
             .id("editor-multitrack-timeline")
-            .h(px(188.0))
+            .h(px(98.0))
             .flex_shrink_0()
             .w_full()
             .bg(Theme::bg_sidebar())
@@ -1440,11 +1677,11 @@ impl MainWindow {
             .flex()
             .flex_col()
             .overflow_hidden()
-            // 时间轴顶栏工具区
+            // 时间轴顶栏工具区 (紧凑 28px)
             .child(
                 div()
-                    .h(px(36.0))
-                    .px_4()
+                    .h(px(28.0))
+                    .px_3()
                     .bg(Theme::bg_sidebar())
                     .border_b_1()
                     .border_color(Theme::border())
@@ -1455,168 +1692,48 @@ impl MainWindow {
                         div()
                             .flex()
                             .items_center()
-                            .gap_2p5()
+                            .gap_2()
                             .child(
                                 div()
-                                    .text_size(px(13.0))
+                                    .text_size(px(12.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(Theme::text_primary())
                                     .child("时间轴"),
                             )
                             .child(
                                 div()
-                                    .px_2p5()
+                                    .px_2()
                                     .py_0p5()
                                     .rounded_full()
                                     .bg(rgb(0x181820))
                                     .border_1()
                                     .border_color(rgb(0x282832))
-                                    .text_size(px(11.0))
+                                    .text_size(px(10.5))
                                     .font_family("Consolas")
                                     .text_color(Theme::accent_mint())
                                     .font_weight(FontWeight::BOLD)
-                                    .child(seconds_to_srt_time(cur_time)),
+                                    .child(seconds_to_hms(cur_time)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(Theme::text_muted())
+                                    .child(format!("共 {} 句 · 总长 {}", self.state.segments.len(), format_duration_short(total_dur))),
                             ),
-                    )
-                    // 快捷跳转分段容器 (iOS Segmented Style)
-                    .child(
-                        div()
-                            .bg(rgb(0x16161c))
-                            .p(px(2.0))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(rgb(0x282832))
-                            .flex()
-                            .items_center()
-                            .gap(px(1.0))
-                            .child(self.render_jump_btn("0%", 0.0, cx))
-                            .child(self.render_jump_btn("25%", total_dur * 0.25, cx))
-                            .child(self.render_jump_btn("50%", total_dur * 0.50, cx))
-                            .child(self.render_jump_btn("75%", total_dur * 0.75, cx))
-                            .child(self.render_jump_btn("100%", total_dur, cx)),
                     ),
             )
-            // 时间刻度标尺 (Time Ruler - 点击/拖拽任意位置精确定位)
-            .child(
-                div()
-                    .id("timeline-time-ruler")
-                    .h(px(24.0))
-                    .w_full()
-                    .bg(rgb(0x131316))
-                    .border_b_1()
-                    .border_color(Theme::border())
-                    .flex()
-                    .items_center()
-                    .pl(px(70.0)) // 留出左侧轨道标号宽度
-                    .relative()
-                    .cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                        let win_w = window.viewport_size().width;
-                        this.seek_by_mouse_x(event.position.x, win_w, false, cx);
-                    }))
-                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                        if event.pressed_button == Some(MouseButton::Left) {
-                            let win_w = window.viewport_size().width;
-                            this.seek_by_mouse_x(event.position.x, win_w, true, cx);
-                        }
-                    }))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                        let win_w = window.viewport_size().width;
-                        this.seek_by_mouse_x(event.position.x, win_w, false, cx);
-                    }))
-                    .children((0usize..=10).map(|i| {
-                        let ratio = i as f64 / 10.0;
-                        let t = total_dur * ratio;
-                        div()
-                            .id(("ruler-tick-btn", i))
-                            .absolute()
-                            .left(relative(ratio as f32))
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.seek_to(t);
-                                this.trigger_extract_frame(cx);
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .w(px(1.0))
-                                    .h(px(6.0))
-                                    .bg(Theme::text_muted()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(9.0))
-                                    .font_family("Consolas")
-                                    .text_color(Theme::text_muted())
-                                    .child(format_duration_short(t)),
-                            )
-                    })),
-            )
-            // 核心多轨道区域 (Video Track + Subtitle Track)
+            // 1. 统一主字幕轨道 (紧凑苗条单轨布局，高 34px)
             .child(
                 div()
                     .flex_1()
                     .w_full()
                     .relative()
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .py_2()
-                    // 1. 视频主轨道 (V1 Video Track)
+                    .items_center()
+                    .py_1()
                     .child(
                         div()
-                            .h(px(36.0))
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .w(px(70.0))
-                                    .pl_3()
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(Theme::text_secondary())
-                                    .child("V1 视频"),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .h_full()
-                                    .mr_4()
-                                    .rounded_xl()
-                                    .bg(rgb(0x1a1a20))
-                                    .border_1()
-                                    .border_color(Theme::border())
-                                    .relative()
-                                    .overflow_hidden()
-                                    .child(
-                                        div()
-                                            .h_full()
-                                            .w(relative(progress_ratio))
-                                            .bg(rgba(0x10b98124)),
-                                    )
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .top_1()
-                                            .left_2()
-                                            .text_size(px(10.0))
-                                            .text_color(Theme::text_muted())
-                                            .child(format!(
-                                                "原视频流 · 总时长 {}",
-                                                format_duration_short(total_dur)
-                                            )),
-                                    ),
-                            ),
-                    )
-                    // 2. 字幕专用轨道 (T1 Subtitle Track - 轻量化智能按需渲染，消除卡顿)
-                    .child(
-                        div()
-                            .h(px(46.0))
+                            .h_full()
                             .w_full()
                             .flex()
                             .items_center()
@@ -1627,14 +1744,14 @@ impl MainWindow {
                                     .text_size(px(11.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(Theme::accent_mint())
-                                    .child("T1 字幕"),
+                                    .child("字幕轨"),
                             )
                             .child(
                                 div()
                                     .flex_1()
-                                    .h_full()
+                                    .h(px(34.0))
                                     .mr_4()
-                                    .rounded_xl()
+                                    .rounded_lg()
                                     .bg(rgb(0x18181f))
                                     .border_1()
                                     .border_color(Theme::border())
@@ -1647,40 +1764,11 @@ impl MainWindow {
                                             .w(relative(progress_ratio))
                                             .bg(rgba(0x10b98115)),
                                     )
-                                    // 轨道概览文字标签 (实时显示当前字幕信息)
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .top_1()
-                                            .left_2()
-                                            .text_size(px(10.0))
-                                            .text_color(Theme::text_muted())
-                                            .child(if let Some(ref seg) = active_seg {
-                                                format!(
-                                                    "字幕轨 · 共 {} 句 · 当前播放: #{:03} [{}] {}",
-                                                    self.state.segments.len(),
-                                                    seg.index,
-                                                    seconds_to_srt_time(seg.start),
-                                                    seg.display_text()
-                                                )
-                                            } else if let Some(ref seg) = cur_seg {
-                                                format!(
-                                                    "字幕轨 · 共 {} 句 · 当前选中: #{:03} [{}] {}",
-                                                    self.state.segments.len(),
-                                                    seg.index,
-                                                    seconds_to_srt_time(seg.start),
-                                                    seg.display_text()
-                                                )
-                                            } else {
-                                                format!("字幕轨 · 共 {} 句字幕", self.state.segments.len())
-                                            }),
-                                    )
-                                    // 仅渲染当前时间附近/选中的核心字幕色块 (彻底消除 1400 句密集堆叠卡顿)
+                                    // 字幕片段渲染 (紧凑纤细卡片，高度 28px)
                                     .children({
                                         let relevant_segments: Vec<_> = if self.state.segments.len() <= 20 {
                                             self.state.segments.iter().collect()
                                         } else {
-                                            // 优化过滤条件：扩大可见范围到 ±15 秒，提升预加载效果
                                             self.state.segments.iter().filter(|seg| {
                                                 sel_idx == Some(seg.index)
                                                     || (cur_time >= seg.start && cur_time <= seg.end)
@@ -1697,12 +1785,12 @@ impl MainWindow {
                                             div()
                                                 .id(("timeline-clip", seg_idx))
                                                 .absolute()
-                                                .top(px(18.0))
-                                                .bottom(px(3.0))
+                                                .top(px(2.0))
+                                                .bottom(px(2.0))
                                                 .left(relative(start_r))
                                                 .w(relative(width_r))
-                                                .min_w(px(50.0))
-                                                .rounded_md()
+                                                .min_w(px(40.0))
+                                                .rounded(px(4.0))
                                                 .bg(if is_selected {
                                                     rgb(0x2563eb)
                                                 } else if is_active {
@@ -1731,7 +1819,7 @@ impl MainWindow {
                                                 }))
                                                 .child(
                                                     div()
-                                                        .text_size(px(10.0))
+                                                        .text_size(px(10.5))
                                                         .text_color(rgb(0xffffff))
                                                         .child(seg.display_text().to_string()),
                                                 )
@@ -1739,15 +1827,15 @@ impl MainWindow {
                                     }),
                             ),
                     )
-                    // 3. 贯穿全轨的交互响应层与播放游标指针 (Playhead / CTI & 点击/拖拽任意位置精确定位)
+                    // 贯穿轨道的交互响应层与播放游标指针
                     .child(
                         div()
                             .id("timeline-playhead-interactive-surface")
                             .absolute()
                             .top_0()
                             .bottom_0()
-                            .left(px(70.0)) // 避开左侧轨道标号
-                            .right(px(16.0)) // 避开右侧边距
+                            .left(px(70.0))
+                            .right(px(16.0))
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                                 let win_w = window.viewport_size().width;
@@ -1769,12 +1857,14 @@ impl MainWindow {
                                     .top_0()
                                     .bottom_0()
                                     .left(relative(progress_ratio))
+                                    .ml(px(-6.0))
+                                    .w(px(12.0))
                                     .flex()
                                     .flex_col()
                                     .items_center()
                                     .child(
                                         div()
-                                            .text_size(px(11.0))
+                                            .text_size(px(9.5))
                                             .text_color(Theme::accent_mint())
                                             .child("▼"),
                                     )
@@ -1787,9 +1877,78 @@ impl MainWindow {
                             ),
                     ),
             )
+            // 2. 探底时间刻度标尺 (Time Ruler 移至底部展示，精简 20px)
+            .child(
+                div()
+                    .id("timeline-time-ruler")
+                    .h(px(20.0))
+                    .w_full()
+                    .bg(rgb(0x131316))
+                    .border_t_1()
+                    .border_color(Theme::border())
+                    .relative()
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        let win_w = window.viewport_size().width;
+                        this.seek_by_mouse_x(event.position.x, win_w, false, cx);
+                    }))
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                        if event.pressed_button == Some(MouseButton::Left) {
+                            let win_w = window.viewport_size().width;
+                            this.seek_by_mouse_x(event.position.x, win_w, true, cx);
+                        }
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                        let win_w = window.viewport_size().width;
+                        this.seek_by_mouse_x(event.position.x, win_w, false, cx);
+                    }))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(70.0))
+                            .right(px(16.0))
+                            .children((0usize..=10).map(|i| {
+                                let ratio = i as f64 / 10.0;
+                                let t = total_dur * ratio;
+                                div()
+                                    .id(("ruler-tick-btn", i))
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .left(relative(ratio as f32))
+                                    .ml(px(-16.0))
+                                    .w(px(32.0))
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.state.seek_to(t);
+                                        this.trigger_extract_frame(cx);
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .w(px(1.0))
+                                            .h(px(6.0))
+                                            .bg(Theme::text_muted()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.0))
+                                            .font_family("Consolas")
+                                            .text_color(Theme::text_muted())
+                                            .child(format_duration_short(t)),
+                                    )
+                            })),
+                    ),
+            )
     }
 
     /// 快捷跳转预设按钮 (iOS Segmented Pill)
+    #[allow(dead_code)]
     fn render_jump_btn(&mut self, label: &'static str, target_time: f64, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id(label)
@@ -1816,16 +1975,15 @@ impl MainWindow {
         }
         self.halt_preview_playback();
         let nav_w = px(180.0); // 左侧导航侧边栏占用宽度
-        let inspector_w = px(380.0); // 右侧属性检查器占用宽度
-        let left_pad = px(70.0); // 左侧轨道名称标签占用宽度
-        let right_pad = px(16.0); // 右侧留白边距
+        let left_pad = px(70.0); // 左侧轨道名称标签占用宽度 ("字幕轨")
+        let right_pad = px(16.0); // 右侧留白边距 (mr_4)
 
-        let center_w = window_width - nav_w - inspector_w;
-        let track_w = center_w - left_pad - right_pad;
+        let track_start_x = nav_w + left_pad;
+        let track_w = window_width - nav_w - left_pad - right_pad;
         if track_w <= px(10.0) {
             return;
         }
-        let relative_x = mouse_x - nav_w - left_pad;
+        let relative_x = mouse_x - track_start_x;
         let ratio = (relative_x / track_w).clamp(0.0, 1.0) as f64;
         let target_time = ratio * self.state.total_duration;
         self.state.seek_to(target_time);
@@ -1845,6 +2003,7 @@ impl MainWindow {
     }
 
     /// 弹出原生 Windows 输入对话框进行字幕文本修改（完美支持搜狗/微软等中文输入法）
+    #[allow(dead_code)]
     pub(crate) fn prompt_edit_text(&mut self, cx: &mut Context<Self>) {
         let current_text = self.state.editing_text.clone();
         let prompt_title = "Voice2Word - 修改字幕文本";

@@ -180,7 +180,8 @@ impl WhisperEngine {
 
         let lang = language.unwrap_or("auto");
         let th = threads.unwrap_or(self.threads);
-        // 读取配置的处理单元并发数，启用多处理器并行解码
+        // 处理器数量保持可配置：不同 Vulkan 驱动对单实例/多实例调度差异很大，
+        // 应通过同一素材基准测试选择最佳值，而不是硬编码 GPU 并发策略。
         let processors = self.processors.max(1) as usize;
 
         // 线程保护机制：多处理器并行时，单处理器线程数等额下调，
@@ -259,7 +260,9 @@ impl WhisperEngine {
             .arg("-of")
             .arg(&prefix);
 
-        // 小模型才关温度回退换速度；turbo 保留 fallback，课堂专有名词不容易瞎编。
+        // Turbo 保留温度回退：课程录音中的专有名词、口音和低音量片段需要
+        // 回退采样来维持识别质量。速度优化通过线程/处理器基准选择完成，
+        // 不牺牲这一层纠错能力。
         let is_precise = effective_model
             .file_name()
             .and_then(|s| s.to_str())
@@ -395,6 +398,7 @@ impl WhisperEngine {
                                     start: start_sec,
                                     end: end_sec,
                                     text: clean_text,
+                                    translation: None,
                                     polished: String::new(),
                                     language: None,
                                 })
@@ -481,6 +485,7 @@ impl WhisperEngine {
                             start,
                             end,
                             text,
+                            translation: None,
                             polished: String::new(),
                             language: detected_lang.clone(),
                         });
@@ -489,16 +494,13 @@ impl WhisperEngine {
             }
         }
 
-        // 多处理器并行后，按起始时间戳精准排序并重新编排连续序号，消除可能存在的跨块微小乱序
-        segments.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
-        for (i, seg) in segments.iter_mut().enumerate() {
-            seg.index = i + 1;
-        }
-
         // 回退逻辑：如果 json 没产出，从捕获的 stdout 解析
         if segments.is_empty() && !stdout_str.is_empty() {
             segments = Self::parse_stdout_segments(&stdout_str);
         }
+
+        // 智能优化时间轴：消除 100ms 重叠鬼影、消除时间重叠冲突、广播级短句延展平滑
+        crate::subtitle::optimize_segments(&mut segments);
 
         if let Some(ref cb) = cb_shared.as_ref() {
             cb(1.0, &format!("转写完成，共 {} 个片段", segments.len()), None);
@@ -548,6 +550,7 @@ impl WhisperEngine {
                             start,
                             end,
                             text,
+                            translation: None,
                             polished: String::new(),
                             language: None,
                         });

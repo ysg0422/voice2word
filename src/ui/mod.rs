@@ -18,6 +18,43 @@ use tokio::sync::watch;
 
 use crate::app::state::{AppState, WorkspaceTab};
 use theme::Theme;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditorExportFormat {
+    #[default]
+    JianYing,    // 剪映草稿
+    Srt,         // SRT 字幕
+    Ass,         // ASS 特效字幕
+    Fcpxml,      // FCPXML (达芬奇 / FCP)
+    PremiereXml, // Premiere XML
+    Txt,         // TXT 纯文本
+    Vtt,         // VTT 网页字幕
+}
+
+impl EditorExportFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::JianYing => "剪映草稿 (一键直出)",
+            Self::Srt => "SRT 字幕 (.srt)",
+            Self::Ass => "ASS 特效字幕 (.ass)",
+            Self::Fcpxml => "FCPXML (达芬奇 / FCP)",
+            Self::PremiereXml => "Premiere XML (.xml)",
+            Self::Txt => "TXT 纯文本 (.txt)",
+            Self::Vtt => "VTT 网页字幕 (.vtt)",
+        }
+    }
+
+    pub fn all() -> &'static [EditorExportFormat] {
+        &[
+            Self::JianYing,
+            Self::Srt,
+            Self::Ass,
+            Self::Fcpxml,
+            Self::PremiereXml,
+            Self::Txt,
+            Self::Vtt,
+        ]
+    }
+}
 
 pub struct MainWindow {
     pub(crate) state: AppState,
@@ -30,6 +67,11 @@ pub struct MainWindow {
     pub(crate) play_tick_generation: u64,
     pub(crate) completion_dialog: Option<CompletionDialogInfo>,
     pub(crate) benchmark_dialog: Option<BenchmarkDialogInfo>,
+    pub(crate) editor_export_format: EditorExportFormat,
+    pub(crate) is_export_dropdown_open: bool,
+    pub(crate) is_lang_dropdown_open: bool,
+    pub(crate) is_subtitle_style_open: bool,
+    pub(crate) text_cursor_pos: usize,
 }
 
 impl MainWindow {
@@ -47,6 +89,11 @@ impl MainWindow {
             play_tick_generation: 0,
             completion_dialog: None,
             benchmark_dialog: None,
+            editor_export_format: EditorExportFormat::default(),
+            is_export_dropdown_open: false,
+            is_lang_dropdown_open: false,
+            is_subtitle_style_open: false,
+            text_cursor_pos: 0,
         };
 
         // 若启动已载入历史视频工程，立即触发首帧提取，并按硬件策略补代理

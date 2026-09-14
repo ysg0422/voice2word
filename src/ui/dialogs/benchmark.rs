@@ -98,16 +98,36 @@ impl MainWindow {
                             .flex()
                             .flex_col()
                             .gap_2p5()
-                            .child(Self::render_metric_row("1. FFmpeg 音频处理", m.ffmpeg_audio_sec, m.total_elapsed_sec, Theme::text_secondary()))
-                            .child(Self::render_metric_row("2. Silero VAD 语音检测", m.vad_sec, m.total_elapsed_sec, Theme::accent_blue()))
-                            .child(Self::render_metric_row("3. Whisper 核心转写", m.whisper_sec, m.total_elapsed_sec, Theme::accent_mint()))
+                            .child(Self::render_metric_row(
+                                &format!("1. {}", m.audio_process_name.as_deref().unwrap_or("FFmpeg 音频处理")),
+                                m.ffmpeg_audio_sec,
+                                m.total_elapsed_sec,
+                                Theme::text_secondary(),
+                            ))
+                            .child(Self::render_metric_row(
+                                &format!("2. {}", m.vad_engine_name.as_deref().unwrap_or("Silero VAD 语音检测")),
+                                m.vad_sec,
+                                m.total_elapsed_sec,
+                                Theme::accent_blue(),
+                            ))
+                            .child(Self::render_metric_row(
+                                &format!("3. {}", m.asr_engine_name.as_deref().unwrap_or("Whisper 核心转写")),
+                                m.whisper_sec,
+                                m.total_elapsed_sec,
+                                Theme::accent_mint(),
+                            ))
                             .child(Self::render_metric_row(
                                 format!("4. {}", m.polish_engine_name.as_deref().unwrap_or("标点/AI润色")),
                                 m.qwen_sec,
                                 m.total_elapsed_sec,
                                 Theme::text_secondary(),
                             ))
-                            .child(Self::render_metric_row("5. 字幕生成与写出", m.srt_export_sec, m.total_elapsed_sec, Theme::text_muted()))
+                            .child(Self::render_metric_row(
+                                &format!("5. {}", m.export_name.as_deref().unwrap_or("字幕生成与写出")),
+                                m.srt_export_sec,
+                                m.total_elapsed_sec,
+                                Theme::text_muted(),
+                            ))
                             .child(
                                 div()
                                     .pt_2()
@@ -129,19 +149,17 @@ impl MainWindow {
                                             .text_size(px(15.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(Theme::accent_mint())
-                                            .child(format!("{:.1} 秒", m.total_elapsed_sec)),
+                                            .child(if m.total_elapsed_sec <= 0.00001 {
+                                                "0 ms".to_string()
+                                            } else if m.total_elapsed_sec < 0.001 {
+                                                "< 1 ms".to_string()
+                                            } else if m.total_elapsed_sec < 0.1 {
+                                                format!("{:.0} ms", (m.total_elapsed_sec * 1000.0).round())
+                                            } else {
+                                                format!("{:.1} 秒", m.total_elapsed_sec)
+                                            }),
                                     ),
                             ),
-                    )
-                    // 分析说明提示
-                    .child(
-                        div()
-                            .p_3()
-                            .rounded_lg()
-                            .bg(rgb(0x181820))
-                            .text_size(px(11.5))
-                            .text_color(Theme::text_muted())
-                            .child("提示：以上数据已作为基准线归档。可针对耗时占比最高的阶段进行定向优化（如提升 Whisper 线程、调整 VAD 参数或关闭 LLM 润色）。"),
                     )
                     .child(
                         div()

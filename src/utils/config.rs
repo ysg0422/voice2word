@@ -19,6 +19,12 @@ pub struct PathsConfig {
     pub vad_model: Option<String>,
     #[serde(default = "default_punc_model")]
     pub punc_model: Option<String>,
+    #[serde(default = "default_sensevoice_model")]
+    pub sensevoice_model: Option<String>,
+    #[serde(default = "default_sensevoice_tokens")]
+    pub sensevoice_tokens: Option<String>,
+    #[serde(default = "default_sensevoice_vad")]
+    pub sensevoice_vad: Option<String>,
     pub llama_cli: String,
     pub llm_model: String,
 }
@@ -29,6 +35,18 @@ fn default_true() -> bool {
 
 fn default_punc_model() -> Option<String> {
     Some("models/punc/model.int8.onnx".to_string())
+}
+
+fn default_sensevoice_model() -> Option<String> {
+    Some("models/sensevoice/model.int8.onnx".to_string())
+}
+
+fn default_sensevoice_tokens() -> Option<String> {
+    Some("models/sensevoice/tokens.txt".to_string())
+}
+
+fn default_sensevoice_vad() -> Option<String> {
+    Some("models/sensevoice/silero_vad.onnx".to_string())
 }
 
 fn default_polish_mode() -> String {
@@ -63,13 +81,16 @@ impl Default for AppConfig {
                 whisper_model: "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string(),
                 vad_model: Some("models/whisper/ggml-silero-v6.2.0.bin".to_string()),
                 punc_model: Some("models/punc/model.int8.onnx".to_string()),
+                sensevoice_model: Some("models/sensevoice/model.int8.onnx".to_string()),
+                sensevoice_tokens: Some("models/sensevoice/tokens.txt".to_string()),
+                sensevoice_vad: Some("models/sensevoice/silero_vad.onnx".to_string()),
                 llama_cli: "A:\\cppsoft\\llama.cpp\\build\\bin\\Release\\llama-completion.exe".to_string(),
                 llm_model: "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string(),
             },
             pipeline: PipelineConfig {
                 language: "zh".to_string(),
                 output_format: "srt".to_string(),
-                enable_polish: true,
+                enable_polish: false,
                 polish_mode: "punc".to_string(),
                 enable_vad: false,
                 whisper_threads: 8,

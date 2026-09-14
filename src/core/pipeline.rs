@@ -8,7 +8,9 @@ use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
-use crate::engines::{transcribe_chunked, FFmpegEngine, LLMEngine, PunctuationEngine, WhisperEngine};
+use crate::engines::{
+    transcribe_chunked, FFmpegEngine, LLMEngine, PunctuationEngine, SenseVoiceEngine, WhisperEngine,
+};
 use crate::subtitle::{Segment, SubtitleWriter};
 
 #[derive(Debug, Clone)]
@@ -23,6 +25,7 @@ pub enum PipelineEvent {
 pub struct TaskPipeline {
     ffmpeg: Arc<FFmpegEngine>,
     whisper: Arc<WhisperEngine>,
+    sensevoice: Option<Arc<SenseVoiceEngine>>,
     llm: Arc<LLMEngine>,
     punc: Option<Arc<PunctuationEngine>>,
     cancelled: Arc<AtomicBool>,
@@ -32,12 +35,14 @@ impl TaskPipeline {
     pub fn new(
         ffmpeg: Arc<FFmpegEngine>,
         whisper: Arc<WhisperEngine>,
+        sensevoice: Option<Arc<SenseVoiceEngine>>,
         llm: Arc<LLMEngine>,
         punc: Option<Arc<PunctuationEngine>>,
     ) -> Self {
         Self {
             ffmpeg,
             whisper,
+            sensevoice,
             llm,
             punc,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -105,9 +110,14 @@ impl TaskPipeline {
         let ffmpeg = self.ffmpeg.clone();
         let use_gpu = whisper.uses_gpu();
 
+        let is_sensevoice = model_override
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_lowercase().contains("sensevoice"))
+            .unwrap_or(false);
+
         // 判断是否启用纯内存管道推流 (In-Memory PCM Streaming Pipe):
-        // 当启用 GPU 推理，或音频时长无需多进程切块时，直接以 0 磁盘 I/O 管道推流
-        let can_stream = use_gpu || duration_for_chunks <= 405.0;
+        // 当使用 SenseVoice、启用 GPU 推理，或音频时长无需多进程切块时，直接以 0 磁盘 I/O 管道推流
+        let can_stream = is_sensevoice || use_gpu || duration_for_chunks <= 405.0;
 
         let mut ffmpeg_audio_sec = 0.0;
         let mut temp_wav_path: Option<PathBuf> = None;
@@ -144,11 +154,19 @@ impl TaskPipeline {
             return Ok(Vec::new());
         }
 
+        let asr_engine_name = if is_sensevoice {
+            "SenseVoice 极速转写".to_string()
+        } else {
+            "Whisper 神经转写".to_string()
+        };
+
         let _ = tx.send(PipelineEvent::StageChanged("语音识别".into()));
         let _ = tx.send(PipelineEvent::Progress {
             stage: "语音识别".into(),
             progress: 0.15,
-            detail: if can_stream {
+            detail: if is_sensevoice {
+                "SenseVoice 正在通过纯内存管道极速转写语音...".into()
+            } else if can_stream {
                 "Whisper 正在通过纯内存管道流式转写语音...".into()
             } else {
                 "Whisper 模型正在转写语音...".into()
@@ -161,13 +179,56 @@ impl TaskPipeline {
         let whisper_span = if enable_polish { 0.45 } else { 0.80 };
 
         let transcription_started = Instant::now();
-        let (mut segments, vad_sec) = if can_stream {
+        let (mut segments, vad_sec, pure_whisper_sec) = if is_sensevoice && self.sensevoice.is_some() {
+            let sv_engine = self.sensevoice.as_ref().unwrap().clone();
+            let in_file_stream = input_file.clone();
+            let ffmpeg_stream = ffmpeg.clone();
+            let tx_sv = tx.clone();
+            let lang_sv = lang_clone.clone();
+
+            let (segs, elapsed) = tokio::task::spawn_blocking(move || -> Result<(Vec<Segment>, f64)> {
+                let mut ffmpeg_child = ffmpeg_stream.spawn_audio_stream(&in_file_stream)?;
+                let ffmpeg_stdout = ffmpeg_child.stdout.take()
+                    .context("获取 FFmpeg 内存管道输出失败")?;
+
+                struct ChildReaper(std::process::Child);
+                impl Drop for ChildReaper {
+                    fn drop(&mut self) {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+                let mut reaper = ChildReaper(ffmpeg_child);
+
+                let tx_cb = tx_sv.clone();
+                let res = sv_engine.transcribe_stream(
+                    Box::new(ffmpeg_stdout),
+                    lang_sv.as_deref(),
+                    threads,
+                    if duration_for_chunks > 0.0 { Some(duration_for_chunks) } else { None },
+                    Some(Box::new(move |p, info, opt_seg| {
+                        if let Some(seg) = opt_seg {
+                            let _ = tx_cb.send(PipelineEvent::SegmentStream(seg));
+                        }
+                        let _ = tx_cb.send(PipelineEvent::Progress {
+                            stage: "语音识别".into(),
+                            progress: 0.15 + p * whisper_span,
+                            detail: info.to_string(),
+                        });
+                    })),
+                );
+                let _ = reaper.0.wait();
+                res
+            })
+            .await??;
+            (segs, 0.0, elapsed)
+        } else if can_stream {
             let in_file_stream = input_file.clone();
             let ffmpeg_stream = ffmpeg.clone();
             let whisper_engine = whisper.clone();
             let model_override_stream = model_override.clone();
 
-            tokio::task::spawn_blocking(move || -> Result<(Vec<Segment>, f64)> {
+            let (segs, v_sec) = tokio::task::spawn_blocking(move || -> Result<(Vec<Segment>, f64)> {
                 let mut ffmpeg_child = ffmpeg_stream.spawn_audio_stream(&in_file_stream)?;
                 let ffmpeg_stdout = ffmpeg_child.stdout.take()
                     .context("获取 FFmpeg 内存管道输出失败")?;
@@ -202,14 +263,17 @@ impl TaskPipeline {
                 let _ = reaper.0.wait();
                 res
             })
-            .await??
+            .await??;
+            let total_elapsed = transcription_started.elapsed().as_secs_f64();
+            let pure_sec = (total_elapsed - v_sec).max(0.0);
+            (segs, v_sec, pure_sec)
         } else {
             let wav_path = temp_wav_path.as_ref().unwrap().clone();
             let ffmpeg_chunks = ffmpeg.clone();
             let whisper_engine = whisper.clone();
             let model_override_clone = model_override.clone();
 
-            tokio::task::spawn_blocking(move || {
+            let (segs, v_sec) = tokio::task::spawn_blocking(move || {
                 transcribe_chunked(
                     ffmpeg_chunks.as_ref(),
                     whisper_engine.as_ref(),
@@ -231,12 +295,20 @@ impl TaskPipeline {
                     })),
                 )
             })
-            .await??
+            .await??;
+            let total_elapsed = transcription_started.elapsed().as_secs_f64();
+            let pure_sec = (total_elapsed - v_sec).max(0.0);
+            (segs, v_sec, pure_sec)
         };
 
-        let total_transcribe_elapsed = transcription_started.elapsed().as_secs_f64();
-        let pure_whisper_sec = (total_transcribe_elapsed - vad_sec).max(0.0);
-        info!(elapsed = ?transcription_started.elapsed(), vad_sec, pure_whisper_sec, segments = segments.len(), "Whisper 转写完成");
+        info!(
+            elapsed = ?transcription_started.elapsed(),
+            vad_sec,
+            pure_whisper_sec,
+            segments = segments.len(),
+            engine = %asr_engine_name,
+            "语音转写完成"
+        );
 
         // 清理临时 wav (仅当存在时清理)
         if let Some(ref p) = temp_wav_path {
@@ -255,7 +327,15 @@ impl TaskPipeline {
             let mode = polish_mode.unwrap_or_else(|| "punc".to_string());
             let use_punc = (mode == "punc") && self.punc.as_ref().map(|p| p.is_available()).unwrap_or(false);
 
-            if use_punc {
+            if is_sensevoice && mode == "punc" {
+                polish_engine_name = Some("SenseVoice 原生标点".to_string());
+                info!("SenseVoice 原生自带高精度标点与数字规范化(ITN)，跳过 CT-Punc 阶段以实现极致速度");
+                let _ = tx.send(PipelineEvent::Progress {
+                    stage: "极速标点".into(),
+                    progress: 0.95,
+                    detail: "SenseVoice 原生自带高精度标点与 ITN，已瞬时就绪".into(),
+                });
+            } else if use_punc {
                 polish_engine_name = Some("CT-Punc 极速标点".to_string());
                 let _ = tx.send(PipelineEvent::StageChanged("极速标点".into()));
                 let _ = tx.send(PipelineEvent::Progress {
@@ -360,6 +440,7 @@ impl TaskPipeline {
 
         // ── 阶段 4: 输出字幕文件（失败也不阻塞 Finished，避免界面一直转圈）──
         let _ = tx.send(PipelineEvent::StageChanged("生成字幕".into()));
+        crate::subtitle::optimize_segments(&mut segments);
         let writing_started = Instant::now();
         match SubtitleWriter::write_to_file(&segments, &out_path, &output_format) {
             Ok(()) => {
@@ -389,14 +470,47 @@ impl TaskPipeline {
             segments.last().map(|s| s.end).unwrap_or(0.0)
         };
 
+        let audio_process_name = if can_stream {
+            "纯内存 PCM 匿名管道推流 (0 物理磁盘 I/O)".to_string()
+        } else {
+            "FFmpeg 抽取临时 WAV 文件".to_string()
+        };
+
+        let vad_engine_name = if is_sensevoice {
+            "SenseVoice 融合流式 VAD".to_string()
+        } else if vad_sec > 0.0 {
+            "Silero VAD 毫秒级语音切片压实".to_string()
+        } else {
+            "无独立 VAD (全音频直接输入)".to_string()
+        };
+
+        let asr_detail_name = if is_sensevoice {
+            format!("SenseVoice-Small INT8 (非自回归单次前向 · {}线程)", threads.unwrap_or(8))
+        } else {
+            let model_name = model_override
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("ggml-model.bin");
+            let dev_str = if use_gpu { "GPU加速" } else { "CPU" };
+            format!("Whisper {model_name} ({dev_str} · {}线程)", threads.unwrap_or(8))
+        };
+
+        let export_name = format!("{} 标准字幕格式写出", output_format.to_uppercase());
+
         let metrics = crate::core::PipelinePerformanceMetrics {
             video_duration,
             ffmpeg_audio_sec,
+            audio_process_name: Some(audio_process_name),
             vad_sec,
+            vad_engine_name: Some(vad_engine_name),
             whisper_sec: pure_whisper_sec,
+            asr_engine_name: Some(asr_detail_name),
             qwen_sec,
             polish_engine_name,
             srt_export_sec,
+            export_name: Some(export_name),
+            segment_count: segments.len(),
             total_elapsed_sec,
         };
 

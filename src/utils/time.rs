@@ -1,4 +1,4 @@
-﻿//! 时间戳转换与格式化工具
+//! 时间戳转换与格式化工具
 
 /// 将浮点秒转换为 SRT 时间格式: 00:01:23,456
 pub fn seconds_to_srt_time(seconds: f64) -> String {
@@ -8,6 +8,16 @@ pub fn seconds_to_srt_time(seconds: f64) -> String {
     let secs = (total_millis % 60_000) / 1000;
     let millis = total_millis % 1000;
     format!("{:02}:{:02}:{:02},{:03}", hours, minutes, secs, millis)
+}
+
+/// 将浮点秒转换为标准毫秒时间戳格式: 00:01:23.456
+pub fn seconds_to_timestamp(seconds: f64) -> String {
+    let total_millis = (seconds.max(0.0) * 1000.0).round() as u64;
+    let hours = total_millis / 3_600_000;
+    let minutes = (total_millis % 3_600_000) / 60_000;
+    let secs = (total_millis % 60_000) / 1000;
+    let millis = total_millis % 1000;
+    format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, secs, millis)
 }
 
 /// 将浮点秒转换为 ASS 时间格式: 0:01:23.45 (两位小数百分秒)
@@ -28,9 +38,25 @@ pub fn format_duration_short(seconds: f64) -> String {
     format!("{:02}:{:02}", mins, secs)
 }
 
+/// 将浮点秒转换为时分秒格式 (无毫秒): 00:01:23
+pub fn seconds_to_hms(seconds: f64) -> String {
+    let total_secs = seconds.max(0.0).round() as u64;
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, mins, secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hms_time() {
+        assert_eq!(seconds_to_hms(0.0), "00:00:00");
+        assert_eq!(seconds_to_hms(65.123), "00:01:05");
+        assert_eq!(seconds_to_hms(3661.0), "01:01:01");
+    }
 
     #[test]
     fn test_srt_time() {

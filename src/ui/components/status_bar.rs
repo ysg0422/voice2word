@@ -122,7 +122,7 @@ impl MainWindow {
                                     div()
                                         .text_size(px(12.0))
                                         .text_color(Theme::text_secondary())
-                                        .child("新视频已就绪，点击右下角「开始处理」"),
+                                        .child("文件已就绪"),
                                 )
                         } else {
                             div()
@@ -140,7 +140,7 @@ impl MainWindow {
                                     div()
                                         .text_size(px(12.0))
                                         .text_color(Theme::text_muted())
-                                        .child("Voice2Word 智能转写引擎就绪 · 等待导入新视频"),
+                                        .child("就绪"),
                                 )
                         }
                     )
@@ -166,24 +166,6 @@ impl MainWindow {
                             .hover(|s| s.bg(Theme::bg_hover()))
                             .on_click(cx.listener(|this, _, _, cx| this.play_video(cx)))
                             .child("播放预览"),
-                    )
-                    .child(
-                        div()
-                            .id("export-subtitles-btn")
-                            .px_4()
-                            .py_1p5()
-                            .rounded_full()
-                            .cursor_pointer()
-                            .bg(if can_export { Theme::bg_card() } else { rgb(0x1a1a22) })
-                            .text_color(if can_export { Theme::text_primary() } else { Theme::text_muted() })
-                            .border_1()
-                            .border_color(Theme::border())
-                            .text_size(px(12.0))
-                            .hover(|s| s.bg(Theme::bg_hover()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.export_subtitles(cx);
-                            }))
-                            .child("导出字幕"),
                     )
                     .child(
                         div()
