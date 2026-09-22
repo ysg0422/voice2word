@@ -16,6 +16,16 @@ use super::segment::Segment;
 pub struct JianYingExporter;
 
 impl JianYingExporter {
+    /// XML 特殊字符转义：字幕文本直接拼入 content 的内嵌 XML，
+    /// 未转义的 & < > " 会使剪映解析草稿失败
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+
     /// 自动探测本地剪映草稿工程根目录
     pub fn detect_local_draft_root() -> Option<PathBuf> {
         let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
@@ -87,7 +97,7 @@ impl JianYingExporter {
             let end_us = (seg.end * 1_000_000.0) as u64;
             let dur_us = end_us.saturating_sub(start_us).max(100_000);
 
-            let raw_text = seg.display_text().replace('\n', " ");
+            let raw_text = Self::xml_escape(&seg.display_text().replace('\n', " "));
             let content_xml = format!(
                 r##"<font id="" path="" size="8.0"><color_val color="#ffffff">{}</color_val></font>"##,
                 raw_text
@@ -669,6 +679,15 @@ mod tests {
         assert_eq!(val["tracks"].as_array().unwrap().len(), 1);
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn content_xml_escapes_special_chars() {
+        let segs = vec![Segment::new(1, 0.0, 1.0, r#"A&B<C>"引号'"#)];
+        let val = JianYingExporter::build_draft_content(&segs, None, 1.0);
+        let content = val["materials"]["texts"][0]["content"].as_str().unwrap();
+        assert!(content.contains("A&amp;B&lt;C&gt;&quot;引号&apos;"), "未正确转义: {content}");
+        assert!(!content.contains("A&B"), "原始特殊字符泄漏进了内嵌 XML");
     }
 }
 

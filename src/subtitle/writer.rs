@@ -38,6 +38,7 @@ impl SubtitleWriter {
         match format.to_lowercase().as_str() {
             "srt" => Self::write_srt_with_mode(segments, path, mode),
             "ass" => Self::write_ass_with_mode(segments, path, mode),
+            "vtt" => Self::write_vtt_with_mode(segments, path, mode),
             "txt" => Self::write_txt_with_mode(segments, path, mode),
             "fcpxml" => super::fcpxml::FcpXmlExporter::write_to_file(segments, path, "Voice2Word Subtitles"),
             "xml" | "premiere" => super::premiere::PremiereXmlExporter::write_to_file(segments, path, "Voice2Word Subtitles"),
@@ -111,6 +112,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         Ok(())
     }
 
+    /// 生成 WebVTT 格式 (无序号、点号毫秒分隔，供网页 <track> 使用)
+    pub fn write_vtt_with_mode<P: AsRef<Path>>(
+        segments: &[Segment],
+        path: P,
+        mode: ExportMode,
+    ) -> Result<()> {
+        let mut file = File::create(path).with_context(|| "创建 VTT 文件失败")?;
+        writeln!(file, "WEBVTT")?;
+        writeln!(file)?;
+        for seg in segments {
+            let start = seconds_to_srt_time(seg.start).replace(',', ".");
+            let end = seconds_to_srt_time(seg.end).replace(',', ".");
+            let text = seg.export_text(mode);
+            writeln!(file, "{} --> {}", start, end)?;
+            writeln!(file, "{}", text)?;
+            writeln!(file)?;
+        }
+        Ok(())
+    }
+
     /// 生成 TXT 纯文本 (每行一句)
     pub fn write_txt<P: AsRef<Path>>(segments: &[Segment], path: P) -> Result<()> {
         Self::write_txt_with_mode(segments, path, ExportMode::RawOnly)
@@ -126,5 +147,25 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             writeln!(file, "{}", seg.export_text(mode))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writes_webvtt_header_and_dot_timestamps() {
+        let segs = vec![Segment::new(1, 1.0, 2.5, "你好世界")];
+        let temp = std::env::temp_dir().join("test_v2w.vtt");
+        SubtitleWriter::write_to_file(&segs, &temp, "vtt").unwrap();
+
+        let content = std::fs::read_to_string(&temp).unwrap();
+        assert!(content.starts_with("WEBVTT\n"), "缺少 WEBVTT 头: {content}");
+        assert!(content.contains("00:00:01.000 --> 00:00:02.500"), "毫秒应以点号分隔: {content}");
+        assert!(content.contains("你好世界"));
+        assert!(!content.contains(','), "VTT 时间戳不应含逗号");
+
+        let _ = std::fs::remove_file(temp);
     }
 }

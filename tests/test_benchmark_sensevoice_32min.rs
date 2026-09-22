@@ -77,6 +77,7 @@ async fn test_benchmark_sensevoice_32min() {
             None,
             Some(8),
             model_override,
+            0.0,
             tx,
         )
         .await

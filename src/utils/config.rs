@@ -53,6 +53,14 @@ fn default_polish_mode() -> String {
     "punc".to_string()
 }
 
+fn default_rescue_logprob() -> f64 {
+    -0.65
+}
+
+fn default_max_context() -> u32 {
+    32
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
     pub language: String,
@@ -67,6 +75,16 @@ pub struct PipelineConfig {
     /// 0 表示按 CPU 核数自动推导；GPU 后端应设置为 1，避免争用单个设备。
     #[serde(default)]
     pub whisper_processors: u32,
+    /// 是否对 turbo 等大模型同样禁用温度回退 (-nf) 以提速；
+    /// 由此漏掉的低置信片段由置信度二段重解码救回（默认开启）
+    #[serde(default = "default_true")]
+    pub whisper_no_fallback: bool,
+    /// 置信度救场阈值：avg_logprob 低于该值的片段触发带回退重解码；0.0 = 关闭救场
+    #[serde(default = "default_rescue_logprob")]
+    pub whisper_rescue_logprob: f64,
+    /// 跨句自注意力上下文 token 上限 (-mc，原硬编码 32，暴露出来供 A/B 实验)
+    #[serde(default = "default_max_context")]
+    pub whisper_max_context: u32,
     pub llm_threads: u32,
     pub llm_ctx: u32,
 }
@@ -95,6 +113,9 @@ impl Default for AppConfig {
                 enable_vad: false,
                 whisper_threads: 8,
                 whisper_processors: 2,
+                whisper_no_fallback: true,
+                whisper_rescue_logprob: -0.65,
+                whisper_max_context: 32,
                 llm_threads: 8,
                 llm_ctx: 4096,
             },

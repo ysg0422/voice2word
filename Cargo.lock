@@ -6516,6 +6516,7 @@ dependencies = [
  "image",
  "open",
  "pollster 0.3.0",
+ "raw-window-handle",
  "rayon",
  "rfd",
  "rusqlite",

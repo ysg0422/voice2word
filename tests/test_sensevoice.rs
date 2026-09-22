@@ -103,6 +103,7 @@ async fn test_sensevoice_pipeline_streaming() {
             None,
             Some(4),
             model_override,
+            0.0,
             tx,
         )
         .await

@@ -37,6 +37,8 @@ async fn test_real_video_pipeline() {
         config.pipeline.whisper_threads,
         config.pipeline.whisper_processors,
         true,
+        config.pipeline.whisper_no_fallback,
+        config.pipeline.whisper_max_context,
     ));
     let llm = Arc::new(LLMEngine::new(
         AppConfig::resolve_path(&config.paths.llama_cli),
@@ -109,6 +111,7 @@ async fn test_real_video_pipeline() {
             Some("punc".to_string()),
             Some(8),
             None,
+            0.0, // 关闭置信度救场，保持测试行为纯净
             tx,
         )
         .await

@@ -13,6 +13,8 @@ pub use types::*;
 
 use gpui::prelude::*;
 use gpui::*;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -69,9 +71,20 @@ pub struct MainWindow {
     pub(crate) benchmark_dialog: Option<BenchmarkDialogInfo>,
     pub(crate) editor_export_format: EditorExportFormat,
     pub(crate) is_export_dropdown_open: bool,
-    pub(crate) is_lang_dropdown_open: bool,
     pub(crate) is_subtitle_style_open: bool,
     pub(crate) text_cursor_pos: usize,
+    /// 内嵌播放器 RenderImage 缓存：(帧版本号, 帧宽, 帧高, 已构建的 GPU 纹理图像)。
+    /// 帧版本与尺寸均未变时直接复用，避免每次渲染深拷贝帧数据并重新上传纹理。
+    pub(crate) cached_live_image: Option<(u64, u32, u32, Arc<RenderImage>)>,
+    /// 字幕清单虚拟列表的滚动位置句柄（uniform_list 仅渲染可视行）
+    pub(crate) subtitle_list_scroll: UniformListScrollHandle,
+    /// 上次清单跟随滚动到的选中序号，用于选中变化时自动滚动跟随
+    pub(crate) subtitle_list_followed_sel: Option<usize>,
+    /// 视频库卡片首帧缩略图缓存：task_id -> 首帧 JPG 路径（磁盘级缓存，跨会话命中）
+    /// 空路径表示该任务提取过但失败（视频文件缺失等），用占位框渲染且不再重复派发
+    pub(crate) library_thumbs: HashMap<i64, PathBuf>,
+    /// 正在后台提取首帧的任务 id 集合，防止重复派发
+    pub(crate) library_thumb_inflight: HashSet<i64>,
 }
 
 impl MainWindow {
@@ -91,9 +104,13 @@ impl MainWindow {
             benchmark_dialog: None,
             editor_export_format: EditorExportFormat::default(),
             is_export_dropdown_open: false,
-            is_lang_dropdown_open: false,
             is_subtitle_style_open: false,
             text_cursor_pos: 0,
+            cached_live_image: None,
+            subtitle_list_scroll: UniformListScrollHandle::new(),
+            subtitle_list_followed_sel: None,
+            library_thumbs: HashMap::new(),
+            library_thumb_inflight: HashSet::new(),
         };
 
         // 若启动已载入历史视频工程，立即触发首帧提取，并按硬件策略补代理

@@ -208,6 +208,12 @@ pub struct AppState {
     pub whisper_threads: u32,
     pub whisper_model_tier: WhisperModelTier,
 
+    /// 用户已点击「终止转写」，等待管线收尾事件（用于区分取消与真实失败）
+    pub cancel_requested: bool,
+
+    /// 字幕编辑产生的未落库脏标记（去抖：切句/跳转/播放/导出时统一写回）
+    pub segments_dirty: bool,
+
     // 字幕翻译相关状态
     pub is_translating: bool,
     pub translate_progress: f32,
@@ -230,6 +236,12 @@ pub struct AppState {
     // 视频帧缓存（优化拖动时间轴性能）
     pub frame_cache: Arc<FrameCache>,
 
+    /// 当前视频真实分辨率（异步探测，驱动监视器画面等比适配与字幕定位）
+    pub video_width: u32,
+    pub video_height: u32,
+    /// 已完成分辨率探测的视频路径（防止重复探测）
+    pub dims_probed_for: Option<PathBuf>,
+
     // 实时内嵌视频播放引擎
     pub video_player: Arc<crate::engines::VideoPlayerEngine>,
     /// Runtime-selected rendering/decode policy shared by preview and seek.
@@ -247,6 +259,8 @@ pub struct AppState {
     pub recommended_profile: crate::core::InferenceProfile,
     pub benchmark_result: Option<crate::core::BenchmarkResult>,
     pub is_benchmarking: bool,
+    /// 性能设置页配置说明卡的展开状态（右上角问号按钮切换）
+    pub show_perf_help: bool,
 
     // 字幕全局样式与排版配置 (模仿 SmartSub & VideoCaptioner)
     pub subtitle_style: SubtitleStyleConfig,
@@ -329,6 +343,8 @@ impl AppState {
             polish_mode,
             whisper_threads: threads,
             whisper_model_tier: WhisperModelTier::SenseVoice, // 默认阿里 SenseVoice 极速引擎 (42x 极速，32分钟仅约45秒)
+            cancel_requested: false,
+            segments_dirty: false,
             is_translating: false,
             translate_progress: 0.0,
             translate_status_msg: String::new(),
@@ -344,6 +360,9 @@ impl AppState {
             timeline_zoom: 1.0,
             editing_text: String::new(),
             frame_cache: Arc::new(FrameCache::new(100)), // 缓存 100 帧（约占 5-10MB）
+            video_width: crate::engines::PLAYER_WIDTH,
+            video_height: crate::engines::PLAYER_HEIGHT,
+            dims_probed_for: None,
             video_player,
             proxy_manager,
             hardware,
@@ -357,6 +376,7 @@ impl AppState {
             recommended_profile,
             benchmark_result: None,
             is_benchmarking: false,
+            show_perf_help: false,
             subtitle_style: SubtitleStyleConfig::default(),
         };
 
@@ -418,6 +438,8 @@ impl AppState {
 
     /// 载入历史任务并无缝切换至剪辑工作台
     pub fn load_task(&mut self, task: &TaskRecord) {
+        // 换工程前先落库当前工程的编辑
+        self.flush_segments_if_dirty();
         self.selected_file = Some(PathBuf::from(&task.file_path));
         self.status = ProcessStatus::Idle;
         self.segments = task.segments.clone();
@@ -472,6 +494,8 @@ impl AppState {
 
     /// 彻底清空当前工作区工程状态（重置为空闲初始状态）
     pub fn clear_current_workspace(&mut self) {
+        // 清空前先落库当前工程的编辑
+        self.flush_segments_if_dirty();
         self.selected_file = None;
         self.status = ProcessStatus::Idle;
         self.segments.clear();
@@ -483,6 +507,9 @@ impl AppState {
         self.is_playing = false;
         self.preview_source = None;
         self.proxy_busy = false;
+        self.video_width = crate::engines::PLAYER_WIDTH;
+        self.video_height = crate::engines::PLAYER_HEIGHT;
+        self.dims_probed_for = None;
         self.clear_streaming();
     }
 
@@ -509,6 +536,7 @@ impl AppState {
 
     /// 0 秒智能缓存命中载入：瞬间恢复已缓存的完整字幕片段与各项指标，彻底跳过重复计算
     pub fn load_from_cache(&mut self, cached: TaskRecord) {
+        self.flush_segments_if_dirty();
         let file_path = PathBuf::from(&cached.file_path);
         let total_dur = if cached.duration > 0.0 {
             cached.duration
@@ -521,6 +549,8 @@ impl AppState {
         self.selected_file = Some(file_path.clone());
         self.preview_source = Some(file_path);
         self.segments = cached.segments;
+        // 旧缓存任务载入时统一再优化一遍：长句自动拆分、鬼影剔除等规则对历史数据同样生效
+        crate::subtitle::optimize_segments(&mut self.segments);
         if let Some(first) = self.segments.first() {
             self.select_segment(first.index);
         }
@@ -534,6 +564,15 @@ impl AppState {
 
     pub fn preview_media(&self) -> Option<&PathBuf> {
         self.preview_source.as_ref().or(self.selected_file.as_ref())
+    }
+
+    /// 视频画面宽高比（探测未完成或失败时回退 16:9）
+    pub fn video_aspect(&self) -> f32 {
+        if self.video_width > 0 && self.video_height > 0 {
+            self.video_width as f32 / self.video_height as f32
+        } else {
+            16.0 / 9.0
+        }
     }
 
     pub fn whisper_eta_label(&self) -> String {
@@ -561,13 +600,17 @@ impl AppState {
     }
 
     /// 获取当前播放时间对应的有效字幕片段
+    /// 半开区间 [start, end)：边界时刻 (t == end == 下一句 start) 归下一句，
+    /// 避免选中某句时画面字幕仍显示上一句
     pub fn get_active_segment(&self) -> Option<&Segment> {
         let t = self.current_time;
-        self.segments.iter().find(|seg| t >= seg.start && t <= seg.end)
+        self.segments.iter().find(|seg| t >= seg.start && t < seg.end)
     }
 
     /// 选中指定索引的字幕片段
     pub fn select_segment(&mut self, index: usize) {
+        // 切句前先把上一句的编辑落库（去抖收口点）
+        self.flush_segments_if_dirty();
         self.selected_segment_index = Some(index);
         if let Some(seg) = self.segments.iter().find(|s| s.index == index) {
             self.editing_text = seg.display_text().to_string();
@@ -577,6 +620,7 @@ impl AppState {
 
     /// 跳转播放指针时间
     pub fn seek_to(&mut self, time_sec: f64) {
+        self.flush_segments_if_dirty();
         let max_dur = if self.total_duration > 0.0 {
             self.total_duration
         } else {
@@ -596,7 +640,7 @@ impl AppState {
         }
     }
 
-    /// 保存当前选中字幕片段的修改文本并写回数据库
+    /// 保存当前选中字幕片段的修改文本（仅内存，去抖后统一落库）
     pub fn save_selected_text(&mut self) {
         let Some(idx) = self.selected_segment_index else { return; };
         let new_text = self.editing_text.trim().to_string();
@@ -606,7 +650,17 @@ impl AppState {
                 seg.polished = new_text;
             }
         }
-        self.sync_segments_to_db();
+        // 去抖：编辑逐键触发，若每次都全量序列化全部片段写 SQLite，长视频输入时是隐形 I/O 热点。
+        // 仅标记脏，等切句/跳转/播放/导出等天然节点由 flush_segments_if_dirty 统一写回。
+        self.segments_dirty = true;
+    }
+
+    /// 将编辑产生的脏字幕落库（幂等，未脏时零开销）
+    pub fn flush_segments_if_dirty(&mut self) {
+        if self.segments_dirty {
+            self.segments_dirty = false;
+            self.sync_segments_to_db();
+        }
     }
 
     /// 微调选中字幕片段的起止时间
@@ -616,7 +670,8 @@ impl AppState {
             seg.start = (seg.start + delta_start).max(0.0);
             seg.end = (seg.end + delta_end).max(seg.start + 0.1);
         }
-        self.sync_segments_to_db();
+        self.segments_dirty = true;
+        self.flush_segments_if_dirty();
     }
 
     /// 拆分当前选中的字幕片段为前后两段
@@ -650,13 +705,15 @@ impl AppState {
             translation: orig.translation.clone(),
             polished: if !orig.polished.is_empty() { part2 } else { String::new() },
             language: orig.language.clone(),
+            confidence: orig.confidence,
         };
         self.segments.insert(pos + 1, new_seg);
 
         // 重新规范化所有序号
         self.reindex_segments();
         self.select_segment(idx + 1);
-        self.sync_segments_to_db();
+        self.segments_dirty = true;
+        self.flush_segments_if_dirty();
     }
 
     /// 将当前选中字幕与下一段字幕合并
@@ -677,7 +734,8 @@ impl AppState {
 
         self.reindex_segments();
         self.select_segment(idx);
-        self.sync_segments_to_db();
+        self.segments_dirty = true;
+        self.flush_segments_if_dirty();
     }
 
     /// 删除当前选中的字幕片段
@@ -694,7 +752,8 @@ impl AppState {
             self.selected_segment_index = None;
             self.editing_text.clear();
         }
-        self.sync_segments_to_db();
+        self.segments_dirty = true;
+        self.flush_segments_if_dirty();
     }
 
     fn reindex_segments(&mut self) {

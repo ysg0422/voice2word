@@ -13,6 +13,7 @@ use super::{EditorExportFormat, MainWindow};
 impl MainWindow {
     /// CPU 机器强制走 H.264 代理；有 GPU 默认原片，用户仍可手动打开。
     pub(crate) fn ensure_preview_proxy(&mut self, cx: &mut Context<Self>) {
+        self.probe_video_dimensions(cx);
         if !self.state.proxy_enabled {
             self.state.preview_source = self.state.selected_file.clone();
             self.state.proxy_busy = false;
@@ -118,6 +119,7 @@ impl MainWindow {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         self.state.clear_streaming();
+        self.state.cancel_requested = false;
         self.state.status = ProcessStatus::Processing {
             stage: "准备中...".to_string(),
             progress: 0.0,
@@ -142,6 +144,7 @@ impl MainWindow {
             let abs = crate::utils::AppConfig::resolve_path(&rel);
             Some(abs)
         };
+        let rescue_logprob = self.state.config.pipeline.whisper_rescue_logprob;
 
         // 后台通过独立线程执行 Tokio 异步管线，不阻塞 UI 主线程
         let in_file = input_file.clone();
@@ -152,7 +155,7 @@ impl MainWindow {
                 .unwrap();
             rt.block_on(async move {
                 if let Err(err) = pipeline
-                    .run(in_file, None, lang, fmt, polish, polish_mode, threads, model_override, tx.clone())
+                    .run(in_file, None, lang, fmt, polish, polish_mode, threads, model_override, rescue_logprob, tx.clone())
                     .await
                 {
                     let _ = tx.send(PipelineEvent::Error(format!("转写失败: {err}")));
@@ -195,7 +198,13 @@ impl MainWindow {
                                 }
                                 PipelineEvent::Finished(segments, metrics) => {
                                     this.state.clear_streaming();
-                                    if segments.is_empty() {
+                                    if this.state.cancel_requested {
+                                        // 用户主动终止：静默收尾，不弹完成框、不写历史库
+                                        this.state.cancel_requested = false;
+                                        this.state.status = ProcessStatus::Idle;
+                                        this.state.transcribe_file = None;
+                                        this.state.transcribe_duration = 0.0;
+                                    } else if segments.is_empty() {
                                         this.state.status = ProcessStatus::Failed("未能识别出任何有效字幕，请检查音频音量或识别语言设置".to_string());
                                     } else {
                                         let finished_file = this.state.transcribe_file.take();
@@ -254,7 +263,15 @@ impl MainWindow {
                                     }
                                 }
                                 PipelineEvent::Error(err) => {
-                                    this.state.status = ProcessStatus::Failed(err);
+                                    if this.state.cancel_requested {
+                                        // 终止导致的子进程报错按取消处理，不显示为失败
+                                        this.state.cancel_requested = false;
+                                        this.state.status = ProcessStatus::Idle;
+                                        this.state.transcribe_file = None;
+                                        this.state.transcribe_duration = 0.0;
+                                    } else {
+                                        this.state.status = ProcessStatus::Failed(err);
+                                    }
                                 }
                         }
                     }
@@ -272,27 +289,55 @@ impl MainWindow {
         }
 
         let fmt = self.state.output_format.clone();
-        let segments = self.state.segments.clone();
         let stem = self.state.selected_file.as_ref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
             .unwrap_or("subtitle");
         let default_name = format!("{}.{}", stem, fmt);
 
+        self.export_with_save_dialog(
+            cx,
+            default_name,
+            "Subtitle",
+            fmt.clone(),
+            move |segs, save_path| SubtitleWriter::write_to_file(segs, save_path, &fmt),
+        );
+    }
+
+    /// 通用导出流程：编辑落库 -> 弹系统保存对话框 -> 后台写出文件 -> 状态回写。
+    /// 统一四个导出入口的重复骨架（对话框参数与写出函数因格式而异）。
+    pub(crate) fn export_with_save_dialog(
+        &mut self,
+        cx: &mut Context<Self>,
+        default_name: String,
+        filter_label: &str,
+        filter_ext: String,
+        write_file: impl FnOnce(&[crate::subtitle::Segment], &std::path::Path) -> anyhow::Result<()> + Send + 'static,
+    ) {
+        if self.state.segments.is_empty() {
+            return;
+        }
+        self.state.flush_segments_if_dirty();
+
+        let segments = self.state.segments.clone();
+        let filter_label = filter_label.to_string();
         cx.spawn(async move |this, cx| {
             let handle = rfd::AsyncFileDialog::new()
                 .set_file_name(&default_name)
-                .add_filter("Subtitle", &[fmt.as_str()])
+                .add_filter(&filter_label, &[filter_ext.as_str()])
                 .save_file()
                 .await;
             if let Some(save_handle) = handle {
                 let save_path = save_handle.path().to_path_buf();
-                let res = SubtitleWriter::write_to_file(&segments, &save_path, &fmt);
+                let res = write_file(&segments, &save_path);
                 let _ = this.update(cx, |this, cx| {
-                    if let Err(e) = res {
-                        this.state.status = ProcessStatus::Failed(format!("导出失败: {}", e));
-                    } else {
-                        info!("字幕成功导出至: {:?}", save_path);
+                    match res {
+                        Ok(()) => {
+                            info!("字幕成功导出至: {:?}", save_path);
+                        }
+                        Err(e) => {
+                            this.state.status = ProcessStatus::Failed(format!("导出失败: {}", e));
+                        }
                     }
                     cx.notify();
                 });
@@ -306,6 +351,7 @@ impl MainWindow {
         if self.state.segments.is_empty() {
             return;
         }
+        self.state.flush_segments_if_dirty();
 
         let segments = self.state.segments.clone();
         let video_path = self.state.selected_file.clone();
@@ -393,34 +439,19 @@ impl MainWindow {
         if self.state.segments.is_empty() {
             return;
         }
-
-        let segments = self.state.segments.clone();
         let stem = self.state.selected_file.as_ref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
             .unwrap_or("subtitle")
             .to_string();
-        let default_name = format!("{}.fcpxml", stem);
 
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_file_name(&default_name)
-                .add_filter("Final Cut Pro XML (*.fcpxml)", &["fcpxml"])
-                .save_file()
-                .await;
-            if let Some(save_handle) = handle {
-                let save_path = save_handle.path().to_path_buf();
-                let res = crate::subtitle::FcpXmlExporter::write_to_file(&segments, &save_path, &stem);
-                let _ = this.update(cx, |this, cx| {
-                    if let Err(e) = res {
-                        this.state.status = ProcessStatus::Failed(format!("导出 FCPXML 失败: {}", e));
-                    } else {
-                        info!("FCPXML 成功导出至: {:?}", save_path);
-                    }
-                    cx.notify();
-                });
-            }
-        }).detach();
+        self.export_with_save_dialog(
+            cx,
+            format!("{}.fcpxml", stem),
+            "Final Cut Pro XML (*.fcpxml)",
+            "fcpxml".to_string(),
+            move |segs, path| crate::subtitle::FcpXmlExporter::write_to_file(segs, path, &stem),
+        );
     }
 
     /// 导出 Adobe Premiere Pro XML (FCP7 XML / xmeml) 工程文件
@@ -428,34 +459,19 @@ impl MainWindow {
         if self.state.segments.is_empty() {
             return;
         }
-
-        let segments = self.state.segments.clone();
         let stem = self.state.selected_file.as_ref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
             .unwrap_or("subtitle")
             .to_string();
-        let default_name = format!("{}.xml", stem);
 
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_file_name(&default_name)
-                .add_filter("Premiere Pro XML (*.xml)", &["xml"])
-                .save_file()
-                .await;
-            if let Some(save_handle) = handle {
-                let save_path = save_handle.path().to_path_buf();
-                let res = crate::subtitle::PremiereXmlExporter::write_to_file(&segments, &save_path, &stem);
-                let _ = this.update(cx, |this, cx| {
-                    if let Err(e) = res {
-                        this.state.status = ProcessStatus::Failed(format!("导出 Premiere XML 失败: {}", e));
-                    } else {
-                        info!("Premiere XML 成功导出至: {:?}", save_path);
-                    }
-                    cx.notify();
-                });
-            }
-        }).detach();
+        self.export_with_save_dialog(
+            cx,
+            format!("{}.xml", stem),
+            "Premiere Pro XML (*.xml)",
+            "xml".to_string(),
+            move |segs, path| crate::subtitle::PremiereXmlExporter::write_to_file(segs, path, &stem),
+        );
     }
 
     /// 使用 FFplay 播放当前视频，并通过 subtitles 滤镜叠加已生成字幕。
@@ -468,11 +484,14 @@ impl MainWindow {
             cx.notify();
             return;
         }
+        self.state.flush_segments_if_dirty();
 
         let subtitle_path = std::env::temp_dir().join(format!(
             "voice2word_preview_{}.srt",
             std::process::id()
         ));
+        // 复用同一临时文件名，写新前先清旧，避免历次预览 SRT 在 temp 无限累积
+        let _ = std::fs::remove_file(&subtitle_path);
         if let Err(error) = SubtitleWriter::write_srt(&self.state.segments, &subtitle_path) {
             self.state.status = ProcessStatus::Failed(format!("生成预览字幕失败: {}", error));
             cx.notify();
@@ -510,8 +529,37 @@ impl MainWindow {
         }
     }
 
+    /// 异步探测当前视频的真实分辨率（驱动监视器画面等比适配，杜绝字幕掉进黑边、画面拉伸变形）
+    pub(crate) fn probe_video_dimensions(&mut self, cx: &mut Context<Self>) {
+        let Some(video) = self.state.preview_media().cloned() else {
+            return;
+        };
+        if self.state.dims_probed_for.as_ref() == Some(&video) {
+            return;
+        }
+        self.state.dims_probed_for = Some(video.clone());
+        let ffmpeg_path = crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
+        let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { ffmpeg.get_resolution(&video) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some((w, h)) = result {
+                    this.state.video_width = w;
+                    this.state.video_height = h;
+                    this.state.video_player.set_frame_dimensions(w, h);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// 异步根据当前播放时间抽取单帧画面（单飞队列：最多 1 个 FFmpeg 实例并发，合并多余拖动请求）
     pub(crate) fn trigger_extract_frame(&mut self, cx: &mut Context<Self>) {
+        self.probe_video_dimensions(cx);
         let Some(video_path) = self.state.preview_media().cloned() else { return; };
         if !video_path.exists() {
             return;
@@ -598,6 +646,7 @@ impl MainWindow {
             self.state.current_time = self.state.video_player.current_play_time();
             self.state.is_playing = false;
         }
+        self.state.flush_segments_if_dirty();
         self.state.video_player.stop();
         self.play_tick_generation = self.state.video_player.generation();
     }
@@ -637,6 +686,7 @@ impl MainWindow {
             let Some(video_file) = self.state.preview_media().cloned() else {
                 return;
             };
+            self.state.flush_segments_if_dirty();
             self.state.is_playing = true;
             let start_sec = self.state.current_time;
             self.state.video_player.play(video_file, start_sec);
@@ -689,25 +739,37 @@ impl MainWindow {
 
     /// 根据当前剪辑工作台选中的格式执行统一导出
     pub(crate) fn perform_editor_export(&mut self, cx: &mut Context<Self>) {
+        self.state.flush_segments_if_dirty();
+        if self.state.segments.is_empty() {
+            return;
+        }
+
+        let stem = self.state.selected_file.as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("subtitle")
+            .to_string();
+
         match self.editor_export_format {
             EditorExportFormat::JianYing => self.export_jianying_local(cx),
             EditorExportFormat::Fcpxml => self.export_fcpxml(cx),
             EditorExportFormat::PremiereXml => self.export_premiere_xml(cx),
-            EditorExportFormat::Srt => {
-                self.state.output_format = "srt".to_string();
-                self.export_subtitles(cx);
-            }
-            EditorExportFormat::Ass => {
-                self.state.output_format = "ass".to_string();
-                self.export_subtitles(cx);
-            }
-            EditorExportFormat::Txt => {
-                self.state.output_format = "txt".to_string();
-                self.export_subtitles(cx);
-            }
-            EditorExportFormat::Vtt => {
-                self.state.output_format = "vtt".to_string();
-                self.export_subtitles(cx);
+            EditorExportFormat::Srt | EditorExportFormat::Ass | EditorExportFormat::Txt | EditorExportFormat::Vtt => {
+                let ext = match self.editor_export_format {
+                    EditorExportFormat::Srt => "srt",
+                    EditorExportFormat::Ass => "ass",
+                    EditorExportFormat::Txt => "txt",
+                    EditorExportFormat::Vtt => "vtt",
+                    _ => unreachable!(),
+                };
+                // 直接按目标扩展名导出，不再临时改写全局 output_format（避免副作用泄漏到后续管线调用）
+                self.export_with_save_dialog(
+                    cx,
+                    format!("{}.{}", stem, ext),
+                    "Subtitle",
+                    ext.to_string(),
+                    move |segs, path| SubtitleWriter::write_to_file(segs, path, ext),
+                );
             }
         }
     }

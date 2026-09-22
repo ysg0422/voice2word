@@ -13,7 +13,7 @@ pub use llm::LLMEngine;
 pub use punc::PunctuationEngine;
 pub use sensevoice::SenseVoiceEngine;
 pub use translate::TranslateEngine;
-pub use video_player::{VideoPlayerEngine, PLAYER_HEIGHT, PLAYER_WIDTH};
+pub use video_player::{PlayerFrame, VideoPlayerEngine, PLAYER_HEIGHT, PLAYER_WIDTH};
 pub use whisper::WhisperEngine;
 pub use chunked_whisper::transcribe_chunked;
 pub use media_pipeline::{

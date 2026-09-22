@@ -34,6 +34,7 @@ encoding_rs = "0.8"
 zhconv = "0.3"
 rayon = "1.10"
 uuid = { version = "1.26.1", features = ["v4", "fast-rng"] }
+raw-window-handle = "0.6"
 
 [profile.dev]
 opt-level = 0

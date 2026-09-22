@@ -6,7 +6,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{error, info, warn};
@@ -17,12 +17,25 @@ pub const PLAYER_WIDTH: u32 = 1280;
 pub const PLAYER_HEIGHT: u32 = 720;
 pub const FRAME_BYTES: usize = (PLAYER_WIDTH * PLAYER_HEIGHT * 4) as usize;
 
+/// 一帧解码输出：BGRA 像素 + 本帧实际尺寸（随视频真实宽高比动态变化，UI 据此构建纹理）
+pub struct PlayerFrame {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
 pub struct VideoPlayerEngine {
     ffmpeg_path: PathBuf,
     ffplay_path: PathBuf,
     policy: DecodePolicy,
 
-    current_frame: Arc<Mutex<Option<Vec<u8>>>>,
+    // 以 Arc 共享最新帧：出帧线程写入，UI 只克隆指针，杜绝每帧 3.68MB 深拷贝
+    current_frame: Arc<Mutex<Option<Arc<PlayerFrame>>>>,
+    /// 出帧尺寸（随视频真实分辨率等比适配，set_frame_dimensions 驱动）
+    frame_width: AtomicU32,
+    frame_height: AtomicU32,
+    /// 帧版本号：每写入一帧自增，UI 据此判断画面是否变化（永不回退，与 generation 解耦）
+    frame_version: Arc<AtomicU64>,
     is_playing: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     video_proc: Arc<Mutex<Option<Child>>>,
@@ -57,6 +70,9 @@ impl VideoPlayerEngine {
             ffplay_path: ffplay,
             policy,
             current_frame: Arc::new(Mutex::new(None)),
+            frame_width: AtomicU32::new(PLAYER_WIDTH),
+            frame_height: AtomicU32::new(PLAYER_HEIGHT),
+            frame_version: Arc::new(AtomicU64::new(0)),
             is_playing: Arc::new(AtomicBool::new(false)),
             generation: Arc::new(AtomicU64::new(0)),
             video_proc: Arc::new(Mutex::new(None)),
@@ -73,8 +89,35 @@ impl VideoPlayerEngine {
     }
 
     /// 最新一帧 BGRA（播放中或暂停后都可用，严格匹配 GPUI Bgra8Unorm，避免红蓝颠倒与暂停闪黑）。
-    pub fn get_frame(&self) -> Option<Vec<u8>> {
+    /// 返回 Arc 指针克隆而非深拷贝，UI 层配合 frame_version 缓存 RenderImage 实现零拷贝复用。
+    pub fn get_frame(&self) -> Option<Arc<PlayerFrame>> {
         self.current_frame.lock().ok()?.clone()
+    }
+
+    /// 设定视频源分辨率：在 1280x720 预算内等比适配出帧尺寸（偶数对齐）。
+    /// scale 滤镜、帧缓冲读取与 UI 画面比例全部由此驱动，保证任意宽高比下画面不拉伸。
+    pub fn set_frame_dimensions(&self, src_w: u32, src_h: u32) {
+        let (sw, sh) = (src_w.max(2), src_h.max(2));
+        let scale = (PLAYER_WIDTH as f32 / sw as f32).min(PLAYER_HEIGHT as f32 / sh as f32);
+        let mut w = ((sw as f32 * scale).round() as u32).clamp(2, PLAYER_WIDTH);
+        let mut h = ((sh as f32 * scale).round() as u32).clamp(2, PLAYER_HEIGHT);
+        w -= w % 2;
+        h -= h % 2;
+        self.frame_width.store(w, Ordering::SeqCst);
+        self.frame_height.store(h, Ordering::SeqCst);
+    }
+
+    /// 当前出帧尺寸 (宽, 高)
+    pub fn frame_dimensions(&self) -> (u32, u32) {
+        (
+            self.frame_width.load(Ordering::SeqCst),
+            self.frame_height.load(Ordering::SeqCst),
+        )
+    }
+
+    /// 当前帧版本号：每写入一帧自增一次。UI 版本未变时可直接复用已构建的 RenderImage。
+    pub fn frame_version(&self) -> u64 {
+        self.frame_version.load(Ordering::SeqCst)
     }
 
     pub fn is_playing(&self) -> bool {
@@ -234,13 +277,17 @@ impl VideoPlayerEngine {
             }
         }
 
+        // 出帧尺寸：按视频真实宽高比等比适配（探测未完成时回退 1280x720）
+        let (frame_w, frame_h) = self.frame_dimensions();
+        let frame_bytes = frame_w as usize * frame_h as usize * 4;
+
         let mut used_hwaccel = self.policy.try_hwaccel;
-        let mut video_child = match self.spawn_video(&video_path, &start_sec_str, used_hwaccel) {
+        let mut video_child = match self.spawn_video(&video_path, &start_sec_str, used_hwaccel, frame_w, frame_h) {
             Ok(child) => child,
             Err(e) if used_hwaccel => {
                 warn!(error = %e, "硬件解码启动失败，回退软解");
                 used_hwaccel = false;
-                match self.spawn_video(&video_path, &start_sec_str, false) {
+                match self.spawn_video(&video_path, &start_sec_str, false, frame_w, frame_h) {
                     Ok(child) => child,
                     Err(e) => {
                         error!("启动 FFmpeg 视频流失败: {}", e);
@@ -266,6 +313,7 @@ impl VideoPlayerEngine {
         }
 
         let frame_target = self.current_frame.clone();
+        let frame_version_target = self.frame_version.clone();
         let is_playing_flag = self.is_playing.clone();
         let generation = self.generation.clone();
         let play_instant_target = self.play_start_instant.clone();
@@ -274,7 +322,6 @@ impl VideoPlayerEngine {
         std::thread::Builder::new()
             .name(format!("v2w-preview-{gen}"))
             .spawn(move || {
-                let mut buf = vec![0u8; FRAME_BYTES];
                 let mut frame_index: u64 = 0;
                 let mut active_start: Option<Instant> = None;
                 const FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(40);
@@ -282,6 +329,9 @@ impl VideoPlayerEngine {
                 while is_playing_flag.load(Ordering::SeqCst)
                     && generation.load(Ordering::SeqCst) == gen
                 {
+                    // 每帧独立分配并直接装入 Arc：读取即所有权，整条链路零深拷贝。
+                    // 分配器会复用上一帧归还的同尺寸内存块，稳态下无页错误开销。
+                    let mut buf = vec![0u8; frame_bytes];
                     match stdout.read_exact(&mut buf) {
                         Ok(()) => {
                             if generation.load(Ordering::SeqCst) != gen {
@@ -307,7 +357,12 @@ impl VideoPlayerEngine {
                                 continue;
                             }
                             if let Ok(mut lock) = frame_target.lock() {
-                                *lock = Some(buf.clone());
+                                *lock = Some(Arc::new(PlayerFrame {
+                                    data: buf,
+                                    width: frame_w,
+                                    height: frame_h,
+                                }));
+                                frame_version_target.fetch_add(1, Ordering::SeqCst);
                             }
                             frame_index += 1;
                             frame_index_target.store(frame_index, Ordering::SeqCst);
@@ -322,7 +377,9 @@ impl VideoPlayerEngine {
                 start = start_seconds,
                 hwaccel = used_hwaccel,
                 gen,
-                "内嵌播放器已启动 (BGRA 1280x720 @ 25fps)"
+                width = frame_w,
+                height = frame_h,
+                "内嵌播放器已启动 (BGRA 等比出帧 @ 25fps)"
             );
     }
 
@@ -331,6 +388,8 @@ impl VideoPlayerEngine {
         video_path: &Path,
         start_sec_str: &str,
         hwaccel: bool,
+        frame_w: u32,
+        frame_h: u32,
     ) -> std::io::Result<Child> {
         let mut video_cmd = Command::new(&self.ffmpeg_path);
         apply_no_window(&mut video_cmd);
@@ -359,7 +418,7 @@ impl VideoPlayerEngine {
                 "-vf",
                 &format!(
                     "scale={}:{}:flags=fast_bilinear,format=bgra",
-                    PLAYER_WIDTH, PLAYER_HEIGHT
+                    frame_w, frame_h
                 ),
                 "-pix_fmt",
                 "bgra",

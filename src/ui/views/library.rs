@@ -2,6 +2,8 @@
 
 use gpui::prelude::*;
 use gpui::*;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::app::state::WorkspaceTab;
 use crate::subtitle::SubtitleWriter;
@@ -14,6 +16,9 @@ impl MainWindow {
     pub(crate) fn render_library_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let tasks = self.state.recent_tasks.clone();
         let total_count = tasks.len();
+
+        // 为缺失首帧的卡片后台派发缩略图提取（幂等，完成后自动刷新）
+        self.ensure_library_thumbnails(&tasks, cx);
 
         div()
             .id("library-workspace-layout")
@@ -176,6 +181,50 @@ impl MainWindow {
             .into_any_element()
     }
 
+    /// 为视频库卡片异步预提取首帧缩略图。
+    /// 复用全局 FrameCache（磁盘级缓存：路径+文件签名+时间键，跨会话命中），时间 0.0 即首帧；
+    /// 每个任务仅派发一次，失败时写入空路径标记防止逐帧重试刷爆后台。
+    fn ensure_library_thumbnails(
+        &mut self,
+        tasks: &[crate::storage::db::TaskRecord],
+        cx: &mut Context<Self>,
+    ) {
+        for task in tasks {
+            let task_id = task.id;
+            if self.library_thumbs.contains_key(&task_id)
+                || self.library_thumb_inflight.contains(&task_id)
+            {
+                continue;
+            }
+            let video_path = PathBuf::from(&task.file_path);
+            if !video_path.exists() {
+                continue;
+            }
+            self.library_thumb_inflight.insert(task_id);
+
+            let ffmpeg = Arc::new(crate::engines::FFmpegEngine::new(
+                crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg),
+            ));
+            let cache = self.state.frame_cache.clone();
+
+            cx.spawn(async move |this, cx| {
+                let thumb = cx
+                    .background_executor()
+                    .spawn(async move { cache.get_or_extract(&video_path, 0.0, &ffmpeg) })
+                    .await;
+
+                let _ = this.update(cx, |this, cx| {
+                    this.library_thumb_inflight.remove(&task_id);
+                    // 失败也占位（空路径），避免每次渲染重复派发
+                    this.library_thumbs
+                        .insert(task_id, thumb.unwrap_or_default());
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
     /// 单条视频卡片 —— 横向布局：缩略图 | 信息区 | 操作按钮
     fn render_library_card(
         &self,
@@ -210,11 +259,16 @@ impl MainWindow {
             })
             .unwrap_or_else(|| "未知大小".to_string());
 
-        // 摘录首条字幕文本
+        // 摘录首条字幕文本 (按字符边界截断，避免切进多字节中文字符导致 panic)
         let sample_text = task.segments.first()
             .map(|s| {
                 let t = s.display_text().to_string();
-                if t.len() > 80 { format!("{}...", &t[..77]) } else { t }
+                if t.chars().count() > 40 {
+                    let cut: String = t.chars().take(40).collect();
+                    format!("{}...", cut)
+                } else {
+                    t
+                }
             })
             .unwrap_or_else(|| "无字幕内容".to_string());
 
@@ -237,43 +291,84 @@ impl MainWindow {
             .flex()
             .flex_row()
             .gap_4()
-            // ── 左侧：缩略图占位 ──
-            .child(
-                div()
+            // ── 左侧：首帧缩略图（后台提取完成前显示占位） ──
+            .child({
+                let thumb_box = div()
                     .flex_shrink_0()
                     .w(px(180.0))
                     .h(px(108.0))
                     .rounded_lg()
+                    .overflow_hidden()
                     .bg(rgb(0x12121a))
                     .border_1()
                     .border_color(rgb(0x1e1e2a))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .flex_col()
-                    .gap_1()
-                    // 格式标识
-                    .child(
-                        div()
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .bg(rgb(0x1c1c28))
-                            .border_1()
-                            .border_color(rgb(0x2a2a38))
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(Theme::text_muted())
-                            .child(ext),
-                    )
-                    // 时长标签
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(Theme::text_muted())
-                            .child(dur_str.clone()),
-                    ),
-            )
+                    .relative();
+
+                match self.library_thumbs.get(&task_id) {
+                    Some(path) if path.exists() => thumb_box
+                        // 视频首帧铺满卡片，Cover 裁剪对齐 16:9
+                        .child(
+                            img(path.clone())
+                                .size_full()
+                                .object_fit(ObjectFit::Cover),
+                        )
+                        // 底部信息条：格式 + 时长
+                        .child(
+                            div()
+                                .absolute()
+                                .bottom_0()
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px_2()
+                                .py_0p5()
+                                .bg(rgba(0x0a0a0fb8))
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(Theme::text_muted())
+                                        .child(ext),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(Theme::text_muted())
+                                        .child(dur_str.clone()),
+                                ),
+                        ),
+                    _ => thumb_box
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .flex_col()
+                        .gap_1()
+                        // 格式标识
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x1c1c28))
+                                .border_1()
+                                .border_color(rgb(0x2a2a38))
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(Theme::text_muted())
+                                .child(ext),
+                        )
+                        // 时长标签
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(Theme::text_muted())
+                                .child(dur_str.clone()),
+                        ),
+                }
+            })
             // ── 中间：信息区 ──
             .child(
                 div()

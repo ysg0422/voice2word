@@ -72,10 +72,25 @@ impl FFmpegEngine {
 
     /// 纯内存管道推流：以 16kHz 单声道 s16le PCM WAV 格式将音频输出到 stdout 匿名管道 (0 磁盘 I/O)
     pub fn spawn_audio_stream<P: AsRef<Path>>(&self, input_path: P) -> Result<std::process::Child> {
+        self.spawn_audio_stream_at(input_path, None, None)
+    }
+
+    /// 带时间窗的纯内存管道推流（用于置信度救场：只重解码指定的低置信窗口）。
+    /// `start_sec`/`duration_sec` 为 None 时等价于 spawn_audio_stream 全片推流。
+    pub fn spawn_audio_stream_at<P: AsRef<Path>>(
+        &self,
+        input_path: P,
+        start_sec: Option<f64>,
+        duration_sec: Option<f64>,
+    ) -> Result<std::process::Child> {
         let input_path = input_path.as_ref();
         info!(
-            "FFmpeg 启动纯内存音频推流管道: {:?}",
-            input_path.file_name().unwrap_or_default()
+            "FFmpeg 启动纯内存音频推流管道: {:?} (窗口: {:?})",
+            input_path.file_name().unwrap_or_default(),
+            match (start_sec, duration_sec) {
+                (Some(s), Some(d)) => format!("{:.2}s ~ {:.2}s", s, s + d),
+                _ => "全片".to_string(),
+            }
         );
 
         let mut cmd = Command::new(&self.ffmpeg_path);
@@ -84,7 +99,14 @@ impl FFmpegEngine {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000);
         }
-        cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+        if let Some(s) = start_sec {
+            cmd.arg("-ss").arg(format!("{:.3}", s.max(0.0)));
+        }
+        if let Some(d) = duration_sec {
+            cmd.arg("-t").arg(format!("{:.3}", d.max(0.1)));
+        }
+        cmd.arg("-i")
             .arg(input_path)
             .args([
                 "-map", "0:a:0?",
@@ -129,6 +151,34 @@ impl FFmpegEngine {
             }
         }
         0.0
+    }
+
+    /// 探测视频真实分辨率 (宽, 高)。解析 `ffmpeg -i` 元数据输出中首个视频流的尺寸；
+    /// 探测失败返回 None（调用方回退 16:9）。
+    pub fn get_resolution<P: AsRef<Path>>(&self, input_path: P) -> Option<(u32, u32)> {
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let output = cmd.arg("-i").arg(input_path.as_ref()).output().ok()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            let Some(video_pos) = line.find("Video:") else { continue };
+            for token in line[video_pos..].split(&[',', ' ', '(', ')']) {
+                let Some((w, h)) = token.split_once('x') else { continue };
+                let (Ok(w), Ok(h)) = (w.trim().parse::<u32>(), h.trim().parse::<u32>())
+                else {
+                    continue;
+                };
+                // 过滤 0x001B 之类的十六进制杂讯与异常值，只接受合理分辨率
+                if w >= 16 && h >= 16 && w <= 16384 && h <= 16384 {
+                    return Some((w, h));
+                }
+            }
+        }
+        None
     }
 
     /// 根据时间点快速抽取视频某一帧画面 (用于视频编辑监视器预览)

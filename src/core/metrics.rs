@@ -19,6 +19,12 @@ pub struct PipelinePerformanceMetrics {
     pub vad_engine_name: Option<String>,
     /// 阶段 3: 语音识别纯推理耗时 (秒)
     pub whisper_sec: f64,
+    /// 阶段 3+: 置信度二段重解码耗时 (秒，未触发时为 0.0)
+    #[serde(default)]
+    pub rescue_sec: f64,
+    /// 阶段 3+: 触发重解码救回的低置信窗口数量
+    #[serde(default)]
+    pub rescue_span_count: usize,
     /// 阶段 3 ASR 引擎详细说明（如 "SenseVoice-Small (非自回归 INT8 · CPU 8线程)" 或 "Whisper Turbo Q5 (ggml-large-v3-turbo-q5_0.bin)"）
     #[serde(default)]
     pub asr_engine_name: Option<String>,
@@ -58,6 +64,11 @@ impl PipelinePerformanceMetrics {
             },
         );
         let asr_desc = self.asr_engine_name.as_deref().unwrap_or("Whisper 语音转写");
+        let rescue_desc = if self.rescue_span_count > 0 {
+            format!("{} 个低置信窗口已带回退重解码救回", self.rescue_span_count)
+        } else {
+            "未触发 (全程置信度良好或已关闭)".to_string()
+        };
         let polish_desc = self.polish_engine_name.as_deref().unwrap_or("标点/AI润色 (跳过)");
         let export_desc = self.export_name.as_deref().unwrap_or("字幕文件写出");
 
@@ -65,6 +76,7 @@ impl PipelinePerformanceMetrics {
         let audio_pct = (self.ffmpeg_audio_sec / total * 100.0).clamp(0.0, 100.0);
         let vad_pct = (self.vad_sec / total * 100.0).clamp(0.0, 100.0);
         let asr_pct = (self.whisper_sec / total * 100.0).clamp(0.0, 100.0);
+        let rescue_pct = (self.rescue_sec / total * 100.0).clamp(0.0, 100.0);
         let polish_pct = (self.qwen_sec / total * 100.0).clamp(0.0, 100.0);
         let export_pct = (self.srt_export_sec / total * 100.0).clamp(0.0, 100.0);
 
@@ -94,6 +106,7 @@ r#"
 [阶段 1] 音频通道：    {:>6.1} 秒 ({:>4.1}%) | {audio_desc}
 [阶段 2] 语音活性检测：{:>6.1} 秒 ({:>4.1}%) | {vad_desc}
 [阶段 3] 语音转写识别：{:>6.1} 秒 ({:>4.1}%) | {asr_desc}
+[阶段 3+]置信度救场：  {:>6.1} 秒 ({:>4.1}%) | {rescue_desc}
 [阶段 4] 标点与语法：  {:>6.1} 秒 ({:>4.1}%) | {polish_desc}
 [阶段 5] 字幕导出写出：{:>6.1} 秒 ({:>4.1}%) | {export_desc}
 
@@ -104,6 +117,7 @@ r#"
             self.ffmpeg_audio_sec, audio_pct,
             self.vad_sec, vad_pct,
             self.whisper_sec, asr_pct,
+            self.rescue_sec, rescue_pct,
             self.qwen_sec, polish_pct,
             self.srt_export_sec, export_pct,
             self.total_elapsed_sec,

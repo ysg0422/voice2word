@@ -11,7 +11,6 @@ use image::{Frame, ImageBuffer, Rgba};
 use smallvec::SmallVec;
 use std::sync::Arc;
 use crate::app::state::{WorkspaceTab, ProcessStatus};
-use crate::engines::{PLAYER_HEIGHT, PLAYER_WIDTH};
 use crate::utils::time::{format_duration_short, seconds_to_hms, seconds_to_timestamp};
 use super::theme::Theme;
 use super::{EditorExportFormat, MainWindow};
@@ -342,7 +341,7 @@ impl MainWindow {
                             .child("独立窗口"),
                     ),
             )
-            // 16:9 监视器视口屏幕
+            // 监视器视口屏幕：视频画面按真实宽高比等比适配居中（分辨率探测前回退 16:9）
             .child(
                 div()
                     .id("monitor-viewport-screen")
@@ -355,102 +354,49 @@ impl MainWindow {
                     .items_center()
                     .justify_center()
                     .overflow_hidden()
-                    // 视频画面展示 (实时内嵌播放 vs 静态时间轴帧)
+                    // 画面容器 (stage)：与视频画面等比，是字幕覆盖层的定位基准，
+                    // 保证字幕始终压在画面上而不是视口黑边里
                     .child({
-                        let live_frame = self.state.video_player.get_frame();
-
-                        if let Some(bgra_data) = live_frame {
-                            // GPUI RenderImage 底层纹理严格要求 BGRA 格式（wgpu::TextureFormat::Bgra8Unorm），FFmpeg 已按 bgra 直出
-                            if let Some(buffer) = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(PLAYER_WIDTH, PLAYER_HEIGHT, bgra_data) {
-                                let render_img = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
-                                div()
-                                    .size_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(img(render_img).size_full())
-                            } else {
-                                div().size_full()
-                            }
-                        } else if let Some(ref frame_path) = self.state.preview_frame_path {
-                            if frame_path.exists() {
-                                div()
-                                    .size_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        img(frame_path.clone())
-                                            .size_full()
-                                    )
-                            } else {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .child(
-                                        div()
-                                            .text_size(px(12.0))
-                                            .text_color(Theme::text_muted())
-                                            .child("正在提取视频帧..."),
-                                    )
-                            }
-                        } else if self.state.selected_file.is_some() {
-                            div()
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .gap_1p5()
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .text_color(Theme::accent_mint())
-                                        .child("正在同步视频画面..."),
-                                )
-                        } else {
-                            div()
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .gap_1p5()
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .text_color(Theme::text_muted())
-                                        .child("拖动时间轴或点击播放，画面将在此实时呈现"),
-                                )
-                        }
-                    })
-                    // 电影级高对比度字幕覆盖居中层
-                    .child(
-                        div()
-                            .absolute()
-                            .bottom(px(18.0))
-                            .left_0()
-                            .right_0()
-                            .flex()
-                            .justify_center()
-                            .px_6()
+                        let video_aspect = self.state.video_aspect();
+                        let mut stage = div().relative().w_full().max_h_full();
+                        stage.style().aspect_ratio = Some(video_aspect);
+                        stage
+                            // 视频画面展示 (实时内嵌播放 vs 静态时间轴帧)
+                            .child(self.render_monitor_picture())
+                            // 电影级高对比度字幕覆盖层：锚定画面底部（画面高度 5.5%，随画面等比缩放）
                             .child(
-                                if let Some(seg) = active_seg {
-                                    div()
-                                        .px_4()
-                                        .py_1p5()
-                                        .rounded_md()
-                                        .bg(rgba(0x000000dd))
-                                        .border_1()
-                                        .border_color(rgba(0xffffff28))
-                                        .text_size(px(15.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(0xffffff))
-                                        .text_align(TextAlign::Center)
-                                        .child(seg.display_text().to_string())
-                                } else {
-                                    div()
-                                }
-                            ),
-                    ),
+                                div()
+                                    .absolute()
+                                    .bottom(relative(0.055))
+                                    .left_0()
+                                    .right_0()
+                                    .flex()
+                                    .justify_center()
+                                    .px_6()
+                                    .child(
+                                        if let Some(seg) = active_seg {
+                                            div()
+                                                // 限宽折行：超长句在画面内自动换行居中，绝不横向溢出画面
+                                                .max_w_full()
+                                                .min_w_0()
+                                                .px_4()
+                                                .py_1p5()
+                                                .rounded_md()
+                                                .bg(rgba(0x000000dd))
+                                                .border_1()
+                                                .border_color(rgba(0xffffff28))
+                                                .text_size(px(15.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(rgb(0xffffff))
+                                                .text_align(TextAlign::Center)
+                                                .line_height(px(22.0))
+                                                .child(seg.display_text().to_string())
+                                        } else {
+                                            div()
+                                        }
+                                    )
+                            )
+                    }),
             )
             // 监视器底部播放控制器与时间码显示
             .child(
@@ -618,6 +564,107 @@ impl MainWindow {
                             ),
                     ),
             )
+    }
+
+    /// 监视器画面内容：实时内嵌播放帧 vs 静态时间轴帧 vs 占位提示。
+    /// 帧尺寸随视频真实宽高比动态变化，纹理构建与缓存均以本帧自带尺寸为准。
+    fn render_monitor_picture(&mut self) -> Div {
+        let live_frame = self.state.video_player.get_frame();
+        let live_version = self.state.video_player.frame_version();
+
+        if let Some(frame) = live_frame {
+            // GPUI RenderImage 底层纹理严格要求 BGRA 格式（wgpu::TextureFormat::Bgra8Unorm），FFmpeg 已按 bgra 直出。
+            // 按 (帧版本, 尺寸) 缓存 RenderImage：未变直接复用（零拷贝、零纹理重传），仅新帧到来时重建一次。
+            let (frame_w, frame_h) = (frame.width, frame.height);
+            let cached_hit = match self.cached_live_image.as_ref() {
+                Some((version, width, height, cached_img))
+                    if *version == live_version
+                        && *width == frame_w
+                        && *height == frame_h =>
+                {
+                    Some(cached_img.clone())
+                }
+                _ => None,
+            };
+            let render_img: Option<Arc<RenderImage>> = match cached_hit {
+                Some(cached_img) => Some(cached_img),
+                None => {
+                    let data = match Arc::try_unwrap(frame) {
+                        Ok(f) => f.data,
+                        Err(arc) => arc.data.clone(),
+                    };
+                    match ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(frame_w, frame_h, data) {
+                        Some(buffer) => {
+                            let new_img = Arc::new(RenderImage::new(
+                                SmallVec::from_elem(Frame::new(buffer), 1),
+                            ));
+                            self.cached_live_image =
+                                Some((live_version, frame_w, frame_h, new_img.clone()));
+                            Some(new_img)
+                        }
+                        None => None,
+                    }
+                }
+            };
+            if let Some(render_img) = render_img {
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(img(render_img).size_full())
+            } else {
+                div().size_full()
+            }
+        } else if let Some(ref frame_path) = self.state.preview_frame_path {
+            if frame_path.exists() {
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        img(frame_path.clone())
+                            .size_full()
+                    )
+            } else {
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(Theme::text_muted())
+                            .child("正在提取视频帧..."),
+                    )
+            }
+        } else if self.state.selected_file.is_some() {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_1p5()
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(Theme::accent_mint())
+                        .child("正在同步视频画面..."),
+                )
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_1p5()
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(Theme::text_muted())
+                        .child("拖动时间轴或点击播放，画面将在此实时呈现"),
+                )
+        }
     }
 
     /// 渲染字幕属性检查器与错别字编辑区 (Inspector)
@@ -1384,104 +1431,126 @@ impl MainWindow {
                                             .child("翻译字幕"),
                                     ),
                             )
-                            // 表格行内容 (可流畅上下滚动)
-                            .child(
-                                div()
-                                    .id("inspector-segments-scroll")
-                                    .flex_1()
-                                    .overflow_y_scroll()
-                                    .w_full()
-                                    .children(self.state.segments.iter().map(|seg| {
-                                        let seg_idx = seg.index;
-                                        let is_selected = sel_idx == Some(seg_idx);
-                                        let is_playing_here = self.state.current_time >= seg.start && self.state.current_time <= seg.end;
-                                        let start_ts = seconds_to_timestamp(seg.start);
-                                        let end_ts = seconds_to_timestamp(seg.end);
-                                        let raw_text = seg.text.clone();
-                                        let trans_text = seg.translation.as_deref().unwrap_or("—").to_string();
+                            // 表格行内容：uniform_list 虚拟化渲染，千行级字幕清单仅构建可视行，
+                            // 长视频下不再整表全量布局（原先 1400+ 行全部渲染导致滚动掉帧）
+                            .child({
+                                // 选中行变化时自动滚动跟随（时间轴点击 / 上下句跳转 / 播放联动）
+                                if self.subtitle_list_followed_sel != sel_idx {
+                                    if let Some(idx) = sel_idx {
+                                        if let Some(pos) = self.state.segments.iter().position(|s| s.index == idx) {
+                                            self.subtitle_list_scroll.scroll_to_item(pos, ScrollStrategy::Top);
+                                        }
+                                    }
+                                    self.subtitle_list_followed_sel = sel_idx;
+                                }
 
-                                        div()
-                                            .id(("table-row-seg", seg_idx))
-                                            .w_full()
-                                            .min_h(px(40.0))
-                                            .px_3()
-                                            .py_2()
-                                            .border_b_1()
-                                            .border_color(rgb(0x1e1e26))
-                                            .cursor_pointer()
-                                            .bg(if is_selected {
-                                                rgba(0x10b9811c)
-                                            } else if is_playing_here {
-                                                rgba(0x6366f116)
-                                            } else {
-                                                rgba(0x00000000)
-                                            })
-                                            .hover(|s| s.bg(if is_selected { rgba(0x10b98128) } else { Theme::bg_hover() }))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.state.select_segment(seg_idx);
-                                                this.trigger_extract_frame(cx);
-                                                cx.notify();
-                                            }))
-                                            .flex()
-                                            .items_center()
-                                            .gap_3()
-                                            // 序号
-                                            .child(
+                                let row_count = self.state.segments.len();
+                                uniform_list(
+                                    "inspector-segments-virtual",
+                                    row_count,
+                                    cx.processor(move |this, visible_range: std::ops::Range<usize>, _window, cx| {
+                                        let sel = this.state.selected_segment_index;
+                                        let cur_time = this.state.current_time;
+                                        visible_range
+                                            .filter_map(|i| this.state.segments.get(i).map(|seg| (i, seg)))
+                                            .map(|(_i, seg)| {
+                                                let seg_idx = seg.index;
+                                                let is_selected = sel == Some(seg_idx);
+                                                let is_playing_here = cur_time >= seg.start && cur_time <= seg.end;
+                                                let start_ts = seconds_to_timestamp(seg.start);
+                                                let end_ts = seconds_to_timestamp(seg.end);
+                                                let raw_text = seg.text.clone();
+                                                let trans_text = seg.translation.as_deref().unwrap_or("—").to_string();
+
                                                 div()
-                                                    .w(px(36.0))
-                                                    .text_center()
-                                                    .text_size(px(12.5))
-                                                    .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::NORMAL })
-                                                    .text_color(if is_selected { Theme::accent_mint() } else { Theme::text_muted() })
-                                                    .child(format!("{}", seg_idx)),
-                                            )
-                                            // 开始时间 (图二高精时间戳)
-                                            .child(
-                                                div()
-                                                    .w(px(92.0))
-                                                    .text_center()
-                                                    .font_family("Consolas")
-                                                    .text_size(px(12.0))
-                                                    .text_color(if is_selected { Theme::accent_mint() } else { Theme::text_secondary() })
-                                                    .child(start_ts),
-                                            )
-                                            // 结束时间 (图二高精时间戳)
-                                            .child(
-                                                div()
-                                                    .w(px(92.0))
-                                                    .text_center()
-                                                    .font_family("Consolas")
-                                                    .text_size(px(12.0))
-                                                    .text_color(if is_selected { Theme::accent_mint() } else { Theme::text_secondary() })
-                                                    .child(end_ts),
-                                            )
-                                            // 字幕内容 (原文，清晰中文字体)
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w(px(110.0))
-                                                    .text_size(px(13.0))
-                                                    .font_weight(if is_selected { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
-                                                    .text_color(if is_selected { Theme::text_primary() } else { rgb(0xe2e8f0) })
-                                                    .child(raw_text),
-                                            )
-                                            // 翻译字幕 (多语言对照)
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w(px(110.0))
-                                                    .text_size(px(12.5))
-                                                    .text_color(if is_selected {
-                                                        rgb(0xd1d5db)
-                                                    } else if trans_text == "—" {
-                                                        Theme::text_muted()
+                                                    .id(("table-row-seg", seg_idx))
+                                                    .w_full()
+                                                    .h(px(40.0))
+                                                    .px_3()
+                                                    .border_b_1()
+                                                    .border_color(rgb(0x1e1e26))
+                                                    .cursor_pointer()
+                                                    .bg(if is_selected {
+                                                        rgba(0x10b9811c)
+                                                    } else if is_playing_here {
+                                                        rgba(0x6366f116)
                                                     } else {
-                                                        Theme::text_secondary()
+                                                        rgba(0x00000000)
                                                     })
-                                                    .child(trans_text),
-                                            )
-                                    })),
-                            ),
+                                                    .hover(|s| s.bg(if is_selected { rgba(0x10b98128) } else { Theme::bg_hover() }))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.state.select_segment(seg_idx);
+                                                        this.trigger_extract_frame(cx);
+                                                        cx.notify();
+                                                    }))
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_3()
+                                                    // 序号
+                                                    .child(
+                                                        div()
+                                                            .w(px(36.0))
+                                                            .text_center()
+                                                            .text_size(px(12.5))
+                                                            .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                                            .text_color(if is_selected { Theme::accent_mint() } else { Theme::text_muted() })
+                                                            .child(format!("{}", seg_idx)),
+                                                    )
+                                                    // 开始时间 (图二高精时间戳)
+                                                    .child(
+                                                        div()
+                                                            .w(px(92.0))
+                                                            .text_center()
+                                                            .font_family("Consolas")
+                                                            .text_size(px(12.0))
+                                                            .text_color(if is_selected { Theme::accent_mint() } else { Theme::text_secondary() })
+                                                            .child(start_ts),
+                                                    )
+                                                    // 结束时间 (图二高精时间戳)
+                                                    .child(
+                                                        div()
+                                                            .w(px(92.0))
+                                                            .text_center()
+                                                            .font_family("Consolas")
+                                                            .text_size(px(12.0))
+                                                            .text_color(if is_selected { Theme::accent_mint() } else { Theme::text_secondary() })
+                                                            .child(end_ts),
+                                                    )
+                                                    // 字幕内容 (原文，清晰中文字体；单行截断保证虚拟列表行高一致)
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(110.0))
+                                                            .text_size(px(13.0))
+                                                            .font_weight(if is_selected { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                                                            .text_color(if is_selected { Theme::text_primary() } else { rgb(0xe2e8f0) })
+                                                            .truncate()
+                                                            .child(raw_text),
+                                                    )
+                                                    // 翻译字幕 (多语言对照)
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(110.0))
+                                                            .text_size(px(12.5))
+                                                            .text_color(if is_selected {
+                                                                rgb(0xd1d5db)
+                                                            } else if trans_text == "—" {
+                                                                Theme::text_muted()
+                                                            } else {
+                                                                Theme::text_secondary()
+                                                            })
+                                                            .truncate()
+                                                            .child(trans_text),
+                                                    )
+                                            })
+                                            .collect()
+                                    }),
+                                )
+                                .track_scroll(self.subtitle_list_scroll.clone())
+                                .flex_1()
+                                .w_full()
+                            }),
                     )
             )
             // ── 底部固定：统一导出控制底栏 ──

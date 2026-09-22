@@ -1,9 +1,12 @@
 //! 右侧转写参数配置抽屉及硬件监控部件
+//!
+//! 结构：标题 → 文件卡片 → 识别引擎档位栅格 → 转写参数（语言/格式/润色/线程）→ 硬件监控 → 主操作 CTA
 
 use gpui::prelude::*;
 use gpui::*;
 
 use crate::app::state::ProcessStatus;
+use crate::app::{PolishMode, WhisperModelTier};
 use crate::utils::time::format_duration_short;
 use super::super::theme::Theme;
 use super::super::MainWindow;
@@ -11,7 +14,7 @@ use super::super::MainWindow;
 impl MainWindow {
     /// 渲染右侧配置面板 (转写配置与选项：左中右架构之「右」)
     pub(crate) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_sv = self.state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
+        let is_sv = self.state.whisper_model_tier == WhisperModelTier::SenseVoice;
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
         let has_file = self.state.transcribe_file.is_some();
         let fname = self.state.transcribe_file.as_ref()
@@ -33,7 +36,7 @@ impl MainWindow {
             .p_4()
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_2p5()
             // ── 1. 顶栏标头与引擎指示 ──
             .child(
                 div()
@@ -144,150 +147,13 @@ impl MainWindow {
                             .child(if has_file { "更换" } else { "浏览" }),
                     ),
             )
-            // ── 3. 核心配置组合面板 ──
-            .child(
-                div()
-                    .p_3()
-                    .rounded_xl()
-                    .bg(Theme::bg_card())
-                    .border_1()
-                    .border_color(Theme::border())
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    // ── 3.1 识别引擎与架构选择 ──
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_size(px(11.0))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(Theme::text_secondary())
-                                            .child("识别引擎与模型架构"),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_full()
-                                            .bg(if is_sv { rgba(0x10b98118) } else { rgba(0x6366f118) })
-                                            .border_1()
-                                            .border_color(if is_sv { rgba(0x10b98133) } else { rgba(0x6366f133) })
-                                            .text_size(px(10.0))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(if is_sv { Theme::accent_mint() } else { Theme::accent_primary() })
-                                            .child(self.state.whisper_model_tier.speed_label()),
-                                    ),
-                            )
-                    // ── 3.3 高级引擎与模型参数卡片 (引导至性能与推理设置) ──
-                    .child({
-                        let tier_label = match self.state.whisper_model_tier {
-                            crate::app::WhisperModelTier::SenseVoice => "SenseVoice 42x 极速",
-                            crate::app::WhisperModelTier::Fast => "Whisper Base",
-                            crate::app::WhisperModelTier::Balanced => "Whisper Small",
-                            crate::app::WhisperModelTier::TurboSpeed => "Whisper Turbo Q5",
-                            crate::app::WhisperModelTier::Precise => "Whisper Turbo Q8",
-                        };
-                        let thread_label = format!("{} 线程", self.state.whisper_threads);
-                        let polish_label = if self.state.enable_polish {
-                            if self.state.polish_mode == crate::app::PolishMode::PuncFast { "极速标点" } else { "Qwen 润色" }
-                        } else {
-                            "标点关闭"
-                        };
-
-                        div()
-                            .p_3()
-                            .rounded_xl()
-                            .bg(rgb(0x131318))
-                            .border_1()
-                            .border_color(rgb(0x22222c))
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_size(px(11.0))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(Theme::text_secondary())
-                                            .child("当前引擎与并发配置"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("btn-nav-to-performance")
-                                            .cursor_pointer()
-                                            .text_size(px(10.5))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(Theme::accent_mint())
-                                            .hover(|s| s.text_color(Theme::accent_primary()))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.state.active_tab = crate::app::WorkspaceTab::Performance;
-                                                cx.notify();
-                                            }))
-                                            .child("调整高级参数 →"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_md()
-                                            .bg(rgb(0x1a1a24))
-                                            .border_1()
-                                            .border_color(rgb(0x282836))
-                                            .text_size(px(10.5))
-                                            .text_color(Theme::text_primary())
-                                            .child(tier_label),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_md()
-                                            .bg(rgb(0x1a1a24))
-                                            .border_1()
-                                            .border_color(rgb(0x282836))
-                                            .text_size(px(10.5))
-                                            .text_color(Theme::text_primary())
-                                            .child(thread_label),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_md()
-                                            .bg(rgb(0x1a1a24))
-                                            .border_1()
-                                            .border_color(rgb(0x282836))
-                                            .text_size(px(10.5))
-                                            .text_color(Theme::text_muted())
-                                            .child(polish_label),
-                                    ),
-                            )
-                    }),
-            )
-            )
-            // ── 4. 硬件监控看板 ──
+            // ── 3. 识别引擎档位栅格 ──
+            .child(self.render_engine_card(cx))
+            // ── 4. 转写参数（语言 / 格式 / 润色 / 线程）──
+            .child(self.render_params_card(cx))
+            // ── 5. 硬件监控看板 ──
             .child(self.render_hardware_monitor_card(cx))
-            // ── 5. 底部主操作 CTA 按钮 (工程级突出呈现) ──
+            // ── 6. 底部主操作 CTA 按钮 (工程级突出呈现) ──
             .child(
                 div()
                     .id("sidebar-primary-cta-btn")
@@ -329,7 +195,14 @@ impl MainWindow {
                     .on_click(cx.listener(|this, _, _, cx| {
                         let processing = matches!(this.state.status, ProcessStatus::Processing { .. });
                         if processing {
-                            this.state.status = ProcessStatus::Idle;
+                            // 真正终止：标记取消请求并强杀识别子进程，事件回传后由收尾逻辑复位状态
+                            this.state.cancel_requested = true;
+                            this.state.status = ProcessStatus::Processing {
+                                stage: "终止中".to_string(),
+                                progress: 1.0,
+                                detail: "正在终止识别进程，请稍候...".to_string(),
+                            };
+                            this.state.pipeline.cancel();
                             cx.notify();
                         } else if this.state.transcribe_file.is_some() {
                             this.start_processing(cx);
@@ -345,6 +218,264 @@ impl MainWindow {
                         "选择文件并转写"
                     }),
             )
+    }
+
+    /// 「识别引擎」卡片：五档模型栅格（SenseVoice 独占整行）+ 高级参数入口
+    fn render_engine_card(&mut self, cx: &mut Context<Self>) -> Div {
+        let tiers: [(WhisperModelTier, &'static str, &'static str); 4] = [
+            (WhisperModelTier::Fast, "Base", "20x 倍速 · 轻量"),
+            (WhisperModelTier::Balanced, "Small", "7x 倍速 · 均衡"),
+            (WhisperModelTier::TurboSpeed, "Turbo Q5", "6x 倍速 · 推荐"),
+            (WhisperModelTier::Precise, "Turbo Q8", "4x 倍速 · 高精"),
+        ];
+
+        let mut grid = div().flex().flex_wrap().gap_1p5();
+        grid = grid.child(self.tier_pill(
+            WhisperModelTier::SenseVoice,
+            "SenseVoice 极速",
+            "42x 极速 · 自带标点与数字规范",
+            true,
+            cx,
+        ));
+        for (tier, name, speed) in tiers {
+            grid = grid.child(self.tier_pill(tier, name, speed, false, cx));
+        }
+
+        div()
+            .p_3()
+            .rounded_xl()
+            .bg(Theme::bg_card())
+            .border_1()
+            .border_color(Theme::border())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(Theme::text_secondary())
+                            .child("识别引擎"),
+                    )
+                    .child(
+                        div()
+                            .id("btn-nav-to-performance")
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(Theme::accent_mint())
+                            .hover(|s| s.text_color(Theme::accent_primary()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.active_tab = crate::app::WorkspaceTab::Performance;
+                                cx.notify();
+                            }))
+                            .child("高级推理参数 →"),
+                    ),
+            )
+            .child(grid)
+    }
+
+    /// 模型档位选择胶囊：两行布局（档位名 + 速度提示）
+    fn tier_pill(
+        &mut self,
+        tier: WhisperModelTier,
+        name: &'static str,
+        speed: &'static str,
+        full_width: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let is_sel = self.state.whisper_model_tier == tier;
+        let pill = div()
+            .id(name)
+            .h(px(42.0))
+            .px_2()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_0p5()
+            .rounded_lg()
+            .border_1()
+            .border_color(if is_sel { rgba(0x38bdf888) } else { rgba(0x00000000) })
+            .bg(if is_sel { rgba(0x38bdf826) } else { rgb(0x1b1b24) })
+            .cursor_pointer()
+            .hover(move |s| if is_sel { s } else { s.bg(rgba(0xffffff0d)) })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.state.whisper_model_tier = tier;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font_weight(if is_sel { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                    .text_color(if is_sel { Theme::accent_blue() } else { Theme::text_primary() })
+                    .child(name),
+            )
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(if is_sel { rgba(0x38bdf8aa) } else { Theme::text_muted() })
+                    .child(speed),
+            );
+        if full_width {
+            pill.w_full()
+        } else {
+            pill.flex_1().min_w(px(140.0))
+        }
+    }
+
+    /// 「转写参数」卡片：识别语言 / 输出格式 / 标点润色 / 转写线程
+    fn render_params_card(&mut self, cx: &mut Context<Self>) -> Div {
+        let lang_sel = match self.state.language.as_str() {
+            "zh" => "zh",
+            "en" => "en",
+            _ => "auto",
+        };
+        let fmt_sel = match self.state.output_format.as_str() {
+            "vtt" => "vtt",
+            "ass" => "ass",
+            "txt" => "txt",
+            _ => "srt",
+        };
+        let polish_sel = if !self.state.enable_polish {
+            "off"
+        } else if self.state.polish_mode == PolishMode::PuncFast {
+            "punc"
+        } else {
+            "qwen"
+        };
+        let thread_sel = self.state.whisper_threads.to_string();
+
+        div()
+            .p_3()
+            .rounded_xl()
+            .bg(Theme::bg_card())
+            .border_1()
+            .border_color(Theme::border())
+            .flex()
+            .flex_col()
+            .gap_2p5()
+            .child(self.param_group(
+                "识别语言",
+                vec![("auto", "自动"), ("zh", "中文"), ("en", "English")],
+                lang_sel,
+                |this, sel, cx| {
+                    this.state.language = sel.to_string();
+                    cx.notify();
+                },
+                cx,
+            ))
+            .child(self.param_group(
+                "字幕输出格式",
+                vec![("srt", "SRT"), ("vtt", "VTT"), ("ass", "ASS"), ("txt", "TXT")],
+                fmt_sel,
+                |this, sel, cx| {
+                    this.state.output_format = sel.to_string();
+                    cx.notify();
+                },
+                cx,
+            ))
+            .child(self.param_group(
+                "标点与润色",
+                vec![("off", "关闭"), ("punc", "极速标点"), ("qwen", "Qwen 润色")],
+                polish_sel,
+                |this, sel, cx| {
+                    match sel {
+                        "punc" => {
+                            this.state.enable_polish = true;
+                            this.state.polish_mode = PolishMode::PuncFast;
+                        }
+                        "qwen" => {
+                            this.state.enable_polish = true;
+                            this.state.polish_mode = PolishMode::QwenDeep;
+                        }
+                        _ => {
+                            this.state.enable_polish = false;
+                        }
+                    }
+                    cx.notify();
+                },
+                cx,
+            ))
+            .child(self.param_group(
+                "转写线程",
+                vec![("4", "4 线程"), ("8", "8 线程"), ("16", "16 线程")],
+                &thread_sel,
+                |this, sel, cx| {
+                    this.state.whisper_threads = sel.parse::<u32>().unwrap_or(8);
+                    cx.notify();
+                },
+                cx,
+            ))
+    }
+
+    /// 参数分组：小标题 + 分段选择器行
+    fn param_group(
+        &mut self,
+        label: &'static str,
+        options: Vec<(&'static str, &'static str)>,
+        selected: &str,
+        on_select: impl Fn(&mut Self, &'static str, &mut Context<Self>) + Copy + 'static,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(Theme::text_muted())
+                    .child(label),
+            )
+            .child(self.pill_row(options, selected, on_select, cx))
+    }
+
+    /// 通用分段选择器：一行等宽胶囊，单击切换
+    fn pill_row(
+        &mut self,
+        options: Vec<(&'static str, &'static str)>,
+        selected: &str,
+        on_select: impl Fn(&mut Self, &'static str, &mut Context<Self>) + Copy + 'static,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut row = div().flex().w_full().gap_1p5();
+        for (key, label) in options {
+            let is_sel = key == selected;
+            row = row.child(
+                div()
+                    .id(key)
+                    .flex_1()
+                    .h(px(26.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if is_sel { rgba(0x38bdf866) } else { rgba(0x00000000) })
+                    .bg(if is_sel { rgba(0x38bdf81f) } else { rgb(0x1b1b24) })
+                    .text_size(px(11.0))
+                    .cursor_pointer()
+                    .font_weight(if is_sel { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                    .text_color(if is_sel { Theme::accent_blue() } else { Theme::text_secondary() })
+                    .hover(move |s| {
+                        if is_sel {
+                            s
+                        } else {
+                            s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
+                        }
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| on_select(this, key, cx)))
+                    .child(label),
+            );
+        }
+        row
     }
 
     /// 渲染硬件与模型资源监控对比卡片 (CPU / 内存实时对比)
@@ -544,129 +675,5 @@ impl MainWindow {
                             ),
                     ),
             )
-    }
-
-    pub(crate) fn render_model_tier_pill(
-        &mut self,
-        tier: crate::app::WhisperModelTier,
-        label: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_selected = self.state.whisper_model_tier == tier;
-        div()
-            .id(label)
-            .flex_1()
-            .h(px(24.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .border_1()
-            .border_color(if is_selected { rgba(0x38bdf888) } else { rgba(0x00000000) })
-            .bg(if is_selected { rgba(0x38bdf826) } else { rgba(0x00000000) })
-            .text_size(px(10.5))
-            .cursor_pointer()
-            .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::NORMAL })
-            .text_color(if is_selected { Theme::accent_blue() } else { Theme::text_secondary() })
-            .hover(move |s| {
-                if !is_selected { s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary()) } else { s }
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.state.whisper_model_tier = tier;
-                cx.notify();
-            }))
-            .child(label)
-    }
-
-    pub(crate) fn render_option_pill(
-        &mut self,
-        val: &'static str,
-        label: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_selected = self.state.language == val;
-        div()
-            .id(val)
-            .flex_1()
-            .h(px(26.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .text_size(px(11.0))
-            .cursor_pointer()
-            .bg(if is_selected {
-                rgb(0x2c2c36)
-            } else {
-                rgba(0x00000000)
-            })
-            .font_weight(if is_selected {
-                FontWeight::SEMIBOLD
-            } else {
-                FontWeight::NORMAL
-            })
-            .text_color(if is_selected {
-                rgb(0xffffff)
-            } else {
-                Theme::text_secondary()
-            })
-            .hover(move |s| {
-                if !is_selected {
-                    s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
-                } else {
-                    s
-                }
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.state.language = val.to_string();
-                cx.notify();
-            }))
-            .child(label)
-    }
-
-    pub(crate) fn render_thread_pill(
-        &mut self,
-        val: u32,
-        label: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_selected = self.state.whisper_threads == val;
-        div()
-            .id(label)
-            .flex_1()
-            .h(px(26.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .text_size(px(11.0))
-            .cursor_pointer()
-            .bg(if is_selected {
-                rgb(0x2c2c36)
-            } else {
-                rgba(0x00000000)
-            })
-            .font_weight(if is_selected {
-                FontWeight::SEMIBOLD
-            } else {
-                FontWeight::NORMAL
-            })
-            .text_color(if is_selected {
-                rgb(0xffffff)
-            } else {
-                Theme::text_secondary()
-            })
-            .hover(move |s| {
-                if !is_selected {
-                    s.bg(rgba(0xffffff0d)).text_color(Theme::text_primary())
-                } else {
-                    s
-                }
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.state.whisper_threads = val;
-                cx.notify();
-            }))
-            .child(label)
     }
 }

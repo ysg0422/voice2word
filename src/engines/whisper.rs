@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 
 use crate::subtitle::Segment;
@@ -15,6 +17,13 @@ pub struct WhisperEngine {
     threads: u32,
     processors: u32,
     use_gpu: bool,
+    /// 禁用温度回退 (-nf)： turbo 等大模型同样跳过回退重解码以提速，
+    /// 由此损失的少数低置信片段由管线的置信度二段重解码救回
+    no_fallback: bool,
+    /// 跨句自注意力上下文 token 上限 (-mc)
+    max_context: u32,
+    cancel: Arc<AtomicBool>,
+    active_children: Arc<Mutex<Vec<u32>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +41,16 @@ struct WhisperResultMeta {
 struct WhisperJsonSegment {
     offsets: Option<WhisperOffsets>,
     text: Option<String>,
+    /// -ojf 完整输出的 token 级明细，每 token 带概率 p；据此自算 avg_logprob
+    #[serde(default)]
+    tokens: Vec<WhisperJsonToken>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhisperJsonToken {
+    text: Option<String>,
+    #[serde(default)]
+    p: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,7 +99,7 @@ impl WhisperEngine {
         threads: u32,
         processors: u32,
     ) -> Self {
-        Self::with_device(cli_path, model_path, vad_model_path, threads, processors, true)
+        Self::with_device(cli_path, model_path, vad_model_path, threads, processors, true, false, 32)
     }
 
     pub fn with_device<P1: AsRef<Path>, P2: AsRef<Path>>(
@@ -90,6 +109,8 @@ impl WhisperEngine {
         threads: u32,
         processors: u32,
         use_gpu: bool,
+        no_fallback: bool,
+        max_context: u32,
     ) -> Self {
         Self {
             cli_path: cli_path.as_ref().to_path_buf(),
@@ -98,11 +119,38 @@ impl WhisperEngine {
             threads,
             processors,
             use_gpu,
+            no_fallback,
+            max_context: max_context.clamp(0, 448),
+            cancel: Arc::new(AtomicBool::new(false)),
+            active_children: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub fn uses_gpu(&self) -> bool {
         self.use_gpu
+    }
+
+    /// 用户请求终止：置位取消标志并强杀全部正在运行的 whisper-cli 子进程（含切块并行实例）
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        let pids: Vec<u32> = self
+            .active_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for pid in pids {
+            kill_process_tree(pid);
+        }
+    }
+
+    /// 复位取消标志（每次新任务开始前由管线调用）
+    pub fn reset(&self) {
+        self.cancel.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
     }
 
     pub fn transcribe<P: AsRef<Path>>(
@@ -115,7 +163,6 @@ impl WhisperEngine {
     ) -> Result<(Vec<Segment>, f64)> {
         self.transcribe_with_model(audio_path, language, threads, total_duration, None, progress_cb)
     }
-
     /// 转写音频文件，支持通过 `model_path_override` 在运行时动态切换模型档位（极速/均衡/精准）
     /// 返回 `(segments, vad_duration_sec)`
     pub fn transcribe_with_model<P: AsRef<Path>>(
@@ -133,6 +180,7 @@ impl WhisperEngine {
             threads,
             total_duration,
             model_path_override,
+            false,
             progress_cb,
         )
     }
@@ -153,11 +201,35 @@ impl WhisperEngine {
             threads,
             total_duration,
             model_path_override,
+            false,
             progress_cb,
         )
     }
 
-    /// 统一入口：根据 AudioInput 分发文件路径模式或纯内存管道推流模式
+    /// 置信度救场专用：强制保留温度回退（无视引擎级 -nf）重解码低置信窗口，
+    /// 质量与旧的回退路径等价，仅用于管线二段重解码的少量片段。
+    pub fn transcribe_stream_with_fallback(
+        &self,
+        stream: Box<dyn std::io::Read + Send + 'static>,
+        language: Option<&str>,
+        threads: Option<u32>,
+        total_duration: Option<f64>,
+        model_path_override: Option<&Path>,
+        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+    ) -> Result<(Vec<Segment>, f64)> {
+        self.transcribe_input(
+            AudioInput::Stream(stream),
+            language,
+            threads,
+            total_duration,
+            model_path_override,
+            true,
+            progress_cb,
+        )
+    }
+
+    /// 统一入口：根据 AudioInput 分发文件路径模式或纯内存管道推流模式。
+    /// `force_fallback` 为 true 时不附加 -nf，即使引擎配置了禁用回退。
     pub fn transcribe_input<'a>(
         &self,
         audio_input: AudioInput<'a>,
@@ -165,6 +237,7 @@ impl WhisperEngine {
         threads: Option<u32>,
         total_duration: Option<f64>,
         model_path_override: Option<&Path>,
+        force_fallback: bool,
         progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
     ) -> Result<(Vec<Segment>, f64)> {
         let temp_dir = std::env::temp_dir();
@@ -254,21 +327,21 @@ impl WhisperEngine {
             .arg("-bs")
             .arg("1")
             .arg("-mc")
-            .arg("32") // 限制跨句自注意力上下文深度为 32，消解自注意力平方增长，提速 20%~30%
+            .arg(self.max_context.to_string())
             .arg("-sns") // 抑制非语音标记(音乐/掌声/杂音)，杜绝自回归发散与幻读
-            .arg("-oj")
+            .arg("-ojf") // 完整 JSON：带 token 级概率，用于自算 avg_logprob 置信度
             .arg("-of")
             .arg(&prefix);
 
-        // Turbo 保留温度回退：课程录音中的专有名词、口音和低音量片段需要
-        // 回退采样来维持识别质量。速度优化通过线程/处理器基准选择完成，
-        // 不牺牲这一层纠错能力。
+        // Turbo 保留温度回退的旧策略已升级为两段式：快速通场全程 -nf 提速，
+        // 低置信片段由管线切窗带回退重解码救回，速度与质量兼得。
         let is_precise = effective_model
             .file_name()
             .and_then(|s| s.to_str())
             .map(|n| n.contains("large") || n.contains("turbo"))
             .unwrap_or(false);
-        if !is_precise {
+        let suppress_fallback = if force_fallback { false } else { self.no_fallback || !is_precise };
+        if suppress_fallback {
             cmd.arg("-nf");
         }
 
@@ -306,6 +379,14 @@ impl WhisperEngine {
         let mut child = cmd.spawn().with_context(|| {
             format!("调用 whisper-cli 失败: {:?}", self.cli_path)
         })?;
+
+        // 登记子进程 PID，供用户「终止转写」时强杀
+        let child_pid = child.id();
+        {
+            let mut pids = self.active_children.lock().unwrap_or_else(|e| e.into_inner());
+            pids.retain(|p| *p != child_pid);
+            pids.push(child_pid);
+        }
 
         // 若为内存流输入，启动高效流泵送线程 (128KB 环形缓冲，0 磁盘 I/O)
         let stream_pump_handle = match audio_input {
@@ -401,6 +482,7 @@ impl WhisperEngine {
                                     translation: None,
                                     polished: String::new(),
                                     language: None,
+                                    confidence: None,
                                 })
                             } else {
                                 None
@@ -439,11 +521,20 @@ impl WhisperEngine {
         });
 
         let output_status = child.wait().with_context(|| "等待 whisper-cli 进程结束失败")?;
+        {
+            let mut pids = self.active_children.lock().unwrap_or_else(|e| e.into_inner());
+            pids.retain(|p| *p != child_pid);
+        }
         if let Some(h) = stream_pump_handle {
             let _ = h.join();
         }
         let stdout_str = stdout_handle.join().unwrap_or_default();
         let stderr_str = stderr_handle.join().unwrap_or_default();
+
+        // 用户主动终止：被杀进程的退出码不重要，按空结果返回，由管线走取消收尾
+        if self.cancel.load(Ordering::SeqCst) {
+            return Ok((Vec::new(), 0.0));
+        }
 
         if !output_status.success() {
             error!("whisper-cli 运行报错 (退出码 {:?}): {}", output_status.code(), stderr_str);
@@ -459,39 +550,40 @@ impl WhisperEngine {
             let parsed: Result<WhisperJsonOutput, _> = serde_json::from_str(&json_str);
             let _ = std::fs::remove_file(&json_file); // 清理临时 json
 
-            if let Ok(data) = parsed {
-                let detected_lang = data.result.and_then(|r| r.language);
-                if let Some(trans) = data.transcription {
-                    for (i, item) in trans.into_iter().enumerate() {
-                        let text = normalize_zh_text(&item.text.unwrap_or_default());
-                        if text.is_empty() {
-                            continue;
-                        }
-                        let start = item
-                            .offsets
-                            .as_ref()
-                            .and_then(|o| o.from)
-                            .unwrap_or(0) as f64
-                            / 1000.0;
-                        let end = item
-                            .offsets
-                            .as_ref()
-                            .and_then(|o| o.to)
-                            .unwrap_or(0) as f64
-                            / 1000.0;
+                if let Ok(data) = parsed {
+                    let detected_lang = data.result.and_then(|r| r.language);
+                    if let Some(trans) = data.transcription {
+                        for (i, item) in trans.into_iter().enumerate() {
+                            let text = normalize_zh_text(&item.text.unwrap_or_default());
+                            if text.is_empty() {
+                                continue;
+                            }
+                            let start = item
+                                .offsets
+                                .as_ref()
+                                .and_then(|o| o.from)
+                                .unwrap_or(0) as f64
+                                / 1000.0;
+                            let end = item
+                                .offsets
+                                .as_ref()
+                                .and_then(|o| o.to)
+                                .unwrap_or(0) as f64
+                                / 1000.0;
 
-                        segments.push(Segment {
-                            index: i + 1,
-                            start,
-                            end,
-                            text,
-                            translation: None,
-                            polished: String::new(),
-                            language: detected_lang.clone(),
-                        });
+                            segments.push(Segment {
+                                index: i + 1,
+                                start,
+                                end,
+                                text,
+                                translation: None,
+                                polished: String::new(),
+                                language: detected_lang.clone(),
+                                confidence: Self::tokens_avg_logprob(&item.tokens),
+                            });
+                        }
                     }
                 }
-            }
         }
 
         // 回退逻辑：如果 json 没产出，从捕获的 stdout 解析
@@ -509,6 +601,24 @@ impl WhisperEngine {
         let vad_sec = Self::parse_vad_time(&stderr_str);
         info!(segments = segments.len(), vad_sec, "Whisper 转写完成");
         Ok((segments, vad_sec))
+    }
+
+    /// 从 -ojf 的 token 级概率自算 avg_logprob（与官方 avg_logprob 同语义）。
+    /// 过滤 "[_BEG_]"/"[_SOT_]" 等特殊标记 token，只统计真实解码 token。
+    fn tokens_avg_logprob(tokens: &[WhisperJsonToken]) -> Option<f64> {
+        let logprobs: Vec<f64> = tokens
+            .iter()
+            .filter(|t| {
+                t.p.is_some_and(|p| p > 0.0)
+                    && !t.text.as_deref().unwrap_or("").starts_with("[_")
+            })
+            .map(|t| t.p.unwrap().ln())
+            .collect();
+        if logprobs.is_empty() {
+            None
+        } else {
+            Some(logprobs.iter().sum::<f64>() / logprobs.len() as f64)
+        }
     }
 
     /// 从 whisper-cli 的 stderr 日志中提取 Silero VAD 耗时 (秒)
@@ -553,6 +663,7 @@ impl WhisperEngine {
                             translation: None,
                             polished: String::new(),
                             language: None,
+                            confidence: None,
                         });
                         idx += 1;
                     }
@@ -573,6 +684,21 @@ impl WhisperEngine {
         } else {
             0.0
         }
+    }
+}
+
+/// 跨平台强杀指定进程及其子进程树（用于用户「终止转写」即时生效）
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("taskkill");
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let _ = cmd.args(["/F", "/T", "/PID", &pid.to_string()]).output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
     }
 }
 
@@ -613,6 +739,23 @@ mod tests {
     }
 
     #[test]
+    fn avg_logprob_from_token_probs() {
+        let tok = |text: &str, p: f64| WhisperJsonToken {
+            text: Some(text.to_string()),
+            p: Some(p),
+        };
+        // [_BEG_] 应被过滤；两个真实 token: ln(0.9) 与 ln(0.5) 的均值
+        let tokens = vec![tok("[_BEG_]", 0.913), tok("你", 0.9), tok("好", 0.5)];
+        let got = WhisperEngine::tokens_avg_logprob(&tokens).unwrap();
+        let expect = (0.9f64.ln() + 0.5f64.ln()) / 2.0;
+        assert!((got - expect).abs() < 1e-12);
+        // 全特殊 token / 空列表 / 零概率 → None
+        assert!(WhisperEngine::tokens_avg_logprob(&[tok("[_SOT_]", 1.0)]).is_none());
+        assert!(WhisperEngine::tokens_avg_logprob(&[]).is_none());
+        assert!(WhisperEngine::tokens_avg_logprob(&[tok("词", 0.0)]).is_none());
+    }
+
+    #[test]
     fn gbk_bytes_decode_to_han() {
         let (bytes, _, _) = encoding_rs::GBK.encode("切比雪夫不等式");
         assert_eq!(decode_cli_bytes(&bytes), "切比雪夫不等式");
@@ -627,7 +770,7 @@ mod tests {
 
         if cli_path.exists() && model_path.exists() && ffmpeg_path.exists() && sample_media.exists() {
             let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
-            let engine = WhisperEngine::with_device(cli_path, model_path, None, 4, 1, true);
+            let engine = WhisperEngine::with_device(cli_path, model_path, None, 4, 1, true, true, 32);
 
             let mut child = ffmpeg.spawn_audio_stream(&sample_media).expect("FFmpeg 内存流启动失败");
             let stdout = child.stdout.take().expect("获取 stdout 失败");
@@ -655,7 +798,7 @@ mod tests {
         let cli_path = PathBuf::from("tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe");
         let model_path = PathBuf::from("models/whisper/ggml-large-v3-turbo-q5_0.bin");
         let vad_path = Some(PathBuf::from("models/whisper/ggml-silero-v6.2.0.bin"));
-        let engine = WhisperEngine::with_device(cli_path, model_path, vad_path, 8, 2, true);
+        let engine = WhisperEngine::with_device(cli_path, model_path, vad_path, 8, 2, true, false, 32);
         let mut audio = PathBuf::from("target/test_30s.wav");
         if !audio.exists() {
             audio = PathBuf::from("target/test_2min.wav");

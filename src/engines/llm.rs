@@ -431,8 +431,13 @@ impl LLMEngine {
         if (clean.starts_with('"') && clean.ends_with('"'))
             || (clean.starts_with('“') && clean.ends_with('”'))
         {
-            if clean.len() >= 2 {
-                clean = clean[1..clean.len() - 1].trim().to_string();
+            // 弯引号 “ ” 是多字节字符，按字节切片会 panic，必须用 strip 按字符边界剥壳
+            if let Some(inner) = clean
+                .strip_prefix('"')
+                .or_else(|| clean.strip_prefix('“'))
+                .and_then(|s| s.strip_suffix('"').or_else(|| s.strip_suffix('”')))
+            {
+                clean = inner.trim().to_string();
             }
         }
 
@@ -470,5 +475,15 @@ mod tests {
     #[test]
     fn strips_llama_stop_tags() {
         assert_eq!(LLMEngine::strip_stop_tags("结果。 [end of text]"), "结果。");
+    }
+
+    #[test]
+    fn clean_response_strips_curly_quotes_without_panic() {
+        // 回归：弯引号 “ ” 是多字节字符，按字节切片会 panic（not a char boundary）
+        assert_eq!(LLMEngine::clean_response("“你好世界”", "原文"), "你好世界");
+        assert_eq!(LLMEngine::clean_response("\"你好世界\"", "原文"), "你好世界");
+        // 纯中文内容超长时也不 panic
+        let long_zh = "式".repeat(50);
+        assert_eq!(LLMEngine::clean_response(&format!("“{long_zh}”"), "原文"), long_zh);
     }
 }

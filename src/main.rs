@@ -74,6 +74,8 @@ fn main() -> Result<()> {
         config.pipeline.whisper_threads,
         config.pipeline.whisper_processors,
         hardware.use_gpu_pipeline(),
+        config.pipeline.whisper_no_fallback,
+        config.pipeline.whisper_max_context,
     ));
 
     let llm = Arc::new(LLMEngine::new(

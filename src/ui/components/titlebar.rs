@@ -11,15 +11,23 @@ use super::super::MainWindow;
 mod win_drag {
     #[link(name = "user32")]
     extern "system" {
-        fn GetForegroundWindow() -> isize;
         fn ReleaseCapture() -> i32;
         fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
     }
 
-    pub fn drag_window() {
-        unsafe {
-            let hwnd = GetForegroundWindow();
-            if hwnd != 0 {
+    /// 按下标题栏时拖动窗口本体。
+    /// 必须用自身窗口句柄；原先的 GetForegroundWindow 在焦点位于其他进程窗口时会拖错窗口。
+    pub fn drag_window(window: &mut gpui::Window) {
+        let raw = match raw_window_handle::HasWindowHandle::window_handle(window) {
+            Ok(handle) => handle,
+            Err(_) => return,
+        };
+        let raw_window_handle::RawWindowHandle::Win32(handle) = raw.as_raw() else {
+            return;
+        };
+        let hwnd = handle.hwnd.get() as isize;
+        if hwnd != 0 {
+            unsafe {
                 ReleaseCapture();
                 const WM_NCLBUTTONDOWN: u32 = 0x00A1;
                 const HTCAPTION: usize = 2;
@@ -100,9 +108,9 @@ impl MainWindow {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .on_mouse_down(MouseButton::Left, |_, _, _| {
+                    .on_mouse_down(MouseButton::Left, |_, window, _| {
                         #[cfg(target_os = "windows")]
-                        win_drag::drag_window();
+                        win_drag::drag_window(window);
                     })
                     .child(
                         div()

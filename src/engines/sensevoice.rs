@@ -5,9 +5,26 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 use crate::subtitle::Segment;
+
+/// 跨平台强杀指定进程及其子进程树（用于用户「终止转写」即时生效）
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("taskkill");
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let _ = cmd.args(["/F", "/T", "/PID", &pid.to_string()]).output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct SenseVoiceStreamLine {
@@ -45,6 +62,8 @@ pub struct SenseVoiceEngine {
     tokens_path: PathBuf,
     vad_model_path: PathBuf,
     threads: u32,
+    cancel: Arc<AtomicBool>,
+    active_children: Arc<Mutex<Vec<u32>>>,
 }
 
 impl SenseVoiceEngine {
@@ -61,7 +80,28 @@ impl SenseVoiceEngine {
             tokens_path: tokens_path.as_ref().to_path_buf(),
             vad_model_path: vad_model_path.as_ref().to_path_buf(),
             threads: threads.max(1),
+            cancel: Arc::new(AtomicBool::new(false)),
+            active_children: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// 用户请求终止：置位取消标志并强杀正在运行的 runner 子进程
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        let pids: Vec<u32> = self
+            .active_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for pid in pids {
+            kill_process_tree(pid);
+        }
+    }
+
+    /// 复位取消标志（每次新任务开始前由管线调用）
+    pub fn reset(&self) {
+        self.cancel.store(false, Ordering::SeqCst);
     }
 
     /// 检查 SenseVoice 所需脚本与全部模型权重是否就位
@@ -164,6 +204,14 @@ impl SenseVoiceEngine {
     ) -> Result<(Vec<Segment>, f64)> {
         let mut child = cmd.spawn().with_context(|| format!("启动 SenseVoice 进程失败: {:?}", self.runner_path))?;
 
+        // 登记子进程 PID，供用户「终止转写」时强杀
+        let child_pid = child.id();
+        {
+            let mut pids = self.active_children.lock().unwrap_or_else(|e| e.into_inner());
+            pids.retain(|p| *p != child_pid);
+            pids.push(child_pid);
+        }
+
         // 若有内存音频流输入，启动泵送线程写入子进程 stdin
         let stream_handle = if let Some(stream) = input_stream {
             let stdin = child.stdin.take().context("获取 SenseVoice 标准输入管道失败")?;
@@ -211,6 +259,7 @@ impl SenseVoiceEngine {
                             translation: None,
                             polished: parsed.text.clone(),
                             language: None,
+                            confidence: None,
                         };
                         segments.push(seg.clone());
                         if let Some(ref cb) = progress_cb {
@@ -230,6 +279,7 @@ impl SenseVoiceEngine {
                                     translation: None,
                                     polished: item.text,
                                     language: None,
+                                    confidence: None,
                                 });
                             }
                         }
@@ -240,10 +290,19 @@ impl SenseVoiceEngine {
         }
 
         let status = child.wait().with_context(|| "等待 SenseVoice 进程结束失败")?;
+        {
+            let mut pids = self.active_children.lock().unwrap_or_else(|e| e.into_inner());
+            pids.retain(|p| *p != child_pid);
+        }
         if let Some(h) = stream_handle {
             let _ = h.join();
         }
         let stderr_str = stderr_handle.join().unwrap_or_default();
+
+        // 用户主动终止：被杀进程的退出码不重要，按空结果返回，由管线走取消收尾
+        if self.cancel.load(Ordering::SeqCst) {
+            return Ok((Vec::new(), 0.0));
+        }
 
         if !status.success() {
             warn!("SenseVoice 退出状态非 0: {:?}, 错误日志: {}", status.code(), stderr_str);
