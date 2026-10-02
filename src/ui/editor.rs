@@ -350,6 +350,9 @@ impl MainWindow {
                                 let style = self.state.config.subtitle_style.clone();
                                 let font_px = style.preview_font_px();
                                 let (fg, bg, border) = subtitle_preset_colors(&style.preset_name);
+                                // 宽度与编辑卡里的预览框同源：拖把手时两者在同一帧一起变，
+                                // 不存在「预览改了、画面上没跟上」的延迟
+                                let box_w = self.subtitle_box_w();
                                 div()
                                     .absolute()
                                     .bottom(relative(style.preview_bottom_ratio()))
@@ -361,8 +364,11 @@ impl MainWindow {
                                     .child(
                                         if let Some(seg) = active_seg {
                                             div()
-                                                // 按「单行最大字数」限宽折行，超长句在画面内自动换行居中
-                                                .max_w(px(font_px * style.max_chars_per_line as f32))
+                                                // 固定宽度（不是 max_w）：拖动把手时画面上的
+                                                // 字幕框要跟着同宽变化，而不是只有超长句才受影响。
+                                                // 短句在框内居中，长句按此宽度折行——与编辑卡的
+                                                // 预览框是同一个宽度值，两者同步增减。
+                                                .w(px(box_w))
                                                 .min_w_0()
                                                 .px_3()
                                                 .py_1()
@@ -790,42 +796,6 @@ impl MainWindow {
                                                 }))
                                         )
                                 )
-                                // 2) 实时预览条：改样式立刻能看到效果，无需载入视频
-                                .child({
-                                    let font_px = cur_style.preview_font_px();
-                                    let (fg, bg, border) =
-                                        subtitle_preset_colors(&cur_style.preset_name);
-                                    let bg = preview_backdrop(bg);
-                                    div()
-                                        .w_full()
-                                        .h(px(Theme::STYLE_PREVIEW_H))
-                                        .rounded(px(Theme::RADIUS_LG))
-                                        .bg(Theme::bg_media())
-                                        .border_1()
-                                        .border_color(Theme::border())
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .overflow_hidden()
-                                        .child(
-                                            div()
-                                                .max_w(px(
-                                                    font_px * cur_style.max_chars_per_line as f32
-                                                ))
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_md()
-                                                .bg(bg)
-                                                .border_1()
-                                                .border_color(border)
-                                                .text_size(px(font_px))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(fg)
-                                                .text_align(TextAlign::Center)
-                                                .line_height(px(font_px * cur_style.line_spacing))
-                                                .child("字幕样式实时预览"),
-                                        )
-                                })
                                 // 3) 排版参数（字号 / 字间距 / 行间距 / 单行字数 / 底边距）
                                 .child(
                                     div()
@@ -1021,9 +991,14 @@ impl MainWindow {
                             div().into_any_element()
                         }
                     )
-                    // 2. 选中文段快速编辑与微调条 (选中时呈现)
+                    // 2. 单句快速编辑卡（仅「字幕样式」面板）。
+                    //
+                    // 这张卡自带「实时预览条」，预览的就是卡里正在编辑的这一句——编辑与
+                    // 预览在同一张卡上，改字 / 调字号都是即时的。翻译面板不重复放编辑卡：
+                    // 面板标头已能切回样式面板，两处各放一份只会让人分不清哪份生效。
                     .child(
-                        if let Some(ref seg) = cur_seg {
+                        if panel == EditorSubtitlePanel::Style && cur_seg.is_some() {
+                            let seg = cur_seg.as_ref().unwrap();
                             let seg_idx = seg.index;
                             let start_ts = seconds_to_timestamp(seg.start);
                             let end_ts = seconds_to_timestamp(seg.end);
@@ -1321,6 +1296,13 @@ impl MainWindow {
                                                 })
                                         })
                                 )
+                                // 第二行半：实时预览条——显示的就是上一行正在编辑的那句文本。
+                                // 排版参数（字号 / 行间距 / 底边距 / 单行字数）改一下立刻在这里
+                                // 看到效果，不必载入视频、也不必去别的面板找。
+                                //
+                                // 两侧各挂一个「拖拽调宽」把手（`subtitle_preview_box`）：
+                                // 字幕框以中线为中心左右对称收放，把手贴在框的两条边上。
+                                .child(self.render_subtitle_preview_box(&cur_text, cx))
                                 // 第三行：时间微调按钮组与快捷标点注入 (紧凑规整，不遮挡)
                                 .child(
                                     div()
@@ -1765,6 +1747,146 @@ impl MainWindow {
             )
             // ── 底部固定：统一导出控制底栏 ──
             .child(self.render_editor_export_dock(cx))
+    }
+
+    /// 字幕预览框：显示当前编辑句的排版效果，两侧把手可拖拽调宽。
+    ///
+    /// 拖动任一手的位移按**两倍**作用到宽度上——把手贴在字幕框的两条边上，
+    /// 往右拖 d 像素，右边多 d、左边也多 d，于是框以中线为中心左右对称变宽 / 变窄。
+    /// 手动拖过之后宽度以手动值为准（`preview_box_w`），否则按「单行最大字数 ×
+    /// 预览字号」自动推算。
+    fn render_subtitle_preview_box(
+        &mut self,
+        cur_text: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // 样式取自全局配置（面板里改哪个参数都立即写回这里）
+        let style = self.state.config.subtitle_style.clone();
+        let font_px = style.preview_font_px();
+        let (fg, bg, border) = subtitle_preset_colors(&style.preset_name);
+        let bg = preview_backdrop(bg);
+        // 空行会被 GPUI 折成 0 高，给个占位符保证预览条始终有形
+        let preview_text = if cur_text.trim().is_empty() {
+            "（本句暂无文字）".to_string()
+        } else {
+            cur_text.to_string()
+        };
+        let box_w = self.subtitle_box_w();
+        let is_dragging = self.preview_drag.is_some();
+
+        div()
+            .id("subtitle-preview-row")
+            .w_full()
+            .h(px(Theme::STYLE_PREVIEW_H))
+            .rounded(px(Theme::RADIUS_LG))
+            .bg(Theme::bg_media())
+            .border_1()
+            .border_color(if is_dragging {
+                Theme::accent_mint()
+            } else {
+                Theme::border()
+            })
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            // 位移监听挂在整个预览行上而不是把手上：把手只有几像素宽，拖动时指针
+            // 稍一移动就出了它的命中区；整行满宽，横向拖多远都不会掉出去。
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.drag_preview_box(event.position.x, cx);
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.end_preview_box_drag();
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(self.preview_resize_handle(true, cx))
+                    .child(
+                        div()
+                            .w(px(box_w))
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(bg)
+                            .border_1()
+                            .border_color(border)
+                            .text_size(px(font_px))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(fg)
+                            .text_align(TextAlign::Center)
+                            .line_height(px(font_px * style.line_spacing))
+                            .child(preview_text),
+                    )
+                    .child(self.preview_resize_handle(false, cx)),
+            )
+    }
+
+    /// 预览框的拖拽把手，贴在字幕框左右两侧；`left` 决定是左只还是右只。
+    fn preview_resize_handle(&self, left: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.preview_drag.is_some();
+        div()
+            .id(if left {
+                "preview-handle-left"
+            } else {
+                "preview-handle-right"
+            })
+            .w(px(Theme::RESIZE_HANDLE_W))
+            .h(px(Theme::STYLE_PREVIEW_H - Theme::SPACE_3 * 2.0))
+            .rounded(px(Theme::RADIUS_SM))
+            .bg(if active {
+                Theme::accent_mint()
+            } else {
+                Theme::border_strong()
+            })
+            .opacity(if active { 1.0 } else { 0.5 })
+            .cursor_col_resize()
+            .hover(|s| s.opacity(1.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.begin_preview_box_drag(event.position.x);
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// 字幕框的统一宽度（px）。
+    ///
+    /// 监视器覆盖层与编辑卡预览条**共用这一个来源**，所以拖把手时两者在同一帧一起
+    /// 变化，不存在「预览改了、画面没跟上」的延迟。手动拖过就用 `preview_box_w`，
+    /// 否则按「单行最大字数 × 预览字号」自动推算。
+    fn subtitle_box_w(&self) -> f32 {
+        let s = &self.state.config.subtitle_style;
+        self.preview_box_w
+            .unwrap_or_else(|| s.preview_font_px() * s.max_chars_per_line as f32)
+            .clamp(Theme::PREVIEW_BOX_MIN_W, Theme::PREVIEW_BOX_MAX_W)
+    }
+
+    /// 开始拖拽预览框：记下基准宽度与按下时的鼠标 x。
+    fn begin_preview_box_drag(&mut self, mouse_x: Pixels) {
+        self.preview_drag = Some((self.subtitle_box_w(), f32::from(mouse_x)));
+    }
+
+    /// 拖拽中：位移按两倍作用到宽度（两侧对称），结果记进手动宽度。
+    fn drag_preview_box(&mut self, mouse_x: Pixels, cx: &mut Context<Self>) {
+        let Some((start_w, start_x)) = self.preview_drag else {
+            return;
+        };
+        let new_w = (start_w + 2.0 * (f32::from(mouse_x) - start_x))
+            .clamp(Theme::PREVIEW_BOX_MIN_W, Theme::PREVIEW_BOX_MAX_W);
+        self.preview_box_w = Some(new_w);
+        cx.notify();
+    }
+
+    /// 松手：结束拖拽会话，并把宽度落盘（下次启动仍用这个宽度）。
+    fn end_preview_box_drag(&mut self) {
+        if self.preview_drag.take().is_some() {
+            self.state.config.subtitle_style.preview_box_w = self.preview_box_w;
+            self.state.save_subtitle_style();
+        }
     }
 
     /// 渲染剪辑工作台右侧底部的统一导出控制底栏

@@ -414,4 +414,11 @@ impl Theme {
     pub const CTRL_GAP_TIGHT: f32 = Self::SPACE_1;
     /// 波形柱的最小可见高度（静音段也留一条细线，保持整轨连续）
     pub const WAVE_BAR_MIN_H: f32 = 1.0;
+    /// 字幕预览条两侧「拖拽调宽」把手的宽度。
+    /// 把手贴在字幕框左右两侧，拖动时按位移的**两倍**收放（两侧对称），
+    /// 所以看到的是字幕框以中线为中心变宽 / 变窄。
+    pub const RESIZE_HANDLE_W: f32 = 6.0;
+    /// 字幕预览框的宽度约束（手动拖动的可调区间）
+    pub const PREVIEW_BOX_MIN_W: f32 = 140.0;
+    pub const PREVIEW_BOX_MAX_W: f32 = 560.0;
 }

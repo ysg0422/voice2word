@@ -99,6 +99,11 @@ pub struct MainWindow {
     pub(crate) benchmark_dialog: Option<BenchmarkDialogInfo>,
     pub(crate) editor_export_format: EditorExportFormat,
     pub(crate) is_export_dropdown_open: bool,
+    /// 字幕预览框的**手动**宽度（px）。`Some` 时以它为准并压过「单行最大字数」
+    /// 推出的宽度；拖动预览条两侧把手会写入这里并落盘，`None` 则回到按字数自动推算。
+    pub(crate) preview_box_w: Option<f32>,
+    /// 预览条拖动会话：(基准宽度, 按下时的鼠标 x)。`Some` 表示正在拖。
+    pub(crate) preview_drag: Option<(f32, f32)>,
     /// 右侧检查器当前显示哪张面板（样式 / 翻译），互斥切换
     pub(crate) subtitle_panel: EditorSubtitlePanel,
     pub(crate) text_cursor_pos: usize,
@@ -253,6 +258,9 @@ impl MainWindow {
         let api_base_input = state.config.translate.api_base.clone();
         let api_model_input = state.config.translate.api_model.clone();
         let api_key_input = state.config.translate.api_key.clone();
+        // 预览框宽度：配置里存过就用存的，否则 `preview_box_w` 留空，
+        // 由 `MainWindow::subtitle_box_w()` 按「单行最大字数 × 预览字号」自动推算
+        let preview_box_w_initial = state.config.subtitle_style.preview_box_w;
         let mut window = Self {
             state,
             metrics_rx,
@@ -266,6 +274,8 @@ impl MainWindow {
             benchmark_dialog: None,
             editor_export_format: EditorExportFormat::default(),
             is_export_dropdown_open: false,
+            preview_box_w: preview_box_w_initial,
+            preview_drag: None,
             subtitle_panel: EditorSubtitlePanel::default(),
             text_cursor_pos: 0,
             cached_live_image: None,
