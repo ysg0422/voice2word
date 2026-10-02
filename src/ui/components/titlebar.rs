@@ -4,6 +4,7 @@ use gpui::prelude::*;
 use gpui::*;
 
 use crate::app::state::WorkspaceTab;
+use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::MainWindow;
 
@@ -12,11 +13,17 @@ mod win_drag {
     #[link(name = "user32")]
     extern "system" {
         fn ReleaseCapture() -> i32;
-        fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+        fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
     }
 
     /// 按下标题栏时拖动窗口本体。
     /// 必须用自身窗口句柄；原先的 GetForegroundWindow 在焦点位于其他进程窗口时会拖错窗口。
+    ///
+    /// 必须用 PostMessageW 而非 SendMessageW：本函数运行在鼠标事件回调内，gpui 的 App
+    /// RefCell 借用仍在栈上；SendMessageW 会同步进入 DefWindowProc 的模态拖拽循环并重入
+    /// 消息泵，此刻被泵到的前台任务一旦调用 Entity::update 就会 panic "RefCell already
+    /// borrowed"（转写事件泵每 80ms 入队一个任务，拖动窗口时极易命中）。PostMessage 把
+    /// 模态循环推迟到主消息循环无借用时执行。
     pub fn drag_window(window: &mut gpui::Window) {
         let raw = match raw_window_handle::HasWindowHandle::window_handle(window) {
             Ok(handle) => handle,
@@ -31,7 +38,7 @@ mod win_drag {
                 ReleaseCapture();
                 const WM_NCLBUTTONDOWN: u32 = 0x00A1;
                 const HTCAPTION: usize = 2;
-                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+                PostMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
             }
         }
     }
@@ -58,14 +65,14 @@ impl MainWindow {
         div()
             .id("custom-titlebar")
             .w_full()
-            .h(px(38.0))
+            .h(px(Theme::TITLEBAR_H))
             .bg(Theme::bg_sidebar())
             .border_b_1()
             .border_color(Theme::border())
             .flex()
             .items_center()
             .justify_between()
-            .px_3()
+            .px(px(Theme::CARD_PAD_SM))
             // 左侧：Logo 与应用标题
             .child(
                 div()
@@ -74,28 +81,28 @@ impl MainWindow {
                     .gap_2()
                     .child(
                         div()
-                            .w(px(20.0))
-                            .h(px(20.0))
-                            .rounded_md()
+                            .w(px(Theme::BADGE_H))
+                            .h(px(Theme::BADGE_H))
+                            .rounded(px(Theme::RADIUS_MD))
                             .bg(Theme::accent_mint())
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(11.0))
+                            .text_size(px(Theme::TEXT_SMALL))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(0x09090b))
+                            .text_color(Theme::text_on_accent())
                             .child("V"),
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(Theme::TEXT_BODY))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(Theme::text_primary())
                             .child("Voice2Word"),
                     )
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(Theme::TEXT_SMALL))
                             .text_color(Theme::text_muted())
                             .child("· 智能字幕与音视频工作台"),
                     ),
@@ -120,13 +127,13 @@ impl MainWindow {
                             .children(if let Some(name) = current_file_name {
                                 vec![
                                     div()
-                                        .w(px(6.0))
-                                        .h(px(6.0))
+                                        .w(px(Theme::DOT_SM))
+                                        .h(px(Theme::DOT_SM))
                                         .rounded_full()
                                         .bg(Theme::accent_mint())
                                         .into_any_element(),
                                     div()
-                                        .text_size(px(11.0))
+                                        .text_size(px(Theme::TEXT_SMALL))
                                         .text_color(Theme::text_secondary())
                                         .child(name.to_string())
                                         .into_any_element(),
@@ -134,7 +141,7 @@ impl MainWindow {
                             } else {
                                 vec![
                                     div()
-                                        .text_size(px(11.0))
+                                        .text_size(px(Theme::TEXT_SMALL))
                                         .text_color(Theme::text_muted())
                                         .child("未载入媒体")
                                         .into_any_element(),
@@ -150,55 +157,28 @@ impl MainWindow {
                     .h_full()
                     // 最小化
                     .child(
-                        div()
+                        primitives::titlebar_btn("—", false)
                             .id("titlebar-btn-min")
-                            .w(px(40.0))
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(12.0))
-                            .text_color(Theme::text_secondary())
-                            .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
                             .on_click(cx.listener(|_, _, window, _| {
                                 window.minimize_window();
-                            }))
-                            .child("—"),
+                            })),
                     )
                     // 最大化 / 还原
                     .child(
-                        div()
+                        primitives::titlebar_btn("▢", false)
                             .id("titlebar-btn-max")
-                            .w(px(40.0))
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(11.0))
-                            .text_color(Theme::text_secondary())
-                            .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
                             .on_click(cx.listener(|_, _, window, _| {
                                 window.zoom_window();
-                            }))
-                            .child("▢"),
+                            })),
                     )
                     // 关闭
                     .child(
-                        div()
+                        primitives::titlebar_btn("✕", true)
                             .id("titlebar-btn-close")
-                            .w(px(44.0))
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(13.0))
-                            .text_color(Theme::text_secondary())
-                            .hover(|s| s.bg(rgb(0xe11d48)).text_color(rgb(0xffffff)))
                             .on_click(cx.listener(|_, _, window, cx| {
                                 window.remove_window();
                                 cx.quit();
-                            }))
-                            .child("✕"),
+                            })),
                     ),
             )
     }

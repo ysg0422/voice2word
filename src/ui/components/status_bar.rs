@@ -4,6 +4,7 @@ use gpui::prelude::*;
 use gpui::*;
 
 use crate::app::state::ProcessStatus;
+use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::MainWindow;
 
@@ -11,7 +12,9 @@ impl MainWindow {
     /// 渲染底部状态与操作栏 (iOS Minimal Toolbar 规范)
     pub(crate) fn render_bottom_timeline(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
-        let can_start = self.state.transcribe_file.is_some() && !is_processing;
+        let has_file = self.state.transcribe_file.is_some();
+        let has_batch = !self.state.batch_queue.is_empty();
+        let can_start = (has_file || has_batch) && !is_processing;
         let can_export = !self.state.segments.is_empty();
         let can_play = self.state.selected_file.is_some() && can_export && !is_processing;
 
@@ -25,11 +28,13 @@ impl MainWindow {
         };
 
         div()
-            .h(px(64.0))
+            .w_full()
+            .h(px(Theme::STATUS_BAR_H))
+            .flex_shrink_0()
             .bg(Theme::bg_sidebar())
             .border_t_1()
             .border_color(Theme::border())
-            .px_6()
+            .px(px(Theme::PAGE_PAD))
             .flex()
             .items_center()
             .justify_between()
@@ -64,7 +69,7 @@ impl MainWindow {
                                         .gap_2()
                                         .child(
                                             div()
-                                                .text_size(px(12.0))
+                                                .text_size(px(Theme::TEXT_BODY))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(Theme::text_primary())
                                                 .child(stage_text.to_string()),
@@ -72,7 +77,7 @@ impl MainWindow {
                                         .child(
                                             if total_dur > 0.0 {
                                                 div()
-                                                    .text_size(px(11.0))
+                                                    .text_size(px(Theme::TEXT_SMALL))
                                                     .text_color(Theme::text_secondary())
                                                     .child(format!("{cur_mm:02}:{cur_ss:02} / {tot_mm:02}:{tot_ss:02}"))
                                             } else {
@@ -80,65 +85,53 @@ impl MainWindow {
                                             }
                                         )
                                         .child(
-                                            div()
-                                                .px_2()
-                                                .py_0p5()
-                                                .rounded_full()
-                                                .bg(rgba(0x10b98120))
-                                                .text_size(px(11.0))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(Theme::accent_mint())
-                                                .child(format!("{:.1}%", display_ratio * 100.0)),
+                                            primitives::badge_accent(format!(
+                                                "{:.1}%",
+                                                display_ratio * 100.0
+                                            )),
                                         ),
                                 )
                                 .child(
                                     div()
-                                        .w(px(260.0))
-                                        .h(px(4.0))
-                                        .rounded_full()
-                                        .bg(rgb(0x22222a))
-                                        .overflow_hidden()
-                                        .child(
-                                            div()
-                                                .h_full()
-                                                .w(relative(display_ratio as f32))
-                                                .rounded_full()
-                                                .bg(Theme::accent_mint()),
-                                        ),
+                                        .w(px(Theme::PROGRESS_W))
+                                        .child(primitives::progress_bar(display_ratio as f32)),
                                 )
                         } else if self.state.transcribe_file.is_some() {
                             div()
                                 .flex()
                                 .items_center()
                                 .gap_2()
+                                .child(primitives::stat_dot_sm(Theme::accent_blue()))
                                 .child(
                                     div()
-                                        .w(px(7.0))
-                                        .h(px(7.0))
-                                        .rounded_full()
-                                        .bg(Theme::accent_blue()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
+                                        .text_size(px(Theme::TEXT_BODY))
                                         .text_color(Theme::text_secondary())
                                         .child("文件已就绪"),
+                                )
+                        } else if has_batch {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(primitives::stat_dot_sm(Theme::accent_mint()))
+                                .child(
+                                    div()
+                                        .text_size(px(Theme::TEXT_BODY))
+                                        .text_color(Theme::text_secondary())
+                                        .child(format!(
+                                            "批量队列已就绪 · {} 个待处理",
+                                            self.state.queue_pending_count()
+                                        )),
                                 )
                         } else {
                             div()
                                 .flex()
                                 .items_center()
                                 .gap_2()
+                                .child(primitives::stat_dot_sm(Theme::bg_dot_idle()))
                                 .child(
                                     div()
-                                        .w(px(7.0))
-                                        .h(px(7.0))
-                                        .rounded_full()
-                                        .bg(rgb(0x3a3a44)),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
+                                        .text_size(px(Theme::TEXT_BODY))
                                         .text_color(Theme::text_muted())
                                         .child("就绪"),
                                 )
@@ -152,49 +145,38 @@ impl MainWindow {
                     .items_center()
                     .gap_2p5()
                     .child(
-                        div()
+                        // 「播放预览」：禁用态只置灰不接交互，形状不变
+                        primitives::pill_btn_outline_state("播放预览", can_play)
                             .id("play-video-btn")
-                            .px_4()
-                            .py_1p5()
-                            .rounded_full()
-                            .cursor_pointer()
-                            .bg(if can_play { Theme::bg_card() } else { rgb(0x1a1a22) })
-                            .text_color(if can_play { Theme::text_primary() } else { Theme::text_muted() })
-                            .border_1()
-                            .border_color(Theme::border())
-                            .text_size(px(12.0))
-                            .hover(|s| s.bg(Theme::bg_hover()))
-                            .on_click(cx.listener(|this, _, _, cx| this.play_video(cx)))
-                            .child("播放预览"),
+                            .when(can_play, |d| {
+                                d.on_click(cx.listener(|this, _, _, cx| this.play_video(cx)))
+                            }),
                     )
                     .child(
-                        div()
-                            .id("start-pipeline-btn")
-                            .px_5()
-                            .py_1p5()
-                            .rounded_full()
-                            .cursor_pointer()
-                            .bg(if can_start {
-                                Theme::accent_mint()
-                            } else {
-                                rgb(0x282832)
-                            })
-                            .text_color(if can_start {
-                                rgb(0x09090b)
-                            } else {
-                                Theme::text_muted()
-                            })
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .hover(|s| s.opacity(0.9))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.start_processing(cx);
-                            }))
-                            .child(if is_processing {
-                                "处理中..."
+                        // 「开始处理 / 开始全部」：实心薄荷胶囊，禁用时退化为中性底槽
+                        primitives::pill_btn_solid_state(
+                            if is_processing {
+                                if self.state.batch_running { "批量处理中..." } else { "处理中..." }
+                            } else if has_file {
+                                "开始处理"
+                            } else if has_batch {
+                                "开始全部"
                             } else {
                                 "开始处理"
-                            }),
+                            },
+                            Theme::accent_mint(),
+                            can_start,
+                        )
+                        .id("start-pipeline-btn")
+                        .when(can_start, |d| {
+                            d.on_click(cx.listener(|this, _, _, cx| {
+                                if this.state.transcribe_file.is_some() {
+                                    this.start_processing(cx);
+                                } else {
+                                    this.start_batch_queue(cx);
+                                }
+                            }))
+                        }),
                     ),
             )
     }

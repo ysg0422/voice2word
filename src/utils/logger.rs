@@ -2,7 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
@@ -50,10 +50,48 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DualWriter {
     }
 }
 
+/// 保留的历史日志文件数量上限（不含 `latest.txt`）。
+///
+/// 每次启动都会新建一个 `voice2word_<时间戳>.txt` 且只追加、从不轮转，
+/// 因此若不清理，`logs/` 会随启动次数线性增长（当前已有 100+ 个文件）。
+/// 保留最近 20 次启动的日志，既够排查近期问题，又不会无限膨胀。
+const KEEP_LOG_FILES: usize = 20;
+
+/// 清理 `logs/` 下过期的历史日志：按修改时间只保留最近 `keep` 个。
+///
+/// 只处理 `voice2word_*.txt` 这种自动生成的名字，`latest.txt` 与用户自己
+/// 放进来的文件一律不动。删除失败静默忽略——清理失败不该阻断启动。
+fn prune_old_logs(logs_dir: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(logs_dir) else {
+        return;
+    };
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !(name.starts_with("voice2word_") && name.ends_with(".txt")) {
+                return None;
+            }
+            let modified = e.metadata().and_then(|m| m.modified()).ok()?;
+            Some((modified, e.path()))
+        })
+        .collect();
+
+    if logs.len() <= keep {
+        return;
+    }
+    // 新的排在前面，跳过头 keep 个后剩下的都是最旧的
+    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in logs.into_iter().skip(keep) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 /// 初始化 txt 文件与控制台双写日志
 pub fn init_logger() -> anyhow::Result<PathBuf> {
     let logs_dir = crate::utils::AppConfig::app_root_dir().join("logs");
     fs::create_dir_all(&logs_dir)?;
+    prune_old_logs(&logs_dir, KEEP_LOG_FILES);
 
     let now = chrono::Local::now();
     let file_name = format!("voice2word_{}.txt", now.format("%Y%m%d_%H%M%S"));
@@ -132,4 +170,37 @@ pub fn init_logger() -> anyhow::Result<PathBuf> {
     info!("==========================================");
 
     Ok(log_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 日志轮转只保留最近 keep 个 `voice2word_*.txt`，且绝不碰 latest.txt 与其它文件。
+    #[test]
+    fn prune_old_logs_keeps_newest_and_spares_latest() {
+        let dir = std::env::temp_dir().join(format!("v2w_logs_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        for i in 0..4 {
+            fs::write(dir.join(format!("voice2word_2026010{i}_000000.txt")), b"log").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        fs::write(dir.join("latest.txt"), b"latest").unwrap();
+        fs::write(dir.join("_warn_now.log"), b"agent scratch").unwrap();
+
+        prune_old_logs(&dir, 2);
+
+        let remaining: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(remaining.iter().filter(|n| n.starts_with("voice2word_")).count(), 2);
+        assert!(dir.join("latest.txt").exists(), "latest.txt 不能被删");
+        assert!(dir.join("_warn_now.log").exists(), "非 voice2word_ 前缀的文件不能被删");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

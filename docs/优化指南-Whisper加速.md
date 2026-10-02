@@ -1,4 +1,18 @@
-# Whisper GPU 加速配置指南
+# Whisper CPU 加速配置指南
+
+当前项目的实际配置（`config.toml` + `src/main.rs:58`）：模型 `ggml-small-q5_0.bin`、`whisper_threads = 12`、`[gpu] whisper_offload = true`，因此默认链路**走 Vulkan GPU 推理**，并叠加 `gpu_limit_percent = 60` 的占空比限速；只有关掉 `whisper_offload` 或检测不到可用显卡时才会退回 `-ng` 纯 CPU。Small-Q5 仍是 Whisper Small，只是将权重做 Q5_0 量化。
+
+下面的 GPU/Vulkan 段落是历史记录。此处曾写作「当前默认链路不启用 GPU」，与 `config.toml` 的 `whisper_offload = true`、`src/main.rs` 的判定以及运行日志（`Whisper 使用 GPU 推理`）矛盾，已更正为「默认启用 GPU」。CPU 参数仍以 `config.toml` 为准（关掉 offload 时走这条路）。
+
+10 分钟（600 秒）标准片段、1.00x 速率的实测：GPU 路径 28.13 秒、CER 12.03%，纯 CPU（`-ng`）65.67 秒、CER 11.76%（均为 `ggml-small-q5_0`、`-t 12`、当前生产参数）。历史记录的「Small-Q5 CPU 16 线程约 57.65 秒、CER 12.88%」用的是 16 线程，与当前 `whisper_threads = 12` 不同，仅供参照。此处旧版还写过「未量化 Small 34.46 秒」，该数字比量化后的 Q5（57.65 秒）还快、且未能复现，与同一份文档的 CER 表自相矛盾，已废弃（详见 `docs/Whisper人工标准字幕对比.md` 第 5 节）。长音频会按现有切块逻辑并行处理，10 分钟两块并行约 52.5 秒。Q4_0 约 46.33 秒但 CER 16.10%，不设默认。
+
+生成量化模型：
+
+```powershell
+.\scripts\quantize_whisper_small.ps1 -Type q5_0
+```
+
+如果只保留原始模型，把 `whisper_model` 指回 `models/whisper/ggml-small.bin`，并把 `whisper_threads` 按机器调整。`-bo 1 -bs 1 -nf -mc 32 -vsd 250` 已是当前测试过的速度参数组合；继续提高 VAD 阈值或缩短静音间隔会增加切段重算，收益不稳定。
 
 ## 🎯 目标
 将 Whisper 语音识别速度从 **1x 实时** 提升至 **10-50x 实时**

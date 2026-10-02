@@ -1,42 +1,91 @@
-﻿# Voice2Word — 音视频智能字幕生成与校对工具
+# Voice2Word — 音视频智能字幕生成与校对工具
 
-Voice2Word 是一款本地运行的音视频字幕自动生成与精修桌面应用。无需联网上传音视频，100% 本地完成语音识别、标点润色错别字纠错、多轨时间轴画面对齐以及字幕导出。
+Voice2Word 是一款**完全本地运行**的音视频字幕工作台。音视频不出本机，识别、标点、
+翻译、校对、导出全部离线完成（在线翻译 API 为可选功能）。
+
+Rust + [GPUI](https://github.com/zed-industries/zed) 实现，Windows 桌面原生应用。
 
 ---
 
-## 🌟 主要功能
+## ✨ 功能一览
 
-- **本地一键转写**：支持 MP4、MKV、MOV、FLV、MP3、WAV 等主流音视频格式，自动提取音频并转写为带时间戳的字幕。
-- **静音加速检测**：内置语音活动检测（VAD），自动跳过空白静音段，长视频转写速度大幅提升。
-- **智能标点与错别字纠错**：转写完成后自动补全标点符号，纠正常见同音字与语音识别错别字。
-- **可视化时间轴校对工作台**：
-  - **音画对齐预览**：拖动或点击时间轴刻度，实时预览对应视频画面与字幕叠层。
-  - **字幕快捷精修**：直接在界面上修改错字，支持常用标点一键插入。
-  - **毫秒级微调与编辑**：支持字幕起止时间微调（±0.1s / ±0.5s）、长句拆分、短句合并与片段删除。
-- **多格式导出**：一键重新生成并导出为标准 **SRT**、**ASS** 或 **TXT** 字幕文件。
-- **历史记录保存**：内置本地数据库，处理过的任务自动保存，随时点击恢复并二次编辑。
+### 语音识别（多引擎可选）
+
+| 引擎 | 模型 | 特点 |
+| --- | --- | --- |
+| **SenseVoice** | `model.int8.onnx` | 阿里达摩院非自回归模型，单次出字，速度最快（5~8×） |
+| **Whisper Base** | `ggml-base.bin` | 39M 参数，轻量 |
+| **Whisper Small** | `ggml-small-q5_0.bin` | 244M 参数，默认档位，速度与精度均衡 |
+| **Whisper Turbo Q5** | `ggml-large-v3-turbo-q5_0.bin` | 破带宽量化，提速 25%~30% |
+| **Whisper Turbo Q8** | `ggml-large-v3-turbo-q8_0.bin` | 旗舰精度，抗口音吞音 |
+
+- **静音加速**：内置 Silero VAD 自动跳过空白段，长视频提速显著。
+- **音频预处理**：可选降噪 / 响度归一化 / 高通滤波 / 静音段压缩，弱语音场景下提升识别率。
+- **长音频分块**：超长音视频自动切块并行转写，避免单次推理内存爆掉。
+- **说话人分离**：可选，最多 4 位说话人（基于音频聚类）。
+
+### 标点与润色
+
+- **CT-Transformer 标点恢复**（`model.int8.onnx`）：毫秒级补全标点，出厂默认。
+- **Qwen 大模型深度润色**：可切换，纠正同音错别字与口语碎词，较慢。
+
+### 多语言字幕翻译
+
+- **本地 Qwen 离线翻译**：免费、无需联网、无需密钥。
+- **在线 API 翻译**：兼容 OpenAI / DeepSeek 等格式，需在「性能设置」中填写 API Key
+  （留空时回退读取环境变量 `VOICE2WORD_API_KEY`）。
+- 目标语种：简体中文 / 繁体中文 / English / 日本語 / 한국어 / Русский / Français / Deutsch。
+
+### 剪辑校对工作台
+
+- **音画同步监视器**：点时间轴刻度或字幕块，实时预览对应视频帧与字幕叠层。
+- **多轨时间轴**：字幕轨 + 音频波形轨，共用一条时间刻度，方便对着语音峰值卡点。
+- **字幕精修**：直接改错字、一键插入标点、起止时间 ±0.1s / ±0.5s 微调、长句拆分、短句合并、片段删除。
+- **字幕样式**：4 种视觉预设（白字黑影 / 黄字黑边 / 半透明黑框 / 电影沉浸），
+  可调字号、字间距、行间距、单行字数、底边距，并带实时预览条。
+- **虚拟化清单**：千行级字幕表仅渲染可视行，滚动不掉帧；支持原文 / 译文关键字搜索。
+
+### 导出
+
+一键导出为以下格式（均可直接导入对应剪辑软件）：
+
+| 格式 | 说明 |
+| --- | --- |
+| **剪映草稿** | 一键直出到本机草稿库，或导出到自选文件夹 |
+| **SRT** / **ASS** | 标准字幕 / 特效字幕（ASS 会写入预设的描边、阴影、底框参数） |
+| **FCPXML** | 达芬奇 / Final Cut Pro |
+| **Premiere XML** | Adobe Premiere |
+| **TXT** / **VTT** | 纯文本 / 网页字幕 |
+
+### 其他
+
+- **历史视频库**：内置 SQLite 记录处理过的任务，随时恢复二次编辑。
+- **硬件监控**：CPU / 内存占用实时看板，支持 GPU 解码与推理卸载开关。
+- **深色 / 浅色双主题**。
 
 ---
 
 ## 📖 使用教程
 
-1. **选择音视频**：打开软件后，在左侧点击「选择音视频文件」载入目标文件。
-2. **一键生成字幕**：确认语言和导出格式，点击「开始智能处理」。界面会实时展示识别进度与转写出来的文字。
-3. **校对与精修**：
-   - 转写完成后，应用会自动进入「剪辑校对工作台」。
-   - 点击底部时间轴上的任意字幕色块或时间刻度，上方监视器会同步展示当前画面的视频帧。
-   - 在右侧「字幕属性」面板中直接修改错别字、微调时间或拆分/合并句子。
-4. **导出成品**：在右上角点击「重新导出 SRT / ASS」，即可保存最终字幕。
+1. **选择音视频** — 左侧「智能转写」页载入文件（支持 mp4 / mkv / mov / avi / flv / webm /
+   mp3 / wav / flac / m4a）。
+2. **一键生成** — 选好模型档位与语言，点「开始智能处理」。界面实时流式展示识别出的文字。
+3. **校对精修** — 转写完成自动进入「剪辑校对」工作台：
+   - 点底部时间轴的字幕块或刻度，上方监视器同步显示画面；
+   - 右侧面板在「字幕样式」与「字幕翻译」两个视图间切换：
+     - **字幕样式**：调字体观感、微调当前句的时间 / 拆分 / 合并 / 删除；
+     - **字幕翻译**：选引擎与目标语言，一键翻译。
+4. **导出** — 右下角选择导出格式，点「导出」。
 
 ---
 
-## 🛠️ 个人部署与运行指南
+## 🛠️ 部署与运行
 
 ### 1. 环境准备
 
 - **操作系统**：Windows 10 / 11 (x64)
-- **Rust 环境**：安装 [Rust 1.80+](https://www.rust-lang.org/tools/install)
-- **C/C++ 编译环境**：Visual Studio（勾选“使用 C++ 的桌面开发”）
+- **Rust**：[1.80+](https://www.rust-lang.org/tools/install)（edition 2021）
+- **C/C++ 构建工具**：Visual Studio，勾选「使用 C++ 的桌面开发」（`rusqlite` 需要）
 
 ### 2. 克隆仓库
 
@@ -47,57 +96,114 @@ cd voice2word
 
 ### 3. 准备模型与组件
 
-为保证离线高效运行，本应用调用以下本地组件与模型文件：
+模型与可执行组件体积很大（合计约 5 GB），**不进版本库**，需自行下载后按下列路径放置。
+目录名必须一致，文件名可在 `config.toml` 里改。
 
-1. **FFmpeg**：
-   - 下载 Windows 版 FFmpeg，解压得到 `ffmpeg.exe`。
-2. **语音识别组件**：
-   - 准备 `whisper-cli.exe` 识别程序。
-   - 下载语音识别模型（如 `ggml-base.bin`）以及静音检测模型（如 `ggml-silero-v6.2.0.bin`）放入 `models/whisper/` 目录。
-3. **大语言模型（可选，用于纠错）**：
-   - 准备 `llama-completion.exe` 推理程序。
-   - 下载语言模型（如 `qwen2.5-0.5b-instruct-q4_k_m.gguf`）放入 `models/llm/` 目录。
+```
+tools/
+  ffmpeg.exe                                  # FFmpeg 主程序
+  llama-completion.exe                        # llama.cpp 推理程序（LLM 润色 / 翻译用）
+  whisper-vulkan/
+    whisper-1.8.4-windows-x64/
+      whisper-cli.exe                         # whisper.cpp 识别程序（Vulkan 加速版）
+  punc_runner.py                              # 标点引擎 Python 胶水（仓库自带）
+  sensevoice_runner.py                        # SenseVoice Python 胶水（仓库自带）
+
+models/
+  whisper/
+    ggml-silero-v6.2.0.bin                    # Silero VAD（静音检测）
+    ggml-small-q5_0.bin                       # 默认档位模型（按需换成其它档位）
+  punc/
+    model.int8.onnx                           # CT-Transformer 标点模型
+  sensevoice/
+    model.int8.onnx                           # SenseVoice 识别模型
+    tokens.txt
+    silero_vad.onnx
+  llm/
+    qwen2.5-0.5b-instruct-q4_k_m.gguf         # 本地润色 / 翻译用的 Qwen 模型
+```
+
+- **FFmpeg**：从 [ffmpeg.org](https://ffmpeg.org/download.html) 下载 Windows 版，取 `ffmpeg.exe`。
+- **whisper.cpp**：下载 Windows 预编译版（或自行编译带 Vulkan 后端），取 `whisper-cli.exe`。
+- **llama.cpp**：下载预编译版，取 `llama-completion.exe`。
+- **模型**：Whisper 系列从 [HuggingFace ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) 取；
+  Qwen 从 [Qwen2.5 GGUF](https://huggingface.co/Qwen) 取；SenseVoice / CT-Punc 的 ONNX 模型可从
+  ModelScope 获取（`tools/download_sensevoice.py` 提供了 SenseVoice 的下载脚本）。
+
+> 只用某一种引擎时，其余模型可以不放——对应功能在界面上不可用，但程序能正常启动。
 
 ### 4. 配置路径
 
-打开根目录下的 `config.toml`，将工具路径和模型路径配置为您本地的实际存放路径：
+打开根目录的 `config.toml`，把路径改成本地实际位置（**相对路径以项目根为基准，也可写绝对路径**）：
 
 ```toml
 [paths]
-ffmpeg = "tools/ffmpeg.exe"
-whisper_cli = "tools/whisper-cli.exe"
-whisper_model = "models/whisper/ggml-base.bin"
-vad_model = "models/whisper/ggml-silero-v6.2.0.bin"
-llama_cli = "tools/llama-completion.exe"
-llm_model = "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+ffmpeg         = "tools/ffmpeg.exe"
+whisper_cli    = "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"
+whisper_model  = "models/whisper/ggml-small-q5_0.bin"
+vad_model      = "models/whisper/ggml-silero-v6.2.0.bin"
+punc_model     = "models/punc/model.int8.onnx"
+sensevoice_model = "models/sensevoice/model.int8.onnx"
+llama_cli      = "tools/llama-completion.exe"
+llm_model      = "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+python         = "python"          # 标点 / SenseVoice 胶水脚本的解释器
 
 [pipeline]
-language = "zh"           # 默认识别语言 (zh / en / auto)
-output_format = "srt"     # 默认导出格式 (srt / ass)
-enable_polish = true      # 是否开启智能润色与纠错
-enable_vad = true         # 是否开启静音加速检测
-whisper_threads = 8       # Whisper CPU 线程数
-llm_threads = 8           # 大模型 CPU 线程数
-llm_ctx = 4096            # 上下文大小
+language          = "zh"           # 识别语言：zh / en / auto
+output_format     = "srt"          # srt / ass
+enable_polish     = true           # 是否开启标点与润色
+enable_vad        = true           # 是否开启静音加速
+whisper_threads   = 8              # Whisper CPU 线程数
+whisper_processors = 2             # 并行处理器数
+llm_threads       = 8
+llm_ctx           = 4096
+parallel_workers  = 0              # 长音频分块并行数，0 = 自动
+
+[translate]
+mode       = "offline_qwen"        # offline_qwen / online_api
+api_base   = "https://api.deepseek.com/v1"
+api_key    = ""                    # 留空则读环境变量 VOICE2WORD_API_KEY
+api_model  = "deepseek-chat"
 ```
 
 ### 5. 编译与启动
 
-在项目根目录下执行以下命令即可启动桌面客户端：
-
 ```powershell
-cargo run
+cargo run                 # 开发模式运行
+cargo build --release     # 发布版构建
 ```
 
-如需编译为发布版独立可执行文件：
+发布产物位于 `target/release/voice2word.exe`。**双击运行时，请确保工作目录是项目根目录**
+（程序靠当前目录下的 `models/` 定位项目根），或直接用 `cargo run` 启动。
+
+### 6. 运行测试
 
 ```powershell
-cargo build --release
+cargo test --lib          # 单元测试（不依赖模型文件）
 ```
-编译成功后，产物位于 `target/release/voice2word.exe`，直接双击运行即可。
+
+`tests/` 下的集成测试需要 `testVideo/` 与 `models/` 就位，未准备素材时会自动跳过。
+
+---
+
+## 📁 目录结构
+
+```
+src/
+  app/        应用状态机、任务调度
+  core/       性能监控、指标、主管道
+  engines/    FFmpeg / Whisper / SenseVoice / 标点 / LLM / 翻译 / 波形 / 说话人分离 / 视频解码
+  storage/    SQLite 历史库
+  subtitle/   字幕模型与导出器（SRT / ASS / FCPXML / Premiere / 剪映 / VTT）
+  ui/         设计系统（theme / primitives）+ 各工作台视图
+  utils/      配置、日志、帧缓存、临时文件守卫
+examples/     基准与评测工具（cargo run --example <name>）
+scripts/      算法 A/B、CER 评测、模型量化等一次性脚本
+docs/         优化记录与设计规范
+```
 
 ---
 
 ## 📄 许可证
 
-本项目基于 [MIT License](LICENSE) 协议发布。
+本项目基于 MIT License 协议发布。

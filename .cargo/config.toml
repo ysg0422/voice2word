@@ -1,0 +1,4 @@
+[build]
+# 原本把编译产物重定向到 D:\cargo-target\voice2word（当初为把产物挪出 C/A 盘、减轻系统盘占用而加）；
+# 现注释掉，cargo 回到默认 <仓库根>/target。想恢复旧行为，取消下一行注释即可。
+# target-dir = "D:\\cargo-target\\voice2word"

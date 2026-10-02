@@ -39,6 +39,8 @@ async fn test_real_video_pipeline() {
         true,
         config.pipeline.whisper_no_fallback,
         config.pipeline.whisper_max_context,
+        config.gpu.yield_to_desktop,
+        config.gpu.effective_gpu_limit(),
     ));
     let llm = Arc::new(LLMEngine::new(
         AppConfig::resolve_path(&config.paths.llama_cli),
@@ -77,7 +79,9 @@ async fn test_real_video_pipeline() {
     let video_path = PathBuf::from("testVideo/03.1.3概率不等式.mp4");
     assert!(video_path.exists(), "测试视频必须存在！");
 
-    let srt_out = PathBuf::from("testVideo/03.1.3概率不等式_success.srt");
+    // 注意：不能写回 `03.1.3概率不等式_success.srt`——那是人工校对过的标准字幕，
+    // 是 `scripts/eval_cer.py` 的参考真值，跑一次测试就会把它覆盖掉。
+    let srt_out = PathBuf::from("target/03.1.3概率不等式_pipeline_test.srt");
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     // 打印事件监听

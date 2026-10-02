@@ -8,13 +8,57 @@
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::engines::FFmpegEngine;
 
+/// 磁盘帧目录的保留文件数上限。
+///
+/// 内存缓存有 `max_size` 上限，但磁盘上的 `%TEMP%/v2w_frames` 原先只增不减：
+/// 每拖动一次时间轴（0.5s 量化）就可能落一个新 JPG，视频库每张卡片也会落一张，
+/// 长期使用后该目录会累积成千上万个文件。按「最近使用」保留最近 N 个即可。
+const DISK_KEEP_FILES: usize = 400;
+
+/// 每新增这么多帧才扫一次磁盘目录。
+/// 扫描需要 `read_dir` + 每个文件的 metadata，不能每抽一帧都做一遍。
+const PRUNE_EVERY: usize = 32;
+
+/// 按修改时间保留磁盘帧目录里最近的 `keep` 个 JPG，其余删除。
+///
+/// 只删 `.jpg`，其它文件一概不动；任何一步失败都静默跳过——磁盘裁剪只是
+/// 缓存维护，不该影响抽帧结果。
+fn prune_disk_dir(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jpg") {
+                return None;
+            }
+            let modified = e.metadata().and_then(|m| m.modified()).ok()?;
+            Some((modified, path))
+        })
+        .collect();
+
+    if files.len() <= keep {
+        return;
+    }
+    // 新的排在前面，跳过最近 keep 个后剩下的都是最旧的
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in files.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 pub struct FrameCache {
     cache: Arc<Mutex<FrameCacheInner>>,
     max_size: usize,
+    /// 距上次磁盘裁剪新增的帧数，攒够 [`PRUNE_EVERY`] 才触发一次目录扫描。
+    since_prune: AtomicUsize,
 }
 
 struct FrameCacheInner {
@@ -62,6 +106,15 @@ impl FrameCache {
                 order: VecDeque::new(),
             })),
             max_size: max_size.max(1),
+            since_prune: AtomicUsize::new(0),
+        }
+    }
+
+    /// 记一次新增帧，攒够阈值就裁剪一次磁盘目录。
+    fn note_disk_write(&self, disk_dir: &Path) {
+        if self.since_prune.fetch_add(1, Ordering::Relaxed) + 1 >= PRUNE_EVERY {
+            self.since_prune.store(0, Ordering::Relaxed);
+            prune_disk_dir(disk_dir, DISK_KEEP_FILES);
         }
     }
 
@@ -118,6 +171,8 @@ impl FrameCache {
 
         // 限制缓存大小，FIFO 淘汰
         self.cache.lock().unwrap().insert(key, out_jpg.clone(), self.max_size);
+        // 磁盘目录也要有上限，否则长期使用后 v2w_frames 会只增不减
+        self.note_disk_write(&temp_dir);
 
         Ok(out_jpg)
     }
@@ -182,5 +237,35 @@ mod tests {
             assert!(inner.map.contains_key("k1"));
             assert!(inner.map.contains_key("k3"));
         }
+    }
+
+    /// 磁盘目录按数量裁剪：只留最近 keep 个 JPG，且不碰非 jpg 文件。
+    #[test]
+    fn prune_disk_dir_keeps_newest_jpgs_only() {
+        let dir = std::env::temp_dir().join(format!("v2w_prune_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 逐个写入并让 mtime 递增，保证「最近」可判定
+        for i in 0..5 {
+            let p = dir.join(format!("f{i}.jpg"));
+            std::fs::write(&p, b"x").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        std::fs::write(dir.join("keep_me.txt"), b"not a frame").unwrap();
+
+        prune_disk_dir(&dir, 2);
+
+        let jpgs: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".jpg"))
+            .collect();
+        assert_eq!(jpgs.len(), 2, "只应保留最近 2 个 jpg: {jpgs:?}");
+        assert!(jpgs.contains(&"f4.jpg".to_string()), "最新的一帧必须留下");
+        assert!(dir.join("keep_me.txt").exists(), "非 jpg 文件不该被删");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

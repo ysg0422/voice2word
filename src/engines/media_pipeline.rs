@@ -5,10 +5,11 @@
 //! a discrete/integrated GPU; export / independent playback keeps the original.
 
 use anyhow::{Context, Result};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tracing::{info, warn};
 
@@ -24,12 +25,15 @@ pub struct HardwareProfile {
     pub adapter_name: String,
     pub hardware_decode: bool,
     pub force_proxy: bool,
+    pub is_discrete: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct DecodePolicy {
     pub try_hwaccel: bool,
     pub software_threads: u32,
+    /// 让路模式：预览解码进程降到低于正常优先级，避免与桌面合成器抢 GPU/CPU
+    pub yield_to_desktop: bool,
 }
 
 impl HardwareProfile {
@@ -63,6 +67,7 @@ impl HardwareProfile {
                 adapter_name: info.name,
                 hardware_decode: true,
                 force_proxy: false,
+                is_discrete: matches!(info.device_type, wgpu::DeviceType::DiscreteGpu),
             };
         }
 
@@ -72,6 +77,20 @@ impl HardwareProfile {
             adapter_name: "software (wgpu WARP / lavapipe)".into(),
             hardware_decode: false,
             force_proxy: true,
+            is_discrete: false,
+        }
+    }
+
+    /// CPU-only profile used when both GPU switches are disabled. It avoids
+    /// creating a wgpu instance just to discover an adapter that will not be
+    /// used by either preview or Whisper.
+    pub fn cpu_only() -> Self {
+        Self {
+            backend: RenderBackend::CpuSoftware,
+            adapter_name: "CPU software (GPU probe disabled)".into(),
+            hardware_decode: false,
+            force_proxy: true,
+            is_discrete: false,
         }
     }
 
@@ -79,10 +98,11 @@ impl HardwareProfile {
         self.backend == RenderBackend::Gpu
     }
 
-    pub fn decode_policy(&self) -> DecodePolicy {
+    pub fn decode_policy(&self, yield_to_desktop: bool) -> DecodePolicy {
         DecodePolicy {
             try_hwaccel: self.hardware_decode,
             software_threads: 0, // ffmpeg 0 = auto
+            yield_to_desktop,
         }
     }
 }
@@ -91,6 +111,31 @@ impl HardwareProfile {
 pub struct ProxyManager {
     ffmpeg_path: PathBuf,
     lock: Mutex<()>,
+    height_cache: Mutex<HashMap<PathBuf, (FileSignature, Option<u32>)>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileSignature {
+    len: u64,
+    modified_secs: u64,
+}
+
+fn file_signature(path: &Path) -> FileSignature {
+    match std::fs::metadata(path) {
+        Ok(meta) => FileSignature {
+            len: meta.len(),
+            modified_secs: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        },
+        Err(_) => FileSignature {
+            len: 0,
+            modified_secs: 0,
+        },
+    }
 }
 
 impl ProxyManager {
@@ -98,6 +143,7 @@ impl ProxyManager {
         Self {
             ffmpeg_path: ffmpeg_path.as_ref().to_path_buf(),
             lock: Mutex::new(()),
+            height_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -126,21 +172,10 @@ impl ProxyManager {
                 }
             })
             .collect();
-        let (len, mtime) = match std::fs::metadata(source) {
-            Ok(meta) => {
-                let ts = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                (meta.len(), ts)
-            }
-            Err(_) => (0, 0),
-        };
+        let signature = file_signature(source);
         std::env::temp_dir().join(format!(
             "voice2word_proxy_{}_{}_{}_{}p.mp4",
-            safe, len, mtime, height
+            safe, signature.len, signature.modified_secs, height
         ))
     }
 
@@ -185,7 +220,12 @@ impl ProxyManager {
 
         let vf = format!("scale=-2:{}", height);
         let mut cmd = Command::new(&self.ffmpeg_path);
-        apply_no_window(&mut cmd);
+        apply_background_priority(&mut cmd);
+        let encode_threads = proxy_encode_threads();
+        info!(
+            threads = encode_threads,
+            "proxy transcode runs at below-normal priority with a bounded thread budget"
+        );
         let status = cmd
             .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(source)
@@ -208,9 +248,9 @@ impl ProxyManager {
                 "96k",
                 "-movflags",
                 "+faststart",
-                "-threads",
-                "0",
             ])
+            .arg("-threads")
+            .arg(encode_threads.to_string())
             .arg(&out)
             .status()
             .with_context(|| format!("启动代理生成失败: {:?}", self.ffmpeg_path))?;
@@ -223,11 +263,29 @@ impl ProxyManager {
     }
 
     fn probe_height(&self, source: &Path) -> Option<u32> {
+        let signature = file_signature(source);
+        if let Some((cached_signature, height)) = self
+            .height_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(source)
+            .copied()
+        {
+            if cached_signature == signature {
+                return height;
+            }
+        }
+
         let mut cmd = Command::new(&self.ffmpeg_path);
         apply_no_window(&mut cmd);
         let output = cmd.arg("-i").arg(source).output().ok()?;
         let stderr = String::from_utf8_lossy(&output.stderr);
-        parse_ffmpeg_height(&stderr)
+        let height = parse_ffmpeg_height(&stderr);
+        self.height_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(source.to_path_buf(), (signature, height));
+        height
     }
 }
 
@@ -253,6 +311,228 @@ pub fn apply_no_window(cmd: &mut Command) {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let _ = cmd;
+}
+
+/// 代理转码专用启动参数：隐藏控制台 + 降低到 BELOW_NORMAL 优先级。
+///
+/// 代理生成是后台非紧急任务，而 ASR（Whisper / SenseVoice）才是整条链路里
+/// 占 99% 耗时的关键路径。若代理以默认优先级抢占 CPU，用户点下「开始转写」
+/// 后识别速度会被明显拖慢，因此这里主动让出调度权重。
+pub fn apply_background_priority(cmd: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
+        cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+    }
+    let _ = cmd;
+}
+
+/// 统一的子进程启动标志：始终隐藏控制台；`yield_to_desktop` 为真时额外降到
+/// BELOW_NORMAL_PRIORITY_CLASS，把 CPU 与 GPU 调度权重让给桌面与前台程序。
+///
+/// 核显（Radeon 680M 这类）既要跑推理又要输出画面：Whisper Vulkan 会把 compute
+/// 队列持续压在 65%~80%，此时整机拖窗口、切前台都会顿。实测 5 分钟音频 /
+/// small-q5_0 / 16 线程：让路开 = 18.4s、GPU 均值 62.7%；让路关 = 19.7s、GPU 均值
+/// 65.1%。速度基本无损，桌面跟手程度差别明显。
+pub fn apply_child_flags(cmd: &mut Command, yield_to_desktop: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
+        let mut flags = CREATE_NO_WINDOW;
+        if yield_to_desktop {
+            flags |= BELOW_NORMAL_PRIORITY_CLASS;
+        }
+        cmd.creation_flags(flags);
+    }
+    let _ = (cmd, yield_to_desktop);
+}
+
+/// GPU 占空比限速器：按「跑 N% 时间、挂起 (100-N)% 时间」给 GPU 主动留出空窗。
+///
+/// 为什么需要它：进程优先级（BELOW_NORMAL）只影响 CPU 时间片分配，管不到已经提交到
+/// GPU 命令队列里的工作量。核显（如 Radeon 680M）既要跑 Whisper Vulkan 推理、又要
+/// 驱动显示器，compute 队列一旦排满，桌面合成器就只能排队等 GPU，表现为拖窗掉帧。
+/// 挂起进程会让其命令队列在几十毫秒内排空，桌面拿到独占 GPU 的窗口；恢复后推理从
+/// 断点继续，显存不释放、模型不重载，因此「有效计算时段」内的吞吐不变，只是把总
+/// 耗时按比例拉长（上限 60% → 约 1.67 倍）。
+///
+/// 生命周期约定：析构时会自动停止限速线程（见 `Drop` 实现），因此提前返回不会
+/// 留下野线程；但**必须在 `Child` 被 drop（进程句柄关闭）之前**完成停止——
+/// 否则系统可能把该句柄值复用到别的进程上，工作线程就会误挂起无关进程。
+/// 由于 `GpuThrottle` 总是声明在 `Child` 之后，Rust 的局部变量逆序析构天然满足这一点。
+pub struct GpuThrottle {
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl GpuThrottle {
+    /// 空实现：不做任何限速。
+    pub fn off() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        }
+    }
+
+    /// 为正在运行的子进程启动限速。`limit_percent >= 100`、非 Windows 平台
+    /// 或拿不到 ntdll 导出函数时自动退化为空实现（即保持原速）。
+    pub fn for_child(child: &std::process::Child, limit_percent: u32) -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::io::AsRawHandle;
+            Self::start(child.as_raw_handle() as isize, limit_percent)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (child, limit_percent);
+            Self::off()
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn start(raw_handle: isize, limit_percent: u32) -> Self {
+        if raw_handle == 0 || limit_percent >= 100 {
+            return Self::off();
+        }
+        if !nt_process::available() {
+            warn!("ntdll 未导出 NtSuspendProcess/NtResumeProcess，GPU 限速降级为不限速");
+            return Self::off();
+        }
+        let limit = limit_percent.clamp(20, 95);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        info!(limit_percent = limit, "GPU 限速已开启：按占空比给桌面留出 GPU 空窗");
+        let worker = std::thread::Builder::new()
+            .name("gpu-duty-throttle".into())
+            .spawn(move || {
+                // 100ms 周期在「桌面跟手」与「切换开销」之间折中：
+                // 让出段至少 5ms，足够 60Hz 合成器补上几帧，同时每秒只切换 10 次。
+                const PERIOD_MS: u64 = 100;
+                let run_ms = (PERIOD_MS * limit as u64 / 100).max(5);
+                let idle_ms = (PERIOD_MS - run_ms).max(5);
+                while !flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(run_ms));
+                    if flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if !nt_process::set_suspended(raw_handle, true) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(idle_ms));
+                    if !nt_process::set_suspended(raw_handle, false) {
+                        break;
+                    }
+                }
+                // 兜底：任何退出路径都必须恢复子进程，否则转写会永久卡死
+                nt_process::set_suspended(raw_handle, false);
+            })
+            .ok();
+        Self { stop, worker }
+    }
+
+    /// 停止限速并等待工作线程退出，确保返回后不会再有任何挂起动作。
+    ///
+    /// 等价于析构，保留这个方法是为了让调用点能显式表达「现在就要停」的意图
+    /// （例如 `child.wait()` 之后、`Child` 句柄关闭之前）。
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    /// 停线程 + join。被 [`Self::stop`] 与 `Drop` 共用，保证两条路径行为一致。
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for GpuThrottle {
+    fn drop(&mut self) {
+        // 为什么必须补 Drop：限速线程握着子进程的原始句柄按 100ms 周期挂起/恢复它，
+        // 一旦 `GpuThrottle` 在任意 `?` / 提前返回 / panic 路径上被直接丢弃而没有
+        // `stop()`，线程就会永远转下去——句柄随 `Child` 关闭后被系统复用给别的进程时，
+        // 它就会开始误挂起无关进程（例如桌面窗口）。把清理绑定到析构上，
+        // 就一次性覆盖了所有退出路径，不必在每个 return 前手动补 stop()。
+        self.shutdown();
+    }
+}
+
+/// `NtSuspendProcess` / `NtResumeProcess` 没有出现在 Windows SDK 头文件里，
+/// 只能运行时从 ntdll.dll 取函数地址（Process Explorer 等工具同款做法），
+/// 因此不引入 ntdll.lib 依赖，缺符号时安全降级。
+#[cfg(target_os = "windows")]
+mod nt_process {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleA(name: *const u8) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    }
+
+    type SuspendResumeFn = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    struct Api {
+        suspend: SuspendResumeFn,
+        resume: SuspendResumeFn,
+    }
+
+    fn api() -> Option<&'static Api> {
+        static API: OnceLock<Option<Api>> = OnceLock::new();
+        API.get_or_init(|| unsafe {
+            let module = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+            if module.is_null() {
+                return None;
+            }
+            let suspend = GetProcAddress(module, b"NtSuspendProcess\0".as_ptr());
+            let resume = GetProcAddress(module, b"NtResumeProcess\0".as_ptr());
+            if suspend.is_null() || resume.is_null() {
+                return None;
+            }
+            Some(Api {
+                suspend: std::mem::transmute::<*mut c_void, SuspendResumeFn>(suspend),
+                resume: std::mem::transmute::<*mut c_void, SuspendResumeFn>(resume),
+            })
+        })
+        .as_ref()
+    }
+
+    pub fn available() -> bool {
+        api().is_some()
+    }
+
+    pub fn set_suspended(raw_handle: isize, suspended: bool) -> bool {
+        let Some(api) = api() else {
+            return false;
+        };
+        let handle = raw_handle as *mut c_void;
+        let status = unsafe {
+            if suspended {
+                (api.suspend)(handle)
+            } else {
+                (api.resume)(handle)
+            }
+        };
+        status >= 0
+    }
+}
+
+/// 代理转码的编码线程预算：按逻辑核心数的 1/4 计算，上限 4、下限 1。
+///
+/// 原先使用 `-threads 0`（FFmpeg 自动，实际约 1.5x 核心数），16 核机器上会
+/// 起 20+ 个编码线程，与 8~16 线程的 ASR 进程直接争抢核心与内存带宽。
+/// 代理只服务于预览流畅度，不需要满速，留出核心给识别才是正确取舍。
+pub fn proxy_encode_threads() -> u32 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (cores / 4).clamp(1, 4) as u32
 }
 
 /// Shared NV12 → RGB shader. Runs on a hardware adapter when one exists,

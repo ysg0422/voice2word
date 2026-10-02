@@ -5,31 +5,25 @@ use gpui::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::app::state::WorkspaceTab;
+use crate::app::state::{ProcessStatus, WorkspaceTab};
 use crate::subtitle::SubtitleWriter;
 use crate::utils::time::format_duration_short;
+use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::MainWindow;
 
 impl MainWindow {
     /// 渲染历史视频库 (视频资产管理与一键载入工作台)
     pub(crate) fn render_library_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let tasks = self.state.recent_tasks.clone();
-        let total_count = tasks.len();
+        let total_count = self.state.recent_tasks.len();
 
         // 为缺失首帧的卡片后台派发缩略图提取（幂等，完成后自动刷新）
-        self.ensure_library_thumbnails(&tasks, cx);
+        self.ensure_library_thumbnails(cx);
 
-        div()
-            .id("library-workspace-layout")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .w_full()
-            .h_full()
-            .bg(Theme::bg_panel())
-            .p_6()
-            .gap_5()
+        // 页面外壳统一走 primitives::page_shell：内边距 / 分区间距与其余工作台页同源。
+        // 注意本页内容自身带滚动列表（library-cards-scroll），外层不再额外滚动，
+        // 故把 page_shell 自带的 overflow_y_scroll 顶掉，避免双滚动条。
+        primitives::page_shell("library-workspace-layout")
             .overflow_hidden()
             // 顶部标头栏
             .child(
@@ -41,79 +35,40 @@ impl MainWindow {
                         div()
                             .flex()
                             .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .text_size(px(20.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(Theme::text_primary())
-                                    .child("视频库"),
-                            )
-                            .child(
-                                div()
-                                    .px_2p5()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(rgb(0x1e1e28))
-                                    .border_1()
-                                    .border_color(Theme::border())
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(Theme::text_muted())
-                                    .child(format!("{} 项", total_count)),
-                            ),
+                            .gap(px(Theme::SPACE_3))
+                            .child(primitives::page_title("视频库"))
+                            // 计数徽标统一走 badge 原语（不再是手写的圆角胶囊）
+                            .child(primitives::badge(format!("{} 项", total_count))),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_2p5()
+                            .gap(px(Theme::SPACE_2))
                             .child(
-                                div()
+                                primitives::btn_clickable("导入视频", primitives::BtnSize::Md, primitives::BtnVariant::Primary)
                                     .id("library-import-btn")
-                                    .px_5()
-                                    .py_2()
-                                    .rounded_lg()
-                                    .bg(Theme::accent_mint())
-                                    .cursor_pointer()
-                                    .text_size(px(13.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(0x09090b))
-                                    .hover(|s| s.opacity(0.88))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.state.active_tab = WorkspaceTab::Generate;
                                         cx.notify();
-                                    }))
-                                    .child("导入视频"),
+                                    })),
                             )
                             .child(
-                                div()
+                                primitives::btn_clickable("刷新", primitives::BtnSize::Md, primitives::BtnVariant::Secondary)
                                     .id("library-refresh-btn")
-                                    .px_4()
-                                    .py_2()
-                                    .rounded_lg()
-                                    .bg(Theme::bg_card())
-                                    .border_1()
-                                    .border_color(Theme::border())
-                                    .cursor_pointer()
-                                    .text_size(px(13.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(Theme::text_secondary())
-                                    .hover(|s| s.bg(Theme::bg_hover()).border_color(Theme::border_light()))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.state.refresh_recent_tasks();
                                         cx.notify();
-                                    }))
-                                    .child("刷新"),
+                                    })),
                             ),
                     ),
             )
             // 视频卡片列表区域
             .child(
-                if tasks.is_empty() {
+                if total_count == 0 {
                     self.render_library_empty(cx)
                 } else {
-                    self.render_library_cards(tasks, cx)
+                    self.render_library_cards(cx)
                 }
             )
     }
@@ -126,56 +81,43 @@ impl MainWindow {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap_3()
+            .gap(px(Theme::SPACE_3))
             .child(
                 div()
-                    .text_size(px(16.0))
+                    .text_size(px(Theme::TEXT_HEADING))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(Theme::text_secondary())
                     .child("暂无解析历史"),
             )
             .child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(px(Theme::TEXT_BODY_LG))
                     .text_color(Theme::text_muted())
                     .child("导入视频文件后，转写记录将在此显示"),
             )
             .child(
-                div()
+                // 空态主行动按钮走 btn 原语，与其余页面的 CTA 同高同色
+                primitives::btn_clickable("导入视频开始转写", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
                     .id("empty-lib-goto-gen")
-                    .mt_2()
-                    .px_6()
-                    .py_2p5()
-                    .rounded_lg()
-                    .bg(Theme::accent_mint())
-                    .cursor_pointer()
-                    .text_size(px(14.0))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0x09090b))
-                    .hover(|s| s.opacity(0.88))
+                    .mt(px(Theme::SPACE_2))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.state.active_tab = WorkspaceTab::Generate;
                         cx.notify();
-                    }))
-                    .child("导入视频开始转写"),
+                    })),
             )
             .into_any_element()
     }
 
-    /// 卡片列表
-    fn render_library_cards(
-        &self,
-        tasks: Vec<crate::storage::db::TaskRecord>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// 卡片列表：直接借用 recent_tasks，避免每次渲染克隆全部任务的 segments
+    fn render_library_cards(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("library-cards-scroll")
             .flex_1()
             .overflow_y_scroll()
             .flex()
             .flex_col()
-            .gap_3()
-            .children(tasks.into_iter().map(|task| {
+            .gap(px(Theme::SPACE_3))
+            .children(self.state.recent_tasks.iter().map(|task| {
                 self.render_library_card(task, cx)
             }))
             .into_any_element()
@@ -184,19 +126,27 @@ impl MainWindow {
     /// 为视频库卡片异步预提取首帧缩略图。
     /// 复用全局 FrameCache（磁盘级缓存：路径+文件签名+时间键，跨会话命中），时间 0.0 即首帧；
     /// 每个任务仅派发一次，失败时写入空路径标记防止逐帧重试刷爆后台。
-    fn ensure_library_thumbnails(
-        &mut self,
-        tasks: &[crate::storage::db::TaskRecord],
-        cx: &mut Context<Self>,
-    ) {
-        for task in tasks {
-            let task_id = task.id;
-            if self.library_thumbs.contains_key(&task_id)
-                || self.library_thumb_inflight.contains(&task_id)
-            {
-                continue;
+    fn ensure_library_thumbnails(&mut self, cx: &mut Context<Self>) {
+        const MAX_THUMB_WORKERS: usize = 2;
+        // 先收集待派发项（只取 id 与路径），避免在借用 recent_tasks 的同时
+        // 修改 library_thumb_inflight，也避免克隆整段字幕数据
+        let pending: Vec<(i64, PathBuf)> = self
+            .state
+            .recent_tasks
+            .iter()
+            .filter(|t| {
+                !self.library_thumbs.contains_key(&t.id)
+                    && !self.library_thumb_inflight.contains(&t.id)
+            })
+            .map(|t| (t.id, PathBuf::from(&t.file_path)))
+            .collect();
+
+        for (task_id, video_path) in pending {
+            // A render can revisit this method frequently. Bound background
+            // ffmpeg work so a large library cannot starve Whisper workers.
+            if self.library_thumb_inflight.len() >= MAX_THUMB_WORKERS {
+                break;
             }
-            let video_path = PathBuf::from(&task.file_path);
             if !video_path.exists() {
                 continue;
             }
@@ -226,15 +176,14 @@ impl MainWindow {
     }
 
     /// 单条视频卡片 —— 横向布局：缩略图 | 信息区 | 操作按钮
+    /// 只借用任务记录，点击时再按 id 回查，避免每次渲染克隆整段字幕
     fn render_library_card(
         &self,
-        task: crate::storage::db::TaskRecord,
+        task: &crate::storage::db::TaskRecord,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let task_id = task.id;
-        let task_clone = task.clone();
-        let task_export = task.clone();
-        let seg_len = task.segments.len();
+        let seg_len = task.segment_count;
         let dur_str = format_duration_short(task.duration);
 
         // 文件扩展名
@@ -260,17 +209,18 @@ impl MainWindow {
             .unwrap_or_else(|| "未知大小".to_string());
 
         // 摘录首条字幕文本 (按字符边界截断，避免切进多字节中文字符导致 panic)
-        let sample_text = task.segments.first()
-            .map(|s| {
-                let t = s.display_text().to_string();
-                if t.chars().count() > 40 {
-                    let cut: String = t.chars().take(40).collect();
-                    format!("{}...", cut)
-                } else {
-                    t
-                }
-            })
-            .unwrap_or_else(|| "无字幕内容".to_string());
+        // 列表查询已由 SQLite 抽出首句文本，这里不再反序列化整段字幕
+        let sample_text = {
+            let t = task.sample_text.clone();
+            if t.trim().is_empty() {
+                "无字幕内容".to_string()
+            } else if t.chars().count() > 40 {
+                let cut: String = t.chars().take(40).collect();
+                format!("{}...", cut)
+            } else {
+                t
+            }
+        };
 
         // 格式化日期（取日期部分）
         let date_display = if task.created_at.len() >= 10 {
@@ -287,7 +237,7 @@ impl MainWindow {
             .bg(Theme::bg_card())
             .border_1()
             .border_color(Theme::border())
-            .hover(|s| s.border_color(Theme::border_light()).bg(rgb(0x242428)))
+            .hover(|s| s.border_color(Theme::border_light()).bg(Theme::bg_card_hover()))
             .flex()
             .flex_row()
             .gap_4()
@@ -295,13 +245,13 @@ impl MainWindow {
             .child({
                 let thumb_box = div()
                     .flex_shrink_0()
-                    .w(px(180.0))
-                    .h(px(108.0))
+                    .w(px(Theme::LIB_THUMB_W))
+                    .h(px(Theme::LIB_THUMB_H))
                     .rounded_lg()
                     .overflow_hidden()
-                    .bg(rgb(0x12121a))
+                    .bg(Theme::bg_sidebar())
                     .border_1()
-                    .border_color(rgb(0x1e1e2a))
+                    .border_color(Theme::border_subtle())
                     .relative();
 
                 match self.library_thumbs.get(&task_id) {
@@ -324,19 +274,21 @@ impl MainWindow {
                                 .justify_between()
                                 .px_2()
                                 .py_0p5()
-                                .bg(rgba(0x0a0a0fb8))
+                                // 角标条压在缩略图上，底色恒为深色，文字必须用媒体区浅色 token
+                                // （浅色主题下 text_muted 会变深，压在深底上直接糊掉）
+                                .bg(Theme::bg_overlay())
                                 .child(
                                     div()
-                                        .text_size(px(10.0))
+                                        .text_size(px(Theme::TEXT_CAPTION))
                                         .font_weight(FontWeight::BOLD)
-                                        .text_color(Theme::text_muted())
+                                        .text_color(Theme::text_on_overlay())
                                         .child(ext),
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(10.0))
+                                        .text_size(px(Theme::TEXT_CAPTION))
                                         .font_weight(FontWeight::MEDIUM)
-                                        .text_color(Theme::text_muted())
+                                        .text_color(Theme::text_on_overlay())
                                         .child(dur_str.clone()),
                                 ),
                         ),
@@ -352,10 +304,10 @@ impl MainWindow {
                                 .px_3()
                                 .py_1()
                                 .rounded_md()
-                                .bg(rgb(0x1c1c28))
+                                .bg(Theme::bg_raised())
                                 .border_1()
-                                .border_color(rgb(0x2a2a38))
-                                .text_size(px(13.0))
+                                .border_color(Theme::border_mid())
+                                .text_size(px(Theme::TEXT_BODY_LG))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(Theme::text_muted())
                                 .child(ext),
@@ -363,7 +315,7 @@ impl MainWindow {
                         // 时长标签
                         .child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(px(Theme::TEXT_SMALL))
                                 .text_color(Theme::text_muted())
                                 .child(dur_str.clone()),
                         ),
@@ -392,7 +344,7 @@ impl MainWindow {
                                     // 文件名 (大字)
                                     .child(
                                         div()
-                                            .text_size(px(16.0))
+                                            .text_size(px(Theme::TEXT_HEADING))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(Theme::text_primary())
                                             .overflow_hidden()
@@ -400,12 +352,7 @@ impl MainWindow {
                                     )
                                     // 已完成标记
                                     .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .w(px(8.0))
-                                            .h(px(8.0))
-                                            .rounded_full()
-                                            .bg(Theme::accent_mint()),
+                                        primitives::stat_dot(Theme::accent_mint()),
                                     ),
                             )
                             // 元数据标签行
@@ -429,7 +376,7 @@ impl MainWindow {
                     // 字幕预览文本
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(px(Theme::TEXT_BODY_LG))
                             .text_color(Theme::text_muted())
                             .overflow_hidden()
                             .child(sample_text),
@@ -437,8 +384,8 @@ impl MainWindow {
                     // 日期
                     .child(
                         div()
-                            .text_size(px(12.0))
-                            .text_color(rgba(0xffffff33))
+                            .text_size(px(Theme::TEXT_BODY))
+                            .text_color(Theme::text_muted())
                             .child(date_display),
                     ),
             )
@@ -454,20 +401,10 @@ impl MainWindow {
                     // 耗时详情 (if metrics)
                     .children(task.metrics.clone().map(|m| {
                         let fname = task.file_name.clone();
-                        div()
+                        // 次级薄荷按钮：薄荷浅底 + 薄荷字，与主操作的实心薄荷区分开
+                        primitives::btn_mint_soft("耗时详情")
                             .id(("lib-metrics-btn", task_id as usize))
-                            .w(px(110.0))
-                            .px_3()
-                            .py_1p5()
-                            .rounded_lg()
-                            .bg(rgb(0x1a2420))
-                            .border_1()
-                            .border_color(rgba(0x10b98130))
-                            .cursor_pointer()
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(Theme::accent_mint())
-                            .hover(|s| s.bg(rgb(0x22322a)).border_color(rgba(0x10b98150)))
+                            .w(px(Theme::LIB_ACTION_W))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.benchmark_dialog = Some(crate::ui::types::BenchmarkDialogInfo {
                                     file_name: fname.clone(),
@@ -475,54 +412,56 @@ impl MainWindow {
                                 });
                                 cx.notify();
                             }))
-                            .flex()
-                            .justify_center()
-                            .child("耗时详情")
                     }))
                     // 剪辑按钮 (主操作)
                     .child(
-                        div()
+                        // 主操作：实心薄荷方角按钮，与全站 CTA 同形
+                        primitives::btn_clickable("剪辑校对", primitives::BtnSize::Md, primitives::BtnVariant::Primary)
                             .id(("lib-edit-btn", task_id as usize))
-                            .w(px(110.0))
-                            .px_3()
-                            .py_1p5()
-                            .rounded_lg()
-                            .bg(Theme::accent_mint())
-                            .cursor_pointer()
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(0x09090b))
-                            .hover(|s| s.opacity(0.88))
+                            .w(px(Theme::LIB_ACTION_W))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.load_task(&task_clone);
+                                // 点击时才按 id 取出完整任务数据（渲染期不再克隆）
+                                let Some(record) = this
+                                    .state
+                                    .recent_tasks
+                                    .iter()
+                                    .find(|t| t.id == task_id)
+                                    .cloned()
+                                else {
+                                    return;
+                                };
+                                this.state.load_task(&record);
                                 this.trigger_extract_frame(cx);
                                 this.ensure_preview_proxy(cx);
+                                this.ensure_waveform(cx);
                                 cx.notify();
-                            }))
-                            .flex()
-                            .justify_center()
-                            .child("剪辑校对"),
+                            })),
                     )
-                    // 导出按钮
+                    // 导出按钮：次级中性按钮（抬升底 + 描边），方角
                     .child(
-                        div()
+                        primitives::btn_clickable("导出字幕", primitives::BtnSize::Md, primitives::BtnVariant::Secondary)
                             .id(("lib-export-btn", task_id as usize))
-                            .w(px(110.0))
-                            .px_3()
-                            .py_1p5()
-                            .rounded_lg()
-                            .bg(rgb(0x1c1c26))
-                            .border_1()
-                            .border_color(Theme::border())
-                            .cursor_pointer()
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(Theme::text_secondary())
-                            .hover(|s| s.bg(Theme::bg_hover()).border_color(Theme::border_light()))
-                            .on_click(cx.listener(move |_this, _, _, cx| {
-                                let task_name = task_export.file_name.clone();
-                                let segs = task_export.segments.clone();
-                                cx.spawn(async move |_this, _cx| {
+                            .w(px(Theme::LIB_ACTION_W))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                // 同上：仅在真正导出时才取出该任务的字幕数据
+                                let Some(record) = this
+                                    .state
+                                    .recent_tasks
+                                    .iter()
+                                    .find(|t| t.id == task_id)
+                                    .cloned()
+                                else {
+                                    return;
+                                };
+                                let task_name = record.file_name.clone();
+                                // 列表记录不含字幕正文，导出时按 id 现取，避免为一次导出
+                                // 把整库字幕都留在内存里
+                                let segs = this
+                                    .state
+                                    .db
+                                    .load_task_segments(task_id)
+                                    .unwrap_or_default();
+                                cx.spawn(async move |this, cx| {
                                     if let Some(handle) = rfd::AsyncFileDialog::new()
                                         .set_file_name(&format!("{}.srt", task_name))
                                         .add_filter("SubRip Subtitle", &["srt"])
@@ -530,41 +469,38 @@ impl MainWindow {
                                         .await
                                     {
                                         let save_path = handle.path().to_path_buf();
-                                        let _ = SubtitleWriter::write_srt(&segs, &save_path);
+                                        // 用 write_to_file 由内容自动决定是否双语：
+                                        // 与剪辑台的导出保持一致，带译文的工程不会在这里
+                                        // 悄悄退化成只有原文。
+                                        if let Err(err) =
+                                            SubtitleWriter::write_to_file(&segs, &save_path, "srt")
+                                        {
+                                            // 导出失败必须报出来：静默吞掉会让用户以为
+                                            // 文件已经写出去了，回头找不到又无从排查。
+                                            let _ = this.update(cx, |this, cx| {
+                                                this.state.status = ProcessStatus::Failed(format!(
+                                                    "导出失败: {err}"
+                                                ));
+                                                cx.notify();
+                                            });
+                                        }
                                     }
                                 })
                                 .detach();
-                            }))
-                            .flex()
-                            .justify_center()
-                            .child("导出字幕"),
+                            })),
                     )
-                    // 删除按钮
+                    // 删除按钮：危险操作按钮原语，卡片级尺寸（32px 圆角块）
                     .child(
-                        div()
+                        primitives::btn_danger("删除", primitives::BtnSize::Lg)
                             .id(("lib-del-btn", task_id as usize))
-                            .w(px(110.0))
-                            .px_3()
-                            .py_1p5()
-                            .rounded_lg()
-                            .bg(rgba(0xf43f5e0a))
-                            .border_1()
-                            .border_color(rgba(0xf43f5e20))
-                            .cursor_pointer()
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(Theme::accent_red())
-                            .hover(|s| s.bg(rgba(0xf43f5e18)).border_color(rgba(0xf43f5e38)))
+                            .w(px(Theme::LIB_ACTION_W))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.state.delete_task_record(task_id);
                                 if this.state.selected_file.is_some() {
                                     this.trigger_extract_frame(cx);
                                 }
                                 cx.notify();
-                            }))
-                            .flex()
-                            .justify_center()
-                            .child("删除"),
+                            })),
                     ),
             )
     }
@@ -578,18 +514,18 @@ impl MainWindow {
             .px_2p5()
             .py_1()
             .rounded_md()
-            .bg(rgb(0x1a1a24))
+            .bg(Theme::bg_raised())
             .border_1()
-            .border_color(rgb(0x252530))
+            .border_color(Theme::border_subtle())
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_SMALL))
                     .text_color(Theme::text_muted())
                     .child(format!("{}:", label)),
             )
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(Theme::TEXT_BODY))
                     .font_weight(FontWeight::BOLD)
                     .text_color(Theme::text_secondary())
                     .child(value.to_string()),
