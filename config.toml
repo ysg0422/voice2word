@@ -49,6 +49,7 @@ line_spacing = 1.2000000476837158
 max_chars_per_line = 16
 bottom_margin = 40
 preset_name = "白字黑影"
+preview_box_w = 374.13323974609375
 
 [translate]
 mode = "offline_qwen"

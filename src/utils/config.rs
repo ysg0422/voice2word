@@ -139,6 +139,13 @@ pub struct SubtitleStyleConfig {
     pub bottom_margin: u32,
     /// 预设名称："白字黑影" / "黄字黑边" / "半透明黑框" / "电影沉浸"
     pub preset_name: String,
+    /// 预览框的手动宽度（px）。
+    ///
+    /// `None`（旧配置 / 从未拖过）= 按「单行最大字数 × 预览字号」自动推算；
+    /// `Some(w)` = 用户在预览条两侧拖过把手，以手动值为准。
+    /// 用 `#[serde(default)]` 保证老 `config.toml` 缺这一项时能正常反序列化。
+    #[serde(default)]
+    pub preview_box_w: Option<f32>,
 }
 
 impl Default for SubtitleStyleConfig {
@@ -150,6 +157,7 @@ impl Default for SubtitleStyleConfig {
             max_chars_per_line: 16,
             bottom_margin: 40,
             preset_name: "白字黑影".to_string(),
+            preview_box_w: None,
         }
     }
 }

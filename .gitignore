@@ -52,6 +52,8 @@ $RECYCLE.BIN/
 .tmp-*
 tmp_*
 _scratch_ro/
+# 随手贴的报错 / 界面截图（只用于排查，不属于项目内容）
+image/
 
 # Local binaries & Python caches
 *.exe
