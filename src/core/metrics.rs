@@ -7,6 +7,9 @@ use crate::utils::time::format_duration_short;
 pub struct PipelinePerformanceMetrics {
     /// 媒体文件时长 (秒)
     pub video_duration: f64,
+    /// VAD/字幕覆盖到的有声时间 (秒)。这是语音区间并集，不是 VAD 计算耗时。
+    #[serde(default)]
+    pub voiced_duration_sec: f64,
     /// 阶段 1: FFmpeg 提取音频耗时 (秒)
     pub ffmpeg_audio_sec: f64,
     /// 阶段 1 音频通道说明（如 "纯内存 PCM 匿名管道推流 (0 磁盘 I/O)" 或 "FFmpeg 抽取临时 WAV 文件"）
@@ -33,9 +36,11 @@ pub struct PipelinePerformanceMetrics {
     /// 阶段 4 引擎说明（如 "SenseVoice 原生标点与 ITN (免二次后处理)" 或 "CT-Punc 极速标点 (INT8)" 或 "Qwen 字幕润色"）
     #[serde(default)]
     pub polish_engine_name: Option<String>,
+    /// 阶段 4+: 说话人分离耗时 (秒，未启用时为 0.0)
+    #[serde(default)]
+    pub diarization_sec: f64,
     /// 阶段 5: 字幕写出与导出耗时 (秒)
-    pub srt_export_sec: f64,
-    /// 阶段 5 导出说明（如 "SRT 标准字幕写出"）
+    pub srt_export_sec: f64,    /// 阶段 5 导出说明（如 "SRT 标准字幕写出"）
     #[serde(default)]
     pub export_name: Option<String>,
     /// 产出的字幕片段总数量
@@ -70,6 +75,11 @@ impl PipelinePerformanceMetrics {
             "未触发 (全程置信度良好或已关闭)".to_string()
         };
         let polish_desc = self.polish_engine_name.as_deref().unwrap_or("标点/AI润色 (跳过)");
+        let diarization_desc = if self.diarization_sec > 0.0 {
+            "声学特征聚类 (基频/能量/过零率)"
+        } else {
+            "未启用"
+        };
         let export_desc = self.export_name.as_deref().unwrap_or("字幕文件写出");
 
         let total = self.total_elapsed_sec.max(0.001);
@@ -78,6 +88,7 @@ impl PipelinePerformanceMetrics {
         let asr_pct = (self.whisper_sec / total * 100.0).clamp(0.0, 100.0);
         let rescue_pct = (self.rescue_sec / total * 100.0).clamp(0.0, 100.0);
         let polish_pct = (self.qwen_sec / total * 100.0).clamp(0.0, 100.0);
+        let diarization_pct = (self.diarization_sec / total * 100.0).clamp(0.0, 100.0);
         let export_pct = (self.srt_export_sec / total * 100.0).clamp(0.0, 100.0);
 
         let speed_ratio = if total > 0.0 && self.video_duration > 0.0 {
@@ -100,6 +111,7 @@ impl PipelinePerformanceMetrics {
 r#"
 ======================= 全链路性能与耗时统计 =======================
 媒体总时长：        {dur_str} ({:.1} 秒)
+有声覆盖时长：      {:.1} 秒 ({:.1}%)
 生成字幕句数：      {seg_info}
 处理吞吐倍率：      {speed_ratio}
 
@@ -108,17 +120,25 @@ r#"
 [阶段 3] 语音转写识别：{:>6.1} 秒 ({:>4.1}%) | {asr_desc}
 [阶段 3+]置信度救场：  {:>6.1} 秒 ({:>4.1}%) | {rescue_desc}
 [阶段 4] 标点与语法：  {:>6.1} 秒 ({:>4.1}%) | {polish_desc}
+[阶段 4+]说话人分离：  {:>6.1} 秒 ({:>4.1}%) | {diarization_desc}
 [阶段 5] 字幕导出写出：{:>6.1} 秒 ({:>4.1}%) | {export_desc}
 
 全流程总耗时：       {:>6.1} 秒
 ===================================================================
 "#,
             self.video_duration,
+            self.voiced_duration_sec,
+            if self.video_duration > 0.0 {
+                self.voiced_duration_sec / self.video_duration * 100.0
+            } else {
+                0.0
+            },
             self.ffmpeg_audio_sec, audio_pct,
             self.vad_sec, vad_pct,
             self.whisper_sec, asr_pct,
             self.rescue_sec, rescue_pct,
             self.qwen_sec, polish_pct,
+            self.diarization_sec, diarization_pct,
             self.srt_export_sec, export_pct,
             self.total_elapsed_sec,
         )

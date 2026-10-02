@@ -1,11 +1,15 @@
 [paths]
-ffmpeg = "A:\\cppsoft\\ffmpeg-6.9\\bin\\ffmpeg.exe"
+ffmpeg = 'A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe'
 whisper_cli = "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"
-whisper_model = "models/whisper/ggml-large-v3-turbo-q8_0.bin"
+whisper_model = "models/whisper/ggml-small-q5_0.bin"
 vad_model = "models/whisper/ggml-silero-v6.2.0.bin"
 punc_model = "models/punc/model.int8.onnx"
-llama_cli = "A:\\cppsoft\\llama.cpp\\build\\bin\\Release\\llama-completion.exe"
+sensevoice_model = "models/sensevoice/model.int8.onnx"
+sensevoice_tokens = "models/sensevoice/tokens.txt"
+sensevoice_vad = "models/sensevoice/silero_vad.onnx"
+llama_cli = 'A:\cppsoft\llama.cpp\build\bin\Release\llama-completion.exe'
 llm_model = "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+python = "python"
 
 [pipeline]
 language = "zh"
@@ -13,10 +17,46 @@ output_format = "srt"
 enable_polish = false
 polish_mode = "punc"
 enable_vad = true
-whisper_threads = 8
-whisper_processors = 2
+whisper_threads = 10
+whisper_processors = 1
 whisper_no_fallback = true
-whisper_rescue_logprob = -0.65
+whisper_rescue_logprob = 0.0
 whisper_max_context = 32
+whisper_audio_speed = 1.0
+whisper_vad_threshold = 0.5
+preprocess_enabled = true
+preprocess_denoise = true
+preprocess_normalize = true
+preprocess_highpass_hz = 70.0
+preprocess_compact = false
+preprocess_min_saving = 0.1
 llm_threads = 8
 llm_ctx = 4096
+parallel_workers = 0
+enable_diarization = false
+speaker_count = 2
+
+[gpu]
+hwaccel_decode = false
+whisper_offload = true
+yield_to_desktop = true
+gpu_limit_percent = 100
+
+[subtitle_style]
+font_size = 40
+letter_spacing = 1
+line_spacing = 1.2000000476837158
+max_chars_per_line = 16
+bottom_margin = 40
+preset_name = "白字黑影"
+
+[translate]
+mode = "offline_qwen"
+api_base = "https://api.deepseek.com/v1"
+api_key = ""
+api_model = "deepseek-chat"
+batch_size = 20
+timeout_secs = 120
+
+[ui]
+theme = "dark"

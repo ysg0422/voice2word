@@ -35,11 +35,20 @@ zhconv = "0.3"
 rayon = "1.10"
 uuid = { version = "1.26.1", features = ["v4", "fast-rng"] }
 raw-window-handle = "0.6"
+ureq = { version = "2.10", default-features = false, features = ["json", "tls"] }
 
 [profile.dev]
-opt-level = 0
+# Keep debug symbols and fast incremental builds, while giving the UI,
+# JSON parsing, and subtitle pipeline basic optimization in the debug exe.
+opt-level = 1
 debug = 1
 
 # 仅对外部依赖库（GPUI、Tokio等）开启优化以保证运行流畅，本地业务代码开启 0 优化极速增量编译
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

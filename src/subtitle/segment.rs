@@ -22,6 +22,10 @@ pub struct Segment {
     /// 模型对该片段的平均对数置信度 (avg_logprob，越小越不可靠；旧记录/非 Whisper 引擎为 None)
     #[serde(default)]
     pub confidence: Option<f64>,
+    /// 说话人编号 (0 起，展示时 +1 为「说话人 N」)。
+    /// `None` 表示尚未做过说话人分离，或该段没有有效人声。
+    #[serde(default)]
+    pub speaker: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,26 +49,52 @@ impl Segment {
             polished: String::new(),
             language: None,
             confidence: None,
+            speaker: None,
         }
     }
 
-    /// 显示文本：原汁原味的声音识别文本 (直接声音是啥就是啥)
+    /// 显示文本：优先取润色/标点恢复后的文本，为空时回退原声识别文本。
+    ///
+    /// Stage 3 的标点恢复与 LLM 润色会把结果写进 `polished`，界面与导出都经这里
+    /// 取文本，因此非空即代表「有更好的版本可用」。
     pub fn display_text(&self) -> &str {
-        &self.text
+        if self.polished.trim().is_empty() {
+            &self.text
+        } else {
+            &self.polished
+        }
     }
 
-    /// 根据导出模式格式化字幕文本
+    /// 说话人标签（1 起编号，供界面与导出使用）
+    pub fn speaker_label(&self) -> Option<String> {
+        self.speaker.map(|s| format!("说话人 {}", s + 1))
+    }
+
+    /// 带说话人前缀的文本（仅在该段有说话人标签时加前缀）
+    pub fn text_with_speaker(&self, mode: ExportMode) -> String {
+        let body = self.export_text(mode);
+        match self.speaker_label() {
+            Some(label) if !body.trim().is_empty() => format!("{label}: {body}"),
+            _ => body,
+        }
+    }
+
+    /// 根据导出模式格式化字幕文本。
+    ///
+    /// 原文一律走 [`Segment::display_text`]（优先润色文本）；`Bilingual` 的第二行是
+    /// 译文，保持不动。
     pub fn export_text(&self, mode: ExportMode) -> String {
         match mode {
-            ExportMode::RawOnly => self.text.clone(),
-            ExportMode::TranslationOnly => {
-                self.translation.clone().unwrap_or_else(|| self.text.clone())
-            }
+            ExportMode::RawOnly => self.display_text().to_string(),
+            ExportMode::TranslationOnly => self
+                .translation
+                .clone()
+                .unwrap_or_else(|| self.display_text().to_string()),
             ExportMode::Bilingual => {
                 if let Some(ref trans) = self.translation {
-                    format!("{}\n{}", trans, self.text)
+                    format!("{}\n{}", trans, self.display_text())
                 } else {
-                    self.text.clone()
+                    self.display_text().to_string()
                 }
             }
         }
@@ -76,13 +106,34 @@ impl Segment {
     }
 }
 
+/// 这一批字幕里是否存在说话人标签。
+///
+/// 导出时以「整批」为单位决定是否加前缀：只有部分行带前缀会看起来像漏标，
+/// 所以只要有任意一句带标签，就统一加。
+pub fn has_speaker_labels(segments: &[Segment]) -> bool {
+    segments.iter().any(|s| s.speaker.is_some())
+}
+
+/// 按导出模式取文本，并按需带上说话人前缀。
+pub fn export_text_for(seg: &Segment, mode: ExportMode, with_speaker: bool) -> String {
+    if with_speaker {
+        seg.text_with_speaker(mode)
+    } else {
+        seg.export_text(mode)
+    }
+}
+
 /// 智能优化字幕时间轴与消除鬼影/闪烁：
 /// 1. 按起始时间升序排序
 /// 2. 剔除无效片段 (duration <= 0.05s) 以及模型幻读重叠鬼影 (< 0.25s 且与后句同时间启动)
 /// 3. 消除时间戳倒退与重叠冲突（前句尾部不超出后句头部）
 /// 4. 长句自动拆分：超过 6 秒 / 60 字的大句按标点就近均分，时间按字数比例分配
 /// 5. 广播级极短句平滑：短句 (< 0.8s) 在间隙允许范围内适当延展，避免 0.1s~0.4s 闪烁过快导致人眼无法阅读
-/// 6. 重新编排连续序号 (1, 2, 3...)
+/// 6. 用第 2 步同一判据复扫一遍：消重叠/拆分/平滑都只动边界，可能在本次造出新的无效或鬼影片段
+/// 7. 重新编排连续序号 (1, 2, 3...)
+///
+/// **必须幂等**：`AppState` 每次载入工程（`load_task_with`、`load_from_cache`）都会调用本函数，
+/// 不幂等就表现为「同一个工程打开一次 N 条、再打开少一条」，而且消失的那条文本无处可寻。
 pub fn optimize_segments(segments: &mut Vec<Segment>) {
     if segments.is_empty() {
         return;
@@ -93,27 +144,13 @@ pub fn optimize_segments(segments: &mut Vec<Segment>) {
 
     // 2. 剔除无效时长与同时间戳鬼影片段
     let mut filtered = Vec::with_capacity(segments.len());
-    let mut i = 0;
-    while i < segments.len() {
-        let curr = &segments[i];
-        let dur = curr.end - curr.start;
-        if dur <= 0.05 || curr.display_text().trim().is_empty() {
-            i += 1;
+    for i in 0..segments.len() {
+        // 检查是否为同时间段重叠的极短鬼影碎片 (例如 100ms 的 "对吧？" 与紧随其后同一毫秒启动的整句)
+        if should_drop_segment(&segments[i], segments.get(i + 1)) {
+            // 无效片段 / 模型分词切片边界重复，跳过
             continue;
         }
-
-        // 检查是否为同时间段重叠的极短鬼影碎片 (例如 100ms 的 "对吧？" 与紧随其后同一毫秒启动的整句)
-        if i + 1 < segments.len() {
-            let next = &segments[i + 1];
-            if dur < 0.25 && (next.start - curr.start).abs() < 0.15 {
-                // 属于模型分词切片边界重复，跳过鬼影
-                i += 1;
-                continue;
-            }
-        }
-
-        filtered.push(curr.clone());
-        i += 1;
+        filtered.push(segments[i].clone());
     }
 
     // 3. 消除时间重叠
@@ -150,12 +187,61 @@ pub fn optimize_segments(segments: &mut Vec<Segment>) {
         }
     }
 
-    // 6. 重新编排序号
+    // 6. 复扫：第 3 步消重叠只改边界，可能把前句尾部收到 `start + 0.1`，
+    // 造出一条「时长过短 + 与后句几乎同时开始」的鬼影碎片；第 4/5 步拆分与平滑
+    // 也可能留下类似的短碎片。若留到下一次载入才由第 2 步剔除，用户看到的就是
+    // 「点开一次两条、再点开少一条」，而且那条碎条的文本被静默丢弃。
+    // 这里用与第 2 步完全相同的判据复扫到稳定（复扫只会删、不会改边界）。
+    filtered = drop_invalid_and_ghosts_until_stable(filtered);
+
+    // 7. 重新编排序号
     for (idx, seg) in filtered.iter_mut().enumerate() {
         seg.index = idx + 1;
     }
 
     *segments = filtered;
+}
+
+/// 「无效或鬼影」判据：单条片段是否应在筛除阶段丢弃。
+///
+/// 合并成一处是刻意的：[`optimize_segments`] 的第 2 步首筛与第 6 步复扫必须用同一条
+/// 判据，否则首筛放过的碎片会在复扫时被删（或反过来），函数就不再幂等。
+/// `next` 是紧随其后的片段；为 `None`（末条）时不做鬼影判断。
+fn should_drop_segment(seg: &Segment, next: Option<&Segment>) -> bool {
+    // 无效时长（含被压成 0 甚至负长度的区间）或空文本
+    if seg.end - seg.start <= 0.05 || seg.display_text().trim().is_empty() {
+        return true;
+    }
+    // 同时间段重叠的极短鬼影碎片：例如消重叠后被压到 0.1s、又与后句起点只差 50ms
+    match next {
+        Some(n) => seg.end - seg.start < GHOST_MAX_DUR && (n.start - seg.start).abs() < GHOST_START_TOL,
+        None => false,
+    }
+}
+
+/// 反复用 [`should_drop_segment`] 过滤，直到一轮下来不再删任何片段。
+///
+/// 为什么要迭代而不是单趟扫描：删掉一条之后，它前一句的「后一句」就换成了更后面的一条，
+/// 判据的邻居随之改变，新暴露出来的鬼影只有再扫一遍才能发现。每轮要么删掉至少一条、
+/// 要么直接收敛，因此必然终止；每轮是 O(n) 的一次遍历（用 `into_iter` 移动而非克隆），
+/// 只在载入/转写收尾跑一次。
+fn drop_invalid_and_ghosts_until_stable(segments: Vec<Segment>) -> Vec<Segment> {
+    let mut current = segments;
+    loop {
+        let len = current.len();
+        let mut kept: Vec<Segment> = Vec::with_capacity(len);
+        let mut rest = current.into_iter().peekable();
+        while let Some(seg) = rest.next() {
+            if should_drop_segment(&seg, rest.peek()) {
+                continue;
+            }
+            kept.push(seg);
+        }
+        if kept.len() == len {
+            return kept;
+        }
+        current = kept;
+    }
 }
 
 /// 长句自动拆分阈值：单条字幕最长显示 6 秒 / 60 字
@@ -198,6 +284,28 @@ fn split_index_at_ratio(text: &str, ratio: f64) -> Option<usize> {
     best.map(|(cut, _)| cut)
 }
 
+/// 把 `text` 按 `ratio` 切成前后两半，供译文/润色文本跟随原文切点。
+///
+/// 优先在标点处切（与原文同一套就近规则）；找不到可用标点时按比例硬切，
+/// **绝不让后半段落空**——否则右半段会退化成「没有译文」（双语导出时右行只剩
+/// 原文，整句译文全挂在左行，双语行错位）或「没有润色」（展示/导出回落成未标点、
+/// 未清理的原始识别文本，左右两半风格不一致）。
+/// 文本长度不足 2 无法切分时返回 `None`，由调用方按「不切」处理。
+fn split_following(text: &str, ratio: f64) -> (String, Option<String>) {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n <= 1 {
+        return (text.to_string(), None);
+    }
+    let cut = split_index_at_ratio(text, ratio).unwrap_or_else(|| {
+        let c = (n as f64 * ratio.clamp(0.0, 1.0)).round() as usize;
+        c.clamp(1, n - 1)
+    });
+    let left: String = chars[..cut].iter().collect();
+    let right: String = chars[cut..].iter().collect();
+    (left, Some(right))
+}
+
 /// 递归拆分单条长句：按标点就近均分文本，时间按字数比例分配；
 /// 翻译与润色文本按同比例就近标点跟随拆分。无合理标点切点时保留原句。
 fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
@@ -220,30 +328,18 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
     let right_text: String = chars[cut..].iter().collect();
 
     let (left_trans, right_trans) = match &seg.translation {
-        Some(trans) if trans.chars().count() > 8 => match split_index_at_ratio(trans, ratio) {
-            Some(tc) => {
-                let t: Vec<char> = trans.chars().collect();
-                (
-                    Some(t[..tc].iter().collect()),
-                    Some(t[tc..].iter().collect()),
-                )
-            }
-            None => (Some(trans.clone()), None),
-        },
-        Some(trans) => (Some(trans.clone()), None),
+        Some(trans) => {
+            let (l, r) = split_following(trans, ratio);
+            (Some(l), r)
+        }
         None => (None, None),
     };
 
     let (left_polished, right_polished) = if seg.polished.is_empty() {
         (String::new(), String::new())
     } else {
-        match split_index_at_ratio(&seg.polished, ratio) {
-            Some(pc) => {
-                let p: Vec<char> = seg.polished.chars().collect();
-                (p[..pc].iter().collect(), p[pc..].iter().collect())
-            }
-            None => (seg.polished.clone(), String::new()),
-        }
+        let (l, r) = split_following(&seg.polished, ratio);
+        (l, r.unwrap_or_default())
     };
 
     let left = Segment {
@@ -255,6 +351,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         polished: left_polished,
         language: seg.language.clone(),
         confidence: seg.confidence,
+        speaker: seg.speaker,
     };
     let right = Segment {
         index: 0,
@@ -265,13 +362,22 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         polished: right_polished,
         language: seg.language,
         confidence: seg.confidence,
+        speaker: seg.speaker,
     };
     split_segment_recursive(left, out);
     split_segment_recursive(right, out);
 }
 
-/// 逐条长句拆分
-fn split_long_segments(segments: Vec<Segment>) -> Vec<Segment> {
+/// 逐条长句拆分：把超过 [`MAX_SEGMENT_DUR`] 秒 / [`MAX_SEGMENT_CHARS`] 字的片段按标点
+/// 就近递归拆短（时间按字数比例分配，译文/润色/说话人随切点跟随）。
+///
+/// [`optimize_segments`] 内部第 4 步会调用它，因此**最终落库/导出的片段本来就已拆短**。
+/// 公开出来是给转写期的**流式预览**用：VAD 段在密集讲话时可能长达 30s+（静音边界缺失），
+/// 模型会把整段吐成一条，若原样推进 `streaming_segments`，界面上就会出现「一条字幕塞
+/// 一整段话」，而结束后才被 `optimize_segments` 拆开——实时流与最终结果对不上。
+/// 在推流收口处调用本函数，让预览粒度与最终结果一致（与 SenseVoice 侧
+/// `tools/sensevoice_runner.py::split_sentence_timed` 同一策略）。
+pub fn split_long_segments(segments: Vec<Segment>) -> Vec<Segment> {
     let mut out = Vec::with_capacity(segments.len());
     for seg in segments {
         split_segment_recursive(seg, &mut out);
@@ -279,9 +385,181 @@ fn split_long_segments(segments: Vec<Segment>) -> Vec<Segment> {
     out
 }
 
+/// 单条字幕的最短显示时长。微调与重叠修复都以此为准：压到 0 长度的字幕既看不见，
+/// 又会被 [`optimize_segments`] 当成鬼影碎片剔除，用户会以为「改一下时间字幕就没了」。
+pub const MIN_SEGMENT_DUR: f64 = 0.1;
+
+/// [`optimize_segments`] 判定「幻读鬼影」的时长阈值：**短于**它的片段，只有在与后句
+/// 几乎同时开始时才会被删掉。提成常量是为了让 [`plan_time_edit`] 与判据同源——
+/// 两边各写一份数字，改一处就会重新出现「用户调完时间，下次载入丢句」。
+const GHOST_MAX_DUR: f64 = 0.25;
+
+/// 鬼影判定里的「几乎同时开始」容差（秒）。
+const GHOST_START_TOL: f64 = 0.15;
+
+/// 微调后允许的最短时长。
+///
+/// 为什么不用 [`MIN_SEGMENT_DUR`]（0.1s）：那只是「看得见」的下限，而
+/// [`optimize_segments`] 会把「时长 < 0.25s 且与后句起点相差 < 0.15s」的片段当作
+/// 幻读碎片直接删除。微调若把片段压进这个组合，用户下次载入工程就会丢句，且怎么
+/// 改都回不来。取鬼影时长阈值本身作下限后，「本句时长 >= 0.25s」就与邻居起点差
+/// 无关地免疫了这条判据，不必再去推算邻居的位置。
+///
+/// 公开给上层（如 `AppState::split_selected_segment`）是为了让「拆出来的两半
+/// 也不能短于这个下限」这一条用同一个数字，避免两处各写一份而重新长出丢句现象。
+pub const MIN_EDIT_DUR: f64 = GHOST_MAX_DUR;
+
+/// 字幕清单的搜索过滤：返回命中的片段下标（关键字为空即全部下标）。
+///
+/// 抽成纯函数是为了让「编辑之后这串下标仍然覆盖全部字幕」能脱离 GPUI 直接单测。
+/// 清单是虚拟列表、按这串下标取行，一旦下标漏项或越界，列表会因为量不到行高
+/// （`item_height = 0`）而整片空白，而且只要缓存键不变就一直刷不出来。
+pub fn matched_indices(segments: &[Segment], needle: &str) -> Vec<usize> {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return (0..segments.len()).collect();
+    }
+    segments
+        .iter()
+        .enumerate()
+        .filter(|(_, seg)| {
+            seg.display_text().to_lowercase().contains(&needle)
+                || seg
+                    .translation
+                    .as_deref()
+                    .map(|t| t.to_lowercase().contains(&needle))
+                    .unwrap_or(false)
+        })
+        .map(|(pos, _)| pos)
+        .collect()
+}
+
+/// 下标序列是否仍可安全用于当前片段表：过滤态下允许少于片段总数，
+/// 但任何一个下标都必须落在表内（越界即会让虚拟列表整片空白）。
+pub fn indices_cover_segments(indices: &[usize], segment_count: usize) -> bool {
+    indices.iter().all(|&i| i < segment_count)
+}
+
+/// 一次「微调」的纯计算结果：自身新区间 + 被越界时一并让位的邻居边界。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimeEdit {
+    pub start: f64,
+    pub end: f64,
+    /// 前一句被收短的终点（`None` 表示前一句不用动）
+    pub prev_end: Option<f64>,
+    /// 后一句被后挪的起点（`None` 表示后一句不用动）
+    pub next_start: Option<f64>,
+}
+
+/// 规划一次时间微调：起点加 `d_start`、终点加 `d_end`。
+///
+/// 除了「起点 >= 0、终点比起点晚至少 [`MIN_EDIT_DUR`]」这两条自身约束，还要
+/// **保证调完之后的时间轴能原样通过 [`optimize_segments`]**：
+/// * 越过前一句的终点就把前一句的尾巴收回来；
+/// * 越过下一句的起点就把下一句的头往后挪；
+/// * 谁都让不开时，宁可拒绝这次微调（把本句的起点收回来），也不留下非法区间。
+///
+/// 为什么必须在这里挡住：交叉区间会让「按播放时间取句」取到错的那一句、时间轴块
+/// 互相压盖；更要命的是下次载入工程时 [`optimize_segments`] 会按「排序 + 截断重叠 +
+/// 剔除鬼影」把用户手工调好的时间再改一遍，用户看到的就是「怎么改都恢复不了」。
+///
+/// 给邻居留的余量是 [`MIN_EDIT_DUR`] 而不是 [`MIN_SEGMENT_DUR`]：被收短/后挪的那
+/// 一句同样会落进鬼影判据的区间里，余量太小等于把「删句」这件事推给邻居。
+pub fn plan_time_edit(
+    start: f64,
+    end: f64,
+    prev: Option<(f64, f64)>,
+    next: Option<(f64, f64)>,
+    d_start: f64,
+    d_end: f64,
+) -> TimeEdit {
+    let mut new_start = (start + d_start).max(0.0);
+    let mut new_end = (end + d_end).max(new_start + MIN_EDIT_DUR);
+    let mut prev_end = None;
+    let mut next_start = None;
+
+    // 只修用户这次真正碰过的那一侧，避免「改终点却动了前一句」这种莫名连带
+    if d_start != 0.0 {
+        if let Some((p_start, p_end)) = prev {
+            if new_start < p_end {
+                // 收短前一句的尾巴，但不能把它压到最短时长以下，也不能反而变长
+                let trimmed = new_start.max(p_start + MIN_EDIT_DUR).min(p_end);
+                prev_end = Some(trimmed);
+                if trimmed > new_start {
+                    // 前一句已经让不开：这一句就停在边界上，不再往左
+                    new_start = trimmed;
+                    new_end = new_end.max(new_start + MIN_EDIT_DUR);
+                }
+            }
+        }
+    }
+
+    // 后一句一侧不能只看 `d_end`：把起点往右推时，本句为了维持最短时长会把终点
+    // 一起顶过去，同样会压进下一句——这正是用户反复点「起点 +0.5」踩到的坑。
+    if let Some((n_start, n_end)) = next {
+        if new_end > n_start {
+            // 把下一句的头往后挪，同样给它留够最短时长
+            let pushed = new_end.min(n_end - MIN_EDIT_DUR).max(n_start);
+            if pushed != n_start {
+                next_start = Some(pushed);
+            }
+            if pushed < new_end {
+                // 下一句让不开（再挪就没长度了）：本句的终点停在它身上
+                new_end = pushed;
+            }
+        }
+    }
+
+    // 兜底：终点被压回之后本句可能已经短于下限，此时只能反过来把起点收回来。
+    // 这也是「后一句已经贴脸、退无可退」时的正常收场——拒绝这次微调，而不是
+    // 留下一个会被下次载入删掉的短片段。
+    if new_end - new_start < MIN_EDIT_DUR {
+        new_start = (new_end - MIN_EDIT_DUR).max(0.0);
+        if let Some((p_start, p_end)) = prev {
+            if new_start < p_end {
+                let trimmed = new_start.max(p_start + MIN_EDIT_DUR).min(p_end);
+                prev_end = Some(trimmed);
+                if trimmed > new_start {
+                    new_start = trimmed;
+                }
+            }
+        }
+    }
+
+    TimeEdit {
+        start: new_start,
+        end: new_end,
+        prev_end,
+        next_start,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_display_text_prefers_polished_then_falls_back() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "原始识别文本");
+        assert_eq!(seg.display_text(), "原始识别文本", "polished 为空时回退 text");
+
+        seg.polished = "润色后的文本。".to_string();
+        assert_eq!(seg.display_text(), "润色后的文本。", "polished 非空时优先返回");
+
+        // 纯空白不算「有润色」，仍回退原文
+        seg.polished = "   ".to_string();
+        assert_eq!(seg.display_text(), "原始识别文本", "空白 polished 仍回退 text");
+
+        // 导出路径同样吃到润色文本，译文行不受影响
+        seg.polished = "润色后的文本。".to_string();
+        assert_eq!(seg.export_text(ExportMode::RawOnly), "润色后的文本。");
+        seg.translation = Some("translated".to_string());
+        assert_eq!(
+            seg.export_text(ExportMode::Bilingual),
+            "translated\n润色后的文本。"
+        );
+        assert_eq!(seg.export_text(ExportMode::TranslationOnly), "translated");
+    }
 
     #[test]
     fn test_optimize_segments_removes_ghost_stub() {
@@ -348,6 +626,152 @@ mod tests {
         }
     }
 
+    /// 长句拆分时译文/润色必须跟着切点走：右半段不能出现「没有译文」「没有润色」，
+    /// 否则双语导出时整句译文只挂在左行（右行只剩原文），
+    /// 展示/导出时右半段又会回落成未标点、未清理的原始识别文本。
+    #[test]
+    fn test_split_keeps_translation_and_polished_on_both_halves() {
+        let mut seg = Segment::new(1, 0.0, 8.0, "前面这半句讲的是背景，后面这半句讲的是结论。");
+        seg.translation = Some(
+            "the first half gives the background and the second half gives the conclusion"
+                .to_string(),
+        );
+        // 润色文本刻意不含标点：按比例硬切也必须两半都有，不能整段留在左边
+        seg.polished = "前面这半句讲的是背景后面这半句讲的是结论".to_string();
+        let mut segs = vec![seg];
+        optimize_segments(&mut segs);
+
+        assert_eq!(segs.len(), 2, "8 秒大句应被拆成两段");
+        for s in &segs {
+            assert!(
+                s.translation.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false),
+                "右半段丢了译文：{:?}",
+                s
+            );
+            assert!(!s.polished.trim().is_empty(), "右半段丢了润色：{:?}", s);
+        }
+        let right = &segs[1];
+        let exported = right.export_text(ExportMode::Bilingual);
+        assert!(
+            exported.contains('\n') && exported.contains(right.translation.as_deref().unwrap()),
+            "双语导出右行应带上译文行，而不是回落成纯原文：{exported:?}"
+        );
+    }
+
+    #[test]
+    fn optimize_segments_is_idempotent_on_overlapping_input() {
+        // 两条几乎同时开始、又互相重叠的片段：第 3 步消重叠会把前一条的尾部收到
+        // `start + 0.1`，若不在此次就按鬼影判据删掉，下一次载入（`AppState::load_task_with`
+        // 会再跑一遍 `optimize_segments`）数量就会变少，且那条碎条的文本无从找回。
+        let mut segs = vec![
+            Segment::new(1, 0.0, 3.0, "第一句很长足够长的一句话"),
+            Segment::new(2, 0.05, 3.0, "第二句"),
+        ];
+        optimize_segments(&mut segs);
+        let first: Vec<(f64, f64, String)> = segs
+            .iter()
+            .map(|s| (s.start, s.end, s.text.clone()))
+            .collect();
+
+        let mut again = segs.clone();
+        optimize_segments(&mut again);
+        let second: Vec<(f64, f64, String)> = again
+            .iter()
+            .map(|s| (s.start, s.end, s.text.clone()))
+            .collect();
+
+        assert_eq!(
+            first, second,
+            "optimize_segments 对重叠输入不幂等：同一工程两次载入结果不同"
+        );
+    }
+
+    /// 消重叠压出来的 0.1s 碎条必须**当次**就清掉，而不是留到下次载入。
+    /// 修前：一次跑完剩两条 `[(31.0,31.1),(31.05,34.0)]`，再跑一遍只剩一条，
+    /// 而且被删那条的文本「第一句很长足够长的一句话」直接消失。
+    #[test]
+    fn overlap_trim_does_not_leave_a_ghost_stub() {
+        let mut segs = vec![
+            Segment::new(1, 31.0, 34.0, "第一句很长足够长的一句话"),
+            Segment::new(2, 31.05, 34.0, "第二句"),
+        ];
+        optimize_segments(&mut segs);
+        assert_eq!(
+            segs.len(),
+            1,
+            "被消重叠压成 0.1s、又与后句起点只差 50ms 的碎条应本次剔除: {segs:?}"
+        );
+        assert_eq!(segs[0].text, "第二句");
+        // 一次跑完即稳定：再跑一遍数量与内容都不变
+        let mut again = segs.clone();
+        optimize_segments(&mut again);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].text, "第二句");
+    }
+
+    /// 幂等性 + 不变量：对若干「重叠 / 等起点 / 三连叠」的恶意输入，
+    /// 一次性跑两遍必须完全一致，且结果里不存在交叉区间，也不存在会被下次
+    /// 载入当鬼影删掉的短碎片。
+    #[test]
+    fn optimize_segments_is_idempotent_and_keeps_invariants() {
+        let cases: Vec<Vec<Segment>> = vec![
+            // 等起点、后一条更长
+            vec![
+                Segment::new(1, 0.0, 2.0, "甲句内容比较长一些"),
+                Segment::new(2, 0.0, 5.0, "乙句内容也不短"),
+            ],
+            // 前一条被压成 0.1s 的碎条
+            vec![
+                Segment::new(1, 10.0, 13.0, "第一句很长足够长的一句话"),
+                Segment::new(2, 10.08, 13.0, "第二句"),
+            ],
+            // 三条几乎同起点，制造级联剔除
+            vec![
+                Segment::new(1, 5.0, 5.5, "短一"),
+                Segment::new(2, 5.06, 5.6, "短二"),
+                Segment::new(3, 5.07, 9.0, "后面这句子比较长一些"),
+            ],
+            // 未排序的输入
+            vec![
+                Segment::new(1, 20.0, 23.0, "后面的句子"),
+                Segment::new(2, 20.05, 23.0, "前面的句子"),
+            ],
+        ];
+
+        for (case_no, case) in cases.into_iter().enumerate() {
+            let mut once = case.clone();
+            optimize_segments(&mut once);
+            let mut twice = once.clone();
+            optimize_segments(&mut twice);
+
+            let snap = |segs: &[Segment]| -> Vec<(f64, f64, String)> {
+                segs.iter()
+                    .map(|s| (s.start, s.end, s.text.clone()))
+                    .collect()
+            };
+            assert_eq!(
+                snap(&once),
+                snap(&twice),
+                "case {case_no} 不幂等: {:?} vs {:?}",
+                snap(&once),
+                snap(&twice)
+            );
+            for w in once.windows(2) {
+                assert!(
+                    w[0].end <= w[1].start + 1e-9,
+                    "case {case_no} 结果仍存在交叉区间: {w:?}"
+                );
+            }
+            for i in 0..once.len() {
+                assert!(
+                    !should_drop_segment(&once[i], once.get(i + 1)),
+                    "case {case_no} 结果里仍有会被下次载入剔除的片段: {:?}",
+                    once[i]
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_normal_segments_untouched_by_splitter() {
         let mut segs = vec![
@@ -366,5 +790,82 @@ mod tests {
         optimize_segments(&mut segs);
         assert_eq!(segs.len(), 1, "无标点可切时不强行拆分");
         assert_eq!(segs[0].text, text);
+    }
+
+    /// 流式预览入口（`split_long_segments`）对单条超长片段必须与 `optimize_segments`
+    /// 内的拆分结果一致：whisper.cpp 的 VAD 在密集讲话下会把 30s+ 整段吐成一条，
+    /// 预览若不拆，界面上就是「一句几秒钟说不完的话」。
+    #[test]
+    fn split_long_segments_splits_single_overlong_segment() {
+        let text = "那么第二个我们再来看一下,就是PA加B小于等于PA加B加C,这个是显然的,因为B加C包含了B,对不对,所以概率就更大,那么我们再来看第三个,就是PAB大于等于PABC。";
+        let seg = Segment::new(1, 1160.14, 1192.31, text);
+        assert!(seg.duration() > MAX_SEGMENT_DUR, "前提：该段确实超长");
+
+        let out = split_long_segments(vec![seg]);
+        assert!(out.len() >= 2, "30s 级长段应被拆成多条，实际 {}", out.len());
+        for s in &out {
+            // 契约：能拆则拆到 6 秒以内；中段 50% 附近无可用标点时按设计保留原样
+            // （`split_segment_recursive` 的「无合理标点切点时保留原句」分支）。
+            if s.duration() > MAX_SEGMENT_DUR + 1e-9 {
+                assert!(
+                    split_index_at_ratio(&s.text, 0.5).is_none(),
+                    "可拆却未拆到 6 秒内: {:?}",
+                    (s.start, s.end, s.duration(), &s.text)
+                );
+            }
+        }
+        // 时间必须首尾相接、单调不重叠，且严格落在原段区间内
+        assert!((out[0].start - 1160.14).abs() < 1e-9);
+        assert!((out.last().unwrap().end - 1192.31).abs() < 1e-9);
+        for w in out.windows(2) {
+            assert!((w[0].end - w[1].start).abs() < 1e-9, "拆分处必须无缝衔接");
+        }
+        // 无丢字
+        let joined: String = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, text);
+    }
+
+    /// 终点往右加：越界时把下一句的头往后挪。
+    #[test]
+    fn test_plan_time_edit_pushes_next_start() {
+        let edit = plan_time_edit(1.0, 2.0, None, Some((2.0, 4.0)), 0.0, 0.5);
+        assert_eq!(edit.start, 1.0, "只动终点不该改起点");
+        assert_eq!(edit.end, 2.5);
+        assert_eq!(edit.next_start, Some(2.5), "下一句的头应被后挪到本句终点");
+        assert_eq!(edit.prev_end, None, "改终点不该牵连前一句");
+    }
+
+    /// 起点往左加：越界时收短前一句的尾巴。
+    #[test]
+    fn test_plan_time_edit_trims_prev_end() {
+        let edit = plan_time_edit(3.0, 4.0, Some((1.0, 3.0)), None, -0.5, 0.0);
+        assert_eq!(edit.start, 2.5);
+        assert_eq!(edit.prev_end, Some(2.5), "前一句尾巴应收短到本句新起点");
+        assert_eq!(edit.next_start, None);
+    }
+
+    /// 反复点「起点 +0.5」：起点右移会把终点顶着一起右移（要维持最短时长），
+    /// 因此同样可能压进下一句。把上一个 fix 前的行为（只认 `d_end`）留在这里当回归：
+    /// 旧实现会产出交叉区间，且把本句压成 0.1s 的鬼影候选，下次载入被删。
+    #[test]
+    fn test_plan_time_edit_repeated_start_push_stays_valid() {
+        let mut segs = vec![(0.0, 2.0), (2.0, 4.0), (4.0, 6.0)];
+        for _ in 0..8 {
+            let (s, e) = segs[0];
+            let edit = plan_time_edit(s, e, None, Some(segs[1]), 0.5, 0.0);
+            segs[0] = (edit.start, edit.end);
+            if let Some(ns) = edit.next_start {
+                segs[1].0 = ns;
+            }
+            for w in segs.windows(2) {
+                assert!(w[0].1 <= w[1].0 + 1e-9, "时间轴出现交叉：{w:?}");
+            }
+            for seg in &segs {
+                assert!(
+                    seg.1 - seg.0 >= MIN_EDIT_DUR - 1e-9,
+                    "出现过短片段，下次载入会被当鬼影删掉：{seg:?}"
+                );
+            }
+        }
     }
 }

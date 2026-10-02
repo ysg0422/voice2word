@@ -13,15 +13,12 @@ pub struct SystemMonitor {
 
 impl SystemMonitor {
     pub fn new() -> Self {
-        let mut system = System::new_with_specifics(
+        let system = System::new_with_specifics(
             RefreshKind::new()
                 .with_cpu(CpuRefreshKind::everything())
                 .with_memory(MemoryRefreshKind::everything())
                 .with_processes(ProcessRefreshKind::everything()),
         );
-        system.refresh_cpu_all();
-        system.refresh_memory();
-        system.refresh_processes(ProcessesToUpdate::All);
 
         let current_pid = sysinfo::get_current_pid().ok();
 
@@ -101,7 +98,7 @@ impl SystemMonitor {
             .name("v2w-resource-monitor".to_string())
             .spawn(move || {
                 loop {
-                    std::thread::sleep(Duration::from_millis(1000));
+                    std::thread::sleep(Duration::from_millis(2000));
                     let metrics = monitor.sample();
                     if tx.send(metrics).is_err() {
                         break; // 接收端关闭时退出线程

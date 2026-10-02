@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::subtitle::Segment;
+use crate::utils::TempPathGuard;
 
 // Qwen 0.5B 的 4096 上下文可安全容纳约 24 条普通字幕；批量越大，模型加载
 // 次数越少。优化后从 8 条/批提升到 24 条/批，速度提升 2-3 倍。
@@ -103,7 +104,8 @@ pub struct LLMEngine {
     cli_path: PathBuf,
     model_path: PathBuf,
     ctx_size: u32,
-    threads: u32,
+    /// 推理线程数：设置页可运行时调整，故用原子量而非普通字段
+    threads: std::sync::atomic::AtomicU32,
 }
 
 impl LLMEngine {
@@ -117,8 +119,18 @@ impl LLMEngine {
             cli_path: cli_path.as_ref().to_path_buf(),
             model_path: model_path.as_ref().to_path_buf(),
             ctx_size,
-            threads,
+            threads: std::sync::atomic::AtomicU32::new(threads.max(1)),
         }
+    }
+
+    /// 运行时调整推理线程数（设置页滑条调用，对下一次润色生效）
+    pub fn set_threads(&self, threads: u32) {
+        self.threads
+            .store(threads.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn threads(&self) -> u32 {
+        self.threads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 润色单个字符串 (采用严格的 Few-Shot 标点恢复提示词)
@@ -159,6 +171,9 @@ impl LLMEngine {
                 .as_nanos(),
         ));
 
+        // 先挂守卫再落盘：create / write_all 任一步失败都会用 `.ok()?` 提前返回，
+        // 过去那两行 `?` 会跳过函数末尾的 remove_file，留下一个半截提示词文件。
+        let mut prompt_guard = TempPathGuard::file(&temp_prompt_file);
         let mut file = std::fs::File::create(&temp_prompt_file).ok()?;
         file.write_all(prompt.as_bytes()).ok()?;
         drop(file);
@@ -169,7 +184,7 @@ impl LLMEngine {
             .arg("-c")
             .arg(self.ctx_size.to_string())
             .arg("-t")
-            .arg(self.threads.to_string())
+            .arg(self.threads().to_string())
             .arg("-f")
             .arg(&temp_prompt_file)
             .arg("-n")
@@ -183,7 +198,8 @@ impl LLMEngine {
             .arg("--no-display-prompt")
             .output();
 
-        let _ = std::fs::remove_file(&temp_prompt_file);
+        // 进程已退出，提示词文件不再需要：立刻删除（守卫仍会在返回时兜底）
+        prompt_guard.remove_now();
 
         match output {
             Ok(out) if out.status.success() => {
@@ -205,7 +221,7 @@ impl LLMEngine {
         if !server_path.exists() || !self.model_path.exists() {
             return None;
         }
-        LlamaServer::start(&server_path, &self.model_path, self.ctx_size, self.threads)
+        LlamaServer::start(&server_path, &self.model_path, self.ctx_size, self.threads())
     }
 
     /// 批量润色字幕片段
@@ -391,7 +407,7 @@ impl LLMEngine {
         result
     }
 
-    fn parse_batch_response(
+    pub(crate) fn parse_batch_response(
         raw: &str,
         expected: &std::collections::HashSet<usize>,
     ) -> std::collections::HashMap<usize, String> {

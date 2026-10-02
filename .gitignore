@@ -12,8 +12,6 @@ tools/*
 
 # Test videos and temporary media
 testVideo/
-test_vad.wav
-gpui_test/
 resources/
 *.tmp
 
@@ -48,3 +46,13 @@ compile_output.txt
 Thumbs.db
 [Dd]esktop.ini
 $RECYCLE.BIN/
+
+# Scratch / debug leftovers
+.tmp_*
+.tmp-*
+tmp_*
+_scratch_ro/
+
+# Local binaries & Python caches
+*.exe
+__pycache__/

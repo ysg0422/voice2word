@@ -1,0 +1,61 @@
+# ===== Voice2Word / .cursorignore =====
+# 目的：把大体积、可再生成的产物排除出 agent 上下文，减少一次性打包的 token。
+# 语义：被本文件忽略的文件，agent 完全无法访问（连按需读取也不行）。
+# 语法与 .gitignore 相同：以 `!` 开头表示反向例外（取消忽略）。
+# --- 构建产物（本仓库最大头：target/ 约 27800 个文件 / 12.9 GB）---
+target/
+node_modules/
+dist/
+build/
+incremental/
+*.pdb
+*.exe
+*.d
+*.o
+*.rmeta
+*.rlib
+*.bin
+*.pre-lto.bc
+*.natvis
+
+# --- 版本控制 / IDE ---
+.git/
+.idea/
+.vscode/
+
+# --- 大体积模型与二进制工具（models/ 约 5.2 GB；tools/whisper-vulkan 约 118 MB）---
+models/
+tools/whisper-vulkan/
+
+# --- 测试视频（约 105 MB）---
+# 只排除 mp4，保留 testVideo/*_success.srt 等人工校对的标准字幕（docs 与 eval 脚本要用）。
+*.mp4
+
+# --- 日志与临时文件 ---
+logs/
+*.log
+*.log.*
+.tmp_*
+tmp_*
+*.tmp
+
+# --- 数据库与运行时数据 ---
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# --- 文档 / 演示稿（二进制，无源码价值）---
+*.pptx
+*.docx
+*.pdf
+
+# --- JSON ---
+# 实测 target/ 之外只有一个 JSON：models/punc/.../tokens.json（4.2 MB 模型词表，已被 models/ 覆盖）。
+# 无需要 agent 读取的 JSON 配置，故保留裸规则；若日后新增 .cursor/mcp.json 之类配置，在此行下方补例外：
+#   !.cursor/**/*.json
+*.json
+# --- 排查/调试残留（agent 无需读，不让它们进可读面）---
+_scratch_ro/
+*.wav
+resources/

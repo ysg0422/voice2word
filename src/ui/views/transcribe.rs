@@ -3,9 +3,10 @@
 use gpui::prelude::*;
 use gpui::*;
 
-use crate::app::state::{ProcessStatus, WorkspaceTab};
+use crate::app::state::{ProcessStatus, QueueState, WorkspaceTab};
 use crate::subtitle::Segment;
 use crate::utils::time::format_duration_short;
+use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::MainWindow;
 
@@ -25,7 +26,7 @@ impl MainWindow {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w(px(520.0))
+                    .min_w(px(Theme::MIN_CENTER_COL_W))
                     .h_full()
                     .overflow_hidden()
                     .child(self.render_main_workspace(cx))
@@ -41,21 +42,18 @@ impl MainWindow {
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
         let is_sensevoice = self.state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
 
-        div()
+        // 页面外壳统一走 primitives::page_shell：底色 / 内边距 / 分区间距与其余三个
+        // 工作台页同源，切页时中央列不再横向跳动；`.flex_1()` 保留它在左右分栏里
+        // 撑满剩余宽度的职责。
+        primitives::page_shell("transcribe-main-workspace")
             .flex_1()
-            .h_full()
-            .bg(Theme::bg_panel())
-            .p_5()
-            .flex()
-            .flex_col()
-            .gap_3()
             // ── 顶部步骤流式导航栏 (借鉴 SmartSub / VideoCaptioner 黄金布局) ──
             .child(
                 div()
                     .w_full()
-                    .px_4()
-                    .py_2()
-                    .rounded_xl()
+                    .px(px(Theme::CARD_PAD))
+                    .py(px(Theme::SPACE_2))
+                    .rounded(px(Theme::CARD_RADIUS))
                     .bg(Theme::bg_card())
                     .border_1()
                     .border_color(Theme::border())
@@ -75,27 +73,27 @@ impl MainWindow {
                                     .gap_2()
                                     .child(
                                         div()
-                                            .w(px(20.0))
-                                            .h(px(20.0))
+                                            .w(px(Theme::STEP_DOT))
+                                            .h(px(Theme::STEP_DOT))
                                             .rounded_full()
-                                            .bg(if !is_processing && self.state.transcribe_file.is_some() { Theme::accent_mint() } else { rgb(0x282834) })
+                                            .bg(if !is_processing && self.state.transcribe_file.is_some() { Theme::accent_mint() } else { Theme::bg_hover_strong() })
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .text_size(px(10.5))
+                                            .text_size(px(Theme::TEXT_SMALL))
                                             .font_weight(FontWeight::BOLD)
-                                            .text_color(if !is_processing && self.state.transcribe_file.is_some() { rgb(0x09090b) } else { rgb(0xffffff) })
+                                            .text_color(if !is_processing && self.state.transcribe_file.is_some() { Theme::text_on_accent() } else { Theme::text_primary() })
                                             .child("1"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(12.0))
+                                            .text_size(px(Theme::TEXT_BODY))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(if !is_processing && self.state.transcribe_file.is_some() { Theme::text_primary() } else { Theme::text_secondary() })
                                             .child("导入媒体"),
                                     ),
                             )
-                            .child(div().w(px(24.0)).h(px(1.0)).bg(rgb(0x2a2a36)))
+                            .child(primitives::step_connector())
                             // Step 2: 转写
                             .child(
                                 div()
@@ -104,27 +102,27 @@ impl MainWindow {
                                     .gap_2()
                                     .child(
                                         div()
-                                            .w(px(20.0))
-                                            .h(px(20.0))
+                                            .w(px(Theme::STEP_DOT))
+                                            .h(px(Theme::STEP_DOT))
                                             .rounded_full()
-                                            .bg(if is_processing { Theme::accent_mint() } else { rgb(0x282834) })
+                                            .bg(if is_processing { Theme::accent_mint() } else { Theme::bg_hover_strong() })
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .text_size(px(10.5))
+                                            .text_size(px(Theme::TEXT_SMALL))
                                             .font_weight(FontWeight::BOLD)
-                                            .text_color(if is_processing { rgb(0x09090b) } else { rgb(0xffffff) })
+                                            .text_color(if is_processing { Theme::text_on_accent() } else { Theme::text_primary() })
                                             .child("2"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(12.0))
+                                            .text_size(px(Theme::TEXT_BODY))
                                             .font_weight(if is_processing { FontWeight::BOLD } else { FontWeight::MEDIUM })
                                             .text_color(if is_processing { Theme::accent_mint() } else { Theme::text_secondary() })
                                             .child("语音转写"),
                                     ),
                             )
-                            .child(div().w(px(24.0)).h(px(1.0)).bg(rgb(0x2a2a36)))
+                            .child(primitives::step_connector())
                             // Step 3: 校对
                             .child(
                                 div()
@@ -133,27 +131,28 @@ impl MainWindow {
                                     .gap_2()
                                     .child(
                                         div()
-                                            .w(px(20.0))
-                                            .h(px(20.0))
+                                            .w(px(Theme::STEP_DOT))
+                                            .h(px(Theme::STEP_DOT))
                                             .rounded_full()
-                                            .bg(if current_tab == WorkspaceTab::Editor && !self.state.segments.is_empty() { Theme::accent_blue() } else { rgb(0x282834) })
+                                            .bg(if current_tab == WorkspaceTab::Editor && !self.state.segments.is_empty() { Theme::accent_blue() } else { Theme::bg_hover_strong() })
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .text_size(px(10.5))
+                                            .text_size(px(Theme::TEXT_SMALL))
                                             .font_weight(FontWeight::BOLD)
-                                            .text_color(rgb(0xffffff))
+                                            // 选中态是蓝色饱和块，数字恒白；未选中是中性底槽，同样恒白
+                                            .text_color(Theme::text_on_saturated())
                                             .child("3"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(12.0))
+                                            .text_size(px(Theme::TEXT_BODY))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(Theme::text_secondary())
                                             .child("字幕校对"),
                                     ),
                             )
-                            .child(div().w(px(24.0)).h(px(1.0)).bg(rgb(0x2a2a36)))
+                            .child(primitives::step_connector())
                             // Step 4: 导出
                             .child(
                                 div()
@@ -162,21 +161,23 @@ impl MainWindow {
                                     .gap_2()
                                     .child(
                                         div()
-                                            .w(px(20.0))
-                                            .h(px(20.0))
+                                            .w(px(Theme::STEP_DOT))
+                                            .h(px(Theme::STEP_DOT))
                                             .rounded_full()
-                                            .bg(rgb(0x282834))
+                                            .bg(Theme::bg_hover_strong())
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .text_size(px(10.5))
+                                            .text_size(px(Theme::TEXT_SMALL))
                                             .font_weight(FontWeight::BOLD)
-                                            .text_color(rgb(0xffffff))
+                                            // 未激活的步骤圆点是**翻转**的中性底槽，数字须用翻转文字；
+                                            // 只有激活态（薄荷/蓝实心）才用恒深 text_on_accent
+                                            .text_color(Theme::text_primary())
                                             .child("4"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(12.0))
+                                            .text_size(px(Theme::TEXT_BODY))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(Theme::text_secondary())
                                             .child("导出工程"),
@@ -184,52 +185,38 @@ impl MainWindow {
                             ),
                     )
                     .child(
-                        // 右侧状态药丸
+                        // 右侧状态药丸：转写中 / 文件就绪两态都收敛到 badge 原语，
+                        // 行内状态点沿用 stat_dot_sm，不再各写一份胶囊尺寸。
                         if is_processing {
                             div()
-                                .px_2p5()
-                                .py_1()
-                                .rounded_full()
-                                .bg(rgba(0x10b98118))
-                                .border_1()
-                                .border_color(rgba(0x10b98133))
                                 .flex()
                                 .items_center()
-                                .gap_1p5()
-                                .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(Theme::accent_mint()))
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(Theme::accent_mint())
-                                        .child("正在转写..."),
-                                )
+                                .gap(px(Theme::SPACE_1))
+                                .child(primitives::stat_dot_sm(Theme::accent_mint()))
+                                .child(primitives::badge_accent("正在转写..."))
                         } else if let Some(ref file) = self.state.transcribe_file {
                             div()
-                                .px_2p5()
-                                .py_1()
-                                .rounded_full()
-                                .bg(rgb(0x181820))
-                                .border_1()
-                                .border_color(Theme::border())
                                 .flex()
                                 .items_center()
-                                .gap_2()
-                                .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(Theme::accent_blue()))
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .text_color(Theme::text_secondary())
-                                        .child(file.file_name().and_then(|s| s.to_str()).unwrap_or("媒体文件").to_string()),
-                                )
+                                .gap(px(Theme::SPACE_1))
+                                .child(primitives::stat_dot_sm(Theme::accent_blue()))
+                                .child(primitives::badge(
+                                    file.file_name().and_then(|s| s.to_str()).unwrap_or("媒体文件").to_string(),
+                                ))
                         } else {
                             div()
-                                .text_size(px(11.0))
+                                .text_size(px(Theme::TEXT_SMALL))
                                 .text_color(Theme::text_muted())
                                 .child("就绪")
                         }
                     ),
             )
+            // ── 批量转写队列 (F-012)：队列非空时固定在步骤流下方，随时可见 ──
+            .children(if self.state.batch_queue.is_empty() {
+                None
+            } else {
+                Some(self.render_batch_queue_panel(cx))
+            })
             // 核心工作台展示区
             .child(
                 if is_processing {
@@ -263,52 +250,43 @@ impl MainWindow {
                         .flex_col()
                         .items_center()
                         .justify_center()
-                        .gap_3p5()
+                        .gap(px(Theme::SPACE_4))
                         // 1. 媒体与当前阶段卡片
                         .child(
-                            div()
+                            // 卡片外壳统一走 card()：内边距 / 圆角 / 底色与其余卡片同源
+                            primitives::card()
                                 .w_full()
-                                .max_w(px(860.0))
-                                .p_3()
-                                .rounded_xl()
-                                .bg(Theme::bg_card())
-                                .border_1()
-                                .border_color(Theme::border())
-                                .flex()
+                                .max_w(px(Theme::CONTENT_MAX_W))
+                                .flex_row()
                                 .items_center()
                                 .justify_between()
                                 .child(
                                     div()
                                         .flex()
                                         .items_center()
-                                        .gap_3()
+                                        .gap(px(Theme::SPACE_3))
                                         .child(
                                             div()
-                                                .w(px(32.0))
-                                                .h(px(32.0))
-                                                .rounded_lg()
-                                                .bg(if is_sensevoice { rgba(0x10b9811c) } else { rgba(0x38bdf81c) })
+                                                .w(px(Theme::ICON_BOX))
+                                                .h(px(Theme::ICON_BOX))
+                                                .rounded(px(Theme::RADIUS_LG))
+                                                .bg(if is_sensevoice { Theme::tint_mint_soft() } else { Theme::tint_blue_soft() })
                                                 .border_1()
-                                                .border_color(if is_sensevoice { rgba(0x10b98133) } else { rgba(0x38bdf833) })
+                                                .border_color(if is_sensevoice { Theme::tint_mint_border() } else { Theme::tint_blue_border() })
                                                 .flex()
                                                 .items_center()
                                                 .justify_center()
-                                                .child(div().w(px(9.0)).h(px(9.0)).rounded_full().bg(if is_sensevoice { Theme::accent_mint() } else { Theme::accent_blue() })),
+                                                .child(primitives::stat_dot(if is_sensevoice { Theme::accent_mint() } else { Theme::accent_blue() })),
                                         )
                                         .child(
                                             div()
                                                 .flex()
                                                 .flex_col()
+                                                // 阶段名是看板的主标题，走 panel_title（14px）与其余面板标头一致
+                                                .child(primitives::panel_title(stage))
                                                 .child(
                                                     div()
-                                                        .text_size(px(14.0))
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .text_color(Theme::text_primary())
-                                                        .child(stage),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(11.0))
+                                                        .text_size(px(Theme::TEXT_SMALL))
                                                         .text_color(Theme::text_muted())
                                                         .child(if detail.trim().is_empty() {
                                                             if is_sensevoice { "SenseVoice 正在通过纯内存音频管道极速识别...".to_string() } else { "Whisper 模型正在转写音频流...".to_string() }
@@ -322,48 +300,23 @@ impl MainWindow {
                                     div()
                                         .flex()
                                         .items_center()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .px_2p5()
-                                                .py_1()
-                                                .rounded_md()
-                                                .bg(if is_sensevoice { rgba(0x10b98118) } else { rgba(0x38bdf818) })
-                                                .border_1()
-                                                .border_color(if is_sensevoice { rgba(0x10b98133) } else { rgba(0x38bdf833) })
-                                                .text_size(px(10.5))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(if is_sensevoice { Theme::accent_mint() } else { Theme::accent_blue() })
-                                                .child(if is_sensevoice { "SenseVoice INT8 (42x 极速)" } else { "Whisper Turbo (GPU加速)" }),
-                                        )
-                                        .child(
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .rounded_md()
-                                                .bg(rgb(0x181820))
-                                                .border_1()
-                                                .border_color(Theme::border())
-                                                .text_size(px(10.5))
-                                                .text_color(Theme::text_secondary())
-                                                .child(format!("{tot_mm:02}:{tot_ss:02}")),
-                                        ),
+                                        .gap(px(Theme::SPACE_1_5))
+                                        // 引擎标签与总时长都是元信息，统一走徽标原语
+                                        .child(if is_sensevoice {
+                                            primitives::badge_accent("SenseVoice INT8 (14x 极速)")
+                                        } else {
+                                            primitives::badge("Whisper Turbo (GPU加速)")
+                                        })
+                                        .child(primitives::badge(format!("{tot_mm:02}:{tot_ss:02}"))),
                                 ),
                         )
                         // 2. 实时流式字幕视窗卡片
                         .child(
-                            div()
+                            // 卡片外壳走 card()：圆角 / 内边距 / 底色与其余卡片同源
+                            primitives::card()
                                 .w_full()
-                                .max_w(px(860.0))
-                                .rounded_2xl()
-                                .bg(Theme::bg_card())
-                                .border_1()
-                                .border_color(Theme::border())
-                                .p_4()
+                                .max_w(px(Theme::CONTENT_MAX_W))
                                 .overflow_hidden()
-                                .flex()
-                                .flex_col()
-                                .gap_3()
                                 .child(
                                     div()
                                         .flex()
@@ -373,30 +326,15 @@ impl MainWindow {
                                             div()
                                                 .flex()
                                                 .items_center()
-                                                .gap_2()
-                                                .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(Theme::accent_mint()))
-                                                .child(
-                                                    div()
-                                                        .text_size(px(13.0))
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .text_color(Theme::text_primary())
-                                                        .child("实时流式字幕视窗"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .px_2()
-                                                        .py_0p5()
-                                                        .rounded_full()
-                                                        .bg(rgba(0x10b9811c))
-                                                        .text_size(px(10.5))
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .text_color(Theme::accent_mint())
-                                                        .child(format!("已流式生成 {seg_count} 句")),
-                                                ),
+                                                .gap(px(Theme::SPACE_2))
+                                                // 卡片标头统一走 section_title，与「批量转写队列」等同级
+                                                .child(primitives::stat_dot_sm(Theme::accent_mint()))
+                                                .child(primitives::section_title("实时流式字幕视窗"))
+                                                .child(primitives::badge_accent(format!("已流式生成 {seg_count} 句"))),
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(11.5))
+                                                .text_size(px(Theme::TEXT_BODY))
                                                 .font_weight(FontWeight::BOLD)
                                                 .text_color(Theme::text_secondary())
                                                 .child(if total_dur > 0.0 {
@@ -406,34 +344,18 @@ impl MainWindow {
                                                 }),
                                         ),
                                 )
-                                // 平滑大进度条
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .h(px(6.0))
-                                        .rounded_full()
-                                        .bg(rgb(0x181820))
-                                        .border_1()
-                                        .border_color(Theme::border())
-                                        .overflow_hidden()
-                                        .child(
-                                            div()
-                                                .h_full()
-                                                .rounded_full()
-                                                .w(relative(display_ratio as f32))
-                                                .bg(Theme::accent_mint()),
-                                        ),
-                                )
+                                // 平滑大进度条：统一走进度条原语（轨道色 / 高亮色 / 高度同源）
+                                .child(primitives::progress_bar(display_ratio as f32))
                                 // 字幕列表动态滚动流
                                 .child(
                                     if seg_count == 0 {
                                         div()
-                                            .min_h(px(110.0))
+                                            .min_h(px(Theme::STREAM_MIN_H))
                                             .w_full()
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .text_size(px(12.5))
+                                            .text_size(px(Theme::TEXT_BODY_LG))
                                             .text_color(Theme::text_muted())
                                             .child(if is_sensevoice {
                                                 "SenseVoice 极速模型正在解析音频流，首句字幕即将秒级呈现..."
@@ -445,7 +367,7 @@ impl MainWindow {
                                         let seg_list: Vec<&Segment> = self.state.streaming_segments.iter().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
                                         let total_items = seg_list.len();
                                         div()
-                                            .min_h(px(110.0))
+                                            .min_h(px(Theme::STREAM_MIN_H))
                                             .w_full()
                                             .flex()
                                             .flex_col()
@@ -462,25 +384,26 @@ impl MainWindow {
                                                 if is_last {
                                                     div()
                                                         .w_full()
-                                                        .px_3p5()
-                                                        .py_2()
-                                                        .rounded_lg()
-                                                        .bg(rgba(0x10b98114))
+                                                        .px(px(Theme::SPACE_3))
+                                                        .py(px(Theme::SPACE_2))
+                                                        .rounded(px(Theme::RADIUS_LG))
+                                                        .bg(Theme::tint_mint_soft())
                                                         .border_1()
-                                                        .border_color(rgba(0x10b98138))
+                                                        .border_color(Theme::tint_mint_border())
                                                         .overflow_hidden()
                                                         .flex()
                                                         .items_start()
-                                                        .gap_3()
+                                                        .gap(px(Theme::SPACE_3))
                                                         .child(
+                                                            // 时间戳胶囊：字色与底色都来自薄荷 tint 阶梯
                                                             div()
                                                                 .flex_shrink_0()
                                                                 .mt(px(1.5))
-                                                                .px_1p5()
-                                                                .py_0p5()
-                                                                .rounded_md()
-                                                                .bg(rgba(0x10b98125))
-                                                                .text_size(px(10.5))
+                                                                .px(px(Theme::SPACE_1_5))
+                                                                .py(px(Theme::SPACE_1))
+                                                                .rounded(px(Theme::RADIUS_MD))
+                                                                .bg(Theme::tint_mint_badge())
+                                                                .text_size(px(Theme::TEXT_SMALL))
                                                                 .font_weight(FontWeight::BOLD)
                                                                 .text_color(Theme::accent_mint())
                                                                 .child(time_badge),
@@ -490,7 +413,7 @@ impl MainWindow {
                                                                 .flex_1()
                                                                 .min_w(px(0.0))
                                                                 .line_height(relative(1.4))
-                                                                .text_size(px(13.0))
+                                                                .text_size(px(Theme::TEXT_BODY_LG))
                                                                 .font_weight(FontWeight::BOLD)
                                                                 .text_color(Theme::text_primary())
                                                                 .child(seg.display_text().to_string()),
@@ -498,17 +421,17 @@ impl MainWindow {
                                                 } else {
                                                     div()
                                                         .w_full()
-                                                        .px_3p5()
-                                                        .py_1p5()
+                                                        .px(px(Theme::SPACE_3))
+                                                        .py(px(Theme::SPACE_1_5))
                                                         .overflow_hidden()
                                                         .flex()
                                                         .items_start()
-                                                        .gap_3()
+                                                        .gap(px(Theme::SPACE_3))
                                                         .child(
                                                             div()
                                                                 .flex_shrink_0()
                                                                 .mt(px(1.0))
-                                                                .text_size(px(10.5))
+                                                                .text_size(px(Theme::TEXT_SMALL))
                                                                 .text_color(Theme::text_muted())
                                                                 .child(time_badge),
                                                         )
@@ -518,7 +441,7 @@ impl MainWindow {
                                                                 .min_w(px(0.0))
                                                                 .overflow_hidden()
                                                                 .line_height(relative(1.4))
-                                                                .text_size(px(12.0))
+                                                                .text_size(px(Theme::TEXT_BODY))
                                                                 .text_color(Theme::text_secondary())
                                                                 .child(seg.display_text().to_string()),
                                                         )
@@ -532,69 +455,44 @@ impl MainWindow {
                         .child(
                             div()
                                 .w_full()
-                                .max_w(px(860.0))
+                                .max_w(px(Theme::CONTENT_MAX_W))
                                 .flex()
                                 .items_center()
                                 .gap_3()
                                 .child(
-                                    div()
+                                    // 统计磁贴外壳统一走 card_sm()：内边距 / 圆角 / 描边同源，
+                                    // 数字用 TEXT_STAT、标签用 TEXT_SMALL 保持四格对齐。
+                                    primitives::card_sm()
                                         .flex_1()
-                                        .p_3()
-                                        .rounded_xl()
-                                        .bg(Theme::bg_card())
-                                        .border_1()
-                                        .border_color(Theme::border())
-                                        .flex()
-                                        .flex_col()
                                         .gap_0p5()
-                                        .child(div().text_size(px(10.5)).text_color(Theme::text_muted()).child("总体进度"))
-                                        .child(div().text_size(px(17.0)).font_weight(FontWeight::BOLD).text_color(Theme::accent_mint()).child(format!("{:.1}%", display_ratio * 100.0)))
-                                        .child(div().text_size(px(9.5)).text_color(Theme::text_secondary()).child(format!("{cur_mm:02}:{cur_ss:02} / {tot_mm:02}:{tot_ss:02}"))),
+                                        .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("总体进度"))
+                                        .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::accent_mint()).child(format!("{:.1}%", display_ratio * 100.0)))
+                                        .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child(format!("{cur_mm:02}:{cur_ss:02} / {tot_mm:02}:{tot_ss:02}"))),
                                 )
                                 .child(
-                                    div()
+                                    primitives::card_sm()
                                         .flex_1()
-                                        .p_3()
-                                        .rounded_xl()
-                                        .bg(Theme::bg_card())
-                                        .border_1()
-                                        .border_color(Theme::border())
-                                        .flex()
-                                        .flex_col()
                                         .gap_0p5()
-                                        .child(div().text_size(px(10.5)).text_color(Theme::text_muted()).child("预计耗时"))
-                                        .child(div().text_size(px(17.0)).font_weight(FontWeight::BOLD).text_color(Theme::text_primary()).child(eta))
-                                        .child(div().text_size(px(9.5)).text_color(Theme::text_secondary()).child(if is_sensevoice { "极速 42.1x 实时倍速" } else { "Whisper 并行解码" })),
+                                        .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("预计耗时"))
+                                        .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::text_primary()).child(eta))
+                                        .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child(if is_sensevoice { "极速 14.5x 实时倍速" } else { "Whisper 并行解码" })),
                                 )
                                 .child(
-                                    div()
+                                    primitives::card_sm()
                                         .flex_1()
-                                        .p_3()
-                                        .rounded_xl()
-                                        .bg(Theme::bg_card())
-                                        .border_1()
-                                        .border_color(Theme::border())
-                                        .flex()
-                                        .flex_col()
                                         .gap_0p5()
-                                        .child(div().text_size(px(10.5)).text_color(Theme::text_muted()).child("音频推流"))
-                                        .child(div().text_size(px(17.0)).font_weight(FontWeight::BOLD).text_color(Theme::accent_blue()).child("纯内存管道"))
-                                        .child(div().text_size(px(9.5)).text_color(Theme::text_secondary()).child("0 磁盘 I/O · 0 磨损")),
+                                        .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("音频推流"))
+                                        .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::accent_blue()).child("纯内存管道"))
+                                        .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child("0 磁盘 I/O · 0 磨损")),
                                 )
                                 .child(
-                                    div()
+                                    primitives::card_sm()
                                         .flex_1()
-                                        .p_3()
-                                        .rounded_xl()
-                                        .bg(Theme::bg_card())
-                                        .border_1()
-                                        .border_color(Theme::border())
-                                        .flex()
-                                        .flex_col()
                                         .gap_0p5()
-                                        .child(div().text_size(px(10.5)).text_color(Theme::text_muted()).child("推理引擎"))
-                                        .child(div().text_size(px(15.0)).font_weight(FontWeight::BOLD).text_color(if is_sensevoice { Theme::accent_mint() } else { Theme::accent_blue() }).child(if is_sensevoice { "SenseVoice INT8" } else { "Whisper Turbo" }))
-                                        .child(div().text_size(px(9.5)).text_color(Theme::text_secondary()).child(if is_sensevoice { "非自回归 · 自带标点" } else { "多处理器并行" })),
+                                        .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("推理引擎"))
+                                        // 引擎名比数字短，降到 TEXT_TITLE 免得撑破磁贴宽度
+                                        .child(div().text_size(px(Theme::TEXT_TITLE)).font_weight(FontWeight::BOLD).text_color(if is_sensevoice { Theme::accent_mint() } else { Theme::accent_blue() }).child(if is_sensevoice { "SenseVoice INT8" } else { "Whisper Turbo" }))
+                                        .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child(if is_sensevoice { "非自回归 · 自带标点" } else { "多处理器并行" })),
                                 ),
                         )
                         .into_any_element()
@@ -611,7 +509,7 @@ impl MainWindow {
                     } else {
                         match self.state.whisper_model_tier {
                             crate::app::WhisperModelTier::Fast => "Whisper Base",
-                            crate::app::WhisperModelTier::Balanced => "Whisper Small",
+                            crate::app::WhisperModelTier::Balanced => "Whisper Small-Q5",
                             crate::app::WhisperModelTier::TurboSpeed => "Whisper Turbo Q5",
                             crate::app::WhisperModelTier::Precise => "Whisper Turbo Q8",
                             _ => "Whisper",
@@ -626,20 +524,14 @@ impl MainWindow {
                         .flex_col()
                         .items_center()
                         .justify_center()
-                        .p_6()
+                        .p(px(Theme::PAGE_PAD))
                         .child(
-                            div()
+                            // 就绪卡片外壳走 card()，与其余卡片同圆角 / 同内边距
+                            primitives::card()
                                 .w_full()
-                                .max_w(px(640.0))
-                                .p_6()
-                                .rounded_2xl()
-                                .bg(Theme::bg_card())
-                                .border_1()
-                                .border_color(Theme::border())
-                                .flex()
-                                .flex_col()
+                                .max_w(px(Theme::CONTENT_MAX_W))
                                 .items_center()
-                                .gap_4()
+                                .gap(px(Theme::SPACE_4))
                                 // 顶部状态条
                                 .child(
                                     div()
@@ -648,42 +540,37 @@ impl MainWindow {
                                         .items_center()
                                         .justify_between()
                                         .child(
-                                            div()
-                                                .px_2p5()
-                                                .py_0p5()
-                                                .rounded_full()
-                                                .bg(if is_sensevoice { rgba(0x10b98118) } else { rgba(0x38bdf818) })
-                                                .border_1()
-                                                .border_color(if is_sensevoice { rgba(0x10b98133) } else { rgba(0x38bdf833) })
-                                                .text_size(px(11.0))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(if is_sensevoice { Theme::accent_mint() } else { Theme::accent_blue() })
-                                                .child(tier_name),
+                                            // 引擎档位是元信息，走 badge 原语（与进度看板同款）
+                                            if is_sensevoice {
+                                                primitives::badge_accent(tier_name)
+                                            } else {
+                                                primitives::badge(tier_name)
+                                            },
                                         )
                                         .child(
                                             div()
                                                 .flex()
                                                 .items_center()
-                                                .gap_2p5()
+                                                .gap(px(Theme::SPACE_2))
                                                 .child(
                                                     div()
-                                                        .text_size(px(11.0))
+                                                        .text_size(px(Theme::TEXT_SMALL))
                                                         .text_color(Theme::text_secondary())
                                                         .child(format!("时长: {}", dur_str)),
                                                 )
                                                 .children(if has_dur {
+                                                    // 预估耗时药丸：薄荷档 = 极速引擎，其余走主重音 tint，
+                                                    // 两档配色都取自 Theme 的 tint_* 阶梯；形状走
+                                                    // primitives::tag_tinted，字号 / 字重按原样保留。
                                                     Some(
-                                                        div()
-                                                            .px_2()
-                                                            .py_0p5()
-                                                            .rounded_full()
-                                                            .bg(if is_sensevoice { rgba(0x10b98118) } else { rgba(0x6366f118) })
-                                                            .border_1()
-                                                            .border_color(if is_sensevoice { rgba(0x10b98133) } else { rgba(0x6366f133) })
-                                                            .text_size(px(10.5))
+                                                        primitives::tag_tinted(
+                                                            format!("预估 {}", eta_str),
+                                                            if is_sensevoice { Theme::tint_mint_soft() } else { Theme::tint_primary_soft() },
+                                                            if is_sensevoice { Theme::tint_mint_border() } else { Theme::tint_primary_border() },
+                                                            if is_sensevoice { Theme::accent_mint() } else { Theme::accent_primary() },
+                                                        )
                                                             .font_weight(FontWeight::BOLD)
-                                                            .text_color(if is_sensevoice { Theme::accent_mint() } else { Theme::accent_primary() })
-                                                            .child(format!("预估 {}", eta_str)),
+                                                            .text_size(px(Theme::TEXT_SMALL)),
                                                     )
                                                 } else {
                                                     None
@@ -691,32 +578,26 @@ impl MainWindow {
                                         ),
                                 )
                                 // 文件主标题
-                                .child(
-                                    div()
-                                        .text_size(px(18.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(Theme::text_primary())
-                                        .child(fname),
-                                )
+                                .child(primitives::page_title(fname))
                                 // 缓存提示卡片
                                 .children(if let Some(ref cached) = cached_opt {
                                     Some(
                                         div()
                                             .w_full()
-                                            .px_3p5()
-                                            .py_1p5()
-                                            .rounded_xl()
-                                            .bg(rgba(0x10b98114))
+                                            .px(px(Theme::SPACE_3))
+                                            .py(px(Theme::SPACE_1_5))
+                                            .rounded(px(Theme::CARD_RADIUS))
+                                            .bg(Theme::tint_mint_soft())
                                             .border_1()
-                                            .border_color(rgba(0x10b98130))
+                                            .border_color(Theme::tint_mint_border())
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .gap_2()
-                                            .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(Theme::accent_mint()))
+                                            .gap(px(Theme::SPACE_2))
+                                            .child(primitives::stat_dot_sm(Theme::accent_mint()))
                                             .child(
                                                 div()
-                                                    .text_size(px(12.0))
+                                                    .text_size(px(Theme::TEXT_BODY))
                                                     .font_weight(FontWeight::BOLD)
                                                     .text_color(Theme::accent_mint())
                                                     .child(format!("命中本地转写缓存 (含 {} 句字幕)", cached.segments.len())),
@@ -725,106 +606,51 @@ impl MainWindow {
                                 } else {
                                     None
                                 })
-                                // 核心操作按钮组
+                                // 核心操作按钮组：主行动 Lg/Primary，其余 Lg/Secondary，
+                                // 按钮骨架（高度 / 内边距 / 文字色）交给 btn 原语统一
                                 .child(
                                     div()
                                         .flex()
                                         .items_center()
-                                        .gap_3()
-                                        .mt_2()
+                                        .gap(px(Theme::SPACE_3))
+                                        .mt(px(Theme::SPACE_2))
                                         .children(if let Some(cached) = cached_opt {
                                             vec![
-                                                div()
+                                                primitives::btn("载入缓存", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
                                                     .id("cache-hit-load-btn")
-                                                    .px_6()
-                                                    .py_2p5()
-                                                    .rounded_xl()
-                                                    .bg(Theme::accent_mint())
-                                                    .cursor_pointer()
-                                                    .text_size(px(13.0))
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .text_color(rgb(0x09090b))
-                                                    .hover(|s| s.opacity(0.9))
                                                     .on_click({
                                                         let cached_clone = cached.clone();
                                                         cx.listener(move |this, _, _, cx| {
                                                             this.load_cached_result(cx, cached_clone.clone());
                                                         })
                                                     })
-                                                    .child("载入缓存")
                                                     .into_any_element(),
-                                                div()
+                                                primitives::btn("重新完整转写", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
                                                     .id("ready-start-process-btn")
-                                                    .px_5()
-                                                    .py_2p5()
-                                                    .rounded_xl()
-                                                    .bg(Theme::bg_card())
-                                                    .border_1()
-                                                    .border_color(Theme::border())
-                                                    .cursor_pointer()
-                                                    .text_size(px(13.0))
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(Theme::text_primary())
-                                                    .hover(|s| s.bg(Theme::bg_hover()))
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.start_processing(cx);
                                                     }))
-                                                    .child("重新完整转写")
                                                     .into_any_element(),
-                                                div()
+                                                primitives::btn("更换视频", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
                                                     .id("ready-repick-file-btn")
-                                                    .px_4()
-                                                    .py_2p5()
-                                                    .rounded_xl()
-                                                    .bg(Theme::bg_card())
-                                                    .border_1()
-                                                    .border_color(Theme::border())
-                                                    .cursor_pointer()
-                                                    .text_size(px(13.0))
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(Theme::text_secondary())
-                                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.choose_file(cx);
                                                     }))
-                                                    .child("更换视频")
                                                     .into_any_element(),
                                             ]
                                         } else {
                                             vec![
-                                                div()
+                                                primitives::btn(if is_sensevoice { "开始极速转写" } else { "开始神经转写" }, primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
                                                     .id("ready-start-process-btn")
-                                                    .px_8()
-                                                    .py_3()
-                                                    .rounded_xl()
-                                                    .bg(Theme::accent_mint())
-                                                    .cursor_pointer()
-                                                    .text_size(px(14.0))
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .text_color(rgb(0x09090b))
-                                                    .hover(|s| s.opacity(0.9))
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.start_processing(cx);
                                                     }))
-                                                    .child(if is_sensevoice { "开始极速转写" } else { "开始神经转写" })
                                                     .into_any_element(),
-                                                div()
+                                                primitives::btn("重新选择", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
                                                     .id("ready-repick-file-btn")
-                                                    .px_5()
-                                                    .py_3()
-                                                    .rounded_xl()
-                                                    .bg(Theme::bg_card())
-                                                    .border_1()
-                                                    .border_color(Theme::border())
-                                                    .cursor_pointer()
-                                                    .text_size(px(13.0))
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(Theme::text_secondary())
-                                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.choose_file(cx);
                                                     }))
-                                                    .child("重新选择")
                                                     .into_any_element(),
                                             ]
                                         }),
@@ -841,91 +667,312 @@ impl MainWindow {
                         .flex_col()
                         .items_center()
                         .justify_center()
-                        .p_6()
+                        .p(px(Theme::PAGE_PAD))
                         .child(
-                            div()
+                            // 空态卡片外壳走 card()，内边距升一档让引导区更舒展
+                            primitives::card_with_pad(Theme::SPACE_6)
                                 .w_full()
-                                .max_w(px(640.0))
-                                .p_10()
-                                .rounded_2xl()
-                                .bg(Theme::bg_card())
-                                .border_1()
-                                .border_color(Theme::border())
-                                .flex()
-                                .flex_col()
+                                .max_w(px(Theme::CONTENT_MAX_W))
                                 .items_center()
-                                .gap_4()
+                                .gap(px(Theme::SPACE_4))
                                 .child(
                                     div()
-                                        .w(px(56.0))
-                                        .h(px(56.0))
-                                        .rounded_2xl()
-                                        .bg(rgb(0x1a1a24))
+                                        .w(px(Theme::ICON_BOX_LG))
+                                        .h(px(Theme::ICON_BOX_LG))
+                                        .rounded(px(Theme::CARD_RADIUS))
+                                        .bg(Theme::bg_raised())
                                         .border_1()
-                                        .border_color(rgb(0x2c2c3e))
+                                        .border_color(Theme::border_mid())
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .text_size(px(22.0))
+                                        // 大号「+」比页面标题再大一档，作为空态主视觉
+                                        .text_size(px(Theme::TEXT_DISPLAY))
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(Theme::accent_blue())
                                         .child("+"),
                                 )
-                                .child(
-                                    div()
-                                        .text_size(px(18.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(Theme::text_primary())
-                                        .child("导入音视频文件"),
-                                )
+                                .child(primitives::page_title("导入音视频文件"))
                                 .child(
                                     div()
                                         .flex()
                                         .items_center()
-                                        .gap_3()
-                                        .mt_2()
+                                        .gap(px(Theme::SPACE_3))
+                                        .mt(px(Theme::SPACE_2))
                                         .child(
-                                            div()
+                                            primitives::btn_clickable("浏览本地文件", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
                                                 .id("idle-pick-file-btn")
-                                                .px_6()
-                                                .py_2p5()
-                                                .rounded_xl()
-                                                .bg(Theme::accent_mint())
-                                                .cursor_pointer()
-                                                .text_size(px(13.0))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(rgb(0x09090b))
-                                                .hover(|s| s.opacity(0.9))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.choose_file(cx);
-                                                }))
-                                                .child("浏览本地文件"),
+                                                })),
                                         )
                                         .child(
-                                            div()
+                                            primitives::btn_clickable("从历史视频库选择", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
                                                 .id("idle-goto-library-btn")
-                                                .px_5()
-                                                .py_2p5()
-                                                .rounded_xl()
-                                                .bg(Theme::bg_card())
-                                                .border_1()
-                                                .border_color(Theme::border())
-                                                .cursor_pointer()
-                                                .text_size(px(13.0))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(Theme::text_secondary())
-                                                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.state.active_tab = WorkspaceTab::Library;
                                                     this.state.refresh_recent_tasks();
                                                     cx.notify();
-                                                }))
-                                                .child("从历史视频库选择"),
+                                                })),
+                                        )
+                                        .child(
+                                            primitives::btn_clickable("批量导入多个文件", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
+                                                .id("idle-batch-import-btn")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.choose_batch_files(cx);
+                                                })),
                                         ),
                                 ),
                         )
                         .into_any_element()
                 },
             )
+    }
+
+    /// 批量转写队列面板 (F-012)：文件清单 + 「开始全部 / 终止 / 清空」操作组。
+    ///
+    /// 队列非空时常驻在工作区顶部，让用户随时看清哪些跑完了、哪些还在等，
+    /// 而不是只能盯着一条进度条猜整批的进度。
+    pub(crate) fn render_batch_queue_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
+        let batch_running = self.state.batch_running;
+        let total = self.state.batch_queue.len();
+        let pending = self.state.queue_pending_count();
+        let (done, failed, _) = self.state.queue_summary();
+        let total_dur = self.state.queue_total_duration();
+        let active = self.state.batch_active;
+        let can_start = !is_processing && pending > 0;
+
+        // 先把要渲染的数据抽成纯值。下面给「移除」按钮挂 cx.listener 需要可变借用
+        // 上下文，如果行内容还借着 self.state，两个借用会打架。
+        // kind: 0 等待 / 1 转写中 / 2 已完成 / 3 失败
+        let rows: Vec<(usize, String, String, f64, u8)> = self
+            .state
+            .batch_queue
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                let kind = match item.state {
+                    QueueState::Pending => 0u8,
+                    QueueState::Running => 1,
+                    QueueState::Done { .. } => 2,
+                    QueueState::Failed(_) => 3,
+                };
+                (
+                    idx,
+                    item.name.clone(),
+                    item.state.label(),
+                    item.duration,
+                    kind,
+                )
+            })
+            .collect();
+
+        // 面板外壳走 card_sm()：批量队列是工作区里的次级区块，用紧凑内边距；
+        // 运行中换成薄荷描边提示「这批正在跑」。
+        primitives::card_sm()
+            .id("batch-queue-panel")
+            .w_full()
+            .flex_shrink_0()
+            .border_color(if batch_running {
+                Theme::tint_mint_border()
+            } else {
+                Theme::border()
+            })
+            .gap(px(Theme::SPACE_2))
+            // ── 标头：统计徽章 + 操作组 ──
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(Theme::SPACE_3))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(Theme::SPACE_2))
+                            .child(primitives::section_title("批量转写队列"))
+                            // 计数 / 失败 / 累计时长三类元信息统一走 badge 阶梯
+                            .child(primitives::badge(format!("{done}/{total} 完成 · {pending} 待处理")))
+                            .children(if failed > 0 {
+                                Some(primitives::badge_danger(format!("{failed} 失败")))
+                            } else {
+                                None
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .text_color(Theme::text_muted())
+                                    .child(format!(
+                                        "累计时长 {}",
+                                        format_duration_short(total_dur)
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(Theme::SPACE_2))
+                            .child(
+                                primitives::btn("批量导入", primitives::BtnSize::Sm, primitives::BtnVariant::Secondary)
+                                    .id("queue-add-files-btn")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.choose_batch_files(cx)),
+                                    ),
+                            )
+                            .child(if is_processing {
+                                primitives::btn("终止批量", primitives::BtnSize::Sm, primitives::BtnVariant::Danger)
+                                    .id("queue-cancel-btn")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.cancel_batch_queue(cx)),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                // 「开始全部」有可点 / 不可点两态，禁用态需要自绘底色与文字色，
+                                // 因此沿用 btn 的骨架再按 can_start 覆盖配色。
+                                primitives::btn("开始全部", primitives::BtnSize::Sm, primitives::BtnVariant::Primary)
+                                    .id("queue-start-all-btn")
+                                    .bg(if can_start {
+                                        Theme::accent_mint()
+                                    } else {
+                                        Theme::bg_hover_strong()
+                                    })
+                                    .text_color(if can_start {
+                                        Theme::text_on_accent()
+                                    } else {
+                                        Theme::text_muted()
+                                    })
+                                    .when(can_start, |s| s.cursor_pointer().hover(|s| s.opacity(0.9)))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.start_batch_queue(cx)),
+                                    )
+                                    .into_any_element()
+                            })
+                            .child(
+                                primitives::btn("清空", primitives::BtnSize::Sm, primitives::BtnVariant::Ghost)
+                                    .id("queue-clear-btn")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.clear_batch_queue(cx)),
+                                    ),
+                            ),
+                    ),
+            )
+            // ── 文件清单：超高时面板内部滚动，不把整个工作区撑开 ──
+            .child(
+                div()
+                    .id("batch-queue-list")
+                    .w_full()
+                    .max_h(px(Theme::QUEUE_LIST_MAX_H))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Theme::SPACE_1))
+                    .children(rows.into_iter().map(|(idx, name, label, dur, kind)| {
+                        let dot = match kind {
+                            1 => Theme::accent_orange(),
+                            2 => Theme::accent_mint(),
+                            3 => Theme::accent_red(),
+                            _ => Theme::bg_dot_idle(),
+                        };
+                        let label_color = match kind {
+                            1 => Theme::accent_orange(),
+                            3 => Theme::accent_red(),
+                            _ => Theme::text_muted(),
+                        };
+                        let is_active = active == Some(idx);
+                        div()
+                            .id(("batch-queue-row", idx))
+                            .w_full()
+                            .flex_shrink_0()
+                            .px(px(Theme::SPACE_2))
+                            .py(px(Theme::SPACE_1_5))
+                            .rounded(px(Theme::RADIUS_LG))
+                            .bg(if is_active {
+                                Theme::tint_mint_soft()
+                            } else {
+                                Theme::bg_inset()
+                            })
+                            .border_1()
+                            .border_color(if is_active {
+                                Theme::tint_mint_border()
+                            } else {
+                                Theme::border_subtle()
+                            })
+                            .flex()
+                            .items_center()
+                            .gap(px(Theme::SPACE_2))
+                            .child(
+                                primitives::stat_dot_sm(dot),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .font_weight(if is_active {
+                                        FontWeight::BOLD
+                                    } else {
+                                        FontWeight::MEDIUM
+                                    })
+                                    .text_color(Theme::text_primary())
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .text_color(Theme::text_muted())
+                                    .child(if dur > 0.0 {
+                                        format_duration_short(dur)
+                                    } else {
+                                        "--:--".to_string()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .max_w(px(Theme::QUEUE_LABEL_MAX_W))
+                                    .truncate()
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .text_color(label_color)
+                                    .child(label),
+                            )
+                            .child(
+                                if is_active && is_processing {
+                                    // 正在转写的条目不给删：删了会让「当前项」失去归属，
+                                    // 用户想停应该用「终止批量」。
+                                    div()
+                                        .flex_shrink_0()
+                                        .px(px(Theme::SPACE_1_5))
+                                        .text_size(px(Theme::TEXT_SMALL))
+                                        .text_color(Theme::accent_orange())
+                                        .child("转写中")
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .id(("batch-queue-remove", idx))
+                                        .flex_shrink_0()
+                                        .px(px(Theme::SPACE_1_5))
+                                        .rounded(px(Theme::RADIUS_MD))
+                                        .cursor_pointer()
+                                        .text_size(px(Theme::TEXT_SMALL))
+                                        .text_color(Theme::text_muted())
+                                        .hover(|s| {
+                                            s.bg(Theme::bg_hover_strong())
+                                                .text_color(Theme::accent_red())
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.remove_queue_item(idx, cx)
+                                        }))
+                                        .child("移除")
+                                        .into_any_element()
+                                },
+                            )
+                    })),
+            )
+            .into_any_element()
     }
 }

@@ -182,6 +182,57 @@ impl HardwareInfo {
         }
     }
 
+    /// Reuse the adapter selected by the media pipeline. This keeps the CPU
+    /// and memory measurements but avoids a second wgpu adapter enumeration
+    /// during application startup.
+    pub fn detect_with_media_profile(profile: &crate::engines::HardwareProfile) -> Self {
+        let mut system = System::new_with_specifics(
+            RefreshKind::new()
+                .with_cpu(CpuRefreshKind::everything())
+                .with_memory(MemoryRefreshKind::everything()),
+        );
+        system.refresh_cpu_all();
+        system.refresh_memory();
+
+        let cpus = system.cpus();
+        let cpu_brand = cpus
+            .first()
+            .map(|c| c.brand().trim().to_string())
+            .unwrap_or_else(|| "未知 CPU".to_string());
+        let cpu_frequency_mhz = cpus.first().map(|c| c.frequency()).unwrap_or(0);
+        let logical_threads = cpus.len().max(1);
+        let physical_cores = system.physical_core_count().unwrap_or(logical_threads.max(1));
+        let total_memory_bytes = system.total_memory();
+        let available_memory_bytes = system.available_memory();
+
+        let gpus = if profile.use_gpu_pipeline() {
+            vec![GpuInfo {
+                name: profile.adapter_name.clone(),
+                backend: "wgpu".to_string(),
+                is_discrete: profile.is_discrete,
+                vram_mb: None,
+            }]
+        } else {
+            Vec::new()
+        };
+        let inference_mode = if gpus.is_empty() {
+            InferenceMode::CpuHighPerformance
+        } else {
+            InferenceMode::GpuAccelerated
+        };
+
+        Self {
+            cpu_brand,
+            physical_cores,
+            logical_threads,
+            cpu_frequency_mhz,
+            total_memory_bytes,
+            available_memory_bytes,
+            gpus,
+            inference_mode,
+        }
+    }
+
     /// 综合性能评估算法（基于多维硬件特征评分）
     pub fn evaluate_performance(&self) -> PerformanceLevel {
         let mut score: u32 = 0;

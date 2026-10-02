@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{error, info, warn};
 
-use super::media_pipeline::{apply_no_window, DecodePolicy};
+use super::media_pipeline::{apply_background_priority, apply_no_window, DecodePolicy};
 
 pub const PLAYER_WIDTH: u32 = 1280;
 pub const PLAYER_HEIGHT: u32 = 720;
@@ -53,6 +53,7 @@ impl VideoPlayerEngine {
             DecodePolicy {
                 try_hwaccel: false,
                 software_threads: 0,
+                yield_to_desktop: true,
             },
             false,
         )
@@ -272,6 +273,14 @@ impl VideoPlayerEngine {
                         if let Ok(mut lock) = self.audio_feeder_proc.lock() {
                             *lock = Some(feeder_child);
                         }
+                    } else {
+                        // ffplay 起不来：feeder 已经在往一个没人读的管道里灌 WAV。
+                        // `Child` 的 Drop 不会杀进程，放任下去会留下一个阻塞在满管道上的
+                        // 孤儿 ffmpeg —— 一直占着视频文件句柄，反复预览会越积越多，
+                        // 用户连改名/删除这个视频都会失败。
+                        warn!("启动 ffplay 失败，就地回收音频馈送子进程");
+                        let _ = feeder_child.kill();
+                        let _ = feeder_child.wait();
                     }
                 }
             }
@@ -392,7 +401,13 @@ impl VideoPlayerEngine {
         frame_h: u32,
     ) -> std::io::Result<Child> {
         let mut video_cmd = Command::new(&self.ffmpeg_path);
-        apply_no_window(&mut video_cmd);
+        if self.policy.yield_to_desktop {
+            // 预览出帧是可延迟的后台工作：让路时降到低于正常优先级，
+            // 避免与桌面合成器、Whisper 转写抢 GPU/CPU 时间片。
+            apply_background_priority(&mut video_cmd);
+        } else {
+            apply_no_window(&mut video_cmd);
+        }
         video_cmd.args([
             "-hide_banner",
             "-loglevel",
