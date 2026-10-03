@@ -661,18 +661,7 @@ impl MainWindow {
                     .items_center()
                     .justify_between()
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2p5()
-                            .child(
-                                primitives::panel_title("MARK-A 字幕配置与多语言列表"),
-                            )
-                            .child(primitives::badge(if let Some(idx) = sel_idx {
-                                format!("已选 #{}/共 {} 句", idx, self.state.segments.len())
-                            } else {
-                                format!("共 {} 句", self.state.segments.len())
-                            })),
+                        primitives::panel_title("字幕配置与多语言列表"),
                     )
                     .child(
                         // 两张面板互斥切换：顶部一对分段选项代替原先的「展开 / 收起」开关。
@@ -1847,7 +1836,7 @@ impl MainWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.begin_preview_box_drag(event.position.x);
+                    this.begin_preview_box_drag(event.position.x, left);
                     cx.notify();
                 }),
             )
@@ -1865,17 +1854,22 @@ impl MainWindow {
             .clamp(Theme::PREVIEW_BOX_MIN_W, Theme::PREVIEW_BOX_MAX_W)
     }
 
-    /// 开始拖拽预览框：记下基准宽度与按下时的鼠标 x。
-    fn begin_preview_box_drag(&mut self, mouse_x: Pixels) {
-        self.preview_drag = Some((self.subtitle_box_w(), f32::from(mouse_x)));
+    /// 开始拖拽预览框：记下基准宽度、按下时的鼠标 x、以及抓的是哪一侧把手。
+    fn begin_preview_box_drag(&mut self, mouse_x: Pixels, left: bool) {
+        self.preview_drag = Some((self.subtitle_box_w(), f32::from(mouse_x), left));
     }
 
     /// 拖拽中：位移按两倍作用到宽度（两侧对称），结果记进手动宽度。
+    ///
+    /// 左右把手的「往外」方向相反，所以按手柄所在侧取符号：右手柄往右拉（dx>0）
+    /// 加宽，左手柄往左拉（dx<0）同样加宽。少了这一步符号，左手柄往外拉会算成
+    /// 负增量，看着就是「往外拉反而变窄」。
     fn drag_preview_box(&mut self, mouse_x: Pixels, cx: &mut Context<Self>) {
-        let Some((start_w, start_x)) = self.preview_drag else {
+        let Some((start_w, start_x, left)) = self.preview_drag else {
             return;
         };
-        let new_w = (start_w + 2.0 * (f32::from(mouse_x) - start_x))
+        let sign = if left { -1.0 } else { 1.0 };
+        let new_w = (start_w + sign * 2.0 * (f32::from(mouse_x) - start_x))
             .clamp(Theme::PREVIEW_BOX_MIN_W, Theme::PREVIEW_BOX_MAX_W);
         self.preview_box_w = Some(new_w);
         cx.notify();
