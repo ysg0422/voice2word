@@ -953,6 +953,9 @@ impl TaskPipeline {
                 let llm = self.llm.clone();
                 let segs_clone = segments.clone();
                 let tx_llm = tx.clone();
+                // 把管线的取消标志交给 LLM：润色是分批长循环，不接这根线的话
+                // 用户点「终止转写」只杀掉 ASR，润色会继续把几百条字幕跑完。
+                llm.install_cancel_flag(self.cancelled.clone());
 
                 let polishing_started = Instant::now();
                 match tokio::task::spawn_blocking(move || {

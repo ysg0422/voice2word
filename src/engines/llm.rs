@@ -5,6 +5,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -45,6 +47,7 @@ impl LlamaServer {
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
+        crate::utils::child_registry::adopt(&child);
 
         let address = format!("127.0.0.1:{port}");
         let started = Instant::now();
@@ -106,6 +109,16 @@ pub struct LLMEngine {
     ctx_size: u32,
     /// 推理线程数：设置页可运行时调整，故用原子量而非普通字段
     threads: std::sync::atomic::AtomicU32,
+    /// 取消标志。润色 / 翻译都是**分批长循环**，用户点「终止」后不能等整批跑完
+    /// 才生效（长视频几百条字幕要等几分钟）。每个批次开始前检查一次，置位即返回。
+    ///
+    /// 用 `Mutex<Arc<..>>` 而不是裸 `Arc`：标志由**外部**（管线的 cancelled、
+    /// 翻译面板的取消位）在任务开始时注入，而 `LLMEngine` 在 `Arc` 后面被共享、
+    /// 拿不到 `&mut self`。每批读一次锁，开销可忽略。
+    ///
+    /// 与 `TaskPipeline::cancelled` 共用同一个 `Arc`：转写的取消与润色的取消是
+    /// 同一件事，各自维护一份标志会导致「终止转写」只杀掉 ASR、润色照跑。
+    cancel: Mutex<Arc<AtomicBool>>,
 }
 
 impl LLMEngine {
@@ -120,7 +133,25 @@ impl LLMEngine {
             model_path: model_path.as_ref().to_path_buf(),
             ctx_size,
             threads: std::sync::atomic::AtomicU32::new(threads.max(1)),
+            cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
         }
+    }
+
+    /// 注入外部取消标志（管线 / 翻译面板在任务开始前调用）。
+    ///
+    /// **只安装、不复位**：复位是「任务开始」的职责，由调用方在起手时做
+    /// （`TaskPipeline::run` 复位自己的 `cancelled`；翻译面板在起手处复位
+    /// `translate_cancel`）。在这里顺手复位是危险的——润色阶段才安装标志，
+    /// 若此时把标志清零，用户在此之前按下的「终止」就被无声撤销了。
+    pub fn install_cancel_flag(&self, cancel: Arc<AtomicBool>) {
+        *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = cancel;
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 运行时调整推理线程数（设置页滑条调用，对下一次润色生效）
@@ -244,6 +275,10 @@ impl LLMEngine {
 
         let mut completed = 0usize;
         for group in segments.chunks_mut(MAX_SEGMENTS_PER_BATCH) {
+            if self.is_cancelled() {
+                info!("润色被取消，保留已完成的部分（{completed}/{total}）");
+                break;
+            }
             let group_len = group.len();
             // 长字幕按字符数进一步拆开，避免输入占满模型上下文。
             let batches: Vec<&mut [Segment]> = if group.iter().map(|seg| seg.text.len()).sum::<usize>() > MAX_BATCH_CHARS {
@@ -253,6 +288,9 @@ impl LLMEngine {
             };
 
             for batch in batches {
+                if self.is_cancelled() {
+                    break;
+                }
                 let results = self.polish_batch(batch, server.as_mut());
                 for seg in batch.iter_mut() {
                     seg.polished = results
@@ -294,6 +332,10 @@ impl LLMEngine {
 
         let mut completed = 0usize;
         for group in segments.chunks_mut(MAX_SEGMENTS_PER_BATCH) {
+            if self.is_cancelled() {
+                info!("翻译被取消，保留已完成的部分（{completed}/{total}）");
+                break;
+            }
             let group_len = group.len();
             let batches: Vec<&mut [Segment]> = if group.iter().map(|seg| seg.text.len()).sum::<usize>() > MAX_BATCH_CHARS {
                 group.chunks_mut(MAX_SEGMENTS_PER_BATCH / 2).collect()
@@ -302,6 +344,9 @@ impl LLMEngine {
             };
 
             for batch in batches {
+                if self.is_cancelled() {
+                    break;
+                }
                 let results = self.translate_batch(batch, target_lang, server.as_mut());
                 for seg in batch.iter_mut() {
                     if let Some(trans) = results.get(&seg.index) {

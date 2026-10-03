@@ -248,6 +248,7 @@ impl VideoPlayerEngine {
             .stderr(Stdio::null());
 
             if let Ok(mut feeder_child) = feeder_cmd.spawn() {
+                crate::utils::child_registry::adopt(&feeder_child);
                 if let Some(feeder_stdout) = feeder_child.stdout.take() {
                     let mut player_cmd = Command::new(&self.ffplay_path);
                     apply_no_window(&mut player_cmd);
@@ -267,6 +268,7 @@ impl VideoPlayerEngine {
                     .stderr(Stdio::null());
 
                     if let Ok(player_child) = player_cmd.spawn() {
+                        crate::utils::child_registry::adopt(&player_child);
                         if let Ok(mut lock) = self.audio_proc.lock() {
                             *lock = Some(player_child);
                         }
@@ -301,6 +303,11 @@ impl VideoPlayerEngine {
                     Err(e) => {
                         error!("启动 FFmpeg 视频流失败: {}", e);
                         self.is_playing.store(false, Ordering::SeqCst);
+                        // 音频管线（ffplay + ffmpeg feeder）在视频流之前就已启动并
+                        // 存进 audio_proc / audio_feeder_proc。这里只置 is_playing
+                        // 而不回收，界面显示「未播放」却仍有声音，且两进程一直占着
+                        // 视频文件句柄。必须与 `stop()` 同源地把整条管线收掉。
+                        self.kill_procs();
                         return;
                     }
                 }
@@ -308,13 +315,21 @@ impl VideoPlayerEngine {
             Err(e) => {
                 error!("启动 FFmpeg 视频流失败: {}", e);
                 self.is_playing.store(false, Ordering::SeqCst);
+                self.kill_procs();
                 return;
             }
         };
 
         let mut stdout = match video_child.stdout.take() {
             Some(s) => s,
-            None => return,
+            None => {
+                // 同上：拿不到出帧管道就没法播，音频管线一并收掉，别留半条在响。
+                self.is_playing.store(false, Ordering::SeqCst);
+                let _ = video_child.kill();
+                let _ = video_child.wait();
+                self.kill_procs();
+                return;
+            }
         };
 
         if let Ok(mut lock) = self.video_proc.lock() {
@@ -459,6 +474,7 @@ impl VideoPlayerEngine {
             .stderr(Stdio::null());
 
         let mut child = video_cmd.spawn()?;
+        crate::utils::child_registry::adopt(&child);
         if hwaccel {
             std::thread::sleep(std::time::Duration::from_millis(60));
             match child.try_wait() {

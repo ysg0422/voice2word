@@ -97,6 +97,18 @@ pub struct MainWindow {
     pub(crate) play_tick_generation: u64,
     pub(crate) completion_dialog: Option<CompletionDialogInfo>,
     pub(crate) benchmark_dialog: Option<BenchmarkDialogInfo>,
+    /// 待确认的破坏性操作（清空队列 / 删除记录）。`Some` 时渲染通用确认弹窗。
+    pub(crate) confirm_dialog: Option<ConfirmDialogInfo>,
+    /// 一次性中性提示（成功类反馈，如「已删除该记录」）。
+    ///
+    /// 与 `state.status` 的 `Failed` 分开：那个语义是「出错了」，走红色横幅；
+    /// 这里是「操作成功但需要告知」，走中性配色。用户在剪辑台/视频库做完操作后
+    /// 需要知道结果，而底部状态栏只在转写页可见。
+    pub(crate) notice: Option<String>,
+    /// 字幕翻译的取消标志。`trigger_llm_translation` 起任务时把它注入引擎，
+    /// 「取消」按钮置位。任务结束后必须复位（引擎在任务开始前也会复位一次，
+    /// 双保险），否则下一次翻译一进来就在第一个批次检查点直接退出。
+    pub(crate) translate_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) editor_export_format: EditorExportFormat,
     pub(crate) is_export_dropdown_open: bool,
     /// 字幕预览框的**手动**宽度（px）。`Some` 时以它为准并压过「单行最大字数」
@@ -265,6 +277,11 @@ impl MainWindow {
         // 预览框宽度：配置里存过就用存的，否则 `preview_box_w` 留空，
         // 由 `MainWindow::subtitle_box_w()` 按「单行最大字数 × 预览字号」自动推算
         let preview_box_w_initial = state.config.subtitle_style.preview_box_w;
+        // 启动即绑定全局子进程作业对象：此后所有转写/转码/预览子进程都挂在它名下，
+        // 本进程一旦消失（正常退出、关窗、崩溃、被任务管理器结束），Windows 会连根
+        // 清掉整棵进程树。这是唯一能覆盖「父进程被强杀」的兜底 —— 单靠退出路径里的
+        // kill 逻辑在强杀场景下根本没有机会执行。非 Windows 平台为空实现。
+        crate::utils::child_registry::ensure_job_object();
         let mut window = Self {
             state,
             metrics_rx,
@@ -276,6 +293,9 @@ impl MainWindow {
             play_tick_generation: 0,
             completion_dialog: None,
             benchmark_dialog: None,
+            confirm_dialog: None,
+            notice: None,
+            translate_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             editor_export_format: EditorExportFormat::default(),
             is_export_dropdown_open: false,
             preview_box_w: preview_box_w_initial,
@@ -604,6 +624,14 @@ impl Render for MainWindow {
             )
             // 1. 顶部自定义标题栏 (极简沉浸式，包含窗口拖拽与控制按钮)
             .child(self.render_titlebar(cx))
+            // 1.5 全局失败提示条：`ProcessStatus::Failed` 的产生点遍布导出 / 预览 /
+            // 视频库等各处，而底部状态栏只在「语音转写」页存在。失败时就地在这一条
+            // 跨页常驻的横幅上显示，否则用户在其它页面只会看到「点了没反应」。
+            // 非失败态渲染空元素，不影响任何现有布局。
+            .child(self.render_error_banner(cx))
+            // 1.6 一次性中性提示条：成功类反馈（如「已删除该记录」）与错误条同处一列，
+            // 但配色中性——操作成功不该被误读成出错。两者同时存在时错误条在上。
+            .child(self.render_notice_banner(cx))
             // 2. 左中右专业工作台架构
             .child(
                 div()
@@ -631,14 +659,24 @@ impl Render for MainWindow {
                     ),
             );
 
+        // 注意：每一层都必须 `let root = ...` 回写。GPUI 的 `.child()` 返回**新的**
+        // `Div`，原值不动；少了赋值这一步，弹窗就永远不会出现在渲染树里
+        // （基准测试弹窗此前正是这样被静默丢掉的）。
         let root = if let Some(info) = self.completion_dialog.clone() {
             root.child(self.render_completion_dialog(info, cx))
         } else {
             root
         };
 
-        if let Some(info) = self.benchmark_dialog.clone() {
+        let root = if let Some(info) = self.benchmark_dialog.clone() {
             root.child(self.render_benchmark_dialog(info, cx))
+        } else {
+            root
+        };
+
+        // 二次确认弹窗排在最后：它是阻塞式的，应盖在其它弹窗之上
+        if let Some(info) = self.confirm_dialog.clone() {
+            root.child(self.render_confirm_dialog(info, cx))
         } else {
             root
         }

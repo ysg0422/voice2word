@@ -625,6 +625,7 @@ impl WhisperEngine {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("调用 whisper-cli 失败: {:?}", self.cli_path))?;
+        crate::utils::child_registry::adopt(&child);
 
         // 登记子进程 PID，供用户「终止转写」时强杀。
         // 用 RAII 守卫而不是「函数末尾手动 retain」：后续任何 `?` / 提前 return /
@@ -829,10 +830,13 @@ impl WhisperEngine {
                                     }
                                 }
                             }
+                            // 回退解析（JSON 缺失时）只需要 [.. --> ..] 形式的行。
+                            // 注意：必须在 `if trimmed.contains("-->")` **之内**——此前这行
+                            // 的缩进与注释对齐、看起来像在循环体尾部，实际仍在 if 内（缩进是
+                            // 24 空格，闭合花括号在 20）。不要把它挪到 if 外，否则长视频下
+                            // 每一行进度日志都会被逐行 `String` 累积。
+                            captured_lines.push(line);
                         }
-                        // 回退解析（JSON 缺失时）只需要 [.. --> ..] 形式的行，
-                        // 其余进度日志不再入内存，避免长视频下逐行 String 累积
-                        captured_lines.push(line);
                     }
                 }
             }

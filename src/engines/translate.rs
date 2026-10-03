@@ -6,6 +6,8 @@
 //!   （DeepSeek / OpenAI / 通义 / Kimi / 本地 vLLM / Ollama 均可）。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -97,6 +99,7 @@ impl TranslateEngine {
         segments: Vec<Segment>,
         target_lang: &str,
         progress_cb: Option<Box<dyn Fn(f64, &str) + Send>>,
+        cancel: Arc<AtomicBool>,
     ) -> Result<Vec<Segment>> {
         info!("开始执行字幕翻译 (目标语言: {}, 引擎: {:?})", target_lang, self.mode);
         match self.mode {
@@ -105,6 +108,8 @@ impl TranslateEngine {
                     .llm_engine
                     .as_ref()
                     .ok_or_else(|| anyhow!("离线翻译引擎未初始化"))?;
+                // 取消标志下沉到引擎：润色/翻译都是分批长循环，取消必须能在批次之间生效
+                engine.install_cancel_flag(cancel);
                 engine.translate(segments, target_lang, progress_cb)
             }
             TranslateMode::OnlineApi => {
@@ -112,7 +117,7 @@ impl TranslateEngine {
                     .online
                     .as_ref()
                     .ok_or_else(|| anyhow!("在线翻译接口未配置"))?;
-                translate_via_online_api(cfg, segments, target_lang, progress_cb)
+                translate_via_online_api(cfg, segments, target_lang, progress_cb, cancel)
             }
         }
     }
@@ -145,6 +150,7 @@ fn translate_via_online_api(
     mut segments: Vec<Segment>,
     target_lang: &str,
     progress_cb: Option<Box<dyn Fn(f64, &str) + Send>>,
+    cancel: Arc<AtomicBool>,
 ) -> Result<Vec<Segment>> {
     if cfg.api_key.trim().is_empty() {
         return Err(anyhow!(
@@ -176,6 +182,12 @@ fn translate_via_online_api(
         .collect();
 
     for chunk in translatable.chunks(batch_size) {
+        // 每批开始前检查取消：单批最长可达 `timeout_secs`（默认 120s），
+        // 不在批次之间检查的话，用户点「取消」要等当前批跑完才生效。
+        if cancel.load(Ordering::Relaxed) {
+            info!("在线翻译被取消，保留已完成的部分（{completed}/{total}）");
+            break;
+        }
         let batch: Vec<&Segment> = chunk.iter().map(|&pos| &segments[pos]).collect();
         let translations = request_batch_translation(cfg, &batch, target_lang)?;
         let mut matched = 0usize;
@@ -349,7 +361,7 @@ mod tests {
             ..sample_cfg()
         };
         let segs = vec![Segment::new(1, 0.0, 1.0, "hello")];
-        let err = translate_via_online_api(&cfg, segs, "简体中文", None)
+        let err = translate_via_online_api(&cfg, segs, "简体中文", None, Arc::new(AtomicBool::new(false)))
             .expect_err("空密钥必须直接报错而不是静默返回原文");
         assert!(err.to_string().contains("API Key"), "错误信息应指引用户去填密钥: {err}");
     }
@@ -361,7 +373,7 @@ mod tests {
             ..sample_cfg()
         };
         let segs = vec![Segment::new(1, 0.0, 1.0, "hello")];
-        let err = translate_via_online_api(&cfg, segs, "简体中文", None)
+        let err = translate_via_online_api(&cfg, segs, "简体中文", None, Arc::new(AtomicBool::new(false)))
             .expect_err("空模型名必须报错");
         assert!(err.to_string().contains("模型名"), "{err}");
     }

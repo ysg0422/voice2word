@@ -236,6 +236,8 @@ impl FFmpegEngine {
             .stderr(std::process::Stdio::null());
 
         let child = cmd.spawn().with_context(|| format!("启动 FFmpeg 内存管道失败: {:?}", self.ffmpeg_path))?;
+        // 并入全局作业对象：本进程若被强杀/崩溃，这个 ffmpeg 会被系统一并清掉
+        crate::utils::child_registry::adopt(&child);
         Ok(child)
     }
 
@@ -288,6 +290,7 @@ impl FFmpegEngine {
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| format!("启动 FFmpeg 音频解码失败: {:?}", self.ffmpeg_path))?;
+        crate::utils::child_registry::adopt(&child);
 
         let mut raw = Vec::new();
         if let Some(mut stdout) = child.stdout.take() {

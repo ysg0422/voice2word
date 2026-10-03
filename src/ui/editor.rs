@@ -770,7 +770,15 @@ impl MainWindow {
                                                         .rounded_md()
                                                         .cursor_pointer()
                                                         .text_size(px(Theme::TEXT_SMALL))
-                                                        .text_center()
+                                                        // 用布局居中（flex + justify_center），不用 `text_center()`：
+                                                        // GPUI 0.2.2 的 `.hover()` 走 `Style::refine`，而 `Style::text`
+                                                        // 没有 `#[refineable]`，悬停时整块 `TextStyleRefinement` 会被
+                                                        // hover 闭包里那份（只设了 text_color）**整体替换**，没显式设过的
+                                                        // `text_align` 于是回落到默认值 Left —— 鼠标一移上去文字就跳到左边。
+                                                        // 居中交给 flex 后，悬停只碰底色/前景色，不再牵动对齐。
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
                                                         .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
                                                         .border_1()
                                                         .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
@@ -1781,10 +1789,29 @@ impl MainWindow {
             .overflow_hidden()
             // 位移监听挂在整个预览行上而不是把手上：把手只有几像素宽，拖动时指针
             // 稍一移动就出了它的命中区；整行满宽，横向拖多远都不会掉出去。
+            //
+            // 必须再校验 `event.pressed_button`：GPUI 的 `on_mouse_move` 只看指针**当前**
+            // 是否落在元素内，并不关心按钮是不是在这个元素上按下的。少了这层校验，指针
+            // 在别处按下、再移进本行时会被误当成「正在拖预览框」——`drag_preview_box`
+            // 见 `preview_drag` 是 `Some` 就一直改宽度。更糟的是若按钮是在把手之外
+            // 松开的，本行的 `on_mouse_up` 收不到（松手时指针不在行内），`preview_drag`
+            // 永远不清空，此后指针每次划过预览行都会继续改宽度。
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if event.pressed_button != Some(MouseButton::Left) {
+                    return;
+                }
                 this.drag_preview_box(event.position.x, cx);
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.end_preview_box_drag();
+                cx.notify();
+            }))
+            // 在行**外**松手也要收尾。GPUI 的 `on_mouse_up` 同样要求指针落在元素内，
+            // 若用户把指针拖出行外才松手，上面的 handler 收不到，`preview_drag` 会一直
+            // 挂着——预览行从此恒亮「拖拽中」描边，且宽度卡在半途的中间值。
+            // `on_mouse_up_out` 走捕获阶段、专在「松手时指针不在元素内」时触发，用它兜底。
+            // 没有拖拽会话时 `end_preview_box_drag` 是空操作，因此它在任何别处松手都安全。
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.end_preview_box_drag();
                 cx.notify();
             }))
@@ -1996,15 +2023,26 @@ impl MainWindow {
                                     .child(if is_open { "▲" } else { "▼" }),
                             ),
                     )
-                    .child(
-                        primitives::btn("导出", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
-                            .id("editor-do-export-btn")
-                            .px(px(Theme::SPACE_6))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                    .child({
+                        // 无字幕时置灰：导出链路（`perform_editor_export` 等）在没有
+                        // segments 时都是静默 return，按钮却照常可点，用户会以为程序坏了。
+                        // 同页的 mini_btn 早已有禁用态规范，导出按钮此前漏了这一层。
+                        let can_export = !self.state.segments.is_empty();
+                        primitives::btn_state(
+                            "导出",
+                            primitives::BtnSize::Lg,
+                            primitives::BtnVariant::Primary,
+                            can_export,
+                        )
+                        .id("editor-do-export-btn")
+                        .px(px(Theme::SPACE_6))
+                        .when(can_export, |d| {
+                            d.on_click(cx.listener(|this, _, _, cx| {
                                 this.is_export_dropdown_open = false;
                                 this.perform_editor_export(cx);
-                            })),
-                    ),
+                            }))
+                        })
+                    }),
             )
     }
 
@@ -2238,6 +2276,25 @@ impl MainWindow {
                     } else {
                         "开始翻译"
                     }),
+            )
+            // 翻译中才出现的「取消」：离线 Qwen 模型路径不对、在线 API 长时间无响应时，
+            // 此前只能强杀进程——按钮变成灰的「翻译中…」且不可点，是条纯死路。
+            // 取消只需置位一个 AtomicBool，引擎在**每个批次之间**检查，最多损失当前批。
+            .child(
+                if is_translating {
+                    primitives::btn_clickable(
+                        "取消",
+                        primitives::BtnSize::Sm,
+                        primitives::BtnVariant::Secondary,
+                    )
+                    .id("btn-translate-cancel")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cancel_llm_translation(cx);
+                    }))
+                    .into_any_element()
+                } else {
+                    div().into_any_element()
+                },
             )
             .child(
                 div()

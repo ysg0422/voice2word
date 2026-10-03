@@ -33,3 +33,28 @@ pub struct BenchmarkDialogInfo {
     pub file_name: String,
     pub metrics: PipelinePerformanceMetrics,
 }
+
+/// 需要二次确认的破坏性操作。
+///
+/// 用枚举而不是存闭包：GPUI 的状态要能 `Clone + PartialEq`，闭包做不到；
+/// 把「确认后做什么」编码成可比较的动作，渲染层与执行层就解耦了。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfirmAction {
+    /// 清空批量转写队列（队列非空或有转写在跑时会顺带终止）
+    ClearBatchQueue,
+    /// 删除视频库里的一条任务记录
+    DeleteTaskRecord(i64),
+}
+
+/// 二次确认弹窗的内容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfirmDialogInfo {
+    pub title: String,
+    pub message: String,
+    /// 确认按钮上的文案（如「清空」「删除」），动词比「确定」更能让人看清在点什么
+    pub confirm_label: String,
+    /// 是否把确认键渲染成危险样式（不可逆操作用红）
+    pub danger: bool,
+    pub action: ConfirmAction,
+}
+
