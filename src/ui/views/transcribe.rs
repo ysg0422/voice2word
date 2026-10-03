@@ -8,6 +8,7 @@ use crate::subtitle::Segment;
 use crate::utils::time::format_duration_short;
 use super::super::primitives;
 use super::super::theme::Theme;
+use super::super::types::{ConfirmAction, ConfirmDialogInfo};
 use super::super::MainWindow;
 
 impl MainWindow {
@@ -853,9 +854,33 @@ impl MainWindow {
                             .child(
                                 primitives::btn("清空", primitives::BtnSize::Sm, primitives::BtnVariant::Ghost)
                                     .id("queue-clear-btn")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.clear_batch_queue(cx)),
-                                    ),
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        // 清空会连同正在跑的转写一起终止（`clear_batch_queue`
+                                        // 内部先 cancel），而按钮是最弱的 Ghost 样式、又紧挨
+                                        // 着「开始全部」，误触代价却是丢掉整批任务。
+                                        // 队列为空时没什么可清，直接跳过弹窗。
+                                        if this.state.batch_queue.is_empty() {
+                                            return;
+                                        }
+                                        let running = matches!(
+                                            this.state.status,
+                                            ProcessStatus::Processing { .. }
+                                        );
+                                        this.confirm_dialog = Some(ConfirmDialogInfo {
+                                            title: "清空批量队列？".to_string(),
+                                            message: if running {
+                                                "队列里所有文件都会被移除，**正在进行的转写也会被终止**。已转写完成并落库的工程不受影响。"
+                                                    .to_string()
+                                            } else {
+                                                "队列里所有文件都会被移除。已转写完成并落库的工程不受影响。"
+                                                    .to_string()
+                                            },
+                                            confirm_label: "清空".to_string(),
+                                            danger: running,
+                                            action: ConfirmAction::ClearBatchQueue,
+                                        });
+                                        cx.notify();
+                                    })),
                             ),
                     ),
             )

@@ -353,6 +353,25 @@ pub fn btn_clickable(label: impl Into<SharedString>, size: BtnSize, variant: Btn
     }
 }
 
+/// 带禁用态的按钮：`enabled = false` 时置灰、不接交互。
+///
+/// 与 [`btn_clickable`] 的分工：那个只负责「可点 + 悬停反馈」，禁用与否由调用点
+/// 用 `.when()` 自行决定；本函数把「形状不变、只换配色」的禁用观感固化下来，
+/// 让「点了没反应」这类死路不再出现（调用点只需 `if enabled { .on_click(..) }`）。
+pub fn btn_state(label: impl Into<SharedString>, size: BtnSize, variant: BtnVariant, enabled: bool) -> Div {
+    let base = btn(label, size, variant);
+    if enabled {
+        base.cursor_pointer().hover(|s| match variant {
+            BtnVariant::Primary => s.opacity(0.9),
+            _ => s.bg(Theme::bg_hover()).text_color(Theme::text_primary()),
+        })
+    } else {
+        base.bg(Theme::bg_hover_strong())
+            .text_color(Theme::text_muted())
+            .opacity(0.6)
+    }
+}
+
 // ==================== 分段选项（单选胶囊） ====================
 
 /// 可选中的分段选项。迁移前有四份实现（高度 26/28/34/自动，圆角 md/lg/full 各异，

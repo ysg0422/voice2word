@@ -250,6 +250,47 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// 删除一条视频库记录，并把「当前工程被删掉了」这件事显式告诉用户。
+    ///
+    /// `AppState::delete_task_record` 在删掉的恰好是当前打开的工程时，会**静默**把
+    /// 工作区换成列表里的下一条记录。用户回到剪辑台会发现字幕变成了另一个视频的，
+    /// 却没有任何线索说明发生了什么。这里在删除后检查当前工程是否真的被换掉，
+    /// 是则发一条**中性提示**（不是错误——删除本身成功了）说明切换到了哪一条。
+    pub(crate) fn delete_task_record(&mut self, id: i64, cx: &mut Context<Self>) {
+        let was_current = self
+            .state
+            .recent_tasks
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| {
+                self.state.selected_file.as_ref().is_some_and(|p| {
+                    p.to_string_lossy().replace('\\', "/") == t.file_path.replace('\\', "/")
+                })
+            })
+            .unwrap_or(false);
+
+        self.state.delete_task_record(id);
+
+        self.notice = Some(if was_current {
+            match self
+                .state
+                .selected_file
+                .as_ref()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            {
+                Some(name) => format!("已删除当前工程，工作区已切换到「{name}」"),
+                None => "已删除当前工程，工作区已清空".to_string(),
+            }
+        } else {
+            "已删除该记录".to_string()
+        });
+
+        if self.state.selected_file.is_some() {
+            self.trigger_extract_frame(cx);
+        }
+        cx.notify();
+    }
+
     /// 「开始全部」：从第一个待处理项起，连续转写直到队列跑完。
     ///
     /// 失败项会被重新排队——用户点「开始全部」的语义就是「把没成功的再跑一遍」，
@@ -874,6 +915,9 @@ impl MainWindow {
             .spawn()
         {
             Ok(child) => {
+                // 先并入全局作业对象，再登记：这样「本进程被强杀」时 ffplay 也会
+                // 被系统一并清掉，而不仅是靠退出路径里的 retire_all。
+                crate::utils::child_registry::adopt(&child);
                 crate::utils::child_registry::register(child);
                 info!("已启动带字幕视频预览");
             }
@@ -1246,6 +1290,9 @@ impl MainWindow {
         let llm_model = crate::utils::config::AppConfig::resolve_path(&self.state.config.paths.llm_model);
         let llm_ctx = self.state.config.pipeline.llm_ctx;
         let llm_threads = self.state.config.pipeline.llm_threads;
+        // 取消标志：任务起手先复位（上一轮取消后它会停在 true），再交给引擎
+        let cancel_flag = self.translate_cancel.clone();
+        cancel_flag.store(false, std::sync::atomic::Ordering::SeqCst);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(f64, String)>();
 
@@ -1272,6 +1319,7 @@ impl MainWindow {
                     Some(Box::new(move |p, msg| {
                         let _ = tx_clone.send((p, msg.to_string()));
                     })),
+                    cancel_flag,
                 )
             });
 
@@ -1287,22 +1335,44 @@ impl MainWindow {
             }).detach();
 
             let result = handle.await;
+            // 取消位要在 update 闭包里读、在闭包里复位——中间不能被别的任务改掉
+            let was_cancelled = this
+                .update(cx, |this, cx| {
+                    let c = this
+                        .translate_cancel
+                        .load(std::sync::atomic::Ordering::SeqCst);
+                    this.state.is_translating = false;
+                    this.translate_cancel
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    cx.notify();
+                    c
+                })
+                .unwrap_or(false);
             let _ = this.update(cx, |this, cx| {
-                this.state.is_translating = false;
                 match result {
                     Ok(translated_segs) => {
                         let done = translated_segs
                             .iter()
                             .filter(|s| s.translation.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false))
                             .count();
-                        info!("字幕多语言翻译成功完成 ({} 句带译文)", done);
+                        // 引擎在取消时返回**已完成的偏序结果**而非错误，所以这里必须
+                        // 显式区分「跑完了」与「被取消了」。不区分的话，用户点了取消
+                        // 却看到「翻译已完成（N 句）」，会以为取消没生效。
+                        if was_cancelled {
+                            info!("字幕多语言翻译已取消（已完成 {} 句）", done);
+                            this.state.translate_status_msg =
+                                format!("已取消翻译（保留已完成的 {} 句）", done);
+                        } else {
+                            info!("字幕多语言翻译成功完成 ({} 句带译文)", done);
+                            this.state.translate_progress = 1.0;
+                            this.state.translate_status_msg = format!("翻译已完成（{} 句）", done);
+                        }
+                        // 无论完成还是取消，已产出的译文都要并入当前字幕表
                         this.state.segments = translated_segs;
                         this.state.bump_segments_revision();
                         // 译文必须落库，否则重启后历史库里的双语对照会凭空消失
                         this.state.segments_dirty = true;
                         this.state.flush_segments_if_dirty();
-                        this.state.translate_progress = 1.0;
-                        this.state.translate_status_msg = format!("翻译已完成（{} 句）", done);
                     }
                     Err(e) => {
                         tracing::warn!("字幕多语言翻译过程报错: {}", e);
@@ -1314,6 +1384,21 @@ impl MainWindow {
             });
         })
         .detach();
+    }
+
+    /// 取消正在进行的字幕翻译。
+    ///
+    /// 只置位取消标志：引擎在**每个批次之间**检查（离线 Qwen 与在线 API 两条链路
+    /// 都接了），因此最多损失当前一批，已翻译的句子原样保留。任务收尾时统一复位
+    /// （见 `trigger_llm_translation` 的 `handle.await` 之后）。
+    pub(crate) fn cancel_llm_translation(&mut self, cx: &mut Context<Self>) {
+        if !self.state.is_translating {
+            return;
+        }
+        self.translate_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.state.translate_status_msg = "正在取消翻译，等待当前批次结束…".to_string();
+        cx.notify();
     }
 
     /// 在线翻译接口连通性自检（设置页「测试连接」按钮）

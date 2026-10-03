@@ -10,6 +10,7 @@ use crate::subtitle::SubtitleWriter;
 use crate::utils::time::format_duration_short;
 use super::super::primitives;
 use super::super::theme::Theme;
+use super::super::types::{ConfirmAction, ConfirmDialogInfo};
 use super::super::MainWindow;
 
 impl MainWindow {
@@ -490,18 +491,26 @@ impl MainWindow {
                             })),
                     )
                     // 删除按钮：危险操作按钮原语，卡片级尺寸（32px 圆角块）
-                    .child(
+                    .child({
+                        let task_name = task.file_name.clone();
                         primitives::btn_danger("删除", primitives::BtnSize::Lg)
                             .id(("lib-del-btn", task_id as usize))
                             .w(px(Theme::LIB_ACTION_W))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.delete_task_record(task_id);
-                                if this.state.selected_file.is_some() {
-                                    this.trigger_extract_frame(cx);
-                                }
+                                // 删除不可逆，且若删的是当前工程会静默换掉工作区，
+                                // 必须先确认。真正执行走 ConfirmAction。
+                                this.confirm_dialog = Some(ConfirmDialogInfo {
+                                    title: "删除这条记录？".to_string(),
+                                    message: format!(
+                                        "「{task_name}」及其字幕将被永久删除，无法恢复。"
+                                    ),
+                                    confirm_label: "删除".to_string(),
+                                    danger: true,
+                                    action: ConfirmAction::DeleteTaskRecord(task_id),
+                                });
                                 cx.notify();
-                            })),
-                    ),
+                            }))
+                    }),
             )
     }
 

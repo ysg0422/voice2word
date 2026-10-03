@@ -142,6 +142,7 @@ impl PunctuationEngine {
         }
 
         let child = cmd.spawn().context("启动 CT-Transformer 标点恢复子进程失败")?;
+        crate::utils::child_registry::adopt(&child);
         // 从这里到 wait_with_output() 之间的任何提前退出都由守卫兜底回收子进程
         let mut reaper = ChildReaper::new(child);
 

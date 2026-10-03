@@ -2,3 +2,4 @@
 
 pub mod benchmark;
 pub mod completion;
+pub mod confirm;

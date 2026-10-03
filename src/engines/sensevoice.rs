@@ -262,6 +262,7 @@ impl SenseVoiceEngine {
         }
 
         let mut child = cmd.spawn().with_context(|| format!("启动 SenseVoice 进程失败: {:?}", self.runner_path))?;
+        crate::utils::child_registry::adopt(&child);
 
         // 登记子进程 PID，供用户「终止转写」时强杀。
         // 用 RAII 守卫（与 whisper 引擎复用同一份实现）而不是「函数末尾手动 retain」：
