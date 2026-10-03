@@ -102,8 +102,12 @@ pub struct MainWindow {
     /// 字幕预览框的**手动**宽度（px）。`Some` 时以它为准并压过「单行最大字数」
     /// 推出的宽度；拖动预览条两侧把手会写入这里并落盘，`None` 则回到按字数自动推算。
     pub(crate) preview_box_w: Option<f32>,
-    /// 预览条拖动会话：(基准宽度, 按下时的鼠标 x)。`Some` 表示正在拖。
-    pub(crate) preview_drag: Option<(f32, f32)>,
+    /// 预览条拖动会话：(基准宽度, 按下时的鼠标 x, 是否左手柄)。`Some` 表示正在拖。
+    ///
+    /// 记下是哪个手柄，是因为左右两侧「往外拉」的位移方向相反：右手柄往右拉
+    /// 位移为正，左手柄往左拉位移为负。宽度变化要按手柄所在侧取符号，否则左手柄
+    /// 往外拉会算成负增量，框反而变窄。
+    pub(crate) preview_drag: Option<(f32, f32, bool)>,
     /// 右侧检查器当前显示哪张面板（样式 / 翻译），互斥切换
     pub(crate) subtitle_panel: EditorSubtitlePanel,
     pub(crate) text_cursor_pos: usize,
