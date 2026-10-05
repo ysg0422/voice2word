@@ -175,6 +175,23 @@ pub const ITEMS: &[DownloadItem] = &[
         companion: None,
     },
     DownloadItem {
+        id: "sensevoice-vad",
+        label: "SenseVoice 静音检测（Silero VAD）",
+        note: "SenseVoice 引擎切分语音段所需，缺它该引擎无法启用",
+        dest: "models/sensevoice/silero_vad.onnx",
+        urls: &[
+            // sherpa-onnx 官方发在 GitHub Release，走免梯子代理（与 whisper-cli 同一套）。
+            "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+            "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+        ],
+        size: 643_854,
+        min_size: 400_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
+    },
+    DownloadItem {
         id: "whisper-small",
         label: "Whisper Small（均衡档）",
         note: "默认档位；中文精度与速度平衡",
@@ -523,6 +540,7 @@ fn configured_path_for(item: &DownloadItem, cfg: &Option<AppConfig>) -> Option<P
         "punc-model" => cfg.paths.punc_model.as_deref(),
         "sensevoice-model" => cfg.paths.sensevoice_model.as_deref(),
         "sensevoice-tokens" => cfg.paths.sensevoice_tokens.as_deref(),
+        "sensevoice-vad" => cfg.paths.sensevoice_vad.as_deref(),
         "qwen-llm" => Some(cfg.paths.llm_model.as_str()),
         // llama.cpp 也走配置：用户可能把它装在别处（例如自编译产物）。
         // 若不接配置，即使用户已经能用，界面也会一直标「缺失」。
