@@ -818,6 +818,15 @@ impl AppConfig {
         on_disk.paths = shared_paths;
         let content =
             toml::to_string_pretty(&on_disk).with_context(|| "序列化配置为 TOML 失败")?;
+        // 与本机覆盖同理：内容没变就不重复落盘。UI 上每敲一个键都会走到
+        // 这里（见 `commit_api_field`），而在 API Key / 模型名里输入时共享配置并不改变——
+        // 没必要每个字符都做一次写盘 + rename。
+        let unchanged = std::fs::read_to_string(&full_path)
+            .map(|existing| existing == content)
+            .unwrap_or(false);
+        if unchanged {
+            return Ok(());
+        }
         Self::atomic_write(&full_path, &content)
     }
 
@@ -1151,6 +1160,29 @@ mod tests {
         assert_eq!(back.paths.llama_cli, r"A:\cppsoft\llama.cpp\llama-completion.exe");
         assert_eq!(back.pipeline.whisper_threads, 12);
         assert_eq!(back.ui.theme, "light");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 内容没变时 `save_to_file` 不应重写文件（避免 UI 每敲一个字符都做一次
+    /// 写盘 + rename）。用修改时间做证据：第二次保存后 mtime 必须不变。
+    #[test]
+    fn save_skips_disk_write_when_content_unchanged() {
+        let dir = std::env::temp_dir().join(format!("v2w_cfg_idem_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let main_path = dir.join("config.toml");
+
+        let cfg = super::AppConfig::default();
+        cfg.save_to_file(&main_path).expect("first save");
+        let mtime1 = std::fs::metadata(&main_path).expect("meta").modified().expect("mtime");
+
+        // 确保时间戳可区分（一些文件系统粒度较粗）
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cfg.save_to_file(&main_path).expect("second save");
+        let mtime2 = std::fs::metadata(&main_path).expect("meta").modified().expect("mtime");
+
+        assert_eq!(mtime1, mtime2, "内容未变时不应重写文件");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
