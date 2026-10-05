@@ -587,10 +587,7 @@ fn extract_message_content(value: &serde_json::Value) -> Option<String> {
     let direct = choice
         .get("message")
         .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned);
+        .and_then(content_to_text);
     if direct.is_some() {
         return direct;
     }
@@ -606,10 +603,33 @@ fn extract_message_content(value: &serde_json::Value) -> Option<String> {
     choice
         .get("message")
         .and_then(|m| m.get("reasoning_content"))
-        .and_then(|c| c.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
+        .and_then(content_to_text)
+}
+
+/// 把 `content` 字段还原成文本。
+///
+/// 兼容两种形态：
+/// - 字符串：标准 `chat/completions` 响应；
+/// - 数组：部分 OpenAI 兼容网关（以及多模态接口）会把 content 拆成
+///   `[{"type":"text","text":"..."}]` 的分片数组。只取字符串的话，这类
+///   服务端的译文会被整批判为「空内容」而失败。
+fn content_to_text(c: &serde_json::Value) -> Option<String> {
+    if let Some(s) = c.as_str() {
+        let t = s.trim();
+        return if t.is_empty() { None } else { Some(t.to_string()) };
+    }
+    let parts = c.as_array()?;
+    let joined = parts
+        .iter()
+        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("");
+    let t = joined.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -683,6 +703,24 @@ mod tests {
 
         let broken = serde_json::json!({ "error": { "message": "boom" } });
         assert!(extract_message_content(&broken).is_none());
+
+        // 部分 OpenAI 兼容网关把 content 拆成分片数组
+        let parts = serde_json::json!({
+            "choices": [{ "message": { "content": [
+                { "type": "text", "text": "[1] 你好。" },
+                { "type": "text", "text": "[2] 世界！" }
+            ] } }]
+        });
+        assert_eq!(
+            extract_message_content(&parts).as_deref(),
+            Some("[1] 你好。[2] 世界！")
+        );
+
+        // 空数组 / 无 text 字段 → 视为无内容
+        let empty_parts = serde_json::json!({
+            "choices": [{ "message": { "content": [] } }]
+        });
+        assert!(extract_message_content(&empty_parts).is_none());
     }
     /// 重试判定：限流与网络问题是暂时的，参数类错误重试只是浪费用户时间。
     #[test]
