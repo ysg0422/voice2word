@@ -13,13 +13,14 @@
 //! | 源 | 结果 |
 //! | --- | --- |
 //! | `hf-mirror.com` | **HTTP 200，全部模型文件可下** |
+//! | `gh-proxy.com` / `ghproxy.net`（GitHub Release 代理） | **HTTP 200，附件可下** |
 //! | `www.modelscope.cn` | HTTP 200 |
-//! | `github.com` 的 release 附件 | **超时（不可达）** |
-//! | `ghproxy.net` | 403 |
+//! | `github.com` 直连 release 附件 | **超时（不可达）** |
 //!
-//! 因此下载源一律走 `hf-mirror.com`（HuggingFace 的国内镜像），**不需要梯子**。
-//! 注意 `github.com` 首页能通、release 附件却超时，所以「站点可达」不等于
-//! 「文件可下」——本模块登记的每个 URL 都逐个做过 HEAD 实测。
+//! 模型走 `hf-mirror.com`（HuggingFace 的国内镜像）；部分只发在 GitHub Release
+//! 的可执行组件（whisper.cpp / sherpa-onnx）走免梯子的 GitHub 代理。
+//! 两者都**不需要梯子**。注意 `github.com` 首页能通、release 附件却超时，
+//! 所以「站点可达」不等于「文件可下」——本模块登记的每个 URL 都逐个做过 HEAD 实测。
 //!
 //! # 关于校验
 //!
