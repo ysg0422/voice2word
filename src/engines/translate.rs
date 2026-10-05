@@ -213,6 +213,13 @@ fn translate_via_online_api(
         let translations = match request_batch_with_retry(cfg, &batch, target_lang, &cancel) {
             Ok(map) => map,
             Err(err) => {
+                // 取消（而非真实错误）：保留已完成的部分，按取消语义返回偏序结果。
+                // 这一步必须排在 is_retryable 之前——用户取消会以「翻译已取消」
+                // 从这里返回，若不特判就会被当成「不可重试错误」直接报失败。
+                if cancel.load(Ordering::Relaxed) {
+                    info!("在线翻译被取消，保留已完成的部分（{completed}/{pending_total}）");
+                    break;
+                }
                 // 参数类错误（401/403/404：密钥、地址、模型名）不是暂时性的，
                 // 后面的批会以完全相同的原因再失败一遍。继续「逐批跳过」只会把
                 // 一个配置错误伪装成「翻译完成 0 句」。立刻带着真实原因中止。
@@ -1007,5 +1014,28 @@ mod tests {
             err.to_string().contains("未能译出任何一句"),
             "应提示没译出任何一句: {err}"
         );
+    }
+
+    /// 用户取消不是错误：必须返回**偏序结果**（已译部分），不能报失败。
+    ///
+    /// 回归：新增的「不可重试错误立刻中止」分支若排在取消判定之前，会把用户主动
+    /// 取消（引擎以「翻译已取消」返回）误报成「在线翻译中止」。
+    #[test]
+    fn online_translation_cancel_returns_partial_not_error() {
+        let (addr, _seen) = spawn_mock_server(vec![]);
+        let cfg = online_cfg_for(&addr);
+
+        let segs = vec![Segment::new(1, 0.0, 1.0, "你好")];
+        // 起手就置位取消：循环第一件事就是 break，返回原始片段（无译文）而非 Err
+        let out = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .expect("取消应返回偏序结果而非错误");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].translation.is_none(), "取消时不该凭空产生译文");
     }
 }
