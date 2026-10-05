@@ -712,7 +712,7 @@ impl AppState {
     pub fn translated_count(&self) -> usize {
         self.segments
             .iter()
-            .filter(|seg| seg.translation.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false))
+            .filter(|seg| seg.has_translation())
             .count()
     }
 
@@ -741,8 +741,10 @@ impl AppState {
             translated.into_iter().map(|s| (s.index, s)).collect();
         for seg in self.segments.iter_mut() {
             if let Some(src) = by_index.get(&seg.index) {
-                // 只搬译文，不碰用户可能已改动的原文/时间/说话人
-                if src.translation.is_some() {
+                // 只搬**非空**译文，不碰用户可能已改动的原文/时间/说话人。
+                // 引擎解析失败时可能回填空串，用它覆盖用户已有的好译文会让
+                // 「翻译一结束译文变空白」。
+                if src.has_translation() {
                     seg.translation = src.translation.clone();
                     seg.translation_lang = src.translation_lang.clone();
                 }
@@ -2099,6 +2101,34 @@ mod tests {
         assert_eq!(
             state.segments[0].translation_lang.as_deref(),
             Some("English")
+        );
+    }
+
+    /// 回归：引擎回填空串译文时，`merge_translations` 不能覆盖用户已有的好译文。
+    ///
+    /// 引擎在「本句没译出」时理论上只保留旧值，但解析失败路径可能写入空串。
+    /// 若收尾无条件 `seg.translation = src.translation`，用户先前译好的句子会在
+    /// 「再点一次翻译」后**变空白**。这里断言空串译文被忽略。
+    #[test]
+    fn merge_translations_ignores_blank_translation() {
+        use crate::subtitle::Segment;
+
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "你好")]);
+        // 用户已有一句好译文
+        state.segments[0].translation = Some("Hello".to_string());
+        state.segments[0].translation_lang = Some("English".to_string());
+
+        // 引擎快照里这句变成空串译文（模拟解析失败回填）
+        let mut translated = state.segments.clone();
+        translated[0].translation = Some("   ".to_string());
+        translated[0].translation_lang = Some("English".to_string());
+
+        state.merge_translations(translated);
+
+        assert_eq!(
+            state.segments[0].translation.as_deref(),
+            Some("Hello"),
+            "空串译文不该覆盖用户已有的好译文"
         );
     }
 }

@@ -213,6 +213,14 @@ fn translate_via_online_api(
         let translations = match request_batch_with_retry(cfg, &batch, target_lang, &cancel) {
             Ok(map) => map,
             Err(err) => {
+                // 参数类错误（401/403/404：密钥、地址、模型名）不是暂时性的，
+                // 后面的批会以完全相同的原因再失败一遍。继续「逐批跳过」只会把
+                // 一个配置错误伪装成「翻译完成 0 句」。立刻带着真实原因中止。
+                if !is_retryable(&err) {
+                    return Err(err).map_err(|e| {
+                        anyhow!("在线翻译中止：{e}。请检查「性能设置 → 在线翻译 API」的地址、密钥与模型名。")
+                    });
+                }
                 soft_failed_batches += 1;
                 warn!(
                     error = %err,
@@ -274,6 +282,20 @@ fn translate_via_online_api(
         }
     }
 
+    // 一句都没译出、又没被取消：多半是接口配置/鉴权问题被分批重试掩盖成了
+    // 「逐批跳过」。此时返回 `Ok` 会让上层显示「翻译已完成（0 句）」——假成功。
+    // 这里显式报错，让用户看到真正的失败原因（密钥、地址、模型名）。
+    if !cancel.load(Ordering::Relaxed) {
+        let ok = translatable
+            .iter()
+            .filter(|&&pos| segments[pos].translation_matches(target_lang))
+            .count();
+        if ok == 0 {
+            return Err(anyhow!(
+                "在线翻译未能译出任何一句（共 {pending_total} 句待译）。请用「性能设置 → 在线翻译 API → 测试连接」检查地址、密钥与模型名。"
+            ));
+        }
+    }
     if soft_failed_batches > 0 {
         info!("在线 API 字幕翻译完成（{soft_failed_batches} 批未成功，可再次点击「开始翻译」补译）");
     } else {
@@ -929,5 +951,56 @@ mod tests {
             "第一批漏掉的 [2] 应被折半重试补回"
         );
         assert_eq!(seen.lock().unwrap().len(), 2, "应发出「首批 + 补译」两次请求");
+    }
+    /// 参数类错误（401）不该被「逐批跳过」吞掉：整片会以同一原因全失败，
+    /// 最终返回错误，让用户看到真正的失败原因，而不是「完成 0 句」的假成功。
+    #[test]
+    fn online_translation_fails_fast_on_auth_error() {
+        let (addr, _seen) = spawn_mock_server_status(vec![
+            (401, r#"{"error":{"message":"invalid api key"}}"#.to_string()),
+        ]);
+        let cfg = online_cfg_for(&addr);
+
+        let segs = vec![Segment::new(1, 0.0, 1.0, "你好")];
+        let err = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect_err("401 应让整片翻译直接失败");
+
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "错误信息应带状态码: {msg}");
+        assert!(msg.contains("在线翻译中止"), "应给出可操作的中止提示: {msg}");
+    }
+
+    /// 全部待译句都译不出（接口持续 429、重试用尽后逐批跳过）时，应返回错误
+    /// 而不是「完成 0 句」的假成功。
+    #[test]
+    fn online_translation_reports_error_when_nothing_translated() {
+        // 每批重试 MAX_BATCH_RETRIES 次；给足响应数以免 mock 耗尽后连接被拒
+        let (addr, _seen) = spawn_mock_server_status(
+            (0..MAX_BATCH_RETRIES * 4)
+                .map(|_| (429, r#"{"error":{"message":"still limited"}}"#.to_string()))
+                .collect(),
+        );
+        let cfg = online_cfg_for(&addr);
+
+        let segs = vec![Segment::new(1, 0.0, 1.0, "你好")];
+        let err = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect_err("一句都没译出应报错");
+
+        assert!(
+            err.to_string().contains("未能译出任何一句"),
+            "应提示没译出任何一句: {err}"
+        );
     }
 }

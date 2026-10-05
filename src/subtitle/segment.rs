@@ -98,6 +98,19 @@ impl Segment {
         }
     }
 
+    /// 是否**已经带有**一条非空译文（忽略纯空白）。
+    ///
+    /// 全项目只在这里判定「有没有译文」：导出模式选择、`translated_count`、
+    /// 界面「—」占位都调用它。散落各处的 `translation.is_some()` 会漏掉
+    /// 「译文是空串 / 纯空白」的情况——引擎在解析失败时可能写进一个空串，
+    /// 那种句子不该被算成「有译文」（双语导出会多出一行空白）。
+    pub fn has_translation(&self) -> bool {
+        self.translation
+            .as_deref()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false)
+    }
+
     /// 说话人标签（1 起编号，供界面与导出使用）
     pub fn speaker_label(&self) -> Option<String> {
         self.speaker.map(|s| format!("说话人 {}", s + 1))
@@ -119,17 +132,18 @@ impl Segment {
     pub fn export_text(&self, mode: ExportMode) -> String {
         match mode {
             ExportMode::RawOnly => self.display_text().to_string(),
-            ExportMode::TranslationOnly => self
-                .translation
-                .clone()
-                .unwrap_or_else(|| self.display_text().to_string()),
-            ExportMode::Bilingual => {
-                if let Some(ref trans) = self.translation {
-                    format!("{}\n{}", trans, self.display_text())
-                } else {
-                    self.display_text().to_string()
+            ExportMode::TranslationOnly => match self.translation.as_deref() {
+                // 空串 / 纯空白不算译文：回退原文，避免导出一片空白行
+                Some(t) if !t.trim().is_empty() => t.to_string(),
+                _ => self.display_text().to_string(),
+            },
+            ExportMode::Bilingual => match self.translation.as_deref() {
+                // 同上：只有**非空**译文才拼出第二行，否则整段回落为纯原文
+                Some(t) if !t.trim().is_empty() => {
+                    format!("{}\n{}", t, self.display_text())
                 }
-            }
+                _ => self.display_text().to_string(),
+            },
         }
     }
 
@@ -955,6 +969,26 @@ mod tests {
         // 空白译文不算完成
         seg.translation = Some("   ".to_string());
         assert!(!seg.translation_matches("English"));
+    }
+    /// 空串 / 纯空白译文不算「有译文」：双语导出必须回落为单行原文，不能多出一行空白。
+    #[test]
+    fn has_translation_ignores_blank_and_export_falls_back() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "你好");
+        assert!(!seg.has_translation(), "无译文时不应判为有");
+
+        seg.translation = Some(String::new());
+        assert!(!seg.has_translation(), "空串译文不算有译文");
+
+        seg.translation = Some("   ".to_string());
+        assert!(!seg.has_translation(), "纯空白译文不算有译文");
+        // 双语导出应回落成单行原文（用 display_text），不拼出空白第二行
+        assert_eq!(seg.export_text(ExportMode::Bilingual), "你好");
+        assert_eq!(seg.export_text(ExportMode::TranslationOnly), "你好");
+
+        seg.translation = Some("Hello".to_string());
+        assert!(seg.has_translation());
+        assert_eq!(seg.export_text(ExportMode::Bilingual), "Hello\n你好");
+        assert_eq!(seg.export_text(ExportMode::TranslationOnly), "Hello");
     }
 
     /// 拆分片段时译文与**目标语言**都要跟随，否则拆完一半会变成「无语言标记」，

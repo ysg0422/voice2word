@@ -1611,7 +1611,12 @@ impl MainWindow {
                                                 let start_ts = seconds_to_timestamp_short(seg.start);
                                                 let end_ts = seconds_to_timestamp_short(seg.end);
                                                 let raw_text = seg.display_text().to_string();
-                                                let trans_text = seg.translation.as_deref().unwrap_or("—").to_string();
+                                                // 空串译文按「无译文」处理，占位「—」
+                                                let trans_text = if seg.has_translation() {
+                                                    seg.translation.clone().unwrap_or_default()
+                                                } else {
+                                                    "—".to_string()
+                                                };
                                                 let speaker = seg.speaker;
 
                                                 div()
@@ -2208,6 +2213,9 @@ impl MainWindow {
                         } else {
                             format!("模型 {}", model)
                         }
+                    } else if !self.state.model_is_present("qwen-llm") {
+                        // 模型没下：直接点名，避免用户点「开始翻译」后才收到错误
+                        "未下载 Qwen 模型，请在「性能设置 → 模型与组件」下载".to_string()
                     } else {
                         "本地 Qwen，无需密钥".to_string()
                     }),

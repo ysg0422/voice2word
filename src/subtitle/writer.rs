@@ -17,7 +17,9 @@ impl SubtitleWriter {
         path: P,
         format: &str,
     ) -> Result<()> {
-        let mode = if segments.iter().any(|s| s.translation.is_some()) {
+        // 用 `Segment::has_translation` 而非 `translation.is_some()`：空串译文不算
+        // 「有译文」，否则会导出成双语却多出一行空白。
+        let mode = if segments.iter().any(|s| s.has_translation()) {
             ExportMode::Bilingual
         } else {
             ExportMode::RawOnly

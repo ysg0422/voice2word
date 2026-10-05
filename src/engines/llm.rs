@@ -1,6 +1,6 @@
 //! LLM 引擎 — 基于 llama.cpp 的字幕文本润色 (标点恢复、错别字修正、智能断句)
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -338,6 +338,30 @@ impl LLMEngine {
         LlamaServer::start(&server_path, &self.model_path, self.ctx_size, self.threads())
     }
 
+    /// 离线链路前置检查：模型与推理程序缺一不可。
+    ///
+    /// 为什么必须显式报错而不是「静默跑出 0 句」：`polish` / `translate` 走的是
+    /// 「先起常驻服务、失败再回退命令行」两条路。模型文件缺失时两条路都起不来，
+    /// 循环里每批都返回空映射，最后 `Ok(segments)` 原样返回——用户看到的是
+    /// 「翻译已完成（0 句）」这种既没报错、也没任何结果的诡异状态，根本不知道
+    /// 是「没下模型」。这里在开工前就给出可操作的中文提示（去「模型与组件」下载）。
+    fn ensure_ready(&self) -> Result<()> {
+        if !self.model_path.exists() {
+            return Err(anyhow!(
+                "本地 Qwen 模型未就位：{}。请到「性能设置 → 模型与组件」点击下载，或改用「在线 API」翻译。",
+                self.model_path.display()
+            ));
+        }
+        // 命令行回退要用的主程序；常驻服务是它的同目录兄弟（llama-server.exe）
+        if !self.cli_path.exists() {
+            return Err(anyhow!(
+                "本地推理程序未就位：{}。请到「性能设置 → 模型与组件」补下 llama.cpp 组件。",
+                self.cli_path.display()
+            ));
+        }
+        Ok(())
+    }
+
     /// 批量润色字幕片段
     pub fn polish(
         &self,
@@ -345,6 +369,9 @@ impl LLMEngine {
         progress_cb: Option<Box<dyn Fn(f64, &str) + Send>>,
     ) -> Result<Vec<Segment>> {
         let total = segments.len();
+        // 先做前置检查：模型/程序缺失时立刻给出可操作的中文提示，
+        // 而不是跑完一圈「0 句」让用户以为翻译成功了。
+        self.ensure_ready()?;
         info!("LLM 开始润色 {} 个字幕片段", total);
         if let Some(ref cb) = progress_cb {
             cb(0.0, "正在加载 Qwen 模型，首次启动通常需要几秒...");
@@ -410,6 +437,8 @@ impl LLMEngine {
         progress_cb: Option<Box<dyn Fn(f64, &str) + Send>>,
     ) -> Result<Vec<Segment>> {
         let total = segments.len();
+        // 同 polish：模型/程序缺失时 fail-fast，避免「翻译完成 0 句」的假成功。
+        self.ensure_ready()?;
         info!("LLM 开始将 {} 个字幕片段翻译为 {}", total, target_lang);
         if let Some(ref cb) = progress_cb {
             cb(0.0, "正在加载 Qwen 翻译模型，首次启动需要几秒...");
@@ -490,6 +519,20 @@ impl LLMEngine {
             }
         }
 
+        // 一句都没译出、又没被取消：多半是模型/程序异常（常驻服务起不来、命令行回退
+        // 也失败）。此时 `Ok` 会让上层显示「翻译已完成（0 句）」——彻头彻尾的假成功，
+        // 用户以为译完了、实际全空。这里改成显式报错，让失败在界面上看得见。
+        if !self.is_cancelled() {
+            let ok = pending
+                .iter()
+                .filter(|&&pos| segments[pos].translation_matches(target_lang))
+                .count();
+            if ok == 0 {
+                return Err(anyhow!(
+                    "Qwen 未能译出任何一句（共 {pending_total} 句待译）。请检查「模型与组件」里的 Qwen 模型与 llama.cpp 是否就位，或改用「在线 API」翻译。"
+                ));
+            }
+        }
         info!("LLM 全部字幕翻译完成");
         Ok(segments)
     }
@@ -918,5 +961,21 @@ mod tests {
         let per = PROMPT_TOKENS_PER_CHAR + OUTPUT_TOKENS_PER_CHAR;
         assert!((small as f64 * per) <= 2048.0);
         assert!((large as f64 * per) <= 8192.0);
+    }
+    /// 离线链路前置检查：模型或程序缺失时必须报错（而非静默跑出 0 句的假成功）。
+    #[test]
+    fn ensure_ready_fails_when_model_or_cli_missing() {
+        let engine = LLMEngine::new(
+            "definitely-not-a-real-cli-path.exe",
+            "definitely-not-a-real-model.gguf",
+            4096,
+            4,
+        );
+        let err = engine.ensure_ready().expect_err("缺模型/程序时应报错");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("模型未就位") || msg.contains("推理程序未就位"),
+            "错误信息应说明缺什么: {msg}"
+        );
     }
 }
