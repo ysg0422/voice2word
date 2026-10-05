@@ -384,18 +384,33 @@ fn is_present_with(item: &DownloadItem, cfg: &Option<AppConfig>) -> bool {
         return false;
     }
     let floor = min_acceptable_size(item);
-    // 压缩包类组件：入口文件之外还必须有伴生文件（如 llama-server.exe），
-    // 否则「解压了一半 / DLL 缺失」会被误判为已就位，用户点翻译时才炸。
-    if let Some(companion) = item.companion {
-        let ok = path.parent().map(|d| d.join(companion).exists()).unwrap_or(false);
-        if !ok {
-            return false;
-        }
+    if companion_missing(&path, item) {
+        return false;
     }
     if floor == 0 {
         return true;
     }
     meta.len() >= floor
+}
+
+/// 压缩包类组件的「伴生文件是否缺失」。
+///
+/// # 为什么只在**默认落地路径**上校验
+///
+/// 伴生文件（如 llama-server.exe）是为了拦住「我们自己下载回来的包
+/// 解压不完整」。但当用户在 `config` 里把路径指向自编译 /
+/// 静态链接的构建时，同目录本来就可能没有那些 DLL——那是完好的。
+/// 若一律要求，会把这种「能用的自定义构建」误判为缺失。
+/// 因此仅在命中默认 dest（即我们自己下载的产物）时才校验；
+/// 用户显式配置的路径交给用户自己负责。
+fn companion_missing(path: &Path, item: &DownloadItem) -> bool {
+    let Some(companion) = item.companion else {
+        return false;
+    };
+    if path != AppConfig::resolve_path(item.dest) {
+        return false;
+    }
+    !path.parent().map(|d| d.join(companion).exists()).unwrap_or(false)
 }
 
 /// 该条目可接受的最小字节数。
@@ -1102,6 +1117,30 @@ mod tests {
         );
 
         let _ = fs::remove_file(&fake_ffmpeg);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 用户把 llama.cpp 指向**自编译 / 静态构建**（同目录没有那些 DLL）时，
+    /// 不能因为「缺伴生文件」而把它误判为缺失。
+    /// 伴生文件校验只应用于**默认落地路径**（即我们自己下载回来的包）。
+    #[test]
+    fn configured_custom_llama_build_without_companion_is_present() {
+        let dir = std::env::temp_dir().join(format!("v2w_cfgllama_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 只有一个 exe，没有 llama-server.exe / DLL（模拟静态构建）
+        let custom = dir.join("llama-completion.exe");
+        fs::write(&custom, vec![0u8; 2_000_000]).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.paths.llama_cli = custom.to_string_lossy().to_string();
+
+        let item = ITEMS.iter().find(|i| i.id == "llama-cpp").expect("有 llama-cpp 条目");
+        assert!(
+            is_present_with(item, &Some(cfg)),
+            "配置指向自构建时，不应要求同目录必有伴生文件"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 
