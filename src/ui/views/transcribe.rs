@@ -221,13 +221,14 @@ impl MainWindow {
             // 核心工作台展示区
             .child(
                 if is_processing {
+                    // GPUI 的 `Div::child` 要求文本是 `'static`（内部转 `SharedString`），
+                    // 无法借用 `self.state.status` 里的 `&str`，因此这里必须 clone 出所有权。
                     let (stage, progress, detail) = match &self.state.status {
                         ProcessStatus::Processing { stage, progress, detail } => {
                             (stage.clone(), *progress, detail.clone())
                         }
-                        _ => ("正在全速转写中...".to_string(), 0.0, "".to_string()),
+                        _ => ("正在全速转写中...".to_string(), 0.0, String::new()),
                     };
-
                     let total_dur = self.state.transcribe_duration;
                     let cur_sec = self.state.streaming_current_sec;
                     let cur_mm = (cur_sec / 60.0) as u32;
