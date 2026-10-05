@@ -480,7 +480,7 @@ impl WhisperEngine {
 
         if !effective_model.exists() {
             anyhow::bail!(
-                "Whisper 模型文件未找到: {:?}。请检查模型是否放置在正确目录。",
+                "Whisper 模型未就位：{:?}。请到「性能设置 → 模型与组件」下载，或在 config.toml 的 paths.whisper_model 指向实际模型文件。",
                 effective_model
             );
         }
@@ -613,6 +613,16 @@ impl WhisperEngine {
         // 与 register_child 之间时，仍由那处复查补杀。两者是串联的两道门，不会互相干扰。
         if self.cancel.load(Ordering::SeqCst) {
             return Ok((Vec::new(), 0.0));
+        }
+
+        // 推理程序缺失时提前给出可操作的中文提示：否则 `cmd.spawn()` 只会抛一句
+        // 原始的「调用 whisper-cli 失败」，新用户看不出是「程序没下」还是「路径写错」。
+        // 放在取消早退之后：取消语义优先，不应被缺失检查打断。
+        if !self.cli_path.exists() {
+            anyhow::bail!(
+                "Whisper 推理程序未就位：{:?}。请到「性能设置 → 模型与组件」下载「whisper.cpp 识别程序」（会自动解压）；若你自行编译了 Vulkan 版，也可在 config.toml 的 paths.whisper_cli 指向它。",
+                self.cli_path
+            );
         }
 
         let mut child = cmd
@@ -1461,7 +1471,7 @@ mod tests {
 
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("调用 whisper-cli 失败"),
+            msg.contains("Whisper 推理程序未就位"),
             "错误应来自 spawn 失败这条路径，实际: {msg}"
         );
     }
