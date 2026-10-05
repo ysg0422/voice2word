@@ -423,13 +423,9 @@ fn is_retryable(err: &anyhow::Error) -> bool {
 /// （本地 vLLM / Ollama 或 32K 以外的自建网关），服务端返回 400；而 `is_retryable`
 /// 把 4xx 判为**不可重试**，于是整片翻译在第一批就带着「在线翻译中止」失败。
 ///
-/// 这里复用同一套字符预算思路：单批源文本（含 `[序号] ` 前缀）超过字符预算就提前
-/// 收口，单条自身超预算时仍单独成批（交回服务端处理总好过在这里死循环）。
+/// 这里复用同一套字符预算思路：单批源文本（含 `[序号] ` 前缀）超过 [`ONLINE_CHAR_BUDGET`]
+/// 就提前收口，单条自身超预算时仍单独成批（交回服务端处理总好过在这里死循环）。
 fn plan_online_batches(pending: &[usize], segments: &[Segment], max_lines: usize) -> Vec<Vec<usize>> {
-    // 在线接口的字符预算：经验值——多数 OpenAI 兼容服务端上下文 >= 8K token，
-    // 按「输入 + 输出」各留一半、每字符约 1 token 估算，单批源文本给到 ~6000 字符
-    // 仍然安全；再叠加条数上限双保险。
-    const ONLINE_CHAR_BUDGET: usize = 6_000;
     let max_lines = max_lines.max(1);
     let mut batches: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
@@ -451,6 +447,17 @@ fn plan_online_batches(pending: &[usize], segments: &[Segment], max_lines: usize
     }
     batches
 }
+
+/// 在线链路单批的**源文本字符预算**（含 `[序号] ` 前缀）。
+///
+/// 推导：按最保守的 8K token 上下文估算——中文约 1 token/字符，一批要同时装下
+/// 「输入 prompt」与「模型输出」，再给系统提示词留 ~200 token，于是单批源文本
+/// 与译文各约 (8192 - 200) / 2 ≈ 4000 字符；再压到 3500 留安全余量。
+///
+/// 注意这只是**安全上限**：普通字幕（每行 < 60 字）即便 40 行也才 ~2400 字符，
+/// 根本够不到预算，因此常规批次仍由条数上限（20/40 条）决定，不会变慢；
+/// 只有出现**超长行**时预算才会提前收口——那正是顶爆小上下文服务端的场景。
+const ONLINE_CHAR_BUDGET: usize = 3_500;
 
 /// 一条字幕译文大致需要的输出 token（本地 Qwen2.5 实测中→英约 0.84 token/字符，
 /// 按 1.0 封顶给膨胀型目标语言留余量）。
@@ -986,7 +993,7 @@ mod tests {
                 .iter()
                 .map(|&p| segs[p].translate_source().chars().count() + 6)
                 .sum();
-            assert!(chars <= 6_000, "单批字符数应受预算约束: {chars}");
+            assert!(chars <= ONLINE_CHAR_BUDGET, "单批字符数应受预算约束: {chars}");
         }
         let mut all2: Vec<usize> = batches2.iter().flatten().copied().collect();
         all2.sort_unstable();
