@@ -636,17 +636,58 @@ impl LLMEngine {
         result
     }
 
+    /// 解析一行「序号 + 译文」，兼容模型常见的几种序号写法。
+    ///
+    /// 主格式是提示词要求的 `[序号] 译文`。但小模型（尤其 Qwen 0.5B）偶尔会写成
+    /// `1. 译文` / `1) 译文` / `1、译文` / `1: 译文`——只认方括号的话，整行会被判为
+    /// 解析失败而**丢失**（配合重试也只是反复失败）。这里按「前导数字 + 分隔符」
+    /// 宽容识别；调用方再用 `expected` 集合过滤，因此译文正文里恰好以数字开头的
+    /// 情况（如「2024 年」）不会误命中，除非该数字正好是某个待译序号。
+    fn parse_indexed_line(line: &str) -> Option<(usize, String)> {
+        let line = line.trim();
+        // 主格式：[123] 译文
+        if let Some(rest) = line.strip_prefix('[') {
+            let (index, text) = rest.split_once(']')?;
+            let index = index.trim().parse::<usize>().ok()?;
+            let text = text.trim_start_matches([':', '：', '-', ' ']).trim();
+            return Some((index, text.to_string()));
+        }
+        // 回退格式：123. / 123) / 123、/ 123: 后跟译文
+        //
+        // 必须紧跟一个**分隔标点**（不是纯空格）才算序号：否则「2 个苹果」这种
+        // 恰好以数字开头的普通行会被误判成「序号 2 的译文」，一旦 2 正好是待译
+        // 序号就会张冠李戴。宁可漏认（下一轮重试仍会补），不可错认。
+        let digits: String = line.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        let rest_raw = &line[digits.len()..];
+        let sep_ok = rest_raw
+            .chars()
+            .next()
+            .map(|c| matches!(c, '.' | ')' | '）' | '、' | ':' | '：' | '-' | '—' | '|'))
+            .unwrap_or(false);
+        if !sep_ok {
+            return None;
+        }
+        let index = digits.parse::<usize>().ok()?;
+        let rest = rest_raw
+            .trim_start_matches(['.', ')', '）', '、', ':', '：', '-', '—', '|', ' '])
+            .trim();
+        if rest.is_empty() {
+            return None;
+        }
+        Some((index, rest.to_string()))
+    }
+
     pub(crate) fn parse_batch_response(
         raw: &str,
         expected: &std::collections::HashSet<usize>,
     ) -> std::collections::HashMap<usize, String> {
         let mut result = std::collections::HashMap::new();
         for line in raw.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix('[') else { continue };
-            let Some((index, text)) = rest.split_once(']') else { continue };
-            let Ok(index) = index.trim().parse::<usize>() else { continue };
-            let text = Self::strip_stop_tags(text.trim().trim_start_matches([':', '：', '-', ' ']).trim());
+            let Some((index, text)) = Self::parse_indexed_line(line) else { continue };
+            let text = Self::strip_stop_tags(&text);
             if expected.contains(&index) && !text.is_empty() {
                 result.insert(index, text);
             }
@@ -719,6 +760,51 @@ mod tests {
         let result = LLMEngine::parse_batch_response("[1] 第一条。\n[2] 第二条！", &expected);
         assert_eq!(result.get(&1).map(String::as_str), Some("第一条。"));
         assert_eq!(result.get(&2).map(String::as_str), Some("第二条！"));
+    }
+
+    /// 解析器必须宽容小模型常见的几种序号写法，否则整行会被判为失败而丢失。
+    #[test]
+    fn parses_tolerant_index_formats() {
+        let expected = HashSet::from([1, 2, 3, 4, 5]);
+        let raw = "[1] 方括号\n2. 点号\n3) 右括号\n4、顿号\n5：全角冒号";
+        let result = LLMEngine::parse_batch_response(raw, &expected);
+        assert_eq!(result.get(&1).map(String::as_str), Some("方括号"));
+        assert_eq!(result.get(&2).map(String::as_str), Some("点号"));
+        assert_eq!(result.get(&3).map(String::as_str), Some("右括号"));
+        assert_eq!(result.get(&4).map(String::as_str), Some("顿号"));
+        assert_eq!(result.get(&5).map(String::as_str), Some("全角冒号"));
+    }
+
+    /// 回退格式（`2. 译文`）必须带**分隔标点**：纯空格开头的「2 个苹果」不算序号，
+    /// 否则会把它误当成序号 2 的译文，一旦 2 恰是待译序号就张冠李戴。
+    #[test]
+    fn fallback_index_requires_separator_punctuation() {
+        assert_eq!(
+            LLMEngine::parse_indexed_line("2. Hello"),
+            Some((2, "Hello".to_string()))
+        );
+        assert_eq!(
+            LLMEngine::parse_indexed_line("3、你好"),
+            Some((3, "你好".to_string()))
+        );
+        assert_eq!(LLMEngine::parse_indexed_line("2 个苹果"), None);
+        assert_eq!(LLMEngine::parse_indexed_line("Hello world"), None);
+    }
+
+    /// 宽容解析**不能**把译文正文里以数字开头的句子误当成序号。
+    /// 靠 `expected` 集合过滤：正文里的数字几乎不会是「另一个待译序号」。
+    #[test]
+    fn tolerant_parse_does_not_steal_numbered_body() {
+        let expected = HashSet::from([1]);
+        // 第 1 句的译文正文恰好以「2024」开头——不该被当成序号 2024 的条目
+        let raw = "[1] 2024 年是很特别的一年。";
+        let result = LLMEngine::parse_batch_response(raw, &expected);
+        assert_eq!(
+            result.get(&1).map(String::as_str),
+            Some("2024 年是很特别的一年。"),
+            "正文里的数字不该被误切"
+        );
+        assert_eq!(result.len(), 1);
     }
 
     #[test]
