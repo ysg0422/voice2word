@@ -1446,9 +1446,15 @@ impl MainWindow {
                             this.state.translate_progress = 1.0;
                             this.state.translate_status_msg = format!("翻译已完成（{} 句）", done);
                         }
-                        // 无论完成还是取消，已产出的译文都要并入当前字幕表
-                        this.state.segments = translated_segs;
-                        this.state.bump_segments_revision();
+                        // 译文**按句合并**回当前字幕表，而不是整表覆盖。
+                        //
+                        // 翻译要跑几分钟，而这段时间里用户仍能在剪辑台编辑字幕
+                        // （改错别字、调时间、拆合句）。引擎拿的是开始时的快照，
+                        // 若在这里 `= translated_segs` 直接覆盖，用户这几分钟的
+                        // 编辑会被静默回滚——改了半天，翻译一结束全没了。
+                        // `merge_translations` 只把译文按 index 并回去，原文/时间
+                        // 等用户改动原样保留。
+                        this.state.merge_translations(translated_segs);
                         // 译文必须落库，否则重启后历史库里的双语对照会凭空消失
                         this.state.segments_dirty = true;
                         this.state.flush_segments_if_dirty();

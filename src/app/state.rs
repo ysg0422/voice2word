@@ -723,6 +723,34 @@ impl AppState {
             .filter(|seg| seg.translation_matches(target_lang))
             .count()
     }
+    /// 把翻译结果**按句合并**回当前字幕表，而不是整表覆盖。
+    ///
+    /// # 为什么不能直接 `self.segments = translated`
+    ///
+    /// 翻译是在后台跑几分钟的任务，而字幕编辑器在翻译期间**仍然可编辑**（用户
+    /// 可以一边等一边改错别字、调时间、拆合句）。引擎拿到的是**开始时**克隆的一份
+    /// 字幕快照，若收尾时直接 `self.segments = translated` 覆盖，就等于把用户在这
+    /// 几分钟里做的所有编辑**静默回滚**——改了半天，翻译一结束全没了。
+    ///
+    /// 这里只把译文（`translation` / `translation_lang`）按 `index` 合并回当前表：
+    /// 用户改过的 `text` / `polished` / 时间戳原样保留，只补上译文。
+    /// 当前表里已经消失的句子（用户删了）跳过；引擎多出来的句子忽略。
+    pub fn merge_translations(&mut self, translated: Vec<Segment>) {
+        use std::collections::HashMap;
+        let by_index: HashMap<usize, Segment> =
+            translated.into_iter().map(|s| (s.index, s)).collect();
+        for seg in self.segments.iter_mut() {
+            if let Some(src) = by_index.get(&seg.index) {
+                // 只搬译文，不碰用户可能已改动的原文/时间/说话人
+                if src.translation.is_some() {
+                    seg.translation = src.translation.clone();
+                    seg.translation_lang = src.translation_lang.clone();
+                }
+            }
+        }
+        self.bump_segments_revision();
+    }
+
 
     /// 切换目标语言并落盘。目标语言是长期偏好，必须持久化，
     /// 否则重启后又跳回默认语言，用户会以为设置没生效。
@@ -2029,5 +2057,48 @@ mod tests {
             "缓存命中应复用同一份 Arc，而不是每帧深拷贝整份字幕"
         );
         assert_eq!(first.segments.len(), 2);
+    }
+    /// 回归：翻译收尾必须**按句合并**，不能整表覆盖。
+    ///
+    /// 翻译在后台跑几分钟，期间用户仍可编辑字幕。修前收尾是
+    /// `self.segments = translated`（开始时的快照），会把用户这几分钟的编辑
+    /// 静默回滚。这里模拟「翻译期间用户改了原文」，断言：译文合并进来了，
+    /// 但用户的原文改动**没有被回滚**。
+    #[test]
+    fn merge_translations_keeps_concurrent_user_edits() {
+        use crate::subtitle::Segment;
+
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 2.0, "原始第一句"),
+            Segment::new(2, 2.0, 4.0, "原始第二句"),
+        ]);
+
+        // 引擎开始时的快照（只带译文，原文是旧的）
+        let mut translated = state.segments.clone();
+        translated[0].translation = Some("First sentence.".to_string());
+        translated[0].translation_lang = Some("English".to_string());
+        translated[1].translation = Some("Second sentence.".to_string());
+        translated[1].translation_lang = Some("English".to_string());
+
+        // 翻译期间用户改了第 1 句原文、并删掉了第 2 句
+        state.segments[0].text = "用户改过的第一句".to_string();
+        state.segments.remove(1);
+
+        state.merge_translations(translated);
+
+        assert_eq!(state.segments.len(), 1, "用户删掉的句子不该被翻译结果复活");
+        assert_eq!(
+            state.segments[0].text, "用户改过的第一句",
+            "用户的原文改动不该被翻译收尾回滚"
+        );
+        assert_eq!(
+            state.segments[0].translation.as_deref(),
+            Some("First sentence."),
+            "译文应正确合并进来"
+        );
+        assert_eq!(
+            state.segments[0].translation_lang.as_deref(),
+            Some("English")
+        );
     }
 }
