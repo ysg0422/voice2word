@@ -1164,7 +1164,11 @@ impl MainWindow {
                 if is_latest {
                     if let Ok(frame_path) = frame_result {
                         let _ = this.update(cx, |this, cx| {
-                            this.state.preview_frame_path = Some(frame_path);
+                            // 在这里判一次存在性：`get_or_extract` 正常返回的路径都已落盘，
+                            // 但磁盘帧目录会按「最近使用」裁剪——把存在性收敛到后台更新点，
+                            // 渲染路径就不必每帧对预览帧 `path.exists()`。
+                            this.state.preview_frame_path =
+                                if frame_path.exists() { Some(frame_path) } else { None };
                             cx.notify();
                         });
                     }

@@ -217,9 +217,17 @@ impl MainWindow {
 
                 let _ = this.update(cx, |this, cx| {
                     this.library_thumb_inflight.remove(&task_id);
-                    // 失败也占位（空路径），避免每次渲染重复派发
-                    this.library_thumbs
-                        .insert(task_id, thumb.unwrap_or_default());
+                    // 失败（或后台提取出来的文件随后被磁盘裁剪掉）都归一成**空路径**，
+                    // 空路径 = 「没有可用缩略图」，渲染时直接走占位框且不再重复派发。
+                    // 在这里判一次存在性（后台线程），渲染路径就不必每帧对每张卡片
+                    // `path.exists()` —— 库列表没有虚拟化，40 张卡片就是每帧 40 次 stat。
+                    let raw = thumb.unwrap_or_default();
+                    let usable = if raw.as_os_str().is_empty() || raw.exists() {
+                        raw
+                    } else {
+                        PathBuf::new()
+                    };
+                    this.library_thumbs.insert(task_id, usable);
                     cx.notify();
                 });
             })
@@ -304,7 +312,7 @@ impl MainWindow {
                     .relative();
 
                 match self.library_thumbs.get(&task_id) {
-                    Some(path) if path.exists() => thumb_box
+                    Some(path) if !path.as_os_str().is_empty() => thumb_box
                         // 视频首帧铺满卡片，Cover 裁剪对齐 16:9
                         .child(
                             img(path.clone())

@@ -178,13 +178,13 @@ impl MainWindow {
         let can_export = !self.state.segments.is_empty();
         let can_play = self.state.selected_file.is_some() && can_export && !is_processing;
 
-        let (stage_text, progress_val, _detail_text) = match &self.state.status {
-            ProcessStatus::Idle => ("就绪", 0.0, String::new()),
-            ProcessStatus::Processing { stage, progress, detail } => {
-                (stage.as_str(), *progress, detail.clone())
-            }
-            ProcessStatus::Completed => ("转写完成", 1.0, String::new()),
-            ProcessStatus::Failed(e) => ("出错", 0.0, e.clone()),
+        // 只取阶段名与进度即可：`detail` 从未被消费（下游只用 stage/progress），
+        // 而它是 `String`——每帧 `clone()` 一个可能非空的详情串纯属浪费。改为只借用。
+        let (stage_text, progress_val) = match &self.state.status {
+            ProcessStatus::Idle => ("就绪", 0.0),
+            ProcessStatus::Processing { stage, progress, .. } => (stage.as_str(), *progress),
+            ProcessStatus::Completed => ("转写完成", 1.0),
+            ProcessStatus::Failed(_) => ("出错", 0.0),
         };
 
         div()

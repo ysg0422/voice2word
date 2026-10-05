@@ -577,30 +577,14 @@ impl MainWindow {
                 div().size_full()
             }
         } else if let Some(ref frame_path) = self.state.preview_frame_path {
-            if frame_path.exists() {
-                div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        img(frame_path.clone())
-                            .size_full()
-                    )
-            } else {
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_1p5()
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_BODY))
-                            // 监视器视口恒为深底，文字须用媒体区 token
-                            .text_color(Theme::text_on_media())
-                            .child("正在提取视频帧..."),
-                    )
-            }
+            // `preview_frame_path` 只在**确认文件存在**时被写入（见 actions.rs 的帧抽取
+            // 回写点），因此这里不再逐帧 `exists()`。空 `Some` 不会出现。
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(img(frame_path.clone()).size_full())
         } else if self.state.selected_file.is_some() {
             div()
                 .flex()
