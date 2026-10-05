@@ -732,18 +732,30 @@ impl AppState {
     /// 字幕快照，若收尾时直接 `self.segments = translated` 覆盖，就等于把用户在这
     /// 几分钟里做的所有编辑**静默回滚**——改了半天，翻译一结束全没了。
     ///
-    /// 这里只把译文（`translation` / `translation_lang`）按 `index` 合并回当前表：
-    /// 用户改过的 `text` / `polished` / 时间戳原样保留，只补上译文。
-    /// 当前表里已经消失的句子（用户删了）跳过；引擎多出来的句子忽略。
+    /// # 为什么键是「起始时间」而不是 `index`
+    ///
+    /// 拆句 / 合句 / 删句都会调用 [`AppState::reindex_segments`] 把序号整体重排。
+    /// 若按 `index` 合并，重排后的句子会拿到**别人**的译文——静默张冠李戴，比丢译文
+    /// 严重得多（用户看到的是「译文内容对不上原句」却毫无提示）。
+    ///
+    /// 起始时间在三种结构编辑下都稳定：拆句时前半段保留原 `start`、合句时保留首段
+    /// `start`、删句时其余句子不动。只有用户手动微调时间才会变，那种情况下宁可**漏认**
+    /// （不合并，留待下次补译），也绝不错误合并。
+    ///
+    /// 只搬**非空**译文，不碰用户可能已改动的原文 / 时间 / 说话人。
     pub fn merge_translations(&mut self, translated: Vec<Segment>) {
         use std::collections::HashMap;
-        let by_index: HashMap<usize, Segment> =
-            translated.into_iter().map(|s| (s.index, s)).collect();
+        // 毫秒取整做键：快照与当前表里的 start 是**逐字节复制**的同一 f64，
+        // 取整后必然相等；同时规避 -0.0 / 0.0 之类的位级差异。
+        let key = |start: f64| -> i64 { (start * 1000.0).round() as i64 };
+        let mut by_start: HashMap<i64, Segment> = HashMap::with_capacity(translated.len());
+        for seg in translated {
+            by_start.insert(key(seg.start), seg);
+        }
         for seg in self.segments.iter_mut() {
-            if let Some(src) = by_index.get(&seg.index) {
-                // 只搬**非空**译文，不碰用户可能已改动的原文/时间/说话人。
+            if let Some(src) = by_start.get(&key(seg.start)) {
                 // 引擎解析失败时可能回填空串，用它覆盖用户已有的好译文会让
-                // 「翻译一结束译文变空白」。
+                // 「翻译一结束译文变空白」，故只认非空译文。
                 if src.has_translation() {
                     seg.translation = src.translation.clone();
                     seg.translation_lang = src.translation_lang.clone();
@@ -2129,6 +2141,42 @@ mod tests {
             state.segments[0].translation.as_deref(),
             Some("Hello"),
             "空串译文不该覆盖用户已有的好译文"
+        );
+    }
+
+    /// 回归：结构编辑（拆/合/删）会重排序号，合并键必须是**起始时间**而非 index。
+    ///
+    /// 这里删掉第一句，剩余那句的 index 从 2 变成 1。若按 index 合并，它会拿到
+    /// 原本属于第 1 句（start 0.0）的译文——张冠李戴。按 start 合并则正确拿到
+    /// 它自己（start 2.0）的译文。
+    #[test]
+    fn merge_translations_survives_index_shift_from_delete() {
+        use crate::subtitle::Segment;
+
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 2.0, "第一句"),
+            Segment::new(2, 2.0, 4.0, "第二句"),
+        ]);
+        // 引擎快照：两句都带各自的译文
+        let mut translated = state.segments.clone();
+        translated[0].translation = Some("First.".to_string());
+        translated[0].translation_lang = Some("English".to_string());
+        translated[1].translation = Some("Second.".to_string());
+        translated[1].translation_lang = Some("English".to_string());
+
+        // 翻译期间用户删掉了第一句，并重新编号（reindex_segments 的行为）
+        state.segments.remove(0);
+        state.reindex_segments();
+        assert_eq!(state.segments.len(), 1);
+        assert_eq!(state.segments[0].index, 1, "删句后序号被重排");
+        assert_eq!(state.segments[0].start, 2.0);
+
+        state.merge_translations(translated);
+
+        assert_eq!(
+            state.segments[0].translation.as_deref(),
+            Some("Second."),
+            "剩余句（start 2.0）必须拿到自己的译文，而不是被重排后的 index 撞上的第一句译文"
         );
     }
 }
