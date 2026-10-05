@@ -610,12 +610,21 @@ impl LLMEngine {
             .map(|seg| format!("[{}] {}", seg.index, seg.translate_source()))
             .collect::<Vec<_>>()
             .join("\n");
+        // 源语言线索：ASR 已检测到整批的语言（Segment::language）。多给这一条，
+        // 模型在「日→中」「中英混排」这类方向上更少漏译、更少误翻专名。
+        let src_hint = crate::subtitle::dominant_language(source_segments.iter().copied())
+            .map(|code| format!("源语言为{}；", crate::subtitle::language_name(&code)))
+            .unwrap_or_default();
         let prompt = format!(
-            "<|im_start|>system\n你是一个专业字幕翻译专家。将给出的字幕文本准确翻译为地道的{}。保持原意，语言通顺紧凑。必须逐行输出，格式为 [序号] 翻译文本；不解释，不合并，不遗漏。<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\n你是一个专业字幕翻译专家。{}将给出的字幕文本准确翻译为地道的{}。保持原意，语言通顺紧凑。必须逐行输出，格式为 [序号] 翻译文本；不解释，不合并，不遗漏。<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            src_hint,
             target_lang,
             source
         );
-        let source_chars: usize = source_segments.iter().map(|s| s.translate_source().chars().count()).sum();
+        let source_chars: usize = source_segments
+            .iter()
+            .map(|s| s.translate_source().chars().count())
+            .sum();
         let max_tokens = output_token_budget(source_chars, self.ctx_size);
         let output = server
             .and_then(|server| server.complete(&prompt, max_tokens))

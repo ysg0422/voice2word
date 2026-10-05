@@ -161,6 +161,59 @@ pub fn has_speaker_labels(segments: &[Segment]) -> bool {
     segments.iter().any(|s| s.speaker.is_some())
 }
 
+/// 把 ISO-639-1 语言码转成提示词里用的可读语言名；未知码原样返回（去掉空白）。
+///
+/// 翻译提示词此前只告诉模型**目标语言**，从不提源语言。对「中→英」这类常见方向
+/// 影响不大，但遇到「日语→中文」「中英混排→英文」时，模型少了这个线索容易漏译
+/// 或把不该翻的专名翻掉。这里把 ASR 已经检测到的语言（`Segment::language`）转成
+/// 可读名喂给提示词，作为一条轻量线索。
+pub fn language_name(code: &str) -> String {
+    match code.trim().to_ascii_lowercase().as_str() {
+        "zh" | "zh-cn" | "zh-hans" | "cmn" => "中文",
+        "zh-tw" | "zh-hant" => "繁体中文",
+        "en" => "英语",
+        "ja" | "jp" => "日语",
+        "ko" => "韩语",
+        "ru" => "俄语",
+        "fr" => "法语",
+        "de" => "德语",
+        "es" => "西班牙语",
+        "it" => "意大利语",
+        "pt" => "葡萄牙语",
+        "yue" => "粤语",
+        other => return other.to_string(),
+    }
+    .to_string()
+}
+
+/// 这一批字幕里**最常见**的非空语言码（用于给翻译提示词提供源语言线索）。
+///
+/// 取众数而非「第一条」：批次可能跨越语种切换，但绝大多数情况下整批同语种，
+/// 众数比首条更稳。全为空时返回 `None`（此时提示词不带源语言线索）。
+///
+/// 接受 `&[&Segment]`（调用方常先筛出非空片段）或 `&[Segment]` 等任意片段迭代器。
+pub fn dominant_language<'a, I>(segments: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a Segment>,
+{
+    use std::collections::HashMap;
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for seg in segments {
+        if let Some(lang) = seg
+            .language
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+        {
+            *counts.entry(lang).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(lang, _)| lang.to_string())
+}
+
 /// 按导出模式取文本，并按需带上说话人前缀。
 pub fn export_text_for(seg: &Segment, mode: ExportMode, with_speaker: bool) -> String {
     if with_speaker {
@@ -1012,5 +1065,38 @@ mod tests {
                 "拆出的片段必须保留目标语言标记"
             );
         }
+    }
+    /// 语言码 → 可读名；未知码原样返回（不 panic、不丢信息）。
+    #[test]
+    fn language_name_maps_known_and_passes_unknown() {
+        assert_eq!(language_name("zh"), "中文");
+        assert_eq!(language_name("ZH-CN"), "中文");
+        assert_eq!(language_name("en"), "英语");
+        assert_eq!(language_name("ja"), "日语");
+        // 未知码原样返回（去空白），不 panic
+        assert_eq!(language_name("  xx  "), "xx");
+    }
+
+    /// 众数取整批最常出现的语言；全空返回 None。
+    #[test]
+    fn dominant_language_takes_mode() {
+        let mut a = Segment::new(1, 0.0, 1.0, "一");
+        a.language = Some("ja".to_string());
+        let mut b = Segment::new(2, 1.0, 2.0, "二");
+        b.language = Some("ja".to_string());
+        let mut c = Segment::new(3, 2.0, 3.0, "三");
+        c.language = Some("en".to_string());
+        let segs = vec![a, b, c];
+        assert_eq!(dominant_language(segs.iter()).as_deref(), Some("ja"));
+
+        // 全空 → None
+        let none = vec![Segment::new(1, 0.0, 1.0, "x")];
+        assert_eq!(dominant_language(none.iter()), None);
+
+        // 空串语言码同样忽略
+        let mut blank = Segment::new(1, 0.0, 1.0, "x");
+        blank.language = Some("   ".to_string());
+        let blank_segs = vec![blank];
+        assert_eq!(dominant_language(blank_segs.iter()), None);
     }
 }

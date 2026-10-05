@@ -446,13 +446,18 @@ fn request_batch_translation(
         .collect::<Vec<_>>()
         .join("\n");
 
+    // 源语言线索：ASR 已检测到整批语言（Segment::language），多给这一条能减少
+    // 「日→中」「中英混排」方向上的漏译与专名误翻。
+    let src_hint = crate::subtitle::dominant_language(batch.iter().copied())
+        .map(|code| format!("源语言为{}；", crate::subtitle::language_name(&code)))
+        .unwrap_or_default();
     let payload = serde_json::json!({
         "model": cfg.model,
         "messages": [
             {
                 "role": "system",
                 "content": format!(
-                    "你是专业字幕翻译专家。把用户给出的带序号字幕逐条翻译为地道的{target_lang}，\
+                    "你是专业字幕翻译专家。{src_hint}把用户给出的带序号字幕逐条翻译为地道的{target_lang}，\
                      保持原意与语气，语言通顺紧凑。\
                      必须逐行输出，格式严格为「[序号] 译文」，不得解释、不得合并、不得遗漏、不得改动序号。"
                 )
