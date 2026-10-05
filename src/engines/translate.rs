@@ -405,15 +405,27 @@ fn request_batch_with_retry(
 /// 错误是否值得重试：网络层错误与 429 / 5xx 属于暂时性，其余（401/403/404 等）不是。
 fn is_retryable(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
-    if msg.contains("HTTP 429") {
-        return true;
+    // 优先按真实状态码判断。不能直接 `contains("HTTP 5")`：因为错误文案里还拼了服务端的
+    // 响应体（snippet），一个 4xx 的响应体若恰好提到了「HTTP 5xx」，就会被误判为可重试而白等退避。
+    if let Some(code) = http_status_code(&msg) {
+        return code == 429 || (500..=599).contains(&code);
     }
-    // 5xx：取 "HTTP 5xx" 的首位数字判断，避免把 500/502/503/504 逐一列全
-    if msg.contains("HTTP 5") {
-        return true;
-    }
-    // ureq 的网络类错误不带 HTTP 状态码，文案里带「无法连接」或底层 io 错误
+    // 无状态码：ureq 的网络类错误，文案里带「无法连接」或底层 io 错误
     msg.contains("无法连接") || msg.contains("timed out") || msg.contains("timeout")
+}
+
+/// 从错误文案里取出「HTTP <状态码>」的状态码。取不到返回 `None`。
+///
+/// 只认**紧跟在 "HTTP " 之后的 3 位数字**：避开响应体里其他位置的数字（如日志里的流水号）。
+fn http_status_code(msg: &str) -> Option<u16> {
+    let idx = msg.find("HTTP ")?;
+    let rest = &msg[idx + "HTTP ".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() == 3 {
+        digits.parse::<u16>().ok()
+    } else {
+        None
+    }
 }
 
 /// 把待译下标切成在线请求的批次：**同时**受「条数」与「字符数」约束。
@@ -684,6 +696,12 @@ mod tests {
         assert!(!is_retryable(&anyhow!("在线接口返回 HTTP 403（API Key 无效或无权限）")));
         assert!(!is_retryable(&anyhow!("在线接口返回 HTTP 404（接口地址或模型名不存在）")));
         assert!(!is_retryable(&anyhow!("在线接口响应不是合法 JSON: expected value")));
+        // 4xx 的响应体里提到「HTTP 5xx」时不得被误判为可重试（只看真实状态码）
+        assert!(!is_retryable(&anyhow!(
+            "在线接口返回 HTTP 400: upstream said HTTP 500, bad request"
+        )));
+        // 500-系列应重试
+        assert!(is_retryable(&anyhow!("在线接口返回 HTTP 503: service unavailable")));
     }
 
     /// 增量翻译：已有目标语言译文的句子不该再发请求（在线接口按 token 计费）。
