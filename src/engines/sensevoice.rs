@@ -66,6 +66,12 @@ pub struct SenseVoiceEngine {
     threads: u32,
     /// 运行 runner 脚本的 Python 解释器（默认 "python"，可配置为绝对路径）
     python_path: PathBuf,
+    /// 让路模式：子进程降到 BELOW_NORMAL_PRIORITY_CLASS。
+    ///
+    /// 此前这里**只设了 CREATE_NO_WINDOW**，完全忽略 `gpu.yield_to_desktop`。
+    /// 后果：用户以为开了「让路」，实际上 SenseVoice 的 Python 进程仍以正常
+    /// 优先级抢占 CPU，长音频多进程并行时桌面照样卡。
+    yield_to_desktop: bool,
     cancel: Arc<AtomicBool>,
     active_children: Arc<Mutex<Vec<ChildEntry>>>,
 }
@@ -85,6 +91,8 @@ impl SenseVoiceEngine {
             vad_model_path,
             threads,
             PathBuf::from("python"),
+            // 默认与 config.toml 的 gpu.yield_to_desktop 默认值一致
+            true,
         )
     }
 
@@ -96,6 +104,7 @@ impl SenseVoiceEngine {
         vad_model_path: P4,
         threads: u32,
         python_path: P5,
+        yield_to_desktop: bool,
     ) -> Self {
         Self {
             runner_path: runner_path.as_ref().to_path_buf(),
@@ -104,6 +113,7 @@ impl SenseVoiceEngine {
             vad_model_path: vad_model_path.as_ref().to_path_buf(),
             threads: threads.max(1),
             python_path: python_path.as_ref().to_path_buf(),
+            yield_to_desktop,
             cancel: Arc::new(AtomicBool::new(false)),
             active_children: Arc::new(Mutex::new(Vec::new())),
         }
@@ -171,11 +181,9 @@ impl SenseVoiceEngine {
         );
 
         let mut cmd = Command::new(&self.python_path);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
+        // 让路模式必须在这里生效：SenseVoice 走 Python 子进程，长音频下
+        // 多进程并行会吃满 CPU。只设 CREATE_NO_WINDOW 等于忽略用户的让路开关。
+        super::media_pipeline::apply_child_flags(&mut cmd, self.yield_to_desktop);
 
         let th = threads.unwrap_or(self.threads);
         cmd.arg(&self.runner_path)
@@ -211,11 +219,9 @@ impl SenseVoiceEngine {
         info!("SenseVoice 启动纯内存管道非自回归推流转写 (0 磁盘 I/O)");
 
         let mut cmd = Command::new(&self.python_path);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
+        // 让路模式必须在这里生效：SenseVoice 走 Python 子进程，长音频下
+        // 多进程并行会吃满 CPU。只设 CREATE_NO_WINDOW 等于忽略用户的让路开关。
+        super::media_pipeline::apply_child_flags(&mut cmd, self.yield_to_desktop);
 
         let th = threads.unwrap_or(self.threads);
         cmd.arg(&self.runner_path)

@@ -71,6 +71,10 @@ fn main() -> Result<()> {
     } else {
         info!("GPU 策略: 让路模式关闭，转写子进程按正常优先级抢占 CPU/GPU");
     }
+    // 把让路设置下发给所有引擎的公共出口。此前只有 whisper 与预览播放器
+    // 读了配置，SenseVoice / 标点 / LLM / FFmpeg 全部硬编码 CREATE_NO_WINDOW，
+    // 用户打开「让路」对它们毫无作用——长音频多进程并行时桌面照样卡。
+    engines::media_pipeline::set_yield_to_desktop(config.gpu.yield_to_desktop);
     // GPU 占用上限：让路只降 CPU 调度优先级，压不住已经排进 GPU 队列的命令缓冲，
     // 想让桌面真正跟手必须按占空比给 GPU 留空窗
     let gpu_limit_percent = if whisper_gpu {
@@ -164,6 +168,7 @@ fn main() -> Result<()> {
                 vad,
                 config.pipeline.whisper_threads,
                 python_path.clone(),
+                config.gpu.yield_to_desktop,
             )))
         } else {
             warn!(
@@ -188,6 +193,7 @@ fn main() -> Result<()> {
                 model,
                 4,
                 python_path.clone(),
+                config.gpu.yield_to_desktop,
             )))
         } else {
             warn!("CT-Transformer 极速标点引擎未就绪 (runner={}, model={})", runner.exists(), model.exists());

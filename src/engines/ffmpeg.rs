@@ -65,11 +65,8 @@ impl FFmpegEngine {
         );
 
         let mut cmd = Command::new(&self.ffmpeg_path);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
+        // 跟随全局让路设置（此前硬编码 CREATE_NO_WINDOW，忽略用户的开关）
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
         cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(input_path)
             .args(["-map", "0:a:0?", "-vn", "-sn", "-dn"]);
@@ -119,11 +116,8 @@ impl FFmpegEngine {
             std::fs::create_dir_all(parent).ok();
         }
         let mut cmd = Command::new(&self.ffmpeg_path);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
+        // 跟随全局让路设置（此前硬编码 CREATE_NO_WINDOW，忽略用户的开关）
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
         cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
         if start_sec > 0.0 {
             cmd.arg("-ss").arg(format!("{:.3}", start_sec));
@@ -201,11 +195,8 @@ impl FFmpegEngine {
         );
 
         let mut cmd = Command::new(&self.ffmpeg_path);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
+        // 跟随全局让路设置（此前硬编码 CREATE_NO_WINDOW，忽略用户的开关）
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
         cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
         if let Some(s) = start_sec {
             cmd.arg("-ss").arg(format!("{:.3}", s.max(0.0)));
@@ -267,11 +258,8 @@ impl FFmpegEngine {
     ) -> Result<Vec<i16>> {
         let input_path = input_path.as_ref();
         let mut cmd = Command::new(&self.ffmpeg_path);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
+        // 跟随全局让路设置（此前硬编码 CREATE_NO_WINDOW，忽略用户的开关）
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
         cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(input_path)
             .args(["-map", "0:a:0?", "-vn", "-sn", "-dn"]);
@@ -341,11 +329,8 @@ impl FFmpegEngine {
     /// 探测失败返回 None（调用方回退 16:9）。
     pub fn get_resolution<P: AsRef<Path>>(&self, input_path: P) -> Option<(u32, u32)> {
         let mut cmd = Command::new(&self.ffmpeg_path);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
+        // 跟随全局让路设置（此前硬编码 CREATE_NO_WINDOW，忽略用户的开关）
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
         let output = cmd.arg("-i").arg(input_path.as_ref()).output().ok()?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         for line in stderr.lines() {
@@ -382,11 +367,8 @@ impl FFmpegEngine {
 
         let mut cmd = Command::new(&self.ffmpeg_path);
 
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: 杜绝弹出控制台窗口与系统句柄消耗
-        }
+        // 跟随全局让路设置（此前硬编码 CREATE_NO_WINDOW，忽略用户的开关）
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
 
         let status = cmd
             .arg("-ss")
@@ -428,11 +410,8 @@ impl FFmpegEngine {
             std::fs::create_dir_all(parent)?;
         }
         let mut cmd = Command::new(&self.ffmpeg_path);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
+        // 跟随全局让路设置（此前硬编码 CREATE_NO_WINDOW，忽略用户的开关）
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
         let status = cmd
             .args(["-hide_banner", "-loglevel", "error", "-y"])
             .arg("-ss")

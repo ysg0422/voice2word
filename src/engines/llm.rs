@@ -29,7 +29,10 @@ impl LlamaServer {
         let port = listener.local_addr().ok()?.port();
         drop(listener);
 
-        let child = Command::new(server_path)
+        let mut cmd = Command::new(server_path);
+        // 让路模式：llama-server 是常驻进程，CPU 占用高，必须跟随全局设置
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
+        let child = cmd
             .arg("-m")
             .arg(model_path)
             .arg("-c")
@@ -241,7 +244,10 @@ impl LLMEngine {
         file.write_all(prompt.as_bytes()).ok()?;
         drop(file);
 
-        let output = Command::new(&self.cli_path)
+        let mut cli_cmd = Command::new(&self.cli_path);
+        // 让路模式同样适用于命令行回退路径
+        super::media_pipeline::apply_default_child_flags(&mut cli_cmd);
+        let output = cli_cmd
             .arg("-m")
             .arg(&self.model_path)
             .arg("-c")

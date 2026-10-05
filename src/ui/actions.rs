@@ -119,6 +119,9 @@ impl MainWindow {
         // 避免阻塞这次实体更新闭包。
         self.state.transcribe_duration = 0.0;
         self.state.transcribe_file = Some(file.clone());
+        // 换了文件 → 「0 秒命中」的缓存结果必然作废。不清理的话，
+        // 新文件会沿用上一个文件的缓存命中信息（界面显示错误的句数）。
+        self.state.invalidate_cached_transcription();
         self.state.status = ProcessStatus::Idle;
         self.state.active_tab = WorkspaceTab::Generate;
         cx.notify();
@@ -628,6 +631,9 @@ impl MainWindow {
                                                 )
                                                 .ok();
                                             this.state.refresh_recent_tasks();
+                                            // 刚写入了新记录 → 让「0 秒命中」缓存失效，
+                                            // 否则再次选中同一文件会显示旧的命中状态
+                                            this.state.invalidate_cached_transcription();
                                         }
 
                                         // 2. 将本次成果同步至剪辑校对工作台。

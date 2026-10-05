@@ -329,6 +329,37 @@ pub fn apply_background_priority(cmd: &mut Command) {
     let _ = cmd;
 }
 
+/// 进程级的「让路模式」总开关。
+///
+/// # 为什么用全局而不是逐个引擎传参
+///
+/// 这是**进程级策略**，不是某个引擎的属性：用户在设置页打开一次「让路」，
+/// 期望的是「所有会吃 CPU/GPU 的子进程都降优先级」。而 `FFmpegEngine` 与
+/// `LLMEngine` 在代码里有十多个构造点（预览抽帧、波形、代理、时长探测、
+/// 翻译……），逐个加参数既啰嗦又必然会漏。
+///
+/// 默认 `true`，与 `config.toml` 的 `gpu.yield_to_desktop` 默认值一致；
+/// 启动时由 `main.rs` 按配置覆盖一次。
+static YIELD_TO_DESKTOP: AtomicBool = AtomicBool::new(true);
+
+/// 设置让路模式（启动时由 `main.rs` 按 `config.toml` 调用一次）。
+pub fn set_yield_to_desktop(on: bool) {
+    YIELD_TO_DESKTOP.store(on, Ordering::Relaxed);
+}
+
+/// 当前是否处于让路模式。
+pub fn yield_to_desktop() -> bool {
+    YIELD_TO_DESKTOP.load(Ordering::Relaxed)
+}
+
+/// 按**全局让路设置**为子进程套用启动标志（隐藏窗口 + 可选降优先级）。
+///
+/// 绝大多数调用点都应该用这个，而不是自己写 `creation_flags(0x08000000)`——
+/// 后者会静默忽略用户的让路开关。
+pub fn apply_default_child_flags(cmd: &mut Command) {
+    apply_child_flags(cmd, yield_to_desktop());
+}
+
 /// 统一的子进程启动标志：始终隐藏控制台；`yield_to_desktop` 为真时额外降到
 /// BELOW_NORMAL_PRIORITY_CLASS，把 CPU 与 GPU 调度权重让给桌面与前台程序。
 ///
@@ -1060,5 +1091,20 @@ mod tests {
             assert!(px[0] < 12 && px[1] < 12 && px[2] < 12, "got {:?}", px);
             assert_eq!(px[3], 255);
         }
+    }
+    // ─────────── 让路模式开关 ───────────
+
+    /// 全局开关必须能读回写入的值（它决定所有子进程是否降优先级）。
+    #[test]
+    fn yield_to_desktop_flag_roundtrips() {
+        // 保存现场：这个开关是进程级全局量，测试之间会互相影响
+        let before = yield_to_desktop();
+
+        set_yield_to_desktop(true);
+        assert!(yield_to_desktop(), "写入 true 后应读回 true");
+        set_yield_to_desktop(false);
+        assert!(!yield_to_desktop(), "写入 false 后应读回 false");
+
+        set_yield_to_desktop(before);
     }
 }
