@@ -344,7 +344,8 @@ impl LLMEngine {
     /// 「先起常驻服务、失败再回退命令行」两条路。模型文件缺失时两条路都起不来，
     /// 循环里每批都返回空映射，最后 `Ok(segments)` 原样返回——用户看到的是
     /// 「翻译已完成（0 句）」这种既没报错、也没任何结果的诡异状态，根本不知道
-    /// 是「没下模型」。这里在开工前就给出可操作的中文提示（去「模型与组件」下载）。
+    /// 是「没下模型」。这里在开工前就给出可操作的中文提示：模型指向「模型与
+    /// 组件」下载，推理程序指向 README 的手动准备章节。
     fn ensure_ready(&self) -> Result<()> {
         if !self.model_path.exists() {
             return Err(anyhow!(
@@ -353,9 +354,12 @@ impl LLMEngine {
             ));
         }
         // 命令行回退要用的主程序；常驻服务是它的同目录兄弟（llama-server.exe）
+        // 注意：模型在「模型与组件」里可一键下载，**llama.cpp 可执行文件不在下载清单**
+        // 里（体积/平台差异大，见 README 的「准备模型与组件」），所以措辞只提示
+        // 「放置位置 + 去哪看获取方式」，不承诺界面里有下载按钮。
         if !self.cli_path.exists() {
             return Err(anyhow!(
-                "本地推理程序未就位：{}。请到「性能设置 → 模型与组件」补下 llama.cpp 组件。",
+                "本地推理程序未就位：{}。请在 config.toml 的 paths.llama_cli 指向 llama.cpp 的 llama-completion.exe（获取方式见 README「准备模型与组件」），或改用「在线 API」翻译。",
                 self.cli_path.display()
             ));
         }
