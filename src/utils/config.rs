@@ -693,7 +693,7 @@ impl AppConfig {
         // 本地覆盖是可选的：不存在、或解析失败，都不应阻断启动——
         // 覆盖文件坏掉时退回共享配置，比整个应用起不来要好。
         //
-        // 注意必须**紧邻 config.toml** 解析，不能走 esolve_path：后者以项目根为基准，
+        // 注意必须**紧邻 config.toml** 解析，不能走 resolve_path：后者以项目根为基准，
         // 会把覆盖文件错认到项目根下，于是「自定义路径的配置」永远读不到自己的覆盖。
         let local_path = Self::local_override_path(&full_path);
         if local_path.exists() {
