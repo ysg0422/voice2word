@@ -243,7 +243,7 @@ impl MainWindow {
                     };
 
                     let eta = self.state.whisper_eta_label();
-                    let seg_count = self.state.streaming_segments.len();
+                    let seg_count = self.state.streaming_segment_count;
 
                     div()
                         .id("lightweight-processing-dashboard")

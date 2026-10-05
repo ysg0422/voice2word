@@ -329,6 +329,13 @@ pub struct AppState {
     // 实时流式转写数据与当前识别推进绝对时间 (秒)
     pub streaming_segments: Vec<Segment>,
     pub streaming_current_sec: f64,
+    /// 自本次转写开始累计的已流式生成句数。
+    ///
+    /// 为什么不能直接用 `streaming_segments.len()`：那个缓冲区被裁剪到
+    /// [`Self::STREAMING_WINDOW`]（32 句），长视频下计数会永远卡在 32——
+    /// 界面上「已流式生成 N 句」看起来像卡死了。这里单独计一个
+    /// 单调计数器，与缓冲区裁剪解耦。
+    pub streaming_segment_count: usize,
 
     // 处理选项
     pub language: String,
@@ -544,6 +551,7 @@ impl AppState {
             recent_tasks,
             streaming_segments: Vec::new(),
             streaming_current_sec: 0.0,
+            streaming_segment_count: 0,
             language: lang,
             output_format: fmt,
             enable_polish: polish,
@@ -914,6 +922,7 @@ impl AppState {
             self.streaming_current_sec = seg.end;
         }
         self.streaming_segments.push(seg);
+        self.streaming_segment_count += 1;
         if self.streaming_segments.len() > Self::STREAMING_WINDOW {
             let excess = self.streaming_segments.len() - Self::STREAMING_WINDOW;
             self.streaming_segments.drain(..excess);
@@ -924,6 +933,7 @@ impl AppState {
     pub fn clear_streaming(&mut self) {
         self.streaming_segments.clear();
         self.streaming_current_sec = 0.0;
+        self.streaming_segment_count = 0;
     }
 
     /// 检查当前待转写文件是否已存在本地已完成解析记录 (用于 0 秒智能缓存命中)。
@@ -1926,6 +1936,11 @@ mod tests {
             "窗口必须钉死在上限内，实际 {}",
             state.streaming_segments.len()
         );
+        // 计数器不受窗口裁剪影响：已流式生成句数应等于实际 push 的总数
+        assert_eq!(
+            state.streaming_segment_count, 500,
+            "计数器必须是单调累计值，不能被缓冲区裁剪截断"
+        );
         // 保留的是**最近**的若干句，不是最早的
         let last = state.streaming_segments.last().expect("应有内容");
         assert_eq!(last.index, 500, "窗口里应保留最后 push 的那句");
@@ -1957,6 +1972,7 @@ mod tests {
         state.clear_streaming();
         assert!(state.streaming_segments.is_empty());
         assert_eq!(state.streaming_current_sec, 0.0);
+        assert_eq!(state.streaming_segment_count, 0, "清理必须把计数器也归零");
     }
 
     /// 渲染路径每帧都会调 `get_cached_transcription()`，而底层 `find_cached_task`
