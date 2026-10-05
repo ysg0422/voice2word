@@ -242,12 +242,27 @@ fn translate_via_online_api(
             }
         }
         if matched < chunk.len() {
-            soft_failed_batches += 1;
-            warn!(
-                "在线翻译本批输出不完整 ({}/{} 条)，未匹配条目保持未翻译",
-                matched,
-                chunk.len()
+            // 本批没译全：把漏掉的句子**对半重试**，而不是整批丢弃。
+            // 输出被截断时，拆成更小的批通常一轮就能补齐；实在补不上才计入软失败。
+            let missing: Vec<usize> = chunk
+                .iter()
+                .copied()
+                .filter(|&pos| !segments[pos].translation_matches(target_lang))
+                .collect();
+            let recovered = retry_missing_online(
+                cfg,
+                &mut segments,
+                &missing,
+                target_lang,
+                &cancel,
             );
+            if recovered < missing.len() {
+                soft_failed_batches += 1;
+                warn!(
+                    "在线翻译本批输出不完整（{matched}/{} 条，折半重试后补回 {recovered} 条）",
+                    chunk.len()
+                );
+            }
         }
         completed += chunk.len();
         if let Some(ref cb) = progress_cb {
@@ -265,6 +280,64 @@ fn translate_via_online_api(
         info!("在线 API 字幕翻译完成");
     }
     Ok(segments)
+}
+
+/// 单批重试上限。选 3 而不是更多：429 限流通常需要数秒才恢复，再多轮也是空转，
+/// 把一批里**没译出**的句子按更小的批重试，返回补回的条数。
+///
+/// 与离线链路同一套思路：输出被截断时整批丢弃会让用户看到「翻译少了几句」，
+/// 拆成更小的批（折半）通常一轮就能补齐。最多折半到单句；对某句反复补不上
+/// （模型就是吐不出该序号）则放弃，交由上层计入软失败并提示用户可再点一次补译。
+fn retry_missing_online(
+    cfg: &OnlineApiConfig,
+    segments: &mut [Segment],
+    missing: &[usize],
+    target_lang: &str,
+    cancel: &AtomicBool,
+) -> usize {
+    if missing.is_empty() {
+        return 0;
+    }
+    let mut recovered = 0usize;
+    let mut todo: Vec<usize> = missing.to_vec();
+    let mut guard = 0;
+    while !todo.is_empty() && guard < 8 {
+        guard += 1;
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let half = todo.len().div_ceil(2);
+        let mut still: Vec<usize> = Vec::new();
+        for sub in todo.chunks(half) {
+            if cancel.load(Ordering::Relaxed) {
+                return recovered;
+            }
+            let batch: Vec<&Segment> = sub.iter().map(|&pos| &segments[pos]).collect();
+            match request_batch_with_retry(cfg, &batch, target_lang, cancel) {
+                Ok(map) => {
+                    for &pos in sub {
+                        if let Some(text) = map.get(&segments[pos].index) {
+                            segments[pos].translation = Some(text.clone());
+                            segments[pos].translation_lang = Some(target_lang.to_string());
+                            recovered += 1;
+                        } else {
+                            still.push(pos);
+                        }
+                    }
+                }
+                // 请求整体失败：不再继续折半（多半是网络/限流，继续只会更糟），
+                // 把剩余的留给上层计入软失败。
+                Err(_) => {
+                    still.extend_from_slice(sub);
+                }
+            }
+        }
+        if still.len() >= todo.len() {
+            break;
+        }
+        todo = still;
+    }
+    recovered
 }
 
 /// 单批重试上限。选 3 而不是更多：429 限流通常需要数秒才恢复，再多轮也是空转，
@@ -317,6 +390,29 @@ fn is_retryable(err: &anyhow::Error) -> bool {
 
 
 /// 请求一批字幕的译文，返回 `序号 -> 译文` 映射
+/// 一条字幕译文大致需要的输出 token（本地 Qwen2.5 实测中→英约 0.84 token/字符，
+/// 按 1.0 封顶给膨胀型目标语言留余量）。
+const OUTPUT_TOKENS_PER_CHAR: usize = 1;
+/// 输出 token 的硬下限：即使极短批也要给模型留出「[N] xxx」的最小生成空间。
+const MIN_OUTPUT_TOKENS: usize = 256;
+
+/// 按本批源文本长度推导 `max_tokens`。
+///
+/// 在线接口不显式给 `max_tokens` 时，部分服务端默认值偏小（如 512），长批会**静默
+/// 截断**——返回的译文行数少于请求行数，而 `parse_batch_response` 只认能解析出的行，
+/// 少掉的那几句就原样留空。这里按源字符数给足预算（不再依赖服务端默认），
+/// 同时用一个宽松上限防止个别服务对超大值报错。
+fn max_output_tokens(batch: &[&Segment]) -> usize {
+    let chars: usize = batch
+        .iter()
+        .map(|seg| seg.translate_source().chars().count())
+        .sum();
+    (chars * OUTPUT_TOKENS_PER_CHAR)
+        .max(MIN_OUTPUT_TOKENS)
+        .min(8_192)
+}
+
+/// 请求一批字幕的译文，返回 `序号 -> 译文` 映射
 fn request_batch_translation(
     cfg: &OnlineApiConfig,
     batch: &[&Segment],
@@ -342,6 +438,7 @@ fn request_batch_translation(
             { "role": "user", "content": source }
         ],
         "temperature": 0.2,
+        "max_tokens": max_output_tokens(batch),
         "stream": false,
     });
 
@@ -770,5 +867,67 @@ mod tests {
             MAX_BATCH_RETRIES,
             "应恰好重试 MAX_BATCH_RETRIES 次"
         );
+    }
+    /// `max_tokens` 必须随本批源文本长度增长，且不小于硬下限。
+    ///
+    /// 在线接口不显式给 `max_tokens` 时部分服务端默认值偏小（512），长批会静默
+    /// 截断——返回行数少于请求行数。这个断言锁死「不再依赖服务端默认」。
+    #[test]
+    fn online_max_tokens_scales_with_batch() {
+        let short = vec![Segment::new(1, 0.0, 1.0, "你好")];
+        let short_refs: Vec<&Segment> = short.iter().collect();
+        assert_eq!(
+            max_output_tokens(&short_refs),
+            MIN_OUTPUT_TOKENS,
+            "极短批也应给足最小生成空间"
+        );
+
+        let long_text = "字".repeat(300);
+        let long: Vec<Segment> = (1..=20).map(|i| Segment::new(i, 0.0, 1.0, &long_text)).collect();
+        let long_refs: Vec<&Segment> = long.iter().collect();
+        let budget = max_output_tokens(&long_refs);
+        assert!(
+            budget > MIN_OUTPUT_TOKENS,
+            "长批的输出预算应显著大于下限，实际 {budget}"
+        );
+        assert!(budget <= 8_192, "不应超过宽松上限: {budget}");
+    }
+
+    /// 折半重试：第一批返回不完整（缺 [2]），补译请求返回 [2]，最终两句都有译文。
+    ///
+    /// 修前本批解析不完整只会记一条日志、缺的句子留空；修后应自动补回。
+    #[test]
+    fn online_retry_fills_missing_lines() {
+        let first = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] Hello." } }]
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "choices": [{ "message": { "content": "[2] World." } }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![first, second]);
+        let cfg = online_cfg_for(&addr);
+
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "你好"),
+            Segment::new(2, 1.0, 2.0, "世界"),
+        ];
+        let out = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("mock 服务器应返回成功");
+
+        assert_eq!(out[0].translation.as_deref(), Some("Hello."));
+        assert_eq!(
+            out[1].translation.as_deref(),
+            Some("World."),
+            "第一批漏掉的 [2] 应被折半重试补回"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2, "应发出「首批 + 补译」两次请求");
     }
 }

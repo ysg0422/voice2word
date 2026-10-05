@@ -13,10 +13,47 @@ use tracing::{info, warn};
 use crate::subtitle::Segment;
 use crate::utils::TempPathGuard;
 
-// Qwen 0.5B 的 4096 上下文可安全容纳约 24 条普通字幕；批量越大，模型加载
-// 次数越少。优化后从 8 条/批提升到 24 条/批，速度提升 2-3 倍。
+// 每批最多 24 条字幕：条数是「模型加载 / 请求次数」的节流阀，批量越大越快。
 const MAX_SEGMENTS_PER_BATCH: usize = 24;
-const MAX_BATCH_CHARS: usize = 3_600;
+
+/// 输入侧 token/字符 经验系数。
+///
+/// 实测 Qwen2.5 分词器：中文字幕约 0.72~0.80 token/字符。取 0.85 留余量，
+/// 避免英文混排、数字、符号偏多时低估输入长度。
+const PROMPT_TOKENS_PER_CHAR: f64 = 0.85;
+/// 输出侧 token/字符 经验系数。
+///
+/// 译文长度可能**超过**原文（中→英实测约 0.84 token/字符），按 1.0 封顶，
+/// 给膨胀型目标语言留足空间。
+const OUTPUT_TOKENS_PER_CHAR: f64 = 1.0;
+/// 上下文里留给系统提示词、对话模板与特殊 token 的余量。
+const CTX_MARGIN: u32 = 192;
+
+/// 按上下文窗口推导「一批源文本的字符预算」。
+///
+/// 一批要同时装下「输入 prompt」与「模型输出」，两者都随源字符数线性增长，
+/// 因此预算 = (ctx - 余量) / (输入系数 + 输出系数)。硬编码 3600 字符在
+/// 4096 上下文下会让「长行 + 输出膨胀」的组合越界，表现为最后几行译文被截断。
+fn batch_char_budget(ctx_size: u32) -> usize {
+    let usable = ctx_size.saturating_sub(CTX_MARGIN) as f64;
+    let per_char = PROMPT_TOKENS_PER_CHAR + OUTPUT_TOKENS_PER_CHAR;
+    ((usable / per_char) as usize).max(64)
+}
+
+/// 一批译文的输出 token 上限（`-n` / `n_predict`）。
+///
+/// 此前按「条数 × 48」估算并夹在 768：那是 8 条/批时代的经验值，假定每行都短。
+/// 而批次实际按**字符**预算切分，长行批次（如 24 行 × 150 字）需要上千 token
+/// 才能译完，768 会**静默截断**——实测 24 行只译出 14 行（模型撞上 767 步上限），
+/// 剩下 10 行原样留空，用户看到的是「翻译莫名其妙少了几句」。
+///
+/// 改为按源字符数给预算，再用上下文剩余空间封顶，保证 prompt + 输出不越界。
+fn output_token_budget(source_chars: usize, ctx_size: u32) -> u32 {
+    let want = (source_chars as f64 * OUTPUT_TOKENS_PER_CHAR) as u32;
+    let prompt_est = (source_chars as f64 * PROMPT_TOKENS_PER_CHAR) as u32 + 64;
+    let remaining = ctx_size.saturating_sub(prompt_est).saturating_sub(64);
+    want.max(128).min(remaining.max(128))
+}
 
 struct LlamaServer {
     child: Child,
@@ -107,14 +144,22 @@ impl Drop for LlamaServer {
 }
 
 /// 把待译下标切成批次：**同时**受「条数」与「字符数」约束。
+/// 把待译下标切成批次：**同时**受「条数」与「字符数」约束。
 ///
 /// 原先只按条数切（24 条一批），一条长字幕就能把整批输入顶到模型上下文之外，
 /// 表现为最后几条译文缺失（`parse_batch_response` 只认能解析出的行）。这里补上
-/// 字符预算：一批的源文本总长超过 [`MAX_BATCH_CHARS`] 就提前收口。
+/// 字符预算：一批的源文本总长超过 `char_budget` 就提前收口。
+///
+/// `char_budget` 由 [`batch_char_budget`] 按上下文窗口推导，不再硬编码——
+/// 硬编码值在「长行 + 译文膨胀」时会越界，输出被截断且无法察觉。
 ///
 /// 单条自身就超预算时仍单独成批——否则会陷入「永远切不出合法批次」的死循环，
 /// 交回模型截断处理比在这里卡死更合理。
-fn plan_translate_batches(pending: &[usize], segments: &[Segment]) -> Vec<Vec<usize>> {
+fn plan_translate_batches(
+    pending: &[usize],
+    segments: &[Segment],
+    char_budget: usize,
+) -> Vec<Vec<usize>> {
     let mut batches: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
     let mut current_chars = 0usize;
@@ -124,7 +169,7 @@ fn plan_translate_batches(pending: &[usize], segments: &[Segment]) -> Vec<Vec<us
         let cost = segments[pos].translate_source().chars().count() + 6;
         let would_overflow = !current.is_empty()
             && (current.len() >= MAX_SEGMENTS_PER_BATCH
-                || current_chars + cost > MAX_BATCH_CHARS);
+                || current_chars + cost > char_budget);
         if would_overflow {
             batches.push(std::mem::take(&mut current));
             current_chars = 0;
@@ -318,24 +363,32 @@ impl LLMEngine {
                 break;
             }
             let group_len = group.len();
-            // 长字幕按字符数进一步拆开，避免输入占满模型上下文。
-            let batches: Vec<&mut [Segment]> = if group.iter().map(|seg| seg.text.len()).sum::<usize>() > MAX_BATCH_CHARS {
-                group.chunks_mut(MAX_SEGMENTS_PER_BATCH / 2).collect()
-            } else {
-                vec![group]
-            };
-
-            for batch in batches {
+            // 长字幕按**字符预算**进一步拆开：预算随上下文窗口推导（见
+            // `batch_char_budget`），不再靠「超过阈值就把批数减半」这种粗估。
+            let budget = batch_char_budget(self.ctx_size);
+            let mut start = 0usize;
+            while start < group.len() {
                 if self.is_cancelled() {
                     break;
                 }
-                let results = self.polish_batch(batch, server.as_mut());
-                for seg in batch.iter_mut() {
+                let mut end = start;
+                let mut chars = 0usize;
+                while end < group.len() {
+                    let cost = group[end].text.chars().count() + 6;
+                    if end > start && chars + cost > budget {
+                        break;
+                    }
+                    chars += cost;
+                    end += 1;
+                }
+                let results = self.polish_batch(&group[start..end], server.as_mut());
+                for seg in group[start..end].iter_mut() {
                     seg.polished = results
                         .get(&seg.index)
                         .cloned()
                         .unwrap_or_else(|| seg.text.clone());
                 }
+                start = end;
             }
 
             completed += group_len;
@@ -395,7 +448,8 @@ impl LLMEngine {
             info!("增量翻译：{total} 句中有 {pending_total} 句需要翻译为 {target_lang}");
         }
 
-        let batches = plan_translate_batches(&pending, &segments);
+        let budget = batch_char_budget(self.ctx_size);
+        let batches = plan_translate_batches(&pending, &segments, budget);
         let mut completed = 0usize;
         for chunk in batches {
             if self.is_cancelled() {
@@ -407,11 +461,23 @@ impl LLMEngine {
             // 检查器搏斗的写法。相比一次模型推理，这点拷贝可忽略。
             let batch: Vec<Segment> = chunk.iter().map(|&pos| segments[pos].clone()).collect();
             let results = self.translate_batch(&batch, target_lang, server.as_mut());
+            let mut missed: Vec<usize> = Vec::new();
             for &pos in &chunk {
-                if let Some(trans) = results.get(&segments[pos].index) {
-                    segments[pos].translation = Some(trans.clone());
-                    segments[pos].translation_lang = Some(target_lang.to_string());
+                match results.get(&segments[pos].index) {
+                    Some(trans) => {
+                        segments[pos].translation = Some(trans.clone());
+                        segments[pos].translation_lang = Some(target_lang.to_string());
+                    }
+                    // 本批没译出这一句：收集起来，稍后**对半重试**。
+                    None => missed.push(pos),
                 }
+            }
+
+            // 模型偶发漏行（输出截断、行格式串味）时，整批丢弃会让用户看到
+            // 「翻译莫名其妙少了几句」。把漏掉的句子按更小的批（对半）再试一轮，
+            // 小批更不容易撞上输出长度上限，通常一轮就能补齐。
+            if !missed.is_empty() {
+                self.retry_missing(&mut segments, &missed, target_lang, server.as_mut());
             }
 
             completed += chunk.len();
@@ -426,6 +492,60 @@ impl LLMEngine {
 
         info!("LLM 全部字幕翻译完成");
         Ok(segments)
+    }
+
+    /// 把上一轮**没译出**的句子按更小的批重试一轮，直到补全或批次缩到单句为止。
+    ///
+    /// 为什么要专门做这件事：模型输出被截断 / 行格式串味时，`translate_batch` 只
+    /// 返回能解析出的行，剩下的**静默丢失**——用户看到的是「翻译莫名其妙少了几句」，
+    /// 而且没有任何提示。这里把漏掉的句子折半再问一次：批越小，输出越不容易撞上
+    /// 长度上限，一轮下来通常就补齐了；实在补不上的（如某个序号模型就是吐不出）
+    /// 才放弃，并留一条日志。
+    fn retry_missing(
+        &self,
+        segments: &mut [Segment],
+        missed: &[usize],
+        target_lang: &str,
+        mut server: Option<&mut LlamaServer>,
+    ) {
+        let mut todo: Vec<usize> = missed.to_vec();
+        // 每轮把待补清单**对半**拆成更小的批（单条时 half=1，即「单句重试一次」）。
+        // `guard` 只防极端情况下的死循环；正常 24 条最多 5 轮就收敛。
+        let mut guard = 0;
+        while !todo.is_empty() && guard < 8 {
+            guard += 1;
+            let half = todo.len().div_ceil(2);
+            let mut still_missing: Vec<usize> = Vec::new();
+            for sub in todo.chunks(half) {
+                if self.is_cancelled() {
+                    return;
+                }
+                let batch: Vec<Segment> = sub.iter().map(|&p| segments[p].clone()).collect();
+                let results = self.translate_batch(&batch, target_lang, server.as_deref_mut());
+                for &pos in sub {
+                    match results.get(&segments[pos].index) {
+                        Some(trans) => {
+                            segments[pos].translation = Some(trans.clone());
+                            segments[pos].translation_lang = Some(target_lang.to_string());
+                        }
+                        None => still_missing.push(pos),
+                    }
+                }
+            }
+            // 这一轮没有任何进展：模型对这几个序号就是不出，收手，免得空转。
+            if still_missing.len() >= todo.len() {
+                todo = still_missing;
+                break;
+            }
+            todo = still_missing;
+        }
+        if !todo.is_empty() {
+            warn!(
+                count = todo.len(),
+                "Qwen 翻译对 {} 句折半重试后仍未译出，保持未翻译（可再次点击「开始翻译」补译）",
+                todo.len()
+            );
+        }
     }
 
     fn translate_batch(
@@ -452,7 +572,8 @@ impl LLMEngine {
             target_lang,
             source
         );
-        let max_tokens = (source_segments.len() as u32 * 48).clamp(128, 768);
+        let source_chars: usize = source_segments.iter().map(|s| s.translate_source().chars().count()).sum();
+        let max_tokens = output_token_budget(source_chars, self.ctx_size);
         let output = server
             .and_then(|server| server.complete(&prompt, max_tokens))
             .or_else(|| self.run_prompt(&prompt, max_tokens));
@@ -495,7 +616,8 @@ impl LLMEngine {
             "<|im_start|>system\n你是严格的字幕润色工具。为每条字幕添加标点并修正错别字，保持原意。若文本为中文语境下误识别出的英文幻读（如数学公式读音被识为英文句子），请将其修正翻译为地道的简体中文。必须逐行输出，格式为 [序号] 润色文本；不解释，不合并，不遗漏。<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
             source
         );
-        let max_tokens = (source_segments.len() as u32 * 32).clamp(96, 512);
+        let source_chars: usize = source_segments.iter().map(|s| s.text.chars().count()).sum();
+        let max_tokens = output_token_budget(source_chars, self.ctx_size);
         let output = server
             .and_then(|server| server.complete(&prompt, max_tokens))
             .or_else(|| self.run_prompt(&prompt, max_tokens));
@@ -584,7 +706,10 @@ impl LLMEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_translate_batches, LLMEngine, MAX_BATCH_CHARS, MAX_SEGMENTS_PER_BATCH};
+    use super::{
+        batch_char_budget, output_token_budget, plan_translate_batches, LLMEngine,
+        MAX_SEGMENTS_PER_BATCH, OUTPUT_TOKENS_PER_CHAR, PROMPT_TOKENS_PER_CHAR,
+    };
     use crate::subtitle::Segment;
     use std::collections::HashSet;
 
@@ -611,6 +736,7 @@ mod tests {
         assert_eq!(LLMEngine::clean_response(&format!("“{long_zh}”"), "原文"), long_zh);
     }
     // ─────────── 翻译批次规划 ───────────
+    // ─────────── 翻译批次规划 ───────────
 
     fn seg_at(index: usize, text: &str) -> Segment {
         Segment::new(index, 0.0, 1.0, text)
@@ -621,7 +747,7 @@ mod tests {
     fn plan_batches_respects_max_segments() {
         let segs: Vec<Segment> = (1..=50).map(|i| seg_at(i, "短句")).collect();
         let pending: Vec<usize> = (0..50).collect();
-        let batches = plan_translate_batches(&pending, &segs);
+        let batches = plan_translate_batches(&pending, &segs, batch_char_budget(4096));
         assert!(
             batches.iter().all(|b| b.len() <= MAX_SEGMENTS_PER_BATCH),
             "每批不得超过 MAX_SEGMENTS_PER_BATCH"
@@ -632,25 +758,22 @@ mod tests {
         assert_eq!(all, pending);
     }
 
-    /// 长句必须按**字符数**提前收口——这是本次修复的核心：
-    /// 原先只按条数切，一条长字幕就能把整批顶出模型上下文。
+    /// 长句必须按**字符预算**提前收口——原先只按条数切，一条长字幕就能把整批
+    /// 顶出模型上下文，表现为最后几行译文缺失。
     #[test]
     fn plan_batches_splits_on_char_budget() {
-        // 每条 500 字，MAX_BATCH_CHARS=3600 → 每批最多 7 条
+        let budget = batch_char_budget(4096);
         let long = "字".repeat(500);
         let segs: Vec<Segment> = (1..=24).map(|i| seg_at(i, &long)).collect();
         let pending: Vec<usize> = (0..24).collect();
-        let batches = plan_translate_batches(&pending, &segs);
+        let batches = plan_translate_batches(&pending, &segs, budget);
         assert!(batches.len() > 1, "长句应被拆成多批");
         for b in &batches {
             let chars: usize = b
                 .iter()
                 .map(|&p| segs[p].translate_source().chars().count() + 6)
                 .sum();
-            assert!(
-                chars <= MAX_BATCH_CHARS,
-                "批次字符数超预算: {chars} > {MAX_BATCH_CHARS}"
-            );
+            assert!(chars <= budget, "批次字符数超预算: {chars} > {budget}");
         }
         let mut all: Vec<usize> = batches.iter().flatten().copied().collect();
         all.sort_unstable();
@@ -660,9 +783,10 @@ mod tests {
     /// 单条就超过字符预算时仍要单独成批：否则会切不出合法批次而死循环。
     #[test]
     fn plan_batches_keeps_oversized_single_segment() {
-        let huge = "字".repeat(MAX_BATCH_CHARS * 2);
+        let budget = batch_char_budget(4096);
+        let huge = "字".repeat(budget * 2);
         let segs = vec![seg_at(1, &huge)];
-        let batches = plan_translate_batches(&[0], &segs);
+        let batches = plan_translate_batches(&[0], &segs, budget);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0], vec![0]);
     }
@@ -671,6 +795,42 @@ mod tests {
     #[test]
     fn plan_batches_empty_input() {
         let segs: Vec<Segment> = Vec::new();
-        assert!(plan_translate_batches(&[], &segs).is_empty());
+        assert!(plan_translate_batches(&[], &segs, batch_char_budget(4096)).is_empty());
+    }
+
+    /// 回归：输出 token 预算必须**随批次源字符数增长**。
+    ///
+    /// 修前按「条数 × 48」夹在 768：24 行 × 150 字的批次实际需要 1300+ token 才能
+    /// 译完，768 会在第 14 行撞上限后**静默截断**（实测复现），用户看到的是
+    /// 「翻译莫名其妙少了几句」。这个断言锁死「长批不再被 768 卡死」。
+    #[test]
+    fn output_budget_scales_with_source_length() {
+        let ctx = 4096;
+        let short = output_token_budget(200, ctx);
+        let long = output_token_budget(3_000, ctx);
+        assert!(
+            long > 768,
+            "长批的输出预算必须突破旧的 768 上限，实际 {long}"
+        );
+        assert!(long > short, "源越长，输出预算应越大");
+        // 无论多长，prompt + 输出都不该超过上下文窗口
+        assert!(
+            (3_000f64 * PROMPT_TOKENS_PER_CHAR) as u32 + long <= ctx,
+            "prompt + 输出越界: {long}"
+        );
+        // 极短批也要给足最小生成空间
+        assert!(output_token_budget(10, ctx) >= 128);
+    }
+
+    /// 字符预算必须随上下文窗口缩放，且给输入 + 输出都留出空间。
+    #[test]
+    fn char_budget_scales_with_context() {
+        let small = batch_char_budget(2048);
+        let large = batch_char_budget(8192);
+        assert!(large > small, "上下文越大，单批字符预算应越大");
+        // 4096 上下文下的预算 ×（输入+输出系数）不得超过窗口
+        let per = PROMPT_TOKENS_PER_CHAR + OUTPUT_TOKENS_PER_CHAR;
+        assert!((small as f64 * per) <= 2048.0);
+        assert!((large as f64 * per) <= 8192.0);
     }
 }
