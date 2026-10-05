@@ -1,6 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn test_full_pipeline_run() {

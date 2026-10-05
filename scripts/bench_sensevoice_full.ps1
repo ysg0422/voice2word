@@ -20,7 +20,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
-$ffmpeg = 'A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe'
+. (Join-Path $PSScriptRoot 'resolve_paths.ps1')
+$ffmpeg = Get-V2wPath -Key 'ffmpeg' -ProjectRoot $projectRoot
 $runner = Join-Path $projectRoot 'tools\sensevoice_runner.py'
 $model = Join-Path $projectRoot 'models\sensevoice\model.int8.onnx'
 $tokens = Join-Path $projectRoot 'models\sensevoice\tokens.txt'

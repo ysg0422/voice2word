@@ -41,7 +41,6 @@ static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 #[cfg(target_os = "windows")]
 mod job {
     use std::os::windows::io::AsRawHandle;
-    use std::process::Command;
     use std::sync::OnceLock;
     use tracing::{info, warn};
 
@@ -116,13 +115,6 @@ mod job {
         let _ = job_handle();
     }
 
-    /// 把已 spawn 的子进程并入全局 Job。
-    ///
-    /// 用 `OpenProcess` 拿一个独立句柄再 `AssignProcessToJobObject`，而不是直接拿
-    /// `Child` 的句柄——`Child` 的句柄通常不带宽 `PROCESS_SET_QUOTA` 权限，直接用会失败。
-    pub fn assign(child: &Command) {
-        let _ = child; // Command 不暴露 pid；实际赋值在 spawn 之后按 pid 进行
-    }
 
     /// 按 PID 把进程并入全局 Job（spawn 成功后调用）。
     pub fn assign_pid(pid: u32) {

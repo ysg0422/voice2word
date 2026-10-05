@@ -103,6 +103,38 @@ impl Drop for LlamaServer {
     }
 }
 
+/// 把待译下标切成批次：**同时**受「条数」与「字符数」约束。
+///
+/// 原先只按条数切（24 条一批），一条长字幕就能把整批输入顶到模型上下文之外，
+/// 表现为最后几条译文缺失（`parse_batch_response` 只认能解析出的行）。这里补上
+/// 字符预算：一批的源文本总长超过 [`MAX_BATCH_CHARS`] 就提前收口。
+///
+/// 单条自身就超预算时仍单独成批——否则会陷入「永远切不出合法批次」的死循环，
+/// 交回模型截断处理比在这里卡死更合理。
+fn plan_translate_batches(pending: &[usize], segments: &[Segment]) -> Vec<Vec<usize>> {
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut current_chars = 0usize;
+
+    for &pos in pending {
+        // 序号文本（"[123] "）也算输入，粗估 6 字符
+        let cost = segments[pos].translate_source().chars().count() + 6;
+        let would_overflow = !current.is_empty()
+            && (current.len() >= MAX_SEGMENTS_PER_BATCH
+                || current_chars + cost > MAX_BATCH_CHARS);
+        if would_overflow {
+            batches.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current.push(pos);
+        current_chars += cost;
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
 pub struct LLMEngine {
     cli_path: PathBuf,
     model_path: PathBuf,
@@ -330,35 +362,59 @@ impl LLMEngine {
             warn!("Qwen 常驻服务不可用，回退到命令行批量翻译");
         }
 
+        // 增量：只译「还没有目标语言译文」的句子。
+        //
+        // 翻译是可以重入的——中途取消、换目标语言、或补译后来新增的句子，
+        // 都不该把已经译好的部分再烧一遍。判定用 `translation_matches` 精确比对
+        // 目标语言，因此「从 English 改译 日本語」会正确地整篇重译，
+        // 而「上次取消了、这次继续」只补剩下的。
+        let pending: Vec<usize> = segments
+            .iter()
+            .enumerate()
+            .filter(|(_, seg)| {
+                !seg.translate_source().trim().is_empty() && !seg.translation_matches(target_lang)
+            })
+            .map(|(pos, _)| pos)
+            .collect();
+
+        let pending_total = pending.len();
+        if pending_total == 0 {
+            info!("所有片段均已是 {target_lang} 译文，无需翻译");
+            if let Some(ref cb) = progress_cb {
+                cb(1.0, &format!("全部 {total} 句已是{target_lang}译文"));
+            }
+            return Ok(segments);
+        }
+        if pending_total < total {
+            info!("增量翻译：{total} 句中有 {pending_total} 句需要翻译为 {target_lang}");
+        }
+
+        let batches = plan_translate_batches(&pending, &segments);
         let mut completed = 0usize;
-        for group in segments.chunks_mut(MAX_SEGMENTS_PER_BATCH) {
+        for chunk in batches {
             if self.is_cancelled() {
-                info!("翻译被取消，保留已完成的部分（{completed}/{total}）");
+                info!("翻译被取消，保留已完成的部分（{completed}/{pending_total}）");
                 break;
             }
-            let group_len = group.len();
-            let batches: Vec<&mut [Segment]> = if group.iter().map(|seg| seg.text.len()).sum::<usize>() > MAX_BATCH_CHARS {
-                group.chunks_mut(MAX_SEGMENTS_PER_BATCH / 2).collect()
-            } else {
-                vec![group]
-            };
-
-            for batch in batches {
-                if self.is_cancelled() {
-                    break;
-                }
-                let results = self.translate_batch(batch, target_lang, server.as_mut());
-                for seg in batch.iter_mut() {
-                    if let Some(trans) = results.get(&seg.index) {
-                        seg.translation = Some(trans.clone());
-                    }
+            // 克隆这一小批（≤24 条）交给批量函数：`translate_batch` 要的是
+            // `&[Segment]`，而这里必须按下标写回原数组，克隆是唯一不用和借用
+            // 检查器搏斗的写法。相比一次模型推理，这点拷贝可忽略。
+            let batch: Vec<Segment> = chunk.iter().map(|&pos| segments[pos].clone()).collect();
+            let results = self.translate_batch(&batch, target_lang, server.as_mut());
+            for &pos in &chunk {
+                if let Some(trans) = results.get(&segments[pos].index) {
+                    segments[pos].translation = Some(trans.clone());
+                    segments[pos].translation_lang = Some(target_lang.to_string());
                 }
             }
 
-            completed += group_len;
+            completed += chunk.len();
             if let Some(ref cb) = progress_cb {
-                let progress = completed as f64 / total.max(1) as f64;
-                cb(progress, &format!("Qwen 批量翻译中: {}/{}", completed, total));
+                let progress = completed as f64 / pending_total.max(1) as f64;
+                cb(
+                    progress,
+                    &format!("Qwen 批量翻译中: {completed}/{pending_total} 句（共 {total} 句）"),
+                );
             }
         }
 
@@ -374,7 +430,7 @@ impl LLMEngine {
     ) -> std::collections::HashMap<usize, String> {
         let source_segments = segments
             .iter()
-            .filter(|seg| !seg.text.trim().is_empty())
+            .filter(|seg| !seg.translate_source().trim().is_empty())
             .collect::<Vec<_>>();
         if source_segments.is_empty() {
             return Default::default();
@@ -382,7 +438,7 @@ impl LLMEngine {
 
         let source = source_segments
             .iter()
-            .map(|seg| format!("[{}] {}", seg.index, seg.text.replace(['\r', '\n'], " ")))
+            .map(|seg| format!("[{}] {}", seg.index, seg.translate_source()))
             .collect::<Vec<_>>()
             .join("\n");
         let prompt = format!(
@@ -522,7 +578,8 @@ impl LLMEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::LLMEngine;
+    use super::{plan_translate_batches, LLMEngine, MAX_BATCH_CHARS, MAX_SEGMENTS_PER_BATCH};
+    use crate::subtitle::Segment;
     use std::collections::HashSet;
 
     #[test]
@@ -546,5 +603,68 @@ mod tests {
         // 纯中文内容超长时也不 panic
         let long_zh = "式".repeat(50);
         assert_eq!(LLMEngine::clean_response(&format!("“{long_zh}”"), "原文"), long_zh);
+    }
+    // ─────────── 翻译批次规划 ───────────
+
+    fn seg_at(index: usize, text: &str) -> Segment {
+        Segment::new(index, 0.0, 1.0, text)
+    }
+
+    /// 批次必须同时受条数约束。
+    #[test]
+    fn plan_batches_respects_max_segments() {
+        let segs: Vec<Segment> = (1..=50).map(|i| seg_at(i, "短句")).collect();
+        let pending: Vec<usize> = (0..50).collect();
+        let batches = plan_translate_batches(&pending, &segs);
+        assert!(
+            batches.iter().all(|b| b.len() <= MAX_SEGMENTS_PER_BATCH),
+            "每批不得超过 MAX_SEGMENTS_PER_BATCH"
+        );
+        // 所有下标都要被覆盖且不重复
+        let mut all: Vec<usize> = batches.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, pending);
+    }
+
+    /// 长句必须按**字符数**提前收口——这是本次修复的核心：
+    /// 原先只按条数切，一条长字幕就能把整批顶出模型上下文。
+    #[test]
+    fn plan_batches_splits_on_char_budget() {
+        // 每条 500 字，MAX_BATCH_CHARS=3600 → 每批最多 7 条
+        let long = "字".repeat(500);
+        let segs: Vec<Segment> = (1..=24).map(|i| seg_at(i, &long)).collect();
+        let pending: Vec<usize> = (0..24).collect();
+        let batches = plan_translate_batches(&pending, &segs);
+        assert!(batches.len() > 1, "长句应被拆成多批");
+        for b in &batches {
+            let chars: usize = b
+                .iter()
+                .map(|&p| segs[p].translate_source().chars().count() + 6)
+                .sum();
+            assert!(
+                chars <= MAX_BATCH_CHARS,
+                "批次字符数超预算: {chars} > {MAX_BATCH_CHARS}"
+            );
+        }
+        let mut all: Vec<usize> = batches.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, pending, "不得丢句或重复");
+    }
+
+    /// 单条就超过字符预算时仍要单独成批：否则会切不出合法批次而死循环。
+    #[test]
+    fn plan_batches_keeps_oversized_single_segment() {
+        let huge = "字".repeat(MAX_BATCH_CHARS * 2);
+        let segs = vec![seg_at(1, &huge)];
+        let batches = plan_translate_batches(&[0], &segs);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0], vec![0]);
+    }
+
+    /// 空输入不该产出空批次。
+    #[test]
+    fn plan_batches_empty_input() {
+        let segs: Vec<Segment> = Vec::new();
+        assert!(plan_translate_batches(&[], &segs).is_empty());
     }
 }

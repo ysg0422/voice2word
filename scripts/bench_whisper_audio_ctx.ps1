@@ -34,7 +34,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $video = Join-Path $projectRoot 'testVideo\03.1.3概率不等式.mp4'
-$ffmpeg = 'A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe'
+. (Join-Path $PSScriptRoot 'resolve_paths.ps1')
+$ffmpeg = Get-V2wPath -Key 'ffmpeg' -ProjectRoot $projectRoot
 $cli = Join-Path $projectRoot 'tools\whisper-vulkan\whisper-1.8.4-windows-x64\whisper-cli.exe'
 $model = Join-Path $projectRoot $ModelRelative
 $vadModel = Join-Path $projectRoot 'models\whisper\ggml-silero-v6.2.0.bin'

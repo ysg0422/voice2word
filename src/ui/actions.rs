@@ -18,6 +18,19 @@ pub(crate) const MEDIA_EXTS: [&str; 10] = [
 ];
 
 impl MainWindow {
+    /// 裁剪视频库的界面缓存，只保留仍存在于列表里的条目。
+    ///
+    /// `library_thumbs`（首帧缩略图路径）与 `library_sizes`（文件大小文本）
+    /// 都按 `task_id` 累积，而 `recent_tasks` 只保留最近 50 条。用户长期
+    /// 使用（不断导入/删除）后，这两个 map 会一直涨且全是查不到的僵尸条目。
+    /// 在每次刷新列表后统一按当前列表裁剪，是最省心的一处收口。
+    pub(crate) fn prune_library_caches(&mut self) {
+        let live: std::collections::HashSet<i64> =
+            self.state.recent_tasks.iter().map(|t| t.id).collect();
+        self.library_thumbs.retain(|id, _| live.contains(id));
+        self.library_sizes.retain(|id, _| live.contains(id));
+    }
+
     /// CPU 机器强制走 H.264 代理；有 GPU 默认原片，用户仍可手动打开。
     pub(crate) fn ensure_preview_proxy(&mut self, cx: &mut Context<Self>) {
         self.probe_video_dimensions(cx);
@@ -257,6 +270,13 @@ impl MainWindow {
     /// 却没有任何线索说明发生了什么。这里在删除后检查当前工程是否真的被换掉，
     /// 是则发一条**中性提示**（不是错误——删除本身成功了）说明切换到了哪一条。
     pub(crate) fn delete_task_record(&mut self, id: i64, cx: &mut Context<Self>) {
+        // 连带清掉这个任务在界面侧的缓存。这两个 map 按 task_id 累积，
+        // 而 `recent_tasks` 只保留最近 50 条——不清理的话，用户长时间使用
+        // （不断导入/删除）后缓存会一直涨，且全是查不到的僵尸条目。
+        // 注意必须放在删除**之前**：删除后 `recent_tasks` 里已找不到该 id，
+        // 也就无从得知要清哪一条。
+        self.library_thumbs.remove(&id);
+        self.library_sizes.remove(&id);
         let was_current = self
             .state
             .recent_tasks
@@ -722,9 +742,24 @@ impl MainWindow {
                     match res {
                         Ok(()) => {
                             info!("字幕成功导出至: {:?}", save_path);
+                            // 成功必须给出反馈：此前这里只有一行日志，界面上毫无动静。
+                            // 用户点了「导出」、选了路径、然后**什么都没有发生**——
+                            // 无法区分「成功」与「没点到」，只能去文件管理器里翻。
+                            // 走中性提示条（notice）而不是错误条：这是成功操作。
+                            this.notice = Some(format!(
+                                "已导出 {} 句字幕到 {}",
+                                segments.len(),
+                                save_path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| save_path.display().to_string())
+                            ));
                         }
                         Err(e) => {
+                            // 导出失败也要走跨页可见的提示：`ProcessStatus::Failed` 只有
+                            // 转写页的底部状态栏会渲染，而导出是在剪辑台做的。
                             this.state.status = ProcessStatus::Failed(format!("导出失败: {}", e));
+                            this.notice = None;
                         }
                     }
                     cx.notify();
@@ -742,6 +777,8 @@ impl MainWindow {
         self.state.flush_segments_if_dirty();
 
         let segments = self.state.segments.clone();
+        // 条数先取出来：`segments` 会被 move 进后台任务，成功提示还要用它
+        let seg_count = segments.len();
         let video_path = self.state.selected_file.clone();
         let stem = self.state.selected_file.as_ref()
             .and_then(|p| p.file_stem())
@@ -764,6 +801,11 @@ impl MainWindow {
                         info!("成功注入剪映草稿: {:?}", draft_path);
                         let _ = std::process::Command::new("explorer").arg(&draft_path).spawn();
                         this.state.status = ProcessStatus::Idle;
+                        // 已经打开了资源管理器，但仍给一条提示说明「注入了什么」：
+                        // 只弹窗不说明的话，用户不知道这是导入成功还是碰巧打开了目录。
+                        this.notice = Some(format!(
+                            "已注入剪映草稿（{seg_count} 句字幕），打开剪映即可在首页看到"
+                        ));
                     }
                     Err(e) => {
                         tracing::error!("剪映草稿注入失败: {:?}", e);
@@ -810,6 +852,12 @@ impl MainWindow {
                         Ok(p) => {
                             info!("剪映草稿文件夹导出成功: {:?}", p);
                             let _ = std::process::Command::new("explorer").arg(&p).spawn();
+                            this.notice = Some(format!(
+                                "已导出剪映草稿到 {}",
+                                p.file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| p.display().to_string())
+                            ));
                         }
                         Err(e) => {
                             this.state.status = ProcessStatus::Failed(format!("剪映草稿导出失败: {}", e));
@@ -1262,10 +1310,18 @@ impl MainWindow {
         if self.state.segments.is_empty() || self.state.is_translating {
             return;
         }
-        if self.state.translated_count() == self.state.segments.len() {
-            // 全部已有译文时重复触发只是白白烧额度/耗时，直接提示
+        // 「已完成」必须按**当前目标语言**判定。用不分语言的 `translated_count()`
+        // 会踩到这个坑：用户把目标语言从 English 改成 日本語 后，旧英文译文仍算
+        // 「已完成」，于是 100% 时这里直接 return——点「开始翻译」毫无反应，
+        // 用户完全不知道为什么。现在只有「当前语言全部译完」才提前返回。
+        let target_now = self.state.translate_target_lang.clone();
+        let done_now = self.state.translated_count_for(&target_now);
+        if self.state.segments.is_empty() {
+            return;
+        }
+        if done_now == self.state.segments.len() {
             self.state.translate_status_msg =
-                format!("{} 句已全部翻译完成", self.state.segments.len());
+                format!("{} 句已全部翻译为{}", self.state.segments.len(), target_now);
             cx.notify();
             return;
         }
@@ -1285,6 +1341,8 @@ impl MainWindow {
 
         let segments = self.state.segments.clone();
         let target_lang = self.state.translate_target_lang.clone();
+        // 另存一份给收尾提示用：	arget_lang 会被 move 进下面的异步块
+        let target_lang_for_msg = target_lang.clone();
         let online_cfg = self.state.online_translate_config();
         let llama_cli = crate::utils::config::AppConfig::resolve_path(&self.state.config.paths.llama_cli);
         let llm_model = crate::utils::config::AppConfig::resolve_path(&self.state.config.paths.llm_model);
@@ -1351,9 +1409,12 @@ impl MainWindow {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(translated_segs) => {
+                        // 按本轮目标语言统计：这样「翻译已完成（N 句）」里的 N
+                        // 不会混入之前译成别的语言的句子，否则用户会以为本轮
+                        // 译了 1000 句，实际只补了 20 句。
                         let done = translated_segs
                             .iter()
-                            .filter(|s| s.translation.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false))
+                            .filter(|s| s.translation_matches(&target_lang_for_msg))
                             .count();
                         // 引擎在取消时返回**已完成的偏序结果**而非错误，所以这里必须
                         // 显式区分「跑完了」与「被取消了」。不区分的话，用户点了取消
@@ -1442,3 +1503,184 @@ impl MainWindow {
         .detach();
     }
 }
+
+// ─────────── 模型下载（首次使用引导）───────────
+
+impl MainWindow {
+    /// 下载一个模型 / 组件。
+    ///
+    /// 在**后台线程**执行：最大 833 MB 的文件在慢网下要几十分钟，绝不能在
+    /// UI 线程上跑。进度通过 `mpsc` 回传，取消用一个 `AtomicBool`
+    /// （与翻译链路同一套模式）。
+    pub(crate) fn start_model_download(&mut self, item_id: &'static str, cx: &mut Context<Self>) {
+        if self.state.is_downloading {
+            return;
+        }
+        let Some(item) = crate::utils::ITEMS.iter().find(|i| i.id == item_id) else {
+            self.state.download_status_msg = format!("未知的下载项: {item_id}");
+            cx.notify();
+            return;
+        };
+
+        self.state.is_downloading = true;
+        self.state.download_current = Some(item_id.to_string());
+        self.state.download_done_bytes = 0;
+        self.state.download_total_bytes = 0;
+        self.state.download_status_msg = format!("正在下载 {}...", item.label);
+        self.model_download_cancel
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        cx.notify();
+
+        let cancel = self.model_download_cancel.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel::<(u64, u64, String)>();
+
+        // 进度回传协程
+        cx.spawn(async move |this, cx| {
+            while let Some((done, total, id)) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.state.download_done_bytes = done;
+                    this.state.download_total_bytes = total;
+                    this.state.download_current = Some(id);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
+        let item = *item;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let cb: crate::utils::model_download::ProgressFn =
+                        Box::new(move |done, total, id| {
+                            let _ = tx.send((done, total, id.to_string()));
+                        });
+                    crate::utils::model_download::download_one(&item, &cancel, Some(&cb))
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                this.state.is_downloading = false;
+                this.state.download_current = None;
+                this.state.download_done_bytes = 0;
+                this.state.download_total_bytes = 0;
+                match result {
+                    Ok(path) => {
+                        info!("模型下载成功: {}", path.display());
+                        this.state.download_status_msg =
+                            format!("{} 下载完成", item.label);
+                        // 重新扫描：新文件就位后界面上的「缺失」标记要立即消失
+                        this.state.refresh_model_presence();
+                        // 模型换了，硬件档案里的推荐配置与预览代理可能要重算
+                        this.state.refresh_hardware_detection();
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        tracing::warn!(error = %err, item = item.id, "模型下载失败");
+                        this.state.download_status_msg = if msg.contains("已取消") {
+                            format!("{} 下载已取消", item.label)
+                        } else {
+                            format!("{} 下载失败: {msg}", item.label)
+                        };
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 一键补齐所有**缺失**的条目（按体积从小到大，先让用户看到进展）。
+    pub(crate) fn download_all_missing(&mut self, cx: &mut Context<Self>) {
+        if self.state.is_downloading {
+            return;
+        }
+        let mut pending: Vec<&'static crate::utils::DownloadItem> = crate::utils::ITEMS
+            .iter()
+            .filter(|i| !self.state.model_is_present(i.id))
+            .collect();
+        // 小文件先下：几十 MB 的 VAD/tokens 几秒就完，用户立刻看到进展；
+        // ffmpeg(50MB) 与主模型(180MB+) 排在后面。
+        pending.sort_by_key(|i| i.size);
+        if pending.is_empty() {
+            self.state.download_status_msg = "所有组件都已就位".to_string();
+            cx.notify();
+            return;
+        }
+
+        // 条目总数在循环前取好：`pending` 会被 for 消费掉，
+        // 收尾提示还要用它算「完成 N/M」。
+        let total = pending.len();
+        let cancel = self.model_download_cancel.clone();
+        cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.state.is_downloading = true;
+        self.state.download_status_msg = format!("正在补齐 {total} 个缺失组件...");
+        cx.notify();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<(u64, u64, String)>();
+        cx.spawn(async move |this, cx| {
+            while let Some((done, total_b, id)) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.state.download_done_bytes = done;
+                    this.state.download_total_bytes = total_b;
+                    this.state.download_current = Some(id);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            // 逐个串行下载：并发下多个大文件抢带宽，反而都变慢，
+            // 且进度条会来回跳（用户无法判断「还剩多少」）。
+            let mut ok = 0usize;
+            let mut failed: Vec<&'static str> = Vec::new();
+            let mut last_msg = String::new();
+            for item in pending {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    last_msg = "批量下载已取消".to_string();
+                    break;
+                }
+                let tx_cb = tx.clone();
+                let cancel_cb = cancel.clone();
+                let item_copy = *item;
+                let r = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let cb: crate::utils::model_download::ProgressFn =
+                            Box::new(move |done, tot, id| {
+                                let _ = tx_cb.send((done, tot, id.to_string()));
+                            });
+                        crate::utils::model_download::download_one(&item_copy, &cancel_cb, Some(&cb))
+                    })
+                    .await;
+                match r {
+                    Ok(_) => ok += 1,
+                    Err(e) => {
+                        tracing::warn!(item = item.id, error = %e, "批量下载中该项失败");
+                        failed.push(item.label);
+                    }
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.state.is_downloading = false;
+                this.state.download_current = None;
+                this.state.download_done_bytes = 0;
+                this.state.download_total_bytes = 0;
+                this.state.refresh_model_presence();
+                this.state.refresh_hardware_detection();
+                this.state.download_status_msg = if !last_msg.is_empty() {
+                    last_msg
+                } else if failed.is_empty() {
+                    format!("全部 {total} 个组件下载完成")
+                } else {
+                    format!("完成 {ok}/{total}；失败：{}", failed.join("、"))
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+

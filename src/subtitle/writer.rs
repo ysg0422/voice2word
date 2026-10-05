@@ -36,6 +36,63 @@ impl SubtitleWriter {
             std::fs::create_dir_all(parent)?;
         }
 
+        // ── 先写临时文件，成功后再替换目标 ──
+        //
+        // 原先各格式直接 `File::create(path)`：这会**立刻把目标文件截断为 0**，
+        // 然后才逐行写入。于是导出过程中任何失败（磁盘满、用户中途拔盘、
+        // 字符串格式化出错）都会把用户**原有的字幕文件**毁掉，只剩半截内容——
+        // 而「覆盖导出」恰恰是最常见的使用方式（改完字幕重新导一次）。
+        //
+        // 改为：写到同目录的 `.part`，全部写完并 flush 成功后才 rename 覆盖。
+        // rename 在同一目录内是原子的（Windows 上用 MoveFileEx 的替换语义，
+        // 由 `std::fs::rename` 提供），因此目标文件要么是旧内容、要么是完整新内容。
+        //
+        // 剪映导出是个例外：它产出的是**整个草稿目录**（多个 json 文件），
+        // 不是单文件，无法用单次 rename 表达原子性，因此保持原样（见下）。
+        let tmp_path = match Self::temp_sibling(path) {
+            Some(p) => p,
+            None => {
+                // 没有父目录（极端路径）时退化为直接写，至少不 panic
+                return Self::write_in_place(segments, path, format, mode);
+            }
+        };
+
+        let result = Self::write_in_place(segments, &tmp_path, format, mode);
+        match result {
+            Ok(()) => {
+                if let Err(err) = std::fs::rename(&tmp_path, path) {
+                    // 收尾失败要把临时文件清掉，否则用户目录里会留下一堆 .part
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(err).with_context(|| {
+                        format!("替换字幕文件失败: {}", path.display())
+                    });
+                }
+                Ok(())
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                Err(err)
+            }
+        }
+    }
+
+    /// 同目录的临时文件名（保留原扩展名，便于外部工具识别格式）。
+    ///
+    /// 用 `.part` 前缀而不是后缀，是为了不与「用户自己命名的 .part 文件」冲突，
+    /// 同时让任何按扩展名扫描的清理逻辑都不会把它当成正式产物。
+    fn temp_sibling(path: &Path) -> Option<std::path::PathBuf> {
+        let parent = path.parent()?;
+        let name = path.file_name()?.to_string_lossy().to_string();
+        Some(parent.join(format!(".{}.part", name)))
+    }
+
+    /// 实际写盘（不经临时文件）。剪映目录导出与临时文件路径都走这里。
+    fn write_in_place(
+        segments: &[Segment],
+        path: &Path,
+        format: &str,
+        mode: ExportMode,
+    ) -> Result<()> {
         match format.to_lowercase().as_str() {
             "srt" => Self::write_srt_with_mode(segments, path, mode),
             "ass" => Self::write_ass_with_mode(segments, path, mode),
@@ -270,5 +327,102 @@ mod tests {
         // Outline=2 / Shadow=1
         assert!(content.contains(",1,2,1,2,20,20,40,1"), "默认描边与投影不正确: {content}");
         let _ = std::fs::remove_file(temp);
+    }
+    // ─────────── 导出原子性 ───────────
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("v2w_export_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn sample() -> Vec<Segment> {
+        vec![
+            Segment::new(1, 0.0, 1.5, "第一句"),
+            Segment::new(2, 1.5, 3.0, "第二句"),
+        ]
+    }
+
+    /// 正常导出：内容正确，且**不留下**临时文件。
+    #[test]
+    fn export_writes_content_and_leaves_no_temp_file() {
+        let dir = tmp_dir("ok");
+        let out = dir.join("out.srt");
+        SubtitleWriter::write_to_file(&sample(), &out, "srt").expect("导出应成功");
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("第一句"), "内容应写入: {text}");
+        assert!(text.contains("-->"), "应含时间轴");
+
+        // 目录里只应有目标文件，没有 .part 残留
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("part"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应留下临时文件: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 覆盖导出：目标已存在时被完整替换（这是最常见的用法——改完字幕重导一次）。
+    #[test]
+    fn export_overwrites_existing_file_completely() {
+        let dir = tmp_dir("overwrite");
+        let out = dir.join("out.srt");
+        // 先放一个「旧的长文件」，若新内容比它短，非原子实现会留下尾巴
+        std::fs::write(&out, "旧内容\n".repeat(500)).unwrap();
+
+        SubtitleWriter::write_to_file(&sample(), &out, "srt").expect("覆盖导出应成功");
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(!text.contains("旧内容"), "旧内容必须被完全替换，不能留尾巴");
+        assert!(text.contains("第一句"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 导出失败时**不能破坏已存在的目标文件**。
+    ///
+    /// 这是原子写要解决的核心问题：旧实现直接 `File::create(target)`，
+    /// 一上来就把用户的字幕文件截断成 0 字节，之后失败就只剩半截内容。
+    /// 这里用「不支持的格式」触发失败（它在写盘**之前**就返回错误），
+    /// 验证目标文件原封不动。
+    #[test]
+    fn failed_export_preserves_existing_target() {
+        let dir = tmp_dir("fail");
+        let out = dir.join("out.srt");
+        let original = "用户原有的字幕内容，不能被导出失败毁掉\n";
+        std::fs::write(&out, original).unwrap();
+
+        let err = SubtitleWriter::write_to_file(&sample(), &out, "不存在的格式");
+        assert!(err.is_err(), "未知格式应报错");
+
+        let after = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(after, original, "导出失败后原文件必须一字不变");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 各种格式都能导出且不留临时文件（覆盖 srt/ass/vtt/txt/fcpxml/xml 六个分支）。
+    #[test]
+    fn all_single_file_formats_export_cleanly() {
+        for fmt in ["srt", "ass", "vtt", "txt", "fcpxml", "xml"] {
+            let dir = tmp_dir(&format!("fmt_{fmt}"));
+            let out = dir.join(format!("out.{fmt}"));
+            SubtitleWriter::write_to_file(&sample(), &out, fmt)
+                .unwrap_or_else(|e| panic!("{fmt} 导出失败: {e}"));
+            assert!(out.exists(), "{fmt} 应产出文件");
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.contains("part"))
+                .collect();
+            assert!(leftovers.is_empty(), "{fmt} 留下了临时文件: {leftovers:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

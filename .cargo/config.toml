@@ -2,3 +2,18 @@
 # 原本把编译产物重定向到 D:\cargo-target\voice2word（当初为把产物挪出 C/A 盘、减轻系统盘占用而加）；
 # 现注释掉，cargo 回到默认 <仓库根>/target。想恢复旧行为，取消下一行注释即可。
 # target-dir = "D:\\cargo-target\\voice2word"
+
+[env]
+# release 构建必须让 gpui 的 build script 找到 fxc.exe（只有 release 才编译着色器，
+# debug 走运行时 D3DCompileFromFile，所以这个坑只在 --release 出现）。
+#
+# gpui 0.2.2 的 build.rs 只查三处：本环境变量 → `where.exe fxc.exe` → 硬编码的
+# C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe，
+# 三项全灭直接 panic!("Failed to find fxc.exe")。它**不读**注册表 KitsRoot10，
+# 而 embed-resource 读，所以同机 rc 找得到、fxc 找不到。
+#
+# 关键：gpui 对这个变量是 `Path::new(&path).exists()` 判定，路径不存在就继续往下查。
+# 因此这里写本机 SDK 实际位置是**安全**的——换到别的机器上路径不存在时，
+# 会自动回退到 where.exe 与默认路径，不会把别人的构建打挂。
+# 本机 Windows SDK 装在 D 盘，故显式指定；装 C 盘的机器无需改动本文件。
+GPUI_FXC_PATH = "D:\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\fxc.exe"

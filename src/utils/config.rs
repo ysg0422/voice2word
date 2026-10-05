@@ -78,6 +78,16 @@ pub struct TranslateConfig {
     pub batch_size: usize,
     /// 请求超时（秒）。网络差时可调大。
     pub timeout_secs: u64,
+    /// 上次选择的目标语言（与 `TRANSLATE_TARGET_LANGS` 同集合）。
+    ///
+    /// 必须持久化：目标语言是用户的长期偏好，重启后悄悄跳回「简体中文」
+    /// 会让「上次译的是日语，这次怎么变中文了」无从解释。
+    #[serde(default = "default_translate_target_lang")]
+    pub target_lang: String,
+}
+
+fn default_translate_target_lang() -> String {
+    "简体中文".to_string()
 }
 
 impl Default for TranslateConfig {
@@ -89,6 +99,7 @@ impl Default for TranslateConfig {
             api_model: "deepseek-chat".to_string(),
             batch_size: 20,
             timeout_secs: 120,
+            target_lang: default_translate_target_lang(),
         }
     }
 }
@@ -326,6 +337,26 @@ pub struct PathsConfig {
     pub python: String,
 }
 
+impl Default for PathsConfig {
+    /// 便携默认路径：全部相对项目根，可安全提交。
+    /// 本机若把 ffmpeg / llama.cpp 装在别处，请写 config.local.toml 覆盖。
+    fn default() -> Self {
+        Self {
+            ffmpeg: "tools/ffmpeg.exe".to_string(),
+            whisper_cli: "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe".to_string(),
+            whisper_model: "models/whisper/ggml-small-q5_0.bin".to_string(),
+            vad_model: Some("models/whisper/ggml-silero-v6.2.0.bin".to_string()),
+            punc_model: Some("models/punc/model.int8.onnx".to_string()),
+            sensevoice_model: Some("models/sensevoice/model.int8.onnx".to_string()),
+            sensevoice_tokens: Some("models/sensevoice/tokens.txt".to_string()),
+            sensevoice_vad: Some("models/sensevoice/silero_vad.onnx".to_string()),
+            llama_cli: "tools/llama-completion.exe".to_string(),
+            llm_model: "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string(),
+            python: default_python(),
+        }
+    }
+}
+
 fn default_python() -> String {
     "python".to_string()
 }
@@ -472,8 +503,11 @@ pub struct PipelineConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            // 默认值必须是**便携**的（相对项目根），否则「没有 config.toml 时
+            // 生成的默认配置」会把开发机的绝对路径写进去，再被提交。
+            // 本机实际路径请写进 config.local.toml（见 LocalOverride）。
             paths: PathsConfig {
-                ffmpeg: "A:\\cppsoft\\ffmpeg-6.9\\bin\\ffmpeg.exe".to_string(),
+                ffmpeg: "tools/ffmpeg.exe".to_string(),
                 whisper_cli: "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"
                     .to_string(),
                 whisper_model: "models/whisper/ggml-small-q5_0.bin".to_string(),
@@ -482,7 +516,7 @@ impl Default for AppConfig {
                 sensevoice_model: Some("models/sensevoice/model.int8.onnx".to_string()),
                 sensevoice_tokens: Some("models/sensevoice/tokens.txt".to_string()),
                 sensevoice_vad: Some("models/sensevoice/silero_vad.onnx".to_string()),
-                llama_cli: "A:\\cppsoft\\llama.cpp\\build\\bin\\Release\\llama-completion.exe"
+                llama_cli: "tools/llama-completion.exe"
                     .to_string(),
                 llm_model: "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string(),
                 python: "python".to_string(),
@@ -520,38 +554,285 @@ impl Default for AppConfig {
     }
 }
 
+/// 机器本地覆盖文件：`config.local.toml`（不纳入版本控制）。
+///
+/// 每个字段都是 `Option`：**只有写了的字段才会覆盖**，没写的沿用 `config.toml`。
+/// 因此本文件通常只有寥寥几行，例如：
+///
+/// ```toml
+/// [paths]
+/// ffmpeg    = 'A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe'
+/// llama_cli = 'A:\cppsoft\llama.cpp\build\bin\Release\llama-completion.exe'
+/// ```
+///
+/// 设计上只承载「路径」与「GPU 策略」这两类真正因机器而异的东西；
+/// 调参（线程、VAD、润色模式、字幕样式）留在共享配置里，
+/// 免得同一份实验参数被拆到两个文件、A/B 时漏改一处。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalOverride {
+    pub paths: Option<LocalPathsOverride>,
+    pub gpu: Option<GpuConfig>,
+}
+
+/// `[paths]` 的逐字段覆盖。全部为 `Option`，未写的保持共享配置的值。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalPathsOverride {
+    pub ffmpeg: Option<String>,
+    pub whisper_cli: Option<String>,
+    pub whisper_model: Option<String>,
+    pub vad_model: Option<String>,
+    pub punc_model: Option<String>,
+    pub sensevoice_model: Option<String>,
+    pub sensevoice_tokens: Option<String>,
+    pub sensevoice_vad: Option<String>,
+    pub llama_cli: Option<String>,
+    pub llm_model: Option<String>,
+    pub python: Option<String>,
+}
+
+impl LocalPathsOverride {
+    /// 是否记录到任何一项（全空则不必落盘覆盖文件）。
+    pub fn has_any(&self) -> bool {
+        self.ffmpeg.is_some()
+            || self.whisper_cli.is_some()
+            || self.whisper_model.is_some()
+            || self.vad_model.is_some()
+            || self.punc_model.is_some()
+            || self.sensevoice_model.is_some()
+            || self.sensevoice_tokens.is_some()
+            || self.sensevoice_vad.is_some()
+            || self.llama_cli.is_some()
+            || self.llm_model.is_some()
+            || self.python.is_some()
+    }
+}
+
+impl LocalOverride {
+    /// 把覆盖应用到共享配置上，返回被覆盖的段名（用于启动日志）。
+    pub fn apply_to(&self, cfg: &mut AppConfig) -> Vec<&'static str> {
+        let mut touched = Vec::new();
+
+        if let Some(p) = self.paths.as_ref() {
+            // 宏化这组「有值才覆盖」的赋值，避免 11 行手写 if-let 里漏掉一个字段。
+            macro_rules! apply_path {
+                ($($field:ident),* $(,)?) => {
+                    $(
+                        if let Some(v) = p.$field.as_ref() {
+                            cfg.paths.$field = Some(v.clone());
+                        }
+                    )*
+                };
+            }
+            // 三个必填字段是 String，其余是 Option<String>，分开处理
+            if let Some(v) = p.ffmpeg.as_ref() {
+                cfg.paths.ffmpeg = v.clone();
+            }
+            if let Some(v) = p.whisper_cli.as_ref() {
+                cfg.paths.whisper_cli = v.clone();
+            }
+            if let Some(v) = p.whisper_model.as_ref() {
+                cfg.paths.whisper_model = v.clone();
+            }
+            if let Some(v) = p.llama_cli.as_ref() {
+                cfg.paths.llama_cli = v.clone();
+            }
+            if let Some(v) = p.llm_model.as_ref() {
+                cfg.paths.llm_model = v.clone();
+            }
+            if let Some(v) = p.python.as_ref() {
+                cfg.paths.python = v.clone();
+            }
+            apply_path!(vad_model, punc_model, sensevoice_model, sensevoice_tokens, sensevoice_vad);
+            touched.push("paths");
+        }
+
+        if let Some(g) = self.gpu.as_ref() {
+            cfg.gpu = g.clone();
+            touched.push("gpu");
+        }
+
+        touched
+    }
+}
 impl AppConfig {
+    /// 机器本地覆盖文件名（与 config.toml 同目录，不进版本库）。
+    pub const LOCAL_OVERRIDE: &'static str = "config.local.toml";
+
+    /// 读取配置，并在其后叠加机器本地覆盖文件 `config.local.toml`。
+    ///
+    /// # 为什么要分层
+    ///
+    /// `config.toml` 是**被 git 跟踪**的共享配置，但它里面混着两类东西：
+    /// 1. 所有人都一样的调参（线程数、VAD 阈值、字幕样式、润色模式…）；
+    /// 2. **只对本机成立**的绝对路径，例如 `A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe`。
+    ///
+    /// 第 2 类一旦提交，别人 clone 下来直接就是「你的机器」——路径不存在，
+    /// 启动即报错，且每个人都要先把这几行改掉才能跑，改完又会把改动推回去。
+    ///
+    /// 分层后：`config.toml` 只留可共享项与**相对路径默认值**；
+    /// 机器专属项写进 `config.local.toml`（已加进 `.gitignore`），
+    /// 在这里做一次字段级覆盖。缺失该文件是完全正常的情况（CI、新机器）。
+    ///
+    /// 覆盖是**逐字段**而非「整段替换」：本地文件里只写 `[paths] ffmpeg` 一项时，
+    /// 其余路径仍取 `config.toml` 的值，不必把整段复制一遍。
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+
         let full_path = Self::resolve_path(path.as_ref().to_str().unwrap_or("config.toml"));
-        if full_path.exists() {
+        let mut cfg = if full_path.exists() {
             let content = std::fs::read_to_string(&full_path)
                 .with_context(|| format!("读取配置文件失败: {:?}", full_path))?;
-            let cfg: AppConfig =
-                toml::from_str(&content).with_context(|| "反序列化 config.toml 失败")?;
-            Ok(cfg)
+            toml::from_str(&content).with_context(|| "反序列化 config.toml 失败")?
         } else {
             let default_cfg = Self::default();
             default_cfg.save_to_file(&full_path)?;
-            Ok(default_cfg)
+            default_cfg
+        };
+
+        // 本地覆盖是可选的：不存在、或解析失败，都不应阻断启动——
+        // 覆盖文件坏掉时退回共享配置，比整个应用起不来要好。
+        //
+        // 注意必须**紧邻 config.toml** 解析，不能走 esolve_path：后者以项目根为基准，
+        // 会把覆盖文件错认到项目根下，于是「自定义路径的配置」永远读不到自己的覆盖。
+        let local_path = Self::local_override_path(&full_path);
+        if local_path.exists() {
+            match std::fs::read_to_string(&local_path)
+                .map_err(anyhow::Error::from)
+                .and_then(|c| {
+                    toml::from_str::<LocalOverride>(&c)
+                        .map_err(anyhow::Error::from)
+                        .with_context(|| format!("反序列化 {} 失败", Self::LOCAL_OVERRIDE))
+                }) {
+                Ok(local) => {
+                    let touched = local.apply_to(&mut cfg);
+                    if !touched.is_empty() {
+                        tracing::info!(
+                            file = Self::LOCAL_OVERRIDE,
+                            sections = ?touched,
+                            "已应用本机配置覆盖"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        file = Self::LOCAL_OVERRIDE,
+                        error = %err,
+                        "本机配置覆盖读取失败，已忽略并继续使用 config.toml"
+                    );
+                }
+            }
         }
+        Ok(cfg)
+    }
+
+    /// 配置路径参数的规范化：把机器专属的绝对路径拆到 `config.local.toml`，
+    /// `config.toml` 只保留可提交的相对路径。
+    ///
+    /// 判定规则只有一条、且是客观的：**绝对路径即机器专属**。
+    /// 相对路径（如 `models/whisper/ggml-small-q5_0.bin`）随项目根走，人人可共享。
+    ///
+    /// 这样即使 UI 触发的保存把完整配置序列化一遍，写进 `config.toml` 的
+    /// 也永远是可提交的值——机器路径不会随一次「改主题」被悄悄提交回去。
+    fn split_machine_paths(&self) -> (PathsConfig, LocalPathsOverride) {
+        let portable = PathsConfig::default();
+        let mut shared = self.paths.clone();
+        let mut local = LocalPathsOverride::default();
+
+        // 宏化 11 个字段的「绝对则剥离」逻辑，避免手写时漏掉某个字段。
+        // 形参是「字段名」，两类字段（String / Option<String>）分别展开。
+        macro_rules! strip_required {
+            ($($f:ident),* $(,)?) => {
+                $(
+                    if Path::new(&self.paths.$f).is_absolute() {
+                        local.$f = Some(self.paths.$f.clone());
+                        shared.$f = portable.$f.clone();
+                    }
+                )*
+            };
+        }
+        macro_rules! strip_optional {
+            ($($f:ident),* $(,)?) => {
+                $(
+                    if let Some(v) = self.paths.$f.as_ref() {
+                        if Path::new(v).is_absolute() {
+                            local.$f = Some(v.clone());
+                            shared.$f = portable.$f.clone();
+                        }
+                    }
+                )*
+            };
+        }
+
+        strip_required!(ffmpeg, whisper_cli, whisper_model, llama_cli, llm_model, python);
+        strip_optional!(vad_model, punc_model, sensevoice_model, sensevoice_tokens, sensevoice_vad);
+
+        (shared, local)
+    }
+
+    /// 与 `config.toml` 同目录的 `config.local.toml` 路径。
+    fn local_override_path(config_path: &Path) -> PathBuf {
+        config_path.with_file_name(Self::LOCAL_OVERRIDE)
     }
 
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let full_path = Self::resolve_path(path.as_ref().to_str().unwrap_or("config.toml"));
-        let content = toml::to_string_pretty(self).with_context(|| "序列化配置为 TOML 失败")?;
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // 原子写：先写同目录临时文件再 rename 覆盖。
-        // UI 上每敲一个键都会调用本方法落盘（见 commit_api_field），直接
-        // `fs::write` 会先把原文件截断为 0 字节；此时若进程被强杀或断电，
-        // 用户的 config.toml 就会变成空文件/半截文件而丢失全部设置。
-        // rename 在同一目录内是原子的，因此要么是旧内容、要么是新内容。
-        let tmp = full_path.with_extension("toml.tmp");
+
+        let (shared_paths, local_paths) = self.split_machine_paths();
+
+        // 顺序很重要：**先落本机覆盖，再写共享配置**。
+        // 共享配置里那几项会被换成便携默认值（如 `tools/ffmpeg.exe`），
+        // 只有覆盖文件确实已经在磁盘上，换过去才是安全的；反过来先写共享配置，
+        // 一旦覆盖文件写失败，用户的可用路径就丢了。
+        let local_file = Self::local_override_path(&full_path);
+        let should_write_local = local_paths.has_any();
+        if should_write_local {
+            let local = LocalOverride {
+                paths: Some(local_paths),
+                gpu: None,
+            };
+            let text =
+                toml::to_string_pretty(&local).with_context(|| "序列化本机配置覆盖失败")?;
+            let body = format!(
+                "# 本机专属配置（由程序自动维护，不进版本库）\n\
+                 #\n\
+                 # 这里只存「换台机器就不成立」的东西：绝对路径、机器相关的 GPU 策略。\n\
+                 # 共享调参请写 config.toml；本文件的字段会逐项覆盖它。\n\
+                 # 删除本文件不影响启动，只是路径会回退到 config.toml 里的可移植默认值。\n\n{text}"
+            );
+            // 内容没变就不重复落盘：UI 上每敲一个键都会走到这里（见 commit_api_field），
+            // 而这个文件几乎从不变，没必要每个字符都做一次磁盘写。
+            let unchanged = std::fs::read_to_string(&local_file)
+                .map(|existing| existing == body)
+                .unwrap_or(false);
+            if !unchanged {
+                Self::atomic_write(&local_file, &body)
+                    .with_context(|| format!("写回本机配置失败: {:?}", local_file))?;
+            }
+        }
+
+        let mut on_disk = self.clone();
+        on_disk.paths = shared_paths;
+        let content =
+            toml::to_string_pretty(&on_disk).with_context(|| "序列化配置为 TOML 失败")?;
+        Self::atomic_write(&full_path, &content)
+    }
+
+    /// 原子写：先写同目录临时文件再 rename 覆盖。
+    ///
+    /// UI 上每敲一个键都会调用 `save_to_file`（见 `commit_api_field`），直接
+    /// `fs::write` 会先把原文件截断为 0 字节；此时若进程被强杀或断电，
+    /// 用户的 config.toml 就会变成空文件/半截文件而丢失全部设置。
+    /// rename 在同一目录内是原子的，因此要么是旧内容、要么是新内容。
+    fn atomic_write(path: &Path, content: &str) -> Result<()> {
+        let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, content)?;
-        if let Err(err) = std::fs::rename(&tmp, &full_path) {
+        if let Err(err) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
-            return Err(err).with_context(|| format!("写回配置失败: {:?}", full_path));
+            return Err(err).with_context(|| format!("写回配置失败: {:?}", path));
         }
         Ok(())
     }
@@ -704,5 +985,210 @@ mod tests {
         let with_compact = text.replace("preprocess_compact = false", "preprocess_compact = true");
         let back: super::AppConfig = toml::from_str(&with_compact).expect("deserialize");
         assert!(back.pipeline.preprocess_compact);
+    }
+
+    // ─────────── 配置分层（config.toml + config.local.toml）───────────
+
+    /// 本机覆盖必须逐字段生效，且**没写的字段沿用共享配置**。
+    #[test]
+    fn local_override_applies_field_by_field() {
+        let mut cfg = super::AppConfig::default();
+        cfg.paths.ffmpeg = "tools/ffmpeg.exe".to_string();
+        cfg.paths.llama_cli = "tools/llama-completion.exe".to_string();
+        cfg.paths.whisper_cli = "tools/whisper.exe".to_string();
+
+        let local: super::LocalOverride = toml::from_str(
+            r#"
+            [paths]
+            ffmpeg = 'D:\soft\ffmpeg.exe'
+            "#,
+        )
+        .expect("parse local override");
+
+        let touched = local.apply_to(&mut cfg);
+        assert_eq!(touched, vec!["paths"]);
+        assert_eq!(cfg.paths.ffmpeg, r"D:\soft\ffmpeg.exe");
+        // 未在覆盖文件里出现的字段必须原样保留
+        assert_eq!(cfg.paths.llama_cli, "tools/llama-completion.exe");
+        assert_eq!(cfg.paths.whisper_cli, "tools/whisper.exe");
+    }
+
+    /// 覆盖文件里的 `[gpu]` 段整体替换 GPU 策略（这几项本就是机器相关的）。
+    #[test]
+    fn local_override_replaces_gpu_section() {
+        let mut cfg = super::AppConfig::default();
+        cfg.gpu.whisper_offload = false;
+
+        let local: super::LocalOverride = toml::from_str(
+            r#"
+            [gpu]
+            hwaccel_decode = false
+            whisper_offload = true
+            yield_to_desktop = true
+            gpu_limit_percent = 60
+            "#,
+        )
+        .expect("parse local override");
+
+        let touched = local.apply_to(&mut cfg);
+        assert_eq!(touched, vec!["gpu"]);
+        assert!(cfg.gpu.whisper_offload);
+        assert_eq!(cfg.gpu.mode(), "eco");
+    }
+
+    /// 空覆盖文件不应改动任何东西，也不该被报告为「已应用」。
+    #[test]
+    fn empty_local_override_is_a_noop() {
+        let mut cfg = super::AppConfig::default();
+        let before = cfg.paths.ffmpeg.clone();
+        let local: super::LocalOverride = toml::from_str("").expect("empty is valid");
+        assert!(local.apply_to(&mut cfg).is_empty());
+        assert_eq!(cfg.paths.ffmpeg, before);
+    }
+
+    /// 绝对路径必须被剥离到本地覆盖，共享配置只留可提交的相对路径。
+    #[test]
+    fn machine_absolute_paths_are_split_out_of_shared_config() {
+        let mut cfg = super::AppConfig::default();
+        // 三个必填项各来一个绝对路径 + 一个相对路径
+        cfg.paths.ffmpeg = r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe".to_string();
+        cfg.paths.llama_cli = r"A:\cppsoft\llama.cpp\build\bin\Release\llama-completion.exe".to_string();
+        cfg.paths.whisper_cli = "tools/whisper-vulkan/whisper.exe".to_string();
+        // Option 项同样要有覆盖
+        cfg.paths.punc_model = Some(r"D:\models\punc\model.int8.onnx".to_string());
+        cfg.paths.sensevoice_model = Some("models/sensevoice/model.int8.onnx".to_string());
+
+        let (shared, local) = cfg.split_machine_paths();
+
+        // 绝对路径被挪走，共享配置回到便携默认值
+        assert_eq!(shared.ffmpeg, super::PathsConfig::default().ffmpeg);
+        assert_eq!(shared.llama_cli, super::PathsConfig::default().llama_cli);
+        assert_eq!(shared.punc_model, super::PathsConfig::default().punc_model);
+        // 本来就是相对路径的不动
+        assert_eq!(shared.whisper_cli, "tools/whisper-vulkan/whisper.exe");
+        assert_eq!(
+            shared.sensevoice_model.as_deref(),
+            Some("models/sensevoice/model.int8.onnx")
+        );
+
+        // 机器路径原样记录在本地覆盖里
+        assert_eq!(local.ffmpeg.as_deref(), Some(r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe"));
+        assert_eq!(
+            local.punc_model.as_deref(),
+            Some(r"D:\models\punc\model.int8.onnx")
+        );
+        assert!(local.whisper_cli.is_none(), "相对路径不应进入本地覆盖");
+        assert!(local.has_any());
+    }
+
+    /// 全便携的配置不应产生本地覆盖文件。
+    #[test]
+    fn portable_config_produces_no_local_override() {
+        let cfg = super::AppConfig::default();
+        let (shared, local) = cfg.split_machine_paths();
+        assert!(!local.has_any(), "默认配置全是相对路径，不该写本地覆盖");
+        assert_eq!(shared.ffmpeg, cfg.paths.ffmpeg);
+        assert_eq!(shared.llama_cli, cfg.paths.llama_cli);
+    }
+
+    /// 默认配置必须是便携的——否则「没有 config.toml 时自动生成的默认文件」
+    /// 会把开发机路径写进去，再被提交给别人。
+    #[test]
+    fn default_config_paths_are_portable() {
+        let cfg = super::AppConfig::default();
+        for (name, value) in [
+            ("ffmpeg", Some(cfg.paths.ffmpeg.clone())),
+            ("whisper_cli", Some(cfg.paths.whisper_cli.clone())),
+            ("whisper_model", Some(cfg.paths.whisper_model.clone())),
+            ("llama_cli", Some(cfg.paths.llama_cli.clone())),
+            ("llm_model", Some(cfg.paths.llm_model.clone())),
+            ("vad_model", cfg.paths.vad_model.clone()),
+            ("punc_model", cfg.paths.punc_model.clone()),
+            ("sensevoice_model", cfg.paths.sensevoice_model.clone()),
+            ("sensevoice_tokens", cfg.paths.sensevoice_tokens.clone()),
+            ("sensevoice_vad", cfg.paths.sensevoice_vad.clone()),
+        ] {
+            let v = value.expect(name);
+            assert!(
+                !std::path::Path::new(&v).is_absolute(),
+                "默认 {name} 不应是绝对路径: {v}"
+            );
+        }
+    }
+
+    /// 保存→读取的往返：机器路径经 `config.local.toml` 回来后必须**一字不差**，
+    /// 否则「UI 里改个主题」就会把用户配好的 ffmpeg 路径悄悄改成默认值。
+    #[test]
+    fn save_load_roundtrip_preserves_machine_paths() {
+        let dir = std::env::temp_dir().join(format!("v2w_cfg_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let main_path = dir.join("config.toml");
+
+        let mut cfg = super::AppConfig::default();
+        cfg.paths.ffmpeg = r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe".to_string();
+        cfg.paths.llama_cli = r"A:\cppsoft\llama.cpp\llama-completion.exe".to_string();
+        cfg.pipeline.whisper_threads = 12;
+        cfg.ui.theme = "light".to_string();
+
+        // 直接写绝对路径（绕过 resolve_path 的项目根拼接）
+        cfg.save_to_file(&main_path).expect("save");
+
+        // 共享配置里不能出现机器路径
+        let shared_text = std::fs::read_to_string(&main_path).expect("read shared");
+        assert!(
+            !shared_text.contains(r"A:\cppsoft"),
+            "机器路径不应写进 config.toml:\n{shared_text}"
+        );
+        // 覆盖文件里必须有
+        let local_path = dir.join(super::AppConfig::LOCAL_OVERRIDE);
+        let local_text = std::fs::read_to_string(&local_path).expect("read local");
+        assert!(local_text.contains(r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe"));
+
+        // 读回来：机器路径复原，共享调参也保留
+        let back = super::AppConfig::load_from_file(&main_path).expect("load");
+        assert_eq!(back.paths.ffmpeg, r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe");
+        assert_eq!(back.paths.llama_cli, r"A:\cppsoft\llama.cpp\llama-completion.exe");
+        assert_eq!(back.pipeline.whisper_threads, 12);
+        assert_eq!(back.ui.theme, "light");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 覆盖文件损坏时不能把启动带崩——退回 config.toml 即可。
+    #[test]
+    fn corrupt_local_override_falls_back_to_shared_config() {
+        let dir = std::env::temp_dir().join(format!("v2w_cfg_bad_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let main_path = dir.join("config.toml");
+
+        let mut cfg = super::AppConfig::default();
+        cfg.pipeline.whisper_threads = 7;
+        cfg.save_to_file(&main_path).expect("save");
+
+        // 写一个语法错误的覆盖文件
+        std::fs::write(
+            dir.join(super::AppConfig::LOCAL_OVERRIDE),
+            "this is not valid toml = = =",
+        )
+        .expect("write bad override");
+
+        let back = super::AppConfig::load_from_file(&main_path).expect("仍应能加载");
+        assert_eq!(back.pipeline.whisper_threads, 7);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未知字段要报错而不是静默忽略：写错键名时用户能立刻发现。
+    #[test]
+    fn unknown_key_in_local_override_is_rejected() {
+        let parsed: Result<super::LocalOverride, _> = toml::from_str(
+            r#"
+            [paths]
+            ffmpegd = 'typo'
+            "#,
+        );
+        assert!(parsed.is_err(), "拼错的键名应被拒绝");
     }
 }

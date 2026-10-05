@@ -109,6 +109,9 @@ pub struct MainWindow {
     /// 「取消」按钮置位。任务结束后必须复位（引擎在任务开始前也会复位一次，
     /// 双保险），否则下一次翻译一进来就在第一个批次检查点直接退出。
     pub(crate) translate_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// 模型下载的取消标志（与 `translate_cancel` 同一套模式）。
+    /// 下载最大 833 MB，慢网下要几十分钟，必须有办法中断。
+    pub(crate) model_download_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) editor_export_format: EditorExportFormat,
     pub(crate) is_export_dropdown_open: bool,
     /// 字幕预览框的**手动**宽度（px）。`Some` 时以它为准并压过「单行最大字数」
@@ -135,6 +138,12 @@ pub struct MainWindow {
     pub(crate) library_thumbs: HashMap<i64, PathBuf>,
     /// 正在后台提取首帧的任务 id 集合，防止重复派发
     pub(crate) library_thumb_inflight: HashSet<i64>,
+    /// 视频库卡片显示的文件大小（task_id → 已格式化文本）。
+    ///
+    /// 缓存的原因：卡片渲染每帧都要这个字符串，而取它要 `fs::metadata`。
+    /// 列表没有虚拟化，40 条记录就是每帧 40 次 stat。大小只在载入视频库时
+    /// 探测一次，之后只查表。
+    pub(crate) library_sizes: HashMap<i64, String>,
     /// 字幕清单搜索关键字（空串表示不过滤）
     pub(crate) subtitle_search: String,
     pub(crate) subtitle_search_focus: FocusHandle,
@@ -296,6 +305,7 @@ impl MainWindow {
             confirm_dialog: None,
             notice: None,
             translate_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            model_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             editor_export_format: EditorExportFormat::default(),
             is_export_dropdown_open: false,
             preview_box_w: preview_box_w_initial,
@@ -307,6 +317,7 @@ impl MainWindow {
             subtitle_list_followed_sel: None,
             library_thumbs: HashMap::new(),
             library_thumb_inflight: HashSet::new(),
+            library_sizes: HashMap::new(),
             subtitle_search: String::new(),
             subtitle_search_focus,
             subtitle_search_focused: false,
@@ -629,6 +640,8 @@ impl Render for MainWindow {
             // 跨页常驻的横幅上显示，否则用户在其它页面只会看到「点了没反应」。
             // 非失败态渲染空元素，不影响任何现有布局。
             .child(self.render_error_banner(cx))
+            // 字幕写库失败：与转写错误分开显示，因为它要常驻到用户处理为止
+            .child(self.render_db_error_banner(cx))
             // 1.6 一次性中性提示条：成功类反馈（如「已删除该记录」）与错误条同处一列，
             // 但配色中性——操作成功不该被误读成出错。两者同时存在时错误条在上。
             .child(self.render_notice_banner(cx))

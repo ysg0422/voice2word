@@ -14,6 +14,14 @@ pub struct Segment {
     /// 翻译字幕 (其他语言对中文的翻译，无翻译时为 None)
     #[serde(default)]
     pub translation: Option<String>,
+    /// 译文的目标语言（与 `TRANSLATE_TARGET_LANGS` 同集合，如 "English"）。
+    ///
+    /// 为什么必须记住它：翻译是**可重入**的——用户可能先译成 English、再改译成
+    /// 日本語。没有这个字段时，`translated_count()` 只看 `translation` 是否非空，
+    /// 于是切换目标语言后旧译文会被当成「已完成」，界面显示 100% 却整篇是英文，
+    /// 「开始翻译」按钮也因 `done == total` 直接拒绝执行。
+    #[serde(default)]
+    pub translation_lang: Option<String>,
     /// LLM 润色文本 (保留字段兼容)
     #[serde(default)]
     pub polished: String,
@@ -46,6 +54,7 @@ impl Segment {
             end,
             text: text.into(),
             translation: None,
+            translation_lang: None,
             polished: String::new(),
             language: None,
             confidence: None,
@@ -62,6 +71,30 @@ impl Segment {
             &self.text
         } else {
             &self.polished
+        }
+    }
+
+    /// 送去翻译的源文本。
+    ///
+    /// 用 [`Segment::display_text`]（优先标点恢复/润色结果）而非裸 `text`：
+    /// 标点恢复是给模型补断句线索的关键，拿无标点的 `text` 去翻译等于主动丢掉
+    /// 这些线索，长句尤其容易被译得断不开。同时把换行压成空格，避免一条字幕
+    /// 在批量协议里被拆成两行、错位到相邻序号上。
+    pub fn translate_source(&self) -> String {
+        self.display_text().replace(['\r', '\n'], " ")
+    }
+
+    /// 译文是否**已经**是该目标语言的（用于增量翻译与「已完成」判定）。
+    ///
+    /// 只认精确匹配：目标语言清单是固定枚举（`TRANSLATE_TARGET_LANGS`），
+    /// 不做模糊匹配——把 "English" 与 "英语" 视作同一语言的猜测一旦猜错，
+    /// 就会静默跳过本该重译的句子。
+    pub fn translation_matches(&self, target_lang: &str) -> bool {
+        match (self.translation.as_deref(), self.translation_lang.as_deref()) {
+            (Some(text), Some(lang)) => {
+                !text.trim().is_empty() && lang == target_lang
+            }
+            _ => false,
         }
     }
 
@@ -348,6 +381,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         end: split_t,
         text: left_text,
         translation: left_trans,
+        translation_lang: seg.translation_lang.clone(),
         polished: left_polished,
         language: seg.language.clone(),
         confidence: seg.confidence,
@@ -359,6 +393,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         end: seg.end,
         text: right_text,
         translation: right_trans,
+        translation_lang: seg.translation_lang.clone(),
         polished: right_polished,
         language: seg.language,
         confidence: seg.confidence,
@@ -866,6 +901,82 @@ mod tests {
                     "出现过短片段，下次载入会被当鬼影删掉：{seg:?}"
                 );
             }
+        }
+    }
+    // ─────────── 翻译相关的取值与判定 ───────────
+
+    /// 翻译源文本必须用**标点恢复后的文本**，而不是裸识别结果。
+    /// 标点恢复是给模型补断句线索的关键，用无标点的 `text` 去翻译会丢线索。
+    #[test]
+    fn translate_source_prefers_punctuated_text() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "你好世界这是一个测试");
+        assert_eq!(seg.translate_source(), "你好世界这是一个测试");
+
+        seg.polished = "你好，世界。这是一个测试。".to_string();
+        assert_eq!(
+            seg.translate_source(),
+            "你好，世界。这是一个测试。",
+            "应优先取标点恢复后的文本"
+        );
+    }
+
+    /// 源文本里的换行必须压成空格：批量协议是「一行一序号」，
+    /// 保留换行会让一条字幕被拆成两行、错位到相邻序号上。
+    #[test]
+    fn translate_source_flattens_newlines() {
+        let seg = Segment::new(1, 0.0, 1.0, "第一行\n第二行\r\n第三行");
+        let src = seg.translate_source();
+        assert!(!src.contains('\n'), "不应残留换行: {src:?}");
+        assert!(!src.contains('\r'), "不应残留回车: {src:?}");
+        assert_eq!(src, "第一行 第二行  第三行");
+    }
+
+    /// 只有「译文非空 **且** 语言匹配」才算已完成。
+    /// 这是切换目标语言后必须整篇重译的判定基础。
+    #[test]
+    fn translation_matches_requires_same_language() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "你好");
+        // 没有译文
+        assert!(!seg.translation_matches("English"));
+        // 有译文但没记语言（旧数据）：不算「已是目标语言」，必须重译
+        seg.translation = Some("Hello".to_string());
+        assert!(
+            !seg.translation_matches("English"),
+            "旧数据缺 translation_lang 时应保守重译，而不是当作已完成"
+        );
+        // 语言记上了
+        seg.translation_lang = Some("English".to_string());
+        assert!(seg.translation_matches("English"));
+        // 换目标语言 → 不再匹配（旧英文译文不能充当日语译文）
+        assert!(
+            !seg.translation_matches("日本語"),
+            "切换到新语言后旧译文必须判为未完成，否则整片会静默保留旧语言"
+        );
+        // 空白译文不算完成
+        seg.translation = Some("   ".to_string());
+        assert!(!seg.translation_matches("English"));
+    }
+
+    /// 拆分片段时译文与**目标语言**都要跟随，否则拆完一半会变成「无语言标记」，
+    /// 下次翻译判定会把它当未完成而重复请求。
+    #[test]
+    fn split_keeps_translation_lang_on_both_halves() {
+        // 注意：拆分切点取自 `text`（不是 `polished`），且必须命中标点才拆
+        // （见 `split_index_at_ratio` 与 `test_no_punctuation_long_sentence_stays_intact`），
+        // 所以这里给 `text` 本身带标点，才能真的走到「拆成多段」的分支。
+        let mut seg = Segment::new(1, 0.0, 10.0, "前面这半句讲的是背景，后面这半句讲的是结论。");
+        seg.polished = "前面这半句讲的是背景，后面这半句讲的是结论。".to_string();
+        seg.translation = Some("The first half is background, the second half is the conclusion.".to_string());
+        seg.translation_lang = Some("English".to_string());
+
+        let out = split_long_segments(vec![seg]);
+        assert!(out.len() > 1, "应被拆成多段");
+        for piece in &out {
+            assert_eq!(
+                piece.translation_lang.as_deref(),
+                Some("English"),
+                "拆出的片段必须保留目标语言标记"
+            );
         }
     }
 }

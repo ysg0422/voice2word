@@ -111,11 +111,6 @@ struct TimelineRestorer {
 }
 
 impl TimelineRestorer {
-    /// 无预处理时的恒等还原（仅用于让调用方代码只有一条路径）
-    fn identity(original_duration: f64) -> Self {
-        Self { plan: None, speed: 1.0, original_duration }
-    }
-
     fn to_original(&self, t: f64) -> f64 {
         let t = match self.plan.as_deref() {
             Some(p) if !p.is_identity() => p.to_original(t),
@@ -530,9 +525,9 @@ impl TaskPipeline {
 
         // ── 阶段 2: 语音转写 ──
         if self.is_cancelled() {
-            // 取消：清掉临时 WAV。这里显式置 None 是为了让删除发生在 send 之前，
+            // 取消：清掉临时 WAV。这里显式 take + drop 是为了让删除发生在 send 之前，
             // 但即使漏写这一行，函数返回时守卫的 Drop 也会兜住。
-            temp_wav_path = None;
+            drop(temp_wav_path.take());
             let _ = tx.send(PipelineEvent::Finished(Vec::new(), Default::default()));
             return Ok(Vec::new());
         }
@@ -754,7 +749,7 @@ impl TaskPipeline {
 
         // 转写已完成，临时 wav 不再需要：显式释放守卫，尽早把磁盘空间还给用户。
         // 注意这里不是「唯一的删除点」——取消 / 报错提前返回时守卫的 Drop 会同样生效。
-        temp_wav_path = None;
+        drop(temp_wav_path.take());
 
         if self.is_cancelled() {
             let _ = tx.send(PipelineEvent::Finished(segments.clone(), Default::default()));

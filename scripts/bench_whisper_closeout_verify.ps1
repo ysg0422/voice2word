@@ -42,7 +42,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
-$ffmpeg = 'A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe'
+. (Join-Path $PSScriptRoot 'resolve_paths.ps1')
+$ffmpeg = Get-V2wPath -Key 'ffmpeg' -ProjectRoot $projectRoot
 $cli = Join-Path $projectRoot 'tools\whisper-vulkan\whisper-1.8.4-windows-x64\whisper-cli.exe'
 $model = Join-Path $projectRoot $ModelRelative
 $vadModel = Join-Path $projectRoot 'models\whisper\ggml-silero-v6.2.0.bin'
@@ -105,8 +106,12 @@ function Get-Timing([string]$errText, [string]$name) {
 
 $baseArgs = @('-m', $model, '-f', $clip, '-l', 'zh', '-t', "$Threads", '-p', '1', '-oj', '-osrt')
 $vadArgs = @('--vad', '-vm', $vadModel, '-vt', '0.50', '-vsd', '250')
-$prodArgs = @('-bo', '1', '-bs', '1', '-mc', '32', '-sns', '-nf',
-    '--prompt', $promptText, '--carry-initial-prompt')
+# 注意：`*_prod` 臂必须与**当前生产链路**逐字等价，否则「相对生产参数」的结论全部失真。
+# 2026-10-03 复核发现这里曾残留 `--carry-initial-prompt`，而该参数早已从
+# src/engines/whisper.rs 移除（见该文件注释：精度净亏 1.1~1.2 pp）。于是本脚本的
+# `gpu_prod` 报出 CER 13.14%，而真实生产配置是 12.03%——差值全来自这个已删除的参数。
+# 现已对齐：prod 与 nocarry 只差命名，取值与生产链路一致。
+$prodArgs = @('-bo', '1', '-bs', '1', '-mc', '32', '-sns', '-nf', '--prompt', $promptText)
 $nocarryArgs = @('-bo', '1', '-bs', '1', '-mc', '32', '-sns', '-nf', '--prompt', $promptText)
 # 与 $nocarryArgs 只差 `-mc`：显式给 -1（whisper-cli 出厂默认，不裁剪上下文）。
 # 显式写出而不是省略，是为了让两条对照臂在命令行上只差一个值，便于复核。

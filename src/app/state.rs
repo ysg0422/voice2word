@@ -434,6 +434,27 @@ pub struct AppState {
     pub batch_running: bool,
     /// 当前正在转写的队列项下标；单文件模式下为 `None`
     pub batch_active: Option<usize>,
+
+    // ── 模型下载（首次使用引导）──
+    /// 是否正在下载模型
+    pub is_downloading: bool,
+    /// 当前正在下载的条目 id（用于在列表里高亮）
+    pub download_current: Option<String>,
+    /// 已完成字节 / 总字节（总字节为 0 表示服务端未给 Content-Length）
+    pub download_done_bytes: u64,
+    pub download_total_bytes: u64,
+    /// 最近一次下载的结果提示（成功或失败原因）
+    pub download_status_msg: String,
+    /// 最近一次字幕写库失败的原因（`None` = 一切正常）。
+    ///
+    /// 存在的意义：写库失败此前被 `let _ =` 完全吞掉，用户改完字幕、切页面、
+    /// 关程序，重启后发现改动全没了，而界面上从未出现任何异常。现在把它
+    /// 渲染成可见提示条，让「没保存上」这件事至少是可被发现的。
+    pub db_write_error: Option<String>,
+
+    /// 已就位条目的缓存快照：`is_present` 要 stat 磁盘，
+    /// 每帧对 11 个路径做 stat 会拖慢渲染，因此只在启动/下载完成后刷新。
+    pub model_present: std::collections::HashMap<String, bool>,
 }
 
 impl AppState {
@@ -496,6 +517,8 @@ impl AppState {
             &hardware_info,
         );
 
+        // 目标语言在 config 被 move 进 state 之前取出（否则借用已移动的值）
+        let translate_target_lang = config.translate.target_lang.clone();
         let mut state = Self {
             config,
             db,
@@ -524,7 +547,7 @@ impl AppState {
             is_translating: false,
             translate_progress: 0.0,
             translate_status_msg: String::new(),
-            translate_target_lang: "简体中文".to_string(),
+            translate_target_lang,
             translate_mode,
             metrics: ResourceMetrics::default(),
 
@@ -560,6 +583,14 @@ impl AppState {
             batch_queue: Vec::new(),
             batch_running: false,
             batch_active: None,
+            is_downloading: false,
+            download_current: None,
+            download_done_bytes: 0,
+            download_total_bytes: 0,
+            download_status_msg: String::new(),
+            // 首次扫描放在 `with_hardware` 收尾处（那里能拿到 &mut self）
+            db_write_error: None,
+            model_present: std::collections::HashMap::new(),
         };
 
         // 如果存在历史记录，启动时自动加载最近一次的工程，避免开屏黑屏或空数据
@@ -567,6 +598,8 @@ impl AppState {
             state.load_task(&recent);
         }
 
+        // 首次扫描模型就位情况：界面据此在缺必需组件时弹下载引导
+        state.refresh_model_presence();
         state
     }
 
@@ -657,7 +690,11 @@ impl AppState {
         }
     }
 
-    /// 已有多少条字幕带译文（用于界面提示与导出模式判定）
+    /// 已有多少条字幕带译文（不论目标语言）。
+    ///
+    /// 用于**导出模式判定**（有译文就默认走双语导出）——那个场景不该关心译文是哪国语言。
+    /// 界面上的「已完成 N/M 句」请用 [`AppState::translated_count_for`]，
+    /// 否则切换目标语言后会把旧语言的译文也算成完成，显示 100% 却整篇是别的语言。
     pub fn translated_count(&self) -> usize {
         self.segments
             .iter()
@@ -665,6 +702,21 @@ impl AppState {
             .count()
     }
 
+    /// 当前目标语言下已完成的句数（界面进度与「是否还需要翻译」以它为准）
+    pub fn translated_count_for(&self, target_lang: &str) -> usize {
+        self.segments
+            .iter()
+            .filter(|seg| seg.translation_matches(target_lang))
+            .count()
+    }
+
+    /// 切换目标语言并落盘。目标语言是长期偏好，必须持久化，
+    /// 否则重启后又跳回默认语言，用户会以为设置没生效。
+    pub fn set_translate_target_lang(&mut self, lang: &str) {
+        self.translate_target_lang = lang.to_string();
+        self.config.translate.target_lang = lang.to_string();
+        self.save_translate_config();
+    }
     pub fn set_selected_file(&mut self, path: PathBuf) {
         self.selected_file = Some(path);
     }
@@ -782,12 +834,34 @@ impl AppState {
         self.clear_streaming();
     }
 
-    /// 追加实时流式转写片段并推进时间戳
+    /// 实时流式转写窗口保留的句数上限。
+    ///
+    /// 界面只展示**最近 3 句**（见 `transcribe.rs` 的流式看板），但历史上这里
+    /// 是把每一句都 push 进 `streaming_segments` 且从不裁剪。转写一个 32 分钟
+    /// 的课程视频会累积上千条 Segment（每条还带 String），而这些数据在转写
+    /// 结束前一直驻留内存——纯粹为了一个「只显示 3 行」的看板。
+    ///
+    /// 留 32 句而不是 3 句，是为了给「回看刚过去几句」这类交互留余量，
+    /// 同时把内存占用钉死成常数。
+    const STREAMING_WINDOW: usize = 32;
+
+    /// 追加实时流式转写片段并推进时间戳。
+    ///
+    /// 只保留最近 [`Self::STREAMING_WINDOW`] 句：看板只显示 3 句，长视频下
+    /// 无限增长只是白占内存。
+    ///
+    /// 每次超出时挪掉队首若干条（通常只有 1 条）。单次代价是移动窗口内剩余
+    /// 元素（≤32），也就是常数级；相比「转写 32 分钟累积上千条 Segment 常驻
+    /// 内存」，这个代价可以忽略。
     pub fn push_stream_segment(&mut self, seg: Segment) {
         if seg.end > self.streaming_current_sec {
             self.streaming_current_sec = seg.end;
         }
         self.streaming_segments.push(seg);
+        if self.streaming_segments.len() > Self::STREAMING_WINDOW {
+            let excess = self.streaming_segments.len() - Self::STREAMING_WINDOW;
+            self.streaming_segments.drain(..excess);
+        }
     }
 
     /// 清理重置实时流式转写状态
@@ -1071,7 +1145,15 @@ impl AppState {
     pub fn flush_segments_if_dirty(&mut self) {
         if self.segments_dirty {
             self.segments_dirty = false;
-            self.sync_segments_to_db();
+            // 写库失败不能静默：用户以为改动已保存，重启后却发现全丢了。
+            // 记进 `db_write_error`，界面把它渲染成可见的提示条。
+            match self.sync_segments_to_db() {
+                Ok(()) => self.db_write_error = None,
+                Err(err) => {
+                    tracing::warn!(error = %err, "字幕写库失败，改动尚未持久化");
+                    self.db_write_error = Some(format!("字幕保存失败：{err}"));
+                }
+            }
         }
     }
 
@@ -1267,6 +1349,7 @@ impl AppState {
             end: orig.end,
             text: part2.clone(),
             translation: orig.translation.clone(),
+            translation_lang: orig.translation_lang.clone(),
             polished: if !orig.polished.is_empty() { part2 } else { String::new() },
             language: orig.language.clone(),
             confidence: orig.confidence,
@@ -1332,13 +1415,64 @@ impl AppState {
         }
     }
 
-    /// 同步当前字幕到 SQLite 数据库
-    pub fn sync_segments_to_db(&self) {
+    /// 同步当前字幕到 SQLite 数据库。
+    ///
+    /// # 为什么返回 `Result` 而不是吞掉
+    ///
+    /// 此前这里是 `let _ = ...`，写库失败被完全静默。后果是**用户以为保存了**：
+    /// 在剪辑台改了半天字幕、切走页面（触发 flush）、关掉程序，重启后发现改动
+    /// 全没了——而界面上从未出现任何异常。磁盘满、数据库被锁、文件只读都会走到
+    /// 这条路径。
+    ///
+    /// 现在把失败交给调用方（`flush_segments_if_dirty` 会把它挂到界面的提示条上）。
+    /// 注意：**不重试**。写失败通常是持久性原因（磁盘满 / 只读），立刻重试只会
+    /// 在每次 flush 时再失败一次；提示用户才是有效的处置。
+    pub fn sync_segments_to_db(&self) -> anyhow::Result<()> {
         // 按当前工程的数据库主键写回。没有主键（尚未落库）时什么都不做：
         // 退化成按路径更新会把同路径的历史记录一起改掉。
-        if let Some(id) = self.active_task_id {
-            let _ = self.db.update_task_segments(id, &self.segments);
+        match self.active_task_id {
+            Some(id) => self.db.update_task_segments(id, &self.segments),
+            None => Ok(()),
         }
+    }
+
+    // ─────────── 模型下载（首次使用引导）───────────
+
+    /// 重新扫描全部可下载项的就位状态（启动时与每次下载完成后调用）。
+    ///
+    /// 结果缓存在 `model_present`：判定要 `stat` 磁盘，而渲染每帧都问，
+    /// 11 个路径逐帧 stat 是白白的系统调用开销。
+    pub fn refresh_model_presence(&mut self) {
+        // 直接用**内存里的** config：AppState 自己就持有它，判定时再
+        // `load_from_file` 一次纯属浪费（启动路径上会白读一遍 TOML + 解析）。
+        // 顺带也解决了「11 个条目各读一遍」——统一用这一份配置。
+        let ctx = crate::utils::model_download::PresenceContextRef::new(&self.config);
+        self.model_present = crate::utils::ITEMS
+            .iter()
+            .map(|i| (i.id.to_string(), ctx.is_present(i)))
+            .collect();
+    }
+
+    /// 某个条目是否已就位（查缓存快照，不碰磁盘）。
+    pub fn model_is_present(&self, id: &str) -> bool {
+        self.model_present.get(id).copied().unwrap_or(false)
+    }
+
+    /// 缺失的**必需**组件数（ffmpeg 与 Whisper 主模型）。
+    /// 界面据此决定是否弹首次使用引导。
+    pub fn missing_required_models(&self) -> usize {
+        crate::utils::ITEMS
+            .iter()
+            .filter(|i| i.required && !self.model_is_present(i.id))
+            .count()
+    }
+
+    /// 缺失条目总数（含可选）。
+    pub fn missing_model_count(&self) -> usize {
+        crate::utils::ITEMS
+            .iter()
+            .filter(|i| !self.model_is_present(i.id))
+            .count()
     }
 }
 
@@ -1685,5 +1819,50 @@ mod tests {
         // 过滤态（有关键字）只要求不越界
         let hit = matched_indices(&state.segments, "第三句");
         assert!(indices_cover_segments(&hit, state.segments.len()));
+    }
+    /// 流式转写窗口必须有界：长视频会 push 上千句，而看板只显示 3 句。
+    /// 这里锁住「内存占用是常数」这个不变量，防止将来有人把裁剪去掉。
+    #[test]
+    fn streaming_window_stays_bounded() {
+        let mut state = test_state(Vec::new());
+        for i in 1..=500 {
+            state.push_stream_segment(Segment::new(i, (i as f64) * 2.0, (i as f64) * 2.0 + 1.0, "句子"));
+        }
+        assert!(
+            state.streaming_segments.len() <= AppState::STREAMING_WINDOW,
+            "窗口必须钉死在上限内，实际 {}",
+            state.streaming_segments.len()
+        );
+        // 保留的是**最近**的若干句，不是最早的
+        let last = state.streaming_segments.last().expect("应有内容");
+        assert_eq!(last.index, 500, "窗口里应保留最后 push 的那句");
+        // 时间戳仍应推进到最新（进度条依赖它）
+        assert!((state.streaming_current_sec - 1001.0).abs() < 0.001);
+    }
+
+    /// 窗口内句序必须保持 push 顺序（看板按顺序展示最近 3 句）。
+    #[test]
+    fn streaming_window_keeps_order() {
+        let mut state = test_state(Vec::new());
+        for i in 1..=100 {
+            state.push_stream_segment(Segment::new(i, i as f64, i as f64 + 0.5, "x"));
+        }
+        let idxs: Vec<usize> = state.streaming_segments.iter().map(|s| s.index).collect();
+        let mut sorted = idxs.clone();
+        sorted.sort_unstable();
+        assert_eq!(idxs, sorted, "窗口内句序应保持递增");
+        assert_eq!(*idxs.last().unwrap(), 100);
+    }
+
+    /// 清理必须把窗口与计时都归零（换任务时复用同一个 AppState）。
+    #[test]
+    fn clear_streaming_resets_window() {
+        let mut state = test_state(Vec::new());
+        for i in 1..=10 {
+            state.push_stream_segment(Segment::new(i, i as f64, i as f64 + 0.5, "x"));
+        }
+        state.clear_streaming();
+        assert!(state.streaming_segments.is_empty());
+        assert_eq!(state.streaming_current_sec, 0.0);
     }
 }

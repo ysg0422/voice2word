@@ -10,7 +10,22 @@ import json, re, subprocess, sys, time, wave
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-FFMPEG = Path(r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe")
+def _resolve_ffmpeg() -> Path:
+    """与 config.rs 同序解析 ffmpeg：config.local.toml → config.toml → 便携默认。
+    原先这里硬编码了开发机的绝对路径，换台机器脚本直接不可用。"""
+    import re
+    for name in ("config.local.toml", "config.toml"):
+        cfg = ROOT / name
+        if not cfg.exists():
+            continue
+        m = re.findall(r'^\s*ffmpeg\s*=\s*[\'"]([^\'"]+)[\'"]', cfg.read_text(encoding="utf-8"), re.M)
+        if m:
+            v = Path(m[-1])
+            return v if v.is_absolute() else ROOT / v
+    return ROOT / "tools/ffmpeg.exe"
+
+
+FFMPEG = _resolve_ffmpeg()
 VAD = ROOT / "tools/whisper-186-test/Release/whisper-vad-speech-segments.exe"
 CLI = ROOT / "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"
 MODEL = ROOT / "models/whisper/ggml-small-q5_0.bin"

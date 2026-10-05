@@ -20,6 +20,8 @@ impl MainWindow {
 
         // 为缺失首帧的卡片后台派发缩略图提取（幂等，完成后自动刷新）
         self.ensure_library_thumbnails(cx);
+        // 同理补齐文件大小（每任务只 stat 一次，不再逐帧读盘）
+        self.ensure_library_sizes(cx);
 
         // 页面外壳统一走 primitives::page_shell：内边距 / 分区间距与其余工作台页同源。
         // 注意本页内容自身带滚动列表（library-cards-scroll），外层不再额外滚动，
@@ -59,6 +61,8 @@ impl MainWindow {
                                     .id("library-refresh-btn")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.state.refresh_recent_tasks();
+                                        // 列表可能因刷新而变短，顺带裁掉查不到的缓存
+                                        this.prune_library_caches();
                                         cx.notify();
                                     })),
                             ),
@@ -122,6 +126,53 @@ impl MainWindow {
                 self.render_library_card(task, cx)
             }))
             .into_any_element()
+    }
+
+    /// 为视频库卡片补齐「文件大小」显示文本（每个任务只探测一次）。
+    ///
+    /// 大小要 `fs::metadata`，而卡片渲染每帧都读它；列表又没有虚拟化，
+    /// 40 条记录 = 每帧 40 次 stat。因此在载入视频库时探一次并缓存。
+    ///
+    /// 探测放在后台线程：文件可能在机械盘或网络盘上，`metadata` 卡住时
+    /// 不能拖住 UI 线程。失败（文件被删/不可访问）写「未知大小」占位，
+    /// 与缩略图失败占位同一策略，避免每次渲染重复派发。
+    fn ensure_library_sizes(&mut self, cx: &mut Context<Self>) {
+        let pending: Vec<(i64, PathBuf)> = self
+            .state
+            .recent_tasks
+            .iter()
+            .filter(|t| !self.library_sizes.contains_key(&t.id))
+            .map(|t| (t.id, PathBuf::from(&t.file_path)))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let computed = cx
+                .background_executor()
+                .spawn(async move {
+                    pending
+                        .into_iter()
+                        .map(|(id, path)| {
+                            let text = std::fs::metadata(&path)
+                                .ok()
+                                .map(|m| format_file_size(m.len()))
+                                .unwrap_or_else(|| "未知大小".to_string());
+                            (id, text)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                for (id, text) in computed {
+                    this.library_sizes.insert(id, text);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 为视频库卡片异步预提取首帧缩略图。
@@ -194,19 +245,16 @@ impl MainWindow {
             .unwrap_or("MP4")
             .to_uppercase();
 
-        // 格式化文件大小 (从 file_path 尝试获取)
-        let file_size_str = std::fs::metadata(&task.file_path)
-            .ok()
-            .map(|m| {
-                let bytes = m.len();
-                if bytes >= 1_073_741_824 {
-                    format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
-                } else if bytes >= 1_048_576 {
-                    format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-                } else {
-                    format!("{:.0} KB", bytes as f64 / 1024.0)
-                }
-            })
+        // 文件大小：查**缓存快照**，不在这里 stat。
+        //
+        // 这个函数每个可见卡片每帧都会被调一次，而视频库列表是普通
+        // `overflow_y_scroll` + `children`（没有虚拟化），40 条记录就是
+        // 每帧 40 次 `fs::metadata` —— 磁盘慢或文件在网络盘上时直接表现为
+        // 滚动卡顿。大小只在「载入视频库」时探测一次（见 `ensure_library_sizes`）。
+        let file_size_str = self
+            .library_sizes
+            .get(&task_id)
+            .cloned()
             .unwrap_or_else(|| "未知大小".to_string());
 
         // 摘录首条字幕文本 (按字符边界截断，避免切进多字节中文字符导致 panic)
@@ -539,5 +587,39 @@ impl MainWindow {
                     .text_color(Theme::text_secondary())
                     .child(value.to_string()),
             )
+    }
+}
+
+/// 把字节数格式化成界面用的体积文本。
+///
+/// 抽成独立函数是因为它现在跑在后台线程里（见 `ensure_library_sizes`），
+/// 与渲染路径解耦，也便于单测。
+fn format_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.0} KB", b / KB)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_file_size;
+
+    #[test]
+    fn file_size_formatting_matches_previous_rendering() {
+        // 与迁移前的渲染逻辑逐字对齐，避免「顺手重构」改变界面观感
+        assert_eq!(format_file_size(1_073_741_824), "1.0 GB");
+        assert_eq!(format_file_size(2_147_483_648), "2.0 GB");
+        assert_eq!(format_file_size(1_048_576), "1.0 MB");
+        assert_eq!(format_file_size(66_359), "65 KB");
+        assert_eq!(format_file_size(1024), "1 KB");
+        assert_eq!(format_file_size(0), "0 KB");
     }
 }

@@ -11,7 +11,7 @@ use image::{Frame, ImageBuffer, Rgba};
 use smallvec::SmallVec;
 use std::sync::Arc;
 use crate::app::state::{WorkspaceTab, ProcessStatus};
-use crate::utils::time::{format_duration_short, seconds_to_hms, seconds_to_timestamp};
+use crate::utils::time::{format_duration_short, seconds_to_hms, seconds_to_timestamp_short};
 use super::primitives;
 use super::theme::Theme;
 use super::{apply_line_edit, EditorExportFormat, EditorSubtitlePanel, MainWindow};
@@ -93,16 +93,22 @@ const EDITOR_STACK_MONITOR_H: f32 = 320.0;
 
 /// 「多语言对照表」的列宽。表头与数据行共用同一组常量，避免两处各写一份后悄悄漂移。
 ///
-/// 表内最小横向占用 = 左右内边距 8×2 + 序号 28 + 起止时间 80×2 + 说话人 64
-/// + 原文/译文两列各 46 的下限 + 5 处 6px 间距 = 390px（两列文本再窄就只剩省略号）。
-/// 面板宽度减去正文与卡片的两层 12px 内边距后若不足 390，表内单元格就会互相挤压；
-/// 因此 `EDITOR_RIGHT_MIN_W`(440) 与导航栏 180 共同保证窗口 600px 起表格都有 396px 以上。
-const SUBTITLE_TABLE_COL_INDEX_W: f32 = 28.0;
-const SUBTITLE_TABLE_COL_TIME_W: f32 = 80.0;
+/// 表内最小横向占用 = 左右内边距 6×2 + 序号 24 + 起止时间 68×2 + 说话人 64
+/// + 原文/译文两列各 46 的下限 + 5 处 5px 间距 = 355px（两列文本再窄就只剩省略号）。
+/// 面板宽度减去正文与卡片的两层 12px 内边距后若不足 355，表内单元格就会互相挤压；
+/// 因此 `EDITOR_RIGHT_MIN_W`(440) 与导航栏 180 共同保证窗口 600px 起表格都有 360px 以上。
+///
+/// 这几列是本表唯一的「固定开销」，它们每省 1px，原文与译文两列就能各多分到 0.5px
+/// （剩余宽度由两列 `flex_1` 均分），所以压缩要压在这里：
+/// - 时间列 80→68：显示格式同步压到 `hh:mm:ss.t`（10 字符）。毫秒那一位扫读无用，
+///   却是把时间列撑到 80 的唯一原因，白白吃掉两列文本的空间——窄面板下译文最先被截。
+/// - 序号 28→24、说话人保持 64（「说话人 N」+ 内边距下限）、内边距 8→6、列间距 6→5。
+const SUBTITLE_TABLE_COL_INDEX_W: f32 = 24.0;
+const SUBTITLE_TABLE_COL_TIME_W: f32 = 68.0;
 const SUBTITLE_TABLE_COL_SPEAKER_W: f32 = 64.0;
 const SUBTITLE_TABLE_COL_TEXT_MIN_W: f32 = 46.0;
-const SUBTITLE_TABLE_PAD_X: f32 = 8.0;
-const SUBTITLE_TABLE_GAP: f32 = 6.0;
+const SUBTITLE_TABLE_PAD_X: f32 = 6.0;
+const SUBTITLE_TABLE_GAP: f32 = 5.0;
 
 /// 说话人标签的配色：4 个说话人各占一色，超过则回落到第一色循环。
 /// 只在标签本身着色（不染整行），避免与「选中行」的高亮底色互相干扰。
@@ -997,8 +1003,8 @@ impl MainWindow {
                         if panel == EditorSubtitlePanel::Style && cur_seg.is_some() {
                             let seg = cur_seg.as_ref().unwrap();
                             let seg_idx = seg.index;
-                            let start_ts = seconds_to_timestamp(seg.start);
-                            let end_ts = seconds_to_timestamp(seg.end);
+                            let start_ts = seconds_to_timestamp_short(seg.start);
+                            let end_ts = seconds_to_timestamp_short(seg.end);
                             let dur = seg.duration();
                             // 单字无法拆分；最后一句没有下一句可合并，按钮置灰而不是点了没反应
                             let can_split = seg.display_text().chars().count() > 1;
@@ -1618,8 +1624,8 @@ impl MainWindow {
                                                 let seg_idx = seg.index;
                                                 let is_selected = sel == Some(seg_idx);
                                                 let is_playing_here = cur_time >= seg.start && cur_time <= seg.end;
-                                                let start_ts = seconds_to_timestamp(seg.start);
-                                                let end_ts = seconds_to_timestamp(seg.end);
+                                                let start_ts = seconds_to_timestamp_short(seg.start);
+                                                let end_ts = seconds_to_timestamp_short(seg.end);
                                                 let raw_text = seg.display_text().to_string();
                                                 let trans_text = seg.translation.as_deref().unwrap_or("—").to_string();
                                                 let speaker = seg.speaker;
@@ -2153,9 +2159,22 @@ impl MainWindow {
         let is_translating = self.state.is_translating;
         let progress = self.state.translate_progress.clamp(0.0, 1.0) as f32;
         let status = self.state.translate_status_msg.clone();
-        let done = self.state.translated_count();
+        let done = self.state.translated_count_for(&target);
         let total = self.state.segments.len();
         let can_run = total > 0 && !is_translating;
+        // 已带译文、但**不是**当前目标语言的句数。
+        // 有了它才能解释「为什么按钮不是『重新翻译』」：用户切换目标语言后
+        // 旧译文仍然在，但当前语言一句都没有——不提示的话，界面看起来像
+        // 「翻译记录丢了」，用户会以为程序把之前的成果清空了。
+        let other_lang = self
+            .state
+            .segments
+            .iter()
+            .filter(|s| {
+                s.translation.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false)
+                    && !s.translation_matches(&target)
+            })
+            .count();
 
         // 引擎档位：本地 Qwen 免费离线，在线 API 更快更好但需要密钥
         let mode_row = div()
@@ -2233,7 +2252,9 @@ impl MainWindow {
                     is_sel,
                     cx,
                     move |this, cx| {
-                        this.state.translate_target_lang = lang_owned.clone();
+                        // 走 setter 而非直接赋值：目标语言是长期偏好，必须落盘，
+                        // 否则重启后跳回默认语言，用户会以为选择没生效。
+                        this.state.set_translate_target_lang(&lang_owned);
                         cx.notify();
                     },
                 )
@@ -2270,11 +2291,21 @@ impl MainWindow {
                             }))
                     })
                     .child(if is_translating {
-                        "翻译中…"
+                        "翻译中…".to_string()
+                    } else if done == total && total > 0 {
+                        // 当前语言全部译完：再点只会被引擎的增量逻辑判为「无需翻译」，
+                        // 文案说清楚，避免用户以为按钮失灵。
+                        "已全部翻译".to_string()
                     } else if done > 0 {
-                        "重新翻译"
+                        // 部分完成（含取消后继续、或补译新句）——增量翻译，
+                        // 不会把已完成的部分重译一遍。
+                        "继续翻译".to_string()
+                    } else if other_lang > 0 {
+                        // 有别的语言的译文、当前语言一句都没有：这是「换语言」场景，
+                        // 按钮要说清是「译成新语言」而不是「重新翻译」。
+                        format!("译为{}", target)
                     } else {
-                        "开始翻译"
+                        "开始翻译".to_string()
                     }),
             )
             // 翻译中才出现的「取消」：离线 Qwen 模型路径不对、在线 API 长时间无响应时，
@@ -2309,8 +2340,16 @@ impl MainWindow {
                     .child(if status.is_empty() {
                         if total == 0 {
                             "先在「智能转写」生成字幕，再回到这里翻译".to_string()
+                        } else if done == total && total > 0 {
+                            format!("已全部翻译为{target}")
+                        } else if other_lang > 0 && done == 0 {
+                            // 关键提示：换语言后旧译文仍在，只是不属于当前目标语言。
+                            // 不说明的话，界面看起来像翻译记录被清空了。
+                            format!("已有 {other_lang} 句其他语言译文；点上方按钮可译成{target}")
+                        } else if done > 0 {
+                            format!("{target}译文 {done}/{total} 句，可继续补译")
                         } else {
-                            format!("已有 {done}/{total} 句带译文")
+                            format!("尚未翻译（共 {total} 句）")
                         }
                     } else {
                         status

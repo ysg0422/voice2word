@@ -1,0 +1,60 @@
+# ===== Voice2Word / .claudeignore =====
+# 排除大体积、构建产物、多媒体和不可读文件，防止 Claude Code 在搜索/索引/统计时消耗过多 token
+
+# --- 构建产物（Rust target / 临时编译产物）---
+target/
+build/
+dist/
+node_modules/
+incremental/
+*.pdb
+*.exe
+*.d
+*.o
+*.rmeta
+*.rlib
+*.bin
+*.pre-lto.bc
+*.natvis
+
+# --- 版本控制与 IDE ---
+.git/
+.idea/
+.vscode/
+.cargo/
+
+# --- 大体积模型与二进制工具（约 5.2 GB）---
+models/
+tools/whisper-vulkan/
+*.onnx
+*.gguf
+
+# --- 测试音视频与媒体（约 105 MB）---
+testVideo/*.mp4
+*.mp4
+*.wav
+resources/
+image/
+
+# --- 日志与临时文件 ---
+logs/
+*.log
+*.log.*
+.tmp_*
+tmp_*
+*.tmp
+
+# --- 数据库与运行时数据 ---
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# --- 二进制文档与演示稿 ---
+*.pptx
+*.docx
+*.pdf
+
+# --- 排查与调试残留 ---
+_scratch_ro/
+legacy_python/

@@ -177,6 +177,15 @@ impl MainWindow {
             .child(self.render_params_card(cx))
             // ── 5. 硬件监控看板 ──
             .child(self.render_hardware_monitor_card(cx))
+            // ── 5.5 模型缺失引导（仅在缺组件时出现，就绪后自动消失）──
+            .children({
+                let missing = self.state.missing_model_count();
+                if missing > 0 {
+                    Some(self.render_model_manager(true, cx))
+                } else {
+                    None
+                }
+            })
             // ── 6. 底部主操作 CTA 按钮 (工程级突出呈现) ──
             .child(
                 primitives::btn(

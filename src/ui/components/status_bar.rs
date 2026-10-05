@@ -19,6 +19,59 @@ impl MainWindow {
     /// 这里把失败态提升为一条**跨页常驻**的错误条，挂在标题栏正下方。点「关闭」
     /// 把状态复位为 `Idle`（与「文件已就绪」等常规态一致），错误串随之消失。
     /// 只渲染 `Failed` 一种，不影响其余状态在转写页的正常展示。
+    /// 字幕写库失败横幅。
+    ///
+    /// 单列一条而不是塞进 `state.status`：那个状态表示「转写失败了」，
+    /// 与「改动没能存盘」是两件互不相干的事——转写成功、但编辑保存失败，
+    /// 是完全可能的组合。而且这条要**常驻可见**直到用户处理，不能因为
+    /// 一次转写状态变化就被覆盖掉。
+    pub(crate) fn render_db_error_banner(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(msg) = self.state.db_write_error.clone() else {
+            return div().into_any_element();
+        };
+
+        div()
+            .id("db-error-banner")
+            .w_full()
+            .flex_shrink_0()
+            .px(px(Theme::PAGE_PAD))
+            .py(px(Theme::SPACE_2))
+            .bg(Theme::tint_red_soft())
+            .border_b_1()
+            .border_color(Theme::tint_red_border())
+            .flex()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .child(primitives::stat_dot_sm(Theme::accent_red()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(Theme::TEXT_BODY))
+                    .text_color(Theme::accent_red())
+                    // 说明后果，而不只是报错：用户需要知道「现在关程序会丢东西」
+                    .child(format!("{msg}（改动尚未写入历史库，请检查磁盘空间或文件权限）")),
+            )
+            .child(
+                div()
+                    .id("db-error-banner-dismiss")
+                    .flex_shrink_0()
+                    .px(px(Theme::SPACE_2))
+                    .py_0p5()
+                    .rounded(px(Theme::RADIUS_SM))
+                    .cursor_pointer()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::accent_red())
+                    .hover(|s| s.bg(Theme::tint_red_border()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.state.db_write_error = None;
+                        cx.notify();
+                    }))
+                    .child("知道了"),
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn render_error_banner(&self, cx: &mut Context<Self>) -> AnyElement {
         let ProcessStatus::Failed(msg) = &self.state.status else {
             return div().into_any_element();

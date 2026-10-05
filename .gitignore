@@ -1,3 +1,9 @@
+# 本机专属配置（绝对路径 / 机器相关 GPU 策略）：只在本机生效，不进版本库。
+# 共享配置是 config.toml；本文件由程序在保存时自动维护（见 utils/config.rs）。
+config.local.toml
+# 配置原子写留下的临时文件（正常路径会被 rename 掉，异常中断时可能残留）
+*.toml.tmp
+
 # Rust build artifacts
 target/
 **/*.rs.bk
@@ -18,8 +24,17 @@ resources/
 # Database & Runtime logs
 *.db
 *.db-journal
+# WAL 模式的副产物（阶段十一把 journal_mode 切到 WAL 后才会出现）。
+# `-wal` 里是尚未 checkpoint 的事务，`-shm` 是共享内存索引——
+# 两者都是运行时状态，绝不该进版本库（也不该在 clone 后带过去）。
+*.db-wal
+*.db-shm
 *.sqlite
 logs/
+
+# 源码快照压缩包（用户自行打包的发布物，不是源码）
+Voice2Word_Source.zip
+*.zip
 
 # Documents & Presentations
 *.pptx

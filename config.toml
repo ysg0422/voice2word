@@ -1,5 +1,5 @@
 [paths]
-ffmpeg = 'A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe'
+ffmpeg = "tools/ffmpeg.exe"
 whisper_cli = "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"
 whisper_model = "models/whisper/ggml-small-q5_0.bin"
 vad_model = "models/whisper/ggml-silero-v6.2.0.bin"
@@ -7,7 +7,7 @@ punc_model = "models/punc/model.int8.onnx"
 sensevoice_model = "models/sensevoice/model.int8.onnx"
 sensevoice_tokens = "models/sensevoice/tokens.txt"
 sensevoice_vad = "models/sensevoice/silero_vad.onnx"
-llama_cli = 'A:\cppsoft\llama.cpp\build\bin\Release\llama-completion.exe'
+llama_cli = "tools/llama-completion.exe"
 llm_model = "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf"
 python = "python"
 
@@ -43,12 +43,12 @@ yield_to_desktop = true
 gpu_limit_percent = 100
 
 [subtitle_style]
-font_size = 40
-letter_spacing = 1
-line_spacing = 1.2000000476837158
-max_chars_per_line = 16
-bottom_margin = 40
-preset_name = "白字黑影"
+font_size = 36
+letter_spacing = 4
+line_spacing = 1.399999976158142
+max_chars_per_line = 20
+bottom_margin = 80
+preset_name = "电影沉浸"
 preview_box_w = 374.13323974609375
 
 [translate]

@@ -33,6 +33,8 @@ impl MainWindow {
             .child(self.render_polish_selection_card(cx))
             // 6. 步骤 5: 字幕翻译引擎（离线 Qwen / 在线 OpenAI 兼容 API）
             .child(self.render_translate_settings_card(cx))
+            // 7. 步骤 6: 模型与外部组件（缺什么、一键补齐；全部走国内镜像）
+            .child(self.render_model_manager(false, cx))
     }
 
     /// 步骤 5：字幕翻译引擎设置。

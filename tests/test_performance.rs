@@ -1,5 +1,5 @@
-﻿use voice2word::core::{
-    run_cpu_benchmark, HardwareInfo, InferenceProfile, PerformanceLevel, UserStrategy,
+use voice2word::core::{
+    run_cpu_benchmark, HardwareInfo, InferenceProfile, UserStrategy,
 };
 
 #[test]

@@ -324,6 +324,7 @@ impl SenseVoiceEngine {
                             end: parsed.end,
                             text: parsed.text.clone(),
                             translation: None,
+                            translation_lang: None,
                             polished: parsed.text.clone(),
                             language: None,
                             confidence: None,
@@ -345,13 +346,23 @@ impl SenseVoiceEngine {
                         inference_elapsed = parsed.elapsed_sec;
                         if segments.is_empty() && !parsed.segments.is_empty() {
                             for item in parsed.segments {
+                                // runner 的 `polished` 与 `text` 目前同值，但字段是它主动
+                                // 声明的（`all_segments` 里两者并列）：直接拿 `text` 顶上
+                                // 等于把「已润色文本」这条通道静默掐掉——将来 runner 若
+                                // 输出真正的标点恢复文本，这里会一声不响地丢弃。
+                                let polished = if item.polished.trim().is_empty() {
+                                    item.text.clone()
+                                } else {
+                                    item.polished
+                                };
                                 segments.push(Segment {
                                     index: item.index,
                                     start: item.start,
                                     end: item.end,
-                                    text: item.text.clone(),
+                                    text: item.text,
                                     translation: None,
-                                    polished: item.text,
+                                    translation_lang: None,
+                                    polished,
                                     language: None,
                                     confidence: None,
                                     speaker: None,
