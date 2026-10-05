@@ -161,6 +161,14 @@ fn translate_via_online_api(
     if cfg.model.trim().is_empty() {
         return Err(anyhow!("未配置在线翻译模型名（如 deepseek-chat / gpt-4o-mini）"));
     }
+    // 接口地址为空时，`chat_completions_url()` 会拼出 "/chat/completions"——
+    // ureq 会报一句难懂的 URL 解析错误。这里提前给出可操作的中文提示。
+    if !cfg.endpoint.starts_with("http://") && !cfg.endpoint.starts_with("https://") {
+        return Err(anyhow!(
+            "在线翻译接口地址不合法：{}。请在「性能设置 → 在线翻译 API」中填写完整的基址（如 https://api.deepseek.com/v1）。",
+            cfg.endpoint
+        ));
+    }
 
     let total = segments.len();
     let batch_size = cfg.batch_size.clamp(1, 60);
@@ -665,6 +673,22 @@ mod tests {
         let err = translate_via_online_api(&cfg, segs, "简体中文", None, Arc::new(AtomicBool::new(false)))
             .expect_err("空密钥必须直接报错而不是静默返回原文");
         assert!(err.to_string().contains("API Key"), "错误信息应指引用户去填密钥: {err}");
+    }
+
+    #[test]
+    fn empty_endpoint_fails_fast() {
+        let cfg = OnlineApiConfig {
+            endpoint: "/chat/completions".to_string(),
+            ..sample_cfg()
+        };
+        let segs = vec![Segment::new(1, 0.0, 1.0, "hello")];
+        let err =
+            translate_via_online_api(&cfg, segs, "简体中文", None, Arc::new(AtomicBool::new(false)))
+                .expect_err("空地址必须直接报错");
+        assert!(
+            err.to_string().contains("接口地址"),
+            "错误信息应指向地址配置: {err}"
+        );
     }
 
     #[test]
