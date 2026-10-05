@@ -2159,10 +2159,7 @@ impl MainWindow {
             .state
             .segments
             .iter()
-            .filter(|s| {
-                s.translation.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false)
-                    && !s.translation_matches(&target)
-            })
+            .filter(|s| s.has_translation() && !s.translation_matches(&target))
             .count();
 
         // 引擎档位：本地 Qwen 免费离线，在线 API 更快更好但需要密钥

@@ -144,7 +144,6 @@ impl Drop for LlamaServer {
 }
 
 /// 把待译下标切成批次：**同时**受「条数」与「字符数」约束。
-/// 把待译下标切成批次：**同时**受「条数」与「字符数」约束。
 ///
 /// 原先只按条数切（24 条一批），一条长字幕就能把整批输入顶到模型上下文之外，
 /// 表现为最后几条译文缺失（`parse_batch_response` 只认能解析出的行）。这里补上
@@ -877,7 +876,6 @@ mod tests {
         let long_zh = "式".repeat(50);
         assert_eq!(LLMEngine::clean_response(&format!("“{long_zh}”"), "原文"), long_zh);
     }
-    // ─────────── 翻译批次规划 ───────────
     // ─────────── 翻译批次规划 ───────────
 
     fn seg_at(index: usize, text: &str) -> Segment {

@@ -199,7 +199,7 @@ fn translate_via_online_api(
     // 失败但**不需要中止整片**的批次数（重试用尽、或本批解析不完整）
     let mut soft_failed_batches = 0usize;
 
-    for chunk in translatable.chunks(batch_size) {
+    for chunk in plan_online_batches(&translatable, &segments, batch_size) {
         // 每批开始前检查取消：单批最长可达 `timeout_secs`（默认 120s），
         // 不在批次之间检查的话，用户点「取消」要等当前批跑完才生效。
         if cancel.load(Ordering::Relaxed) {
@@ -249,7 +249,7 @@ fn translate_via_online_api(
             }
         };
         let mut matched = 0usize;
-        for &pos in chunk {
+        for &pos in &chunk {
             if let Some(text) = translations.get(&segments[pos].index) {
                 segments[pos].translation = Some(text.clone());
                 segments[pos].translation_lang = Some(target_lang.to_string());
@@ -311,7 +311,6 @@ fn translate_via_online_api(
     Ok(segments)
 }
 
-/// 单批重试上限。选 3 而不是更多：429 限流通常需要数秒才恢复，再多轮也是空转，
 /// 把一批里**没译出**的句子按更小的批重试，返回补回的条数。
 ///
 /// 与离线链路同一套思路：输出被截断时整批丢弃会让用户看到「翻译少了几句」，
@@ -417,8 +416,42 @@ fn is_retryable(err: &anyhow::Error) -> bool {
     msg.contains("无法连接") || msg.contains("timed out") || msg.contains("timeout")
 }
 
+/// 把待译下标切成在线请求的批次：**同时**受「条数」与「字符数」约束。
+///
+/// 离线链路早已按字符预算切批（见 `llm::plan_translate_batches`），在线链路此前
+/// 只按条数切。后果：一小批 40 条**长字幕**拼出的 prompt 可能顶爆小上下文服务端
+/// （本地 vLLM / Ollama 或 32K 以外的自建网关），服务端返回 400；而 `is_retryable`
+/// 把 4xx 判为**不可重试**，于是整片翻译在第一批就带着「在线翻译中止」失败。
+///
+/// 这里复用同一套字符预算思路：单批源文本（含 `[序号] ` 前缀）超过字符预算就提前
+/// 收口，单条自身超预算时仍单独成批（交回服务端处理总好过在这里死循环）。
+fn plan_online_batches(pending: &[usize], segments: &[Segment], max_lines: usize) -> Vec<Vec<usize>> {
+    // 在线接口的字符预算：经验值——多数 OpenAI 兼容服务端上下文 >= 8K token，
+    // 按「输入 + 输出」各留一半、每字符约 1 token 估算，单批源文本给到 ~6000 字符
+    // 仍然安全；再叠加条数上限双保险。
+    const ONLINE_CHAR_BUDGET: usize = 6_000;
+    let max_lines = max_lines.max(1);
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut current_chars = 0usize;
+    for &pos in pending {
+        // 序号文本（"[123] "）也算输入，粗估 6 字符
+        let cost = segments[pos].translate_source().chars().count() + 6;
+        let would_overflow = !current.is_empty()
+            && (current.len() >= max_lines || current_chars + cost > ONLINE_CHAR_BUDGET);
+        if would_overflow {
+            batches.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current.push(pos);
+        current_chars += cost;
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
 
-/// 请求一批字幕的译文，返回 `序号 -> 译文` 映射
 /// 一条字幕译文大致需要的输出 token（本地 Qwen2.5 实测中→英约 0.84 token/字符，
 /// 按 1.0 封顶给膨胀型目标语言留余量）。
 const OUTPUT_TOKENS_PER_CHAR: usize = 1;
@@ -926,6 +959,48 @@ mod tests {
         );
         assert!(budget <= 8_192, "不应超过宽松上限: {budget}");
     }
+    /// 在线批次规划：条数上限与字符预算**同时**生效。
+    ///
+    /// 回归：修前只按条数切，一小批 40 条长字幕拼出的 prompt 可能顶爆小上下文
+    /// 服务端并返回 400，而 4xx 被 `is_retryable` 判为不可重试 → 整片翻译在第一批
+    /// 就中止。这里锁死「长行会被字符预算提前拆批」，且不得丢句或重复。
+    #[test]
+    fn plan_online_batches_splits_on_char_budget_and_line_cap() {
+        // 短句：应完全受条数上限约束
+        let short: Vec<Segment> = (1..=100).map(|i| Segment::new(i, 0.0, 1.0, "短句")).collect();
+        let pending: Vec<usize> = (0..100).collect();
+        let batches = plan_online_batches(&pending, &short, 20);
+        assert!(batches.iter().all(|b| b.len() <= 20), "每批不得超过条数上限");
+        let mut all: Vec<usize> = batches.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, pending, "不得丢句或重复");
+
+        // 长句：单批 40 行、每行 500 字 → 字符预算必须把它拆成多批
+        let long = "字".repeat(500);
+        let segs: Vec<Segment> = (1..=40).map(|i| Segment::new(i, 0.0, 1.0, &long)).collect();
+        let pending2: Vec<usize> = (0..40).collect();
+        let batches2 = plan_online_batches(&pending2, &segs, 40);
+        assert!(batches2.len() > 1, "长行批次应被字符预算拆开");
+        for b in &batches2 {
+            let chars: usize = b
+                .iter()
+                .map(|&p| segs[p].translate_source().chars().count() + 6)
+                .sum();
+            assert!(chars <= 6_000, "单批字符数应受预算约束: {chars}");
+        }
+        let mut all2: Vec<usize> = batches2.iter().flatten().copied().collect();
+        all2.sort_unstable();
+        assert_eq!(all2, pending2, "长句批同样不得丢句或重复");
+
+        // 单条自身超预算：仍必须单独成批，不能死循环
+        let huge = vec![Segment::new(1, 0.0, 1.0, "字".repeat(20_000))];
+        let b3 = plan_online_batches(&[0], &huge, 40);
+        assert_eq!(b3, vec![vec![0]]);
+
+        // 空输入不产出空批次
+        assert!(plan_online_batches(&[], &[], 40).is_empty());
+    }
+
 
     /// 折半重试：第一批返回不完整（缺 [2]），补译请求返回 [2]，最终两句都有译文。
     ///

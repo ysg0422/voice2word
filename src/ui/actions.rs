@@ -1308,7 +1308,7 @@ impl MainWindow {
                     "Subtitle",
                     ext.to_string(),
                     move |segs, path| {
-                        let mode = if segs.iter().any(|s| s.translation.is_some()) {
+                        let mode = if segs.iter().any(|s| s.has_translation()) {
                             crate::subtitle::ExportMode::Bilingual
                         } else {
                             crate::subtitle::ExportMode::RawOnly
