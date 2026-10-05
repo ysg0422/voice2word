@@ -456,9 +456,15 @@ pub struct AppState {
     ///
     /// 渲染路径要读它（转写页卡片显示「已命中缓存 N 句」），而底层查询会把
     /// 整份字幕 JSON 反序列化出来（实测约 0.79 ms/次，1000 句字幕）。
-    /// 用 `Arc<Mutex>` 而非普通字段：渲染只有 `&self` 无法回填，
+    ///
+    /// 缓存里存 `Arc<TaskRecord>` 而不是 `TaskRecord`：渲染每帧都会取出这个
+    /// 结果，若按值返回就等于每帧把上千条 `Segment`（含多个 String）深拷贝一遍，
+    /// 把「省下的反序列化」原样换成「一样重的内存拷贝」。`Arc` 克隆只碰引用计数。
+    /// 命中用 `Option<Arc<TaskRecord>>`，`None` 表示「查过库、确实没有缓存」。
+    ///
+    /// 用 `Arc<Mutex<…>>` 而非普通字段：渲染只有 `&self` 无法回填，
     /// 而 `AppState` 本身是 `Clone` 的（`Mutex` 不实现 `Clone`）。
-    pub cached_transcription: Arc<std::sync::Mutex<Option<(String, Option<TaskRecord>)>>>,
+    pub cached_transcription: Arc<std::sync::Mutex<Option<(String, Option<Arc<TaskRecord>>)>>>,
     /// 已就位条目的缓存快照：`is_present` 要 stat 磁盘，
     /// 每帧对 11 个路径做 stat 会拖慢渲染，因此只在启动/下载完成后刷新。
     pub model_present: std::collections::HashMap<String, bool>,
@@ -510,7 +516,7 @@ impl AppState {
         };
         let video_player = Arc::new(crate::engines::VideoPlayerEngine::with_policy(
             ffmpeg_path,
-            hardware.decode_policy(config.gpu.yield_to_desktop),
+            hardware.decode_policy(),
             hardware.use_gpu_pipeline(),
         ));
 
@@ -890,10 +896,14 @@ impl AppState {
     /// 缓存失效靠 [`Self::invalidate_cached_transcription`]：只在
     /// 「换文件」和「转写完成/写库」这两个真正会改变结果的时刻调用。
     /// 键用文件路径——同一路径的缓存记录内容变了（重转写）会由后者覆盖。
-    pub fn get_cached_transcription(&self) -> Option<TaskRecord> {
+    ///
+    /// 返回 `Option<Arc<TaskRecord>>` 而非按值 `TaskRecord`：调用点在渲染循环里，
+    /// 按值返回等于每帧深拷贝整份字幕（与省掉的反序列化同一量级）。`Arc` 克隆
+    /// 只加一次引用计数。命中为 `Some(Arc)`，确认无缓存为 `None`。
+    pub fn get_cached_transcription(&self) -> Option<Arc<TaskRecord>> {
         let file = self.transcribe_file.as_ref()?;
         let path_str = file.to_string_lossy();
-        // 已有缓存且路径一致 → 直接复用
+        // 已有缓存且路径一致 → 直接复用（Arc 克隆，不深拷贝字幕）
         if let Ok(slot) = self.cached_transcription.lock() {
             if let Some((cached_path, hit)) = slot.as_ref() {
                 if cached_path == path_str.as_ref() {
@@ -903,7 +913,7 @@ impl AppState {
         }
         // 未命中：查一次库并**回填**（用 Mutex 而非 `&mut self`，
         // 因为渲染路径只能拿到 `&self`）。每换一个文件只会走一次。
-        let hit = self.db.find_cached_task(&path_str).ok().flatten();
+        let hit = self.db.find_cached_task(&path_str).ok().flatten().map(Arc::new);
         if let Ok(mut slot) = self.cached_transcription.lock() {
             *slot = Some((path_str.to_string(), hit.clone()));
         }
@@ -1982,5 +1992,42 @@ mod tests {
             .expect("换文件后应查到 B 的缓存");
         assert_eq!(hit.id, id);
         assert_eq!(hit.segments[0].text, "B 文件第一句");
+    }
+
+    /// 缓存命中必须返回**同一个 Arc**（指针相等），而不是每帧深拷贝一份新记录。
+    ///
+    /// 这是「渲染路径零拷贝」的核心不变量：若哪天有人把返回类型换回
+    /// `Option<TaskRecord>`，这个断言会立刻失败——否则每帧都会悄悄复制
+    /// 上千条 Segment 的 String，把省下的反序列化又原样花回去。
+    #[test]
+    fn cached_transcription_hit_shares_one_arc() {
+        use crate::subtitle::Segment;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let mut state = test_state(Vec::new());
+        state.transcribe_file = Some(PathBuf::from("D:/video/a.mp4"));
+        state
+            .db
+            .insert_task(
+                "D:/video/a.mp4",
+                "a.mp4",
+                4.0,
+                "completed",
+                &[
+                    Segment::new(1, 0.0, 2.0, "第一句"),
+                    Segment::new(2, 2.0, 4.0, "第二句"),
+                ],
+                None,
+            )
+            .expect("插入应成功");
+
+        let first: Arc<_> = state.get_cached_transcription().expect("首次应命中");
+        let second: Arc<_> = state.get_cached_transcription().expect("再次应命中");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "缓存命中应复用同一份 Arc，而不是每帧深拷贝整份字幕"
+        );
+        assert_eq!(first.segments.len(), 2);
     }
 }

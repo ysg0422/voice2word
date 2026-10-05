@@ -32,8 +32,6 @@ pub struct HardwareProfile {
 pub struct DecodePolicy {
     pub try_hwaccel: bool,
     pub software_threads: u32,
-    /// 让路模式：预览解码进程降到低于正常优先级，避免与桌面合成器抢 GPU/CPU
-    pub yield_to_desktop: bool,
 }
 
 impl HardwareProfile {
@@ -98,11 +96,10 @@ impl HardwareProfile {
         self.backend == RenderBackend::Gpu
     }
 
-    pub fn decode_policy(&self, yield_to_desktop: bool) -> DecodePolicy {
+    pub fn decode_policy(&self) -> DecodePolicy {
         DecodePolicy {
             try_hwaccel: self.hardware_decode,
             software_threads: 0, // ffmpeg 0 = auto
-            yield_to_desktop,
         }
     }
 }

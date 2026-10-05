@@ -77,7 +77,6 @@ fn main() -> Result<()> {
         false, // CPU：与既有基准口径一致，排除核显调度噪声
         true,  // no_fallback
         32,    // max_context
-        true,  // yield_to_desktop
         100,
     );
 

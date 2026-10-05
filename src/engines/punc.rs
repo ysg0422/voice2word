@@ -1,4 +1,4 @@
-﻿//! PunctuationEngine — 基于 CT-Transformer (ONNX) 的超轻量极速标点恢复引擎
+//! PunctuationEngine — 基于 CT-Transformer (ONNX) 的超轻量极速标点恢复引擎
 //! 纯 CPU 单次推理毫秒级，比大模型快 50~100 倍
 
 use anyhow::{Context, Result};
@@ -58,9 +58,6 @@ pub struct PunctuationEngine {
     threads: u32,
     /// 运行 runner 脚本的 Python 解释器（默认 "python"，可配置为绝对路径）
     python_path: PathBuf,
-    /// 让路模式：子进程降到 BELOW_NORMAL_PRIORITY_CLASS（此前只设了
-    /// CREATE_NO_WINDOW，完全忽略用户的 `gpu.yield_to_desktop` 开关）。
-    yield_to_desktop: bool,
 }
 
 impl PunctuationEngine {
@@ -74,8 +71,6 @@ impl PunctuationEngine {
             model_path,
             threads,
             PathBuf::from("python"),
-            // 默认与 config.toml 的 gpu.yield_to_desktop 默认值一致
-            true,
         )
     }
 
@@ -85,14 +80,12 @@ impl PunctuationEngine {
         model_path: P2,
         threads: u32,
         python_path: P3,
-        yield_to_desktop: bool,
     ) -> Self {
         Self {
             runner_script: runner_script.as_ref().to_path_buf(),
             model_path: model_path.as_ref().to_path_buf(),
             threads,
             python_path: python_path.as_ref().to_path_buf(),
-            yield_to_desktop,
         }
     }
 
@@ -148,7 +141,7 @@ impl PunctuationEngine {
             .stderr(Stdio::piped());
 
         // 让路模式：标点恢复也是 Python 子进程，同样要跟随用户的开关
-        super::media_pipeline::apply_child_flags(&mut cmd, self.yield_to_desktop);
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
         let child = cmd.spawn().context("启动 CT-Transformer 标点恢复子进程失败")?;
         crate::utils::child_registry::adopt(&child);
         // 从这里到 wait_with_output() 之间的任何提前退出都由守卫兜底回收子进程

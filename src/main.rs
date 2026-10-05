@@ -140,7 +140,6 @@ fn main() -> Result<()> {
         whisper_gpu,
         config.pipeline.whisper_no_fallback,
         config.pipeline.whisper_max_context,
-        config.gpu.yield_to_desktop,
         gpu_limit_percent,
     ));
 
@@ -168,7 +167,6 @@ fn main() -> Result<()> {
                 vad,
                 config.pipeline.whisper_threads,
                 python_path.clone(),
-                config.gpu.yield_to_desktop,
             )))
         } else {
             warn!(
@@ -193,7 +191,6 @@ fn main() -> Result<()> {
                 model,
                 4,
                 python_path.clone(),
-                config.gpu.yield_to_desktop,
             )))
         } else {
             warn!("CT-Transformer 极速标点引擎未就绪 (runner={}, model={})", runner.exists(), model.exists());

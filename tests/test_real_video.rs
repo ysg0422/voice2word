@@ -39,7 +39,6 @@ async fn test_real_video_pipeline() {
         true,
         config.pipeline.whisper_no_fallback,
         config.pipeline.whisper_max_context,
-        config.gpu.yield_to_desktop,
         config.gpu.effective_gpu_limit(),
     ));
     let llm = Arc::new(LLMEngine::new(

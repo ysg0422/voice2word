@@ -407,14 +407,22 @@ impl MainWindow {
     }
 
     /// 智能缓存命中处理：直接 0 秒载入已缓存的解析结果
-    pub(crate) fn load_cached_result(&mut self, cx: &mut Context<Self>, cached: crate::storage::TaskRecord) {
+    ///
+    /// 入参是 `Arc<TaskRecord>`：调用点在渲染路径上拿到的是缓存的共享引用，
+    /// 这里按需 `(*cached).clone()` 展开一次即可——载入是**一次性**动作，
+    /// 不像渲染那样每帧发生，复制一次整份字幕可接受。
+    pub(crate) fn load_cached_result(
+        &mut self,
+        cx: &mut Context<Self>,
+        cached: std::sync::Arc<crate::storage::TaskRecord>,
+    ) {
         let filename = cached.file_name.clone();
         let seg_count = cached.segments.len();
         let total_dur = cached.duration;
         let metrics = cached.metrics.clone();
 
         info!("智能缓存命中: 0 秒载入 {:?}", filename);
-        self.state.load_from_cache(cached);
+        self.state.load_from_cache((*cached).clone());
         self.state.active_tab = crate::app::state::WorkspaceTab::Editor;
         self.ensure_waveform(cx);
 

@@ -384,6 +384,11 @@ impl MainWindow {
                 |this, sel, cx| {
                     this.state.gpu_mode = sel.to_string();
                     this.state.config.gpu = crate::utils::config::GpuConfig::from_mode(sel);
+                    // 让路开关是**进程级全局量**，只在启动时下发一次。用户改档位后
+                    // 必须立即重下发，否则「保存了但本进程仍按旧值跑」，要重启才生效。
+                    crate::engines::media_pipeline::set_yield_to_desktop(
+                        this.state.config.gpu.yield_to_desktop,
+                    );
                     let _ = this.state.config.save_to_file("config.toml");
                     cx.notify();
                 },

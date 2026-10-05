@@ -53,7 +53,6 @@ impl VideoPlayerEngine {
             DecodePolicy {
                 try_hwaccel: false,
                 software_threads: 0,
-                yield_to_desktop: true,
             },
             false,
         )
@@ -416,7 +415,10 @@ impl VideoPlayerEngine {
         frame_h: u32,
     ) -> std::io::Result<Child> {
         let mut video_cmd = Command::new(&self.ffmpeg_path);
-        if self.policy.yield_to_desktop {
+        // 让路是**进程级**策略：读全局开关而不是启动时快照的 `policy.yield_to_desktop`，
+        // 否则用户在设置页把「GPU 让路」改成「全速」后，本进程内的预览解码仍按旧值跑。
+        let yield_now = super::media_pipeline::yield_to_desktop();
+        if yield_now {
             // 预览出帧是可延迟的后台工作：让路时降到低于正常优先级，
             // 避免与桌面合成器、Whisper 转写抢 GPU/CPU 时间片。
             apply_background_priority(&mut video_cmd);

@@ -18,10 +18,6 @@ pub struct WhisperEngine {
     threads: u32,
     processors: u32,
     use_gpu: bool,
-    /// 让路模式：whisper-cli 以 BELOW_NORMAL_PRIORITY_CLASS 启动。
-    /// 核显机器上 GPU 转写会把 compute 队列压到 80%，桌面合成器被挤到后面而掉帧；
-    /// 降到低于正常优先级后 Windows 调度器先服务桌面，实测转写速度无损失。
-    yield_to_desktop: bool,
     /// GPU 占用上限（百分比，100 = 不限速）。小于 100 时子进程按占空比被挂起/恢复，
     /// 给桌面合成器留出真正的 GPU 空窗；让路模式只降优先级，压不住 GPU 队列。
     gpu_limit_percent: u32,
@@ -211,7 +207,6 @@ impl WhisperEngine {
             true,
             false,
             32,
-            true,
             100,
         )
     }
@@ -226,7 +221,6 @@ impl WhisperEngine {
         use_gpu: bool,
         no_fallback: bool,
         max_context: u32,
-        yield_to_desktop: bool,
         gpu_limit_percent: u32,
     ) -> Self {
         Self {
@@ -236,7 +230,6 @@ impl WhisperEngine {
             threads,
             processors,
             use_gpu,
-            yield_to_desktop,
             gpu_limit_percent,
             no_fallback,
             max_context: max_context.clamp(0, 448),
@@ -602,7 +595,7 @@ impl WhisperEngine {
         // 让路模式：whisper-cli 降到低于正常优先级，把 CPU 与 GPU 调度权重让给
         // 桌面/前台程序。核显上 Whisper Vulkan 会把 compute 队列压到 65%~80%，
         // 桌面合成器抢不到时间片就会拖窗卡顿；让路后实测转写耗时几乎不变。
-        super::media_pipeline::apply_child_flags(&mut cmd, self.yield_to_desktop);
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
 
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1108,7 +1101,7 @@ mod tests {
         {
             let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
             let engine =
-                WhisperEngine::with_device(cli_path, model_path, None, 4, 1, true, true, 32, true, 100);
+                WhisperEngine::with_device(cli_path, model_path, None, 4, 1, true, true, 32, 100);
 
             let mut child = ffmpeg
                 .spawn_audio_stream(&sample_media)
@@ -1133,7 +1126,7 @@ mod tests {
         let model_path = PathBuf::from("models/whisper/ggml-large-v3-turbo-q5_0.bin");
         let vad_path = Some(PathBuf::from("models/whisper/ggml-silero-v6.2.0.bin"));
         let engine =
-            WhisperEngine::with_device(cli_path, model_path, vad_path, 8, 2, true, false, 32, true, 100);
+            WhisperEngine::with_device(cli_path, model_path, vad_path, 8, 2, true, false, 32, 100);
         let mut audio = PathBuf::from("target/test_30s.wav");
         if !audio.exists() {
             audio = PathBuf::from("target/test_2min.wav");
@@ -1328,7 +1321,6 @@ mod tests {
             false,
             true,
             32,
-            true,
             100,
         )
     }
@@ -1382,7 +1374,6 @@ mod tests {
             false,
             true,
             32,
-            true,
             100,
         )
     }
