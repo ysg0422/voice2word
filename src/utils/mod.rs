@@ -5,6 +5,7 @@ pub mod monitor;
 pub mod temp_cleanup;
 pub mod temp_guard;
 pub mod time;
+pub mod zip_extract;
 pub mod frame_cache;
 pub mod model_download;
 

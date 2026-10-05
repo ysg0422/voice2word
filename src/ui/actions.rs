@@ -1592,8 +1592,11 @@ impl MainWindow {
                 match result {
                     Ok(path) => {
                         info!("模型下载成功: {}", path.display());
+                        // 压缩包类组件（如 llama.cpp）多一步解压，提示语要区分开，
+                        // 否则用户以为只下了个包、不知道程序已经到位可用了。
+                        let verb = if item.is_archive { "下载并解压完成" } else { "下载完成" };
                         this.state.download_status_msg =
-                            format!("{} 下载完成", item.label);
+                            format!("{} {verb}", item.label);
                         // 重新扫描：新文件就位后界面上的「缺失」标记要立即消失
                         this.state.refresh_model_presence();
                         // 模型换了，硬件档案里的推荐配置与预览代理可能要重算

@@ -96,13 +96,20 @@ cd voice2word
 
 ### 3. 准备模型与组件
 
-模型与可执行组件体积很大（合计约 5 GB），**不进版本库**，需自行下载后按下列路径放置。
+模型与可执行组件体积很大（合计约 5 GB），**不进版本库**。
+
+> **推荐：直接在界面里一键下载。** 打开「性能设置 → 模型与组件」，
+> 点“缺失的下载一道”或单个组件的下载按钮即可。所有源都走 `hf-mirror.com`
+> （HuggingFace 国内镜像），**无需梯子**；llama.cpp 打包在 zip 里，下载后会自动解压到 `tools/`。
+> 下面的目录结构只是供你手动安排时参考。
+
 目录名必须一致，文件名可在 `config.toml` 里改。
 
 ```
 tools/
   ffmpeg.exe                                  # FFmpeg 主程序
-  llama-completion.exe                        # llama.cpp 推理程序（LLM 润色 / 翻译用）
+  llama-completion.exe                        # llama.cpp 命令行程序（LLM 润色 / 翻译用）
+  llama-server.exe                            # 同上（常驻服务，热加载更快，与上者同目录）
   whisper-vulkan/
     whisper-1.8.4-windows-x64/
       whisper-cli.exe                         # whisper.cpp 识别程序（Vulkan 加速版）
@@ -125,7 +132,7 @@ models/
 
 - **FFmpeg**：从 [ffmpeg.org](https://ffmpeg.org/download.html) 下载 Windows 版，取 `ffmpeg.exe`。
 - **whisper.cpp**：下载 Windows 预编译版（或自行编译带 Vulkan 后端），取 `whisper-cli.exe`。
-- **llama.cpp**：下载预编译版，取 `llama-completion.exe`。
+- **llama.cpp**：已内置一键下载（「性能设置 → 模型与组件」）；手动准备时下载预编译包，取 `llama-completion.exe` 与 `llama-server.exe`（需与各 DLL 同目录）。
 - **模型**：Whisper 系列从 [HuggingFace ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) 取；
   Qwen 从 [Qwen2.5 GGUF](https://huggingface.co/Qwen) 取；SenseVoice / CT-Punc 的 ONNX 模型可从
   ModelScope 获取（`tools/download_sensevoice.py` 提供了 SenseVoice 的下载脚本）。

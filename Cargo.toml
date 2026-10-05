@@ -36,6 +36,7 @@ rayon = "1.10"
 uuid = { version = "1.26.1", features = ["v4", "fast-rng"] }
 raw-window-handle = "0.6"
 ureq = { version = "2.10", default-features = false, features = ["json", "tls"] }
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 
 [profile.dev]
 # Keep debug symbols and fast incremental builds, while giving the UI,

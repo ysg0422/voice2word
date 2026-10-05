@@ -6530,6 +6530,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "encoding_rs",
+ "flate2",
  "gpui",
  "image",
  "open",

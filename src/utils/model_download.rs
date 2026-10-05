@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use tracing::{info, warn};
 
 use super::AppConfig;
@@ -70,6 +70,7 @@ pub struct DownloadItem {
     ///   int8（75 MB）——两者都能被 onnxruntime 加载，都是「已就位」。
     /// - Whisper Small：上游是 q5_1（181 MB），本项目本地量化过 q5_0（175 MB），
     ///   两者只差 3.4%，落在常规容差边缘。
+    ///
     /// 因此为这类条目显式给出下限，避免把用户手上完好的模型误判为缺失
     /// （误判会让界面一直显示「缺失」，用户反复下载同一个文件）。
     pub min_size: u64,
@@ -77,6 +78,15 @@ pub struct DownloadItem {
     pub required: bool,
     /// 归类：界面按此分组
     pub group: ItemGroup,
+    /// 该条目下载物是 **zip 压缩包**：下载完成后**解压**到 dest 的父目录，
+    /// 而不是把下载物直接改名成 dest。dest 是解压后必须存在的入口文件。
+    pub is_archive: bool,
+    /// 与 dest **同目录**、必须一并存在才算就位的伴生文件（文件名，非路径）。
+    ///
+    /// 为什么需要它：llama.cpp 的官方 Windows 构建把真正的代码放在同目录 DLL 里，
+    /// .exe 只是几 KB 的启动桩。只看 .exe 大小会把「DLL 缺失 / 解压不完整」
+    /// 误判为「已就位」，用户点翻译时才炸。给出伴生 DLL 后判定才可靠。
+    pub companion: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +134,8 @@ pub const ITEMS: &[DownloadItem] = &[
         min_size: 200_000_000,
         required: false,
         group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
     },
     DownloadItem {
         id: "sensevoice-tokens",
@@ -137,6 +149,8 @@ pub const ITEMS: &[DownloadItem] = &[
         min_size: 100_000,
         required: false,
         group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
     },
     DownloadItem {
         id: "whisper-small",
@@ -151,6 +165,8 @@ pub const ITEMS: &[DownloadItem] = &[
         min_size: 160_000_000,
         required: true,
         group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
     },
     DownloadItem {
         id: "whisper-base",
@@ -164,6 +180,8 @@ pub const ITEMS: &[DownloadItem] = &[
         min_size: 130_000_000,
         required: false,
         group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
     },
     DownloadItem {
         id: "whisper-turbo-q5",
@@ -177,6 +195,8 @@ pub const ITEMS: &[DownloadItem] = &[
         min_size: 500_000_000,
         required: false,
         group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
     },
     DownloadItem {
         id: "whisper-turbo-q8",
@@ -190,6 +210,8 @@ pub const ITEMS: &[DownloadItem] = &[
         min_size: 800_000_000,
         required: false,
         group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
     },
     DownloadItem {
         id: "silero-vad",
@@ -203,6 +225,8 @@ pub const ITEMS: &[DownloadItem] = &[
         min_size: 500_000,
         required: false,
         group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
     },
     // ── 标点与翻译 ──
     DownloadItem {
@@ -217,6 +241,8 @@ pub const ITEMS: &[DownloadItem] = &[
         min_size: 60_000_000,
         required: false,
         group: ItemGroup::Text,
+        is_archive: false,
+        companion: None,
     },
     DownloadItem {
         id: "qwen-llm",
@@ -230,6 +256,8 @@ pub const ITEMS: &[DownloadItem] = &[
         min_size: 400_000_000,
         required: false,
         group: ItemGroup::Text,
+        is_archive: false,
+        companion: None,
     },
     // ── 外部组件 ──
     DownloadItem {
@@ -248,11 +276,33 @@ pub const ITEMS: &[DownloadItem] = &[
         min_size: 200_000,
         required: true,
         group: ItemGroup::Binary,
+        is_archive: false,
+        companion: None,
+    },
+    DownloadItem {
+        id: "llama-cpp",
+        label: "llama.cpp 推理程序（离线翻译/润色）",
+        note: "本地 Qwen 翻译与润色的推理后端；下载后自动解压到 tools/",
+        // dest 是解压后必须存在的入口文件（llama-completion.exe）；
+        // zip 里的 llama-server.exe 与一堆 DLL 会同目录落盘。
+        dest: "tools/llama-completion.exe",
+        urls: &[
+            // 官方 ggml-org/llama.cpp 的 Windows CPU 构建镜像（16.9 MB）。
+            // github release 附件在本机不可达，hf-mirror 上这个镜像可下、无需梯子。
+            "https://hf-mirror.com/limnmn/llama.cpp-b9637-Windows-Runtime/resolve/main/llama-b9637-bin-win-cpu-x64.zip",
+        ],
+        size: 16_906_751,
+        // 解压后入口 exe 只有几 KB（真正代码在同目录 DLL），故下限压到 1 KB；
+        // 「解压是否完整」由 companion（llama-server.exe）与 DLL 存在性把关。
+        min_size: 1_000,
+        required: false,
+        group: ItemGroup::Binary,
+        is_archive: true,
+        companion: Some("llama-server.exe"),
     },
 ];
 
 /// 一次扫描中复用的配置快照。
-///
 /// 为什么需要它：`resolve_existing_path` 要知道「用户把 ffmpeg 配在哪」，
 /// 而那需要读 `config.toml`。若每个条目各自读一次，一次扫描就是 11 次
 /// 文件读取 + 11 次 TOML 解析（`refresh_model_presence` 在启动与每次
@@ -334,6 +384,14 @@ fn is_present_with(item: &DownloadItem, cfg: &Option<AppConfig>) -> bool {
         return false;
     }
     let floor = min_acceptable_size(item);
+    // 压缩包类组件：入口文件之外还必须有伴生文件（如 llama-server.exe），
+    // 否则「解压了一半 / DLL 缺失」会被误判为已就位，用户点翻译时才炸。
+    if let Some(companion) = item.companion {
+        let ok = path.parent().map(|d| d.join(companion).exists()).unwrap_or(false);
+        if !ok {
+            return false;
+        }
+    }
     if floor == 0 {
         return true;
     }
@@ -388,6 +446,9 @@ fn configured_path_for(item: &DownloadItem, cfg: &Option<AppConfig>) -> Option<P
         "sensevoice-model" => cfg.paths.sensevoice_model.as_deref(),
         "sensevoice-tokens" => cfg.paths.sensevoice_tokens.as_deref(),
         "qwen-llm" => Some(cfg.paths.llm_model.as_str()),
+        // llama.cpp 也走配置：用户可能把它装在别处（例如自编译产物）。
+        // 若不接配置，即使用户已经能用，界面也会一直标「缺失」。
+        "llama-cpp" => Some(cfg.paths.llama_cli.as_str()),
         _ => None,
     };
     // whisper 档位：只有「配置指向的那个档位」才算就位，否则会把用户没选的
@@ -463,6 +524,25 @@ pub fn download_one(
         }
         match fetch_to_file(url, &part, item.size, item.id, cancel, progress) {
             Ok(()) => {
+                // 压缩包类组件（如 llama.cpp）：下载物是 zip，真正的程序在包内。
+                // 必须解压到 dest 的父目录并校验关键文件都在，才算成功。
+                if item.is_archive {
+                    match unpack_archive(item, &part, &dest) {
+                        Ok(()) => {
+                            let dir = dest.parent().unwrap_or(dest.as_path());
+                            info!(item = item.id, dir = %dir.display(), "下载并解压完成");
+                            return Ok(dest);
+                        }
+                        Err(err) => {
+                            // 结构与登记不符（比如镜像换了打包方式）：当成该源失败，
+                            // 删掉 .part 换下一个源，而不是留下半成品目录。
+                            warn!(item = item.id, url, error = %err, "解压失败，尝试下一个下载源");
+                            let _ = fs::remove_file(&part);
+                            last_err = Some(err);
+                            continue;
+                        }
+                    }
+                }
                 // 校验通过才落正式名
                 fs::rename(&part, &dest).with_context(|| {
                     format!("重命名失败: {} → {}", part.display(), dest.display())
@@ -478,6 +558,38 @@ pub fn download_one(
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("没有可用的下载源")))
+}
+
+/// 把已下载到 `part` 的 zip 解压到 `dest` 的父目录，并校验关键文件都落盘。
+///
+/// 抽成独立函数是因为这几步**顺序敏感**，混在 `download_one` 里容易改错：
+/// 1. 解压到目标目录；
+/// 2. 校验入口文件（`dest`）与伴生文件（`companion`）确实存在；
+/// 3. 全部校验通过后才删除 `.part`。中途失败则保留 `.part`，
+///    既不会留下半成品目录，也能被 `sweep_parts_for` 在下次启动时清掉。
+fn unpack_archive(item: &DownloadItem, part: &Path, dest: &Path) -> Result<()> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| anyhow!("目标路径没有父目录: {}", dest.display()))?;
+    let bytes = fs::read(part).with_context(|| format!("读取压缩包失败: {}", part.display()))?;
+    let n = super::zip_extract::extract_zip(&bytes, dir)
+        .with_context(|| format!("解压失败: {}", part.display()))?;
+    if n == 0 {
+        bail!("压缩包里没有可用的文件: {}", part.display());
+    }
+    if !dest.exists() {
+        bail!(
+            "解压完成但缺少入口文件 {}（压缩包内容与登记不符）",
+            dest.display()
+        );
+    }
+    if let Some(companion) = item.companion {
+        if !dir.join(companion).exists() {
+            bail!("解压完成但缺少伴生文件 {companion}（可能压缩包不完整）");
+        }
+    }
+    fs::remove_file(part).with_context(|| format!("清理中间文件失败: {}", part.display()))?;
+    Ok(())
 }
 
 /// 清扫上次运行残留的 `<目标>.part` 下载中间文件。
@@ -636,6 +748,12 @@ fn fetch_to_file(
 mod tests {
     use super::*;
 
+    /// 把运行时构造的临时路径变成 `'static str`，好塞进 `DownloadItem::dest`。
+    /// 测试里泄漏几个短字符串无所谓，换来的是测试不再向仓库树写东西。
+    fn leak_str(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
     /// 每个条目都必须有 URL、有落地路径、且路径落在预期目录内。
     /// 这些常量一旦手滑写错（例如把 dest 写成绝对路径或漏掉目录），
     /// 只会在用户点下载时才暴露。
@@ -720,20 +838,23 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
+        // 用**绝对路径**（临时目录）避免写进仓库树，
+        // 与其它并行测试互相干扰。
+        let real = dir.join("probe.bin");
         let item = DownloadItem {
             id: "test-item",
             label: "t",
             note: "n",
-            dest: "models/__dl_test__/probe.bin",
+            dest: leak_str(real.to_str().unwrap().to_string()),
             urls: &["https://example.invalid/x"],
             size: 1000,
             min_size: 0,
             required: false,
             group: ItemGroup::Asr,
+            is_archive: false,
+            companion: None,
         };
 
-        // 用真实路径逻辑判断：文件不存在 → 缺
-        let real = AppConfig::resolve_path(item.dest);
         let _ = fs::remove_file(&real);
         assert!(!is_present(&item), "文件不存在时应判为缺失");
 
@@ -757,23 +878,187 @@ mod tests {
     /// 空文件必须判为缺失（0 字节的「下载成功」是最坑的一种损坏）。
     #[test]
     fn empty_file_counts_as_missing() {
+        let dir = std::env::temp_dir().join(format!("v2w_empty_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("probe.bin");
         let item = DownloadItem {
             id: "empty-test",
             label: "t",
             note: "n",
-            dest: "models/__dl_test_empty__/probe.bin",
+            dest: leak_str(real.to_str().unwrap().to_string()),
             urls: &["https://example.invalid/x"],
             size: 100,
             min_size: 0,
             required: false,
             group: ItemGroup::Asr,
+            is_archive: false,
+            companion: None,
         };
-        let real = AppConfig::resolve_path(item.dest);
-        fs::create_dir_all(real.parent().unwrap()).unwrap();
         fs::write(&real, b"").unwrap();
         assert!(!is_present(&item), "0 字节文件必须判为缺失");
-        let _ = fs::remove_file(&real);
+        let _ = fs::remove_dir_all(&dir);
     }
+
+    /// 压缩包类条目：入口文件存在但缺少伴生文件时必须判为缺失。
+    ///
+    /// 这是 llama.cpp 最容易踩的坑：.exe 只有几 KB，
+    /// 真正代码在同目录 DLL 里。只看 exe 大小会把「解压不完整」
+    /// 当成「已就位」，用户点翻译时才爆。
+    #[test]
+    fn companion_file_is_required_for_archive_items() {
+        let dir = std::env::temp_dir().join(format!("v2w_companion_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // dest 用**绝对路径**（指向临时目录）：这样 `resolve_existing_path` 就不会
+        // 落到真实的 models/ 下，避免与并行测试互相干扰（上一版就是因为写到仓库树里、
+        // 残留的伴生文件让第二次运行误判而失败）。
+        let real = dir.join("tool.exe");
+        let item = DownloadItem {
+            id: "arch-test",
+            label: "t",
+            note: "n",
+            dest: leak_str(real.to_str().unwrap().to_string()),
+            urls: &["https://example.invalid/x"],
+            size: 10,
+            min_size: 0,
+            required: false,
+            group: ItemGroup::Binary,
+            is_archive: true,
+            companion: Some("tool-server.exe"),
+        };
+
+        // 只有入口文件 → 仍判为缺失（伴生文件不在）
+        fs::write(&real, vec![0u8; 10]).unwrap();
+        assert!(
+            !is_present(&item),
+            "缺少伴生文件时必须判为缺失"
+        );
+
+        // 补上伴生文件 → 判为已就位
+        fs::write(dir.join("tool-server.exe"), vec![0u8; 10]).unwrap();
+        assert!(is_present(&item), "入口与伴生文件都在时应判为已就位");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 构造一个最小 zip（全部「存储」条目），供解压测试使用。
+    fn tiny_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in files {
+            let local_off = out.len() as u32;
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // stored
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&local_off.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_off = out.len() as u32;
+        let cd_size = central.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    /// 解压成功：入口 + 伴生文件都落盘，且 `.part` 被清理。
+    #[test]
+    fn unpack_archive_succeeds_and_cleans_part() {
+        let dir = std::env::temp_dir().join(format!("v2w_unpack_ok_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let item = DownloadItem {
+            id: "unpack-ok",
+            label: "t",
+            note: "n",
+            dest: "models/__dl_unpack_ok__/tool.exe",
+            urls: &["https://example.invalid/x"],
+            size: 1,
+            min_size: 0,
+            required: false,
+            group: ItemGroup::Binary,
+            is_archive: true,
+            companion: Some("tool-server.exe"),
+        };
+        let part = dir.join("tool.exe.part");
+        fs::write(&part, tiny_zip(&[("tool.exe", b"exe"), ("tool-server.exe", b"server")])).unwrap();
+        let dest = dir.join("tool.exe");
+
+        unpack_archive(&item, &part, &dest).unwrap();
+        assert!(dest.exists(), "入口文件应已解压落盘");
+        assert!(dir.join("tool-server.exe").exists(), "伴生文件应已解压落盘");
+        assert!(!part.exists(), "成功后 .part 必须被删除");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 解压缺伴生文件时必须报错，且**不**删除 `.part`（留给下次清理）。
+    #[test]
+    fn unpack_archive_fails_when_companion_missing() {
+        let dir = std::env::temp_dir().join(format!("v2w_unpack_bad_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let item = DownloadItem {
+            id: "unpack-bad",
+            label: "t",
+            note: "n",
+            dest: "models/__dl_unpack_bad__/tool.exe",
+            urls: &["https://example.invalid/x"],
+            size: 1,
+            min_size: 0,
+            required: false,
+            group: ItemGroup::Binary,
+            is_archive: true,
+            companion: Some("tool-server.exe"),
+        };
+        let part = dir.join("tool.exe.part");
+        // 只有入口，缺伴生文件
+        fs::write(&part, tiny_zip(&[("tool.exe", b"exe")])).unwrap();
+        let dest = dir.join("tool.exe");
+
+        assert!(unpack_archive(&item, &part, &dest).is_err(), "缺伴生文件应报错");
+        assert!(part.exists(), "失败时 .part 应保留以便清理");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// `PresenceContext` 必须与逐条 `is_present` 给出**一致**的结论。
     ///
     /// 引入它是为了把「读配置」从 N 次降到 1 次；一旦两者判定分叉，
@@ -904,7 +1189,7 @@ mod tests {
         fs::write(&dest, b"complete model").unwrap();
         fs::write(&part, b"incomplete").unwrap();
 
-        let removed = sweep_parts_for(&[dest.clone()]);
+        let removed = sweep_parts_for(std::slice::from_ref(&dest));
 
         assert_eq!(removed, 1);
         assert!(!part.exists(), ".part 必须被清掉");
@@ -919,7 +1204,7 @@ mod tests {
     fn sweep_is_noop_when_clean() {
         let (dir, dest) = isolated_dest("clean");
         fs::write(&dest, b"complete").unwrap();
-        assert_eq!(sweep_parts_for(&[dest.clone()]), 0);
+        assert_eq!(sweep_parts_for(std::slice::from_ref(&dest)), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -927,7 +1212,7 @@ mod tests {
     #[test]
     fn sweep_tolerates_missing_everything() {
         let (dir, dest) = isolated_dest("missing");
-        assert_eq!(sweep_parts_for(&[dest.clone()]), 0);
+        assert_eq!(sweep_parts_for(std::slice::from_ref(&dest)), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 }
