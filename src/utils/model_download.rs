@@ -44,8 +44,30 @@ use tracing::{info, warn};
 
 use super::AppConfig;
 
-/// 镜像站根地址。所有下载 URL 都基于它拼接。
+/// 镜像站根地址。下载 URL 基于它拼接（HuggingFace 国内镜像）。
 pub const MIRROR_BASE: &str = "https://hf-mirror.com";
+
+/// GitHub Release 代理站根地址。
+///
+/// 部分组件（如 whisper.cpp 官方 Windows 构建）只发在 GitHub
+/// Release，而 `github.com` 在国内实测不可达。这类组件走
+/// 免梯子的 GitHub 代理：把原始 URL 直接拼在代理域名后。
+/// 已实测（无代理）返回 200 并能完整下载。
+pub const PROXY_BASE: &str = "https://gh-proxy.com/";
+
+/// 备用 GitHub 代理（主代理不可用时自动切换）。
+pub const PROXY_BASE_ALT: &str = "https://ghproxy.net/";
+
+/// 判断一个下载 URL 是否走的是「免梯子」的合法源（镜像或代理）。
+///
+/// 仅测试用：把「只能走免梯子源」这条约束固定下来，
+/// 新增条目时若手滑贴了直连 github 的地址，在测试里就会被拦住。
+#[cfg(test)]
+fn is_allowed_source(url: &str) -> bool {
+    [MIRROR_BASE, PROXY_BASE, PROXY_BASE_ALT]
+        .iter()
+        .any(|b| url.starts_with(b))
+}
 
 /// 单个可下载项。
 #[derive(Debug, Clone, Copy)]
@@ -300,6 +322,30 @@ pub const ITEMS: &[DownloadItem] = &[
         is_archive: true,
         companion: Some("llama-server.exe"),
     },
+    DownloadItem {
+        id: "whisper-cli",
+        label: "whisper.cpp 识别程序（Whisper 引擎）",
+        // 官方 Windows 构建只有 CPU（无 Vulkan）。下载后自动解压到 tools/whisper-vulkan/。
+        note: "官方 CPU 构建（无 Vulkan），下载后自动解压；若想用 GPU 加速请自备 Vulkan 构建",
+        // dest 与 config.toml 的默认 whisper_cli 一致；zip 内部是扁平的
+        // Release/（已被解压器剥掉这层包装），所有 exe/dll 落到同目录。
+        dest: "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe",
+        urls: &[
+            // 官方 ggml-org/whisper.cpp v1.8.4 的 Windows x64 构建（4.1 MB）。
+            // github.com 直连不可达，故走免梯子的 GitHub 代理。
+            "https://gh-proxy.com/https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/whisper-bin-x64.zip",
+            // 备用代理（主代理不可用时自动切换）
+            "https://ghproxy.net/https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/whisper-bin-x64.zip",
+        ],
+        size: 4_078_768,
+        // 解压后入口 exe 约 0.5 MB；程序与各 DLL 同目录，
+        // 完整性由 companion（whisper.dll）把关。
+        min_size: 100_000,
+        required: false,
+        group: ItemGroup::Binary,
+        is_archive: true,
+        companion: Some("whisper.dll"),
+    },
 ];
 
 /// 一次扫描中复用的配置快照。
@@ -384,7 +430,7 @@ fn is_present_with(item: &DownloadItem, cfg: &Option<AppConfig>) -> bool {
         return false;
     }
     let floor = min_acceptable_size(item);
-    if companion_missing(&path, item) {
+    if companion_missing(&path, item, meta.len()) {
         return false;
     }
     if floor == 0 {
@@ -393,21 +439,38 @@ fn is_present_with(item: &DownloadItem, cfg: &Option<AppConfig>) -> bool {
     meta.len() >= floor
 }
 
+/// 「自包含入口」的体积下限：达到这个体积的单文件视为静态链接构建，
+/// 不再强求同目录 DLL。官方 zip 里的 .exe 是几 KB ~ 几百 KB 的启动桩，
+/// 而静态构建是几 MB ~ 几十 MB的单文件（如本机的 Vulkan 版 whisper-cli 达 61 MB）。
+/// 用体积区分这两种**合法形态**，避免把能用的静态构建误判为「解压不完整」。
+const SELF_CONTAINED_ENTRY_FLOOR: u64 = 2 * 1024 * 1024;
+
 /// 压缩包类组件的「伴生文件是否缺失」。
 ///
-/// # 为什么只在**默认落地路径**上校验
+/// # 为什么需要这个判定
 ///
-/// 伴生文件（如 llama-server.exe）是为了拦住「我们自己下载回来的包
-/// 解压不完整」。但当用户在 `config` 里把路径指向自编译 /
-/// 静态链接的构建时，同目录本来就可能没有那些 DLL——那是完好的。
-/// 若一律要求，会把这种「能用的自定义构建」误判为缺失。
-/// 因此仅在命中默认 dest（即我们自己下载的产物）时才校验；
-/// 用户显式配置的路径交给用户自己负责。
-fn companion_missing(path: &Path, item: &DownloadItem) -> bool {
+/// 官方 zip 里的 .exe 只是几 KB 的启动桩，真正代码在同目录 DLL 里。
+/// 若只看 .exe 存不存在，「解压了一半」（只有桩、没 DLL）会被误判为已就位，
+/// 用户点开始转写时才炸。
+///
+/// # 为什么要两道门槛
+///
+/// 1. **仅在默认落地路径上校验**：用户在 `config` 里把路径指向
+///    自己的构建时，同目录本来就可能没有那些 DLL，那是完好的，不能强求。
+/// 2. **入口体积足够大时视为自包含**：官方桩很小，静态构建很大，
+///    用体积区分两种合法形态。
+///
+/// 两道门槛都放行后，才要求伴生文件存在。
+fn companion_missing(path: &Path, item: &DownloadItem, entry_len: u64) -> bool {
     let Some(companion) = item.companion else {
         return false;
     };
+    // 非默认路径：用户自己配的，交给用户负责
     if path != AppConfig::resolve_path(item.dest) {
+        return false;
+    }
+    // 入口足够大 → 静态自包含构建，不强求伴生文件
+    if entry_len >= SELF_CONTAINED_ENTRY_FLOOR {
         return false;
     }
     !path.parent().map(|d| d.join(companion).exists()).unwrap_or(false)
@@ -464,6 +527,7 @@ fn configured_path_for(item: &DownloadItem, cfg: &Option<AppConfig>) -> Option<P
         // llama.cpp 也走配置：用户可能把它装在别处（例如自编译产物）。
         // 若不接配置，即使用户已经能用，界面也会一直标「缺失」。
         "llama-cpp" => Some(cfg.paths.llama_cli.as_str()),
+        "whisper-cli" => Some(cfg.paths.whisper_cli.as_str()),
         _ => None,
     };
     // whisper 档位：只有「配置指向的那个档位」才算就位，否则会把用户没选的
@@ -791,18 +855,21 @@ mod tests {
             );
             for url in item.urls {
                 assert!(
-                    url.starts_with(MIRROR_BASE),
-                    "{} 的下载源必须走国内镜像（无需梯子）: {}",
+                    is_allowed_source(url),
+                    "{} 的下载源必须走免梯子的镜像或代理: {}",
                     item.id,
                     url
                 );
-                // github.com 的 release 附件在本机实测超时，不能作为下载源
-                assert!(
-                    !url.contains("github.com"),
-                    "{} 不应使用 github.com（实测不可达）: {}",
-                    item.id,
-                    url
-                );
+                // 直连 github.com 在本机实测超时，不能作为下载源；
+                // 但允许它出现在代理 URL 的路径里（即 PROXY_BASE 后面）。
+                if let Some(rest) = url.strip_prefix(PROXY_BASE) {
+                    assert!(
+                        rest.starts_with("https://github.com/"),
+                        "{} 的代理源应代理 github.com 的附件: {}",
+                        item.id,
+                        url
+                    );
+                }
             }
         }
     }
@@ -955,6 +1022,38 @@ mod tests {
         fs::write(dir.join("tool-server.exe"), vec![0u8; 10]).unwrap();
         assert!(is_present(&item), "入口与伴生文件都在时应判为已就位");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 静态自包含构建（入口很大、无同目录 DLL）不能被伴生文件校验误判为缺失。
+    ///
+    /// 真实场景：本机已装的 whisper Vulkan 版是 61 MB 的**单文件**，
+    /// 同目录没有 whisper.dll。若一律要求 DLL，会把它误判为缺失。
+    #[test]
+    fn self_contained_build_without_companion_is_present() {
+        let dir = std::env::temp_dir().join(format!("v2w_selfcontained_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("tool.exe");
+        let item = DownloadItem {
+            id: "sc-test",
+            label: "t",
+            note: "n",
+            dest: leak_str(real.to_str().unwrap().to_string()),
+            urls: &["https://example.invalid/x"],
+            size: 4_000_000,
+            min_size: 100_000,
+            required: false,
+            group: ItemGroup::Binary,
+            is_archive: true,
+            companion: Some("tool.dll"),
+        };
+        // 入口 5 MB（> 2 MB 阈值）且没有 tool.dll → 应判为已就位
+        fs::write(&real, vec![0u8; 5_000_000]).unwrap();
+        assert!(
+            is_present(&item),
+            "静态自包含构建不应因缺 DLL 被判为缺失"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

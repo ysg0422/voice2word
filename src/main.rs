@@ -307,7 +307,7 @@ fn check_external_dependencies(config: &AppConfig) {
             .count();
         info!(
             "模型体检：{absent} 个组件未就位（其中 {required} 个为必需）。\
-             启动后可在「性能设置 → 模型与组件」一键下载，下载源为国内镜像 hf-mirror，无需代理。"
+             启动后可在「性能设置 → 模型与组件」一键下载，模型走国内镜像 hf-mirror、             可执行组件走免梯子的 GitHub 代理，均无需代理。"
         );
     }
 }

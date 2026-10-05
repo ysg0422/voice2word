@@ -99,9 +99,10 @@ cd voice2word
 模型与可执行组件体积很大（合计约 5 GB），**不进版本库**。
 
 > **推荐：直接在界面里一键下载。** 打开「性能设置 → 模型与组件」，
-> 点“缺失的下载一道”或单个组件的下载按钮即可。所有源都走 `hf-mirror.com`
-> （HuggingFace 国内镜像），**无需梯子**；llama.cpp 打包在 zip 里，下载后会自动解压到 `tools/`。
-> 下面的目录结构只是供你手动安排时参考。
+> 点“一键补齐缺失的 N 个组件”或单个组件的下载按钮即可。
+> 模型走 `hf-mirror.com`（HuggingFace 国内镜像）、可执行组件走免梯子的
+> GitHub 代理，**均无需梯子**；llama.cpp 与 whisper.cpp 打包在 zip 里，
+> 下载后会自动解压到 `tools/`。下面的目录结构只是供你手动安排时参考。
 
 目录名必须一致，文件名可在 `config.toml` 里改。
 
@@ -131,7 +132,8 @@ models/
 ```
 
 - **FFmpeg**：从 [ffmpeg.org](https://ffmpeg.org/download.html) 下载 Windows 版，取 `ffmpeg.exe`。
-- **whisper.cpp**：下载 Windows 预编译版（或自行编译带 Vulkan 后端），取 `whisper-cli.exe`。
+- **whisper.cpp**：已内置一键下载（官方 CPU 构建，自动解压）；若想用 GPU 加速，
+  可自行编译带 Vulkan 后端的 `whisper-cli.exe` 并在 `config.toml` 里指向它。
 - **llama.cpp**：已内置一键下载（「性能设置 → 模型与组件」）；手动准备时下载预编译包，取 `llama-completion.exe` 与 `llama-server.exe`（需与各 DLL 同目录）。
 - **模型**：Whisper 系列从 [HuggingFace ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) 取；
   Qwen 从 [Qwen2.5 GGUF](https://huggingface.co/Qwen) 取；SenseVoice / CT-Punc 的 ONNX 模型可从
