@@ -2210,11 +2210,19 @@ impl MainWindow {
                         } else {
                             format!("模型 {}", model)
                         }
-                    } else if !self.state.model_is_present("qwen-llm") {
-                        // 模型没下：直接点名，避免用户点「开始翻译」后才收到错误
-                        "未下载 Qwen 模型，请在「性能设置 → 模型与组件」下载".to_string()
                     } else {
-                        "本地 Qwen，无需密钥".to_string()
+                        // 离线链路需要两件东西：Qwen 模型与 llama.cpp 推理程序。
+                        // 缺哪个就点名哪个，避免用户点「开始翻译」后才收到错误；
+                        // 两者均缺时先提模型（体积大、下载慢，先知道更有心理预期）。
+                        let miss_model = !self.state.model_is_present("qwen-llm");
+                        let miss_cli = !self.state.model_is_present("llama-cpp");
+                        if miss_model {
+                            "未下载 Qwen 模型，请在「性能设置 → 模型与组件」下载".to_string()
+                        } else if miss_cli {
+                            "未下载 llama.cpp 推理程序，请在「性能设置 → 模型与组件」下载".to_string()
+                        } else {
+                            "本地 Qwen，无需密钥".to_string()
+                        }
                     }),
             );
 
