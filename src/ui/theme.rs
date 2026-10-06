@@ -174,6 +174,10 @@ impl Theme {
     #[inline] pub fn tint_blue_badge() -> Rgba { Self::a(0x38bdf826, 0x38bdf833) }
     /// 蓝 · 描边
     #[inline] pub fn tint_blue_border() -> Rgba { Self::a(0x38bdf866, 0x38bdf899) }
+    /// 琥珀 · 浅底（提示 / 复核标记，如术语表疑似未命中）
+    #[inline] pub fn tint_warn_soft() -> Rgba { Self::a(0xf59e0b1f, 0xd9770626) }
+    /// 琥珀 · 描边
+    #[inline] pub fn tint_warn_border() -> Rgba { Self::a(0xf59e0b55, 0xd9770677) }
     /// 红 · 浅底
     #[inline] pub fn tint_red_soft() -> Rgba { Self::a(0xf43f5e14, 0xf43f5e1f) }
     /// 红 · 描边

@@ -182,6 +182,50 @@ impl Segment {
     }
 }
 
+/// 术语表合规检查：返回**疑似未遵守术语表**的字幕下标。
+///
+/// 判定：某句原文里出现了术语的「原文」（`from`），但它的译文里**没有**出现对应的
+/// 「译文」（`to`）。这类句子多半是模型没按术语表翻译，值得用户复核。
+///
+/// # 为什么是「疑似」而不是「一定错」
+///
+/// 自然的语言里，术语在译文里未必逐字原样出现（形态、大小写、单复数、语序都可能变），
+/// 而且术语本身可能并不需要逐条落进每一句。所以这里只是**提示复核**，绝不自动改译文。
+/// 为避免明显误报：
+/// - 只检查**已经带译文**的句子；
+/// - `from` 与 `to` 都去掉首尾空白后再比对；
+/// - 大小写不敏感（ASCII）。
+///
+/// 只返回**去重后的下标**，顺序与原句一致，供界面标注与统计。
+pub fn glossary_violations(segments: &[Segment], entries: &[(String, String)]) -> Vec<usize> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for seg in segments {
+        let Some(trans) = seg.translation.as_deref() else {
+            continue;
+        };
+        if trans.trim().is_empty() {
+            continue;
+        }
+        let source = seg.translate_source().to_lowercase();
+        let translated = trans.to_lowercase();
+        let violated = entries.iter().any(|(from, to)| {
+            let from = from.trim().to_lowercase();
+            let to = to.trim().to_lowercase();
+            !from.is_empty()
+                && !to.is_empty()
+                && source.contains(&from)
+                && !translated.contains(&to)
+        });
+        if violated {
+            out.push(seg.index);
+        }
+    }
+    out
+}
+
 /// 这一批字幕里是否存在说话人标签。
 ///
 /// 导出时以「整批」为单位决定是否加前缀：只有部分行带前缀会看起来像漏标，
@@ -1052,6 +1096,46 @@ mod tests {
         seg.translation = Some("   ".to_string());
         assert!(!seg.translation_matches("English"));
     }
+    /// 术语表合规检查：原文含术语但译文未含对应译法 → 标记；已遵守或未带译文 → 不标记。
+    #[test]
+    fn glossary_violations_flags_only_unfollowed_terms() {
+        let entries = vec![
+            ("Transformer".to_string(), "变换器".to_string()),
+            ("GPT".to_string(), "生成式预训练模型".to_string()),
+        ];
+
+        let mut good = Segment::new(1, 0.0, 1.0, "这里讲 Transformer 架构");
+        good.translation = Some("This covers the 变换器 architecture.".to_string());
+
+        let mut bad = Segment::new(2, 1.0, 2.0, "GPT 是核心");
+        bad.translation = Some("GPT is the core.".to_string()); // 未用「生成式预训练模型」
+
+        let mut no_trans = Segment::new(3, 2.0, 3.0, "Transformer 很好");
+        no_trans.translation = None; // 无译文不检查
+
+        let mut unrelated = Segment::new(4, 3.0, 4.0, "今天天气不错");
+        unrelated.translation = Some("Nice weather today.".to_string());
+
+        let segs = vec![good, bad, no_trans, unrelated];
+        let bad_idx = glossary_violations(&segs, &entries);
+        assert_eq!(bad_idx, vec![2], "只应标记未按术语译出的第 2 句: {bad_idx:?}");
+    }
+
+    /// 空术语表 → 零标记；大小写不敏感。
+    #[test]
+    fn glossary_violations_empty_and_case_insensitive() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "GPT 模型");
+        seg.translation = Some("The 生成式预训练模型 works.".to_string());
+        assert!(glossary_violations(&[seg.clone()], &[]).is_empty());
+        let mut lower = Segment::new(2, 0.0, 1.0, "gpt 模型");
+        lower.translation = Some("The 生成式预训练模型 works.".to_string());
+        assert!(glossary_violations(
+            &[lower],
+            &[("GPT".to_string(), "生成式预训练模型".to_string())]
+        )
+        .is_empty());
+    }
+
     /// 空串 / 纯空白译文不算「有译文」：双语导出必须回落为单行原文，不能多出一行空白。
     #[test]
     fn has_translation_ignores_blank_and_export_falls_back() {

@@ -754,6 +754,20 @@ impl AppState {
         self.config.translate.glossary.clone()
     }
 
+    /// 术语表条目（解析后的 `(原文, 译文)` 列表）。
+    pub fn glossary_entries(&self) -> Vec<(String, String)> {
+        self.config.translate.glossary_entries()
+    }
+
+    /// 疑似未遵守术语表的字幕下标（供界面标注）。空术语表时为零开销。
+    pub fn glossary_violations(&self) -> Vec<usize> {
+        let entries = self.config.translate.glossary_entries();
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        crate::subtitle::glossary_violations(&self.segments, &entries)
+    }
+
     /// 覆盖术语表原文并落盘（编辑器关闭回填时调用）。
     pub fn set_glossary_text(&mut self, text: String) {
         self.config.translate.glossary = text;

@@ -1634,12 +1634,20 @@ impl MainWindow {
                                 }
 
                                 let row_count = self.subtitle_filter.len();
+                                // 术语表合规：疑似未按术语表译出的句子下标集合。**每帧只算一次**
+                                // （不在逐行闭包里现算），空术语表时为零开销。
+                                let glossary_bad: std::collections::HashSet<usize> = self
+                                    .state
+                                    .glossary_violations()
+                                    .into_iter()
+                                    .collect();
                                 uniform_list(
                                     "inspector-segments-virtual",
                                     row_count,
                                     cx.processor(move |this, visible_range: std::ops::Range<usize>, _window, cx| {
                                         let sel = this.state.selected_segment_index;
                                         let cur_time = this.state.current_time;
+                                        let glossary_bad = glossary_bad.clone();
                                         visible_range
                                             .map(|i| {
                                                 // 行数必须与请求区间严格一致：uniform_list 的
@@ -1670,6 +1678,8 @@ impl MainWindow {
                                                     "—".to_string()
                                                 };
                                                 let speaker = seg.speaker;
+                                                // 术语表疑似未命中：给这一行一个琥珀色提示条
+                                                let glossary_flagged = glossary_bad.contains(&seg_idx);
 
                                                 div()
                                                     .id(("table-row-seg", seg_idx))
@@ -1681,6 +1691,8 @@ impl MainWindow {
                                                     .cursor_pointer()
                                                     .bg(if is_selected {
                                                         Theme::tint_mint_soft()
+                                                    } else if glossary_flagged {
+                                                        Theme::tint_warn_soft()
                                                     } else if is_playing_here {
                                                         Theme::tint_primary_soft()
                                                     } else {
@@ -2514,11 +2526,16 @@ impl MainWindow {
                             .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(Theme::text_muted())
                             .child({
-                                let n = self.state.config.translate.glossary_entries().len();
-                                if n > 0 {
-                                    format!("已启用 {n} 条（专名/术语按固定译法）")
-                                } else {
+                                let n = self.state.glossary_entries().len();
+                                if n == 0 {
                                     "未设置（可留空；用于固定人名/缩写译法）".to_string()
+                                } else {
+                                    let bad = self.state.glossary_violations().len();
+                                    if bad > 0 {
+                                        format!("已启用 {n} 条 · {bad} 句疑似未按术语译（见琥珀色行）")
+                                    } else {
+                                        format!("已启用 {n} 条（专名/术语按固定译法）")
+                                    }
                                 }
                             }),
                     )
