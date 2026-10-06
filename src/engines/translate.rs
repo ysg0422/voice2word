@@ -965,6 +965,30 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 1, "只应发一次请求");
     }
 
+    /// 术语表必须真的注入到发往接口的提示词里（而不是只在本地拼好就丢掉）。
+    #[test]
+    fn glossary_is_injected_into_request_payload() {
+        let reply = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] Engine." } }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![reply]);
+        let cfg = OnlineApiConfig {
+            glossary_hint: "术语表（以下词条必须按给定译法翻译，不得改写）：生成器=engine。".to_string(),
+            ..online_cfg_for(&addr)
+        };
+
+        let segs = vec![Segment::new(1, 0.0, 1.0, "生成器")];
+        let _ = translate_via_online_api(&cfg, segs, "English", None, Arc::new(AtomicBool::new(false)))
+            .expect("mock 服务器应返回成功");
+
+        let body = seen.lock().unwrap().join("\n");
+        assert!(
+            body.contains("生成器=engine"),
+            "术语表必须出现在请求体里: {body}"
+        );
+    }
+
     /// 增量：已有目标语言译文的句子不该再发请求。
     /// 这是在线链路省钱的核心——重复翻译已完成的部分是直接烧 token。
     #[test]
