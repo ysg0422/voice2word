@@ -135,7 +135,9 @@ impl TranslateEngine {
                 { "role": "user", "content": "只回复两个字：正常" }
             ],
             "temperature": 0.0,
-            "max_tokens": 16,
+            // 探测也要给足预算：推理模型（如 deepseek-v4）会先花几百 token 思考，
+            // 之前只给 16，思考还没结束就被截断，反而把思考过程当成回显给用户。
+            "max_tokens": 512,
             "stream": false,
         });
         let value = post_chat_completions(cfg, &payload)?;
@@ -482,8 +484,17 @@ const ONLINE_CHAR_BUDGET: usize = 3_500;
 /// 一条字幕译文大致需要的输出 token（本地 Qwen2.5 实测中→英约 0.84 token/字符，
 /// 按 1.0 封顶给膨胀型目标语言留余量）。
 const OUTPUT_TOKENS_PER_CHAR: usize = 1;
-/// 输出 token 的硬下限：即使极短批也要给模型留出「[N] xxx」的最小生成空间。
-const MIN_OUTPUT_TOKENS: usize = 256;
+/// 输出 token 的硬下限。
+///
+/// 不能只算“译文本身需要多少 token”——很多在线模型是**推理模型**，
+/// 会先花几百 token “思考”再输出译文，而这些思考 token 也占 `max_tokens`。
+/// 下限太低时，模型思考到一半就被截断，译文根本没开始写。
+/// 实测（deepseek-v4-flash，三条短字幕）：思考占 ~184 token、译文 ~50 token。
+/// 取 512 作为下限，给推理模型留出足够的思考空间。
+const MIN_OUTPUT_TOKENS: usize = 512;
+
+/// 输出 token 的宽松上限：防个别服务对超大值报错。
+const MAX_OUTPUT_TOKENS: usize = 8_192;
 
 /// 按本批源文本长度推导 `max_tokens`。
 ///
@@ -496,9 +507,7 @@ fn max_output_tokens(batch: &[&Segment]) -> usize {
         .iter()
         .map(|seg| seg.translate_source().chars().count())
         .sum();
-    (chars * OUTPUT_TOKENS_PER_CHAR)
-        .max(MIN_OUTPUT_TOKENS)
-        .min(8_192)
+    (chars * OUTPUT_TOKENS_PER_CHAR).clamp(MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS)
 }
 
 /// 请求一批字幕的译文，返回 `序号 -> 译文` 映射
@@ -545,7 +554,54 @@ fn request_batch_translation(
     }
 
     let expected: HashSet<usize> = batch.iter().map(|seg| seg.index).collect();
-    Ok(LLMEngine::parse_batch_response(&content, &expected))
+    let mut parsed = LLMEngine::parse_batch_response(&content, &expected);
+
+    // 输出被截断（`finish_reason=length`）时，**最后一条几乎必然是被切一半的**（模型
+    // 写到一半就撞上 max_tokens）。麻烦在于这种半截行**仍能被
+    // `parse_batch_response` 当成一条完整译文**——于是 `matched == chunk.len()`，
+    // 上层的“本批未译全”分支不会触发，用户看到的就是一句被截断的译文。
+    //
+    // 这里主动**丢掉最后一条已解析的译文**：它自带的“缺一条”会让上层走
+    // 现有的折半重试（`retry_missing_online`）把它当成“漏译”补回来。丢掉的那条
+    // 即使本来完整，重译一次也不会出错，只是多一次请求。
+    if finish_reason_is_length(&value) {
+        let last_matched = batch
+            .iter()
+            .rev()
+            .map(|s| s.index)
+            .find(|i| parsed.contains_key(i));
+        if let Some(idx) = last_matched {
+            parsed.remove(&idx);
+            warn!(
+                index = idx,
+                batch = batch.len(),
+                "在线翻译输出被截断，丢弃末条并交由折半重试补齐"
+            );
+        }
+    }
+
+    Ok(parsed)
+}
+
+/// 响应的 `choices[0].finish_reason` 是否为 `length`（输出被 max_tokens 截断）。
+///
+/// 兼容两种位置：`chat/completions` 的 `choices[0].finish_reason`，
+/// 以及部分网关放在 `choices[0].message` 下的同名字段。取不到时返回 `false`
+/// （宁可当作没截断，也不要把正常响应误报成失败）。
+fn finish_reason_is_length(value: &serde_json::Value) -> bool {
+    let Some(choice) = value.get("choices").and_then(|c| c.get(0)) else {
+        return false;
+    };
+    let reason = choice
+        .get("finish_reason")
+        .and_then(|r| r.as_str())
+        .or_else(|| {
+            choice
+                .get("message")
+                .and_then(|m| m.get("finish_reason"))
+                .and_then(|r| r.as_str())
+        });
+    reason.map(|r| r.eq_ignore_ascii_case("length")).unwrap_or(false)
 }
 
 /// 统一 POST 到 `/chat/completions` 并解析 JSON 响应体
@@ -1125,6 +1181,64 @@ mod tests {
             "第一批漏掉的 [2] 应被折半重试补回"
         );
         assert_eq!(seen.lock().unwrap().len(), 2, "应发出「首批 + 补译」两次请求");
+    }
+
+    /// 输出被 `max_tokens` 截断（finish_reason=length）时，末条被切一半的译文不能
+    /// 当成完整结果：应丢弃它并交给折半重试补回。这里模拟服务端：第一批
+    /// 只返回被截断的 `[1]`（finish_reason=length），重试时返回完整的 `[1]`。
+    #[test]
+    fn truncated_output_is_not_accepted_as_complete() {
+        let truncated = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": { "content": "[1] Hello, wel" }
+            }]
+        })
+        .to_string();
+        let complete = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": { "content": "[1] Hello, welcome." }
+            }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![truncated, complete]);
+        let cfg = online_cfg_for(&addr);
+
+        let segs = vec![Segment::new(1, 0.0, 1.0, "你好，欢迎。")];
+        let out = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("折半重试后应成功");
+
+        assert_eq!(
+            out[0].translation.as_deref(),
+            Some("Hello, welcome."),
+            "被截断的末条不应被接受，应重试拿到完整译文"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2, "应发出「截断首批 + 补译」两次请求");
+    }
+
+    /// `finish_reason` 取值判定：只有 "length" 算截断；"stop" / 缺失 / 异常值都不算。
+    #[test]
+    fn finish_reason_length_detection() {
+        let len = serde_json::json!({ "choices": [{ "finish_reason": "length" }] });
+        assert!(finish_reason_is_length(&len));
+        let len_upper = serde_json::json!({ "choices": [{ "finish_reason": "LENGTH" }] });
+        assert!(finish_reason_is_length(&len_upper));
+        let stop = serde_json::json!({ "choices": [{ "finish_reason": "stop" }] });
+        assert!(!finish_reason_is_length(&stop));
+        let missing = serde_json::json!({ "choices": [{ "message": { "content": "x" } }] });
+        assert!(!finish_reason_is_length(&missing));
+        let nested = serde_json::json!({
+            "choices": [{ "message": { "finish_reason": "length" } }]
+        });
+        assert!(finish_reason_is_length(&nested));
+        assert!(!finish_reason_is_length(&serde_json::json!({})));
     }
     /// 参数类错误（401）不该被「逐批跳过」吞掉：整片会以同一原因全失败，
     /// 最终返回错误，让用户看到真正的失败原因，而不是「完成 0 句」的假成功。
