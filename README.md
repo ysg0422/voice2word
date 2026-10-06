@@ -57,6 +57,10 @@ Rust + [GPUI](https://github.com/zed-industries/zed) 实现，Windows 桌面原�
 | **Premiere XML** | Adobe Premiere |
 | **TXT** / **VTT** | 纯文本 / 网页字幕 |
 
+导出前可在底部导出栏选择**导出内容**：`仅原文` / `仅译文` / `双语对照`。该选项对字幕文件与
+剪映 / FCPXML / Premiere 工程文件统一生效（工程文件里一条字幕=一行文字，双语会压成
+「原文  译文」单行）；视频监视器与 FFplay 弹窗预览也会同步按该模式显示，做到所见即所得。
+
 ### 其他
 
 - **历史视频库**：内置 SQLite 记录处理过的任务，随时恢复二次编辑。

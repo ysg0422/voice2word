@@ -494,6 +494,35 @@ fn companion_missing(path: &Path, item: &DownloadItem, entry_len: u64) -> bool {
     !path.parent().map(|d| d.join(companion).exists()).unwrap_or(false)
 }
 
+/// 目标文件是否像是**用户自编译的自包含构建**（入口很大、同目录没有随附 DLL）。
+///
+/// # 为什么下载前要看一眼
+///
+/// 本项目默认落地的 `whisper-cli.exe` 是官方**启动桩**（几百 KB）+ 同目录一堆 DLL；
+/// 而用户自己编译的 Vulkan 版是一个 **60 MB 左右的单文件**（见上方
+/// `SELF_CONTAINED_ENTRY_FLOOR` 的说明）。两者都合法，但**形态不同**。
+///
+/// 若不做判断就直接下载，用户辛苦编译好的单文件会被官方启动桩**悄悄覆盖**
+/// （体积骤减、GPU 支持消失，而且没有任何提示）。这里用「入口 >= 2 MB 且没有
+/// companion」识别出自包含构建；命中时由 [`download_one`] 拒绝覆盖并给出可操作提示。
+fn looks_like_custom_build(item: &DownloadItem, dest: &Path) -> bool {
+    let Some(companion) = item.companion else {
+        return false;
+    };
+    let Ok(meta) = fs::metadata(dest) else {
+        return false;
+    };
+    if meta.len() < SELF_CONTAINED_ENTRY_FLOOR {
+        return false;
+    }
+    // 只有「同目录缺少随附 DLL」才判定为自包含构建；若 DLL 也在，
+    // 说明是本项目自己下载展开的产物，覆盖属于正常升级。
+    !dest
+        .parent()
+        .map(|d| d.join(companion).exists())
+        .unwrap_or(false)
+}
+
 /// 该条目可接受的最小字节数。
 fn min_acceptable_size(item: &DownloadItem) -> u64 {
     if item.min_size > 0 {
@@ -609,6 +638,20 @@ pub fn download_one(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建目录失败: {}", parent.display()))?;
+    }
+    // 已经存在**自编译的自包含构建**时拒绝覆盖：官方包是「启动桩 + DLL」，
+    // 直接下载会把用户的单文件构建换成启动桩（尤其是手编的 Vulkan 版，
+    // GPU 支持会凭空消失且毫无提示）。让他先自行处理，或把 config 指向别处。
+    if looks_like_custom_build(item, &dest) {
+        bail!(
+            "{} 处已有一个**自编译的单文件构建**（入口约 {:.1} MB、同目录没有 {}）。\
+             为避免覆盖你自己的构建（例如带 Vulkan 的 whisper-cli），已中止下载。\
+             若确实想换成本项目提供的包，请先手动移走该文件；\
+             若只是想继续用它，则无需下载。",
+            dest.display(),
+            fs::metadata(&dest).map(|m| m.len() as f64 / 1048576.0).unwrap_or(0.0),
+            item.companion.unwrap_or("DLL")
+        );
     }
     // `.part` 后缀让它天然被「是否已就位」判定排除（目标名不存在）。
     // 用共用构造函数，保证与 `sweep_stale_parts` 的命名规则一致。
@@ -1073,6 +1116,56 @@ mod tests {
             is_present(&item),
             "静态自包含构建不应因缺 DLL 被判为缺失"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 自编译的自包含构建必须被识别出来，`download_one` 据此拒绝覆盖。
+    ///
+    /// 回归：本机手编的 whisper Vulkan 版是 60 MB 单文件，一旦点「下载」，
+    /// 官方启动桩会把它悄悄换掉、GPU 支持凭空消失。
+    #[test]
+    fn custom_self_contained_build_is_detected() {
+        let dir = std::env::temp_dir().join(format!("v2w_custom_build_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let entry = dir.join("tool.exe");
+        let item = DownloadItem {
+            id: "sc-guard",
+            label: "t",
+            note: "n",
+            dest: leak_str(entry.to_str().unwrap().to_string()),
+            urls: &["https://example.invalid/x"],
+            size: 4_000_000,
+            min_size: 100_000,
+            required: false,
+            group: ItemGroup::Binary,
+            is_archive: true,
+            companion: Some("tool.dll"),
+        };
+
+        // 1) 大单文件、无 DLL → 判定为自编译构建
+        fs::write(&entry, vec![0u8; 5_000_000]).unwrap();
+        assert!(
+            looks_like_custom_build(&item, &entry),
+            "60MB 级单文件应被识别为自编译构建"
+        );
+
+        // 2) 补上随附 DLL（本项目自己下载展开的形态）→ 不再视为自编译，允许升级覆盖
+        fs::write(dir.join("tool.dll"), vec![0u8; 10]).unwrap();
+        assert!(
+            !looks_like_custom_build(&item, &entry),
+            "有随附 DLL 时不应视为自编译构建"
+        );
+
+        // 3) 小体积启动桩（官方形态）→ 不是自编译构建
+        let _ = fs::remove_file(dir.join("tool.dll"));
+        fs::write(&entry, vec![0u8; 300_000]).unwrap();
+        assert!(
+            !looks_like_custom_build(&item, &entry),
+            "几百 KB 的官方启动桩不应被判为自编译构建"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 
