@@ -26,6 +26,54 @@ pub struct HardwareProfile {
     pub hardware_decode: bool,
     pub force_proxy: bool,
     pub is_discrete: bool,
+    /// 厂商归类（从 `adapter_name` 推导），供「按厂商选后端」的策略分流。
+    /// `None` 仅出现在软件后端（WARP/lavapipe）与纯 CPU 档案上。
+    pub vendor: Option<Vendor>,
+}
+
+/// GPU 厂商归类。
+///
+/// 从 wgpu 的 `adapter_name` 字符串模糊归类。**只作策略提示，不作硬约束**——
+/// 即使猜错，也只是选了一个未必最优的后端，不影响正确性。后续 AMD→DirectML、
+/// NVIDIA→CUDA/NVENC、Intel→QSV 的分流都读这一个字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vendor {
+    Amd,
+    Nvidia,
+    Intel,
+    /// 其他厂商（Apple Silicon 等，本项目虽面向 Windows 也保留该分支）
+    Other,
+}
+
+impl Vendor {
+    /// 从适配器名模糊归类厂商。
+    pub fn from_adapter_name(name: &str) -> Option<Self> {
+        let n = name.to_ascii_lowercase();
+        // 先匹配 Intel 内核关键词，再匹配 "radeon"/"amd"，避免 "AMD Radeon
+        // Graphics" 这类核显名被 Intel 规则误伤——反过来不行，所以顺序有讲究。
+        if n.contains("radeon") || n.contains("amd") {
+            return Some(Vendor::Amd);
+        }
+        if n.contains("nvidia") || n.contains("geforce") || n.contains("quadro") || n.contains("rtx") {
+            return Some(Vendor::Nvidia);
+        }
+        if n.contains("intel") || n.contains("iris") || n.contains("uhd") || n.contains("arc") {
+            return Some(Vendor::Intel);
+        }
+        if n.contains("apple") || n.contains("m1") || n.contains("m2") || n.contains("m3") || n.contains("m4") {
+            return Some(Vendor::Other);
+        }
+        None
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Vendor::Amd => "AMD",
+            Vendor::Nvidia => "NVIDIA",
+            Vendor::Intel => "Intel",
+            Vendor::Other => "其他",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,10 +110,11 @@ impl HardwareProfile {
             );
             return Self {
                 backend: RenderBackend::Gpu,
-                adapter_name: info.name,
+                adapter_name: info.name.clone(),
                 hardware_decode: true,
                 force_proxy: false,
                 is_discrete: matches!(info.device_type, wgpu::DeviceType::DiscreteGpu),
+                vendor: Vendor::from_adapter_name(&info.name),
             };
         }
 
@@ -76,6 +125,7 @@ impl HardwareProfile {
             hardware_decode: false,
             force_proxy: true,
             is_discrete: false,
+            vendor: None,
         }
     }
 
@@ -89,6 +139,7 @@ impl HardwareProfile {
             hardware_decode: false,
             force_proxy: true,
             is_discrete: false,
+            vendor: None,
         }
     }
 
@@ -1073,6 +1124,24 @@ mod tests {
     #[test]
     fn detect_does_not_panic() {
         let _ = HardwareProfile::detect();
+    }
+
+    #[test]
+    fn vendor_classifies_common_adapter_names() {
+        assert_eq!(Vendor::from_adapter_name("AMD Radeon RX 7900 XTX"), Some(Vendor::Amd));
+        assert_eq!(Vendor::from_adapter_name("Radeon 680M Graphics"), Some(Vendor::Amd));
+        assert_eq!(Vendor::from_adapter_name("NVIDIA GeForce RTX 4090"), Some(Vendor::Nvidia));
+        assert_eq!(Vendor::from_adapter_name("Intel(R) Iris(R) Xe Graphics"), Some(Vendor::Intel));
+        assert_eq!(Vendor::from_adapter_name("Intel(R) Arc(TM) A770"), Some(Vendor::Intel));
+        assert_eq!(Vendor::from_adapter_name("Microsoft Basic Render Driver"), None);
+        assert_eq!(Vendor::from_adapter_name(""), None);
+    }
+
+    #[test]
+    fn vendor_classification_is_case_insensitive() {
+        assert_eq!(Vendor::from_adapter_name("radeon"), Some(Vendor::Amd));
+        assert_eq!(Vendor::from_adapter_name("NVIDIA"), Some(Vendor::Nvidia));
+        assert_eq!(Vendor::from_adapter_name("INTEL UHD Graphics 770"), Some(Vendor::Intel));
     }
 
     #[test]

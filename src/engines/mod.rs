@@ -27,7 +27,7 @@ pub use chunked_whisper::{
 };
 pub use media_pipeline::{
     convert_nv12_frame, nv12_to_rgba, DecodePolicy, DecodedFrame, FrameRing, HardwareProfile,
-    Nv12Renderer, ProxyManager, RenderBackend, NV12_WGSL_SHADER,
+    Nv12Renderer, ProxyManager, RenderBackend, Vendor, NV12_WGSL_SHADER,
 };
 pub use waveform::{WaveformData, WAVEFORM_SAMPLE_RATE};
 pub use diarization::{detect_speakers, MAX_SPEAKERS};

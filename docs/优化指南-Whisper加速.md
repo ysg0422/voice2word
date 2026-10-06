@@ -76,23 +76,44 @@ tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe --help
 
 ---
 
-## 方法 4：whisper.cpp 编译优化
+## 方法 4：whisper.cpp 编译优化（推荐，已落地为脚本）
 
-如果你有 C++ 编译环境，可以自己编译 whisper.cpp 启用所有优化：
+**直接用项目自带脚本一键编译并部署**（MSVC + Vulkan + Ninja）：
 
-```bash
-# 克隆 whisper.cpp
-git clone https://github.com/ggerganov/whisper.cpp.git
-cd whisper.cpp
-
-# 启用 Vulkan + 全优化编译
-cmake -B build -DWHISPER_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-
-# 编译产物在 build/bin/Release/whisper-cli.exe
+```bat
+scripts\build_whisper_msvc_vulkan.bat
 ```
 
-然后修改 `config.toml`:
-```toml
-whisper_cli = "tools/whisper-custom/whisper-cli.exe"
+脚本会自动定位 Visual Studio、检查 Vulkan SDK、下载 whisper.cpp 源码、
+编译 `whisper-cli`，并把 exe + 全部 DLL（含 `ggml-vulkan.dll`）复制到
+`tools/whisper-vulkan/whisper-1.8.4-windows-x64/`——即 `config.toml` 默认指向的位置，
+无需再改配置。
+
+> 注意：CMake 开关是 **`-DGGML_VULKAN=ON`**（不是 `-DWHISPER_VULKAN=ON`，
+> 后者是旧版写法、当前版本无效）。前端 `whisper.cpp` 仓库也已从 `ggerganov` 更名到
+> `ggml-org`。
+
+**为什么必须用 MSVC 而不是 MinGW**：MinGW 产物依赖 `libgcc_s_seh-1.dll` /
+`libstdc++-6.dll` / `libgomp-1.dll`，用户机器缺一个就 `0xC0000139`
+（STATUS_ENTRYPOINT_NOT_FOUND）秒退、stderr 全空，极难排查；MSVC 产物只依赖
+系统自带的 VC++ 运行库（`VCRUNTIME140` / `MSVCP140` / `VCOMP140`），开箱即用。
+
+**实测收益（本机 AMD 核显、105s 切片、`ggml-small-q5_0`）**：
+
+| 后端 | 耗时 | 相对 CPU |
+| --- | --- | --- |
+| 官方 CPU 包 | 13.21 s | 1.00× |
+| MSVC + Vulkan (-fa) | **7.33 s** | **1.80×** |
+
+两者转写结果逐段一致（均为 52 段）。详见 `docs/Whisper后端基准-MSVC-Vulkan.md`。
+
+若想手动编译（等价于脚本内部步骤）：
+
+```bat
+call "D:\...\VC\Auxiliary\Build\vcvars64.bat"
+cmake -S whisper.cpp -B whisper.cpp/build -G Ninja ^
+  -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_OPENMP=ON ^
+  -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF
+cmake --build whisper.cpp/build --config Release --target whisper-cli -j
 ```
+产物在 `whisper.cpp/build/bin/`，把该目录下 exe 与 DLL 一起拷到部署目录。

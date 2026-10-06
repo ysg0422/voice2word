@@ -8,6 +8,7 @@ pub mod time;
 pub mod zip_extract;
 pub mod frame_cache;
 pub mod model_download;
+pub mod pe_imports;
 
 pub use config::{AppConfig, SubtitleStyleConfig, SUBTITLE_PRESETS};
 pub use logger::init_logger;

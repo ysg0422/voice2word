@@ -58,6 +58,9 @@ pub struct PunctuationEngine {
     threads: u32,
     /// 运行 runner 脚本的 Python 解释器（默认 "python"，可配置为绝对路径）
     python_path: PathBuf,
+    /// ONNX 执行后端：`cpu` | `dml`。默认 `cpu`（零回归）；
+    /// `dml` 只有在 Python 环境装了 DirectML 版 sherpa-onnx 时才真正生效。
+    provider: String,
 }
 
 impl PunctuationEngine {
@@ -81,11 +84,27 @@ impl PunctuationEngine {
         threads: u32,
         python_path: P3,
     ) -> Self {
+        Self::with_python_and_provider(runner_script, model_path, threads, python_path, "cpu")
+    }
+
+    /// 完整指定：解释器 + ONNX 执行后端（`cpu` | `dml`）。
+    pub fn with_python_and_provider<P1: AsRef<Path>, P2: AsRef<Path>, P3: AsRef<Path>>(
+        runner_script: P1,
+        model_path: P2,
+        threads: u32,
+        python_path: P3,
+        provider: &str,
+    ) -> Self {
+        let provider = match provider.trim().to_ascii_lowercase().as_str() {
+            "dml" | "directml" => "dml".to_string(),
+            _ => "cpu".to_string(),
+        };
         Self {
             runner_script: runner_script.as_ref().to_path_buf(),
             model_path: model_path.as_ref().to_path_buf(),
             threads,
             python_path: python_path.as_ref().to_path_buf(),
+            provider,
         }
     }
 
@@ -136,6 +155,8 @@ impl PunctuationEngine {
             .arg(&self.model_path)
             .arg("--threads")
             .arg(self.threads.to_string())
+            .arg("--provider")
+            .arg(&self.provider)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

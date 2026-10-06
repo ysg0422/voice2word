@@ -290,6 +290,12 @@ impl SubtitleStyleConfig {
 /// GPU 资源占用总闸：给桌面/其他应用留显卡
 /// - hwaccel_decode: 预览播放/拖动的显卡硬解 (-hwaccel auto)，关闭后走 CPU 软解
 /// - whisper_offload: 转写推理的 Vulkan GPU 加速 (whisper-vulkan)，关闭后走纯 CPU（转写变慢）
+/// - onnx_provider: SenseVoice / CT-Punc 两个 ONNX 引擎的执行后端。
+///   `cpu`（默认）| `dml`（DirectML，Windows + AMD 免 ROCm 直接吃显卡）。
+///
+///   注意：`dml` 只有在 Python 环境里装了**编译进 DirectML 的 sherpa-onnx / onnxruntime**
+///   时才真正生效；否则 sherpa-onnx 会静默回落 cpu 并打一条 "Unsupported string: dml"。
+///   因此默认保持 cpu（零回归），想启用 DML 的用户先升级 sherpa-onnx 的 DirectML 变体再切。
 /// - yield_to_desktop: 「让路」总闸。转写/预览子进程以 BELOW_NORMAL_PRIORITY_CLASS 启动，
 ///   桌面合成器 (dwm) 与其它前台程序优先拿到 CPU 与 GPU 调度时间。
 ///
@@ -310,6 +316,8 @@ pub struct GpuConfig {
     pub hwaccel_decode: bool,
     #[serde(default)]
     pub whisper_offload: bool,
+    #[serde(default = "default_onnx_provider")]
+    pub onnx_provider: String,
     #[serde(default = "default_true")]
     pub yield_to_desktop: bool,
     #[serde(default = "default_gpu_limit_percent")]
@@ -320,11 +328,16 @@ fn default_gpu_limit_percent() -> u32 {
     100
 }
 
+fn default_onnx_provider() -> String {
+    "cpu".to_string()
+}
+
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
             hwaccel_decode: false,
             whisper_offload: false,
+            onnx_provider: default_onnx_provider(),
             yield_to_desktop: true,
             gpu_limit_percent: 100,
         }
@@ -354,28 +367,43 @@ impl GpuConfig {
             "full" => Self {
                 hwaccel_decode: true,
                 whisper_offload: true,
+                onnx_provider: default_onnx_provider(),
                 yield_to_desktop: false,
                 gpu_limit_percent: 100,
             },
             "balanced" => Self {
                 hwaccel_decode: false,
                 whisper_offload: true,
+                onnx_provider: default_onnx_provider(),
                 yield_to_desktop: true,
                 gpu_limit_percent: 100,
             },
             "eco" => Self {
                 hwaccel_decode: false,
                 whisper_offload: true,
+                onnx_provider: default_onnx_provider(),
                 yield_to_desktop: true,
                 gpu_limit_percent: 60,
             },
             "cpu" => Self {
                 hwaccel_decode: false,
                 whisper_offload: false,
+                onnx_provider: default_onnx_provider(),
                 yield_to_desktop: true,
                 gpu_limit_percent: 100,
             },
             _ => Self::default(),
+        }
+    }
+
+    /// 归一化后的 ONNX 推理后端：`dml`/`directml` → "dml"，其余一律 "cpu"。
+    ///
+    /// 与 Python runner 的 `resolve_provider` 保持同一套收敛规则，避免两侧
+    /// 「一个认 dml 一个不认」导致转写参数漂移。
+    pub fn resolve_onnx_provider(&self) -> &'static str {
+        match self.onnx_provider.trim().to_ascii_lowercase().as_str() {
+            "dml" | "directml" => "dml",
+            _ => "cpu",
         }
     }
 

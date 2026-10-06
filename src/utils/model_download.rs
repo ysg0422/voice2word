@@ -344,7 +344,12 @@ pub const ITEMS: &[DownloadItem] = &[
         id: "whisper-cli",
         label: "whisper.cpp 识别程序（Whisper 引擎）",
         // 官方 Windows 构建只有 CPU（无 Vulkan）。下载后自动解压到 tools/whisper-vulkan/。
-        note: "官方 CPU 构建（无 Vulkan），下载后自动解压；若想用 GPU 加速请自备 Vulkan 构建",
+        // 目录名沿历史叫 whisper-vulkan，但这里放的是**官方 CPU 构建**：MSVC 编译 +
+        // VC++ 运行库（MSVCP140/VCRUNTIME140），系统基本自带，开箱即用。
+        // 想用 GPU 加速：跑 scripts/build_whisper_msvc_vulkan.bat 自编 MSVC + Vulkan 版，
+        // 脚本会自动部署到本目录（覆盖 CPU 包）。GPU 版含 ggml-vulkan.dll，
+        // 会被 `looks_like_custom_build` 识别为「自编译构建」——此后点「下载」不会覆盖它。
+        note: "官方 CPU 构建（免梯子下载）；想用 GPU 请跑 scripts/build_whisper_msvc_vulkan.bat",
         // dest 与 config.toml 的默认 whisper_cli 一致；zip 内部是扁平的
         // Release/（已被解压器剥掉这层包装），所有 exe/dll 落到同目录。
         dest: "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe",
@@ -499,17 +504,21 @@ fn companion_missing(path: &Path, item: &DownloadItem, entry_len: u64) -> bool {
     !path.parent().map(|d| d.join(companion).exists()).unwrap_or(false)
 }
 
-/// 目标文件是否像是**用户自编译的自包含构建**（入口很大、同目录没有随附 DLL）。
+/// 目标文件是否像是**用户自编译的构建**（自包含单文件，或带 GPU 后端 DLL）。
 ///
 /// # 为什么下载前要看一眼
 ///
-/// 本项目默认落地的 `whisper-cli.exe` 是官方**启动桩**（几百 KB）+ 同目录一堆 DLL；
-/// 而用户自己编译的 Vulkan 版是一个 **60 MB 左右的单文件**（见上方
-/// `SELF_CONTAINED_ENTRY_FLOOR` 的说明）。两者都合法，但**形态不同**。
+/// 本项目官方 `whisper-cli` 是 **纯 CPU** 的 MSVC 构建（几百 KB 的启动桩 +
+/// 同目录一堆 DLL，不含 `ggml-vulkan.dll`）。用户按
+/// `docs/企业级升级路线图.md` 的 P0-A2 自编的 **MSVC + Vulkan** 版则有两种形态：
+/// 1. **单文件静态链接版**：入口 60 MB 左右、同目录没有随附 DLL
+///    （见上方 `SELF_CONTAINED_ENTRY_FLOOR` 的说明）；
+/// 2. **带 DLL 的 GPU 版**：入口与官方一样是几百 KB 的桩，但同目录多了
+///    `ggml-vulkan.dll`、`whisper.dll` 等 GPU 后端 DLL。
 ///
-/// 若不做判断就直接下载，用户辛苦编译好的单文件会被官方启动桩**悄悄覆盖**
-/// （体积骤减、GPU 支持消失，而且没有任何提示）。这里用「入口 >= 2 MB 且没有
-/// companion」识别出自包含构建；命中时由 [`download_one`] 拒绝覆盖并给出可操作提示。
+/// 两种都合法。若不做判断就直接下载，用户辛苦编译好的构建会被官方 CPU 包
+/// **悄悄覆盖**（体积骤减、GPU 支持凭空消失，而且没有任何提示）。
+/// 命中时由 [`download_one`] 拒绝覆盖并给出可操作提示。
 fn looks_like_custom_build(item: &DownloadItem, dest: &Path) -> bool {
     let Some(companion) = item.companion else {
         return false;
@@ -517,15 +526,43 @@ fn looks_like_custom_build(item: &DownloadItem, dest: &Path) -> bool {
     let Ok(meta) = fs::metadata(dest) else {
         return false;
     };
-    if meta.len() < SELF_CONTAINED_ENTRY_FLOOR {
-        return false;
+    // 形态一：**单文件自包含构建**——入口 >= 2 MB 且同目录没有随附 DLL。
+    // （静态链接的 MinGW 版常长这样。）
+    if meta.len() >= SELF_CONTAINED_ENTRY_FLOOR
+        && !dest
+            .parent()
+            .map(|d| d.join(companion).exists())
+            .unwrap_or(false)
+    {
+        return true;
     }
-    // 只有「同目录缺少随附 DLL」才判定为自包含构建；若 DLL 也在，
-    // 说明是本项目自己下载展开的产物，覆盖属于正常升级。
-    !dest
-        .parent()
-        .map(|d| d.join(companion).exists())
-        .unwrap_or(false)
+    // 形态二：**带 DLL 的 GPU 构建**——入口虽小（官方形态也是几百 KB 的桩），
+    // 但同目录带着本项目官方 CPU 包**从不提供**的 GPU 后端 DLL（如
+    // `ggml-vulkan.dll`），或入口本身导入 `vulkan-1.dll`。这正是用户按
+    // docs/企业级升级路线图.md 的 P0-A2 自编的 MSVC + Vulkan 版形态：
+    // exe + whisper.dll + ggml.dll + ggml-cpu.dll + **ggml-vulkan.dll**。
+    // 若不拦住，点一次「下载」就会被官方 CPU 包覆盖、GPU 支持凭空消失。
+    is_gpu_build(dest)
+}
+
+/// 该入口是否是**带 GPU 后端的构建**（本项目官方包是纯 CPU，从不含这些）。
+///
+/// 两条独立证据，命中其一即可：
+/// 1. 同目录存在 `ggml-vulkan.dll`（本项目官方 CPU 包不含此文件）；
+/// 2. 入口 exe 的 PE 导入表里出现 `vulkan-1.dll`（单文件静态链接的 Vulkan 版）。
+fn is_gpu_build(entry: &Path) -> bool {
+    let Some(dir) = entry.parent() else {
+        return false;
+    };
+    if dir.join("ggml-vulkan.dll").exists() {
+        return true;
+    }
+    match fs::read(entry) {
+        Ok(bytes) => crate::utils::pe_imports::imported_dll_names(&bytes)
+            .map(|names| names.iter().any(|n| n == "vulkan-1.dll"))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 /// 该条目当前命中的是否是**用户自编译的自包含构建**（供界面打「自编译」标识）。
@@ -1187,6 +1224,52 @@ mod tests {
         assert!(
             !looks_like_custom_build(&item, &entry),
             "几百 KB 的官方启动桩不应被判为自编译构建"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 回归：**带 ggml-vulkan.dll 的 GPU 构建**（入口是官方形态的几百 KB 桩）
+    /// 也必须被判为自定义构建，避免被官方 CPU 包静默覆盖、GPU 支持消失。
+    ///
+    /// 这正是用户按 docs/企业级升级路线图.md P0-A2 自编的 MSVC + Vulkan 版形态：
+    /// whisper-cli.exe + whisper.dll + ggml.dll + ggml-cpu.dll + ggml-vulkan.dll。
+    #[test]
+    fn gpu_build_with_vulkan_dll_is_detected() {
+        let dir = std::env::temp_dir().join(format!("v2w_gpu_build_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let entry = dir.join("whisper-cli.exe");
+        // 入口是几百 KB 的官方形态桩（低于 SELF_CONTAINED_ENTRY_FLOOR），
+        // 因此只能靠 ggml-vulkan.dll 这条证据识别。
+        fs::write(&entry, vec![0u8; 485_888]).unwrap();
+        let item = DownloadItem {
+            id: "whisper-cli",
+            label: "t",
+            note: "n",
+            dest: leak_str(entry.to_str().unwrap().to_string()),
+            urls: &["https://example.invalid/x"],
+            size: 4_000_000,
+            min_size: 100_000,
+            required: false,
+            group: ItemGroup::Binary,
+            is_archive: true,
+            companion: Some("whisper.dll"),
+        };
+
+        // 1) 纯 CPU 形态：有 companion、无 vulkan DLL → 不算自定义构建
+        fs::write(dir.join("whisper.dll"), vec![0u8; 483_840]).unwrap();
+        assert!(
+            !looks_like_custom_build(&item, &entry),
+            "官方 CPU 形态（桩 + companion，无 vulkan）不应被判为自定义构建"
+        );
+
+        // 2) 加上 ggml-vulkan.dll → 判为 GPU 自定义构建
+        fs::write(dir.join("ggml-vulkan.dll"), vec![0u8; 1024]).unwrap();
+        assert!(
+            looks_like_custom_build(&item, &entry),
+            "带 ggml-vulkan.dll 的构建应被判为自定义，避免被 CPU 包覆盖"
         );
 
         let _ = fs::remove_dir_all(&dir);

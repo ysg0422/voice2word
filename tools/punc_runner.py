@@ -10,13 +10,29 @@ import json
 import argparse
 import time
 
+
+def resolve_provider(requested: str) -> str:
+    """把命令行/配置里的 provider 收敛到 sherpa-onnx 认识的取值。
+
+    sherpa-onnx 只有在**绑定的 onnxruntime 编译进 DirectML** 时才认 "dml"，
+    否则会静默回落 cpu。这里显式收敛，与 SenseVoice runner 口径一致。
+    """
+    p = (requested or "cpu").strip().lower()
+    if p in ("dml", "directml"):
+        return "dml"
+    return "cpu"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Voice2Word Punctuation Runner")
     parser.add_argument("--model", required=True, help="Path to CT-Transformer model.onnx")
     parser.add_argument("--input", help="Path to input json file")
     parser.add_argument("--output", help="Path to output json file")
     parser.add_argument("--threads", type=int, default=4, help="CPU threads for ONNX runtime")
+    parser.add_argument("--provider", default="cpu", help="ONNX execution provider: cpu | dml")
     args = parser.parse_args()
+
+    provider = resolve_provider(args.provider)
 
     import sherpa_onnx
 
@@ -25,7 +41,7 @@ def main():
         model=sherpa_onnx.OfflinePunctuationModelConfig(
             ct_transformer=args.model,
             num_threads=args.threads,
-            provider="cpu"
+            provider=provider
         )
     )
     punct = sherpa_onnx.OfflinePunctuation(config)

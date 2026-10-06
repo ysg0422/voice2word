@@ -66,6 +66,10 @@ pub struct SenseVoiceEngine {
     threads: u32,
     /// 运行 runner 脚本的 Python 解释器（默认 "python"，可配置为绝对路径）
     python_path: PathBuf,
+    /// ONNX 执行后端：`cpu` | `dml`。默认 `cpu`（零回归）；
+    /// `dml` 只有在 Python 环境装了 DirectML 版 sherpa-onnx 时才真正生效，
+    /// 否则 runner 会静默回落 cpu。收敛规则与 `GpuConfig::resolve_onnx_provider` 一致。
+    provider: String,
     cancel: Arc<AtomicBool>,
     active_children: Arc<Mutex<Vec<ChildEntry>>>,
 }
@@ -97,6 +101,31 @@ impl SenseVoiceEngine {
         threads: u32,
         python_path: P5,
     ) -> Self {
+        Self::with_python_and_provider(
+            runner_path,
+            model_path,
+            tokens_path,
+            vad_model_path,
+            threads,
+            python_path,
+            "cpu",
+        )
+    }
+
+    /// 完整指定：解释器 + ONNX 执行后端（`cpu` | `dml`）。
+    pub fn with_python_and_provider<P1: AsRef<Path>, P2: AsRef<Path>, P3: AsRef<Path>, P4: AsRef<Path>, P5: AsRef<Path>>(
+        runner_path: P1,
+        model_path: P2,
+        tokens_path: P3,
+        vad_model_path: P4,
+        threads: u32,
+        python_path: P5,
+        provider: &str,
+    ) -> Self {
+        let provider = match provider.trim().to_ascii_lowercase().as_str() {
+            "dml" | "directml" => "dml".to_string(),
+            _ => "cpu".to_string(),
+        };
         Self {
             runner_path: runner_path.as_ref().to_path_buf(),
             model_path: model_path.as_ref().to_path_buf(),
@@ -104,6 +133,7 @@ impl SenseVoiceEngine {
             vad_model_path: vad_model_path.as_ref().to_path_buf(),
             threads: threads.max(1),
             python_path: python_path.as_ref().to_path_buf(),
+            provider,
             cancel: Arc::new(AtomicBool::new(false)),
             active_children: Arc::new(Mutex::new(Vec::new())),
         }
@@ -182,7 +212,8 @@ impl SenseVoiceEngine {
             .arg("--vad-model").arg(&self.vad_model_path)
             .arg("--input").arg(audio_path)
             .arg("--threads").arg(th.to_string())
-            .arg("--language").arg(language.unwrap_or("auto"));
+            .arg("--language").arg(language.unwrap_or("auto"))
+            .arg("--provider").arg(&self.provider);
 
         if let Some(dur) = total_duration {
             if dur > 0.0 {
@@ -220,7 +251,8 @@ impl SenseVoiceEngine {
             .arg("--vad-model").arg(&self.vad_model_path)
             .arg("--input").arg("-")
             .arg("--threads").arg(th.to_string())
-            .arg("--language").arg(language.unwrap_or("auto"));
+            .arg("--language").arg(language.unwrap_or("auto"))
+            .arg("--provider").arg(&self.provider);
 
         if let Some(dur) = total_duration {
             if dur > 0.0 {

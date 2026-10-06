@@ -180,6 +180,14 @@ pub struct MainWindow {
     pub(crate) is_probing_translate: bool,
     /// `(是否成功, 提示文案)`；`None` 表示尚未测试过
     pub(crate) translate_probe_msg: Option<(bool, String)>,
+    /// 视频库批量导出的选中任务 id 集合。
+    ///
+    /// 历史库里一条条点「导出字幕」很费手，尤其是「同一部片子重跑了几版、
+    /// 想一次性全导出来比对」的场景。选中集只存 id（不存下标），列表刷新后
+    /// 顺序变化也不会错位；真正导出时再按 id 现取字幕，避免常驻内存。
+    pub(crate) library_selected: HashSet<i64>,
+    /// 批量导出进行中：按钮置灰并显示进度，防止重复触发并发写盘。
+    pub(crate) library_export_busy: bool,
 }
 
 /// 把一次按键应用到单行文本缓冲区的光标处（自绘输入框的共用编辑核心）。
@@ -348,6 +356,8 @@ impl MainWindow {
             api_key_visible: false,
             is_probing_translate: false,
             translate_probe_msg: None,
+            library_selected: HashSet::new(),
+            library_export_busy: false,
         };
 
         // 若启动已载入历史视频工程，立即触发首帧提取，并按硬件策略补代理

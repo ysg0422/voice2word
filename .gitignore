@@ -70,6 +70,10 @@ _scratch_ro/
 # 随手贴的报错 / 界面截图（只用于排查，不属于项目内容）
 image/
 
+# whisper.cpp 自编译工作区（源码 + CMake 构建产物，体积大，不入库）
+# 编译脚本 scripts/build_whisper_msvc_vulkan.bat 会下载源码到这里。
+_whisper_build/
+
 # Local binaries & Python caches
 *.exe
 __pycache__/

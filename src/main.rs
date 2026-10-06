@@ -89,7 +89,12 @@ fn main() -> Result<()> {
             100.0 / gpu_limit_percent as f64
         );
     }
-    info!(use_gpu_pipeline = hardware.use_gpu_pipeline(), adapter = %hardware.adapter_name, "媒体渲染后端已选择");
+    info!(
+        use_gpu_pipeline = hardware.use_gpu_pipeline(),
+        adapter = %hardware.adapter_name,
+        vendor = hardware.vendor.map(|v| v.label()).unwrap_or("—"),
+        "媒体渲染后端已选择"
+    );
 
     // 3. 打开 SQLite 数据库
     let db = Database::open("voice2word.db")?;
@@ -159,14 +164,16 @@ fn main() -> Result<()> {
         let vad = config.paths.sensevoice_vad.as_ref().map(|p| AppConfig::resolve_path(p))
             .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/silero_vad.onnx"));
         if runner.exists() && model.exists() && tokens.exists() && vad.exists() {
-            info!("SenseVoice 极速非自回归语音识别引擎已就绪: {:?}", model);
-            Some(Arc::new(engines::SenseVoiceEngine::with_python(
+            let provider = config.gpu.resolve_onnx_provider();
+            info!("SenseVoice 极速非自回归语音识别引擎已就绪: {:?} (provider={provider})", model);
+            Some(Arc::new(engines::SenseVoiceEngine::with_python_and_provider(
                 runner,
                 model,
                 tokens,
                 vad,
                 config.pipeline.whisper_threads,
                 python_path.clone(),
+                provider,
             )))
         } else {
             warn!(
@@ -185,12 +192,14 @@ fn main() -> Result<()> {
         let model = config.paths.punc_model.as_ref().map(|p| AppConfig::resolve_path(p))
             .unwrap_or_else(|| AppConfig::resolve_path("models/punc/model.int8.onnx"));
         if runner.exists() && model.exists() {
-            info!("CT-Transformer 极速标点引擎已就绪: {:?}", model);
-            Some(Arc::new(engines::PunctuationEngine::with_python(
+            let provider = config.gpu.resolve_onnx_provider();
+            info!("CT-Transformer 极速标点引擎已就绪: {:?} (provider={provider})", model);
+            Some(Arc::new(engines::PunctuationEngine::with_python_and_provider(
                 runner,
                 model,
                 4,
                 python_path.clone(),
+                provider,
             )))
         } else {
             warn!("CT-Transformer 极速标点引擎未就绪 (runner={}, model={})", runner.exists(), model.exists());
@@ -256,6 +265,12 @@ fn check_external_dependencies(config: &AppConfig) {
         }
     }
 
+    // whisper-cli 就位但**缺少运行库**（MinGW libgcc/libstdc++/libgomp）时，exe
+    // 存在也启动不了，进程会以 0xC0000139（STATUS_ENTRYPOINT_NOT_FOUND）退出，
+    // 且无任何 stderr 输出——用户看到的是「转写失败：」空串，无从排查。
+    // 这里在启动时就把这类「就位但不可运行」的坑提前点破。
+    check_whisper_cli_runtime_deps(config);
+
     // 模型属于「用到才需要」：缺失不报缺失，交由对应引擎在启用时报错
     let optional: [(&str, Option<&str>); 5] = [
         ("whisper 模型", Some(config.paths.whisper_model.as_str())),
@@ -311,3 +326,55 @@ fn check_external_dependencies(config: &AppConfig) {
         );
     }
 }
+
+/// 核对 whisper-cli 及其随附 DLL 的**运行库**是否齐备。
+///
+/// 背景：whisper.cpp 的 Windows 构建把代码拆进同目录 DLL，且运行库是动态链接的：
+/// - **MinGW 构建**依赖 `libgcc_s_seh-1.dll` / `libstdc++-6.dll` / `libgomp-1.dll`；
+/// - **MSVC 构建**依赖 `VCRUNTIME140.dll` / `MSVCP140.dll` / `VCOMP140.dll`（VC++ 运行库，
+///   Win10/11 大多自带）；
+/// - **Vulkan 构建**再依赖 `vulkan-1.dll`（显卡驱动自带）。
+///
+/// 这些库缺一个，exe 启动即被 Windows 以 `0xC0000139`
+/// （STATUS_ENTRYPOINT_NOT_FOUND）秒杀——**没有任何 stderr**，`WhisperEngine`
+/// 只会拿到一个空错误串，用户看到「转写失败：」完全无从下手。
+///
+/// # 为什么不能只查一组写死的 DLL 名
+///
+/// 早期版本无条件去查 MinGW 三件套。把 whisper-cli 换成**官方 MSVC 构建**后，
+/// 它根本不导入 libgcc/libstdc++，于是每次启动都误报「运行库缺失」，把用户往
+/// 错误的修复方向带。正确做法是**解析 PE 导入表**，只对「这份二进制真正需要、
+/// 却在任何搜索路径都找不到」的 DLL 报警（见 [`crate::utils::pe_imports`]）。
+///
+/// 这里只**报告**不阻断：缺失时在启动日志里明确点出缺哪个，并给可操作的修复指引。
+fn check_whisper_cli_runtime_deps(config: &AppConfig) {
+    let cli = AppConfig::resolve_path(&config.paths.whisper_cli);
+    if !cli.exists() {
+        return; // exe 缺失已由 `required` 检查报告，这里不重复
+    }
+
+    // 沿同目录 DLL 递归展开导入闭包，逐个判定能否被加载器解析。
+    // 官方 whisper.cpp 构建里 VCOMP140 藏在 ggml-cpu.dll 的导入表里，
+    // 只看入口 exe 会漏掉它——见 utils::pe_imports::missing_imports。
+    let missing = crate::utils::pe_imports::missing_imports(&cli);
+    if missing.is_empty() {
+        return;
+    }
+
+    // 按构建类型给出更贴切的修复指引：MinGW 缺的是编译器运行库，
+    // MSVC 缺的是 VC++ 运行库（装一次 VC++ Redistributable 即可）。
+    let mingw = missing.iter().any(|d| {
+        d.starts_with("libgcc") || d.starts_with("libstdc++") || d.starts_with("libgomp")
+    });
+    let hint = if mingw {
+        "把缺失的 DLL 与 whisper-cli 放到同一目录，或用「性能设置 → 模型与组件」重新下载官方包"
+    } else {
+        "安装「Microsoft Visual C++ 可再发行程序包 (x64)」（vc_redist.x64.exe），或把缺失的 DLL 与 whisper-cli 放到同一目录"
+    };
+    warn!(
+        dlls = ?missing,
+        "whisper-cli 运行库缺失：exe 存在但启动会立即退出（0xC0000139），且无任何报错。修复：{}。",
+        hint
+    );
+}
+

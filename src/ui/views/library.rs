@@ -68,6 +68,12 @@ impl MainWindow {
                             ),
                     ),
             )
+            // 批量操作栏：有记录才出现。勾选卡片后可一次性导出，省去逐条点「导出字幕」。
+            .child(if total_count == 0 {
+                div().into_any_element()
+            } else {
+                self.render_library_batch_bar(cx)
+            })
             // 视频卡片列表区域
             .child(
                 if total_count == 0 {
@@ -76,6 +82,93 @@ impl MainWindow {
                     self.render_library_cards(cx)
                 }
             )
+    }
+
+    /// 视频库批量操作栏：选中计数 + 全选 / 清空 / 导出选中。
+    ///
+    /// 为什么需要它：历史库里一条条点「导出字幕」再逐次选路径，遇到「同一部片子
+    /// 重跑了几版想一次性导出来比对」时非常费手。勾选后集中导到同一个目录，
+    /// 文件名各自沿用工程名，一次点完。
+    fn render_library_batch_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.library_selected.len();
+        let total = self.state.recent_tasks.len();
+        let busy = self.library_export_busy;
+        let can_export = selected > 0 && !busy;
+        div()
+            .id("library-batch-bar")
+            .w_full()
+            .px_4()
+            .py_2()
+            .mb(px(Theme::SPACE_3))
+            .rounded_lg()
+            .bg(Theme::bg_raised())
+            .border_1()
+            .border_color(if selected > 0 {
+                Theme::tint_mint_border()
+            } else {
+                Theme::border_subtle()
+            })
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_BODY))
+                            .text_color(if selected > 0 {
+                                Theme::text_secondary()
+                            } else {
+                                Theme::text_muted()
+                            })
+                            .child(if selected == 0 {
+                                "勾选左侧方框，可批量导出字幕".to_string()
+                            } else {
+                                format!("已选 {selected} / {total} 项")
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        primitives::chip_clickable("全选", false, false)
+                            .id("lib-select-all-btn")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.library_selected =
+                                    this.state.recent_tasks.iter().map(|t| t.id).collect();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        primitives::chip_clickable("清空", false, false)
+                            .id("lib-clear-sel-btn")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.library_selected.clear();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        primitives::btn_state(
+                            if busy { "导出中…" } else { "导出选中" },
+                            primitives::BtnSize::Md,
+                            primitives::BtnVariant::Primary,
+                            can_export,
+                        )
+                        .id("lib-export-selected-btn")
+                        .when(can_export, |d| {
+                            d.on_click(cx.listener(|this, _, _, cx| {
+                                this.export_selected_library_tasks(cx);
+                            }))
+                        }),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// 空状态
@@ -286,6 +379,7 @@ impl MainWindow {
             task.created_at.clone()
         };
 
+        let selected = self.library_selected.contains(&task_id);
         div()
             .id(("lib-card", task_id as usize))
             .w_full()
@@ -293,11 +387,52 @@ impl MainWindow {
             .rounded_xl()
             .bg(Theme::bg_card())
             .border_1()
-            .border_color(Theme::border())
+            .border_color(if selected {
+                Theme::accent_mint()
+            } else {
+                Theme::border()
+            })
             .hover(|s| s.border_color(Theme::border_light()).bg(Theme::bg_card_hover()))
             .flex()
             .flex_row()
+            .items_center()
             .gap_4()
+            // ── 最左：勾选框（批量导出用） ──
+            .child(
+                div()
+                    .id(("lib-check", task_id as usize))
+                    .flex_shrink_0()
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .rounded(px(Theme::RADIUS_MD))
+                    .border_1()
+                    .border_color(if selected {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::border_mid()
+                    })
+                    .bg(if selected {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::bg_raised()
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(Theme::text_on_accent())
+                    .hover(|s| s.border_color(Theme::accent_mint()))
+                    .child(if selected { "✓" } else { "" })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        // insert 返回 false 表示原本已在集合里 → 再点即取消勾选
+                        if !this.library_selected.insert(task_id) {
+                            this.library_selected.remove(&task_id);
+                        }
+                        cx.notify();
+                    })),
+            )
             // ── 左侧：首帧缩略图（后台提取完成前显示占位） ──
             .child({
                 let thumb_box = div()

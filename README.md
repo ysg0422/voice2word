@@ -119,7 +119,7 @@ tools/
   llama-server.exe                            # 同上（常驻服务，热加载更快，与上者同目录）
   whisper-vulkan/
     whisper-1.8.4-windows-x64/
-      whisper-cli.exe                         # whisper.cpp 识别程序（Vulkan 加速版）
+      whisper-cli.exe                         # whisper.cpp 识别程序（官方 CPU 包；GPU 见 build_whisper_msvc_vulkan.bat）
   punc_runner.py                              # 标点引擎 Python 胶水（仓库自带）
   sensevoice_runner.py                        # SenseVoice Python 胶水（仓库自带）
 
@@ -138,8 +138,10 @@ models/
 ```
 
 - **FFmpeg**：从 [ffmpeg.org](https://ffmpeg.org/download.html) 下载 Windows 版，取 `ffmpeg.exe`。
-- **whisper.cpp**：已内置一键下载（官方 CPU 构建，自动解压）；若想用 GPU 加速，
-  可自行编译带 Vulkan 后端的 `whisper-cli.exe` 并在 `config.toml` 里指向它。
+- **whisper.cpp**：已内置一键下载（官方 CPU 构建，自动解压，免梯子）。
+  **想用 GPU 加速**：跑 `scripts/build_whisper_msvc_vulkan.bat`（MSVC + Vulkan 一键编译并
+  自动部署到 `tools/whisper-vulkan/`）。实测 AMD 核显上比 CPU 快约 1.8×；
+  产物自带 `ggml-vulkan.dll`，程序识别为「自编译构建」后不会再被 CPU 包覆盖。
 - **llama.cpp**：已内置一键下载（「性能设置 → 模型与组件」）；手动准备时下载预编译包，取 `llama-completion.exe` 与 `llama-server.exe`（需与各 DLL 同目录）。
 - **模型**：Whisper 系列从 [HuggingFace ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) 取；
   Qwen 从 [Qwen2.5 GGUF](https://huggingface.co/Qwen) 取；SenseVoice / CT-Punc 的 ONNX 模型可从

@@ -29,6 +29,106 @@ impl MainWindow {
             self.state.recent_tasks.iter().map(|t| t.id).collect();
         self.library_thumbs.retain(|id, _| live.contains(id));
         self.library_sizes.retain(|id, _| live.contains(id));
+        // 选中集同步裁掉已不存在的任务：删除/刷新后不该再留着查不到的 id。
+        self.library_selected.retain(|id| live.contains(id));
+    }
+
+    /// 把视频库里勾选的多个任务一次性导出为 SRT 到同一目录。
+    ///
+    /// 与单条「导出字幕」同源：字幕按 id 现取（列表记录不含正文），导出内容模式
+    /// 沿用导出栏的「原文 / 仅译文 / 双语」。逐条写盘，失败的记下来一次性汇总提示，
+    /// 不让一条坏数据中断整批。
+    pub(crate) fn export_selected_library_tasks(&mut self, cx: &mut Context<Self>) {
+        if self.library_export_busy {
+            return;
+        }
+        // 按列表顺序取出选中项（保证导出提示与视觉顺序一致）
+        let picked: Vec<(i64, String)> = self
+            .state
+            .recent_tasks
+            .iter()
+            .filter(|t| self.library_selected.contains(&t.id))
+            .map(|t| (t.id, t.file_name.clone()))
+            .collect();
+        if picked.is_empty() {
+            return;
+        }
+
+        let export_mode = self.state.export_mode_from_config();
+        let db = self.state.db.clone();
+        self.library_export_busy = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let folder = rfd::AsyncFileDialog::new()
+                .set_title("选择批量导出目录")
+                .pick_folder()
+                .await;
+            let Some(folder_handle) = folder else {
+                // 用户取消：复位忙状态，不弹提示
+                let _ = this.update(cx, |this, cx| {
+                    this.library_export_busy = false;
+                    cx.notify();
+                });
+                return;
+            };
+            let dir = folder_handle.path().to_path_buf();
+            // 后台闭包与收尾提示都要用 dir：各持一份，避免 move 冲突
+            let dir_for_write = dir.clone();
+
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut ok = 0usize;
+                    let mut failed: Vec<String> = Vec::new();
+                    for (id, name) in &picked {
+                        let segs = match db.load_task_segments(*id) {
+                            Ok(s) if !s.is_empty() => s,
+                            Ok(_) => {
+                                failed.push(format!("{name}（无字幕内容）"));
+                                continue;
+                            }
+                            Err(e) => {
+                                failed.push(format!("{name}（读取失败: {e}）"));
+                                continue;
+                            }
+                        };
+                        // 文件名沿用工程名，剥掉原扩展名再加 .srt，避免「xx.mp4.srt」
+                        let stem = std::path::Path::new(name)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| format!("task_{id}"));
+                        let out = dir_for_write.join(format!("{stem}.srt"));
+                        match SubtitleWriter::write_to_file_with_mode(&segs, &out, "srt", export_mode) {
+                            Ok(()) => ok += 1,
+                            Err(e) => failed.push(format!("{name}（写出失败: {e}）")),
+                        }
+                    }
+                    (ok, failed)
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                this.library_export_busy = false;
+                let (ok, failed) = result;
+                if failed.is_empty() {
+                    this.notice = Some(format!("已导出 {ok} 份字幕到 {}", dir.display()));
+                } else {
+                    let preview = failed.iter().take(3).cloned().collect::<Vec<_>>().join("；");
+                    let more = if failed.len() > 3 {
+                        format!("等 {} 项", failed.len())
+                    } else {
+                        String::new()
+                    };
+                    this.notice = Some(format!(
+                        "批量导出完成：成功 {ok} 份，失败 {} 项（{preview}{more}）",
+                        failed.len()
+                    ));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// CPU 机器强制走 H.264 代理；有 GPU 默认原片，用户仍可手动打开。
