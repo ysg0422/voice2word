@@ -35,6 +35,8 @@ Rust + [GPUI](https://github.com/zed-industries/zed) 实现，Windows 桌面原�
 - **在线 API 翻译**：兼容 OpenAI / DeepSeek 等格式，需在「性能设置」中填写 API Key
   （留空时回退读取环境变量 `VOICE2WORD_API_KEY`）。
 - 目标语种：简体中文 / 繁体中文 / English / 日本語 / 한국어 / Русский / Français / Deutsch。
+- **手工订正译文**：对照表里点某句的译文格（或点「改译文」）即可修改机翻；
+  **术语表**可固定人名 / 缩写 / 专有名词的译法，保证全篇一致（「性能设置 → 术语表」）。
 
 ### 剪辑校对工作台
 
