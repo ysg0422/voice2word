@@ -1087,6 +1087,33 @@ impl MainWindow {
                                                         ),
                                                 )
                                                 .child(
+                                                    if seg.has_translation() {
+                                                        div()
+                                                            .id("btn-clear-translation")
+                                                            .px_2p5()
+                                                            .py_1()
+                                                            .rounded_md()
+                                                            .bg(Theme::bg_inset())
+                                                            .border_1()
+                                                            .border_color(Theme::border_mid())
+                                                            .cursor_pointer()
+                                                            .hover(|s| s.bg(Theme::bg_hover()))
+                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                this.state.set_selected_translation("");
+                                                                cx.notify();
+                                                            }))
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(Theme::TEXT_SMALL))
+                                                                    .text_color(Theme::text_secondary())
+                                                                    .child("清除译文"),
+                                                            )
+                                                            .into_any_element()
+                                                    } else {
+                                                        div().into_any_element()
+                                                    },
+                                                )
+                                                .child(
                                                     div()
                                                         .id("btn-save-text-top")
                                                         .px_3()
@@ -3117,7 +3144,10 @@ impl MainWindow {
             .and_then(|s| s.translation.clone())
             .unwrap_or_default();
         let prompt_title = "Voice2Word - 修改译文";
-        let prompt_msg = "请输入修改后的译文（留空可清除该句译文）：";
+        // 系统 InputBox 在「取消」与「确定但内容为空」两种情况下都返回空串，无法区分。
+        // 因此这里把空串当作**空操作**（与 `prompt_edit_text` 一致），避免用户点「取消」
+        // 却把已译好的句子清空。要删除译文请用旁边的「清除译文」按钮。
+        let prompt_msg = "请输入修改后的译文：（点「取消」不会改动原文；清空请用「清除译文」）";
 
         cx.spawn(async move |this, cx| {
             let res = cx.background_executor().spawn(async move {
@@ -3145,8 +3175,10 @@ impl MainWindow {
 
             if let Some(new_text) = res {
                 let _ = this.update(cx, |this, cx| {
-                    this.state.set_selected_translation(&new_text);
-                    cx.notify();
+                    if !new_text.trim().is_empty() {
+                        this.state.set_selected_translation(&new_text);
+                        cx.notify();
+                    }
                 });
             }
         }).detach();
