@@ -1067,6 +1067,27 @@ impl MainWindow {
                                                 )
                                                 .child(
                                                     div()
+                                                        .id("btn-open-translation-edit")
+                                                        .px_2p5()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .bg(Theme::bg_inset())
+                                                        .border_1()
+                                                        .border_color(Theme::border_mid())
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.prompt_edit_translation(cx);
+                                                        }))
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(Theme::TEXT_SMALL))
+                                                                .text_color(Theme::text_secondary())
+                                                                .child("改译文"),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
                                                         .id("btn-save-text-top")
                                                         .px_3()
                                                         .py_1()
@@ -3058,6 +3079,54 @@ impl MainWindow {
                 let _ = this.update(cx, |this, cx| {
                     this.state.editing_text = new_text;
                     this.state.save_selected_text();
+                    cx.notify();
+                });
+            }
+        }).detach();
+    }
+
+    /// 弹出原生 Windows 输入对话框直接订正**译文**（机翻有出入时手工改）。
+    ///
+    /// 与 `prompt_edit_text` 同一套实现：自绘输入框拿不到系统 IME 组合态，
+    /// 中文/日文输入法下会错字，所以译文编辑也走系统 InputBox。
+    pub(crate) fn prompt_edit_translation(&mut self, cx: &mut Context<Self>) {
+        // 预填「当前选中片段的译文」；没有译文则从原文起步，方便用户直接在机翻基础上改。
+        let current = self
+            .state
+            .selected_segment_index
+            .and_then(|idx| self.state.segments.iter().find(|s| s.index == idx))
+            .and_then(|s| s.translation.clone())
+            .unwrap_or_default();
+        let prompt_title = "Voice2Word - 修改译文";
+        let prompt_msg = "请输入修改后的译文（留空可清除该句译文）：";
+
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move {
+                use std::process::Command;
+                let safe_msg = prompt_msg.replace('\'', "''");
+                let safe_title = prompt_title.replace('\'', "''");
+                let safe_default = current.replace('\'', "''");
+                let script = format!(
+                    "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::InputBox('{}', '{}', '{}')",
+                    safe_msg, safe_title, safe_default
+                );
+                let output = Command::new("powershell")
+                    .arg("-NoProfile")
+                    .arg("-NonInteractive")
+                    .arg("-Command")
+                    .arg(&script)
+                    .output();
+                match output {
+                    Ok(out) if out.status.success() => {
+                        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                    }
+                    _ => None,
+                }
+            }).await;
+
+            if let Some(new_text) = res {
+                let _ = this.update(cx, |this, cx| {
+                    this.state.set_selected_translation(&new_text);
                     cx.notify();
                 });
             }

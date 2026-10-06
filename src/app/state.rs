@@ -1248,6 +1248,34 @@ impl AppState {
         self.bump_segments_revision();
     }
 
+    /// 直接改写当前选中片段的**译文**（用户在对照表里手工订正机翻）。
+    ///
+    /// 与原文编辑走同一条脏标记 + 去抖落库路径；译文本身不参与 `merge_translations`
+    /// 的「只搬非空译文」覆盖，用户改完不会被下一次翻译任务回滚（那套合并按 start 匹配，
+    /// 且只在引擎给出非空译文时才覆盖，见 `merge_translations`）。
+    ///
+    /// 传入空白串视为「清除译文」，回到无译文状态（对照表显示「—」）。
+    pub fn set_selected_translation(&mut self, text: &str) {
+        let Some(idx) = self.selected_segment_index else { return; };
+        self.snapshot_for_undo();
+        let cleaned = text.trim().to_string();
+        if let Some(seg) = self.segments.iter_mut().find(|s| s.index == idx) {
+            if cleaned.is_empty() {
+                seg.translation = None;
+                seg.translation_lang = None;
+            } else {
+                seg.translation = Some(cleaned);
+                // 保留原有目标语言标记；若原先没有（例如用户凭空补一条译文），
+                // 用当前目标语言补上，避免 `translation_matches` 判定它「未完成」。
+                if seg.translation_lang.is_none() {
+                    seg.translation_lang = Some(self.translate_target_lang.clone());
+                }
+            }
+        }
+        self.segments_dirty = true;
+        self.bump_segments_revision();
+    }
+
     /// 将编辑产生的脏字幕落库（幂等，未脏时零开销）
     pub fn flush_segments_if_dirty(&mut self) {
         if self.segments_dirty {
@@ -2176,6 +2204,43 @@ mod tests {
             Some("Hello"),
             "空串译文不该覆盖用户已有的好译文"
         );
+    }
+
+    /// 用户手工订正译文：写入非空译文、空串清除、以及自动补目标语言标记。
+    #[test]
+    fn set_selected_translation_edits_and_clears() {
+        use crate::subtitle::Segment;
+
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 2.0, "你好"),
+            Segment::new(2, 2.0, 4.0, "世界"),
+        ]);
+        state.translate_target_lang = "English".to_string();
+
+        // 选中第一句，手工写入译文
+        state.select_segment(1);
+        state.set_selected_translation("  Hello  ");
+        assert_eq!(
+            state.segments[0].translation.as_deref(),
+            Some("Hello"),
+            "应写入去除首尾空白的译文"
+        );
+        assert_eq!(
+            state.segments[0].translation_lang.as_deref(),
+            Some("English"),
+            "凭空补的译文应带上当前目标语言标记，否则会被判为未完成"
+        );
+        assert!(state.segments[0].translation_matches("English"));
+
+        // 空白串 = 清除译文
+        state.set_selected_translation("   ");
+        assert!(!state.segments[0].has_translation(), "空白应清除译文");
+        assert!(state.segments[0].translation.is_none());
+
+        // 未选中任何片段时是安全空操作
+        state.selected_segment_index = None;
+        state.set_selected_translation("Whatever");
+        assert!(!state.segments[1].has_translation());
     }
 
     /// 回归：结构编辑（拆/合/删）会重排序号，合并键必须是**起始时间**而非 index。
