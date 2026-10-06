@@ -1762,9 +1762,11 @@ impl MainWindow {
                                                             .truncate()
                                                             .child(raw_text),
                                                     )
-                                                    // 翻译字幕 (多语言对照)
+                                                    // 翻译字幕 (多语言对照)：点这一格直接订正译文，
+                                                    // 比先选中再找「改译文」按钮更顺手。
                                                     .child(
                                                         div()
+                                                            .id(("table-row-trans", seg_idx))
                                                             .flex_1()
                                                             .min_w(px(SUBTITLE_TABLE_COL_TEXT_MIN_W))
                                                             .text_size(px(Theme::TEXT_BODY_LG))
@@ -1776,6 +1778,12 @@ impl MainWindow {
                                                                 Theme::text_secondary()
                                                             })
                                                             .truncate()
+                                                            .hover(|s| s.text_color(Theme::accent_mint()))
+                                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                                this.state.select_segment(seg_idx);
+                                                                this.prompt_edit_translation(cx);
+                                                                cx.notify();
+                                                            }))
                                                             .child(trans_text),
                                                     )
                                                     .into_any_element()
