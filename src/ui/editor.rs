@@ -2496,6 +2496,47 @@ impl MainWindow {
             .child(mode_row)
             .child(lang_row)
             .child(action_row)
+            // 术语表状态 + 快速入口：翻译就在这一面板发生，把「固定译法」的入口放在这里
+            // 最顺手。点击直接跳到设置页的术语表编辑（打开系统编辑器改）。
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_SMALL))
+                            .text_color(Theme::text_secondary())
+                            .child("术语表"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child({
+                                let n = self.state.config.translate.glossary_entries().len();
+                                if n > 0 {
+                                    format!("已启用 {n} 条（专名/术语按固定译法）")
+                                } else {
+                                    "未设置（可留空；用于固定人名/缩写译法）".to_string()
+                                }
+                            }),
+                    )
+                    .child(
+                        primitives::chip_clickable("编辑术语表", false, false)
+                            .id("editor-glossary-edit")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_glossary_editor(cx);
+                            })),
+                    )
+                    .child(
+                        primitives::chip_clickable("应用", false, false)
+                            .id("editor-glossary-apply")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.apply_glossary_from_file(cx);
+                            })),
+                    ),
+            )
             // 翻译进行中才出现进度条，空闲时不占版面
             .child(if is_translating {
                 div()
