@@ -159,6 +159,10 @@ pub struct MainWindow {
     /// `subtitle_filter` 的缓存有效性依据：`(搜索关键字, segments_revision)`。
     /// 两者都没变时直接复用上次算好的下标序列，避免每帧重跑子串匹配。
     pub(crate) subtitle_filter_key: Option<(String, u64)>,
+    /// 术语表疑似未命中句下标的缓存：键为 `(术语表文本, segments_revision)`。
+    /// 与 `subtitle_filter` 同理——播放时每 40ms 重绘一次，逐帧对上千句 × 术语条数
+    /// 跑子串匹配会白白掉帧。
+    pub(crate) glossary_bad_cache: Option<((String, u64), Vec<usize>)>,
     /// 在线翻译 API 配置卡片的编辑缓冲（改完即写 config.toml）
     pub(crate) api_base_input: String,
     pub(crate) api_model_input: String,
@@ -332,6 +336,7 @@ impl MainWindow {
             subtitle_search_cursor: 0,
             subtitle_filter: Vec::new(),
             subtitle_filter_key: None,
+            glossary_bad_cache: None,
             api_base_input,
             api_model_input,
             api_key_input,
@@ -378,6 +383,25 @@ impl MainWindow {
         }
         self.subtitle_filter = matched;
         self.subtitle_filter_key = Some(key);
+    }
+
+    /// 术语表疑似未命中的句下标（按 `(术语表文本, segments_revision)` 缓存）。
+    ///
+    /// 术语表为空时直接返回空（零开销）；否则每帧最多重算一次，而不是在虚拟列表的
+    /// 逐行闭包里现算——那会对「可视行 × 术语条数」重复匹配，纯属浪费。
+    pub(crate) fn cached_glossary_violations(&mut self) -> Vec<usize> {
+        let key = (
+            self.state.config.translate.glossary.clone(),
+            self.state.segments_revision,
+        );
+        if let Some((cached_key, cached)) = self.glossary_bad_cache.as_ref() {
+            if cached_key == &key {
+                return cached.clone();
+            }
+        }
+        let result = self.state.glossary_violations();
+        self.glossary_bad_cache = Some((key, result.clone()));
+        result
     }
 
     /// 把 API 配置输入框的编辑缓冲写回 `config.toml`。

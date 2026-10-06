@@ -1637,8 +1637,7 @@ impl MainWindow {
                                 // 术语表合规：疑似未按术语表译出的句子下标集合。**每帧只算一次**
                                 // （不在逐行闭包里现算），空术语表时为零开销。
                                 let glossary_bad: std::collections::HashSet<usize> = self
-                                    .state
-                                    .glossary_violations()
+                                    .cached_glossary_violations()
                                     .into_iter()
                                     .collect();
                                 uniform_list(
@@ -2530,7 +2529,7 @@ impl MainWindow {
                                 if n == 0 {
                                     "未设置（可留空；用于固定人名/缩写译法）".to_string()
                                 } else {
-                                    let bad = self.state.glossary_violations().len();
+                                    let bad = self.cached_glossary_violations().len();
                                     if bad > 0 {
                                         format!("已启用 {n} 条 · {bad} 句疑似未按术语译（见琥珀色行）")
                                     } else {
