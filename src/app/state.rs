@@ -260,6 +260,40 @@ impl WhisperModelTier {
         (8.0 / t).powf(0.45).clamp(0.55, 2.2)
     }
 
+    /// GPU 相对 CPU 的**实时倍率比**（GPU 耗时 ÷ CPU 耗时），按档位标定。
+    ///
+    /// # 为什么必须分档，而不能用一个统一系数
+    ///
+    /// 旧实现对所有档位统一乘 `0.28`——那是「独显级」速度的想当然值。实测本机
+    /// AMD **核显**（Radeon 780M 级，Vulkan 后端）发现：GPU 的收益高度依赖模型
+    /// 大小。小模型本就跑得快、加载与调度占比高，GPU 优势小；大模型算力吃紧，
+    /// GPU 才显著拉开差距。实测（本机 300 s 样片、8 线程、`-fa`）：
+    ///
+    /// | 档位 | CPU 耗时 | GPU 耗时 | GPU/CPU |
+    /// | --- | --- | --- | --- |
+    /// | Fast (Base) | 15.33 s | 8.97 s | 0.585 |
+    /// | Balanced (Small-Q5) | 38.01 s | 15.64 s | 0.412 |
+    /// | Turbo (Turbo-Q5) | 124.73 s | 24.84 s | 0.199 |
+    ///
+    /// 若继续用 0.28：Turbo 会被高估到「实际只要 25 s、界面却说 35 s」（低估速度），
+    /// Base 会被低估到「实际 9 s、界面说 4 s」（高估速度）——两头都误导。
+    /// 与代码里 SenseVoice 误标 5.5 倍是同一类问题，故按档位分别标定。
+    ///
+    /// 说明：这是**核显**实测值；独显（如 RTX）GPU 更快，此系数会偏保守
+    /// （界面预估比实际慢），属于「宁可说慢」的安全方向。后续可按
+    /// `HardwareProfile::is_discrete` 分流，届时补独显档位数据即可。
+    fn gpu_speedup_ratio(self) -> f64 {
+        match self {
+            // SenseVoice 是 ONNX 引擎、不走此分支；给个中性值避免误导。
+            Self::SenseVoice => 1.0,
+            Self::Fast => 0.585,
+            Self::Balanced => 0.412,
+            Self::TurboSpeed => 0.199,
+            // 高精 Turbo Q8 未单独实测，与 Q5 同为大模型，沿用同一比值。
+            Self::Precise => 0.199,
+        }
+    }
+
     /// 预估转写秒数。GPU 上线程收益更弱；润色额外加固定开销。
     pub fn estimate_seconds(
         self,
@@ -274,7 +308,9 @@ impl WhisperModelTier {
         if self == Self::SenseVoice {
             secs *= Self::sensevoice_thread_factor(threads);
         } else if use_gpu {
-            secs *= 0.28 * (0.72 + 0.28 * thread_f);
+            // GPU 路径：按档位实测比值折算 CPU 基线，再叠加**弱化后**的线程因子
+            // （GPU 推理几乎不吃 CPU 线程，多线程对 GPU 耗时的边际收益很小）。
+            secs *= self.gpu_speedup_ratio() * (0.9 + 0.1 * thread_f);
         } else {
             secs *= thread_f;
         }
@@ -1779,6 +1815,27 @@ mod tests {
         let cpu = WhisperModelTier::Precise.estimate_seconds(d, 8, false, false);
         let gpu = WhisperModelTier::Precise.estimate_seconds(d, 8, true, false);
         assert!(gpu < cpu * 0.5);
+    }
+
+    /// P0-A5：GPU ETA 按档位标定——大模型的 GPU 加速比要显著大于小模型，
+    /// 否则 Turbo 档会被严重高估（界面说 35 s、实际 25 s）。
+    #[test]
+    fn gpu_speedup_is_tier_dependent() {
+        let d = 32.0 * 60.0;
+        let ratio = |tier: WhisperModelTier| {
+            let cpu = tier.estimate_seconds(d, 8, false, false);
+            let gpu = tier.estimate_seconds(d, 8, true, false);
+            gpu / cpu
+        };
+        let fast = ratio(WhisperModelTier::Fast);
+        let balanced = ratio(WhisperModelTier::Balanced);
+        let turbo = ratio(WhisperModelTier::TurboSpeed);
+        assert!(
+            fast > balanced && balanced > turbo,
+            "GPU 加速比应随模型变大而增大：fast={fast:.3} balanced={balanced:.3} turbo={turbo:.3}"
+        );
+        // 实测核显：Turbo 的 GPU/CPU 约 0.20，留出余量取 0.28 上限。
+        assert!(turbo < 0.28, "Turbo GPU ETA 不应再被 0.28 系数高估：{turbo:.3}");
     }
 
     /// 失败项不能被续跑逻辑自动重挑，否则一个坏文件会让整批卡在死循环里。
