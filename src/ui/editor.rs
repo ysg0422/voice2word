@@ -360,6 +360,7 @@ impl MainWindow {
                                 // 宽度与编辑卡里的预览框同源：拖把手时两者在同一帧一起变，
                                 // 不存在「预览改了、画面上没跟上」的延迟
                                 let box_w = self.subtitle_box_w();
+                                let export_mode = self.editor_export_mode;
                                 div()
                                     .absolute()
                                     .bottom(relative(style.preview_bottom_ratio()))
@@ -388,7 +389,9 @@ impl MainWindow {
                                                 .text_color(fg)
                                                 .text_align(TextAlign::Center)
                                                 .line_height(px(font_px * style.line_spacing))
-                                                .child(seg.display_text().to_string())
+                                                // 预览与导出同源：按当前导出内容模式渲染，
+                                                // 译好之后在监视器里就能直接看到译文/双语。
+                                                .child(seg.export_text(export_mode))
                                         } else {
                                             div()
                                         }

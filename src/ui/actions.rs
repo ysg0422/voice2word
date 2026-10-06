@@ -948,7 +948,11 @@ impl MainWindow {
         ));
         // 复用同一临时文件名，写新前先清旧，避免历次预览 SRT 在 temp 无限累积
         let _ = std::fs::remove_file(&subtitle_path);
-        if let Err(error) = SubtitleWriter::write_srt(&self.state.segments, &subtitle_path) {
+        // FFplay 弹窗预览与主界面/导出同源：按当前导出内容模式生成预览字幕。
+        let preview_mode = self.editor_export_mode;
+        if let Err(error) =
+            SubtitleWriter::write_srt_with_mode(&self.state.segments, &subtitle_path, preview_mode)
+        {
             self.state.status = ProcessStatus::Failed(format!("生成预览字幕失败: {}", error));
             cx.notify();
             return;
