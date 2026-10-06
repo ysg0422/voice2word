@@ -2319,7 +2319,26 @@ impl MainWindow {
         let action_row = div()
             .flex()
             .items_center()
+            .flex_wrap()
             .gap_2()
+            // 机翻难免有出入：选中某句后可直接订正译文（走系统输入框，支持中文输入法）。
+            // 放在翻译卡里，是因为用户就是在这一面板发现某句译得不对。
+            .child(
+                if self.state.selected_segment_index.is_some() {
+                    primitives::btn_clickable(
+                        "改译文",
+                        primitives::BtnSize::Sm,
+                        primitives::BtnVariant::Secondary,
+                    )
+                    .id("btn-translate-edit-selected")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.prompt_edit_translation(cx);
+                    }))
+                    .into_any_element()
+                } else {
+                    div().into_any_element()
+                },
+            )
             .child(
                 div()
                     .id("btn-translate-subtitles")
