@@ -473,7 +473,7 @@ pub struct AppState {
     /// 而 `AppState` 本身是 `Clone` 的（`Mutex` 不实现 `Clone`）。
     pub cached_transcription: Arc<std::sync::Mutex<Option<(String, Option<Arc<TaskRecord>>)>>>,
     /// 已就位条目的缓存快照：`is_present` 要 stat 磁盘，
-    /// 每帧对 11 个路径做 stat 会拖慢渲染，因此只在启动/下载完成后刷新。
+    /// 每帧对全部条目路径做 stat 会拖慢渲染，因此只在启动/下载完成后刷新。
     pub model_present: std::collections::HashMap<String, bool>,
     /// 命中的是否是用户自编译的自包含构建（如手编 Vulkan whisper-cli）。
     /// 与 `model_present` 一样按帧查缓存，避免渲染时反复 stat 磁盘。
@@ -1576,11 +1576,11 @@ impl AppState {
     /// 重新扫描全部可下载项的就位状态（启动时与每次下载完成后调用）。
     ///
     /// 结果缓存在 `model_present`：判定要 `stat` 磁盘，而渲染每帧都问，
-    /// 11 个路径逐帧 stat 是白白的系统调用开销。
+    /// 全部条目路径逐帧 stat 是白白的系统调用开销。
     pub fn refresh_model_presence(&mut self) {
         // 直接用**内存里的** config：AppState 自己就持有它，判定时再
         // `load_from_file` 一次纯属浪费（启动路径上会白读一遍 TOML + 解析）。
-        // 顺带也解决了「11 个条目各读一遍」——统一用这一份配置。
+        // 顺带也解决了「每个条目各读一遍」——统一用这一份配置。
         let ctx = crate::utils::model_download::PresenceContextRef::new(&self.config);
         self.model_present = crate::utils::ITEMS
             .iter()

@@ -9,7 +9,7 @@
 //!
 //! 全部走 `hf-mirror.com`（HuggingFace 国内镜像），**不需要梯子**。
 //! 2026-10-05 在本机（无代理）实测：`github.com` 的 release 附件超时不可达，
-//! 而 hf-mirror 上 11 个条目全部可下（实测下载 141 MB 用时 19.7 秒）。
+//! 而 hf-mirror 上全部条目均可下（实测下载 141 MB 用时 19.7 秒）。
 //! 详见 `src/utils/model_download.rs` 的模块文档。
 
 use gpui::prelude::*;

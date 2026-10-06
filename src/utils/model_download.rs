@@ -368,7 +368,7 @@ pub const ITEMS: &[DownloadItem] = &[
 
 /// 一次扫描中复用的配置快照。
 /// 为什么需要它：`resolve_existing_path` 要知道「用户把 ffmpeg 配在哪」，
-/// 而那需要读 `config.toml`。若每个条目各自读一次，一次扫描就是 11 次
+/// 而那需要读 `config.toml`。若每个条目各自读一次，一次扫描就是 13 次
 /// 文件读取 + 11 次 TOML 解析（`refresh_model_presence` 在启动与每次
 /// 下载完成后都会调用）。这里把配置读一次、按条目查表复用。
 pub struct PresenceContext {
