@@ -95,19 +95,18 @@ impl SubtitleWriter {
         format: &str,
         mode: ExportMode,
     ) -> Result<()> {
-        // 工程文件（剪映 / FCPXML / Premiere）同样要认「导出模式」：
-        // 只要不是「仅原文」，就带上译文（有译文时压成一行）。此前这三个分支
-        // 直接丢弃译文，用户在剪辑软件里根本看不到已译好的字幕。
-        let bilingual = !matches!(mode, ExportMode::RawOnly);
+        // 工程文件（剪映 / FCPXML / Premiere）同样认「导出模式」：原文 / 仅译文 / 双语，
+        // 有译文时压成一行。此前这三个分支只写原文、直接丢弃译文，用户在剪辑软件里
+        // 根本看不到已译好的字幕。
         match format.to_lowercase().as_str() {
             "srt" => Self::write_srt_with_mode(segments, path, mode),
             "ass" => Self::write_ass_with_mode(segments, path, mode),
             "vtt" => Self::write_vtt_with_mode(segments, path, mode),
             "txt" => Self::write_txt_with_mode(segments, path, mode),
-            "fcpxml" => super::fcpxml::FcpXmlExporter::write_to_file(segments, path, "Voice2Word Subtitles", bilingual),
-            "xml" | "premiere" => super::premiere::PremiereXmlExporter::write_to_file(segments, path, "Voice2Word Subtitles", bilingual),
+            "fcpxml" => super::fcpxml::FcpXmlExporter::write_to_file(segments, path, "Voice2Word Subtitles", mode),
+            "xml" | "premiere" => super::premiere::PremiereXmlExporter::write_to_file(segments, path, "Voice2Word Subtitles", mode),
             "jianying" => {
-                let _ = super::jianying::JianYingExporter::export_to_folder(segments, None, path, "Voice2Word Draft", bilingual)?;
+                let _ = super::jianying::JianYingExporter::export_to_folder(segments, None, path, "Voice2Word Draft", mode)?;
                 Ok(())
             }
             other => anyhow::bail!("不支持的字幕格式: {}", other),

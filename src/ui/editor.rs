@@ -15,6 +15,7 @@ use crate::utils::time::{format_duration_short, seconds_to_hms, seconds_to_times
 use super::primitives;
 use super::theme::Theme;
 use super::{apply_line_edit, EditorExportFormat, EditorSubtitlePanel, MainWindow};
+use crate::subtitle::ExportMode;
 
 /// 预设 → 预览配色 `(文字色, 底色, 描边色)`。
 ///
@@ -1909,6 +1910,7 @@ impl MainWindow {
     pub(crate) fn render_editor_export_dock(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_open = self.is_export_dropdown_open;
         let cur_fmt = self.editor_export_format;
+        let cur_mode = self.editor_export_mode;
 
         div()
             .id("editor-export-dock")
@@ -1979,6 +1981,39 @@ impl MainWindow {
                 } else {
                     div().id("export-format-menu-closed")
                 }
+            )
+            // 导出内容：原文 / 仅译文 / 双语。对字幕与剪辑工程文件统一生效。
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .flex_shrink_0()
+                            .child("导出内容"),
+                    )
+                    .child({
+                        let modes = [
+                            (ExportMode::RawOnly, "仅原文"),
+                            (ExportMode::TranslationOnly, "仅译文"),
+                            (ExportMode::Bilingual, "双语对照"),
+                        ];
+                        div()
+                            .flex()
+                            .gap_1()
+                            .children(modes.into_iter().enumerate().map(|(idx, (mode, label))| {
+                                let selected = mode == cur_mode;
+                                primitives::chip_clickable(label, selected, false)
+                                    .id(("export-mode-opt", idx))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.editor_export_mode = mode;
+                                        cx.notify();
+                                    }))
+                            }))
+                    }),
             )
             .child(
                 div()

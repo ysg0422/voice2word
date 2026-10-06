@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-use super::segment::Segment;
+use super::segment::{ExportMode, Segment};
 
 pub struct JianYingExporter;
 
@@ -84,7 +84,7 @@ impl JianYingExporter {
         segments: &[Segment],
         video_path: Option<&Path>,
         total_duration_sec: f64,
-        bilingual: bool,
+        mode: ExportMode,
     ) -> Value {
         let duration_us = (total_duration_sec * 1_000_000.0) as u64;
 
@@ -98,7 +98,7 @@ impl JianYingExporter {
             let end_us = (seg.end * 1_000_000.0) as u64;
             let dur_us = end_us.saturating_sub(start_us).max(100_000);
 
-            let raw_text = Self::xml_escape(&seg.project_export_text(bilingual));
+            let raw_text = Self::xml_escape(&seg.project_export_text(mode));
             let content_xml = format!(
                 r##"<font id="" path="" size="8.0"><color_val color="#ffffff">{}</color_val></font>"##,
                 raw_text
@@ -546,7 +546,7 @@ impl JianYingExporter {
         video_path: Option<&Path>,
         target_dir: P,
         draft_name: &str,
-        bilingual: bool,
+        mode: ExportMode,
     ) -> Result<PathBuf> {
         let target_dir = target_dir.as_ref();
         fs::create_dir_all(target_dir).with_context(|| "创建目标草稿文件夹失败")?;
@@ -555,7 +555,7 @@ impl JianYingExporter {
         let duration_us = (total_dur * 1_000_000.0) as u64;
         let draft_id = Uuid::new_v4().to_string().to_uppercase();
 
-        let content_json = Self::build_draft_content(segments, video_path, total_dur, bilingual);
+        let content_json = Self::build_draft_content(segments, video_path, total_dur, mode);
         let meta_json = Self::build_draft_meta_info(&draft_id, draft_name, duration_us);
 
         let content_path = target_dir.join("draft_content.json");
@@ -575,7 +575,7 @@ impl JianYingExporter {
         segments: &[Segment],
         video_path: Option<&Path>,
         base_name: &str,
-        bilingual: bool,
+        mode: ExportMode,
     ) -> Result<PathBuf> {
         let draft_root = Self::detect_local_draft_root()
             .context("未在系统中探测到剪映专业版（JianyingPro）草稿安装目录，请先安装或启动一次剪映")?;
@@ -591,7 +591,7 @@ impl JianYingExporter {
         let draft_id = Uuid::new_v4().to_string().to_uppercase();
         let now_us = Utc::now().timestamp_micros() as u64;
 
-        let content_json = Self::build_draft_content(segments, video_path, total_dur, bilingual);
+        let content_json = Self::build_draft_content(segments, video_path, total_dur, mode);
         let mut meta_json = Self::build_draft_meta_info(&draft_id, &project_name, duration_us);
 
         let norm_project_dir = project_dir.to_string_lossy().replace('\\', "/");
@@ -668,7 +668,7 @@ mod tests {
         ];
 
         let temp_dir = std::env::temp_dir().join("test_voice2word_draft");
-        let result = JianYingExporter::export_to_folder(&segs, None, &temp_dir, "单元测试草稿", false);
+        let result = JianYingExporter::export_to_folder(&segs, None, &temp_dir, "单元测试草稿", ExportMode::RawOnly);
         assert!(result.is_ok());
 
         let content_file = temp_dir.join("draft_content.json");
@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn content_xml_escapes_special_chars() {
         let segs = vec![Segment::new(1, 0.0, 1.0, r#"A&B<C>"引号'"#)];
-        let val = JianYingExporter::build_draft_content(&segs, None, 1.0, false);
+        let val = JianYingExporter::build_draft_content(&segs, None, 1.0, ExportMode::RawOnly);
         let content = val["materials"]["texts"][0]["content"].as_str().unwrap();
         assert!(content.contains("A&amp;B&lt;C&gt;&quot;引号&apos;"), "未正确转义: {content}");
         assert!(!content.contains("A&B"), "原始特殊字符泄漏进了内嵌 XML");
@@ -703,12 +703,12 @@ mod tests {
         seg.translation_lang = Some("English".to_string());
         let segs = vec![seg];
 
-        let val = JianYingExporter::build_draft_content(&segs, None, 1.0, true);
+        let val = JianYingExporter::build_draft_content(&segs, None, 1.0, ExportMode::Bilingual);
         let content = val["materials"]["texts"][0]["content"].as_str().unwrap();
         assert!(content.contains("你好世界"), "缺原文: {content}");
         assert!(content.contains("Hello world"), "双语草稿丢了译文: {content}");
 
-        let raw = JianYingExporter::build_draft_content(&segs, None, 1.0, false);
+        let raw = JianYingExporter::build_draft_content(&segs, None, 1.0, ExportMode::RawOnly);
         let content_raw = raw["materials"]["texts"][0]["content"].as_str().unwrap();
         assert!(!content_raw.contains("Hello world"), "关闭双语时不应出现译文");
     }

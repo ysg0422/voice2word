@@ -793,8 +793,8 @@ impl MainWindow {
         let segments = self.state.segments.clone();
         // 条数先取出来：`segments` 会被 move 进后台任务，成功提示还要用它
         let seg_count = segments.len();
-        // 有译文就按「原文␠␠译文」单行写入，否则纯原文（剪映工程项=一行文字）
-        let bilingual = segments.iter().any(|s| s.has_translation());
+        // 工程文件按「导出模式」（原文 / 仅译文 / 双语）写入；有译文时压成单行。
+        let mode = self.editor_export_mode;
         let video_path = self.state.selected_file.clone();
         let stem = self.state.selected_file.as_ref()
             .and_then(|p| p.file_stem())
@@ -808,7 +808,7 @@ impl MainWindow {
                     &segments,
                     video_path.as_deref(),
                     &stem,
-                    bilingual,
+                    mode,
                 )
             }).await;
 
@@ -841,7 +841,7 @@ impl MainWindow {
         }
 
         let segments = self.state.segments.clone();
-        let bilingual = segments.iter().any(|s| s.has_translation());
+        let mode = self.editor_export_mode;
         let video_path = self.state.selected_file.clone();
         let stem = self.state.selected_file.as_ref()
             .and_then(|p| p.file_stem())
@@ -862,7 +862,7 @@ impl MainWindow {
                         video_path.as_deref(),
                         &target_dir,
                         &stem,
-                        bilingual,
+                        mode,
                     )
                 }).await;
 
@@ -899,15 +899,13 @@ impl MainWindow {
             .unwrap_or("subtitle")
             .to_string();
 
+        let mode = self.editor_export_mode;
         self.export_with_save_dialog(
             cx,
             format!("{}.fcpxml", stem),
             "Final Cut Pro XML (*.fcpxml)",
             "fcpxml".to_string(),
-            move |segs, path| {
-                let bilingual = segs.iter().any(|s| s.has_translation());
-                crate::subtitle::FcpXmlExporter::write_to_file(segs, path, &stem, bilingual)
-            },
+            move |segs, path| crate::subtitle::FcpXmlExporter::write_to_file(segs, path, &stem, mode),
         );
     }
 
@@ -922,15 +920,13 @@ impl MainWindow {
             .unwrap_or("subtitle")
             .to_string();
 
+        let mode = self.editor_export_mode;
         self.export_with_save_dialog(
             cx,
             format!("{}.xml", stem),
             "Premiere Pro XML (*.xml)",
             "xml".to_string(),
-            move |segs, path| {
-                let bilingual = segs.iter().any(|s| s.has_translation());
-                crate::subtitle::PremiereXmlExporter::write_to_file(segs, path, &stem, bilingual)
-            },
+            move |segs, path| crate::subtitle::PremiereXmlExporter::write_to_file(segs, path, &stem, mode),
         );
     }
 
@@ -1313,17 +1309,13 @@ impl MainWindow {
                 // 直接按目标扩展名导出，不再临时改写全局 output_format（避免副作用泄漏到后续管线调用）
                 // ASS 会带上主界面配置的字幕样式（字号/字间距/底边距/预设配色）
                 let style = self.state.config.subtitle_style.clone();
+                let mode = self.editor_export_mode;
                 self.export_with_save_dialog(
                     cx,
                     format!("{}.{}", stem, ext),
                     "Subtitle",
                     ext.to_string(),
                     move |segs, path| {
-                        let mode = if segs.iter().any(|s| s.has_translation()) {
-                            crate::subtitle::ExportMode::Bilingual
-                        } else {
-                            crate::subtitle::ExportMode::RawOnly
-                        };
                         SubtitleWriter::write_to_file_with_style(segs, path, ext, mode, &style)
                     },
                 );

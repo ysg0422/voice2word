@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use super::segment::Segment;
+use super::segment::{ExportMode, Segment};
 
 pub struct PremiereXmlExporter;
 
@@ -24,7 +24,7 @@ impl PremiereXmlExporter {
         segments: &[Segment],
         path: P,
         project_name: &str,
-        bilingual: bool,
+        mode: ExportMode,
     ) -> Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -67,7 +67,7 @@ impl PremiereXmlExporter {
             let start_frame = (seg.start * fps).round() as i64;
             let end_frame = ((seg.end * fps).round() as i64).max(start_frame + 1);
             let dur_frames = end_frame - start_frame;
-            let text = seg.project_export_text(bilingual);
+            let text = seg.project_export_text(mode);
             let escaped_text = Self::escape_xml(&text);
 
             writeln!(file, r#"          <generatoritem id="generatoritem-{}">"#, i + 1)?;
@@ -129,7 +129,7 @@ mod tests {
         ];
 
         let temp_file = std::env::temp_dir().join("test_pr.xml");
-        let res = PremiereXmlExporter::write_to_file(&segs, &temp_file, "测试PR序列", false);
+        let res = PremiereXmlExporter::write_to_file(&segs, &temp_file, "测试PR序列", ExportMode::RawOnly);
         assert!(res.is_ok());
         assert!(temp_file.exists());
 
@@ -150,14 +150,14 @@ mod tests {
         let segs = vec![seg];
 
         let temp_file = std::env::temp_dir().join("test_pr_bi.xml");
-        PremiereXmlExporter::write_to_file(&segs, &temp_file, "双向PR工程", true).unwrap();
+        PremiereXmlExporter::write_to_file(&segs, &temp_file, "双向PR工程", ExportMode::Bilingual).unwrap();
         let content = std::fs::read_to_string(&temp_file).unwrap();
         assert!(content.contains("你好世界"), "缺原文");
         assert!(content.contains("Hello world"), "双语导出丢了译文");
         let _ = std::fs::remove_file(temp_file);
 
         let temp2 = std::env::temp_dir().join("test_pr_raw.xml");
-        PremiereXmlExporter::write_to_file(&segs, &temp2, "单向PR工程", false).unwrap();
+        PremiereXmlExporter::write_to_file(&segs, &temp2, "单向PR工程", ExportMode::RawOnly).unwrap();
         let content2 = std::fs::read_to_string(&temp2).unwrap();
         assert!(!content2.contains("Hello world"), "关闭双语时不应出现译文");
         let _ = std::fs::remove_file(temp2);

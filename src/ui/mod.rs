@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::app::state::{AppState, ProcessStatus, WorkspaceTab};
-use crate::subtitle::{indices_cover_segments, matched_indices};
+use crate::subtitle::{indices_cover_segments, matched_indices, ExportMode};
 use theme::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorExportFormat {
@@ -113,6 +113,8 @@ pub struct MainWindow {
     /// 下载最大 833 MB，慢网下要几十分钟，必须有办法中断。
     pub(crate) model_download_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) editor_export_format: EditorExportFormat,
+    /// 导出内容模式：原文 / 仅译文 / 双语。对字幕文件与剪辑工程文件统一生效。
+    pub(crate) editor_export_mode: ExportMode,
     pub(crate) is_export_dropdown_open: bool,
     /// 字幕预览框的**手动**宽度（px）。`Some` 时以它为准并压过「单行最大字数」
     /// 推出的宽度；拖动预览条两侧把手会写入这里并落盘，`None` 则回到按字数自动推算。
@@ -307,6 +309,7 @@ impl MainWindow {
             translate_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             editor_export_format: EditorExportFormat::default(),
+            editor_export_mode: ExportMode::Bilingual,
             is_export_dropdown_open: false,
             preview_box_w: preview_box_w_initial,
             preview_drag: None,
