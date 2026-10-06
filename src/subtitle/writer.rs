@@ -200,14 +200,45 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             margin_v = style.bottom_margin,
         );
         write!(file, "{}", header)?;
+
+        // 说话人分色：有说话人标签时，为每个说话人生成一条独立 ASS 样式（不同主色），
+        // Dialogue 行按说话人引用对应样式。多人访谈/对谈里一眼分清谁在说。
+        // 颜色只改 PrimaryColour，其余（描边/阴影/边距）沿用当前预设，保持视觉一致。
+        let mut speaker_styles: std::collections::BTreeMap<u32, String> =
+            std::collections::BTreeMap::new();
+        if super::segment::has_speaker_labels(segments) {
+            for seg in segments {
+                if let Some(spk) = seg.speaker {
+                    speaker_styles.entry(spk).or_insert_with(|| format!("Speaker{}", spk + 1));
+                }
+            }
+            // 逐个写出说话人样式行
+            for (idx, name) in speaker_styles.values().enumerate() {
+                let color = speaker_ass_color(idx);
+                writeln!(
+                    file,
+                    "Style: {name},Microsoft YaHei,{size},{color},&H000000FF,{outline},{back},0,0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow},2,20,20,{margin_v},1",
+                    size = style.font_size,
+                    spacing = style.letter_spacing,
+                    margin_v = style.bottom_margin,
+                )?;
+            }
+        }
+
         let with_speaker = super::segment::has_speaker_labels(segments);
         for seg in segments {
             let start = seconds_to_ass_time(seg.start);
             let end = seconds_to_ass_time(seg.end);
             let text = super::segment::export_text_for(seg, mode, with_speaker).replace('\n', "\\N");
+            // 有说话人样式就引用它，否则用默认样式
+            let style_name = seg
+                .speaker
+                .and_then(|s| speaker_styles.get(&s))
+                .map(String::as_str)
+                .unwrap_or("Default");
             writeln!(
                 file,
-                "Dialogue: 0,{},{},Default,,0,0,0,,{}",
+                "Dialogue: 0,{},{},{style_name},,0,0,0,,{}",
                 start, end, text
             )?;
         }
@@ -252,6 +283,24 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         }
         Ok(())
     }
+}
+
+/// 说话人序号 → ASS 主色（`&HAABBGGRR`，不透明）。
+///
+/// 取一组在高对比深色/浅色背景下都清晰、且彼此可区分的颜色（薄荷 / 蓝 / 琥珀 /
+/// 品红 / 青 / 紫 / 珊瑚 / 青柠），循环使用。数量超出时回绕，保证永远给得出颜色。
+fn speaker_ass_color(idx: usize) -> &'static str {
+    const PALETTE: [&str; 8] = [
+        "&H00D1B110", // 薄荷绿（与主色一致）
+        "&H00F8BD38", // 天蓝
+        "&H000B9EF5", // 琥珀
+        "&H00D64FD8", // 品红
+        "&H00E0E05A", // 青
+        "&H00F06BC0", // 紫
+        "&H008080F4", // 珊瑚红
+        "&H0080E010", // 青柠
+    ];
+    PALETTE[idx % PALETTE.len()]
 }
 
 /// 预设 → ASS 样式参数：
@@ -318,6 +367,46 @@ mod tests {
         );
         assert!(content.contains("测试字幕"), "对白文本缺失: {content}");
 
+        let _ = std::fs::remove_file(temp);
+    }
+
+    /// 有说话人标签时，ASS 应为每个说话人生成独立样式，且 Dialogue 引用对应样式。
+    #[test]
+    fn ass_emits_per_speaker_styles() {
+        let mut a = Segment::new(1, 0.0, 1.0, "你好");
+        a.speaker = Some(0);
+        let mut b = Segment::new(2, 1.0, 2.0, "你好呀");
+        b.speaker = Some(1);
+        let segs = vec![a, b];
+
+        let temp = std::env::temp_dir().join("test_v2w_speakers.ass");
+        SubtitleWriter::write_ass_with_style(&segs, &temp, ExportMode::RawOnly, &SubtitleStyleConfig::default())
+            .unwrap();
+        let content = std::fs::read_to_string(&temp).unwrap();
+
+        assert!(content.contains("Style: Speaker1,"), "缺 Speaker1 样式: {content}");
+        assert!(content.contains("Style: Speaker2,"), "缺 Speaker2 样式: {content}");
+        // 两个说话人颜色不同
+        let s1 = content.lines().find(|l| l.starts_with("Style: Speaker1,")).unwrap();
+        let s2 = content.lines().find(|l| l.starts_with("Style: Speaker2,")).unwrap();
+        assert_ne!(s1, s2, "不同说话人应有不同样式（含颜色）");
+        // Dialogue 行引用了对应说话人样式
+        assert!(content.contains(",Speaker1,,"), "第 1 句应引用 Speaker1: {content}");
+        assert!(content.contains(",Speaker2,,"), "第 2 句应引用 Speaker2: {content}");
+
+        let _ = std::fs::remove_file(temp);
+    }
+
+    /// 无说话人标签时不应生成任何 SpeakerN 样式（保持旧行为）。
+    #[test]
+    fn ass_without_speakers_uses_default_only() {
+        let segs = vec![Segment::new(1, 0.0, 1.0, "独白")];
+        let temp = std::env::temp_dir().join("test_v2w_nospeaker.ass");
+        SubtitleWriter::write_ass_with_style(&segs, &temp, ExportMode::RawOnly, &SubtitleStyleConfig::default())
+            .unwrap();
+        let content = std::fs::read_to_string(&temp).unwrap();
+        assert!(!content.contains("Style: Speaker"), "无说话人不应生成 SpeakerN 样式");
+        assert!(content.contains(",Default,,"), "应回落到 Default 样式");
         let _ = std::fs::remove_file(temp);
     }
 
