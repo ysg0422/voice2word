@@ -288,6 +288,8 @@ impl MainWindow {
         // 预览框宽度：配置里存过就用存的，否则 `preview_box_w` 留空，
         // 由 `MainWindow::subtitle_box_w()` 按「单行最大字数 × 预览字号」自动推算
         let preview_box_w_initial = state.config.subtitle_style.preview_box_w;
+        // 导出内容模式是长期偏好：从配置恢复，避免每次重启都跳回默认「双语」。
+        let export_mode_initial = state.export_mode_from_config();
         // 启动即绑定全局子进程作业对象：此后所有转写/转码/预览子进程都挂在它名下，
         // 本进程一旦消失（正常退出、关窗、崩溃、被任务管理器结束），Windows 会连根
         // 清掉整棵进程树。这是唯一能覆盖「父进程被强杀」的兜底 —— 单靠退出路径里的
@@ -309,7 +311,7 @@ impl MainWindow {
             translate_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             editor_export_format: EditorExportFormat::default(),
-            editor_export_mode: ExportMode::Bilingual,
+            editor_export_mode: export_mode_initial,
             is_export_dropdown_open: false,
             preview_box_w: preview_box_w_initial,
             preview_drag: None,

@@ -26,12 +26,23 @@ pub struct AppConfig {
 pub struct UiConfig {
     /// `dark`（默认） | `light`
     pub theme: String,
+    /// 导出内容模式：`raw`（仅原文） | `translation`（仅译文） | `bilingual`（默认，双语）。
+    ///
+    /// 必须持久化：用户在导出栏选了「仅译文」后重启，若又跳回「双语」，
+    /// 下次导出就会多出原文行——用户会以为选项没生效。
+    #[serde(default = "default_export_mode")]
+    pub export_mode: String,
+}
+
+fn default_export_mode() -> String {
+    "bilingual".to_string()
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: "dark".to_string(),
+            export_mode: default_export_mode(),
         }
     }
 }
@@ -53,6 +64,8 @@ impl UiConfig {
     pub fn toggled(&self) -> Self {
         Self {
             theme: if self.is_light() { "dark" } else { "light" }.to_string(),
+            // 切换主题不应重置导出内容偏好
+            export_mode: self.export_mode.clone(),
         }
     }
 }
@@ -935,7 +948,26 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::TranslateConfig;
+    use super::{TranslateConfig, UiConfig};
+
+    /// 切换主题不能顺手把导出内容偏好重置回默认「双语」。
+    #[test]
+    fn toggled_theme_preserves_export_mode() {
+        let mut ui = UiConfig::default();
+        ui.export_mode = "translation".to_string();
+        let toggled = ui.toggled();
+        assert!(toggled.is_light(), "默认深色切换后应为浅色");
+        assert_eq!(toggled.export_mode, "translation", "切主题不应重置导出内容偏好");
+        // 再切一次回深色，导出内容仍保留
+        assert_eq!(toggled.toggled().export_mode, "translation");
+    }
+
+    /// 旧配置（没有 export_mode 字段）反序列化必须成功并落到默认「bilingual」。
+    #[test]
+    fn legacy_ui_config_defaults_export_mode_to_bilingual() {
+        let parsed: UiConfig = toml::from_str("theme = \"dark\"\n").expect("旧配置应能解析");
+        assert_eq!(parsed.export_mode, "bilingual");
+    }
 
     #[test]
     fn chat_completions_url_tolerates_trailing_slash_and_full_path() {

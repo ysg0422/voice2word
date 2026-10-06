@@ -686,6 +686,33 @@ impl AppState {
         let _ = self.config.save_to_file("config.toml");
     }
 
+    /// 导出内容模式（原文 / 仅译文 / 双语）的落盘字符串 ↔ 枚举转换。
+    ///
+    /// 存在 `config.ui.export_mode` 而不是 `subtitle` 里：`utils` 不该反过来依赖
+    /// `subtitle` 的枚举，用稳定的字符串做持久化边界，映射放在这层。
+    pub fn export_mode_from_config(&self) -> crate::subtitle::ExportMode {
+        match self.config.ui.export_mode.trim().to_ascii_lowercase().as_str() {
+            "raw" | "raw_only" | "rawonly" => crate::subtitle::ExportMode::RawOnly,
+            "translation" | "translation_only" | "translationonly" => {
+                crate::subtitle::ExportMode::TranslationOnly
+            }
+            _ => crate::subtitle::ExportMode::Bilingual,
+        }
+    }
+
+    /// 把界面上的导出内容模式写回配置并落盘（幂等）。
+    pub fn set_export_mode(&mut self, mode: crate::subtitle::ExportMode) {
+        let s = match mode {
+            crate::subtitle::ExportMode::RawOnly => "raw",
+            crate::subtitle::ExportMode::TranslationOnly => "translation",
+            crate::subtitle::ExportMode::Bilingual => "bilingual",
+        };
+        if self.config.ui.export_mode != s {
+            self.config.ui.export_mode = s.to_string();
+            let _ = self.config.save_to_file("config.toml");
+        }
+    }
+
     /// 应用字幕样式预设：同时套用该预设的整组排版参数并落盘
     pub fn apply_subtitle_preset(&mut self, preset: &str) {
         self.config.subtitle_style.apply_preset(preset);

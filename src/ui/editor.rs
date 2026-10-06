@@ -2061,6 +2061,8 @@ impl MainWindow {
                                     .id(("export-mode-opt", idx))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.editor_export_mode = mode;
+                                        // 落盘：下次启动仍用同一模式，避免「选项没生效」的错觉
+                                        this.state.set_export_mode(mode);
                                         cx.notify();
                                     }))
                             }))
