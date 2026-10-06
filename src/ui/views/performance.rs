@@ -178,6 +178,46 @@ impl MainWindow {
             )
             .into_any_element();
 
+        // 术语表：多行文本，用外部编辑器改（自绘单行框装不下）。两档引擎都生效。
+        let glossary_count = self.state.config.translate.glossary_entries().len();
+        let glossary_status = self.glossary_status.clone();
+        let glossary_control = div()
+            .flex()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .child(if glossary_count > 0 {
+                        format!("已启用 {glossary_count} 条术语")
+                    } else {
+                        "未设置（可留空）".to_string()
+                    }),
+            )
+            .child(
+                primitives::chip_clickable("编辑术语表", false, false)
+                    .id("glossary-edit-btn")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_glossary_editor(cx);
+                    })),
+            )
+            .child(
+                primitives::chip_clickable("应用术语表", false, false)
+                    .id("glossary-apply-btn")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.apply_glossary_from_file(cx);
+                    })),
+            )
+            .children(glossary_status.map(|msg| {
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_secondary())
+                    .truncate()
+                    .child(msg)
+            }))
+            .into_any_element();
+
         // 离线档下把在线参数整块调暗：仍然可见可编辑（方便提前填好），但明确提示未生效
         let dim = move |el: AnyElement| -> AnyElement {
             if is_online {
@@ -199,6 +239,8 @@ impl MainWindow {
             .child(Self::render_setting_row("每批条数", dim(batch_control)))
             .child(Self::render_setting_divider())
             .child(Self::render_setting_row("连通性", probe_control))
+            .child(Self::render_setting_divider())
+            .child(Self::render_setting_row("术语表", glossary_control))
     }
 
     /// 页头：标题 + 帮助按钮 (简约，无徽标)

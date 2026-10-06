@@ -59,6 +59,9 @@ pub struct OnlineApiConfig {
     pub model: String,
     pub batch_size: usize,
     pub timeout_secs: u64,
+    /// 术语表提示（由 `TranslateConfig::glossary_prompt` 生成，空串表示无）。
+    /// 离线与在线两条链路共用同一份注入文本。
+    pub glossary_hint: String,
 }
 
 pub struct TranslateEngine {
@@ -533,9 +536,10 @@ fn request_batch_translation(
             {
                 "role": "system",
                 "content": format!(
-                    "你是专业字幕翻译专家。{src_hint}把用户给出的带序号字幕逐条翻译为地道的{target_lang}，\
+                    "你是专业字幕翻译专家。{src_hint}{glossary}把用户给出的带序号字幕逐条翻译为地道的{target_lang}，\
                      保持原意与语气，语言通顺紧凑。\
-                     必须逐行输出，格式严格为「[序号] 译文」，不得解释、不得合并、不得遗漏、不得改动序号。"
+                     必须逐行输出，格式严格为「[序号] 译文」，不得解释、不得合并、不得遗漏、不得改动序号。",
+                    glossary = cfg.glossary_hint
                 )
             },
             { "role": "user", "content": source }
@@ -707,6 +711,7 @@ mod tests {
             model: "test-model".to_string(),
             batch_size: 4,
             timeout_secs: 30,
+            glossary_hint: String::new(),
         }
     }
 
@@ -925,6 +930,7 @@ mod tests {
             model: "mock-model".to_string(),
             batch_size: 20,
             timeout_secs: 10,
+            glossary_hint: String::new(),
         }
     }
 

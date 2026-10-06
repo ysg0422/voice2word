@@ -52,6 +52,7 @@ fn main() {
         model,
         batch_size: 20,
         timeout_secs: 120,
+        glossary_hint: std::env::var("V2W_PROBE_GLOSSARY").unwrap_or_default(),
     };
 
     // —— 1. 连接自检 ——

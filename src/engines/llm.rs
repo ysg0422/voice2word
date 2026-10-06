@@ -198,6 +198,10 @@ pub struct LLMEngine {
     /// 与 `TaskPipeline::cancelled` 共用同一个 `Arc`：转写的取消与润色的取消是
     /// 同一件事，各自维护一份标志会导致「终止转写」只杀掉 ASR、润色照跑。
     cancel: Mutex<Arc<AtomicBool>>,
+    /// 术语表提示（注入翻译提示词）。空串表示不注入。由翻译面板在起手前用
+    /// [`LLMEngine::set_glossary`] 写入；用 `Mutex<String>` 是因为引擎在 `Arc`
+    /// 后面被共享、拿不到 `&mut self`（与 `cancel` 同一套理由）。
+    glossary: Mutex<String>,
 }
 
 impl LLMEngine {
@@ -213,7 +217,20 @@ impl LLMEngine {
             ctx_size,
             threads: std::sync::atomic::AtomicU32::new(threads.max(1)),
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
+            glossary: Mutex::new(String::new()),
         }
+    }
+
+    /// 写入术语表提示（每次翻译任务起手前调用；传空串即清除）。
+    pub fn set_glossary(&self, hint: &str) {
+        *self.glossary.lock().unwrap_or_else(|e| e.into_inner()) = hint.to_string();
+    }
+
+    fn glossary_hint(&self) -> String {
+        self.glossary
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 注入外部取消标志（管线 / 翻译面板在任务开始前调用）。
@@ -618,9 +635,11 @@ impl LLMEngine {
         let src_hint = crate::subtitle::dominant_language(source_segments.iter().copied())
             .map(|code| format!("源语言为{}；", crate::subtitle::language_name(&code)))
             .unwrap_or_default();
+        let glossary = self.glossary_hint();
         let prompt = format!(
-            "<|im_start|>system\n你是一个专业字幕翻译专家。{}将给出的字幕文本准确翻译为地道的{}。保持原意，语言通顺紧凑。必须逐行输出，格式为 [序号] 翻译文本；不解释，不合并，不遗漏。<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\n你是一个专业字幕翻译专家。{}{}将给出的字幕文本准确翻译为地道的{}。保持原意，语言通顺紧凑。必须逐行输出，格式为 [序号] 翻译文本；不解释，不合并，不遗漏。<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
             src_hint,
+            glossary,
             target_lang,
             source
         );

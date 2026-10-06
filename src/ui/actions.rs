@@ -1373,6 +1373,8 @@ impl MainWindow {
         let llm_model = crate::utils::config::AppConfig::resolve_path(&self.state.config.paths.llm_model);
         let llm_ctx = self.state.config.pipeline.llm_ctx;
         let llm_threads = self.state.config.pipeline.llm_threads;
+        // 术语表提示：离线链路要显式注入到 LLM 引擎（在线链路已随 online_cfg 一起带）。
+        let glossary_hint = self.state.translate_glossary_hint();
         // 取消标志：任务起手先复位（上一轮取消后它会停在 true），再交给引擎
         let cancel_flag = self.translate_cancel.clone();
         cancel_flag.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1392,6 +1394,7 @@ impl MainWindow {
                             llm_ctx,
                             llm_threads,
                         );
+                        llm_engine.set_glossary(&glossary_hint);
                         crate::engines::TranslateEngine::offline(llm_engine)
                     }
                 };
@@ -1490,6 +1493,47 @@ impl MainWindow {
         self.translate_cancel
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.state.translate_status_msg = "正在取消翻译，等待当前批次结束…".to_string();
+        cx.notify();
+    }
+
+    /// 打开（或创建）术语表临时文件，供用户用记事本等编辑器编辑。
+    ///
+    /// 术语表是多行文本，自绘单行输入框既装不下也没法用输入法舒服编辑；改为写文件 +
+    /// 系统编辑器打开，用户改完回来点「应用术语表」读回。
+    pub(crate) fn open_glossary_editor(&mut self, cx: &mut Context<Self>) {
+        match self.state.write_glossary_temp_file() {
+            Ok(path) => {
+                // 用系统默认编辑器打开（记事本 / 用户关联的 .txt 程序）
+                let _ = std::process::Command::new("cmd")
+                    .arg("/C")
+                    .arg("start")
+                    .arg("")
+                    .arg(&path)
+                    .spawn();
+                self.glossary_status = Some(format!(
+                    "已打开术语表文件（{}）。改完保存后回来点「应用术语表」。",
+                    path.display()
+                ));
+            }
+            Err(e) => {
+                self.glossary_status = Some(format!("无法创建术语表文件: {e}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// 从术语表临时文件读回内容并落盘。
+    pub(crate) fn apply_glossary_from_file(&mut self, cx: &mut Context<Self>) {
+        match self.state.reload_glossary_from_temp_file() {
+            Ok(n) => {
+                self.glossary_status = Some(format!("已应用术语表，共 {n} 条生效"));
+            }
+            Err(e) => {
+                self.glossary_status = Some(format!(
+                    "读取术语表失败: {e}（请先点「编辑术语表」创建文件）"
+                ));
+            }
+        }
         cx.notify();
     }
 

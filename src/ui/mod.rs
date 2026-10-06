@@ -115,6 +115,8 @@ pub struct MainWindow {
     pub(crate) editor_export_format: EditorExportFormat,
     /// 导出内容模式：原文 / 仅译文 / 双语。对字幕文件与剪辑工程文件统一生效。
     pub(crate) editor_export_mode: ExportMode,
+    /// 术语表编辑的最近状态提示（打开文件 / 应用结果）。`None` 表示没操作过。
+    pub(crate) glossary_status: Option<String>,
     pub(crate) is_export_dropdown_open: bool,
     /// 字幕预览框的**手动**宽度（px）。`Some` 时以它为准并压过「单行最大字数」
     /// 推出的宽度；拖动预览条两侧把手会写入这里并落盘，`None` 则回到按字数自动推算。
@@ -312,6 +314,7 @@ impl MainWindow {
             model_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             editor_export_format: EditorExportFormat::default(),
             editor_export_mode: export_mode_initial,
+            glossary_status: None,
             is_export_dropdown_open: false,
             preview_box_w: preview_box_w_initial,
             preview_drag: None,

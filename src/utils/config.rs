@@ -97,6 +97,13 @@ pub struct TranslateConfig {
     /// 会让「上次译的是日语，这次怎么变中文了」无从解释。
     #[serde(default = "default_translate_target_lang")]
     pub target_lang: String,
+    /// 自定义术语表（可选）。每行一条 `原文=译文`（也接受 `->` / `→` / `:` / `：` 分隔）。
+    ///
+    /// 为什么要它：课程/技术类视频里人名、缩写、专有名词反复出现，模型每次译法可能不同
+    /// （「Transformer」一会儿「变换器」一会儿「Transformer」）。术语表把用户的固定译法
+    /// 注入翻译提示词，保证全篇一致。空则完全不注入，不影响默认行为。
+    #[serde(default)]
+    pub glossary: String,
 }
 
 fn default_translate_target_lang() -> String {
@@ -113,6 +120,7 @@ impl Default for TranslateConfig {
             batch_size: 20,
             timeout_secs: 120,
             target_lang: default_translate_target_lang(),
+            glossary: String::new(),
         }
     }
 }
@@ -122,6 +130,62 @@ impl TranslateConfig {
     pub fn is_online(&self) -> bool {
         self.mode.eq_ignore_ascii_case("online_api")
     }
+
+    /// 把术语表文本解析成 `(原文, 译文)` 列表。
+    ///
+    /// 每行一条，分隔符接受 `=` / `->` / `→` / `:` / `：`（取**第一次**出现的位置切分，
+    /// 因此译文里再含冒号也不会被切坏）。空行、以 `#` 开头的注释行、以及任一侧为空的
+    /// 行都会被跳过——用户排错时少一条不该整表失效。单条过长的（>60 字符）也跳过，
+    /// 避免把整段误贴进来污染提示词预算。
+    pub fn glossary_entries(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for raw in self.glossary.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let split_at = ["->", "→", "=", ":", "："]
+                .iter()
+                .filter_map(|sep| line.find(sep).map(|i| (i, sep.len())))
+                .min_by_key(|(i, _)| *i);
+            let Some((idx, sep_len)) = split_at else {
+                continue;
+            };
+            let left = line[..idx].trim();
+            let right = line[idx + sep_len..].trim();
+            if left.is_empty() || right.is_empty() {
+                continue;
+            }
+            if left.chars().count() > 60 || right.chars().count() > 60 {
+                continue;
+            }
+            out.push((left.to_string(), right.to_string()));
+        }
+        out
+    }
+
+    /// 把术语表拼成注入提示词的一行指令。空表返回空串（调用方据此跳过注入）。
+    ///
+    /// 只取前 [`Self::MAX_GLOSSARY_ENTRIES`] 条：提示词预算有限，术语太多反而稀释
+    /// 正文注意力，且绝大多数场景几十条足够覆盖专名。
+    pub fn glossary_prompt(&self) -> String {
+        let entries = self.glossary_entries();
+        if entries.is_empty() {
+            return String::new();
+        }
+        let listed = entries
+            .iter()
+            .take(Self::MAX_GLOSSARY_ENTRIES)
+            .map(|(a, b)| format!("{a}={b}"))
+            .collect::<Vec<_>>()
+            .join("；");
+        format!(
+            "术语表（以下词条必须按给定译法翻译，不得改写）：{listed}。"
+        )
+    }
+
+    /// 注入提示词的术语上限。
+    pub const MAX_GLOSSARY_ENTRIES: usize = 80;
 
     /// 实际使用的密钥：配置优先，其次环境变量
     pub fn effective_api_key(&self) -> String {
@@ -953,8 +1017,10 @@ mod tests {
     /// 切换主题不能顺手把导出内容偏好重置回默认「双语」。
     #[test]
     fn toggled_theme_preserves_export_mode() {
-        let mut ui = UiConfig::default();
-        ui.export_mode = "translation".to_string();
+        let ui = UiConfig {
+            export_mode: "translation".to_string(),
+            ..UiConfig::default()
+        };
         let toggled = ui.toggled();
         assert!(toggled.is_light(), "默认深色切换后应为浅色");
         assert_eq!(toggled.export_mode, "translation", "切主题不应重置导出内容偏好");
@@ -967,6 +1033,57 @@ mod tests {
     fn legacy_ui_config_defaults_export_mode_to_bilingual() {
         let parsed: UiConfig = toml::from_str("theme = \"dark\"\n").expect("旧配置应能解析");
         assert_eq!(parsed.export_mode, "bilingual");
+    }
+
+    /// 术语表解析：多种分隔符、跳过空行/注释/残缺行、保留译文内的冒号。
+    #[test]
+    fn glossary_parses_lines_and_skips_noise() {
+        let cfg = TranslateConfig {
+            glossary: [
+                "# 这是注释",
+                "Transformer=变换器",
+                "  GPT -> 生成式预训练模型  ",
+                "注意力机制：注意力机制",   // 中文冒号，两侧相同也保留
+                "坏行没有分隔符",
+                "=缺左边",
+                "缺右边=",
+                "时间:12:30 开始",         // 取第一个冒号切分，译文含冒号不受影响
+                "",
+            ]
+            .join("\n"),
+            ..TranslateConfig::default()
+        };
+        let entries = cfg.glossary_entries();
+        assert_eq!(entries.len(), 4, "注释/空行/残缺行都应跳过: {entries:?}");
+        assert_eq!(entries[0], ("Transformer".to_string(), "变换器".to_string()));
+        assert_eq!(entries[1], ("GPT".to_string(), "生成式预训练模型".to_string()));
+        assert_eq!(entries[2], ("注意力机制".to_string(), "注意力机制".to_string()));
+        assert_eq!(entries[3], ("时间".to_string(), "12:30 开始".to_string()));
+    }
+
+    /// 空术语表不产生任何提示词注入（默认行为不受影响）。
+    #[test]
+    fn empty_glossary_produces_no_prompt() {
+        let cfg = TranslateConfig::default();
+        assert!(cfg.glossary_entries().is_empty());
+        assert_eq!(cfg.glossary_prompt(), "");
+    }
+
+    /// 术语表提示词包含给定译法，并限制条数上限。
+    #[test]
+    fn glossary_prompt_lists_entries_with_cap() {
+        let cfg = TranslateConfig {
+            glossary: (0..(TranslateConfig::MAX_GLOSSARY_ENTRIES + 20))
+                .map(|i| format!("term{i}=术语{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ..TranslateConfig::default()
+        };
+        let prompt = cfg.glossary_prompt();
+        assert!(prompt.contains("术语表"), "应带说明文字: {prompt}");
+        assert!(prompt.contains("term0=术语0"));
+        // 上限之外的条目不应进入提示词
+        assert!(!prompt.contains("term100="), "超出上限的条目不应注入");
     }
 
     #[test]
