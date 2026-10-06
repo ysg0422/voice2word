@@ -518,6 +518,10 @@ impl MainWindow {
                                     .db
                                     .load_task_segments(task_id)
                                     .unwrap_or_default();
+                                // 与剪辑台同源：尊重用户在导出栏选的「原文 / 仅译文 / 双语」。
+                                // 此前这里写死用 `write_to_file` 自动判定，用户改成「仅译文」
+                                // 后从历史库导出仍会带上原文，两处行为不一致。
+                                let export_mode = this.state.export_mode_from_config();
                                 cx.spawn(async move |this, cx| {
                                     if let Some(handle) = rfd::AsyncFileDialog::new()
                                         .set_file_name(&format!("{}.srt", task_name))
@@ -526,12 +530,12 @@ impl MainWindow {
                                         .await
                                     {
                                         let save_path = handle.path().to_path_buf();
-                                        // 用 write_to_file 由内容自动决定是否双语：
-                                        // 与剪辑台的导出保持一致，带译文的工程不会在这里
-                                        // 悄悄退化成只有原文。
-                                        if let Err(err) =
-                                            SubtitleWriter::write_to_file(&segs, &save_path, "srt")
-                                        {
+                                        if let Err(err) = SubtitleWriter::write_to_file_with_mode(
+                                            &segs,
+                                            &save_path,
+                                            "srt",
+                                            export_mode,
+                                        ) {
                                             // 导出失败必须报出来：静默吞掉会让用户以为
                                             // 文件已经写出去了，回头找不到又无从排查。
                                             let _ = this.update(cx, |this, cx| {
