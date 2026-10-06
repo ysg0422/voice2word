@@ -155,10 +155,12 @@ impl Segment {
     /// 剪辑工程（剪映 / FCPXML / Premiere）导出时用的**单行**文本。
     ///
     /// 工程文件里的字幕是「一条轨道项 = 一行文字」，与 SRT 的 [`ExportMode::Bilingual`]
-    /// （两行叠在一个字幕块里）不同。因此这里把双语压成**一行**：
+    /// （两行叠在一个字幕块里）不同。因此这里把双语压成**一行**，且**沿用与
+    /// [`Segment::export_text`] 一致的顺序：译文在前、原文在后**，避免同一份工程
+    /// 换格式导出后上下行颠倒：
     /// - [`ExportMode::RawOnly`] → 原文；
     /// - [`ExportMode::TranslationOnly`] → 仅译文（译文为空时退回原文，避免空条）；
-    /// - [`ExportMode::Bilingual`] → `原文  译文`（无译文时退回原文）。
+    /// - [`ExportMode::Bilingual`] → `译文  原文`（无译文时退回原文）。
     ///
     /// 为什么必须提供它：此前三个工程导出器都只写 `display_text()`，用户辛苦译好的
     /// 字幕在剪映 / 达芬奇 / Premiere 里**凭空消失**，而界面里明明看得见。
@@ -174,7 +176,7 @@ impl Segment {
             ExportMode::RawOnly => raw,
             ExportMode::TranslationOnly if has_trans => trans,
             ExportMode::TranslationOnly => raw,
-            ExportMode::Bilingual if has_trans => format!("{raw}  {trans}"),
+            ExportMode::Bilingual if has_trans => format!("{trans}  {raw}"),
             ExportMode::Bilingual => raw,
         }
     }
@@ -1140,10 +1142,10 @@ mod tests {
         seg.translation = Some("first\nsecond".to_string());
         assert_eq!(seg.project_export_text(ExportMode::RawOnly), "第 一 行 第 二 行");
         assert_eq!(seg.project_export_text(ExportMode::TranslationOnly), "first second");
-        // 双语 = 原文␠␠译文，压成一行
+        // 双语 = 译文␠␠原文（与 export_text 的 Bilingual 同序），压成一行
         assert_eq!(
             seg.project_export_text(ExportMode::Bilingual),
-            "第 一 行 第 二 行  first second"
+            "first second  第 一 行 第 二 行"
         );
 
         // 空白译文不算译文
