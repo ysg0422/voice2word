@@ -414,6 +414,11 @@ impl<'a> PresenceContextRef<'a> {
     pub fn is_present(&self, item: &DownloadItem) -> bool {
         is_present_with(item, &Some(self.cfg.clone()))
     }
+
+    /// 是否命中了用户自编译的自包含构建（同一次扫描内复用配置，不额外读盘）。
+    pub fn is_custom_build(&self, item: &DownloadItem) -> bool {
+        is_custom_build_with(item, &Some(self.cfg.clone()))
+    }
 }
 
 /// 判断某个条目是否已就位（内部使用：允许传入已读好的配置）。
@@ -521,6 +526,24 @@ fn looks_like_custom_build(item: &DownloadItem, dest: &Path) -> bool {
         .parent()
         .map(|d| d.join(companion).exists())
         .unwrap_or(false)
+}
+
+/// 该条目当前命中的是否是**用户自编译的自包含构建**（供界面打「自编译」标识）。
+///
+/// 与 [`looks_like_custom_build`] 的区别：这里先按配置解析出**实际生效**的路径
+/// （用户可能把 `whisper_cli` 指到别处），再判断形态。界面据此区分
+/// 「本项目下载展开的官方包」与「用户自己编的版本」，避免用户误以为自己的构建被覆盖。
+pub fn is_custom_build_with(item: &DownloadItem, cfg: &Option<AppConfig>) -> bool {
+    let Some(path) = resolve_existing_path(item, cfg) else {
+        return false;
+    };
+    looks_like_custom_build(item, &path)
+}
+
+/// 用 `config.toml` + `config.local.toml` 判定（与 [`is_present`] 同路径）。
+pub fn is_custom_build(item: &DownloadItem) -> bool {
+    let cfg = AppConfig::load_from_file("config.toml").ok();
+    is_custom_build_with(item, &cfg)
 }
 
 /// 该条目可接受的最小字节数。

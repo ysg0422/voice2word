@@ -475,6 +475,9 @@ pub struct AppState {
     /// 已就位条目的缓存快照：`is_present` 要 stat 磁盘，
     /// 每帧对 11 个路径做 stat 会拖慢渲染，因此只在启动/下载完成后刷新。
     pub model_present: std::collections::HashMap<String, bool>,
+    /// 命中的是否是用户自编译的自包含构建（如手编 Vulkan whisper-cli）。
+    /// 与 `model_present` 一样按帧查缓存，避免渲染时反复 stat 磁盘。
+    pub model_custom_build: std::collections::HashMap<String, bool>,
 }
 
 impl AppState {
@@ -613,6 +616,7 @@ impl AppState {
             cached_transcription: Arc::new(std::sync::Mutex::new(None)),
             db_write_error: None,
             model_present: std::collections::HashMap::new(),
+            model_custom_build: std::collections::HashMap::new(),
         };
 
         // 如果存在历史记录，启动时自动加载最近一次的工程，避免开屏黑屏或空数据
@@ -1554,11 +1558,25 @@ impl AppState {
             .iter()
             .map(|i| (i.id.to_string(), ctx.is_present(i)))
             .collect();
+        // 同时缓存「自编译构建」判定：同样要 stat 磁盘，不能每帧现算。
+        self.model_custom_build = crate::utils::ITEMS
+            .iter()
+            .map(|i| (i.id.to_string(), ctx.is_custom_build(i)))
+            .collect();
     }
 
     /// 某个条目是否已就位（查缓存快照，不碰磁盘）。
     pub fn model_is_present(&self, id: &str) -> bool {
         self.model_present.get(id).copied().unwrap_or(false)
+    }
+
+    /// 某个条目命中的是否是**用户自编译的自包含构建**（查缓存快照，不碰磁盘）。
+    ///
+    /// 界面据此把徽标从「已就位」换成「自编译」，让用户一眼看出这是自己编的版本
+    /// （例如手编的 Vulkan whisper-cli），而不是本项目下载展开的官方包——
+    /// 后者被覆盖升级无所谓，前者被覆盖会丢 GPU 支持。
+    pub fn model_is_custom_build(&self, id: &str) -> bool {
+        self.model_custom_build.get(id).copied().unwrap_or(false)
     }
 
     /// 缺失的**必需**组件数（ffmpeg 与 Whisper 主模型）。

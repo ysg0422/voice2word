@@ -226,6 +226,10 @@ impl MainWindow {
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
         let present = self.state.model_is_present(item.id);
+        // 用户自编译的自包含构建（如手编 Vulkan whisper-cli）：单独打标，
+        // 且不给「下载」按钮——下载会被 download_one 拒绝（保护用户构建），
+        // 与其点一下弹错，不如直接说明这是你自己的版本、无需下载。
+        let custom = present && self.state.model_is_custom_build(item.id);
         let is_current = self
             .state
             .download_current
@@ -234,7 +238,9 @@ impl MainWindow {
             .unwrap_or(false);
         let row_id = item.id;
 
-        let status_el: AnyElement = if present {
+        let status_el: AnyElement = if custom {
+            primitives::badge_accent("已就位 · 自编译").into_any_element()
+        } else if present {
             primitives::badge("已就位").into_any_element()
         } else if is_current && is_downloading {
             primitives::badge_accent("下载中").into_any_element()
