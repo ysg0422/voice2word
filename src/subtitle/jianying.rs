@@ -84,6 +84,7 @@ impl JianYingExporter {
         segments: &[Segment],
         video_path: Option<&Path>,
         total_duration_sec: f64,
+        bilingual: bool,
     ) -> Value {
         let duration_us = (total_duration_sec * 1_000_000.0) as u64;
 
@@ -97,7 +98,7 @@ impl JianYingExporter {
             let end_us = (seg.end * 1_000_000.0) as u64;
             let dur_us = end_us.saturating_sub(start_us).max(100_000);
 
-            let raw_text = Self::xml_escape(&seg.display_text().replace('\n', " "));
+            let raw_text = Self::xml_escape(&seg.project_export_text(bilingual));
             let content_xml = format!(
                 r##"<font id="" path="" size="8.0"><color_val color="#ffffff">{}</color_val></font>"##,
                 raw_text
@@ -545,6 +546,7 @@ impl JianYingExporter {
         video_path: Option<&Path>,
         target_dir: P,
         draft_name: &str,
+        bilingual: bool,
     ) -> Result<PathBuf> {
         let target_dir = target_dir.as_ref();
         fs::create_dir_all(target_dir).with_context(|| "创建目标草稿文件夹失败")?;
@@ -553,7 +555,7 @@ impl JianYingExporter {
         let duration_us = (total_dur * 1_000_000.0) as u64;
         let draft_id = Uuid::new_v4().to_string().to_uppercase();
 
-        let content_json = Self::build_draft_content(segments, video_path, total_dur);
+        let content_json = Self::build_draft_content(segments, video_path, total_dur, bilingual);
         let meta_json = Self::build_draft_meta_info(&draft_id, draft_name, duration_us);
 
         let content_path = target_dir.join("draft_content.json");
@@ -573,6 +575,7 @@ impl JianYingExporter {
         segments: &[Segment],
         video_path: Option<&Path>,
         base_name: &str,
+        bilingual: bool,
     ) -> Result<PathBuf> {
         let draft_root = Self::detect_local_draft_root()
             .context("未在系统中探测到剪映专业版（JianyingPro）草稿安装目录，请先安装或启动一次剪映")?;
@@ -588,7 +591,7 @@ impl JianYingExporter {
         let draft_id = Uuid::new_v4().to_string().to_uppercase();
         let now_us = Utc::now().timestamp_micros() as u64;
 
-        let content_json = Self::build_draft_content(segments, video_path, total_dur);
+        let content_json = Self::build_draft_content(segments, video_path, total_dur, bilingual);
         let mut meta_json = Self::build_draft_meta_info(&draft_id, &project_name, duration_us);
 
         let norm_project_dir = project_dir.to_string_lossy().replace('\\', "/");
@@ -665,7 +668,7 @@ mod tests {
         ];
 
         let temp_dir = std::env::temp_dir().join("test_voice2word_draft");
-        let result = JianYingExporter::export_to_folder(&segs, None, &temp_dir, "单元测试草稿");
+        let result = JianYingExporter::export_to_folder(&segs, None, &temp_dir, "单元测试草稿", false);
         assert!(result.is_ok());
 
         let content_file = temp_dir.join("draft_content.json");
@@ -684,10 +687,30 @@ mod tests {
     #[test]
     fn content_xml_escapes_special_chars() {
         let segs = vec![Segment::new(1, 0.0, 1.0, r#"A&B<C>"引号'"#)];
-        let val = JianYingExporter::build_draft_content(&segs, None, 1.0);
+        let val = JianYingExporter::build_draft_content(&segs, None, 1.0, false);
         let content = val["materials"]["texts"][0]["content"].as_str().unwrap();
         assert!(content.contains("A&amp;B&lt;C&gt;&quot;引号&apos;"), "未正确转义: {content}");
         assert!(!content.contains("A&B"), "原始特殊字符泄漏进了内嵌 XML");
+    }
+
+
+    /// 双语导出：译文必须出现在 draft_content.json 的 content 字段里
+    /// （回归「剪映草稿丢译文」）。
+    #[test]
+    fn jianying_includes_translation_when_bilingual() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "你好世界");
+        seg.translation = Some("Hello world".to_string());
+        seg.translation_lang = Some("English".to_string());
+        let segs = vec![seg];
+
+        let val = JianYingExporter::build_draft_content(&segs, None, 1.0, true);
+        let content = val["materials"]["texts"][0]["content"].as_str().unwrap();
+        assert!(content.contains("你好世界"), "缺原文: {content}");
+        assert!(content.contains("Hello world"), "双语草稿丢了译文: {content}");
+
+        let raw = JianYingExporter::build_draft_content(&segs, None, 1.0, false);
+        let content_raw = raw["materials"]["texts"][0]["content"].as_str().unwrap();
+        assert!(!content_raw.contains("Hello world"), "关闭双语时不应出现译文");
     }
 }
 

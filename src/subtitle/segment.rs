@@ -151,6 +151,33 @@ impl Segment {
     pub fn duration(&self) -> f64 {
         (self.end - self.start).max(0.0)
     }
+
+    /// 剪辑工程（剪映 / FCPXML / Premiere）导出时用的**单行**文本。
+    ///
+    /// 工程文件里的字幕是「一条轨道项 = 一行文字」，与 SRT 的 `ExportMode::Bilingual`
+    /// （两行叠在一个字幕块里）不同。因此这里把双语压成**一行**：
+    /// - 有译文 → `原文 译文`（译文在前还是原文在前由调用方决定，这里统一原文在前，
+    ///   与多数剪辑习惯一致）；
+    /// - 无译文 → 原文。
+    ///
+    /// 为什么必须提供它：此前三个工程导出器都只写 `display_text()`，用户辛苦译好的
+    /// 字幕在剪映 / 达芬奇 / Premiere 里**凭空消失**，而界面里明明看得见。
+    pub fn project_export_text(&self, bilingual: bool) -> String {
+        let raw = self.display_text().replace(['\r', '\n'], " ");
+        if !bilingual || !self.has_translation() {
+            return raw;
+        }
+        let trans = self
+            .translation
+            .as_deref()
+            .unwrap_or("")
+            .replace(['\r', '\n'], " ");
+        if trans.trim().is_empty() {
+            raw
+        } else {
+            format!("{raw}  {trans}")
+        }
+    }
 }
 
 /// 这一批字幕里是否存在说话人标签。
@@ -1098,5 +1125,28 @@ mod tests {
         blank.language = Some("   ".to_string());
         let blank_segs = vec![blank];
         assert_eq!(dominant_language(blank_segs.iter()), None);
+    }
+
+    /// 剪辑工程导出用的单行文本：无译文=原文；有译文且双语=原文␠␠译文；
+    /// 关闭双语或有译文但为空=原文；内部换行必须被压平，避免一条轨道项裂成多行。
+    #[test]
+    fn project_export_text_single_line_bilingual() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "第 一 行\n第 二 行");
+        // 无译文：即使开双语也只是原文（且压平换行）
+        assert_eq!(seg.project_export_text(true), "第 一 行 第 二 行");
+        assert_eq!(seg.project_export_text(false), "第 一 行 第 二 行");
+
+        seg.translation = Some("first\nsecond".to_string());
+        // 关双语 = 原文
+        assert_eq!(seg.project_export_text(false), "第 一 行 第 二 行");
+        // 开双语 = 原文␠␠译文，压成一行
+        assert_eq!(
+            seg.project_export_text(true),
+            "第 一 行 第 二 行  first second"
+        );
+
+        // 空白译文不算译文
+        seg.translation = Some("   \n  ".to_string());
+        assert_eq!(seg.project_export_text(true), "第 一 行 第 二 行");
     }
 }

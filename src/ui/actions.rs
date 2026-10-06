@@ -793,6 +793,8 @@ impl MainWindow {
         let segments = self.state.segments.clone();
         // 条数先取出来：`segments` 会被 move 进后台任务，成功提示还要用它
         let seg_count = segments.len();
+        // 有译文就按「原文␠␠译文」单行写入，否则纯原文（剪映工程项=一行文字）
+        let bilingual = segments.iter().any(|s| s.has_translation());
         let video_path = self.state.selected_file.clone();
         let stem = self.state.selected_file.as_ref()
             .and_then(|p| p.file_stem())
@@ -806,6 +808,7 @@ impl MainWindow {
                     &segments,
                     video_path.as_deref(),
                     &stem,
+                    bilingual,
                 )
             }).await;
 
@@ -838,6 +841,7 @@ impl MainWindow {
         }
 
         let segments = self.state.segments.clone();
+        let bilingual = segments.iter().any(|s| s.has_translation());
         let video_path = self.state.selected_file.clone();
         let stem = self.state.selected_file.as_ref()
             .and_then(|p| p.file_stem())
@@ -858,6 +862,7 @@ impl MainWindow {
                         video_path.as_deref(),
                         &target_dir,
                         &stem,
+                        bilingual,
                     )
                 }).await;
 
@@ -899,7 +904,10 @@ impl MainWindow {
             format!("{}.fcpxml", stem),
             "Final Cut Pro XML (*.fcpxml)",
             "fcpxml".to_string(),
-            move |segs, path| crate::subtitle::FcpXmlExporter::write_to_file(segs, path, &stem),
+            move |segs, path| {
+                let bilingual = segs.iter().any(|s| s.has_translation());
+                crate::subtitle::FcpXmlExporter::write_to_file(segs, path, &stem, bilingual)
+            },
         );
     }
 
@@ -919,7 +927,10 @@ impl MainWindow {
             format!("{}.xml", stem),
             "Premiere Pro XML (*.xml)",
             "xml".to_string(),
-            move |segs, path| crate::subtitle::PremiereXmlExporter::write_to_file(segs, path, &stem),
+            move |segs, path| {
+                let bilingual = segs.iter().any(|s| s.has_translation());
+                crate::subtitle::PremiereXmlExporter::write_to_file(segs, path, &stem, bilingual)
+            },
         );
     }
 

@@ -24,6 +24,7 @@ impl FcpXmlExporter {
         segments: &[Segment],
         path: P,
         project_name: &str,
+        bilingual: bool,
     ) -> Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -52,7 +53,7 @@ impl FcpXmlExporter {
         for (i, seg) in segments.iter().enumerate() {
             let start = seg.start;
             let dur = (seg.end - seg.start).max(0.1);
-            let text = seg.display_text().replace('\n', " ");
+            let text = seg.project_export_text(bilingual);
             let escaped_text = Self::escape_xml(&text);
             let ts_id = format!("ts{}", i + 1);
 
@@ -89,7 +90,7 @@ mod tests {
         ];
 
         let temp_file = std::env::temp_dir().join("test_fcpxml.fcpxml");
-        let res = FcpXmlExporter::write_to_file(&segs, &temp_file, "测试工程");
+        let res = FcpXmlExporter::write_to_file(&segs, &temp_file, "测试工程", false);
         assert!(res.is_ok());
         assert!(temp_file.exists());
 
@@ -99,6 +100,29 @@ mod tests {
         assert!(content.contains("&lt;转义&gt;"));
 
         let _ = std::fs::remove_file(temp_file);
+    }
+
+    /// 双语导出：译文必须真的写进 FCPXML，而不是只写原文（回归「工程文件丢译文」）。
+    #[test]
+    fn fcpxml_includes_translation_when_bilingual() {
+        let mut seg = Segment::new(1, 0.5, 2.0, "你好世界");
+        seg.translation = Some("Hello world".to_string());
+        seg.translation_lang = Some("English".to_string());
+        let segs = vec![seg];
+
+        let temp_file = std::env::temp_dir().join("test_fcpxml_bi.fcpxml");
+        FcpXmlExporter::write_to_file(&segs, &temp_file, "双向工程", true).unwrap();
+        let content = std::fs::read_to_string(&temp_file).unwrap();
+        assert!(content.contains("你好世界"), "缺原文");
+        assert!(content.contains("Hello world"), "双语导出丢了译文");
+        let _ = std::fs::remove_file(temp_file);
+
+        // 关闭双语 = 只写原文
+        let temp2 = std::env::temp_dir().join("test_fcpxml_raw.fcpxml");
+        FcpXmlExporter::write_to_file(&segs, &temp2, "单向工程", false).unwrap();
+        let content2 = std::fs::read_to_string(&temp2).unwrap();
+        assert!(!content2.contains("Hello world"), "关闭双语时不应出现译文");
+        let _ = std::fs::remove_file(temp2);
     }
 }
 
