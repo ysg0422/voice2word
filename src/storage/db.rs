@@ -30,6 +30,10 @@ pub struct TaskRecord {
     /// `segments` 是否已装载。为 `false` 时表示来自列表查询，内容为空壳。
     pub segments_loaded: bool,
     pub created_at: String,
+    /// 媒体内容的采样指纹（见 `utils::fingerprint`）。老记录或无法读取的文件为 `None`。
+    /// 缓存的**主键**是它，而不是 `file_path`——同内容改名/复制能命中，同路径换内容
+    /// 会正确地失效。
+    pub content_hash: Option<String>,
     pub metrics: Option<crate::core::PipelinePerformanceMetrics>,
 }
 
@@ -47,7 +51,7 @@ impl Database {
     /// 或未来某次迁移必须严格只跑一次）就无从下手——它只会在列已存在时静默跳过、
     /// 在真出问题时也静默失败（返回值被 `let _ =` 吞掉）。版本号把「当前库处在哪个
     /// schema 阶段」变成可读、可断言的状态。
-    pub const SCHEMA_VERSION: i32 = 1;
+    pub const SCHEMA_VERSION: i32 = 2;
 
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -157,6 +161,7 @@ impl Database {
                 duration REAL DEFAULT 0.0,
                 status TEXT NOT NULL,
                 segments_json TEXT NOT NULL,
+                content_hash TEXT,
                 metrics_json TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
@@ -185,6 +190,13 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_tasks_file_path ON tasks(file_path, status);",
             [],
         );
+        // 内容指纹索引：缓存命中走 `content_hash = ?`，与路径索引并列。
+        // 老库此时可能还没有 content_hash 列，`CREATE INDEX` 会失败——那正是
+        // 迁移（apply_migrations）要补的列，故这里忽略错误，迁移后再建一次。
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_content_hash ON tasks(content_hash, status);",
+            [],
+        );
         Ok(())
     }
 
@@ -203,6 +215,14 @@ impl Database {
         // 现在正式纳入版本管理。老库若还没有该列，这里补齐（幂等：忽略 duplicate）。
         if from < 1 {
             let _ = conn.execute("ALTER TABLE tasks ADD COLUMN metrics_json TEXT", []);
+        }
+        // v1 → v2：加入内容指纹列与索引。
+        if from < 2 {
+            let _ = conn.execute("ALTER TABLE tasks ADD COLUMN content_hash TEXT", []);
+            let _ = conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_content_hash ON tasks(content_hash, status);",
+                [],
+            );
         }
         conn.pragma_update(None, "user_version", Self::SCHEMA_VERSION)
             .with_context(|| format!("写入 user_version={} 失败", Self::SCHEMA_VERSION))?;
@@ -223,10 +243,13 @@ impl Database {
         let segments_json = serde_json::to_string(segments)
             .context("序列化 segments 失败")?;
         let metrics_json = metrics.and_then(|m| serde_json::to_string(m).ok());
+        // 落库时顺手算一次内容指纹（采样哈希，毫秒级）。失败（文件已删/不可读）
+        // 就存 NULL，缓存回退到「只按路径」的老行为。
+        let content_hash = crate::utils::fingerprint::media_fingerprint(file_path);
 
         conn.execute(
-            "INSERT INTO tasks (file_path, file_name, duration, status, segments_json, metrics_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![file_path, file_name, duration, status, segments_json, metrics_json],
+            "INSERT INTO tasks (file_path, file_name, duration, status, segments_json, metrics_json, content_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![file_path, file_name, duration, status, segments_json, metrics_json, content_hash],
         )?;
 
         Ok(conn.last_insert_rowid())
@@ -239,7 +262,7 @@ impl Database {
     pub fn list_recent_tasks(&self, limit: usize) -> Result<Vec<TaskRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, file_path, file_name, duration, status, created_at, metrics_json,
+            "SELECT id, file_path, file_name, duration, status, created_at, metrics_json, content_hash,
                     CASE WHEN json_valid(segments_json)
                          THEN COALESCE(json_array_length(segments_json), 0) ELSE 0 END,
                     CASE WHEN json_valid(segments_json)
@@ -262,8 +285,9 @@ impl Database {
                 created_at: row.get(5)?,
                 metrics,
                 segments: Vec::new(),
-                segment_count: row.get::<_, i64>(7).unwrap_or(0).max(0) as usize,
-                sample_text: row.get(8).unwrap_or_default(),
+                segment_count: row.get::<_, i64>(8).unwrap_or(0).max(0) as usize,
+                sample_text: row.get(9).unwrap_or_default(),
+                content_hash: row.get(7).unwrap_or(None),
                 segments_loaded: false,
             })
         })?;
@@ -322,43 +346,52 @@ impl Database {
         Ok(())
     }
 
-    /// 查找指定文件的历史已完成转写记录 (用于 0 秒智能缓存命中)
+    /// 查找指定文件的历史已完成转写记录（0 秒智能缓存命中）。
+    ///
+    /// # 命中优先级：内容指纹 > 路径
+    ///
+    /// 先用**内容指纹**查：同一份内容即使改名/换目录也能命中。找不到再退回
+    /// **路径**匹配，但只认 `content_hash IS NULL` 的老记录——若路径相同、指纹
+    /// 不同，说明这份视频已被覆盖成别的内容，**绝不能**返回旧字幕（那是静默的
+    /// 正确性错误）。文件读不到（指纹为 `None`）时退回纯路径匹配，与老行为一致。
     pub fn find_cached_task(&self, file_path: &str) -> Result<Option<TaskRecord>> {
         let conn = self.conn.lock().unwrap();
+        let fp = crate::utils::fingerprint::media_fingerprint(file_path);
+
+        if let Some(ref fp) = fp {
+            let mut stmt = conn.prepare(
+                "SELECT id, file_path, file_name, duration, status, segments_json, created_at, metrics_json, content_hash
+                 FROM tasks
+                 WHERE content_hash = ?1 AND status = 'completed'
+                 ORDER BY id DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(params![fp], Self::row_to_task)?;
+            if let Some(r) = rows.next() {
+                let record = r?;
+                if !record.segments.is_empty() {
+                    return Ok(Some(record));
+                }
+            }
+        }
+
+        // 路径回退：仅在「无指纹」或「老记录（content_hash 为 NULL）」时启用，
+        // 避免同路径换内容时错误命中。
         let normalized_1 = file_path.replace('\\', "/");
         let normalized_2 = file_path.replace('/', "\\");
-        let mut stmt = conn.prepare(
-            "SELECT id, file_path, file_name, duration, status, segments_json, created_at, metrics_json 
-             FROM tasks 
-             WHERE (file_path = ?1 OR file_path = ?2) AND status = 'completed' 
-             ORDER BY id DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map(params![normalized_1, normalized_2], |row| {
-            let segments_json: String = row.get(5)?;
-            let segments: Vec<Segment> = serde_json::from_str(&segments_json).unwrap_or_default();
-            let metrics_json: Option<String> = row.get(7).unwrap_or(None);
-            let metrics: Option<crate::core::PipelinePerformanceMetrics> = metrics_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok());
-            let sample_text = segments
-                .first()
-                .map(|s| s.display_text().to_string())
-                .unwrap_or_default();
-            Ok(TaskRecord {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_name: row.get(2)?,
-                duration: row.get(3)?,
-                status: row.get(4)?,
-                segment_count: segments.len(),
-                sample_text,
-                segments_loaded: true,
-                segments,
-                created_at: row.get(6)?,
-                metrics,
-            })
-        })?;
-
+        let path_only_legacy = fp.is_none();
+        let sql = if path_only_legacy {
+            "SELECT id, file_path, file_name, duration, status, segments_json, created_at, metrics_json, content_hash
+             FROM tasks
+             WHERE (file_path = ?1 OR file_path = ?2) AND status = 'completed'
+             ORDER BY id DESC LIMIT 1"
+        } else {
+            "SELECT id, file_path, file_name, duration, status, segments_json, created_at, metrics_json, content_hash
+             FROM tasks
+             WHERE (file_path = ?1 OR file_path = ?2) AND status = 'completed' AND content_hash IS NULL
+             ORDER BY id DESC LIMIT 1"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query_map(params![normalized_1, normalized_2], Self::row_to_task)?;
         if let Some(r) = rows.next() {
             let record = r?;
             if !record.segments.is_empty() {
@@ -366,6 +399,35 @@ impl Database {
             }
         }
         Ok(None)
+    }
+
+    /// 把一行（列顺序：id, file_path, file_name, duration, status, segments_json,
+    /// created_at, metrics_json, content_hash）转成 `TaskRecord`。
+    fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRecord> {
+        let segments_json: String = row.get(5)?;
+        let segments: Vec<Segment> = serde_json::from_str(&segments_json).unwrap_or_default();
+        let metrics_json: Option<String> = row.get(7).unwrap_or(None);
+        let metrics: Option<crate::core::PipelinePerformanceMetrics> = metrics_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        let sample_text = segments
+            .first()
+            .map(|s| s.display_text().to_string())
+            .unwrap_or_default();
+        Ok(TaskRecord {
+            id: row.get(0)?,
+            file_path: row.get(1)?,
+            file_name: row.get(2)?,
+            duration: row.get(3)?,
+            status: row.get(4)?,
+            segment_count: segments.len(),
+            sample_text,
+            segments_loaded: true,
+            segments,
+            created_at: row.get(6)?,
+            content_hash: row.get(8).unwrap_or(None),
+            metrics,
+        })
     }
 
     /// 收尾维护：`PRAGMA optimize` + WAL checkpoint(TRUNCATE)。
@@ -386,7 +448,6 @@ impl Database {
         if let Err(err) = conn.execute_batch("PRAGMA optimize;") {
             warn!(error = %err, "退出维护 PRAGMA optimize 失败（忽略）");
         }
-        // rusqlite 把结果的第 2、3 列定义为「已 checkpoint 的页 / 剩余页」。
         match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
         }) {
@@ -481,6 +542,48 @@ mod tests {
             loaded.iter().filter(|s| s.translation_matches("English")).count(),
             1
         );
+    }
+
+    /// P0-7：同一份内容、不同路径（复制/改名）应命中同一条缓存。
+    #[test]
+    fn content_hash_cache_hits_across_paths() {
+        let dir = std::env::temp_dir().join(format!("v2w_fp_cache_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("original.mp4");
+        let b = dir.join("copy.mp4");
+        std::fs::write(&a, vec![3u8; 2048]).unwrap();
+        std::fs::write(&b, vec![3u8; 2048]).unwrap();
+
+        let db = Database::open(":memory:").unwrap();
+        db.insert_task(&a.to_string_lossy(), "original.mp4", 1.0, "completed", &seg("内容一致"), None)
+            .unwrap();
+
+        // 用另一个路径查同一内容 → 必须命中
+        let hit = db.find_cached_task(&b.to_string_lossy()).unwrap();
+        assert!(hit.is_some(), "同内容不同路径应命中缓存");
+        assert_eq!(hit.unwrap().segments[0].text, "内容一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-7：路径不变但**内容已变**（重新导出覆盖同名文件）时，绝不能返回旧字幕。
+    /// 这是旧的「只按路径命中」会犯的静默正确性错误。
+    #[test]
+    fn content_hash_cache_misses_when_file_changed_in_place() {
+        let dir = std::env::temp_dir().join(format!("v2w_fp_changed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("v.mp4");
+        std::fs::write(&a, vec![1u8; 2048]).unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.insert_task(&a.to_string_lossy(), "v.mp4", 1.0, "completed", &seg("旧字幕"), None)
+            .unwrap();
+
+        // 覆盖成不同内容（大小也不同）
+        std::fs::write(&a, vec![9u8; 4096]).unwrap();
+        let hit = db.find_cached_task(&a.to_string_lossy()).unwrap();
+        assert!(hit.is_none(), "同路径内容已变时不应命中旧缓存");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// P0-5：新库打开后 `user_version` 必须被推进到当前 schema 版本，

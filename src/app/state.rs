@@ -1994,6 +1994,7 @@ mod tests {
             sample_text: "乙工程第一句".to_string(),
             segments_loaded: true,
             created_at: String::new(),
+            content_hash: None,
             metrics: None,
         };
         state.load_task_with(&other, true);
