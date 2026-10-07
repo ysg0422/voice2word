@@ -11,12 +11,10 @@ use super::segment::{ExportMode, Segment};
 pub struct PremiereXmlExporter;
 
 impl PremiereXmlExporter {
+    /// 转义委托到共用的 [`super::xml_util::escape_attr`]：此处既用于属性（`name="…"`）
+    /// 也用于文本节点，因此取「属性级」转义（含引号），并顺带剔除 XML 非法控制字符。
     fn escape_xml(s: &str) -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;")
+        super::xml_util::escape_attr(s)
     }
 
     /// 导出 Premiere Pro XML (xmeml) 文件

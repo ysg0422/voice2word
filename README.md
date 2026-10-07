@@ -58,6 +58,8 @@ Rust + [GPUI](https://github.com/zed-industries/zed) 实现，Windows 桌面原�
 | **FCPXML** | 达芬奇 / Final Cut Pro |
 | **Premiere XML** | Adobe Premiere |
 | **TXT** / **VTT** | 纯文本 / 网页字幕 |
+| **JSON** | 结构化字幕（无损字段：原文/译文/置信度/说话人/语言，供程序化消费与质检） |
+| **EBU-TT-D** / **Netflix TTAL** | TTML 广播与流媒体交付格式（UTF-8，中文原样保留） |
 
 导出前可在底部导出栏选择**导出内容**：`仅原文` / `仅译文` / `双语对照`。该选项对字幕文件与
 剪映 / FCPXML / Premiere 工程文件统一生效（工程文件里一条字幕=一行文字，双语会压成
@@ -211,7 +213,7 @@ src/
   core/       性能监控、指标、主管道
   engines/    FFmpeg / Whisper / SenseVoice / 标点 / LLM / 翻译 / 波形 / 说话人分离 / 视频解码
   storage/    SQLite 历史库
-  subtitle/   字幕模型与导出器（SRT / ASS / FCPXML / Premiere / 剪映 / VTT）
+  subtitle/   字幕模型与导出器（SRT / ASS / VTT / TXT / FCPXML / Premiere / 剪映 / JSON / TTML）
   ui/         设计系统（theme / primitives）+ 各工作台视图
   utils/      配置、日志、帧缓存、临时文件守卫
 examples/     基准与评测工具（cargo run --example <name>）

@@ -34,6 +34,9 @@ pub enum EditorExportFormat {
     PremiereXml, // Premiere XML
     Txt,         // TXT 纯文本
     Vtt,         // VTT 网页字幕
+    Json,        // JSON 结构化字幕（无损字段，供程序化消费 / 质检）
+    EbuTtD,      // EBU-TT-D (TTML，广播分发)
+    NetflixTtal, // Netflix TTAL (TTML，流媒体交付)
 }
 
 impl EditorExportFormat {
@@ -47,6 +50,9 @@ impl EditorExportFormat {
             Self::PremiereXml => "Premiere XML (.xml)",
             Self::Txt => "TXT 纯文本 (.txt)",
             Self::Vtt => "VTT 网页字幕 (.vtt)",
+            Self::Json => "JSON 结构化字幕 (.json)",
+            Self::EbuTtD => "EBU-TT-D 广播字幕 (.ttml)",
+            Self::NetflixTtal => "Netflix TTAL (.ttal)",
         }
     }
 
@@ -60,6 +66,9 @@ impl EditorExportFormat {
             Self::PremiereXml,
             Self::Txt,
             Self::Vtt,
+            Self::Json,
+            Self::EbuTtD,
+            Self::NetflixTtal,
         ]
     }
 }

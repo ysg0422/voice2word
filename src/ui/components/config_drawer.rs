@@ -337,10 +337,15 @@ impl MainWindow {
             "en" => "en",
             _ => "auto",
         };
+        // 兜底回落到 "srt" 之前，必须把新增的专业格式也列出来——否则 output_format
+        // 明明是 json/ttml/ttal，界面上却高亮 SRT，用户以为设置没生效。
         let fmt_sel = match self.state.output_format.as_str() {
             "vtt" => "vtt",
             "ass" => "ass",
             "txt" => "txt",
+            "json" => "json",
+            "ttml" => "ttml",
+            "ttal" => "ttal",
             _ => "srt",
         };
         let polish_sel = if !self.state.enable_polish {
@@ -421,7 +426,15 @@ impl MainWindow {
             ))
             .child(self.param_group(
                 "字幕输出格式",
-                vec![("srt", "SRT"), ("vtt", "VTT"), ("ass", "ASS"), ("txt", "TXT")],
+                vec![
+                    ("srt", "SRT"),
+                    ("vtt", "VTT"),
+                    ("ass", "ASS"),
+                    ("txt", "TXT"),
+                    ("json", "JSON"),
+                    ("ttml", "EBU-TT-D"),
+                    ("ttal", "Netflix TTAL"),
+                ],
                 fmt_sel,
                 |this, sel, cx| {
                     this.state.output_format = sel.to_string();

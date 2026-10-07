@@ -1402,22 +1402,44 @@ impl MainWindow {
             EditorExportFormat::JianYingFolder => self.export_jianying_folder(cx),
             EditorExportFormat::Fcpxml => self.export_fcpxml(cx),
             EditorExportFormat::PremiereXml => self.export_premiere_xml(cx),
-            EditorExportFormat::Srt | EditorExportFormat::Ass | EditorExportFormat::Txt | EditorExportFormat::Vtt => {
+            EditorExportFormat::Srt
+            | EditorExportFormat::Ass
+            | EditorExportFormat::Txt
+            | EditorExportFormat::Vtt
+            | EditorExportFormat::Json
+            | EditorExportFormat::EbuTtD
+            | EditorExportFormat::NetflixTtal => {
                 let ext = match self.editor_export_format {
                     EditorExportFormat::Srt => "srt",
                     EditorExportFormat::Ass => "ass",
                     EditorExportFormat::Txt => "txt",
                     EditorExportFormat::Vtt => "vtt",
+                    // 专业 / 结构化格式（P1-10）：扩展名即管线里的格式标识，
+                    // 由 `SubtitleWriter::write_to_file_with_style` 统一分派。
+                    EditorExportFormat::Json => "json",
+                    EditorExportFormat::EbuTtD => "ttml",
+                    EditorExportFormat::NetflixTtal => "ttal",
                     _ => unreachable!(),
                 };
                 // 直接按目标扩展名导出，不再临时改写全局 output_format（避免副作用泄漏到后续管线调用）
                 // ASS 会带上主界面配置的字幕样式（字号/字间距/底边距/预设配色）
                 let style = self.state.config.subtitle_style.clone();
                 let mode = self.editor_export_mode;
+                // 保存对话框的文件类型说明按格式给全，用户一眼能看出在导什么。
+                let filter_label = match self.editor_export_format {
+                    EditorExportFormat::Srt => "SRT 字幕",
+                    EditorExportFormat::Ass => "ASS 特效字幕",
+                    EditorExportFormat::Txt => "TXT 纯文本",
+                    EditorExportFormat::Vtt => "VTT 网页字幕",
+                    EditorExportFormat::Json => "JSON 结构化字幕",
+                    EditorExportFormat::EbuTtD => "EBU-TT-D 广播字幕",
+                    EditorExportFormat::NetflixTtal => "Netflix TTAL 字幕",
+                    _ => "Subtitle",
+                };
                 self.export_with_save_dialog(
                     cx,
                     format!("{}.{}", stem, ext),
-                    "Subtitle",
+                    filter_label,
                     ext.to_string(),
                     move |segs, path| {
                         SubtitleWriter::write_to_file_with_style(segs, path, ext, mode, &style)

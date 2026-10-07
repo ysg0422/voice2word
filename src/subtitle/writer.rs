@@ -105,12 +105,69 @@ impl SubtitleWriter {
             "txt" => Self::write_txt_with_mode(segments, path, mode),
             "fcpxml" => super::fcpxml::FcpXmlExporter::write_to_file(segments, path, "Voice2Word Subtitles", mode),
             "xml" | "premiere" => super::premiere::PremiereXmlExporter::write_to_file(segments, path, "Voice2Word Subtitles", mode),
+            // ── 专业 / 结构化格式（P1-10）──
+            // 这里从容地从字幕本身**推断**文档语言与目标语言，而不是让调用方逐个传参：
+            // 管线（core::pipeline）与剪辑台导出走的是同一个 `write_to_file`，逼它们
+            // 各自带上语言上下文只会增加漏传的机会。语言推断的规则集中在
+            // [`Self::infer_doc_lang`] / [`Self::infer_target_lang`] 两处，可测。
+            "json" => {
+                let doc_lang = Self::infer_doc_lang(segments);
+                let target = Self::infer_target_lang(segments);
+                super::json::JsonSubtitleExporter::write_to_file(
+                    segments, path, None, mode, target.as_deref().or(Some(doc_lang.as_str())),
+                )
+            }
+            "ttml" | "ebu-tt-d" | "ebutt" => {
+                let doc_lang = Self::infer_doc_lang(segments);
+                let target = Self::infer_target_lang(segments);
+                super::ttml::TtmlExporter::write_to_file(
+                    segments, path, &doc_lang, target.as_deref(), mode, super::ttml::TtmlProfile::EbuTtD,
+                )
+            }
+            "ttal" | "netflix-ttal" => {
+                let doc_lang = Self::infer_doc_lang(segments);
+                let target = Self::infer_target_lang(segments);
+                super::ttml::TtmlExporter::write_to_file(
+                    segments, path, &doc_lang, target.as_deref(), mode, super::ttml::TtmlProfile::NetflixTtal,
+                )
+            }
             "jianying" => {
                 let _ = super::jianying::JianYingExporter::export_to_folder(segments, None, path, "Voice2Word Draft", mode)?;
                 Ok(())
             }
             other => anyhow::bail!("不支持的字幕格式: {}", other),
         }
+    }
+
+    /// 从字幕推断**文档主语言**（TTML `xml:lang` / JSON 的兜底）。
+    ///
+    /// 优先用 ASR 写进 `Segment.language` 的众数（[`super::segment::dominant_language`]）；
+    /// 全部为空时退回 `"zh"`——本项目的主力内容语种，也是最无害的默认。
+    fn infer_doc_lang(segments: &[Segment]) -> String {
+        super::segment::dominant_language(segments).unwrap_or_else(|| "zh".to_string())
+    }
+
+    /// 从字幕推断**译文目标语言**（取已存在译文的众数）。
+    ///
+    /// 只认 `translation_lang` 非空且确实带译文的句子，避免把「旧译文残留」当成本次目标。
+    /// 全部为空时返回 `None`（双语导出会据此安全退化为单语，而不是写出空的 `xml:lang`）。
+    fn infer_target_lang(segments: &[Segment]) -> Option<String> {
+        use std::collections::HashMap;
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for seg in segments {
+            if !seg.has_translation() {
+                continue;
+            }
+            if let Some(lang) = seg
+                .translation_lang
+                .as_deref()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+            {
+                *counts.entry(lang).or_insert(0) += 1;
+            }
+        }
+        counts.into_iter().max_by_key(|(_, n)| *n).map(|(l, _)| l.to_string())
     }
 
     /// 生成标准 SRT 格式
@@ -500,10 +557,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 各种格式都能导出且不留临时文件（覆盖 srt/ass/vtt/txt/fcpxml/xml 六个分支）。
+    /// 各种格式都能导出且不留临时文件（覆盖 srt/ass/vtt/txt/fcpxml/xml 与新增的
+    /// json / ttml(ebu-tt-d) / ttal 分支）。
     #[test]
     fn all_single_file_formats_export_cleanly() {
-        for fmt in ["srt", "ass", "vtt", "txt", "fcpxml", "xml"] {
+        for fmt in ["srt", "ass", "vtt", "txt", "fcpxml", "xml", "json", "ttml", "ttal"] {
             let dir = tmp_dir(&format!("fmt_{fmt}"));
             let out = dir.join(format!("out.{fmt}"));
             SubtitleWriter::write_to_file(&sample(), &out, fmt)
@@ -518,5 +576,56 @@ mod tests {
             assert!(leftovers.is_empty(), "{fmt} 留下了临时文件: {leftovers:?}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// 专业格式（JSON / TTML / TTAL）导出后必须是**可解析**的合法文档，而不只是「有字节」。
+    /// 这是「导出成功但下游打不开」这类静默失败的最后一道防线。
+    #[test]
+    fn professional_formats_are_parseable() {
+        // JSON：serde 能反序列化回 Value
+        let dir = tmp_dir("pro_json");
+        let out = dir.join("out.json");
+        SubtitleWriter::write_to_file(&sample(), &out, "json").expect("json 导出应成功");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).expect("json 必须可解析");
+        assert_eq!(v["segment_count"], 2);
+        assert_eq!(v["segments"][0]["text"], "第一句");
+
+        // TTML 家族：起止标签配对、含 <tt 根元素、时间格式正确
+        for fmt in ["ttml", "ttal"] {
+            let d = tmp_dir(&format!("pro_{fmt}"));
+            let o = d.join(format!("out.{fmt}"));
+            SubtitleWriter::write_to_file(&sample(), &o, fmt).unwrap_or_else(|e| panic!("{fmt} 导出失败: {e}"));
+            let text = std::fs::read_to_string(&o).unwrap();
+            assert!(text.starts_with("<?xml"), "{fmt} 应以 XML 声明开头");
+            assert!(text.contains("<tt "), "{fmt} 缺 <tt> 根元素");
+            assert!(text.trim_end().ends_with("</tt>"), "{fmt} 未正确闭合");
+            assert!(text.contains("<p "), "{fmt} 缺字幕段落");
+            // 每个 <p> 都要有 begin/end
+            assert!(text.contains(r#"begin="00:00:00.000""#), "{fmt} 起始时间格式不对: {text}");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 语言推断：文档语言取众数，目标语言取「已带译文」句子的众数。
+    #[test]
+    fn infers_document_and_target_languages() {
+        let mut a = Segment::new(1, 0.0, 1.0, "你好");
+        a.language = Some("zh".to_string());
+        a.translation = Some("Hello".to_string());
+        a.translation_lang = Some("English".to_string());
+        let mut b = Segment::new(2, 1.0, 2.0, "世界");
+        b.language = Some("zh".to_string());
+        // 没有译文的句子不能把目标语言带偏
+        let segs = vec![a, b];
+
+        assert_eq!(SubtitleWriter::infer_doc_lang(&segs), "zh");
+        assert_eq!(SubtitleWriter::infer_target_lang(&segs).as_deref(), Some("English"));
+
+        // 全空时：文档语言回落 zh，目标语言为 None
+        let plain = vec![Segment::new(1, 0.0, 1.0, "无语言标记")];
+        assert_eq!(SubtitleWriter::infer_doc_lang(&plain), "zh");
+        assert_eq!(SubtitleWriter::infer_target_lang(&plain), None);
     }
 }
