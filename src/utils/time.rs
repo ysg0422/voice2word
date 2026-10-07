@@ -61,9 +61,25 @@ pub fn seconds_to_hms(seconds: f64) -> String {
     format!("{:02}:{:02}:{:02}", hours, mins, secs)
 }
 
+/// 文件名安全的本地时间戳：`20261007_153012`。
+///
+/// 用于给「损坏数据库备份」等需要唯一命名的文件加后缀——冒号、空格在 Windows
+/// 文件名里非法，故只留数字与下划线。
+pub fn timestamp_for_filename() -> String {
+    chrono::Local::now().format("%Y%m%d_%H%M%S").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filename_timestamp_has_no_illegal_chars() {
+        let t = timestamp_for_filename();
+        // 形如 20261007_153012：15 个字符，仅数字与下划线
+        assert_eq!(t.len(), 15, "unexpected: {t}");
+        assert!(t.chars().all(|c| c.is_ascii_digit() || c == '_'), "unexpected: {t}");
+    }
 
     #[test]
     fn test_hms_time() {

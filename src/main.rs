@@ -213,6 +213,9 @@ fn main() -> Result<()> {
 
     // 6. 初始化全局应用状态
     let state = AppState::with_hardware(config, db, pipeline, hardware);
+    // 退出时要对数据库做收尾维护（WAL checkpoint），但 `state` 会被 move 进
+    // GPUI 的 run 闭包；`Database` 内部是 `Arc<Mutex<Connection>>`，先克隆一份句柄。
+    let db_for_shutdown = state.db.clone();
 
     // 7. 启动 GPUI 应用程序
     Application::new().run(move |cx: &mut App| {
@@ -241,6 +244,10 @@ fn main() -> Result<()> {
     // 因此必须在 `run()` 返回后统一 kill + wait 回收。
     utils::child_registry::retire_all();
     info!("应用已退出，辅助子进程已回收");
+
+    // 9. 数据库收尾维护：把 WAL 并回主库并截断，避免 `-wal` 长期膨胀、
+    //    拖慢下次冷启动。纯尽力而为，失败不影响退出。
+    db_for_shutdown.maintain_on_shutdown();
 
     Ok(())
 }

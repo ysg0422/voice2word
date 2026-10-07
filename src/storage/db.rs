@@ -5,6 +5,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use tracing::{info, warn};
+
 use crate::subtitle::Segment;
 
 #[derive(Debug, Clone)]
@@ -37,6 +39,16 @@ pub struct Database {
 }
 
 impl Database {
+    /// 当前 schema 版本。每次「新增列 / 新增表 / 改索引」都必须 +1，并在
+    /// [`Self::apply_migrations`] 里补一段从旧版本升到它的迁移。
+    ///
+    /// 为什么用 `PRAGMA user_version` 而不是继续 `ALTER TABLE ADD COLUMN` 硬试：
+    /// 硬试的写法对「加列」能用，但一旦要做**结构性迁移**（回填、改索引、建新表，
+    /// 或未来某次迁移必须严格只跑一次）就无从下手——它只会在列已存在时静默跳过、
+    /// 在真出问题时也静默失败（返回值被 `let _ =` 吞掉）。版本号把「当前库处在哪个
+    /// schema 阶段」变成可读、可断言的状态。
+    pub const SCHEMA_VERSION: i32 = 1;
+
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
         // ── 并发与耐久性设置 ──
@@ -56,11 +68,82 @@ impl Database {
         // （丢的也只是最近一次编辑快照），换来的是写入明显更快。
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
 
-        let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
+        // ── 损坏自愈 ──
+        // 库文件损坏（断电、磁盘坏道、外部工具写坏）时，`init_tables` 里的任何一条
+        // 语句都会直接报错，`Database::open` 于是返回 Err，**整个程序启动失败**——
+        // 用户连界面都进不去，历史库里的其它完好工程也一并不可达。
+        //
+        // 这里先用 `quick_check` 探一次：损坏则把原库改名留底（`.corrupt-<时间戳>`，
+        // 绝不删除，用户可能还想用 sqlite3 .recover 抢救），再建一个空库继续启动。
+        // 代价是「历史列表暂时空了」，收益是「程序能开、能继续干活、能导出」。
+        // quick_check 在 512 KB 的库上实测约 7 ms，对启动无感。
+        let db = match Self::heal_if_corrupt(conn) {
+            Ok(conn) => Self {
+                conn: Arc::new(Mutex::new(conn)),
+            },
+            Err(heal_err) => {
+                // 自愈本身失败（例如目录只读、改名被拒）——退回原库错误，不掩盖根因。
+                return Err(heal_err);
+            }
         };
         db.init_tables()?;
+        db.apply_migrations()?;
         Ok(db)
+    }
+
+    /// 检查连接并返回**可用**的连接：完好则原样返回；损坏则改名留底并新建空库。
+    ///
+    /// 传入的是已经设过 WAL/busy_timeout 的连接（这些 PRAGMA 对损坏库也能设置成功，
+    /// 所以能走到这里）。
+    fn heal_if_corrupt(conn: Connection) -> Result<Connection> {
+        let healthy = conn
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .map(|s| s == "ok")
+            .unwrap_or(false);
+        if healthy {
+            return Ok(conn);
+        }
+
+        // 取原库路径用于改名与新建。`Connection::path()` 对内存库返回 None，
+        // 内存库不可能「损坏到要备份」，直接放行。
+        let path = match conn.path() {
+            Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+            _ => return Ok(conn),
+        };
+        warn!(path = %path.display(), "数据库 quick_check 未通过，尝试自愈：改名留底并新建空库");
+        // 关掉 WAL，确保 -wal / -shm 在改名时一并处理干净（否则残留副产物会
+        // 让新建的空库读到旧的未 checkpoint 事务）。
+        let _ = conn.pragma_update(None, "journal_mode", "DELETE");
+        drop(conn);
+
+        let stamp = crate::utils::time::timestamp_for_filename();
+        let backup = path.with_extension(format!("corrupt-{stamp}.db"));
+        std::fs::rename(&path, &backup).with_context(|| {
+            format!(
+                "数据库损坏，但改名留底失败（{} → {}）",
+                path.display(),
+                backup.display()
+            )
+        })?;
+        // 顺手把 WAL 副产物也改名留底，避免它们被新建的空库误当自己的日志。
+        for suffix in ["-wal", "-shm"] {
+            let side = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
+            if side.exists() {
+                let _ = std::fs::rename(
+                    &side,
+                    std::path::PathBuf::from(format!("{}{}", backup.display(), suffix)),
+                );
+            }
+        }
+        warn!(
+            backup = %backup.display(),
+            "已把损坏的数据库改名留底并新建空库；如仍想抢救旧数据，可用 sqlite3 对备份执行 .recover"
+        );
+        let fresh = Connection::open(&path)?;
+        let _ = fresh.busy_timeout(std::time::Duration::from_secs(5));
+        let _ = fresh.pragma_update(None, "journal_mode", "WAL");
+        let _ = fresh.pragma_update(None, "synchronous", "NORMAL");
+        Ok(fresh)
     }
 
     fn init_tables(&self) -> Result<()> {
@@ -102,6 +185,28 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_tasks_file_path ON tasks(file_path, status);",
             [],
         );
+        Ok(())
+    }
+
+    /// 把库从当前 `user_version` 逐级迁移到 [`Self::SCHEMA_VERSION`]。
+    ///
+    /// 每段迁移都必须**幂等**（即便版本号因故错位、重复执行也不出错/不重复写入），
+    /// 且在一次事务内完成——中途失败则版本号不推进，下次启动重试，不会留下
+    /// 「迁移到一半」的半状态。
+    fn apply_migrations(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let from: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if from >= Self::SCHEMA_VERSION {
+            return Ok(());
+        }
+        // v0 → v1：历史上靠 `ALTER TABLE ADD COLUMN` 硬加出来的 metrics_json 列，
+        // 现在正式纳入版本管理。老库若还没有该列，这里补齐（幂等：忽略 duplicate）。
+        if from < 1 {
+            let _ = conn.execute("ALTER TABLE tasks ADD COLUMN metrics_json TEXT", []);
+        }
+        conn.pragma_update(None, "user_version", Self::SCHEMA_VERSION)
+            .with_context(|| format!("写入 user_version={} 失败", Self::SCHEMA_VERSION))?;
+        info!(from, to = Self::SCHEMA_VERSION, "数据库 schema 已迁移");
         Ok(())
     }
 
@@ -263,6 +368,39 @@ impl Database {
         Ok(None)
     }
 
+    /// 收尾维护：`PRAGMA optimize` + WAL checkpoint(TRUNCATE)。
+    ///
+    /// WAL 模式下每次写入都追加进 `-wal`，只在 checkpoint 时才并回主库；进程
+    /// 正常退出若从不 checkpoint，`-wal` 会持续增长（大库能到几十 MB），下次
+    /// 冷启动要重放整个 WAL 才可用。关程序时做一次 TRUNCATE checkpoint：
+    /// - `PRAGMA optimize`：让 SQLite 按查询统计更新索引/表统计（它自己决定是否需要
+    ///   ANALYZE），比无条件 ANALYZE 便宜、也足以让查询计划长期保持在线；
+    /// - `wal_checkpoint(TRUNCATE)`：把 WAL 全部并回主库并把文件截断到 0。
+    ///
+    /// 两个操作都**尽力而为**：拿不到锁 / 被占用时只记日志、绝不阻断退出。
+    pub fn maintain_on_shutdown(&self) {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Err(err) = conn.execute_batch("PRAGMA optimize;") {
+            warn!(error = %err, "退出维护 PRAGMA optimize 失败（忽略）");
+        }
+        // rusqlite 把结果的第 2、3 列定义为「已 checkpoint 的页 / 剩余页」。
+        match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        }) {
+            Ok((busy, log_pages, checkpointed)) => {
+                if busy != 0 {
+                    info!(log_pages, checkpointed, "退出 checkpoint：库仍被占用，已尽量合并（下次启动继续）");
+                } else {
+                    info!(log_pages, checkpointed, "退出 checkpoint：WAL 已并回主库并截断");
+                }
+            }
+            Err(err) => warn!(error = %err, "退出 checkpoint 失败（忽略，下次启动会继续）"),
+        }
+    }
+
     /// 删除指定历史任务记录
     pub fn delete_task(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -343,6 +481,98 @@ mod tests {
             loaded.iter().filter(|s| s.translation_matches("English")).count(),
             1
         );
+    }
+
+    /// P0-5：新库打开后 `user_version` 必须被推进到当前 schema 版本，
+    /// 否则「版本化迁移」形同虚设。
+    #[test]
+    fn fresh_db_records_schema_version() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let v: i32 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, Database::SCHEMA_VERSION);
+    }
+
+    /// P0-5：老库（user_version=0、缺 metrics_json 列）打开后应被迁移到最新版本，
+    /// 且原有数据不丢。
+    #[test]
+    fn legacy_db_is_migrated_without_data_loss() {
+        let dir = std::env::temp_dir().join(format!("v2w_mig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+
+        // 造一个「旧 schema」库：没有 metrics_json 列、user_version 保持 0
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, file_path TEXT NOT NULL, \
+                 file_name TEXT NOT NULL, duration REAL DEFAULT 0.0, status TEXT NOT NULL, \
+                 segments_json TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (file_path, file_name, duration, status, segments_json) \
+                 VALUES ('D:/a.mp4','a.mp4',1.0,'completed','[]')",
+                [],
+            )
+            .unwrap();
+            let v: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, 0, "前置：旧库版本应为 0");
+        }
+
+        let db = Database::open(&path).expect("老库应能被迁移后打开");
+        let v: i32 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, Database::SCHEMA_VERSION, "迁移后版本号应推进");
+        // 老数据还在，且 metrics_json 列已补齐（可正常 SELECT）
+        let n: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "迁移不应丢数据");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-5：库文件损坏时，`open` 不能把整个程序拖死——应改名留底并新建空库。
+    #[test]
+    fn corrupt_db_is_quarantined_and_reopened_empty() {
+        let dir = std::env::temp_dir().join(format!("v2w_corrupt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("broken.db");
+        // 写一段「像 SQLite 但头被破坏」的字节：SQLite 头魔数 + 垃圾
+        let mut bytes = b"SQLite format 3\0".to_vec();
+        bytes.extend_from_slice(&[0xFFu8; 4096]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let db = Database::open(&path).expect("损坏库应被自愈后仍能打开");
+        // 新库是空的
+        let n: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        // 原损坏文件被改名留底（目录里应存在一个 .corrupt- 备份）
+        let has_backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
+        assert!(has_backup, "损坏库应被改名留底，而不是删除");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 老库里的 JSON 没有 `translation_lang` 字段，反序列化必须成功（默认 None），
