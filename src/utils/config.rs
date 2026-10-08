@@ -1037,8 +1037,19 @@ impl AppConfig {
     ///    就在 exe 旁边，与 cwd、快捷方式怎么起都无关；
     /// 4. 当前工作目录及其祖先：保留旧逻辑，向后兼容「cd 到仓库根再跑」的用法。
     ///
-    /// 每级判据只有一个：目录下存在 `models/`（见 [`pick_app_root`]）。全都不命中时
-    /// 返回旧逻辑的结果（`current_dir()`），**不 panic**，让调用方按既有方式退化。
+    /// 每级判据只有一个：目录下存在 `models/`（见 [`pick_app_root`]）。
+    ///
+    /// # 为什么 `models/` 全不命中时要锚到 **exe 目录**、而不是 `current_dir()`
+    ///
+    /// 发布版是**瘦包**（只有 exe 与 config.toml，模型与工具靠首次运行「一键补齐」下载），
+    /// 因此全新解压的目录下**根本没有 `models/`**——此时若退回 `current_dir()`：
+    /// - 用户从开始菜单/桌面快捷方式启动 → cwd 是 `C:\Windows\System32`，
+    ///   配置、`voice2word.db`、`logs/` 会往系统目录写，**无权限 → 直接启动失败**；
+    /// - 从任意目录 `cd` 后启动 → 数据散落到那个目录，用户找不到自己的工程库。
+    ///
+    /// 锚到 exe 目录则与「快捷方式怎么起」完全无关，且首次下载完成后 `models/` 就在
+    /// exe 旁边出现，后续启动自然命中第 3 级候选，行为保持一致。
+    /// 只有在连 exe 目录都拿不到（极罕见）时才退回 `current_dir()`，**不 panic**。
     pub fn app_root_dir() -> PathBuf {
         let cwd = std::env::current_dir().unwrap_or_default();
         let env_home = std::env::var_os(Self::HOME_ENV).map(PathBuf::from);
@@ -1051,9 +1062,15 @@ impl AppConfig {
         #[cfg(not(debug_assertions))]
         let manifest_dir: Option<PathBuf> = None;
 
-        let candidates =
-            root_candidates(env_home, manifest_dir.as_deref(), exe_dir.as_deref(), &cwd);
-        pick_app_root(candidates).unwrap_or(cwd)
+        let candidates = root_candidates(
+            env_home,
+            manifest_dir.as_deref(),
+            exe_dir.as_deref(),
+            &cwd,
+        );
+        pick_app_root(candidates)
+            .or_else(|| exe_dir.clone())
+            .unwrap_or(cwd)
     }
 
     /// 解析相对路径为相对于项目根目录的绝对路径
@@ -1814,6 +1831,44 @@ mod tests {
 
     /// 全都不命中时的兜底：返回 `current_dir()`，且**绝不 panic**。
     #[test]
+    /// 瘦包场景：exe 旁边**没有** `models/` 时，必须锚到 exe 目录，
+    /// 而不是退回 `current_dir()`（快捷方式启动时那是 System32，会写坏数据）。
+    ///
+    /// 走纯函数 `pick_app_root(...).or_else(exe_dir)` 的组合验证，不改进程级 cwd。
+    #[test]
+    fn app_root_falls_back_to_exe_dir_when_models_absent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "v2w_root_fallback_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let exe_dir = tmp.join("Voice2Word");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        // 刻意不建 models/ —— 这就是「瘦包刚解压」的状态
+        assert!(!super::is_app_root(&exe_dir), "前置条件：exe 旁没有 models/");
+
+        let unrelated_cwd = tmp.join("somewhere_else");
+        std::fs::create_dir_all(&unrelated_cwd).unwrap();
+
+        // 候选里没有一个是项目根 → 必须落到 exe 目录，绝不能是 cwd
+        let candidates = super::root_candidates(
+            None,
+            None,
+            Some(&exe_dir),
+            &unrelated_cwd,
+        );
+        let picked = super::pick_app_root(candidates)
+            .or_else(|| Some(exe_dir.clone()))
+            .unwrap();
+        assert_eq!(picked, exe_dir, "瘦包必须锚到 exe 目录，而不是 cwd");
+        assert_ne!(picked, unrelated_cwd);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     fn app_root_dir_never_panics() {
         let dir = super::AppConfig::app_root_dir();
         assert!(dir.is_absolute(), "app_root_dir 应返回绝对路径: {dir:?}");

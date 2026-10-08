@@ -15,5 +15,11 @@
 # 关键：gpui 对这个变量是 `Path::new(&path).exists()` 判定，路径不存在就继续往下查。
 # 因此这里写本机 SDK 实际位置是**安全**的——换到别的机器上路径不存在时，
 # 会自动回退到 where.exe 与默认路径，不会把别人的构建打挂。
-# 本机 Windows SDK 装在 D 盘，故显式指定；装 C 盘的机器无需改动本文件。
-GPUI_FXC_PATH = "D:\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\fxc.exe"
+# 本仓库**不写死任何机器路径**，见文件末尾的注释示例。
+# GPUI_FXC_PATH = "D:\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\fxc.exe"
+#
+# ↑ 上面这行是「本机 SDK 装在非常规位置」时的覆盖示例，**默认不启用**：
+#   留空时 gpui 会自己按 `where.exe fxc.exe` → 默认 SDK 路径 查找，
+#   因此换台机器 / CI 也能构建（CI 的 windows-latest 自带 Windows SDK）。
+#   只有你的 SDK 装在 where.exe 找不到的地方，才在**本机**取消注释并改成实际路径；
+#   请不要把带本机路径的这行提交回仓库。
