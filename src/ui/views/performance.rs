@@ -154,11 +154,7 @@ fn body_snippet(body: &str) -> String {
 
 /// 把「拉取失败」拼成一句可操作的话：**原样**带上网关的 `error.message` /
 /// `gateway_hint`（只显示「HTTP 400」等于什么都没说），再附上针对性提示。
-pub(crate) fn model_fetch_error_message(
-    status: Option<u16>,
-    detail: &str,
-    raw: &str,
-) -> String {
+pub(crate) fn model_fetch_error_message(status: Option<u16>, detail: &str, raw: &str) -> String {
     let mut msg = match status {
         Some(code) => format!("拉取失败（HTTP {code}）：{detail}"),
         None => format!("拉取失败：{detail}"),
@@ -187,8 +183,12 @@ fn finish_model_fetch(
     url: String,
     note: Option<String>,
 ) -> Result<ModelFetchOutcome, String> {
-    let models = crate::utils::config::parse_model_list(&body)
-        .map_err(|e| format!("{url} 的响应无法解析：{e}\n响应片段：{}", body_snippet(&body)))?;
+    let models = crate::utils::config::parse_model_list(&body).map_err(|e| {
+        format!(
+            "{url} 的响应无法解析：{e}\n响应片段：{}",
+            body_snippet(&body)
+        )
+    })?;
     if models.is_empty() {
         return Err(format!(
             "{url} 返回了 0 个模型（服务端未开放任何模型）\n响应片段：{}",
@@ -543,26 +543,21 @@ impl MainWindow {
                 // 自己写一行而不是走 render_setting_row：说明文案 + 按钮 + 会换行的
                 // 下拉列表塞进「左标签 + 右对齐控件」骨架会被折成右对齐的窄条
                 // （写法参照同文件的 render_onnx_provider_row）。
-                div()
+                div().w_full().py(px(Theme::SPACE_2)).child(dim(div()
                     .w_full()
-                    .py(px(Theme::SPACE_2))
-                    .child(dim(
+                    .flex()
+                    .flex_col()
+                    .gap(px(Theme::SPACE_2))
+                    .child(
                         div()
                             .w_full()
-                            .flex()
-                            .flex_col()
-                            .gap(px(Theme::SPACE_2))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .text_size(px(Theme::TEXT_CAPTION))
-                                    .text_color(Theme::text_muted())
-                                    .child(TranslateConfig::MODEL_ID_HELP),
-                            )
-                            .child(model_fetch_row)
-                            .children(model_choice_row)
-                            .into_any_element(),
-                    )),
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child(TranslateConfig::MODEL_ID_HELP),
+                    )
+                    .child(model_fetch_row)
+                    .children(model_choice_row)
+                    .into_any_element())),
             )
             .child(Self::render_setting_divider())
             .child(Self::render_setting_row("API Key", dim(key_control)))
@@ -846,7 +841,10 @@ impl MainWindow {
                 *slot = Some(ModelListCache {
                     fingerprint: model_cache_fingerprint(&cfg),
                     loading: false,
-                    status: Some((false, "请先填写「接口基址」（例如 http://host:3021/v1）".to_string())),
+                    status: Some((
+                        false,
+                        "请先填写「接口基址」（例如 http://host:3021/v1）".to_string(),
+                    )),
                     models: Vec::new(),
                 })
             });
@@ -941,17 +939,15 @@ impl MainWindow {
         const MODEL_FETCH_MSG_MAX_W: f32 = 420.0;
         let cfg = self.state.config.translate.clone();
         let (loading, status, models) = model_cache_snapshot(&cfg);
-        let model_selected = self
-            .state
-            .config
-            .translate
-            .api_model
-            .trim()
-            .to_string();
+        let model_selected = self.state.config.translate.api_model.trim().to_string();
         let has_selection = models.iter().any(|m| m.id == model_selected);
 
         let mut button = primitives::chip(
-            if loading { "拉取中…" } else { "拉取模型列表" },
+            if loading {
+                "拉取中…"
+            } else {
+                "拉取模型列表"
+            },
             false,
             false,
         )
@@ -974,7 +970,11 @@ impl MainWindow {
                 div()
                     .max_w(px(MODEL_FETCH_MSG_MAX_W))
                     .text_size(px(Theme::TEXT_SMALL))
-                    .text_color(if ok { Theme::accent_mint() } else { Theme::accent_red() })
+                    .text_color(if ok {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::accent_red()
+                    })
                     .child(line.to_string())
             }));
         }

@@ -1297,12 +1297,8 @@ impl AppConfig {
         #[cfg(not(debug_assertions))]
         let manifest_dir: Option<PathBuf> = None;
 
-        let candidates = root_candidates(
-            env_home,
-            manifest_dir.as_deref(),
-            exe_dir.as_deref(),
-            &cwd,
-        );
+        let candidates =
+            root_candidates(env_home, manifest_dir.as_deref(), exe_dir.as_deref(), &cwd);
         pick_app_root(candidates)
             .or_else(|| exe_dir.clone())
             .unwrap_or(cwd)
@@ -2081,18 +2077,16 @@ mod tests {
         let exe_dir = tmp.join("Voice2Word");
         std::fs::create_dir_all(&exe_dir).unwrap();
         // 刻意不建 models/ —— 这就是「瘦包刚解压」的状态
-        assert!(!super::is_app_root(&exe_dir), "前置条件：exe 旁没有 models/");
+        assert!(
+            !super::is_app_root(&exe_dir),
+            "前置条件：exe 旁没有 models/"
+        );
 
         let unrelated_cwd = tmp.join("somewhere_else");
         std::fs::create_dir_all(&unrelated_cwd).unwrap();
 
         // 候选里没有一个是项目根 → 必须落到 exe 目录，绝不能是 cwd
-        let candidates = super::root_candidates(
-            None,
-            None,
-            Some(&exe_dir),
-            &unrelated_cwd,
-        );
+        let candidates = super::root_candidates(None, None, Some(&exe_dir), &unrelated_cwd);
         let picked = super::pick_app_root(candidates)
             .or_else(|| Some(exe_dir.clone()))
             .unwrap();
@@ -2201,10 +2195,7 @@ mod tests {
             api_base: "http://119.29.217.28:3021/v1".to_string(),
             ..TranslateConfig::default()
         };
-        assert_eq!(
-            cfg.models_url(),
-            "http://119.29.217.28:3021/v1/models"
-        );
+        assert_eq!(cfg.models_url(), "http://119.29.217.28:3021/v1/models");
         cfg.api_base = "http://119.29.217.28:3021/v1/".to_string();
         assert_eq!(cfg.models_url(), "http://119.29.217.28:3021/v1/models");
         cfg.api_base = "https://api.openai.com/v1/chat/completions".to_string();
@@ -2262,7 +2253,11 @@ mod tests {
             "不是对象"
         ],"object":"list"}"#;
         let models = super::parse_model_list(body).expect("应能解析");
-        assert_eq!(models.len(), 5, "无 id / 空 id / 非对象项都应跳过: {models:?}");
+        assert_eq!(
+            models.len(),
+            5,
+            "无 id / 空 id / 非对象项都应跳过: {models:?}"
+        );
 
         let first = &models[0];
         assert_eq!(first.id, "cn:hy4-preview-f");
@@ -2273,7 +2268,10 @@ mod tests {
         assert_eq!(first.reasoning_tag(), Some("仅推理"));
 
         // 缺 only_reasoning 时是「推理」，不是「仅推理」
-        let sol = models.iter().find(|m| m.id == "global:gpt-5.6-sol").unwrap();
+        let sol = models
+            .iter()
+            .find(|m| m.id == "global:gpt-5.6-sol")
+            .unwrap();
         assert!(sol.supports_reasoning);
         assert!(!sol.only_reasoning);
         assert_eq!(sol.reasoning_tag(), Some("推理"));
@@ -2330,7 +2328,10 @@ mod tests {
             super::gateway_error_summary(r#"{"error":"boom"}"#).as_deref(),
             Some("boom")
         );
-        assert_eq!(super::gateway_error_summary(r#"{"error":{"code":"x"}}"#), None);
+        assert_eq!(
+            super::gateway_error_summary(r#"{"error":{"code":"x"}}"#),
+            None
+        );
         assert_eq!(super::gateway_error_summary("404 page not found"), None);
     }
 
@@ -2344,7 +2345,8 @@ mod tests {
         assert!(hint.contains("cn:"), "应点明前缀要求: {hint}");
 
         // 只有上游原文（没有 model_unavailable 字样）也要命中
-        let upstream_only = "在线接口返回 HTTP 400: model [deepseek4.1flash] service info not found";
+        let upstream_only =
+            "在线接口返回 HTTP 400: model [deepseek4.1flash] service info not found";
         assert!(super::online_error_hint(upstream_only).is_some());
 
         // 503 账号池空：不是本地配置问题
@@ -2366,8 +2368,14 @@ mod tests {
         assert!(hint.contains("/v1"), "{hint}");
 
         // 没有额外信息可说的普通错误：返回 None，由调用方显示原文（不吞信息）
-        assert_eq!(super::online_error_hint("在线接口返回 HTTP 400: bad request"), None);
-        assert_eq!(super::online_error_hint("在线接口返回 HTTP 500: boom"), None);
+        assert_eq!(
+            super::online_error_hint("在线接口返回 HTTP 400: bad request"),
+            None
+        );
+        assert_eq!(
+            super::online_error_hint("在线接口返回 HTTP 500: boom"),
+            None
+        );
     }
 
     /// 模型 id 说明文案必须点明「要与 /v1/models 的 id 完全一致」与前缀要求。

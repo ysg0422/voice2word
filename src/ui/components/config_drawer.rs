@@ -333,11 +333,19 @@ impl MainWindow {
     fn render_translate_summary_card(&mut self, cx: &mut Context<Self>) -> Div {
         let translate = &self.state.config.translate;
         let is_online = translate.is_online();
-        let mode_label = if is_online { "在线 API" } else { "本地 Qwen" };
+        let mode_label = if is_online {
+            "在线 API"
+        } else {
+            "本地 Qwen"
+        };
         // 端点只显示到主机级别：密钥与完整路径不该在这一栏多露一次
         let endpoint = if is_online {
             let url = translate.resolved_endpoint();
-            match url.split("://").nth(1).and_then(|rest| rest.split('/').next()) {
+            match url
+                .split("://")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+            {
                 Some(host) if !host.is_empty() => host.to_string(),
                 _ => url,
             }
