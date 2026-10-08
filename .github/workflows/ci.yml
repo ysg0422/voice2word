@@ -1,0 +1,315 @@
+# =============================================================================
+# Voice2Word — CI (GitHub Actions)
+# =============================================================================
+# 设计要点与取舍（逐条对应验收要求）：
+#
+# 1) 为什么只跑 windows-latest，而不是 ubuntu / macos / windows 三平台矩阵：
+#    - 项目自身定位就是 Windows 桌面程序（GPUI + D3D12/WARP），
+#      `.cargo/config.toml` 的 `[env] GPUI_FXC_PATH` 指向 Windows SDK 的
+#      `fxc.exe`（gpui 0.2.2 的 build.rs 在 **release** 构建时装着色器需要它；
+#      windows-latest 镜像自带 Windows SDK，靠 `where.exe fxc.exe` 能命中，
+#      路径不存在时 gpui 会自动回退，所以该变量在 CI 上无需改动）。
+#    - 运行/验收所依赖的外部资产全是 Windows 二进制：
+#      whisper-cli.exe / ffmpeg.exe / 带 sherpa-onnx 的 Python。non-Windows
+#      runner 上这些一律不存在。
+#    - 关于 Linux 编译：`src/` 里的 Windows 专属 API（CommandExt::creation_flags、
+#      AsRawHandle、Job Object 的 kernel32 extern 声明）**都已用
+#      #[cfg(target_os = "windows")] / #[cfg(windows)] 包住**，且多数还配了
+#      `#[cfg(not(windows))]` 的 `kill -9` 回退（见 sensevoice.rs:18-27、
+#      whisper.rs:1079-1090、utils/child_registry.rs:41、media_pipeline.rs:367+）。
+#      所以"Linux 上必然编译失败"这个说法我**没有实测依据，不下断言**。
+#    - 但即便如此仍不铺 Linux runner，理由是收益/风险不成比例：
+#      1. gpui 0.2.2 的 Linux 后端要拉 X11/Wayland/fontconfig 等系统库，
+#         其依赖树里还有 bindgen（需要 libclang）、cbindgen —— 这些在
+#         ubuntu-latest 上要额外装一堆 apt 包才可能编过，属于**未验证**路径；
+#         真铺上去，大概率长期红着或者要反复调 apt 列表，是噪音不是信号。
+#      2. 本项目没有任何 Linux 发布目标，绿灯也不代表任何真实用户场景。
+#    - 结论：平台一致性 > 平台覆盖度。等真要做跨平台移植时，再单独开一条
+#      Linux 分支试验 workflow（并且要先把系统依赖装齐、验证过再进主干）。
+#
+# 2) 为什么 test job 用 `--test-threads=1`（单线程）：
+#    独立验收发现 `cargo test --lib` 在默认多线程下**偶发** `STATUS_HEAP_CORRUPTION`
+#    （约 25 次跑崩 1 次；崩溃时缺失的正是两个 wgpu 相关用例：
+#    media_pipeline::tests::wgpu_shader_converts_limited_black 与
+#    media_pipeline::tests::detect_does_not_panic —— 二者都会
+#    `wgpu::Instance::enumerate_adapters` / 创建软件适配器）。
+#    这是已知缺陷的**规避**手段，不是修复。见文件末尾 TODO(#ci-wgpu-flake)。
+#    同时保留 `test-lib-parallel-nonblocking` job（`continue-on-error: true`）
+#    持续采集该崩溃的复现率，一旦长期为 0 就可以删掉单线程绕过。
+#
+# 3) 为什么 clippy 是 -D warnings：
+#    当前基线 `cargo clippy --all-targets` 是 0 error / 约 34 warning。
+#    按任务要求把 clippy 做成**硬门禁**。注意：这意味着在 warning 清零之前，
+#    clippy job 一定会红。若需要"先红后绿"的过渡期，临时把
+#    `-D warnings` 换成 `-D warnings -A clippy::all` 之类的白名单，
+#    或把该 job 加 `continue-on-error: true`；warning 清零后请还原成严格门禁。
+#
+# 4) 第三方依赖的 future-incompat 通告不判红：
+#    `proc-macro-error2 v2.0.1`（经依赖树传入）会打印 future-incompat 通告，
+#    不是本仓库代码的问题，CI 里不做任何校验，忽略即可。
+#
+# 5) `VOICE2WORD_CI`：见文件末尾 CI_ENV_CONTRACT 说明。
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'          # 含 codex/** 等所有功能分支
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新推送取消上一次仍在跑的 CI，省 runner 配额。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 默认只读权限；各 job 需要写权限时单独声明。
+permissions:
+  contents: read
+
+env:
+  # 仓库范围内的 CI 标记。**当前仓库内没有任何代码读取它**（详见文件末尾
+  # CI_ENV_CONTRACT 的核查结论），保留它只是为了给后续"CI 专用分支"留个约定名。
+  VOICE2WORD_CI: "1"
+  # 强制彩色输出，日志更干净、更好比对（否则 CI 上 cargo 自动关色）。
+  CARGO_TERM_COLOR: always
+  # 让 panic/ABORT 输出完整回溯——尤其是那个偶发 STATUS_HEAP_CORRUPTION，
+  # 有回溯才有排查价值。
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1 — fmt：硬门禁，格式必须完全一致（只检查，绝不写文件）
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: fmt (rustfmt --check)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --all -- --check
+        # 注意：这里只做 --check，CI 永远不会执行 `cargo fmt` 去改源码。
+        run: cargo fmt --all -- --check
+
+  # ---------------------------------------------------------------------------
+  # Job 2 — clippy：硬门禁，warning 即 error
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # target/ 极大（GPUI + wgpu + SQLite + ONNX 依赖树），不缓存 CI 会慢到不可用。
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # clippy / test / build 各 job 共用同一份缓存（rust-cache 仍会把
+          # rustc 版本、Cargo.lock 哈希、目标三元组混进最终 key，所以不会串味）。
+          shared-key: v2w-windows
+          # 缓存 registry（~/.cargo）与 target/；本项目 target 目录很大，必须缓存，
+          # 否则 GPUI + wgpu + bundled SQLite 这套依赖树每次冷编会把 CI 拖到不可用。
+          cache-targets: "true"
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Job 3 — test：硬门禁（单线程，规避已知 wgpu 偶发堆损坏）
+  # ---------------------------------------------------------------------------
+  test:
+    name: test (--lib, single-thread)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: v2w-windows
+
+      - name: cargo test --lib -- --test-threads=1
+        # --test-threads=1 是**规避**已知偶发 STATUS_HEAP_CORRUPTION 的绕过手段，
+        # 不是修复：默认并行时约 25 次跑崩 1 次，崩掉的正是两个 wgpu 用例。
+        # TODO(#ci-wgpu-flake): 多线程下的 STATUS_HEAP_CORRUPTION 待排查
+        #   - 复现：cargo test --lib（默认并行，反复跑）
+        #   - 现象：STATUS_HEAP_CORRUPTION，缺 media_pipeline 的两个 wgpu 用例
+        #   - 怀疑方向：多个测试并发枚举 wgpu adapter / 创建软件适配器时
+        #     共享的全局状态或第三方库（wgpu 0.20 / d3d12 / WARP）非线程安全
+        #   - 关联观测 job：test-lib-parallel-nonblocking
+        run: cargo test --lib -- --test-threads=1
+
+  # ---------------------------------------------------------------------------
+  # Job 3b — 非阻塞：默认多线程跑 lib 测试，专门采集上面那个偶发崩溃的复现率。
+  #          永远不阻塞合并（continue-on-error: true），只为留证据。
+  # ---------------------------------------------------------------------------
+  test-lib-parallel-nonblocking:
+    name: test (--lib, default parallel, non-blocking)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: v2w-windows
+
+      - name: cargo test --lib (default parallel — flake telemetry)
+        # 目的单一：暴露 STATUS_HEAP_CORRUPTION 的复现率。
+        # 红不代表代码坏，只代表这次踩到了已知偶发问题；详见 TODO(#ci-wgpu-flake)。
+        run: cargo test --lib
+
+  # ---------------------------------------------------------------------------
+  # Job 4 — 跨目标测试（可选，非阻塞）
+  #          --all-targets 会把 examples/ 与 tests/ 全部编译并运行。
+  #
+  #          实测结论（已逐个读过 tests/*.rs）：**tests/ 下的集成测试会红**，
+  #          因为它们对外部资产是硬断言而不是提前 return：
+  #            - tests/test_pipeline.rs:26-39  assert! ffmpeg / whisper-cli /
+  #              whisper 模型 / llama-cli / llm 模型 / sample.mp4 必须存在
+  #            - tests/test_sensevoice.rs:18-21  assert! runner / onnx / tokens /
+  #              vad 必须存在；:83 再 assert! sample.mp4
+  #            - tests/test_real_video.rs:122  assert! 测试视频必须存在
+  #            - tests/test_benchmark_sensevoice_32min.rs:38  assert! 视频存在
+  #          而 models/ 与 resources/ 都在 .gitignore 里（CI 检出后为空目录），
+  #          所以这个 job 在 CI 上**必然失败**——这正是它 continue-on-error 的原因。
+  #          它的价值只剩两点：1) 证明 tests/ 与 examples/ 能编译过；
+  #          2) 在装了外部依赖的自托管 runner 上给出真实信号。
+  #
+  #          真正"依赖缺失就提前 return"的是 **lib 内的单元测试**（--lib），
+  #          例如 src/engines/chunked_whisper.rs:688/740/819 读不到
+  #          cfg["paths"]["ffmpeg"] 就直接 return；所以 Job 3 是稳定的。
+  # ---------------------------------------------------------------------------
+  test-all-targets-nonblocking:
+    name: test (--all-targets, non-blocking)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: v2w-windows
+
+      - name: cargo test --all-targets --no-fail-fast
+        # --no-fail-fast：一次跑完所有 target，把失败集中暴露，而不是第一个失败就停。
+        # 非阻塞原因：tests/ 下的集成测试对外部资产（whisper-cli / ffmpeg /
+        # llama-cli / 模型 / sample.mp4）是**硬断言**，而 models/ 与 resources/
+        # 都在 .gitignore 里，CI 上必然失败（详见上面 Job 4 的说明）。
+        # 需要真实信号时，把该 job 迁到带这些资产的自托管 runner 上。
+        run: cargo test --all-targets --no-fail-fast
+
+  # ---------------------------------------------------------------------------
+  # Job 5 — build：可选、非阻塞。产出 release 可执行文件并上传。
+  #          只 `needs: [fmt]`（秒级、稳定），**不依赖** clippy/test——
+  #          这样存量 clippy warning 不会连带掐掉构建产物与 smoke 信号；
+  #          build 自身 `continue-on-error: true`，红了也不挡合并。
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (release, non-blocking)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    continue-on-error: true
+    needs: [fmt]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: v2w-windows
+          # release 产物与 debug 不同，单独一份缓存 key 后缀。
+          key: release
+
+      - name: cargo build --release
+        # release 构建会让 gpui build.rs 去找 fxc.exe 编译着色器；
+        # windows-latest 自带 Windows SDK，where.exe fxc.exe 能命中；
+        # 本机 .cargo/config.toml 里那条 GPUI_FXC_PATH 若路径不存在，
+        # gpui 会自动回退到 where.exe，因此无需在 CI 里额外指定。
+        run: cargo build --release
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice2word-windows-release
+          # 只收主程序，避免把整个 target/ 传上去。
+          # 注意 release profile 设了 `strip = "symbols"`，因此 PDB 可能不存在，
+          # 这里不把 .pdb 列为必选，缺失只告警不失败。
+          path: |
+            target/release/voice2word.exe
+          if-no-files-found: warn
+          retention-days: 14
+
+# =============================================================================
+# CI_ENV_CONTRACT — 关于 VOICE2WORD_CI / cfg!(test) / #[ignore] 的现状核查
+# =============================================================================
+# 核实结果（对 src/ 与 tests/ 全量 grep）：
+#
+#   VOICE2WORD_CI           —— **仓库内零消费者（0 处引用）**。
+#                              除工作流 env 外没有任何 Rust 代码读取它。
+#                              已有被读取的环境变量是：
+#                                - VOICE2WORD_API_KEY  (src/utils/config.rs:194)
+#                                - LOCALAPPDATA        (src/subtitle/jianying.rs)
+#                                - V2W_BENCH_START / V2W_BENCH_SECONDS / V2W_BENCH_WORKERS
+#                                                      (tests/bench_sensevoice_parallel.rs)
+#                              结论：CI 里设置 VOICE2WORD_CI=1 目前是**纯声明**，
+#                              对测试行为没有影响。等有代码消费它时再补语义。
+#
+#   cfg!(test)              —— 38 处，均为常规单元测试 gating，无 CI 专用开关。
+#
+#   #[ignore]               —— 2 处：
+#                                - src/engines/whisper.rs:1254
+#                                  `test_real_audio_transcribe`（需要真实
+#                                  whisper-cli.exe + ggml 模型 + 样片音频）
+#                                - tests/bench_sensevoice_parallel.rs:12
+#                                  （SenseVoice 并行基准，需要真实二进制/样片）
+#                              这两条默认就被跳过，CI 不会跑到，符合预期。
+#
+#   依赖缺失时提前 return —— 已核实存在（cfg 解析不到 ffmpeg 路径即 return，
+#                              例如 src/engines/chunked_whisper.rs:688/740/819），
+#                              所以外部二进制缺失不会让 CI 红。
+# =============================================================================
+
+# TODO(#ci-wgpu-flake):
+#   1. 定位 `cargo test --lib` 默认并行下偶发 STATUS_HEAP_CORRUPTION 的根因
+#      （重点看两个 wgpu 用例的并发交互：wgpu::Instance::enumerate_adapters 与
+#      Nv12Renderer 的软件适配器创建）。
+#   2. 定位后把 test job 的 `--test-threads=1` 去掉，恢复并行。
+#   3. 观察 test-lib-parallel-nonblocking 的失败率，作为"是否已修好"的判据。

@@ -52,7 +52,11 @@ fn main() -> Result<()> {
     )?);
     let start: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let dur: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let out_srt = PathBuf::from(args.get(3).cloned().unwrap_or_else(|| "target/prep.srt".into()));
+    let out_srt = PathBuf::from(
+        args.get(3)
+            .cloned()
+            .unwrap_or_else(|| "target/prep.srt".into()),
+    );
     let no_prep = args.iter().any(|a| a == "--no-prep");
     let no_compact = args.iter().any(|a| a == "--no-compact");
 
@@ -90,10 +94,9 @@ fn main() -> Result<()> {
     let t_prep = Instant::now();
     let mut plan: Option<CompactionPlan> = None;
     let mut prep_note = String::from("未启用预处理");
-    let asr_input: PathBuf;
 
-    if no_prep {
-        asr_input = clip.clone();
+    let asr_input: PathBuf = if no_prep {
+        clip.clone()
     } else {
         let chain = SpeechFilterOptions::default().chain_with_speed(1.0);
         let pcm = ffmpeg.decode_pcm_mono_filtered(&clip, ASR_SAMPLE_RATE, chain.as_deref())?;
@@ -106,7 +109,8 @@ fn main() -> Result<()> {
         let use_plan = !p.is_identity() && p.is_worthwhile(0.10);
         let pcm_len = pcm.len();
         let kept: Vec<i16> = if use_plan { p.materialize(&pcm) } else { pcm };
-        let wav = std::env::temp_dir().join(format!("v2w_prepbench_out_{}.wav", std::process::id()));
+        let wav =
+            std::env::temp_dir().join(format!("v2w_prepbench_out_{}.wav", std::process::id()));
         write_wav_mono16(&wav, &kept, ASR_SAMPLE_RATE)?;
         prep_note = format!(
             "增强+压实 {:.1}s -> {:.1}s (切除 {:.0}%, 压实={})",
@@ -118,8 +122,8 @@ fn main() -> Result<()> {
         if use_plan {
             plan = Some(p);
         }
-        asr_input = wav;
-    }
+        wav
+    };
     let prep_sec = t_prep.elapsed().as_secs_f64();
     println!("[预处理] {:.2}s | {}", prep_sec, prep_note);
 
@@ -146,7 +150,10 @@ fn main() -> Result<()> {
     voice2word::subtitle::optimize_segments(&mut segments);
 
     write_srt(&out_srt, &segments, start)?;
-    let chars: usize = segments.iter().map(|s| s.display_text().chars().count()).sum();
+    let chars: usize = segments
+        .iter()
+        .map(|s| s.display_text().chars().count())
+        .sum();
     println!(
         "[转写] {:.2}s | 片段 {} | 字符 {} | 墙钟合计 {:.2}s",
         asr_sec,

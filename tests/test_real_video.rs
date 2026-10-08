@@ -5,18 +5,61 @@ use voice2word::core::TaskPipeline;
 use voice2word::engines::{FFmpegEngine, LLMEngine, WhisperEngine};
 use voice2word::utils::AppConfig;
 
+mod common;
+
 #[tokio::test]
 async fn test_real_video_pipeline() {
     let config = AppConfig::load_from_file("config.toml").expect("加载 config.toml 失败");
     println!("=== 开始真实视频全链路转写测试 ===");
-    println!("FFmpeg 路径: {:?}", AppConfig::resolve_path(&config.paths.ffmpeg));
-    println!("Whisper 路径: {:?}", AppConfig::resolve_path(&config.paths.whisper_cli));
-    println!("Whisper 模型: {:?}", AppConfig::resolve_path(&config.paths.whisper_model));
-    println!("LLM 路径: {:?}", AppConfig::resolve_path(&config.paths.llama_cli));
-    println!("LLM 模型: {:?}", AppConfig::resolve_path(&config.paths.llm_model));
+    println!(
+        "FFmpeg 路径: {:?}",
+        AppConfig::resolve_path(&config.paths.ffmpeg)
+    );
+    println!(
+        "Whisper 路径: {:?}",
+        AppConfig::resolve_path(&config.paths.whisper_cli)
+    );
+    println!(
+        "Whisper 模型: {:?}",
+        AppConfig::resolve_path(&config.paths.whisper_model)
+    );
+    println!(
+        "LLM 路径: {:?}",
+        AppConfig::resolve_path(&config.paths.llama_cli)
+    );
+    println!(
+        "LLM 模型: {:?}",
+        AppConfig::resolve_path(&config.paths.llm_model)
+    );
 
-    assert!(AppConfig::resolve_path(&config.paths.whisper_model).exists(), "Whisper 模型必须真实存在！");
-    assert!(AppConfig::resolve_path(&config.paths.llm_model).exists(), "LLM 模型必须真实存在！");
+    let ffmpeg_path = AppConfig::resolve_path(&config.paths.ffmpeg);
+    let whisper_cli = AppConfig::resolve_path(&config.paths.whisper_cli);
+    let whisper_model = AppConfig::resolve_path(&config.paths.whisper_model);
+    let llama_cli = AppConfig::resolve_path(&config.paths.llama_cli);
+    let llm_model = AppConfig::resolve_path(&config.paths.llm_model);
+    let video_path = PathBuf::from("testVideo/03.1.3概率不等式.mp4");
+
+    // 优雅跳过：CI（checkout 后 models/ 与 testVideo/ 皆空）或本机缺任一资产时，
+    // 打印 SKIP（真实 stderr 句柄，默认 `cargo test` 下即可见）并尽早 return，
+    // 而不是让视频测试假失败。
+    if common::skip_heavy(
+        "test_real_video_pipeline",
+        &[
+            ("FFmpeg", &ffmpeg_path),
+            ("Whisper CLI", &whisper_cli),
+            ("Whisper 模型", &whisper_model),
+            ("LLM CLI", &llama_cli),
+            ("LLM 模型", &llm_model),
+            ("测试视频 03.1.3概率不等式.mp4", &video_path),
+        ],
+    ) {
+        return;
+    }
+
+    // 资产齐备：以下断言与视频转写执行全部保留。
+    assert!(whisper_model.exists(), "Whisper 模型必须真实存在！");
+    assert!(llm_model.exists(), "LLM 模型必须真实存在！");
+    assert!(video_path.exists(), "测试视频必须存在！");
 
     let vad = AppConfig::resolve_path("models/whisper/ggml-silero-v6.2.0.bin");
     let vad_model_path = if vad.exists() { Some(vad) } else { None };
@@ -29,7 +72,9 @@ async fn test_real_video_pipeline() {
     };
     println!("使用 Whisper 模型: {:?}", model_to_use);
 
-    let ffmpeg = Arc::new(FFmpegEngine::new(AppConfig::resolve_path(&config.paths.ffmpeg)));
+    let ffmpeg = Arc::new(FFmpegEngine::new(AppConfig::resolve_path(
+        &config.paths.ffmpeg,
+    )));
     let whisper = Arc::new(WhisperEngine::with_device(
         AppConfig::resolve_path(&config.paths.whisper_cli),
         model_to_use,
@@ -50,33 +95,55 @@ async fn test_real_video_pipeline() {
 
     let punc = {
         let runner = AppConfig::resolve_path("tools/punc_runner.py");
-        let model = config.paths.punc_model.as_ref().map(|p| AppConfig::resolve_path(p))
+        let model = config
+            .paths
+            .punc_model
+            .as_ref()
+            .map(|p| AppConfig::resolve_path(p))
             .unwrap_or_else(|| AppConfig::resolve_path("models/punc/model.int8.onnx"));
         if runner.exists() && model.exists() {
             println!("达摩院 CT-Punc 极速标点引擎已挂载: {:?}", model);
-            Some(Arc::new(voice2word::engines::PunctuationEngine::new(runner, model, 4)))
+            Some(Arc::new(voice2word::engines::PunctuationEngine::new(
+                runner, model, 4,
+            )))
         } else {
+            println!("CT-Punc 未就绪（缺少 runner 或模型），本用例将以无标点引擎运行");
             None
         }
     };
     let sensevoice = {
         let runner = AppConfig::resolve_path("tools/sensevoice_runner.py");
-        let model = config.paths.sensevoice_model.as_ref().map(|p| AppConfig::resolve_path(p))
+        let model = config
+            .paths
+            .sensevoice_model
+            .as_ref()
+            .map(|p| AppConfig::resolve_path(p))
             .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/model.int8.onnx"));
-        let tokens = config.paths.sensevoice_tokens.as_ref().map(|p| AppConfig::resolve_path(p))
+        let tokens = config
+            .paths
+            .sensevoice_tokens
+            .as_ref()
+            .map(|p| AppConfig::resolve_path(p))
             .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/tokens.txt"));
-        let vad = config.paths.sensevoice_vad.as_ref().map(|p| AppConfig::resolve_path(p))
+        let vad = config
+            .paths
+            .sensevoice_vad
+            .as_ref()
+            .map(|p| AppConfig::resolve_path(p))
             .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/silero_vad.onnx"));
         if runner.exists() && model.exists() && tokens.exists() && vad.exists() {
-            Some(Arc::new(voice2word::engines::SenseVoiceEngine::new(runner, model, tokens, vad, 4)))
+            Some(Arc::new(voice2word::engines::SenseVoiceEngine::new(
+                runner, model, tokens, vad, 4,
+            )))
         } else {
+            println!(
+                "SenseVoice 未就绪（缺少 runner/模型/tokens/vad），本用例将以 Whisper 引擎运行"
+            );
             None
         }
     };
 
     let pipeline = Arc::new(TaskPipeline::new(ffmpeg, whisper, sensevoice, llm, punc));
-    let video_path = PathBuf::from("testVideo/03.1.3概率不等式.mp4");
-    assert!(video_path.exists(), "测试视频必须存在！");
 
     // 注意：不能写回 `03.1.3概率不等式_success.srt`——那是人工校对过的标准字幕，
     // 是 `scripts/eval_cer.py` 的参考真值，跑一次测试就会把它覆盖掉。
@@ -90,7 +157,11 @@ async fn test_real_video_pipeline() {
                 voice2word::core::PipelineEvent::SegmentStream(seg) => {
                     println!("  [流式出字] [{}s -> {}s] {}", seg.start, seg.end, seg.text);
                 }
-                voice2word::core::PipelineEvent::Progress { stage, progress, detail } => {
+                voice2word::core::PipelineEvent::Progress {
+                    stage,
+                    progress,
+                    detail,
+                } => {
                     println!("[{stage}] {:.1}% - {detail}", progress * 100.0);
                 }
                 voice2word::core::PipelineEvent::StageChanged(stage) => {
@@ -126,12 +197,21 @@ async fn test_real_video_pipeline() {
     println!("总耗时: {:.1} 秒", elapsed.as_secs_f64());
     println!("成功生成字幕段数: {}", segments.len());
     if let Some(first) = segments.first() {
-        println!("第一条字幕 [{}s -> {}s]: {}", first.start, first.end, first.text);
+        println!(
+            "第一条字幕 [{}s -> {}s]: {}",
+            first.start, first.end, first.text
+        );
     }
     if let Some(last) = segments.last() {
-        println!("最后一条字幕 [{}s -> {}s]: {}", last.start, last.end, last.text);
+        println!(
+            "最后一条字幕 [{}s -> {}s]: {}",
+            last.start, last.end, last.text
+        );
     }
-    println!("SRT 输出文件大小: {} bytes", std::fs::metadata(&srt_out).map(|m| m.len()).unwrap_or(0));
+    println!(
+        "SRT 输出文件大小: {} bytes",
+        std::fs::metadata(&srt_out).map(|m| m.len()).unwrap_or(0)
+    );
     println!("=============================================");
 
     assert!(!segments.is_empty(), "必须成功生成字幕段！");

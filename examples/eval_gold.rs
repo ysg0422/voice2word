@@ -17,19 +17,32 @@ fn parse_time(value: &str) -> Option<f64> {
     if parts.len() != 3 {
         return None;
     }
-    Some(parts[0].parse::<f64>().ok()? * 3600.0
-        + parts[1].parse::<f64>().ok()? * 60.0
-        + parts[2].parse::<f64>().ok()?)
+    Some(
+        parts[0].parse::<f64>().ok()? * 3600.0
+            + parts[1].parse::<f64>().ok()? * 60.0
+            + parts[2].parse::<f64>().ok()?,
+    )
 }
 
 fn read_srt(path: &Path) -> Result<Vec<(f64, f64, String)>> {
-    let raw = fs::read_to_string(path).with_context(|| format!("读取标准字幕失败: {}", path.display()))?;
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("读取标准字幕失败: {}", path.display()))?;
     let mut result = Vec::new();
-    for block in raw.trim_start_matches('\u{feff}').replace("\r\n", "\n").split("\n\n") {
+    for block in raw
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .split("\n\n")
+    {
         let mut lines = block.lines();
-        let Some(time_line) = lines.find(|line| line.contains("-->")) else { continue };
-        let Some((start, end)) = time_line.split_once("-->") else { continue };
-        let (Some(start), Some(end)) = (parse_time(start), parse_time(end)) else { continue };
+        let Some(time_line) = lines.find(|line| line.contains("-->")) else {
+            continue;
+        };
+        let Some((start, end)) = time_line.split_once("-->") else {
+            continue;
+        };
+        let (Some(start), Some(end)) = (parse_time(start), parse_time(end)) else {
+            continue;
+        };
         let text = lines.collect::<Vec<_>>().join("");
         result.push((start, end, text));
     }
@@ -37,14 +50,28 @@ fn read_srt(path: &Path) -> Result<Vec<(f64, f64, String)>> {
 }
 
 fn read_whisper_json(path: &Path) -> Result<Vec<(f64, f64, String)>> {
-    let raw = fs::read_to_string(path).with_context(|| format!("读取 Whisper JSON 失败: {}", path.display()))?;
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("读取 Whisper JSON 失败: {}", path.display()))?;
     let value: Value = serde_json::from_str(&raw)?;
     let mut result = Vec::new();
-    for item in value["transcription"].as_array().context("JSON 缺少 transcription")? {
-        let Some(start) = item["offsets"]["from"].as_f64() else { continue };
-        let Some(end) = item["offsets"]["to"].as_f64() else { continue };
-        let Some(text) = item["text"].as_str() else { continue };
-        result.push((CLIP_START + start / 1000.0, CLIP_START + end / 1000.0, text.to_string()));
+    for item in value["transcription"]
+        .as_array()
+        .context("JSON 缺少 transcription")?
+    {
+        let Some(start) = item["offsets"]["from"].as_f64() else {
+            continue;
+        };
+        let Some(end) = item["offsets"]["to"].as_f64() else {
+            continue;
+        };
+        let Some(text) = item["text"].as_str() else {
+            continue;
+        };
+        result.push((
+            CLIP_START + start / 1000.0,
+            CLIP_START + end / 1000.0,
+            text.to_string(),
+        ));
     }
     Ok(result)
 }
@@ -98,31 +125,52 @@ fn main() -> Result<()> {
         let (prediction, predicted_segments) = normalized_between(&hypothesis, 0.0, f64::INFINITY);
         let edits = edit_distance(&reference, &prediction);
         println!("标准: {} ({}句)", gold_path.display(), gold_segments);
-        println!("待测: {} ({}句)", candidate_path.display(), predicted_segments);
-        println!("全片 CER: {:.2}% ({} / {} 字)",
+        println!(
+            "待测: {} ({}句)",
+            candidate_path.display(),
+            predicted_segments
+        );
+        println!(
+            "全片 CER: {:.2}% ({} / {} 字)",
             edits as f64 / reference.chars().count() as f64 * 100.0,
-            edits, reference.chars().count());
+            edits,
+            reference.chars().count()
+        );
         return Ok(());
     }
     let (reference, gold_segments) = normalized_between(&gold, EVAL_START, EVAL_END);
     let reference_len = reference.chars().count();
-    println!("标准字幕: {} | 评估区间 05:05–14:55 | 句数 {} | 归一化字数 {}", gold_path.display(), gold_segments, reference_len);
+    println!(
+        "标准字幕: {} | 评估区间 05:05–14:55 | 句数 {} | 归一化字数 {}",
+        gold_path.display(),
+        gold_segments,
+        reference_len
+    );
     println!("倍率  VAD   句数   字数   编辑距离   CER");
     for (rate, vad) in [
-        ("1_00", "0_50"), ("1_15", "0_50"), ("1_25", "0_50"),
-        ("1_35", "0_50"), ("1_35", "0_55"), ("1_35", "0_60"),
+        ("1_00", "0_50"),
+        ("1_15", "0_50"),
+        ("1_25", "0_50"),
+        ("1_35", "0_50"),
+        ("1_35", "0_55"),
+        ("1_35", "0_60"),
         ("1_50", "0_50"),
     ] {
         let path = bench_dir.join(format!("result_x{rate}_vad{vad}.json"));
         if !path.exists() {
             continue;
         }
-        let (hypothesis, segments) = normalized_between(&read_whisper_json(&path)?, EVAL_START, EVAL_END);
+        let (hypothesis, segments) =
+            normalized_between(&read_whisper_json(&path)?, EVAL_START, EVAL_END);
         let distance = edit_distance(&reference, &hypothesis);
         println!(
             "{:<5} {:<5} {:>4} {:>6} {:>10} {:>6.2}%",
-            rate.replace('_', "."), vad.replace('_', "."), segments,
-            hypothesis.chars().count(), distance, distance as f64 / reference_len as f64 * 100.0,
+            rate.replace('_', "."),
+            vad.replace('_', "."),
+            segments,
+            hypothesis.chars().count(),
+            distance,
+            distance as f64 / reference_len as f64 * 100.0,
         );
     }
     for (label, file) in [
@@ -139,12 +187,20 @@ fn main() -> Result<()> {
         ("preVAD+", "pre_vad_0.55_mapped.json"),
     ] {
         let path = bench_dir.join(file);
-        if !path.exists() { continue; }
-        let (hypothesis, segments) = normalized_between(&read_whisper_json(&path)?, EVAL_START, EVAL_END);
+        if !path.exists() {
+            continue;
+        }
+        let (hypothesis, segments) =
+            normalized_between(&read_whisper_json(&path)?, EVAL_START, EVAL_END);
         let distance = edit_distance(&reference, &hypothesis);
-        println!("{label:<5} {:<5} {:>4} {:>6} {:>10} {:>6.2}%",
-            "0.50", segments, hypothesis.chars().count(), distance,
-            distance as f64 / reference_len as f64 * 100.0);
+        println!(
+            "{label:<5} {:<5} {:>4} {:>6} {:>10} {:>6.2}%",
+            "0.50",
+            segments,
+            hypothesis.chars().count(),
+            distance,
+            distance as f64 / reference_len as f64 * 100.0
+        );
     }
     Ok(())
 }

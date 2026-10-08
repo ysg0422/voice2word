@@ -13,9 +13,7 @@ use voice2word::storage::Database;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let db_path = args
-        .next()
-        .unwrap_or_else(|| "voice2word.db".to_string());
+    let db_path = args.next().unwrap_or_else(|| "voice2word.db".to_string());
 
     let db = Database::open(&db_path).unwrap_or_else(|e| {
         eprintln!("打开数据库失败：{db_path}（{e}）");
@@ -43,7 +41,10 @@ fn main() {
     let _ = db.find_cached_task(&path);
     let hit = db.find_cached_task(&path).ok().flatten();
     match &hit {
-        Some(t) => println!("命中记录：{} 句（字幕 JSON 将整份反序列化）", t.segments.len()),
+        Some(t) => println!(
+            "命中记录：{} 句（字幕 JSON 将整份反序列化）",
+            t.segments.len()
+        ),
         None => println!("警告：该路径在库中无已完成记录，测得的是「查空」成本，会偏乐观。"),
     }
 

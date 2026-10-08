@@ -20,9 +20,11 @@ fn parse_time(value: &str) -> Option<f64> {
     if parts.len() != 3 {
         return None;
     }
-    Some(parts[0].parse::<f64>().ok()? * 3600.0
-        + parts[1].parse::<f64>().ok()? * 60.0
-        + parts[2].parse::<f64>().ok()?)
+    Some(
+        parts[0].parse::<f64>().ok()? * 3600.0
+            + parts[1].parse::<f64>().ok()? * 60.0
+            + parts[2].parse::<f64>().ok()?,
+    )
 }
 
 fn read_srt(path: &Path) -> Result<Vec<(f64, f64, String)>> {

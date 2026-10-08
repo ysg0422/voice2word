@@ -8,19 +8,33 @@ use std::time::Instant;
 use voice2word::engines::{transcribe_chunked_sensevoice, FFmpegEngine, SenseVoiceEngine};
 use voice2word::utils::AppConfig;
 
+mod common;
+
 #[test]
 #[ignore]
 fn compare_single_process_vs_chunked_parallel() {
+    let test_name = "compare_single_process_vs_chunked_parallel";
     let config = AppConfig::load_from_file("config.toml").expect("加载 config.toml 失败");
     let ffmpeg_path = AppConfig::resolve_path(&config.paths.ffmpeg);
-    if !ffmpeg_path.exists() {
-        eprintln!("跳过：ffmpeg 不存在");
-        return;
-    }
-
+    let runner = AppConfig::resolve_path("tools/sensevoice_runner.py");
+    let model = AppConfig::resolve_path("models/sensevoice/model.int8.onnx");
+    let tokens = AppConfig::resolve_path("models/sensevoice/tokens.txt");
+    let vad = AppConfig::resolve_path("models/sensevoice/silero_vad.onnx");
     let src = PathBuf::from("testVideo/03.1.3概率不等式.mp4");
-    if !src.exists() {
-        eprintln!("跳过：缺少样片 {:?}", src);
+
+    // 与其它集成测试同一套判据：CI 或本机缺任一资产 → 打印 SKIP 并尽早 return。
+    // （本文件本就 `#[ignore]`，这里的 SKIP 只服务于显式 `--ignored` 的场景。）
+    if common::skip_heavy(
+        test_name,
+        &[
+            ("FFmpeg", &ffmpeg_path),
+            ("tools/sensevoice_runner.py", &runner),
+            ("models/sensevoice/model.int8.onnx", &model),
+            ("models/sensevoice/tokens.txt", &tokens),
+            ("models/sensevoice/silero_vad.onnx", &vad),
+            ("样片 03.1.3概率不等式.mp4", &src),
+        ],
+    ) {
         return;
     }
 
@@ -33,7 +47,15 @@ fn compare_single_process_vs_chunked_parallel() {
     let wav = std::env::temp_dir().join(format!("v2w_bench_{}s.wav", bench_sec as u32));
     if !wav.exists() {
         let ok = std::process::Command::new(&ffmpeg_path)
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-ss", &start_sec, "-t"])
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                &start_sec,
+                "-t",
+            ])
             .arg(format!("{bench_sec}"))
             .arg("-i")
             .arg(&src)
@@ -45,15 +67,9 @@ fn compare_single_process_vs_chunked_parallel() {
         assert!(ok, "抽取测试音频失败");
     }
 
-    let engine = SenseVoiceEngine::new(
-        AppConfig::resolve_path("tools/sensevoice_runner.py"),
-        AppConfig::resolve_path("models/sensevoice/model.int8.onnx"),
-        AppConfig::resolve_path("models/sensevoice/tokens.txt"),
-        AppConfig::resolve_path("models/sensevoice/silero_vad.onnx"),
-        16,
-    );
+    let engine = SenseVoiceEngine::new(runner, model, tokens, vad, 16);
     if !engine.is_available() {
-        eprintln!("跳过：SenseVoice 模型或脚本未就绪");
+        common::report_skip(test_name, "SenseVoice 模型或脚本未就绪");
         return;
     }
 
@@ -84,7 +100,10 @@ fn compare_single_process_vs_chunked_parallel() {
     .expect("切块并行转写失败");
     let par_sec = started.elapsed().as_secs_f64();
 
-    println!("单进程 (8 线程)   : {single_sec:7.2}s  {} 句", single_segs.len());
+    println!(
+        "单进程 (8 线程)   : {single_sec:7.2}s  {} 句",
+        single_segs.len()
+    );
     println!("多进程切块并行    : {par_sec:7.2}s  {} 句", par_segs.len());
     println!("加速比            : {:.2}x", single_sec / par_sec);
 

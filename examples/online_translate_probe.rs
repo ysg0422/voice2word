@@ -26,7 +26,9 @@ fn env_or(name: &str, default: &str) -> String {
 }
 
 fn main() {
-    let target = std::env::args().nth(1).unwrap_or_else(|| "English".to_string());
+    let target = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "English".to_string());
 
     let base = env_or("V2W_PROBE_URL", "");
     let key = env_or("V2W_PROBE_KEY", "");
@@ -81,7 +83,9 @@ fn main() {
     let out = match engine.translate_subtitles(
         segs,
         &target,
-        Some(Box::new(|p, msg| println!("   进度 {:.0}% — {msg}", p * 100.0))),
+        Some(Box::new(|p, msg| {
+            println!("   进度 {:.0}% — {msg}", p * 100.0)
+        })),
         Arc::new(AtomicBool::new(false)),
     ) {
         Ok(v) => v,

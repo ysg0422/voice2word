@@ -35,12 +35,7 @@ fn main() {
     let src_chars: usize = segs.iter().map(|s| s.text.chars().count()).sum();
     println!("输入：{rows} 行 × {per_line} 字 = {src_chars} 字符");
 
-    let engine = LLMEngine::new(
-        cli,
-        model,
-        cfg.pipeline.llm_ctx,
-        cfg.pipeline.llm_threads,
-    );
+    let engine = LLMEngine::new(cli, model, cfg.pipeline.llm_ctx, cfg.pipeline.llm_threads);
 
     let t0 = std::time::Instant::now();
     let out = engine
@@ -50,7 +45,12 @@ fn main() {
 
     let done = out
         .iter()
-        .filter(|s| s.translation.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false))
+        .filter(|s| {
+            s.translation
+                .as_deref()
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false)
+        })
         .count();
     println!("译出 {done} / {rows} 行，耗时 {elapsed:.1}s");
     if done < rows {

@@ -1,12 +1,13 @@
-use voice2word::core::{
-    run_cpu_benchmark, HardwareInfo, InferenceProfile, UserStrategy,
-};
+use voice2word::core::{run_cpu_benchmark, HardwareInfo, InferenceProfile, UserStrategy};
 
 #[test]
 fn test_hardware_detection_and_evaluation() {
     let hw = HardwareInfo::detect();
     println!("Detected CPU: {}", hw.cpu_brand);
-    println!("Cores: {} / Threads: {}", hw.physical_cores, hw.logical_threads);
+    println!(
+        "Cores: {} / Threads: {}",
+        hw.physical_cores, hw.logical_threads
+    );
     println!("Total RAM: {}", hw.formatted_total_memory());
     println!("Available RAM: {}", hw.formatted_available_memory());
     println!("Inference Mode: {:?}", hw.inference_mode);
