@@ -3,10 +3,10 @@
 use gpui::prelude::*;
 use gpui::*;
 
-use crate::app::state::WorkspaceTab;
 use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::MainWindow;
+use crate::app::state::WorkspaceTab;
 
 #[cfg(target_os = "windows")]
 mod win_drag {
@@ -32,7 +32,7 @@ mod win_drag {
         let raw_window_handle::RawWindowHandle::Win32(handle) = raw.as_raw() else {
             return;
         };
-        let hwnd = handle.hwnd.get() as isize;
+        let hwnd = handle.hwnd.get();
         if hwnd != 0 {
             unsafe {
                 ReleaseCapture();
@@ -119,35 +119,29 @@ impl MainWindow {
                         #[cfg(target_os = "windows")]
                         win_drag::drag_window(window);
                     })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .children(if let Some(name) = current_file_name {
-                                vec![
-                                    div()
-                                        .w(px(Theme::DOT_SM))
-                                        .h(px(Theme::DOT_SM))
-                                        .rounded_full()
-                                        .bg(Theme::accent_mint())
-                                        .into_any_element(),
-                                    div()
-                                        .text_size(px(Theme::TEXT_SMALL))
-                                        .text_color(Theme::text_secondary())
-                                        .child(name.to_string())
-                                        .into_any_element(),
-                                ]
-                            } else {
-                                vec![
-                                    div()
-                                        .text_size(px(Theme::TEXT_SMALL))
-                                        .text_color(Theme::text_muted())
-                                        .child("未载入媒体")
-                                        .into_any_element(),
-                                ]
-                            }),
-                    ),
+                    .child(div().flex().items_center().gap_2().children(
+                        if let Some(name) = current_file_name {
+                            vec![
+                                div()
+                                    .w(px(Theme::DOT_SM))
+                                    .h(px(Theme::DOT_SM))
+                                    .rounded_full()
+                                    .bg(Theme::accent_mint())
+                                    .into_any_element(),
+                                div()
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .text_color(Theme::text_secondary())
+                                    .child(name.to_string())
+                                    .into_any_element(),
+                            ]
+                        } else {
+                            vec![div()
+                                .text_size(px(Theme::TEXT_SMALL))
+                                .text_color(Theme::text_muted())
+                                .child("未载入媒体")
+                                .into_any_element()]
+                        },
+                    )),
             )
             // 右侧：原生窗口控制按钮组 (最小化 / 最大化 / 关闭)
             .child(
@@ -175,7 +169,14 @@ impl MainWindow {
                     .child(
                         primitives::titlebar_btn("✕", true)
                             .id("titlebar-btn-close")
-                            .on_click(cx.listener(|_, _, window, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                // 关窗前的脏数据守卫：与系统关窗路径（Alt+F4 / 任务栏右键 /
+                                // 系统关闭按钮，见 `install_window_close_guard`）共用同一份
+                                // 实现，避免两套关窗逻辑漂移。`false` = 本次落库失败，已由
+                                // 该实现记好日志并触发重绘，这里直接留着窗口让用户处理。
+                                if !this.flush_segments_before_close(cx) {
+                                    return;
+                                }
                                 window.remove_window();
                                 cx.quit();
                             })),

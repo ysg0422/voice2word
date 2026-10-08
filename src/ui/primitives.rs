@@ -217,7 +217,12 @@ pub fn stat_dot(color: Rgba) -> Div {
 }
 
 fn dot(size: f32, color: Rgba) -> Div {
-    div().w(px(size)).h(px(size)).rounded_full().flex_shrink_0().bg(color)
+    div()
+        .w(px(size))
+        .h(px(size))
+        .rounded_full()
+        .flex_shrink_0()
+        .bg(color)
 }
 
 // ==================== 进度条 ====================
@@ -348,7 +353,10 @@ pub fn btn_clickable(label: impl Into<SharedString>, size: BtnSize, variant: Btn
     let el = btn(label, size, variant).cursor_pointer();
     match variant {
         BtnVariant::Primary => el.hover(|s| s.opacity(0.9)),
-        BtnVariant::Danger => el.hover(|s| s.bg(Theme::accent_red_strong()).text_color(Theme::text_on_saturated())),
+        BtnVariant::Danger => el.hover(|s| {
+            s.bg(Theme::accent_red_strong())
+                .text_color(Theme::text_on_saturated())
+        }),
         _ => el.hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary())),
     }
 }
@@ -358,7 +366,12 @@ pub fn btn_clickable(label: impl Into<SharedString>, size: BtnSize, variant: Btn
 /// 与 [`btn_clickable`] 的分工：那个只负责「可点 + 悬停反馈」，禁用与否由调用点
 /// 用 `.when()` 自行决定；本函数把「形状不变、只换配色」的禁用观感固化下来，
 /// 让「点了没反应」这类死路不再出现（调用点只需 `if enabled { .on_click(..) }`）。
-pub fn btn_state(label: impl Into<SharedString>, size: BtnSize, variant: BtnVariant, enabled: bool) -> Div {
+pub fn btn_state(
+    label: impl Into<SharedString>,
+    size: BtnSize,
+    variant: BtnVariant,
+    enabled: bool,
+) -> Div {
     let base = btn(label, size, variant);
     if enabled {
         base.cursor_pointer().hover(|s| match variant {
@@ -408,7 +421,10 @@ pub fn segmented(label: impl Into<SharedString>, selected: bool, full_width: boo
         base.bg(Theme::bg_raised())
             .border_color(Theme::transparent())
             .text_color(Theme::text_secondary())
-            .hover(|s| s.bg(Theme::tint_neutral()).text_color(Theme::text_primary()))
+            .hover(|s| {
+                s.bg(Theme::tint_neutral())
+                    .text_color(Theme::text_primary())
+            })
     }
 }
 
@@ -565,12 +581,7 @@ pub fn btn_sm_outline(label: impl Into<SharedString>) -> Div {
 
 /// 带色底的小号状态标（「播放中」这类瞬时状态）。方角，与全站控件一致。
 /// `soft` / `border` 由调用点给，以便复用同一形状承载不同语义色。
-pub fn tag_tinted(
-    label: impl Into<SharedString>,
-    soft: Rgba,
-    border: Rgba,
-    text: Rgba,
-) -> Div {
+pub fn tag_tinted(label: impl Into<SharedString>, soft: Rgba, border: Rgba, text: Rgba) -> Div {
     div()
         .h(px(Theme::CHIP_H))
         .px(px(Theme::SPACE_2))
@@ -616,7 +627,8 @@ pub fn pill_btn_outline_state(label: impl Into<SharedString>, enabled: bool) -> 
             .text_color(Theme::text_primary())
             .hover(|s| s.bg(Theme::bg_hover()))
     } else {
-        base.bg(Theme::bg_raised()).text_color(Theme::text_disabled())
+        base.bg(Theme::bg_raised())
+            .text_color(Theme::text_disabled())
     }
 }
 
@@ -625,9 +637,12 @@ pub fn pill_btn_outline_state(label: impl Into<SharedString>, enabled: bool) -> 
 pub fn pill_btn_solid_state(label: impl Into<SharedString>, bg: Rgba, enabled: bool) -> Div {
     let base = pill_base(label).font_weight(FontWeight::SEMIBOLD);
     if enabled {
-        base.bg(bg).text_color(Theme::text_on_accent()).hover(|s| s.opacity(0.9))
+        base.bg(bg)
+            .text_color(Theme::text_on_accent())
+            .hover(|s| s.opacity(0.9))
     } else {
-        base.bg(Theme::bg_hover_strong()).text_color(Theme::text_muted())
+        base.bg(Theme::bg_hover_strong())
+            .text_color(Theme::text_muted())
     }
 }
 
@@ -738,8 +753,11 @@ pub fn titlebar_btn(glyph: &'static str, danger: bool) -> Div {
         .text_size(px(Theme::TEXT_BODY))
         .text_color(Theme::text_secondary());
     if danger {
-        base.hover(|s| s.bg(Theme::accent_red_strong()).text_color(Theme::text_on_saturated()))
-            .child(glyph)
+        base.hover(|s| {
+            s.bg(Theme::accent_red_strong())
+                .text_color(Theme::text_on_saturated())
+        })
+        .child(glyph)
     } else {
         base.hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
             .child(glyph)
@@ -808,14 +826,20 @@ pub fn icon_close_btn() -> Div {
         .bg(Theme::bg_hover_strong())
         .text_color(Theme::text_secondary())
         .cursor_pointer()
-        .hover(|s| s.bg(Theme::border_strong()).text_color(Theme::text_primary()))
+        .hover(|s| {
+            s.bg(Theme::border_strong())
+                .text_color(Theme::text_primary())
+        })
 }
 
 // ==================== 分隔线 ====================
 
 /// 卡片内分组用的极弱横线。
 pub fn divider() -> Div {
-    div().w_full().h(px(Theme::HAIRLINE)).bg(Theme::border_subtle())
+    div()
+        .w_full()
+        .h(px(Theme::HAIRLINE))
+        .bg(Theme::border_subtle())
 }
 
 /// 步骤条里两个步骤之间的短横线。

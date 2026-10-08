@@ -5,13 +5,14 @@ use gpui::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::app::state::{ProcessStatus, WorkspaceTab};
-use crate::subtitle::SubtitleWriter;
-use crate::utils::time::format_duration_short;
 use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::types::{ConfirmAction, ConfirmDialogInfo};
 use super::super::MainWindow;
+use crate::app::state::{ProcessStatus, WorkspaceTab};
+use crate::subtitle::writer::export_spec_for;
+use crate::subtitle::SubtitleWriter;
+use crate::utils::time::format_duration_short;
 
 impl MainWindow {
     /// 渲染历史视频库 (视频资产管理与一键载入工作台)
@@ -49,22 +50,34 @@ impl MainWindow {
                             .items_center()
                             .gap(px(Theme::SPACE_2))
                             .child(
-                                primitives::btn_clickable("导入视频", primitives::BtnSize::Md, primitives::BtnVariant::Primary)
-                                    .id("library-import-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                primitives::btn_clickable(
+                                    "导入视频",
+                                    primitives::BtnSize::Md,
+                                    primitives::BtnVariant::Primary,
+                                )
+                                .id("library-import-btn")
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
                                         this.state.active_tab = WorkspaceTab::Generate;
                                         cx.notify();
-                                    })),
+                                    },
+                                )),
                             )
                             .child(
-                                primitives::btn_clickable("刷新", primitives::BtnSize::Md, primitives::BtnVariant::Secondary)
-                                    .id("library-refresh-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                primitives::btn_clickable(
+                                    "刷新",
+                                    primitives::BtnSize::Md,
+                                    primitives::BtnVariant::Secondary,
+                                )
+                                .id("library-refresh-btn")
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
                                         this.state.refresh_recent_tasks();
                                         // 列表可能因刷新而变短，顺带裁掉查不到的缓存
                                         this.prune_library_caches();
                                         cx.notify();
-                                    })),
+                                    },
+                                )),
                             ),
                     ),
             )
@@ -75,13 +88,11 @@ impl MainWindow {
                 self.render_library_batch_bar(cx)
             })
             // 视频卡片列表区域
-            .child(
-                if total_count == 0 {
-                    self.render_library_empty(cx)
-                } else {
-                    self.render_library_cards(cx)
-                }
-            )
+            .child(if total_count == 0 {
+                self.render_library_empty(cx)
+            } else {
+                self.render_library_cards(cx)
+            })
     }
 
     /// 视频库批量操作栏：选中计数 + 全选 / 清空 / 导出选中。
@@ -112,24 +123,20 @@ impl MainWindow {
             .items_center()
             .justify_between()
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_BODY))
-                            .text_color(if selected > 0 {
-                                Theme::text_secondary()
-                            } else {
-                                Theme::text_muted()
-                            })
-                            .child(if selected == 0 {
-                                "勾选左侧方框，可批量导出字幕".to_string()
-                            } else {
-                                format!("已选 {selected} / {total} 项")
-                            }),
-                    ),
+                div().flex().items_center().gap_2().child(
+                    div()
+                        .text_size(px(Theme::TEXT_BODY))
+                        .text_color(if selected > 0 {
+                            Theme::text_secondary()
+                        } else {
+                            Theme::text_muted()
+                        })
+                        .child(if selected == 0 {
+                            "勾选左侧方框，可批量导出字幕".to_string()
+                        } else {
+                            format!("已选 {selected} / {total} 项")
+                        }),
+                ),
             )
             .child(
                 div()
@@ -195,13 +202,17 @@ impl MainWindow {
             )
             .child(
                 // 空态主行动按钮走 btn 原语，与其余页面的 CTA 同高同色
-                primitives::btn_clickable("导入视频开始转写", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
-                    .id("empty-lib-goto-gen")
-                    .mt(px(Theme::SPACE_2))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.state.active_tab = WorkspaceTab::Generate;
-                        cx.notify();
-                    })),
+                primitives::btn_clickable(
+                    "导入视频开始转写",
+                    primitives::BtnSize::Lg,
+                    primitives::BtnVariant::Primary,
+                )
+                .id("empty-lib-goto-gen")
+                .mt(px(Theme::SPACE_2))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.state.active_tab = WorkspaceTab::Generate;
+                    cx.notify();
+                })),
             )
             .into_any_element()
     }
@@ -215,9 +226,12 @@ impl MainWindow {
             .flex()
             .flex_col()
             .gap(px(Theme::SPACE_3))
-            .children(self.state.recent_tasks.iter().map(|task| {
-                self.render_library_card(task, cx)
-            }))
+            .children(
+                self.state
+                    .recent_tasks
+                    .iter()
+                    .map(|task| self.render_library_card(task, cx)),
+            )
             .into_any_element()
     }
 
@@ -340,7 +354,8 @@ impl MainWindow {
         let dur_str = format_duration_short(task.duration);
 
         // 文件扩展名
-        let ext = task.file_name
+        let ext = task
+            .file_name
             .rsplit('.')
             .next()
             .unwrap_or("MP4")
@@ -392,7 +407,10 @@ impl MainWindow {
             } else {
                 Theme::border()
             })
-            .hover(|s| s.border_color(Theme::border_light()).bg(Theme::bg_card_hover()))
+            .hover(|s| {
+                s.border_color(Theme::border_light())
+                    .bg(Theme::bg_card_hover())
+            })
             .flex()
             .flex_row()
             .items_center()
@@ -449,11 +467,7 @@ impl MainWindow {
                 match self.library_thumbs.get(&task_id) {
                     Some(path) if !path.as_os_str().is_empty() => thumb_box
                         // 视频首帧铺满卡片，Cover 裁剪对齐 16:9
-                        .child(
-                            img(path.clone())
-                                .size_full()
-                                .object_fit(ObjectFit::Cover),
-                        )
+                        .child(img(path.clone()).size_full().object_fit(ObjectFit::Cover))
                         // 底部信息条：格式 + 时长
                         .child(
                             div()
@@ -543,9 +557,7 @@ impl MainWindow {
                                             .child(task.file_name.clone()),
                                     )
                                     // 已完成标记
-                                    .child(
-                                        primitives::stat_dot(Theme::accent_mint()),
-                                    ),
+                                    .child(primitives::stat_dot(Theme::accent_mint())),
                             )
                             // 元数据标签行
                             .child(
@@ -558,10 +570,16 @@ impl MainWindow {
                                     // 文件大小
                                     .child(Self::render_meta_pill("大小", &file_size_str))
                                     // 字幕段数
-                                    .child(Self::render_meta_pill("字幕", &format!("{} 句", seg_len)))
+                                    .child(Self::render_meta_pill(
+                                        "字幕",
+                                        &format!("{} 句", seg_len),
+                                    ))
                                     // 处理耗时 (如果有 metrics)
                                     .children(task.metrics.as_ref().map(|m| {
-                                        Self::render_meta_pill("耗时", &format!("{:.1}s", m.total_elapsed_sec))
+                                        Self::render_meta_pill(
+                                            "耗时",
+                                            &format!("{:.1}s", m.total_elapsed_sec),
+                                        )
                                     })),
                             ),
                     )
@@ -598,92 +616,115 @@ impl MainWindow {
                             .id(("lib-metrics-btn", task_id as usize))
                             .w(px(Theme::LIB_ACTION_W))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.benchmark_dialog = Some(crate::ui::types::BenchmarkDialogInfo {
-                                    file_name: fname.clone(),
-                                    metrics: m.clone(),
-                                });
+                                this.benchmark_dialog =
+                                    Some(crate::ui::types::BenchmarkDialogInfo {
+                                        file_name: fname.clone(),
+                                        metrics: m.clone(),
+                                    });
                                 cx.notify();
                             }))
                     }))
                     // 剪辑按钮 (主操作)
                     .child(
                         // 主操作：实心薄荷方角按钮，与全站 CTA 同形
-                        primitives::btn_clickable("剪辑校对", primitives::BtnSize::Md, primitives::BtnVariant::Primary)
-                            .id(("lib-edit-btn", task_id as usize))
-                            .w(px(Theme::LIB_ACTION_W))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                // 点击时才按 id 取出完整任务数据（渲染期不再克隆）
-                                let Some(record) = this
-                                    .state
-                                    .recent_tasks
-                                    .iter()
-                                    .find(|t| t.id == task_id)
-                                    .cloned()
-                                else {
-                                    return;
-                                };
-                                this.state.load_task(&record);
-                                this.trigger_extract_frame(cx);
-                                this.ensure_preview_proxy(cx);
-                                this.ensure_waveform(cx);
-                                cx.notify();
-                            })),
+                        primitives::btn_clickable(
+                            "剪辑校对",
+                            primitives::BtnSize::Md,
+                            primitives::BtnVariant::Primary,
+                        )
+                        .id(("lib-edit-btn", task_id as usize))
+                        .w(px(Theme::LIB_ACTION_W))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // 点击时才按 id 取出完整任务数据（渲染期不再克隆）
+                            let Some(record) = this
+                                .state
+                                .recent_tasks
+                                .iter()
+                                .find(|t| t.id == task_id)
+                                .cloned()
+                            else {
+                                return;
+                            };
+                            this.state.load_task(&record);
+                            this.trigger_extract_frame(cx);
+                            this.ensure_preview_proxy(cx);
+                            this.ensure_waveform(cx);
+                            cx.notify();
+                        })),
                     )
                     // 导出按钮：次级中性按钮（抬升底 + 描边），方角
                     .child(
-                        primitives::btn_clickable("导出字幕", primitives::BtnSize::Md, primitives::BtnVariant::Secondary)
-                            .id(("lib-export-btn", task_id as usize))
-                            .w(px(Theme::LIB_ACTION_W))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                // 同上：仅在真正导出时才取出该任务的字幕数据
-                                let Some(record) = this
-                                    .state
-                                    .recent_tasks
-                                    .iter()
-                                    .find(|t| t.id == task_id)
-                                    .cloned()
-                                else {
-                                    return;
-                                };
-                                let task_name = record.file_name.clone();
-                                // 列表记录不含字幕正文，导出时按 id 现取，避免为一次导出
-                                // 把整库字幕都留在内存里
-                                let segs = this
-                                    .state
-                                    .db
-                                    .load_task_segments(task_id)
-                                    .unwrap_or_default();
-                                // 与剪辑台同源：尊重用户在导出栏选的「原文 / 仅译文 / 双语」。
-                                // 此前这里写死用 `write_to_file` 自动判定，用户改成「仅译文」
-                                // 后从历史库导出仍会带上原文，两处行为不一致。
-                                let export_mode = this.state.export_mode_from_config();
-                                cx.spawn(async move |this, cx| {
-                                    if let Some(handle) = rfd::AsyncFileDialog::new()
-                                        .set_file_name(&format!("{}.srt", task_name))
-                                        .add_filter("SubRip Subtitle", &["srt"])
-                                        .save_file()
-                                        .await
-                                    {
-                                        let save_path = handle.path().to_path_buf();
-                                        if let Err(err) = SubtitleWriter::write_to_file_with_mode(
-                                            &segs,
-                                            &save_path,
-                                            "srt",
-                                            export_mode,
-                                        ) {
-                                            // 导出失败必须报出来：静默吞掉会让用户以为
-                                            // 文件已经写出去了，回头找不到又无从排查。
-                                            let _ = this.update(cx, |this, cx| {
-                                                this.state.status = ProcessStatus::Failed(format!(
-                                                    "导出失败: {err}"
-                                                ));
-                                                cx.notify();
-                                            });
-                                        }
+                        primitives::btn_clickable(
+                            "导出字幕",
+                            primitives::BtnSize::Md,
+                            primitives::BtnVariant::Secondary,
+                        )
+                        .id(("lib-export-btn", task_id as usize))
+                        .w(px(Theme::LIB_ACTION_W))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // 同上：仅在真正导出时才取出该任务的字幕数据
+                            let Some(record) = this
+                                .state
+                                .recent_tasks
+                                .iter()
+                                .find(|t| t.id == task_id)
+                                .cloned()
+                            else {
+                                return;
+                            };
+                            let task_name = record.file_name.clone();
+                            // 列表记录不含字幕正文，导出时按 id 现取，避免为一次导出
+                            // 把整库字幕都留在内存里
+                            let segs = this
+                                .state
+                                .db
+                                .load_task_segments(task_id)
+                                .unwrap_or_default();
+                            // 与剪辑台同源：尊重用户在导出栏选的「原文 / 仅译文 / 双语」。
+                            // 此前这里写死用 `write_to_file` 自动判定，用户改成「仅译文」
+                            // 后从历史库导出仍会带上原文，两处行为不一致。
+                            let export_mode = this.state.export_mode_from_config();
+                            // 导出格式跟随配置抽屉的「字幕输出格式」，不再写死 SRT：
+                            // 扩展名 / 对话框过滤器 / 写出格式三者同源（都来自
+                            // `writer::export_spec_for`），否则会出现「文件叫 .json、
+                            // 里面却是 SRT」这类不一致。
+                            let (fmt_ext, fmt_label) = export_spec_for(&this.state.output_format);
+                            // 与剪辑台同源：把主界面配置的字幕样式一并带进写出链路，
+                            // 否则 SRT/VTT/ASS 不会按「单行最大字数」折行，同一份字幕
+                            // 从剪辑台导出会折行、从历史库单条导出却不折，两处不一致。
+                            // 这里是 `cx.listener` 的同步闭包，`this.state` 可以直接取；
+                            // 拿到值再 move 进异步块（借用活不过 `'static` 的 task）。
+                            let style = this.state.config.subtitle_style.clone();
+                            cx.spawn(async move |this, cx| {
+                                if let Some(handle) = rfd::AsyncFileDialog::new()
+                                    .set_file_name(format!("{}.{}", task_name, fmt_ext))
+                                    .add_filter(fmt_label, &[fmt_ext])
+                                    .save_file()
+                                    .await
+                                {
+                                    let save_path = handle.path().to_path_buf();
+                                    // 带样式的入口：srt / vtt / ass 折行，其余格式
+                                    // （json / ttml / ttal / txt）在内部原样回落到
+                                    // `write_to_file_with_mode`，不会改变原有字节与可用性。
+                                    if let Err(err) = SubtitleWriter::write_to_file_with_style(
+                                        &segs,
+                                        &save_path,
+                                        fmt_ext,
+                                        export_mode,
+                                        &style,
+                                    ) {
+                                        // 导出失败必须报出来：静默吞掉会让用户以为
+                                        // 文件已经写出去了，回头找不到又无从排查。
+                                        let _ = this.update(cx, |this, cx| {
+                                            this.state.status =
+                                                ProcessStatus::Failed(format!("导出失败: {err}"));
+                                            cx.notify();
+                                        });
                                     }
-                                })
-                                .detach();
-                            })),
+                                }
+                            })
+                            .detach();
+                        })),
                     )
                     // 删除按钮：危险操作按钮原语，卡片级尺寸（32px 圆角块）
                     .child({
@@ -757,7 +798,7 @@ fn format_file_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_file_size;
+    use super::{export_spec_for, format_file_size};
 
     #[test]
     fn file_size_formatting_matches_previous_rendering() {
@@ -768,5 +809,30 @@ mod tests {
         assert_eq!(format_file_size(66_359), "65 KB");
         assert_eq!(format_file_size(1024), "1 KB");
         assert_eq!(format_file_size(0), "0 KB");
+    }
+
+    /// 回归（旧 bug）：批量「导出选中」曾把扩展名与写出格式**双双写死成 SRT**，
+    /// 用户在配置里选了 JSON，批量导出出来的仍是 `.srt`。
+    /// 现在批量导出与单条导出共用同一条构造路径：`export_spec_for(配置值)`
+    /// 同时决定文件名后缀与 `write_to_file_with_mode` 的格式参数。
+    /// 这里断言这份「构造路径」与配置项一致、且扩展名等于格式名，
+    /// 也就是批量导出循环里每个文件的写法都能被 `writer` 接受。
+    #[test]
+    fn batch_export_extension_follows_selected_format() {
+        // 与 `export_selected_library_tasks` 内部逐字一致的构造：扩展名与格式名同源
+        for fmt in ["srt", "ass", "vtt", "txt", "json", "ttml", "ttal"] {
+            let (ext, label) = export_spec_for(fmt);
+            assert_eq!(ext, fmt, "{fmt} 的批量导出扩展名应与格式名一致");
+            assert!(!label.is_empty(), "{fmt} 的批量导出需要对话框过滤器名");
+            // 旧实现：out = dir.join(format!("{stem}.srt")) + write(..., "srt", ...)
+            // 因此「选了 json 却得到 .srt」；现在两者都取自同一份 spec。
+            let out = std::path::Path::new("dir").join(format!("{}.{}", "clip", ext));
+            assert_eq!(
+                out.extension().and_then(|e| e.to_str()),
+                Some(fmt),
+                "{fmt} 的批量导出文件名后缀不对: {}",
+                out.display()
+            );
+        }
     }
 }

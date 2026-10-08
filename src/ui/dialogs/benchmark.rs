@@ -3,14 +3,18 @@
 use gpui::prelude::*;
 use gpui::*;
 
-use crate::utils::time::format_duration_short;
 use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::types::BenchmarkDialogInfo;
 use super::super::MainWindow;
+use crate::utils::time::format_duration_short;
 
 impl MainWindow {
-    pub(crate) fn render_benchmark_dialog(&mut self, info: BenchmarkDialogInfo, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_benchmark_dialog(
+        &mut self,
+        info: BenchmarkDialogInfo,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let m = &info.metrics;
         let dur_str = format_duration_short(m.video_duration);
 
@@ -33,7 +37,9 @@ impl MainWindow {
                                     .items_center()
                                     .gap(px(Theme::SPACE_2))
                                     .child(primitives::stat_dot(Theme::accent_mint()))
-                                    .child(primitives::page_title("全流程性能统计与基准 (Benchmark)")),
+                                    .child(primitives::page_title(
+                                        "全流程性能统计与基准 (Benchmark)",
+                                    )),
                             )
                             .child(
                                 // 圆形关闭键：走 icon_close_btn 原语，与完成弹窗同源
@@ -59,31 +65,48 @@ impl MainWindow {
                             .border_color(Theme::border_mid())
                             .gap(px(Theme::SPACE_2))
                             .child(Self::render_metric_row(
-                                &format!("1. {}", m.audio_process_name.as_deref().unwrap_or("FFmpeg 音频处理")),
+                                &format!(
+                                    "1. {}",
+                                    m.audio_process_name.as_deref().unwrap_or("FFmpeg 音频处理")
+                                ),
                                 m.ffmpeg_audio_sec,
                                 m.total_elapsed_sec,
                                 Theme::text_secondary(),
                             ))
                             .child(Self::render_metric_row(
-                                &format!("2. {}", m.vad_engine_name.as_deref().unwrap_or("Silero VAD 语音检测")),
+                                &format!(
+                                    "2. {}",
+                                    m.vad_engine_name
+                                        .as_deref()
+                                        .unwrap_or("Silero VAD 语音检测")
+                                ),
                                 m.vad_sec,
                                 m.total_elapsed_sec,
                                 Theme::accent_blue(),
                             ))
                             .child(Self::render_metric_row(
-                                &format!("3. {}", m.asr_engine_name.as_deref().unwrap_or("Whisper 核心转写")),
+                                &format!(
+                                    "3. {}",
+                                    m.asr_engine_name.as_deref().unwrap_or("Whisper 核心转写")
+                                ),
                                 m.whisper_sec,
                                 m.total_elapsed_sec,
                                 Theme::accent_mint(),
                             ))
                             .child(Self::render_metric_row(
-                                format!("4. {}", m.polish_engine_name.as_deref().unwrap_or("标点/AI润色")),
+                                format!(
+                                    "4. {}",
+                                    m.polish_engine_name.as_deref().unwrap_or("标点/AI润色")
+                                ),
                                 m.qwen_sec,
                                 m.total_elapsed_sec,
                                 Theme::text_secondary(),
                             ))
                             .child(Self::render_metric_row(
-                                &format!("5. {}", m.export_name.as_deref().unwrap_or("字幕生成与写出")),
+                                &format!(
+                                    "5. {}",
+                                    m.export_name.as_deref().unwrap_or("字幕生成与写出")
+                                ),
                                 m.srt_export_sec,
                                 m.total_elapsed_sec,
                                 Theme::text_muted(),
@@ -114,7 +137,10 @@ impl MainWindow {
                                             } else if m.total_elapsed_sec < 0.001 {
                                                 "< 1 ms".to_string()
                                             } else if m.total_elapsed_sec < 0.1 {
-                                                format!("{:.0} ms", (m.total_elapsed_sec * 1000.0).round())
+                                                format!(
+                                                    "{:.0} ms",
+                                                    (m.total_elapsed_sec * 1000.0).round()
+                                                )
                                             } else {
                                                 format!("{:.1} 秒", m.total_elapsed_sec)
                                             }),
@@ -122,19 +148,20 @@ impl MainWindow {
                             ),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .child(
-                                primitives::btn_clickable("知道了", primitives::BtnSize::Md, primitives::BtnVariant::Primary)
-                                    .id("benchmark-dialog-confirm-btn")
-                                    .px(px(Theme::SPACE_5))
-                                    .rounded_full()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.benchmark_dialog = None;
-                                        cx.notify();
-                                    })),
-                            ),
+                        div().flex().justify_end().child(
+                            primitives::btn_clickable(
+                                "知道了",
+                                primitives::BtnSize::Md,
+                                primitives::BtnVariant::Primary,
+                            )
+                            .id("benchmark-dialog-confirm-btn")
+                            .px(px(Theme::SPACE_5))
+                            .rounded_full()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.benchmark_dialog = None;
+                                cx.notify();
+                            })),
+                        ),
                     ),
             )
     }

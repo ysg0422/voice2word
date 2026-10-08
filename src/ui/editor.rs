@@ -5,17 +5,18 @@
 //! 3. 字幕属性检查器 (支持实时修改错字、增删标点、时间微调、拆分与合并)
 //! 4. 专业多轨时间轴 (时间刻度标尺、红/青色垂直指针游标、视频轨与字幕胶囊块)
 
+use super::actions::translated_out_count;
+use super::primitives;
+use super::theme::Theme;
+use super::{apply_line_edit, EditorExportFormat, EditorSubtitlePanel, MainWindow};
+use crate::app::state::{ProcessStatus, WorkspaceTab};
+use crate::subtitle::ExportMode;
+use crate::utils::time::{format_duration_short, seconds_to_hms, seconds_to_timestamp_short};
 use gpui::prelude::*;
 use gpui::*;
 use image::{Frame, ImageBuffer, Rgba};
 use smallvec::SmallVec;
 use std::sync::Arc;
-use crate::app::state::{WorkspaceTab, ProcessStatus};
-use crate::utils::time::{format_duration_short, seconds_to_hms, seconds_to_timestamp_short};
-use super::primitives;
-use super::theme::Theme;
-use super::{apply_line_edit, EditorExportFormat, EditorSubtitlePanel, MainWindow};
-use crate::subtitle::ExportMode;
 
 /// 预设 → 预览配色 `(文字色, 底色, 描边色)`。
 ///
@@ -41,7 +42,11 @@ fn subtitle_preset_colors(preset: &str) -> (gpui::Rgba, gpui::Rgba, gpui::Rgba) 
             Theme::transparent(),
         ),
         // 白字黑影（默认）：白字 + 浅底色近似投影
-        _ => (Theme::text_subtitle(), rgba(0x00000080), Theme::transparent()),
+        _ => (
+            Theme::text_subtitle(),
+            rgba(0x00000080),
+            Theme::transparent(),
+        ),
     }
 }
 
@@ -88,19 +93,16 @@ const EDITOR_STACK_BELOW_W: f32 = 940.0;
 /// 上下堆叠布局下视频监视器固定占用的高度（监视器自身最少需要 36+180+52=268）。
 const EDITOR_STACK_MONITOR_H: f32 = 320.0;
 
-/// 上下堆叠布局下「多语言对照表」的固定高度。
-///
-/// 此时面板外层已可纵向滚动，表格若继续用 `flex_1` 会在自动高度的滚动容器里塌成 0。
-
 /// 「多语言对照表」的列宽。表头与数据行共用同一组常量，避免两处各写一份后悄悄漂移。
 ///
 /// 表内最小横向占用 = 左右内边距 6×2 + 序号 24 + 起止时间 68×2 + 说话人 64
 /// + 原文/译文两列各 46 的下限 + 5 处 5px 间距 = 355px（两列文本再窄就只剩省略号）。
-/// 面板宽度减去正文与卡片的两层 12px 内边距后若不足 355，表内单元格就会互相挤压；
-/// 因此 `EDITOR_RIGHT_MIN_W`(440) 与导航栏 180 共同保证窗口 600px 起表格都有 360px 以上。
+///   面板宽度减去正文与卡片的两层 12px 内边距后若不足 355，表内单元格就会互相挤压；
+///   因此 `EDITOR_RIGHT_MIN_W`(440) 与导航栏 180 共同保证窗口 600px 起表格都有 360px 以上。
 ///
 /// 这几列是本表唯一的「固定开销」，它们每省 1px，原文与译文两列就能各多分到 0.5px
 /// （剩余宽度由两列 `flex_1` 均分），所以压缩要压在这里：
+///
 /// - 时间列 80→68：显示格式同步压到 `hh:mm:ss.t`（10 字符）。毫秒那一位扫读无用，
 ///   却是把时间列撑到 80 的唯一原因，白白吃掉两列文本的空间——窄面板下译文最先被截。
 /// - 序号 28→24、说话人保持 64（「说话人 N」+ 内边距下限）、内边距 8→6、列间距 6→5。
@@ -159,110 +161,106 @@ impl MainWindow {
             .w_full()
             .h_full()
             .overflow_hidden()
-            .child(
-                if is_processing {
-                    div()
-                        .w_full()
-                        .h(px(Theme::BANNER_H))
-                        .px(px(Theme::PAGE_PAD))
-                        .bg(Theme::tint_mint_soft())
-                        .border_b_1()
-                        .border_color(Theme::tint_mint_border())
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(primitives::stat_dot_sm(Theme::accent_mint()))
-                                .child(
-                                    div()
-                                        .text_size(px(Theme::TEXT_BODY))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(Theme::accent_mint())
-                                        .child("语音转写进行中，完成后自动同步到剪辑工作台"),
-                                ),
-                        )
-                        .child(
-                            // 标头小胶囊走 primitives::btn_sm_outline
-                            primitives::btn_sm_outline("查看进度")
-                                .id("switch-to-generator-banner-btn")
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(Theme::text_primary())
-                                .hover(|s| s.bg(Theme::bg_hover()))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.state.active_tab = WorkspaceTab::Generate;
-                                    cx.notify();
-                                })),
-                        )
-                } else {
-                    div()
-                }
-            )
-            .child(
-                if stacked {
-                    // 窄窗口降级：视频监视器在上、字幕配置在下，两列各占整行宽度
-                    div()
-                        .id("editor-main-stacked")
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .w_full()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .w_full()
-                                .flex_none()
-                                .h(px(EDITOR_STACK_MONITOR_H))
-                                .border_b_1()
-                                .border_color(Theme::border())
-                                .overflow_hidden()
-                                .child(self.render_video_monitor(cx)),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .flex_1()
-                                .min_h_0()
-                                .overflow_hidden()
-                                .child(self.render_subtitle_inspector(true, cx)),
-                        )
-                } else {
-                    div()
-                        .id("editor-main-split")
-                        .flex()
-                        .flex_row()
-                        .flex_1()
-                        .w_full()
-                        .overflow_hidden()
-                        // 左侧：视频监视器 (二分之左 50%)
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .h_full()
-                                .min_w(px(EDITOR_LEFT_MIN_W))
-                                .border_r_1()
-                                .border_color(Theme::border())
-                                .overflow_hidden()
-                                .child(self.render_video_monitor(cx)),
-                        )
-                        // 右侧：字幕配置与多语言列表 (二分之右 50%)
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .h_full()
-                                .min_w(px(EDITOR_RIGHT_MIN_W))
-                                .overflow_hidden()
-                                .child(self.render_subtitle_inspector(false, cx)),
-                        )
-                },
-            )
+            .child(if is_processing {
+                div()
+                    .w_full()
+                    .h(px(Theme::BANNER_H))
+                    .px(px(Theme::PAGE_PAD))
+                    .bg(Theme::tint_mint_soft())
+                    .border_b_1()
+                    .border_color(Theme::tint_mint_border())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(primitives::stat_dot_sm(Theme::accent_mint()))
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(Theme::accent_mint())
+                                    .child("语音转写进行中，完成后自动同步到剪辑工作台"),
+                            ),
+                    )
+                    .child(
+                        // 标头小胶囊走 primitives::btn_sm_outline
+                        primitives::btn_sm_outline("查看进度")
+                            .id("switch-to-generator-banner-btn")
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(Theme::text_primary())
+                            .hover(|s| s.bg(Theme::bg_hover()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.active_tab = WorkspaceTab::Generate;
+                                cx.notify();
+                            })),
+                    )
+            } else {
+                div()
+            })
+            .child(if stacked {
+                // 窄窗口降级：视频监视器在上、字幕配置在下，两列各占整行宽度
+                div()
+                    .id("editor-main-stacked")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .w_full()
+                            .flex_none()
+                            .h(px(EDITOR_STACK_MONITOR_H))
+                            .border_b_1()
+                            .border_color(Theme::border())
+                            .overflow_hidden()
+                            .child(self.render_video_monitor(cx)),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .child(self.render_subtitle_inspector(true, cx)),
+                    )
+            } else {
+                div()
+                    .id("editor-main-split")
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .w_full()
+                    .overflow_hidden()
+                    // 左侧：视频监视器 (二分之左 50%)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .h_full()
+                            .min_w(px(EDITOR_LEFT_MIN_W))
+                            .border_r_1()
+                            .border_color(Theme::border())
+                            .overflow_hidden()
+                            .child(self.render_video_monitor(cx)),
+                    )
+                    // 右侧：字幕配置与多语言列表 (二分之右 50%)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .h_full()
+                            .min_w(px(EDITOR_RIGHT_MIN_W))
+                            .overflow_hidden()
+                            .child(self.render_subtitle_inspector(false, cx)),
+                    )
+            })
             // 底部：时间轴 (全宽横跨)
             .child(self.render_multitrack_timeline(cx))
     }
@@ -306,19 +304,17 @@ impl MainWindow {
                                     .text_color(Theme::text_primary())
                                     .child("视频预览"),
                             )
-                            .child(
-                                if is_playing {
-                                    // 瞬时状态胶囊走 primitives::tag_tinted
-                                    primitives::tag_tinted(
-                                        "播放中",
-                                        Theme::tint_mint_soft(),
-                                        Theme::tint_mint_border(),
-                                        Theme::accent_mint(),
-                                    )
-                                } else {
-                                    div()
-                                }
-                            ),
+                            .child(if is_playing {
+                                // 瞬时状态胶囊走 primitives::tag_tinted
+                                primitives::tag_tinted(
+                                    "播放中",
+                                    Theme::tint_mint_soft(),
+                                    Theme::tint_mint_border(),
+                                    Theme::accent_mint(),
+                                )
+                            } else {
+                                div()
+                            }),
                     )
                     .child(
                         // 标头小胶囊走 primitives::btn_sm_outline
@@ -369,33 +365,31 @@ impl MainWindow {
                                     .flex()
                                     .justify_center()
                                     .px_6()
-                                    .child(
-                                        if let Some(seg) = active_seg {
-                                            div()
-                                                // 固定宽度（不是 max_w）：拖动把手时画面上的
-                                                // 字幕框要跟着同宽变化，而不是只有超长句才受影响。
-                                                // 短句在框内居中，长句按此宽度折行——与编辑卡的
-                                                // 预览框是同一个宽度值，两者同步增减。
-                                                .w(px(box_w))
-                                                .min_w_0()
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_md()
-                                                .bg(bg)
-                                                .border_1()
-                                                .border_color(border)
-                                                .text_size(px(font_px))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(fg)
-                                                .text_align(TextAlign::Center)
-                                                .line_height(px(font_px * style.line_spacing))
-                                                // 预览与导出同源：按当前导出内容模式渲染，
-                                                // 译好之后在监视器里就能直接看到译文/双语。
-                                                .child(seg.export_text(export_mode))
-                                        } else {
-                                            div()
-                                        }
-                                    )
+                                    .child(if let Some(seg) = active_seg {
+                                        div()
+                                            // 固定宽度（不是 max_w）：拖动把手时画面上的
+                                            // 字幕框要跟着同宽变化，而不是只有超长句才受影响。
+                                            // 短句在框内居中，长句按此宽度折行——与编辑卡的
+                                            // 预览框是同一个宽度值，两者同步增减。
+                                            .w(px(box_w))
+                                            .min_w_0()
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_md()
+                                            .bg(bg)
+                                            .border_1()
+                                            .border_color(border)
+                                            .text_size(px(font_px))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(fg)
+                                            .text_align(TextAlign::Center)
+                                            .line_height(px(font_px * style.line_spacing))
+                                            // 预览与导出同源：按当前导出内容模式渲染，
+                                            // 译好之后在监视器里就能直接看到译文/双语。
+                                            .child(seg.export_text(export_mode))
+                                    } else {
+                                        div()
+                                    })
                             })
                     }),
             )
@@ -411,121 +405,100 @@ impl MainWindow {
                     .items_center()
                     .justify_between()
                     // 左侧占位 (保证正中间对齐)
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .justify_start(),
-                    )
+                    .child(div().flex_1().flex().items_center().justify_start())
                     // 中间：iOS 紧凑媒体控制条 (居中 + 放大主要播放按钮)
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .bg(Theme::bg_input())
-                                    .p(px(Theme::CONTROL_INSET))
-                                    .rounded_full()
-                                    .border_1()
-                                    .border_color(Theme::border_mid())
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(Theme::CTRL_GAP_TIGHT))
-                                    // 上一句
-                                    .child(
-                                        primitives::pill_btn("上句")
-                                            .id("ctrl-prev-seg")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.jump_prev_segment(cx);
-                                            })),
+                        div().flex().items_center().justify_center().child(
+                            div()
+                                .bg(Theme::bg_input())
+                                .p(px(Theme::CONTROL_INSET))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(Theme::border_mid())
+                                .flex()
+                                .items_center()
+                                .gap(px(Theme::CTRL_GAP_TIGHT))
+                                // 上一句
+                                .child(primitives::pill_btn("上句").id("ctrl-prev-seg").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.jump_prev_segment(cx);
+                                    }),
+                                ))
+                                // 快退 1 秒
+                                .child(primitives::pill_btn("-1s").id("ctrl-step-back").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.halt_preview_playback();
+                                        let target = (this.state.current_time - 1.0).max(0.0);
+                                        this.state.seek_to(target);
+                                        this.trigger_extract_frame(cx);
+                                        cx.notify();
+                                    }),
+                                ))
+                                // 实时播放 / 暂停 (高亮突出放大按钮)
+                                .child(
+                                    primitives::pill_btn_solid(
+                                        if is_playing { "暂停" } else { "播放" },
+                                        if is_playing {
+                                            Theme::accent_orange()
+                                        } else {
+                                            Theme::accent_mint()
+                                        },
                                     )
-                                    // 快退 1 秒
-                                    .child(
-                                        primitives::pill_btn("-1s")
-                                            .id("ctrl-step-back")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.halt_preview_playback();
-                                                let target = (this.state.current_time - 1.0).max(0.0);
-                                                this.state.seek_to(target);
-                                                this.trigger_extract_frame(cx);
-                                                cx.notify();
-                                            })),
-                                    )
-                                    // 实时播放 / 暂停 (高亮突出放大按钮)
-                                    .child(
-                                        primitives::pill_btn_solid(
-                                            if is_playing { "暂停" } else { "播放" },
-                                            if is_playing { Theme::accent_orange() } else { Theme::accent_mint() },
-                                        )
-                                            .id("ctrl-play-pause")
-                                            .px(px(Theme::SPACE_6))
-                                            .text_size(px(Theme::TEXT_BODY_LG))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_play_preview(cx);
-                                            })),
-                                    )
-                                    // 快进 1 秒
-                                    .child(
-                                        primitives::pill_btn("+1s")
-                                            .id("ctrl-step-fwd")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.halt_preview_playback();
-                                                let target = this.state.current_time + 1.0;
-                                                this.state.seek_to(target);
-                                                this.trigger_extract_frame(cx);
-                                                cx.notify();
-                                            })),
-                                    )
-                                    // 下一句
-                                    .child(
-                                        primitives::pill_btn("下句")
-                                            .id("ctrl-next-seg")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.jump_next_segment(cx);
-                                            })),
-                                    ),
-                            ),
+                                    .id("ctrl-play-pause")
+                                    .px(px(Theme::SPACE_6))
+                                    .text_size(px(Theme::TEXT_BODY_LG))
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.toggle_play_preview(cx);
+                                        },
+                                    )),
+                                )
+                                // 快进 1 秒
+                                .child(primitives::pill_btn("+1s").id("ctrl-step-fwd").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.halt_preview_playback();
+                                        let target = this.state.current_time + 1.0;
+                                        this.state.seek_to(target);
+                                        this.trigger_extract_frame(cx);
+                                        cx.notify();
+                                    }),
+                                ))
+                                // 下一句
+                                .child(primitives::pill_btn("下句").id("ctrl-next-seg").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.jump_next_segment(cx);
+                                    }),
+                                )),
+                        ),
                     )
                     // 右侧时间码 (iOS 胶囊卡片，右对齐)
                     .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_full()
-                                    .bg(Theme::bg_input())
-                                    .border_1()
-                                    .border_color(Theme::border_mid())
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .font_family("Consolas")
-                                    .text_size(px(Theme::TEXT_SMALL))
-                                    .child(
-                                        div()
-                                            .text_color(Theme::accent_mint())
-                                            .font_weight(FontWeight::BOLD)
-                                            .child(seconds_to_hms(cur_time)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(Theme::text_muted())
-                                            .child("/"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(Theme::text_secondary())
-                                            .child(seconds_to_hms(tot_time)),
-                                    ),
-                            ),
+                        div().flex_1().flex().items_center().justify_end().child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_full()
+                                .bg(Theme::bg_input())
+                                .border_1()
+                                .border_color(Theme::border_mid())
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .font_family("Consolas")
+                                .text_size(px(Theme::TEXT_SMALL))
+                                .child(
+                                    div()
+                                        .text_color(Theme::accent_mint())
+                                        .font_weight(FontWeight::BOLD)
+                                        .child(seconds_to_hms(cur_time)),
+                                )
+                                .child(div().text_color(Theme::text_muted()).child("/"))
+                                .child(
+                                    div()
+                                        .text_color(Theme::text_secondary())
+                                        .child(seconds_to_hms(tot_time)),
+                                ),
+                        ),
                     ),
             )
     }
@@ -542,9 +515,7 @@ impl MainWindow {
             let (frame_w, frame_h) = (frame.width, frame.height);
             let cached_hit = match self.cached_live_image.as_ref() {
                 Some((version, width, height, cached_img))
-                    if *version == live_version
-                        && *width == frame_w
-                        && *height == frame_h =>
+                    if *version == live_version && *width == frame_w && *height == frame_h =>
                 {
                     Some(cached_img.clone())
                 }
@@ -559,9 +530,10 @@ impl MainWindow {
                     };
                     match ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(frame_w, frame_h, data) {
                         Some(buffer) => {
-                            let new_img = Arc::new(RenderImage::new(
-                                SmallVec::from_elem(Frame::new(buffer), 1),
-                            ));
+                            let new_img = Arc::new(RenderImage::new(SmallVec::from_elem(
+                                Frame::new(buffer),
+                                1,
+                            )));
                             self.cached_live_image =
                                 Some((live_version, frame_w, frame_h, new_img.clone()));
                             Some(new_img)
@@ -590,31 +562,21 @@ impl MainWindow {
                 .justify_center()
                 .child(img(frame_path.clone()).size_full())
         } else if self.state.selected_file.is_some() {
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap_1p5()
-                .child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .text_color(Theme::accent_on_media())
-                        .child("正在同步视频画面..."),
-                )
+            div().flex().flex_col().items_center().gap_1p5().child(
+                div()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .text_color(Theme::accent_on_media())
+                    .child("正在同步视频画面..."),
+            )
         } else {
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap_1p5()
-                .child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        // 监视器视口在任何主题下都是深底，空态提示也在深底上，
-                        // 必须用媒体区 token；用 text_muted 会在浅色主题下变成深字压深底
-                        .text_color(Theme::text_on_media())
-                        .child("拖动时间轴或点击播放，画面将在此实时呈现"),
-                )
+            div().flex().flex_col().items_center().gap_1p5().child(
+                div()
+                    .text_size(px(Theme::TEXT_BODY))
+                    // 监视器视口在任何主题下都是深底，空态提示也在深底上，
+                    // 必须用媒体区 token；用 text_muted 会在浅色主题下变成深字压深底
+                    .text_color(Theme::text_on_media())
+                    .child("拖动时间轴或点击播放，画面将在此实时呈现"),
+            )
         }
     }
 
@@ -628,7 +590,9 @@ impl MainWindow {
         // 搜索命中的行下标按需重算（键不变时零成本复用），虚拟列表据此渲染
         self.refresh_subtitle_filter();
         let sel_idx = self.state.selected_segment_index;
-        let cur_seg = sel_idx.and_then(|idx| self.state.segments.iter().find(|s| s.index == idx)).cloned();
+        let cur_seg = sel_idx
+            .and_then(|idx| self.state.segments.iter().find(|s| s.index == idx))
+            .cloned();
         let cur_text = self.state.editing_text.clone();
         let panel = self.subtitle_panel;
 
@@ -988,8 +952,7 @@ impl MainWindow {
                     // 预览在同一张卡上，改字 / 调字号都是即时的。翻译面板不重复放编辑卡：
                     // 面板标头已能切回样式面板，两处各放一份只会让人分不清哪份生效。
                     .child(
-                        if panel == EditorSubtitlePanel::Style && cur_seg.is_some() {
-                            let seg = cur_seg.as_ref().unwrap();
+                        if let Some(seg) = cur_seg.as_ref().filter(|_| panel == EditorSubtitlePanel::Style) {
                             let seg_idx = seg.index;
                             let start_ts = seconds_to_timestamp_short(seg.start);
                             let end_ts = seconds_to_timestamp_short(seg.end);
@@ -1769,7 +1732,7 @@ impl MainWindow {
                                                             .min_w(px(SUBTITLE_TABLE_COL_TEXT_MIN_W))
                                                             .text_size(px(Theme::TEXT_BODY_LG))
                                                             .font_weight(if is_selected { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
-                                                            .text_color(if is_selected { Theme::text_primary() } else { Theme::text_primary() })
+                                                            .text_color(Theme::text_primary())
                                                             .truncate()
                                                             .child(raw_text),
                                                     )
@@ -1868,19 +1831,25 @@ impl MainWindow {
                 }
                 this.drag_preview_box(event.position.x, cx);
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.end_preview_box_drag();
-                cx.notify();
-            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.end_preview_box_drag();
+                    cx.notify();
+                }),
+            )
             // 在行**外**松手也要收尾。GPUI 的 `on_mouse_up` 同样要求指针落在元素内，
             // 若用户把指针拖出行外才松手，上面的 handler 收不到，`preview_drag` 会一直
             // 挂着——预览行从此恒亮「拖拽中」描边，且宽度卡在半途的中间值。
             // `on_mouse_up_out` 走捕获阶段、专在「松手时指针不在元素内」时触发，用它兜底。
             // 没有拖拽会话时 `end_preview_box_drag` 是空操作，因此它在任何别处松手都安全。
-            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.end_preview_box_drag();
-                cx.notify();
-            }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.end_preview_box_drag();
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .flex()
@@ -1992,52 +1961,62 @@ impl MainWindow {
             .flex()
             .flex_col()
             .gap_2()
-            .child(
-                if is_open {
-                    div()
-                        .id("export-format-menu")
-                        .rounded_lg()
-                        .bg(Theme::bg_card())
-                        .border_1()
-                        .border_color(Theme::border())
-                        .p_1()
-                        .max_h(px(Theme::DROPDOWN_MAX_H))
-                        .overflow_y_scroll()
-                        .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .children(EditorExportFormat::all().iter().enumerate().map(|(idx, fmt)| {
-                            let fmt = *fmt;
-                            let is_selected = fmt == cur_fmt;
-                            div()
-                                .id(("export-fmt-opt", idx))
-                                .px_2p5()
-                                .py_1()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .bg(if is_selected {
-                                    Theme::tint_mint_badge()
-                                } else {
-                                    Theme::transparent()
-                                })
-                                .hover(|s| s.bg(Theme::bg_hover()))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.editor_export_format = fmt;
-                                    this.is_export_dropdown_open = false;
-                                    cx.notify();
-                                }))
-                                .child(
-                                    div()
-                                        .text_size(px(Theme::TEXT_BODY))
-                                        .font_weight(if is_selected { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
-                                        .text_color(if is_selected { Theme::accent_mint() } else { Theme::text_primary() })
-                                        .child(fmt.label()),
-                                )
-                                .child(
-                                    if is_selected {
+            .child(if is_open {
+                div()
+                    .id("export-format-menu")
+                    .rounded_lg()
+                    .bg(Theme::bg_card())
+                    .border_1()
+                    .border_color(Theme::border())
+                    .p_1()
+                    .max_h(px(Theme::DROPDOWN_MAX_H))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .children(
+                        EditorExportFormat::all()
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, fmt)| {
+                                let fmt = *fmt;
+                                let is_selected = fmt == cur_fmt;
+                                div()
+                                    .id(("export-fmt-opt", idx))
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(if is_selected {
+                                        Theme::tint_mint_badge()
+                                    } else {
+                                        Theme::transparent()
+                                    })
+                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.editor_export_format = fmt;
+                                        this.is_export_dropdown_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_size(px(Theme::TEXT_BODY))
+                                            .font_weight(if is_selected {
+                                                FontWeight::SEMIBOLD
+                                            } else {
+                                                FontWeight::NORMAL
+                                            })
+                                            .text_color(if is_selected {
+                                                Theme::accent_mint()
+                                            } else {
+                                                Theme::text_primary()
+                                            })
+                                            .child(fmt.label()),
+                                    )
+                                    .child(if is_selected {
                                         div()
                                             .text_size(px(Theme::TEXT_CAPTION))
                                             .font_weight(FontWeight::BOLD)
@@ -2045,13 +2024,12 @@ impl MainWindow {
                                             .child("[当前]")
                                     } else {
                                         div()
-                                    }
-                                )
-                        }))
-                } else {
-                    div().id("export-format-menu-closed")
-                }
-            )
+                                    })
+                            }),
+                    )
+            } else {
+                div().id("export-format-menu-closed")
+            })
             // 导出内容：原文 / 仅译文 / 双语。对字幕与剪辑工程文件统一生效。
             .child(
                 div()
@@ -2101,7 +2079,11 @@ impl MainWindow {
                             .rounded(px(Theme::RADIUS_LG))
                             .bg(Theme::bg_card())
                             .border_1()
-                            .border_color(if is_open { Theme::accent_mint() } else { Theme::border() })
+                            .border_color(if is_open {
+                                Theme::accent_mint()
+                            } else {
+                                Theme::border()
+                            })
                             .cursor_pointer()
                             .hover(|s| s.border_color(Theme::accent_mint()))
                             .flex()
@@ -2253,11 +2235,19 @@ impl MainWindow {
         let mode = self.state.translate_mode;
         let target = self.state.translate_target_lang.clone();
         let is_translating = self.state.is_translating;
-        let progress = self.state.translate_progress.clamp(0.0, 1.0) as f32;
+        let progress = self.state.translate_progress.clamp(0.0, 1.0);
         let status = self.state.translate_status_msg.clone();
-        let done = self.state.translated_count_for(&target);
+        // 「已完成」只认**实际译出**：`has_translation()` 要求译文非空（忽略空串/纯空白），
+        // 再叠加目标语言匹配。只要还有译文为空/纯空白（哪怕引擎给它打了
+        // `translation_lang`），这里就不会凑满 total，界面绝不会显示「已全部翻译」。
+        let done = translated_out_count(&self.state.segments, &target);
+        // 分母只算**源文非空**的句子（与引擎的可译口径、与收尾文案一致）：
+        // 空源句（静音段/纯空白行）永远不会有译文，计进分母就会永远差几句。
+        let expected = super::actions::expected_translation_count(&self.state.segments);
         let total = self.state.segments.len();
-        let can_run = total > 0 && !is_translating;
+        // 可点的前提是**有可翻译的文本**：整片都是空源句时点下去只会
+        // 得到「没有可翻译的文本」，不如直接置灰。
+        let can_run = expected > 0 && !is_translating;
         // 已带译文、但**不是**当前目标语言的句数。
         // 有了它才能解释「为什么按钮不是『重新翻译』」：用户切换目标语言后
         // 旧译文仍然在，但当前语言一句都没有——不提示的话，界面看起来像
@@ -2312,7 +2302,14 @@ impl MainWindow {
                     .truncate()
                     .child(if mode == TranslateMode::OnlineApi {
                         let model = self.state.config.translate.api_model.clone();
-                        if self.state.config.translate.effective_api_key().trim().is_empty() {
+                        if self
+                            .state
+                            .config
+                            .translate
+                            .effective_api_key()
+                            .trim()
+                            .is_empty()
+                        {
                             "未配置 API Key，请在「性能设置」中填写".to_string()
                         } else {
                             format!("模型 {}", model)
@@ -2326,7 +2323,8 @@ impl MainWindow {
                         if miss_model {
                             "未下载 Qwen 模型，请在「性能设置 → 模型与组件」下载".to_string()
                         } else if miss_cli {
-                            "未下载 llama.cpp 推理程序，请在「性能设置 → 模型与组件」下载".to_string()
+                            "未下载 llama.cpp 推理程序，请在「性能设置 → 模型与组件」下载"
+                                .to_string()
                         } else {
                             "本地 Qwen，无需密钥".to_string()
                         }
@@ -2371,22 +2369,20 @@ impl MainWindow {
             .gap_2()
             // 机翻难免有出入：选中某句后可直接订正译文（走系统输入框，支持中文输入法）。
             // 放在翻译卡里，是因为用户就是在这一面板发现某句译得不对。
-            .child(
-                if self.state.selected_segment_index.is_some() {
-                    primitives::btn_clickable(
-                        "改译文",
-                        primitives::BtnSize::Sm,
-                        primitives::BtnVariant::Secondary,
-                    )
-                    .id("btn-translate-edit-selected")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.prompt_edit_translation(cx);
-                    }))
-                    .into_any_element()
-                } else {
-                    div().into_any_element()
-                },
-            )
+            .child(if self.state.selected_segment_index.is_some() {
+                primitives::btn_clickable(
+                    "改译文",
+                    primitives::BtnSize::Sm,
+                    primitives::BtnVariant::Secondary,
+                )
+                .id("btn-translate-edit-selected")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.prompt_edit_translation(cx);
+                }))
+                .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(
                 div()
                     .id("btn-translate-subtitles")
@@ -2415,9 +2411,10 @@ impl MainWindow {
                     })
                     .child(if is_translating {
                         "翻译中…".to_string()
-                    } else if done == total && total > 0 {
-                        // 当前语言全部译完：再点只会被引擎的增量逻辑判为「无需翻译」，
-                        // 文案说清楚，避免用户以为按钮失灵。
+                    } else if expected > 0 && done == expected {
+                        // 当前语言应译的句子全部译出（`done` 只数**实际译出**的句子，
+                        // 空/纯空白译文永远凑不满）：再点只会被引擎的增量
+                        // 逻辑判为「无需翻译」，文案说清楚，避免用户以为按钮失灵。
                         "已全部翻译".to_string()
                     } else if done > 0 {
                         // 部分完成（含取消后继续、或补译新句）——增量翻译，
@@ -2434,22 +2431,20 @@ impl MainWindow {
             // 翻译中才出现的「取消」：离线 Qwen 模型路径不对、在线 API 长时间无响应时，
             // 此前只能强杀进程——按钮变成灰的「翻译中…」且不可点，是条纯死路。
             // 取消只需置位一个 AtomicBool，引擎在**每个批次之间**检查，最多损失当前批。
-            .child(
-                if is_translating {
-                    primitives::btn_clickable(
-                        "取消",
-                        primitives::BtnSize::Sm,
-                        primitives::BtnVariant::Secondary,
-                    )
-                    .id("btn-translate-cancel")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.cancel_llm_translation(cx);
-                    }))
-                    .into_any_element()
-                } else {
-                    div().into_any_element()
-                },
-            )
+            .child(if is_translating {
+                primitives::btn_clickable(
+                    "取消",
+                    primitives::BtnSize::Sm,
+                    primitives::BtnVariant::Secondary,
+                )
+                .id("btn-translate-cancel")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.cancel_llm_translation(cx);
+                }))
+                .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(
                 div()
                     .flex_1()
@@ -2463,16 +2458,21 @@ impl MainWindow {
                     .child(if status.is_empty() {
                         if total == 0 {
                             "先在「智能转写」生成字幕，再回到这里翻译".to_string()
-                        } else if done == total && total > 0 {
+                        } else if expected > 0 && done == expected {
+                            // 同上：`done` 只认实际译出，空/纯空白译文不会被
+                            // 当成「已全部翻译为{target}」。
                             format!("已全部翻译为{target}")
+                        } else if expected == 0 {
+                            // 有字幕但没有任何非空源文：没有可翻译的内容
+                            "所有字幕行都为空，没有可翻译的文本".to_string()
                         } else if other_lang > 0 && done == 0 {
                             // 关键提示：换语言后旧译文仍在，只是不属于当前目标语言。
                             // 不说明的话，界面看起来像翻译记录被清空了。
                             format!("已有 {other_lang} 句其他语言译文；点上方按钮可译成{target}")
                         } else if done > 0 {
-                            format!("{target}译文 {done}/{total} 句，可继续补译")
+                            format!("{target}译文 {done}/{expected} 句，可继续补译")
                         } else {
-                            format!("尚未翻译（共 {total} 句）")
+                            format!("尚未翻译（共 {expected} 句）")
                         }
                     } else {
                         status
@@ -2495,13 +2495,15 @@ impl MainWindow {
                             .child("字幕翻译"),
                     )
                     .child(
-                        // 计数徽标走 primitives::count_tag，仅按完成量覆盖文字色
-                        primitives::count_tag(format!("{}/{} 句已翻译", done, total))
-                            .text_color(if done > 0 {
+                        // 计数徽标走 primitives::count_tag，仅按完成量覆盖文字色。
+                        // 分母用**应有译文句数**（排除空源句），否则与收尾文案不一致。
+                        primitives::count_tag(format!("{}/{} 句已翻译", done, expected)).text_color(
+                            if done > 0 {
                                 Theme::accent_mint()
                             } else {
                                 Theme::text_secondary()
-                            }),
+                            },
+                        ),
                     ),
             )
             .child(mode_row)
@@ -2529,11 +2531,27 @@ impl MainWindow {
                                 if n == 0 {
                                     "未设置（可留空；用于固定人名/缩写译法）".to_string()
                                 } else {
+                                    // 显示**实际生效**条数：`glossary_prompt` 只注入前
+                                    // `MAX_GLOSSARY_ENTRIES` 条，超过的部分静默丢弃，
+                                    // 不提示的话用户会以为 120 条全在生效。
+                                    let limit =
+                                        self.state.config.translate.effective_glossary_limit();
+                                    let effective =
+                                        super::views::performance::effective_glossary_count(n, limit);
+                                    let cap_note = if effective < n {
+                                        format!(
+                                            "，其中 {effective} 条生效（受上限 {limit} 条限制）"
+                                        )
+                                    } else {
+                                        String::new()
+                                    };
                                     let bad = self.cached_glossary_violations().len();
                                     if bad > 0 {
-                                        format!("已启用 {n} 条 · {bad} 句疑似未按术语译（见琥珀色行）")
+                                        format!(
+                                            "已启用 {n} 条{cap_note} · {bad} 句疑似未按术语译（见琥珀色行）"
+                                        )
                                     } else {
-                                        format!("已启用 {n} 条（专名/术语按固定译法）")
+                                        format!("已启用 {n} 条{cap_note}（专名/术语按固定译法）")
                                     }
                                 }
                             }),
@@ -2598,7 +2616,11 @@ impl MainWindow {
     }
 
     /// 标点快捷注入按钮 (iOS Pill Chip)
-    fn render_punct_btn(&mut self, punct: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_punct_btn(
+        &mut self,
+        punct: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         primitives::chip_clickable(punct, false, false)
             .id(punct)
             .text_color(Theme::text_primary())
@@ -2633,7 +2655,9 @@ fn resample_peaks(peaks: &[f32], bars: usize) -> Vec<f32> {
     (0..bars)
         .map(|i| {
             let lo = i * peaks.len() / bars;
-            let hi = (((i + 1) * peaks.len()) / bars).max(lo + 1).min(peaks.len());
+            let hi = (((i + 1) * peaks.len()) / bars)
+                .max(lo + 1)
+                .min(peaks.len());
             peaks[lo..hi].iter().copied().fold(0.0f32, f32::max)
         })
         .collect()
@@ -2723,23 +2747,18 @@ impl MainWindow {
                             .children(peaks.into_iter().enumerate().map(|(i, peak)| {
                                 // 已播过的一半用薄荷色，未播的一半用中性灰，形成进度感
                                 let played = (i as f32 + 0.5) / BARS as f32 <= progress_ratio;
-                                div()
-                                    .flex_1()
-                                    .flex()
-                                    .justify_center()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            // 静音段也留 1px 细线，保持「整轨连续」的观感
-                                            .h(px((peak * MAX_BAR_H).max(Theme::WAVE_BAR_MIN_H)))
-                                            .rounded_full()
-                                            .bg(if played {
-                                                Theme::accent_mint()
-                                            } else {
-                                                Theme::bg_dot_idle()
-                                            }),
-                                    )
+                                div().flex_1().flex().justify_center().items_center().child(
+                                    div()
+                                        .w_full()
+                                        // 静音段也留 1px 细线，保持「整轨连续」的观感
+                                        .h(px((peak * MAX_BAR_H).max(Theme::WAVE_BAR_MIN_H)))
+                                        .rounded_full()
+                                        .bg(if played {
+                                            Theme::accent_mint()
+                                        } else {
+                                            Theme::bg_dot_idle()
+                                        }),
+                                )
                             }))
                             .into_any_element()
                     } else {
@@ -2776,7 +2795,10 @@ impl MainWindow {
     }
 
     /// 渲染专业多轨剪辑时间轴 (Multi-track Timeline - 剪映/Premiere风格)
-    pub(crate) fn render_multitrack_timeline(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_multitrack_timeline(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let total_dur = self.state.total_duration.max(1.0);
         let cur_time = self.state.current_time;
         let progress_ratio = (cur_time / total_dur).clamp(0.0, 1.0) as f32;
@@ -2834,52 +2856,52 @@ impl MainWindow {
                                 div()
                                     .text_size(px(Theme::TEXT_SMALL))
                                     .text_color(Theme::text_muted())
-                                    .child(format!("共 {} 句 · 总长 {}", self.state.segments.len(), format_duration_short(total_dur))),
+                                    .child(format!(
+                                        "共 {} 句 · 总长 {}",
+                                        self.state.segments.len(),
+                                        format_duration_short(total_dur)
+                                    )),
                             ),
                     )
                     // 右侧：快捷键速查（与 shortcuts::SHORTCUT_HINTS 同源，只挑高频几项，避免占满工具条）
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .children(
-                                crate::ui::shortcuts::SHORTCUT_HINTS
-                                    .iter()
-                                    .filter(|(key, _)| {
-                                        // 撤销是这次新加的高频操作，不进这个白名单的话
-                                        // 提示只写在常量里、用户永远看不到
-                                        matches!(
-                                            *key,
-                                            "Ctrl+Space" | "Alt+↑↓" | "Ctrl+F" | "Ctrl+E" | "Ctrl+Z"
+                        div().flex().items_center().gap_3().children(
+                            crate::ui::shortcuts::SHORTCUT_HINTS
+                                .iter()
+                                .filter(|(key, _)| {
+                                    // 撤销是这次新加的高频操作，不进这个白名单的话
+                                    // 提示只写在常量里、用户永远看不到
+                                    matches!(
+                                        *key,
+                                        "Ctrl+Space" | "Alt+↑↓" | "Ctrl+F" | "Ctrl+E" | "Ctrl+Z"
+                                    )
+                                })
+                                .map(|(key, label)| {
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded(px(Theme::RADIUS_SM))
+                                                .bg(Theme::bg_inset())
+                                                .border_1()
+                                                .border_color(Theme::border_mid())
+                                                .text_size(px(Theme::TEXT_CAPTION))
+                                                .font_family("Consolas")
+                                                .text_color(Theme::text_secondary())
+                                                .child(*key),
                                         )
-                                    })
-                                    .map(|(key, label)| {
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .px_1p5()
-                                                    .py_0p5()
-                                                    .rounded(px(Theme::RADIUS_SM))
-                                                    .bg(Theme::bg_inset())
-                                                    .border_1()
-                                                    .border_color(Theme::border_mid())
-                                                    .text_size(px(Theme::TEXT_CAPTION))
-                                                    .font_family("Consolas")
-                                                    .text_color(Theme::text_secondary())
-                                                    .child(*key),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(Theme::TEXT_CAPTION))
-                                                    .text_color(Theme::text_muted())
-                                                    .child(*label),
-                                            )
-                                    }),
-                            ),
+                                        .child(
+                                            div()
+                                                .text_size(px(Theme::TEXT_CAPTION))
+                                                .text_color(Theme::text_muted())
+                                                .child(*label),
+                                        )
+                                }),
+                        ),
                     ),
             )
             // 1. 统一主字幕轨道 (紧凑苗条单轨布局，高 34px)
@@ -2926,22 +2948,34 @@ impl MainWindow {
                                     )
                                     // 字幕片段渲染 (紧凑纤细卡片，高度 28px)
                                     .children({
-                                        let relevant_segments: Vec<_> = if self.state.segments.len() <= 20 {
-                                            self.state.segments.iter().collect()
-                                        } else {
-                                            self.state.segments.iter().filter(|seg| {
-                                                sel_idx == Some(seg.index)
-                                                    || (cur_time >= seg.start && cur_time <= seg.end)
-                                                    || (cur_time >= seg.start - 15.0 && cur_time <= seg.end + 15.0)
-                                            }).collect()
-                                        };
+                                        let relevant_segments: Vec<_> =
+                                            if self.state.segments.len() <= 20 {
+                                                self.state.segments.iter().collect()
+                                            } else {
+                                                self.state
+                                                    .segments
+                                                    .iter()
+                                                    .filter(|seg| {
+                                                        sel_idx == Some(seg.index)
+                                                            || (cur_time >= seg.start
+                                                                && cur_time <= seg.end)
+                                                            || (cur_time >= seg.start - 15.0
+                                                                && cur_time <= seg.end + 15.0)
+                                                    })
+                                                    .collect()
+                                            };
 
                                         relevant_segments.into_iter().map(|seg| {
                                             let seg_idx = seg.index;
-                                            let start_r = (seg.start / total_dur).clamp(0.0, 1.0) as f32;
-                                            let width_r = (((seg.end - seg.start) / total_dur).clamp(0.015, 1.0) as f32).max(0.02);
+                                            let start_r =
+                                                (seg.start / total_dur).clamp(0.0, 1.0) as f32;
+                                            let width_r = (((seg.end - seg.start) / total_dur)
+                                                .clamp(0.015, 1.0)
+                                                as f32)
+                                                .max(0.02);
                                             let is_selected = sel_idx == Some(seg_idx);
-                                            let is_active = cur_time >= seg.start && cur_time <= seg.end;
+                                            let is_active =
+                                                cur_time >= seg.start && cur_time <= seg.end;
                                             div()
                                                 .id(("timeline-clip", seg_idx))
                                                 .absolute()
@@ -3003,20 +3037,28 @@ impl MainWindow {
                             .left(px(Theme::TRACK_LABEL_W))
                             .right(px(Theme::TRACK_RIGHT_PAD))
                             .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                let win_w = window.viewport_size().width;
-                                this.seek_by_mouse_x(event.position.x, win_w, false, cx);
-                            }))
-                            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                                if event.pressed_button == Some(MouseButton::Left) {
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
                                     let win_w = window.viewport_size().width;
-                                    this.seek_by_mouse_x(event.position.x, win_w, true, cx);
-                                }
-                            }))
-                            .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                                let win_w = window.viewport_size().width;
-                                this.seek_by_mouse_x(event.position.x, win_w, false, cx);
-                            }))
+                                    this.seek_by_mouse_x(event.position.x, win_w, false, cx);
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(
+                                |this, event: &MouseMoveEvent, window, cx| {
+                                    if event.pressed_button == Some(MouseButton::Left) {
+                                        let win_w = window.viewport_size().width;
+                                        this.seek_by_mouse_x(event.position.x, win_w, true, cx);
+                                    }
+                                },
+                            ))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                                    let win_w = window.viewport_size().width;
+                                    this.seek_by_mouse_x(event.position.x, win_w, false, cx);
+                                }),
+                            )
                             .child(
                                 div()
                                     .absolute()
@@ -3056,20 +3098,26 @@ impl MainWindow {
                     .border_color(Theme::border())
                     .relative()
                     .cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                        let win_w = window.viewport_size().width;
-                        this.seek_by_mouse_x(event.position.x, win_w, false, cx);
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            let win_w = window.viewport_size().width;
+                            this.seek_by_mouse_x(event.position.x, win_w, false, cx);
+                        }),
+                    )
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                         if event.pressed_button == Some(MouseButton::Left) {
                             let win_w = window.viewport_size().width;
                             this.seek_by_mouse_x(event.position.x, win_w, true, cx);
                         }
                     }))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                        let win_w = window.viewport_size().width;
-                        this.seek_by_mouse_x(event.position.x, win_w, false, cx);
-                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            let win_w = window.viewport_size().width;
+                            this.seek_by_mouse_x(event.position.x, win_w, false, cx);
+                        }),
+                    )
                     .child(
                         div()
                             .absolute()
@@ -3116,7 +3164,13 @@ impl MainWindow {
     }
 
     /// 统一的时间轴鼠标点击与拖拽精确定位逻辑
-    pub(crate) fn seek_by_mouse_x(&mut self, mouse_x: Pixels, window_width: Pixels, is_drag: bool, cx: &mut Context<Self>) {
+    pub(crate) fn seek_by_mouse_x(
+        &mut self,
+        mouse_x: Pixels,
+        window_width: Pixels,
+        is_drag: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.state.total_duration <= 0.0 {
             return;
         }
@@ -3150,8 +3204,39 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// 把工作区选中项拨回「弹窗编辑打开时的那一句」，成功返回 `true`。
+    ///
+    /// 系统 InputBox **不是本窗口的模态框**：弹窗开着的时候用户仍能去视频库换工程、
+    /// 删掉当前记录（`load_task_with` / `clear_current_workspace` 会整体换掉 `segments`），
+    /// 连播时播放头推进也会自动改选中项。收尾时若闷头写「当前选中项」，用户敲进对话框的
+    /// 文字就会落到别的句子上、甚至别的工程里，并随即落库——属于静默改错文档。
+    ///
+    /// 因此这里按「弹窗打开时的那份工程 + 那一句下标」定位：工程换了、或那句已不存在，
+    /// 返回 `false` 由调用方丢弃结果；同一工程内则把选中项拨回原句，与用户当初点的是同一句。
+    fn reanchor_prompt_target(
+        &mut self,
+        doc: &Option<std::path::PathBuf>,
+        target: Option<usize>,
+    ) -> bool {
+        let Some(target) = target else {
+            return false;
+        };
+        if self.state.selected_file.as_ref() != doc.as_ref() {
+            return false;
+        }
+        if !self.state.segments.iter().any(|s| s.index == target) {
+            return false;
+        }
+        // 走 `select_segment` 让选中项 / 编辑缓冲 / 播放头三者同步，避免后续写回时错位
+        self.state.select_segment(target);
+        true
+    }
+
     /// 弹出原生 Windows 输入对话框进行字幕文本修改（完美支持搜狗/微软等中文输入法）
     pub(crate) fn prompt_edit_text(&mut self, cx: &mut Context<Self>) {
+        // 记下这次弹窗属于哪份文档的哪一句，收尾时据它定位（见 `reanchor_prompt_target`）
+        let doc = self.state.selected_file.clone();
+        let target = self.state.selected_segment_index;
         let current_text = self.state.editing_text.clone();
         let prompt_title = "Voice2Word - 修改字幕文本";
         let prompt_msg = "请输入修改后的字幕内容（支持中文输入法/粘贴）：";
@@ -3190,6 +3275,10 @@ impl MainWindow {
 
             if let Some(new_text) = res {
                 let _ = this.update(cx, |this, cx| {
+                    // 定位回弹窗打开时的那一句；该句已不属于当前工程则丢弃这次结果
+                    if !this.reanchor_prompt_target(&doc, target) {
+                        return;
+                    }
                     this.state.editing_text = new_text;
                     this.state.save_selected_text();
                     cx.notify();
@@ -3203,11 +3292,17 @@ impl MainWindow {
     /// 与 `prompt_edit_text` 同一套实现：自绘输入框拿不到系统 IME 组合态，
     /// 中文/日文输入法下会错字，所以译文编辑也走系统 InputBox。
     pub(crate) fn prompt_edit_translation(&mut self, cx: &mut Context<Self>) {
+        // 与 `prompt_edit_text` 同样的会话守卫：InputBox 弹出期间工作区可能被换掉、
+        // 选中项也可能被播放联动改掉，收尾时必须定位回原来那一句
+        // （见 `reanchor_prompt_target`）。
+        let doc = self.state.selected_file.clone();
+        let target = self.state.selected_segment_index;
         // 预填「当前选中片段的译文」；没有译文则从原文起步，方便用户直接在机翻基础上改。
         let current = self
             .state
-            .selected_segment_index
-            .and_then(|idx| self.state.segments.iter().find(|s| s.index == idx))
+            .segments
+            .iter()
+            .find(|s| Some(s.index) == target)
             .and_then(|s| s.translation.clone())
             .unwrap_or_default();
         let prompt_title = "Voice2Word - 修改译文";
@@ -3242,6 +3337,10 @@ impl MainWindow {
 
             if let Some(new_text) = res {
                 let _ = this.update(cx, |this, cx| {
+                    // 定位回弹窗打开时的那一句；该句已不属于当前工程则丢弃这次结果
+                    if !this.reanchor_prompt_target(&doc, target) {
+                        return;
+                    }
                     if !new_text.trim().is_empty() {
                         this.state.set_selected_translation(&new_text);
                         cx.notify();
@@ -3249,5 +3348,33 @@ impl MainWindow {
                 });
             }
         }).detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::translated_out_count;
+    use crate::subtitle::Segment;
+
+    /// 回归（P2）：「已全部翻译」的判定必须用**实际译出**口径。
+    /// 引擎可能给空串/纯空白译文打上 `translation_lang`（或直接复制原文），
+    /// 只按语言标签计数会在整片空白时仍显示「已全部翻译」。
+    #[test]
+    fn only_non_empty_translations_count_as_done() {
+        let mut blank = Segment::new(1, 0.0, 1.0, "你好");
+        blank.translation = Some("   ".to_string());
+        blank.translation_lang = Some("English".to_string()); // 脏标签：有标签无译文
+        let mut ok = Segment::new(2, 1.0, 2.0, "世界");
+        ok.translation = Some("World".to_string());
+        ok.translation_lang = Some("English".to_string());
+        let mut other = Segment::new(3, 2.0, 3.0, "再见");
+        other.translation = Some("Au revoir".to_string());
+        other.translation_lang = Some("Français".to_string());
+
+        let segs = vec![blank, ok, other];
+        // 只有 ok 是「当前目标语言 + 非空译文」；blank 的脏标签绝不能算完成。
+        assert_eq!(translated_out_count(&segs, "English"), 1);
+        assert_eq!(translated_out_count(&segs, "Français"), 1);
+        assert_eq!(translated_out_count(&segs, "日本語"), 0);
     }
 }

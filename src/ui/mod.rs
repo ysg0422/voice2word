@@ -26,17 +26,17 @@ use theme::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorExportFormat {
     #[default]
-    JianYing,    // 剪映草稿
+    JianYing, // 剪映草稿
     JianYingFolder, // 剪映草稿（导出到自选文件夹，不写入本机草稿库）
-    Srt,         // SRT 字幕
-    Ass,         // ASS 特效字幕
-    Fcpxml,      // FCPXML (达芬奇 / FCP)
-    PremiereXml, // Premiere XML
-    Txt,         // TXT 纯文本
-    Vtt,         // VTT 网页字幕
-    Json,        // JSON 结构化字幕（无损字段，供程序化消费 / 质检）
-    EbuTtD,      // EBU-TT-D (TTML，广播分发)
-    NetflixTtal, // Netflix TTAL (TTML，流媒体交付)
+    Srt,            // SRT 字幕
+    Ass,            // ASS 特效字幕
+    Fcpxml,         // FCPXML (达芬奇 / FCP)
+    PremiereXml,    // Premiere XML
+    Txt,            // TXT 纯文本
+    Vtt,            // VTT 网页字幕
+    Json,           // JSON 结构化字幕（无损字段，供程序化消费 / 质检）
+    EbuTtD,         // EBU-TT-D (TTML，广播分发)
+    NetflixTtal,    // Netflix TTAL (TTML，流媒体交付)
 }
 
 impl EditorExportFormat {
@@ -93,6 +93,170 @@ pub enum ApiField {
     Base,
     Model,
     Key,
+}
+
+/// 命令面板里一条可执行命令 (P1-A10)。
+///
+/// 用枚举而不是闭包：闭包没法 `Clone`，也就没法跟面板状态一起存进 `MainWindow`；
+/// 枚举则可以把「要执行什么」与「界面上的条目」解耦，且执行点只有一个 `match`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteCommand {
+    OpenFile,
+    StartTranscription,
+    CancelTranscription,
+    ExportCurrentFormat,
+    StartTranslation,
+    CancelTranslation,
+    ToggleTheme,
+    SwitchToEditor,
+    SwitchToGenerate,
+    SwitchToLibrary,
+    SwitchToPerformance,
+    Undo,
+    Redo,
+}
+
+/// 命令面板里一条命令的展示信息。
+///
+/// `zh` / `en` 都参与搜索：中文用户按「导出」找，英文习惯的用户按 `export` 找，
+/// 只认一种别名就会有一半人搜不到。`hint` 是右侧的键位提示，没有独立键位的命令留空。
+pub struct PaletteCommandSpec {
+    pub command: PaletteCommand,
+    /// 中文名
+    pub zh: &'static str,
+    /// 英文别名（小写，仅作匹配与副标题展示）
+    pub en: &'static str,
+    /// 右侧键位提示；空串表示这条命令只有面板入口
+    pub hint: &'static str,
+}
+
+/// 命令面板的命令集。
+///
+/// 每条命令都直接复用 `MainWindow` 上已有的方法（见 `run_palette_command`），
+/// 这里只做「名字 → 已有入口」的映射，不重写任何业务逻辑。
+pub const PALETTE_COMMANDS: [PaletteCommandSpec; 13] = [
+    PaletteCommandSpec {
+        command: PaletteCommand::OpenFile,
+        zh: "打开文件",
+        en: "open file",
+        hint: "",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::StartTranscription,
+        zh: "开始转写",
+        en: "start transcription",
+        hint: "Ctrl+Enter",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::CancelTranscription,
+        zh: "终止转写",
+        en: "stop transcription",
+        hint: "Esc",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::ExportCurrentFormat,
+        zh: "导出（当前格式）",
+        en: "export subtitle",
+        hint: "Ctrl+E",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::StartTranslation,
+        zh: "开始翻译",
+        en: "start translation",
+        hint: "",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::CancelTranslation,
+        zh: "取消翻译",
+        en: "cancel translation",
+        hint: "",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::ToggleTheme,
+        zh: "切换主题",
+        en: "toggle theme",
+        hint: "Ctrl+T",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::SwitchToEditor,
+        zh: "切到剪辑校对",
+        en: "editor tab",
+        hint: "",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::SwitchToGenerate,
+        zh: "切到语音转写",
+        en: "transcribe tab",
+        hint: "",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::SwitchToLibrary,
+        zh: "切到视频库",
+        en: "library tab",
+        hint: "",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::SwitchToPerformance,
+        zh: "切到性能设置",
+        en: "performance tab",
+        hint: "",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::Undo,
+        zh: "撤销",
+        en: "undo",
+        hint: "Ctrl+Z",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::Redo,
+        zh: "重做",
+        en: "redo",
+        hint: "Ctrl+Y",
+    },
+];
+
+/// 命令面板打开时的会话状态。
+///
+/// 输入缓冲 / 光标 / 选中行都只在这里，不进 `AppState`：面板是一次性的浮层，
+/// 关掉即丢，不该污染工程状态，也不该进撤销栈。
+pub struct CommandPaletteState {
+    /// 搜索词（空串显示全部）
+    pub(crate) query: String,
+    /// 搜索框光标（字符下标，非字节）
+    pub(crate) cursor: usize,
+    /// 结果列表里的选中行号（不是 `PALETTE_COMMANDS` 的下标）
+    pub(crate) selected: usize,
+    /// 搜索框的焦点句柄；面板关闭时随之丢弃
+    pub(crate) focus: FocusHandle,
+    /// 结果列表滚动句柄：↑/↓ 移动选中时把该行滚进视野
+    pub(crate) scroll: ScrollHandle,
+}
+
+/// 命令面板结果列表的最大高度：超过就滚动，避免十几条命令把面板撑满整屏。
+const COMMAND_PALETTE_LIST_H: f32 = 280.0;
+
+/// 按查询词过滤命令面板条目，返回 [`PALETTE_COMMANDS`] 里的下标序列。
+///
+/// 纯函数（不读 `MainWindow` / `AppState`），所以可以直接单测。规则：
+/// - 空查询（含纯空白）返回全部，方便用户先看一眼有什么；
+/// - 中文名与英文别名都参与匹配；
+/// - 大小写不敏感（`to_lowercase` 而非 `to_ascii_lowercase`：中文无大小写，
+///   但别名里可能混着非 ASCII 的大小写字母）；
+/// - 无匹配返回空列表，由渲染层显示「没有匹配的命令」。
+fn filter_commands(query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return (0..PALETTE_COMMANDS.len()).collect();
+    }
+    PALETTE_COMMANDS
+        .iter()
+        .enumerate()
+        .filter(|(_, spec)| {
+            spec.zh.to_lowercase().contains(needle.as_str())
+                || spec.en.to_lowercase().contains(needle.as_str())
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 pub struct MainWindow {
@@ -197,6 +361,10 @@ pub struct MainWindow {
     pub(crate) library_selected: HashSet<i64>,
     /// 批量导出进行中：按钮置灰并显示进度，防止重复触发并发写盘。
     pub(crate) library_export_busy: bool,
+    /// 命令面板 (P1-A10) 是否打开。`Some` 时渲染居中模态面板。
+    /// 面板是「非阻塞式冒泡」的轻量浮层而非确认框那种阻塞模态，因此与
+    /// `confirm_dialog` 等并存时由渲染顺序决定盖在谁上面（见 `Render::render`）。
+    pub(crate) command_palette: Option<CommandPaletteState>,
 }
 
 /// 把一次按键应用到单行文本缓冲区的光标处（自绘输入框的共用编辑核心）。
@@ -297,6 +465,24 @@ pub(crate) fn apply_line_edit(
     }
 }
 
+/// 在主窗口上注册「系统级关窗」脏数据守卫。
+///
+/// Alt+F4、任务栏右键「关闭窗口」、点系统标题栏关闭按钮在 gpui 里都收敛到
+/// `WM_CLOSE`（`platform/windows/events.rs` 的 `handle_close_msg`），而
+/// `Window::on_window_should_close(&self, cx: &App, f: impl Fn(&mut Window, &mut App) -> bool)`
+/// 是它的安全封装：回调返回 `false` 时平台层直接 `Some(0)` 短路，不再调用
+/// `DefWindowProcW`，窗口保持打开（返回 `true` 才真正关闭）。
+///
+/// 回调接到与 `components/titlebar.rs` 自绘关闭按钮**完全相同**的判定上，
+/// 避免两套关窗逻辑漂移。
+pub fn install_window_close_guard(window: &Window, root: &Entity<MainWindow>, cx: &mut App) {
+    let root = root.downgrade();
+    window.on_window_should_close(cx, move |_window, cx| {
+        root.update(cx, |view, cx| view.flush_segments_before_close(cx))
+            .unwrap_or(true)
+    });
+}
+
 impl MainWindow {
     pub fn new(state: AppState, cx: &mut Context<Self>) -> Self {
         let metrics_rx = crate::utils::SystemMonitor::spawn_background_monitor();
@@ -367,6 +553,7 @@ impl MainWindow {
             translate_probe_msg: None,
             library_selected: HashSet::new(),
             library_export_busy: false,
+            command_palette: None,
         };
 
         // 若启动已载入历史视频工程，立即触发首帧提取，并按硬件策略补代理
@@ -379,26 +566,54 @@ impl MainWindow {
         window
     }
 
+    /// 关窗前的脏数据守卫（系统关窗路径 Alt+F4 / 任务栏右键 / 系统关闭按钮，
+    /// 与自绘标题栏的关闭按钮共用同一实现）。
+    ///
+    /// `segments_dirty` 的落库是去抖的（切句 / 跳转 / 播放 / 导出时才 flush），
+    /// 用户改完字幕直接关窗会丢掉最后一段未落库的编辑，所以这里先同步 flush 一次。
+    /// 只在「本次确实尝试保存了脏数据、且保存失败」时拦下关窗：若 `db_write_error`
+    /// 是更早一次失败留下的旧值，不能拿它挡住一次与保存无关的正常关闭。
+    ///
+    /// 返回 `true` 表示允许关窗。`components/titlebar.rs` 的关闭按钮直接调用本函数，
+    /// 两条关窗路径收敛到这里，不再各写一份判定。
+    pub(crate) fn flush_segments_before_close(&mut self, cx: &mut Context<Self>) -> bool {
+        let had_dirty = self.state.segments_dirty;
+        self.state.flush_segments_if_dirty();
+        if had_dirty && self.state.db_write_error.is_some() {
+            // 取舍：**阻止关闭**而不是「记日志后照关」。字幕写库失败通常是持久性
+            // 原因（磁盘满 / 数据库只读），一旦关窗这次编辑就永久丢了；留在窗口里，
+            // 跨页常驻的 `db_write_error` 横幅会告诉用户「改动尚未写入历史库」。
+            tracing::error!(
+                error = ?self.state.db_write_error,
+                "关窗前字幕落库失败，已阻止关闭以避免丢失未保存的编辑"
+            );
+            // 触发重绘，让错误横幅立刻可见
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
     /// 按当前搜索关键字重算字幕清单的可见行下标。
     ///
     /// 结果按 `(关键字, segments_revision)` 缓存：播放时界面每 40ms 重绘一次，
     /// 若每帧都对上千条字幕重跑子串匹配，滚动与播放都会白白掉帧。
     pub(crate) fn refresh_subtitle_filter(&mut self) {
         let key = (self.subtitle_search.clone(), self.state.segments_revision);
-        // 缓存除了要求键不变，还必须确认这串下标仍落在当前片段表内。
-        // 撤销/重做会整体替换 `segments`，而缓存的键未必跟着变；一旦沿用越界下标，
-        // 虚拟列表在取不到行时会量出行高 0（`uniform_list` 只拿第 0 行量高度），
-        // 整片清单塌成空白，且键不变就一直空着刷不出来——用户看到的正是「字幕没了」。
+        // 缓存除了要求键不变，还必须确认这串下标仍落在当前片段表内（见
+        // [`filter_cache_usable`]）。撤销/重做会整体替换 `segments` 并重排序号，
+        // 沿用越界下标会让虚拟列表量不到行高，整片清单塌成空白且刷不出来。
         if self.subtitle_filter_key.as_ref() == Some(&key)
-            && indices_cover_segments(&self.subtitle_filter, self.state.segments.len())
+            && filter_cache_usable(&self.subtitle_filter, self.state.segments.len())
         {
             return;
         }
         let mut matched = matched_indices(&self.state.segments, &self.subtitle_search);
         // 兜底：万一匹配结果本身越界（片段表在别处被换过），宁可退成「不过滤」，
         // 也不能把非法下标交给虚拟列表——空白列表比多显示几行难排查得多。
-        if !indices_cover_segments(&matched, self.state.segments.len()) {
-            matched = (0..self.state.segments.len()).collect();
+        let segment_count = self.state.segments.len();
+        if !indices_cover_segments(&matched, segment_count) {
+            matched = (0..segment_count).collect();
         }
         self.subtitle_filter = matched;
         self.subtitle_filter_key = Some(key);
@@ -532,6 +747,385 @@ impl MainWindow {
     }
 }
 
+impl MainWindow {
+    /// 打开 / 关闭命令面板 (P1-A10)。`Ctrl+K` 与面板内的再次 `Ctrl+K` 都走这里。
+    ///
+    /// 打开时把焦点交给面板自己的搜索框：面板一出现就该能直接打字，不该再要求
+    /// 用户点一下输入框。焦点句柄随面板一起创建、随面板一起丢弃（关掉即失焦），
+    /// 所以不会像常驻输入框那样出现「面板没了焦点还挂着」的错位外观。
+    pub(crate) fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_palette.is_some() {
+            self.close_command_palette(cx);
+            return;
+        }
+        let focus = cx.focus_handle();
+        self.command_palette = Some(CommandPaletteState {
+            query: String::new(),
+            cursor: 0,
+            selected: 0,
+            focus: focus.clone(),
+            scroll: ScrollHandle::new(),
+        });
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    /// 收起命令面板（Esc / Ctrl+K / 点遮罩 / 执行命令后都收敛到这里）。
+    pub(crate) fn close_command_palette(&mut self, cx: &mut Context<Self>) {
+        if self.command_palette.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 命令面板里当前是否还有可用的命令（供状态置灰与 Enter 判定复用）。
+    ///
+    /// 只读 `AppState` 上已有的状态位，不引入新的状态字段——面板只是「换个入口」
+    /// 去调已有的方法，可用性判断必须和界面上那些按钮一致。
+    fn palette_command_enabled(&self, command: PaletteCommand) -> bool {
+        match command {
+            // 打开文件与切主题没有任何前置条件
+            PaletteCommand::OpenFile | PaletteCommand::ToggleTheme => true,
+            // 与 `shortcuts::StartTranscription` 的挂载点同一套判断
+            PaletteCommand::StartTranscription => {
+                !matches!(self.state.status, ProcessStatus::Processing { .. })
+                    && self.state.transcribe_file.is_some()
+            }
+            // 与 `request_cancel_processing` 的首行守卫一致
+            PaletteCommand::CancelTranscription => {
+                matches!(self.state.status, ProcessStatus::Processing { .. })
+            }
+            // 与 `perform_editor_export` 的守卫一致
+            PaletteCommand::ExportCurrentFormat => !self.state.segments.is_empty(),
+            // 与 `trigger_llm_translation` 的守卫一致
+            PaletteCommand::StartTranslation => {
+                !self.state.segments.is_empty() && !self.state.is_translating
+            }
+            // 与 `cancel_llm_translation` 的守卫一致
+            PaletteCommand::CancelTranslation => self.state.is_translating,
+            // 已经在这一页时不再重复切换，避免命令面板成了「无操作入口」
+            PaletteCommand::SwitchToEditor => self.state.active_tab != WorkspaceTab::Editor,
+            PaletteCommand::SwitchToGenerate => self.state.active_tab != WorkspaceTab::Generate,
+            PaletteCommand::SwitchToLibrary => self.state.active_tab != WorkspaceTab::Library,
+            PaletteCommand::SwitchToPerformance => {
+                self.state.active_tab != WorkspaceTab::Performance
+            }
+            PaletteCommand::Undo => self.state.can_undo(),
+            PaletteCommand::Redo => self.state.can_redo(),
+        }
+    }
+
+    /// 执行一条命令面板命令。
+    ///
+    /// 每个分支都只调用 `MainWindow` 上已有的方法（与对应按钮/快捷键完全同源），
+    /// 因此这里没有任何业务逻辑，也不该长出业务逻辑——新增命令时若发现需要在这里
+    /// 写判断，说明缺的是 `actions.rs` 里的一个方法，而不是面板里的一段代码。
+    fn run_palette_command(&mut self, command: PaletteCommand, cx: &mut Context<Self>) {
+        if !self.palette_command_enabled(command) {
+            // 置灰命令被 Enter/点击触发时什么都不做，也不收起面板：
+            // 用户看得到它为什么是灰的，换个条件再试即可。
+            cx.notify();
+            return;
+        }
+        // 先关面板再执行：命令可能弹确认框 / 系统文件对话框 / 完成弹窗，
+        // 面板留着会盖在它们上面，用户会以为「按了没反应」。
+        self.command_palette = None;
+        match command {
+            PaletteCommand::OpenFile => self.choose_file(cx),
+            PaletteCommand::StartTranscription => self.start_processing(cx),
+            PaletteCommand::CancelTranscription => self.request_cancel_processing(cx),
+            PaletteCommand::ExportCurrentFormat => self.perform_editor_export(cx),
+            PaletteCommand::StartTranslation => self.trigger_llm_translation(cx),
+            PaletteCommand::CancelTranslation => self.cancel_llm_translation(cx),
+            PaletteCommand::ToggleTheme => self.state.toggle_theme(),
+            // 切页签与左侧导航栏走同一套副作用（剪辑台要补抽帧、视频库要刷新列表）
+            PaletteCommand::SwitchToEditor => {
+                self.state.active_tab = WorkspaceTab::Editor;
+                self.trigger_extract_frame(cx);
+            }
+            PaletteCommand::SwitchToGenerate => {
+                self.state.active_tab = WorkspaceTab::Generate;
+            }
+            PaletteCommand::SwitchToLibrary => {
+                self.state.active_tab = WorkspaceTab::Library;
+                self.state.refresh_recent_tasks();
+            }
+            PaletteCommand::SwitchToPerformance => {
+                self.state.active_tab = WorkspaceTab::Performance;
+            }
+            PaletteCommand::Undo => {
+                if self.state.undo() {
+                    // 与 `shortcuts::Undo` 的挂载点一致：撤销可能整体换掉片段表，
+                    // 不清这个标记虚拟列表会停在旧行号上。
+                    self.subtitle_list_followed_sel = None;
+                }
+            }
+            PaletteCommand::Redo => {
+                if self.state.redo() {
+                    self.subtitle_list_followed_sel = None;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// 移动结果列表里的选中行（`↑` / `↓`，越界即夹住不回绕）。
+    fn move_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(state) = self.command_palette.as_mut() else {
+            return;
+        };
+        let count = filter_commands(&state.query).len();
+        if count == 0 {
+            state.selected = 0;
+            cx.notify();
+            return;
+        }
+        let current = state.selected.min(count - 1) as isize;
+        let next = (current + delta).clamp(0, count as isize - 1) as usize;
+        state.selected = next;
+        // 选中行滚进视野，否则过滤出十几条时按 ↓ 会「选到看不见的地方」
+        state.scroll.scroll_to_item(next);
+        cx.notify();
+    }
+
+    /// 执行结果列表里当前选中的那条命令（`Enter`）。
+    fn run_selected_palette_command(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.command_palette.as_ref() else {
+            return;
+        };
+        let matched = filter_commands(&state.query);
+        // 选中行可能因为别处改状态而落在结果集之外（渲染时是夹住的），这里同样夹一次，
+        // 否则「界面上高亮第 3 条、Enter 却什么都不做」会让人以为面板坏了。
+        let row = state.selected.min(matched.len().saturating_sub(1));
+        let Some(&index) = matched.get(row) else {
+            // 查询无结果时 Enter 不做任何事（尤其不能误触终止转写那类命令）
+            cx.notify();
+            return;
+        };
+        let command = PALETTE_COMMANDS[index].command;
+        self.run_palette_command(command, cx);
+    }
+
+    /// 渲染命令面板 (P1-A10)：居中模态（复用 `modal_scrim` / `modal_card`）
+    /// + 自绘搜索框（复用 `apply_line_edit`）+ 可滚动结果列表 + 选中高亮。
+    ///
+    /// 键盘分工：`↑/↓/Enter` 走搜索框的 `on_key_down`（这三个键没有全局绑定，
+    /// 不会被动作分发先截走）；`Esc` / `Ctrl+K` 走全局动作，落点在 `Render::render`
+    /// 的 `CancelOrClose` 优先级链与 `OpenCommandPalette` 上。
+    pub(crate) fn render_command_palette(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (query, cursor, selected, focus, scroll) = match self.command_palette.as_ref() {
+            Some(state) => (
+                state.query.clone(),
+                state.cursor,
+                state.selected,
+                state.focus.clone(),
+                state.scroll.clone(),
+            ),
+            // 调用点已判过 `is_some()`；这里兜底成空面板，避免多一次 unwrap 风险。
+            None => (String::new(), 0, 0, cx.focus_handle(), ScrollHandle::new()),
+        };
+        let is_focused = focus.contains_focused(window, cx);
+        // 名字过滤是纯函数（见 `filter_commands`，有单测）；状态过滤在这里做，
+        // 因为「哪条命令当前可用」要读 `AppState`，抽不进纯函数。
+        let entries: Vec<(usize, bool)> = filter_commands(&query)
+            .into_iter()
+            .map(|index| {
+                (
+                    index,
+                    self.palette_command_enabled(PALETTE_COMMANDS[index].command),
+                )
+            })
+            .collect();
+        let selected = selected.min(entries.len().saturating_sub(1));
+        let char_count = query.chars().count();
+        let cursor = cursor.min(char_count);
+        let before: String = query.chars().take(cursor).collect();
+        let after: String = query.chars().skip(cursor).collect();
+
+        let search_input = primitives::text_input(is_focused, 200.0)
+            .id("command-palette-input")
+            .track_focus(&focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if let Some(state) = this.command_palette.as_ref() {
+                        window.focus(&state.focus);
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                match event.keystroke.key.as_str() {
+                    "enter" => {
+                        this.run_selected_palette_command(cx);
+                        return;
+                    }
+                    "up" => {
+                        this.move_palette_selection(-1, cx);
+                        return;
+                    }
+                    "down" => {
+                        this.move_palette_selection(1, cx);
+                        return;
+                    }
+                    _ => {}
+                }
+                let Some(state) = this.command_palette.as_mut() else {
+                    return;
+                };
+                let (buffer, cursor) = (&mut state.query, &mut state.cursor);
+                if apply_line_edit(buffer, cursor, event, cx) {
+                    // 查询词一变，原来选中的「第 N 条」已经不是同一条命令了，
+                    // 回到第一条才不会让 Enter 打到用户没看见的命令上。
+                    state.selected = 0;
+                    state.scroll.scroll_to_item(0);
+                    cx.notify();
+                }
+            }))
+            .child(if is_focused {
+                div()
+                    .flex()
+                    .items_center()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .text_color(Theme::text_primary())
+                    .child(before)
+                    .child(div().text_color(Theme::accent_blue()).child("▌"))
+                    .child(after)
+            } else if char_count == 0 {
+                div()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .text_color(Theme::text_muted())
+                    .truncate()
+                    .child("输入命令名或英文别名…")
+            } else {
+                div()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .text_color(Theme::text_primary())
+                    .truncate()
+                    .child(query.clone())
+            });
+
+        let list = div()
+            .id("command-palette-list")
+            .w_full()
+            .max_h(px(COMMAND_PALETTE_LIST_H))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_0_5))
+            .track_scroll(&scroll)
+            .children(entries.iter().enumerate().map(|(row, &(index, enabled))| {
+                let spec = &PALETTE_COMMANDS[index];
+                let command = spec.command;
+                let is_sel = row == selected;
+                let title_color = if !enabled {
+                    Theme::text_disabled()
+                } else if is_sel {
+                    Theme::text_primary()
+                } else {
+                    Theme::text_secondary()
+                };
+                div()
+                    .id(("palette-cmd", row))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(Theme::SPACE_3))
+                    .px(px(Theme::SPACE_2))
+                    .h(px(Theme::CTRL_H_SM))
+                    .rounded(px(Theme::RADIUS_SM))
+                    .bg(if is_sel {
+                        Theme::tint_blue_badge()
+                    } else {
+                        Theme::transparent()
+                    })
+                    .when(enabled, |s| {
+                        s.cursor_pointer().hover(|s| s.bg(Theme::bg_hover()))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(state) = this.command_palette.as_mut() {
+                            state.selected = row;
+                        }
+                        this.run_palette_command(command, cx);
+                        // 行点击已在冒泡路径上处理完，别再让遮罩把面板
+                        // 也当成「点了空白处」——那会把灰命令的点击变成关闭。
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(Theme::SPACE_2))
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .text_color(title_color)
+                                    .child(spec.zh),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_muted())
+                                    .child(spec.en),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .font_family("Consolas")
+                            .text_color(Theme::text_muted())
+                            .child(spec.hint),
+                    )
+            }))
+            .when(entries.is_empty(), |s| {
+                s.child(
+                    div()
+                        .px(px(Theme::SPACE_2))
+                        .py(px(Theme::SPACE_3))
+                        .text_size(px(Theme::TEXT_SMALL))
+                        .text_color(Theme::text_muted())
+                        .child("没有匹配的命令"),
+                )
+            });
+
+        primitives::modal_scrim()
+            .id("command-palette-scrim")
+            // 遮罩挡住底下的鼠标命中：GPUI 的点击会沿命中链从最上层往下冒泡，
+            // 不 occlude 的话「点面板外面关掉面板」会顺带把底下那个按钮也点下去
+            // （面板可以从任何页签打开，底下什么控件都有可能）。
+            .occlude()
+            // 点遮罩 = 收起面板（与 Esc 同义，符合「点外面关掉浮层」的直觉）
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.close_command_palette(cx);
+            }))
+            .child(
+                primitives::modal_card(Theme::DIALOG_W, Theme::PAGE_PAD)
+                    .id("command-palette-card")
+                    // 卡片自身吞掉点击，否则点列表空白处会被遮罩当成「点外面」
+                    .on_click(cx.listener(|_, _, _, _| {}))
+                    .gap(px(Theme::SPACE_2))
+                    .child(search_input)
+                    .child(list)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child(format!("{} 条命令", entries.len()))
+                            .child("↑↓ 选择 · Enter 执行 · Esc 关闭"),
+                    ),
+            )
+    }
+}
+
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.metrics_rx.has_changed().unwrap_or(false) {
@@ -582,82 +1176,157 @@ impl Render for MainWindow {
             ))
             // 全局快捷键（F-017）：键位表在 `shortcuts::bind_default_keys` 注册，
             // 这里只负责把动作接到具体的界面行为上。
-            .on_action(cx.listener(|this, _: &shortcuts::TogglePlayback, _window, cx| {
-                // 转写期间预览解码会与 ASR 抢 CPU/内存带宽，此时不允许用快捷键起播
-                if matches!(this.state.status, ProcessStatus::Processing { .. }) {
-                    return;
-                }
-                this.toggle_play_preview(cx);
-            }))
-            .on_action(cx.listener(|this, _: &shortcuts::PrevSegment, _window, cx| {
-                this.jump_prev_segment(cx);
-            }))
-            .on_action(cx.listener(|this, _: &shortcuts::NextSegment, _window, cx| {
-                this.jump_next_segment(cx);
-            }))
-            .on_action(cx.listener(|this, _: &shortcuts::SeekBackward, _window, cx| {
-                if this.state.segments.is_empty() {
-                    return;
-                }
-                this.halt_preview_playback();
-                let target = (this.state.current_time - 1.0).max(0.0);
-                this.state.seek_to(target);
-                this.trigger_extract_frame(cx);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &shortcuts::SeekForward, _window, cx| {
-                if this.state.segments.is_empty() {
-                    return;
-                }
-                this.halt_preview_playback();
-                let target = this.state.current_time + 1.0;
-                this.state.seek_to(target);
-                this.trigger_extract_frame(cx);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &shortcuts::StartTranscription, _window, cx| {
-                if matches!(this.state.status, ProcessStatus::Processing { .. }) {
-                    return;
-                }
-                if this.state.transcribe_file.is_none() {
-                    return;
-                }
-                this.start_processing(cx);
-            }))
-            .on_action(cx.listener(|this, _: &shortcuts::CancelOrClose, window, cx| {
-                // 优先级：浮层 → 导出下拉 → 搜索框 → 终止任务。Esc 在没有可取消对象时不应有任何副作用。
-                if this.completion_dialog.take().is_some() || this.benchmark_dialog.take().is_some() {
+            //
+            // 除 Esc / Ctrl+K 两个「面板自己的键」外，其余监听器一律先看
+            // `command_palette` 是否打开并直接返回：面板打开时它是唯一的键盘入口，
+            // 不拦这一刀的话，在面板里敲字会顺带触发底下的全局动作——Ctrl+Z 会静默
+            // 撤销字幕编辑、Ctrl+F 会把焦点抢到搜索框上让面板从此收不到按键。
+            .on_action(
+                cx.listener(|this, _: &shortcuts::TogglePlayback, _window, cx| {
+                    if this.command_palette.is_some() {
+                        return;
+                    }
+                    // 转写期间预览解码会与 ASR 抢 CPU/内存带宽，此时不允许用快捷键起播
+                    if matches!(this.state.status, ProcessStatus::Processing { .. }) {
+                        return;
+                    }
+                    this.toggle_play_preview(cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &shortcuts::PrevSegment, _window, cx| {
+                    if this.command_palette.is_some() {
+                        return;
+                    }
+                    this.jump_prev_segment(cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &shortcuts::NextSegment, _window, cx| {
+                    if this.command_palette.is_some() {
+                        return;
+                    }
+                    this.jump_next_segment(cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &shortcuts::SeekBackward, _window, cx| {
+                    if this.command_palette.is_some() {
+                        return;
+                    }
+                    if this.state.segments.is_empty() {
+                        return;
+                    }
+                    this.halt_preview_playback();
+                    let target = (this.state.current_time - 1.0).max(0.0);
+                    this.state.seek_to(target);
+                    this.trigger_extract_frame(cx);
                     cx.notify();
-                    return;
-                }
-                if this.is_export_dropdown_open {
-                    this.is_export_dropdown_open = false;
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &shortcuts::SeekForward, _window, cx| {
+                    if this.command_palette.is_some() {
+                        return;
+                    }
+                    if this.state.segments.is_empty() {
+                        return;
+                    }
+                    this.halt_preview_playback();
+                    let target = this.state.current_time + 1.0;
+                    this.state.seek_to(target);
+                    this.trigger_extract_frame(cx);
                     cx.notify();
-                    return;
-                }
-                // 搜索框聚焦且有关键字时，Esc 先清空过滤词。
-                // 全局键位表把 escape 绑给了本动作，而 GPUI 的动作分发早于 `on_key_down`
-                // 且命中动作后默认停止冒泡，搜索框自己的 Esc 清空分支根本收不到事件。
-                // 不在这里补一刀，用户在搜索框里按 Esc 不但清不掉过滤词，
-                // 还会顺手把正在跑的转写给终止掉（界面提示「Esc 清空」与实际行为不符）。
-                if this.subtitle_search_focus.contains_focused(window, cx)
-                    && !this.subtitle_search.is_empty()
-                {
-                    this.subtitle_search.clear();
-                    this.subtitle_search_cursor = 0;
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &shortcuts::StartTranscription, _window, cx| {
+                    if this.command_palette.is_some() {
+                        return;
+                    }
+                    if matches!(this.state.status, ProcessStatus::Processing { .. }) {
+                        return;
+                    }
+                    if this.state.transcribe_file.is_none() {
+                        return;
+                    }
+                    this.start_processing(cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &shortcuts::CancelOrClose, window, cx| {
+                    // 优先级：确认弹窗 → 命令面板 → 浮层 → 导出下拉 → 搜索框 → 终止任务。
+                    // Esc 在没有可取消对象时不应有任何副作用。
+                    //
+                    // 确认弹窗排在最前，是因为它是最上层模态，且「清空批量队列」这类
+                    // 待确认操作**本身**会终止正在跑的转写：少了这一刀，用户在这个确认框上
+                    // 按 Esc 想关掉弹窗，弹窗纹丝不动、转写却被穿透终止了——弹窗上的
+                    // 「取消」按钮反而成了唯一的正确出口。
+                    if this.confirm_dialog.take().is_some() {
+                        cx.notify();
+                        return;
+                    }
+                    // 命令面板紧随其后（渲染顺序上它也在确认框之下、其它浮层之上）。
+                    // 为什么不是最前：确认框是**阻塞式**的，出现时用户除了「确认/取消」
+                    // 没有别的出口；面板则是随时可关的轻量浮层，而且面板打开时遮罩把
+                    // 底下界面全挡住、用户根本点不出新的确认框，两者实际不会同时在场。
+                    // 万一并存（例如某条命令间接触发了确认框），先关掉视觉上更上层的
+                    // 确认框才符合「Esc 关掉最上面那层」的直觉。
+                    // 为什么必须在「终止任务」之前：面板打开时 Esc 的语义是「关面板」，
+                    // 少了这一刀，用户在面板里按 Esc 会连面板带正在跑的转写一起终止
+                    // （面板本身并没有「终止」这个含义，属于典型的穿透误伤）。
+                    if this.command_palette.is_some() {
+                        this.close_command_palette(cx);
+                        return;
+                    }
+                    if this.completion_dialog.take().is_some()
+                        || this.benchmark_dialog.take().is_some()
+                    {
+                        cx.notify();
+                        return;
+                    }
+                    if this.is_export_dropdown_open {
+                        this.is_export_dropdown_open = false;
+                        cx.notify();
+                        return;
+                    }
+                    // 搜索框聚焦且有关键字时，Esc 先清空过滤词。
+                    // 全局键位表把 escape 绑给了本动作，而 GPUI 的动作分发早于 `on_key_down`
+                    // 且命中动作后默认停止冒泡，搜索框自己的 Esc 清空分支根本收不到事件。
+                    // 不在这里补一刀，用户在搜索框里按 Esc 不但清不掉过滤词，
+                    // 还会顺手把正在跑的转写给终止掉（界面提示「Esc 清空」与实际行为不符）。
+                    if this.subtitle_search_focus.contains_focused(window, cx)
+                        && !this.subtitle_search.is_empty()
+                    {
+                        this.subtitle_search.clear();
+                        this.subtitle_search_cursor = 0;
+                        cx.notify();
+                        return;
+                    }
+                    this.request_cancel_processing(cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &shortcuts::ExportSubtitle, _window, cx| {
+                    if this.command_palette.is_some() {
+                        return;
+                    }
+                    this.perform_editor_export(cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &shortcuts::ToggleTheme, _window, cx| {
+                    if this.command_palette.is_some() {
+                        return;
+                    }
+                    this.state.toggle_theme();
                     cx.notify();
-                    return;
-                }
-                this.request_cancel_processing(cx);
-            }))
-            .on_action(cx.listener(|this, _: &shortcuts::ExportSubtitle, _window, cx| {
-                this.perform_editor_export(cx);
-            }))
-            .on_action(cx.listener(|this, _: &shortcuts::ToggleTheme, _window, cx| {
-                this.state.toggle_theme();
-                cx.notify();
-            }))
+                }),
+            )
             .on_action(cx.listener(|this, _: &shortcuts::Undo, _window, cx| {
+                if this.command_palette.is_some() {
+                    return;
+                }
                 // 键位是全局的，但撤销对象只能是字幕编辑；栈空时什么都不做，
                 // 免得在没有可退操作的页面上按 Ctrl+Z 反而触发别的副作用。
                 if this.state.undo() {
@@ -668,6 +1337,9 @@ impl Render for MainWindow {
                 }
             }))
             .on_action(cx.listener(|this, _: &shortcuts::Redo, _window, cx| {
+                if this.command_palette.is_some() {
+                    return;
+                }
                 if this.state.redo() {
                     this.subtitle_list_followed_sel = None;
                     cx.notify();
@@ -675,6 +1347,9 @@ impl Render for MainWindow {
             }))
             .on_action(
                 cx.listener(|this, _: &shortcuts::FocusSubtitleSearch, window, cx| {
+                    if this.command_palette.is_some() {
+                        return;
+                    }
                     // 搜索框在剪辑台里，先切页再聚焦；若本帧尚未挂载，聚焦调用会静默失效，
                     // 用户再按一次即可，不会误伤其他状态。
                     this.state.active_tab = WorkspaceTab::Editor;
@@ -682,6 +1357,13 @@ impl Render for MainWindow {
                     this.subtitle_search_cursor = this.subtitle_search.chars().count();
                     window.focus(&this.subtitle_search_focus);
                     cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &shortcuts::OpenCommandPalette, window, cx| {
+                    // 同一个键位 toggle：打开时把焦点交给面板搜索框，再按一次收回。
+                    // 打开动作不会去动 `state.status`，因此不会与「终止转写」抢语义。
+                    this.toggle_command_palette(window, cx);
                 }),
             )
             // 1. 顶部自定义标题栏 (极简沉浸式，包含窗口拖拽与控制按钮)
@@ -715,10 +1397,18 @@ impl Render for MainWindow {
                             .h_full()
                             .overflow_hidden()
                             .child(match tab {
-                                WorkspaceTab::Editor => self.render_editor_layout(viewport_w, cx).into_any_element(),
-                                WorkspaceTab::Generate => self.render_generate_layout(cx).into_any_element(),
-                                WorkspaceTab::Library => self.render_library_layout(cx).into_any_element(),
-                                WorkspaceTab::Performance => self.render_performance_layout(cx).into_any_element(),
+                                WorkspaceTab::Editor => {
+                                    self.render_editor_layout(viewport_w, cx).into_any_element()
+                                }
+                                WorkspaceTab::Generate => {
+                                    self.render_generate_layout(cx).into_any_element()
+                                }
+                                WorkspaceTab::Library => {
+                                    self.render_library_layout(cx).into_any_element()
+                                }
+                                WorkspaceTab::Performance => {
+                                    self.render_performance_layout(cx).into_any_element()
+                                }
                             }),
                     ),
             );
@@ -738,11 +1428,143 @@ impl Render for MainWindow {
             root
         };
 
+        // 命令面板 (P1-A10)：排在确认框之下、其余浮层之上。
+        // 它是「可随时关掉的轻量浮层」，而确认框是阻塞式模态——把面板放在确认框
+        // 之前，两者万一并存时确认框仍然盖在最上层，与 Esc 的优先级顺序一致。
+        let root = if self.command_palette.is_some() {
+            root.child(self.render_command_palette(window, cx))
+        } else {
+            root
+        };
+
         // 二次确认弹窗排在最后：它是阻塞式的，应盖在其它弹窗之上
         if let Some(info) = self.confirm_dialog.clone() {
             root.child(self.render_confirm_dialog(info, cx))
         } else {
             root
+        }
+    }
+}
+
+/// 字幕清单缓存是否仍可用：只要求每个下标都落在 `0..segment_count` 内，不要求覆盖全集，
+/// 空下标集（含 `segment_count == 0`）同样视为可用。
+///
+/// 为什么不直接把调用点换回 [`indices_cover_segments`]：那个函数语义是「下标覆盖整个片段
+/// 表」，而过滤态缓存的是全集的一个真子集，两者语义不同；即使某天实现恰好一致，也用一个
+/// 独立命名的本地函数把「不越界即可复用」的语义钉在调用点上，避免将来任一侧收紧语义时
+/// 静默改掉过滤缓存的复用行为（那会让播放期间逐帧重跑上千句的子串匹配）。
+fn filter_cache_usable(indices: &[usize], segment_count: usize) -> bool {
+    indices.iter().all(|&i| i < segment_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filter_cache_usable, filter_commands, PALETTE_COMMANDS};
+
+    /// 不过滤状态下缓存的是 `0..len` 全集：只要没越界就复用（播放期间逐帧重绘
+    /// 时零成本命中）。
+    #[test]
+    fn full_index_set_is_reusable() {
+        assert!(filter_cache_usable(&[0, 1, 2, 3], 4));
+        assert!(filter_cache_usable(&[], 0));
+    }
+
+    /// 过滤态下缓存的是全集的一个真子集，同样必须能复用——否则搜索关键字还在时
+    /// 播放会逐帧重跑上千句的子串匹配（这正是缓存要避免的开销）。
+    #[test]
+    fn filtered_subset_is_reusable() {
+        assert!(filter_cache_usable(&[1, 3], 4));
+        assert!(filter_cache_usable(&[2], 4));
+    }
+
+    /// 片段表在别处被换短后，旧下标越界即判失效，避免虚拟列表量不到行高而塌成空白。
+    #[test]
+    fn stale_indices_are_rejected() {
+        assert!(!filter_cache_usable(&[0, 1, 2, 3], 2));
+        assert!(!filter_cache_usable(&[5], 4));
+    }
+
+    /// 命令面板（P1-A10）：空查询显示全部命令——用户多半是先按 Ctrl+K 看一眼
+    /// 有哪些命令，再决定搜什么。
+    #[test]
+    fn empty_query_lists_every_command() {
+        assert_eq!(filter_commands("").len(), PALETTE_COMMANDS.len());
+        // 纯空白等价于空查询：面板里多敲了几个空格不该把列表清空
+        assert_eq!(filter_commands("   ").len(), PALETTE_COMMANDS.len());
+    }
+
+    /// 大小写不敏感：`EXPORT` / `export` / `Export` 都必须命中「导出」，
+    /// 英文别名只认精确大小写的话，按住 Shift 打词的人会搜不到任何东西。
+    #[test]
+    fn query_is_case_insensitive() {
+        let lower = filter_commands("export");
+        assert!(!lower.is_empty());
+        assert_eq!(filter_commands("EXPORT"), lower);
+        assert_eq!(filter_commands("eXpOrT"), lower);
+    }
+
+    /// 中文名与英文别名都在匹配范围内：中文用户输「导出」、英文习惯的用户输
+    /// `export`，两条路都得通。
+    #[test]
+    fn chinese_and_english_aliases_both_match() {
+        let zh = filter_commands("导出");
+        let en = filter_commands("export");
+        assert!(!zh.is_empty(), "中文名「导出」应当命中");
+        assert!(!en.is_empty(), "英文别名 export 应当命中");
+        // 同一条命令的两个别名：两个查询都得包含「导出（当前格式）」
+        let export_index = PALETTE_COMMANDS
+            .iter()
+            .position(|spec| spec.zh == "导出（当前格式）")
+            .expect("命令集里必须有导出");
+        assert!(zh.contains(&export_index));
+        assert!(en.contains(&export_index));
+    }
+
+    /// 无匹配返回空列表（渲染层据此显示「没有匹配的命令」，Enter 也因此不会
+    /// 误触任何命令）。
+    #[test]
+    fn unmatched_query_returns_nothing() {
+        assert!(filter_commands("zzz-not-a-command-zzz").is_empty());
+        assert!(filter_commands("转写一下这个根本不存在的命令").is_empty());
+    }
+
+    /// 返回的是 `PALETTE_COMMANDS` 的下标，且严格保持命令集顺序：
+    /// 面板的选中行按该序列索引，顺序错乱会让 Enter 执行到另一条命令。
+    #[test]
+    fn filter_preserves_catalog_order_and_indices() {
+        let all = filter_commands("");
+        assert!(all.windows(2).all(|w| w[0] < w[1]), "下标必须递增");
+        assert!(all.iter().all(|&i| i < PALETTE_COMMANDS.len()));
+
+        let undo = filter_commands("undo");
+        let redo = filter_commands("redo");
+        let undo_index = PALETTE_COMMANDS
+            .iter()
+            .position(|spec| spec.zh == "撤销")
+            .unwrap();
+        let redo_index = PALETTE_COMMANDS
+            .iter()
+            .position(|spec| spec.zh == "重做")
+            .unwrap();
+        assert!(undo.contains(&undo_index));
+        assert!(redo.contains(&redo_index));
+        // 「undo」不该顺带把「重做」也匹配进来（别名没有互相包含）
+        assert!(!undo.iter().any(|&i| PALETTE_COMMANDS[i].zh == "重做"));
+    }
+
+    /// 命令集本身的自洽性：英文别名一律小写（匹配前统一 `to_lowercase`，
+    /// 混入大写会让 `en` 列在面板副标题里显示得不整齐），中文名不重复。
+    #[test]
+    fn catalog_aliases_are_wellformed() {
+        let mut seen = std::collections::HashSet::new();
+        for spec in PALETTE_COMMANDS {
+            assert_eq!(
+                spec.en,
+                spec.en.to_lowercase(),
+                "别名必须全小写: {}",
+                spec.en
+            );
+            assert!(seen.insert(spec.zh), "中文名重复: {}", spec.zh);
         }
     }
 }

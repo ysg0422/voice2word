@@ -5,13 +5,13 @@
 use gpui::prelude::*;
 use gpui::*;
 
+use super::super::primitives;
+use super::super::theme::Theme;
+use super::super::MainWindow;
 use crate::app::state::ProcessStatus;
 use crate::app::{PolishMode, WhisperModelTier};
 use crate::engines::MAX_SPEAKERS;
 use crate::utils::time::format_duration_short;
-use super::super::primitives;
-use super::super::theme::Theme;
-use super::super::MainWindow;
 
 /// 说话人数量预设表：`(选项值, 显示名)`，从 2 人起（引擎收敛区间的下限也是 2）。
 /// 渲染时只取前 `MAX_SPEAKERS - 1` 项，所以这张表只需要「够长」，多余的项不会出现在界面上。
@@ -39,8 +39,34 @@ const _: () = assert!(
 fn speaker_options() -> Vec<(&'static str, &'static str)> {
     let mut options = Vec::with_capacity(MAX_SPEAKERS as usize);
     options.push(("off", "关闭"));
-    options.extend(SPEAKER_PRESETS[..(MAX_SPEAKERS as usize) - 1].iter().copied());
+    options.extend(
+        SPEAKER_PRESETS[..(MAX_SPEAKERS as usize) - 1]
+            .iter()
+            .copied(),
+    );
     options
+}
+
+/// 「转写线程」候选项：与性能页滑条同口径（`2..=本机逻辑核心数`），
+/// 取 2 的幂次常用档位，并显式并入滑条上限（核数）与配置里的当前值。
+///
+/// 为什么必须并入当前值：抽屉此前把选项写死成 4/8/16，而性能页滑条是按核数
+/// 推导的（`views/performance.rs`），配置里可能是 12 这类不在旧表里的值；那时
+/// 抽屉里三个胶囊全部处于未选中态，看起来像「什么都没选」，两处口径不一致。
+/// 候选项与性能页共用同一个上限来源（[`crate::app::AppState::logical_cores`]）。
+fn thread_presets(current: u32, cores: u32) -> Vec<u32> {
+    let max = cores.max(2);
+    let mut values: Vec<u32> = [2u32, 4, 8, 16, 32]
+        .into_iter()
+        .filter(|v| *v <= max)
+        .collect();
+    // 滑条能达到的上限档，保证抽屉里也能直接选到它
+    values.push(max);
+    // 配置里的当前值必须始终在列，否则胶囊会全部落空
+    values.push(current.clamp(2, max));
+    values.sort_unstable();
+    values.dedup();
+    values
 }
 
 impl MainWindow {
@@ -53,7 +79,10 @@ impl MainWindow {
         let has_batch = !self.state.batch_queue.is_empty();
         let batch_running = self.state.batch_running;
         let can_act = has_file || has_batch;
-        let fname = self.state.transcribe_file.as_ref()
+        let fname = self
+            .state
+            .transcribe_file
+            .as_ref()
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
             .unwrap_or("未选择文件")
@@ -85,20 +114,18 @@ impl MainWindow {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                primitives::stat_dot(if is_processing {
-                                    Theme::accent_orange()
-                                } else {
-                                    Theme::accent_mint()
-                                }),
-                            )
-                            .child(
-                                primitives::panel_title("转写配置"),
-                            ),
+                            .child(primitives::stat_dot(if is_processing {
+                                Theme::accent_orange()
+                            } else {
+                                Theme::accent_mint()
+                            }))
+                            .child(primitives::panel_title("转写配置")),
                     )
-                    .child(
-                        primitives::badge(if is_sv { "SenseVoice" } else { "Whisper" }),
-                    ),
+                    .child(primitives::badge(if is_sv {
+                        "SenseVoice"
+                    } else {
+                        "Whisper"
+                    })),
             )
             // ── 2. 媒体文件选择与状态卡片 ──
             .child(
@@ -108,9 +135,16 @@ impl MainWindow {
                     .flex_row()
                     .bg(Theme::bg_inset())
                     .border_1()
-                    .border_color(if has_file { Theme::tint_mint_border() } else { Theme::border() })
+                    .border_color(if has_file {
+                        Theme::tint_mint_border()
+                    } else {
+                        Theme::border()
+                    })
                     .cursor_pointer()
-                    .hover(|s| s.bg(Theme::bg_card_hover()).border_color(Theme::border_light()))
+                    .hover(|s| {
+                        s.bg(Theme::bg_card_hover())
+                            .border_color(Theme::border_light())
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.choose_file(cx);
                     }))
@@ -122,15 +156,27 @@ impl MainWindow {
                             .w(px(Theme::CTRL_H_LG))
                             .h(px(Theme::CTRL_H_LG))
                             .rounded(px(Theme::RADIUS_LG))
-                            .bg(if has_file { Theme::tint_blue_soft() } else { Theme::tint_mint_soft() })
+                            .bg(if has_file {
+                                Theme::tint_blue_soft()
+                            } else {
+                                Theme::tint_mint_soft()
+                            })
                             .border_1()
-                            .border_color(if has_file { Theme::tint_blue_border() } else { Theme::tint_mint_border() })
+                            .border_color(if has_file {
+                                Theme::tint_blue_border()
+                            } else {
+                                Theme::tint_mint_border()
+                            })
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_size(px(Theme::TEXT_BODY))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(if has_file { Theme::accent_blue() } else { Theme::accent_mint() })
+                            .text_color(if has_file {
+                                Theme::accent_blue()
+                            } else {
+                                Theme::accent_mint()
+                            })
                             .child(if has_file { "FILE" } else { "+" }),
                     )
                     .child(
@@ -142,7 +188,11 @@ impl MainWindow {
                                     .text_size(px(Theme::TEXT_BODY_LG))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(Theme::text_primary())
-                                    .child(if has_file { fname } else { "选择音视频文件".to_string() }),
+                                    .child(if has_file {
+                                        fname
+                                    } else {
+                                        "选择音视频文件".to_string()
+                                    }),
                             )
                             .children(if has_file {
                                 Some(
@@ -162,12 +212,24 @@ impl MainWindow {
                             .rounded(px(Theme::RADIUS_SM))
                             .flex()
                             .items_center()
-                            .bg(if has_file { Theme::bg_card_hover() } else { Theme::accent_mint() })
+                            .bg(if has_file {
+                                Theme::bg_card_hover()
+                            } else {
+                                Theme::accent_mint()
+                            })
                             .border_1()
-                            .border_color(if has_file { Theme::border_strong() } else { Theme::tint_mint_border() })
+                            .border_color(if has_file {
+                                Theme::border_strong()
+                            } else {
+                                Theme::tint_mint_border()
+                            })
                             .text_size(px(Theme::TEXT_SMALL))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(if has_file { Theme::text_secondary() } else { Theme::text_on_accent() })
+                            .text_color(if has_file {
+                                Theme::text_secondary()
+                            } else {
+                                Theme::text_on_accent()
+                            })
                             .child(if has_file { "更换" } else { "浏览" }),
                     ),
             )
@@ -190,7 +252,11 @@ impl MainWindow {
             .child(
                 primitives::btn(
                     if is_processing {
-                        if batch_running { "终止批量" } else { "终止转写" }
+                        if batch_running {
+                            "终止批量"
+                        } else {
+                            "终止转写"
+                        }
                     } else if has_file {
                         "开始转写"
                     } else if has_batch {
@@ -201,53 +267,57 @@ impl MainWindow {
                     primitives::BtnSize::Lg,
                     primitives::BtnVariant::Primary,
                 )
-                    .id("sidebar-primary-cta-btn")
-                    .w_full()
-                    .gap(px(Theme::SPACE_2))
-                    .bg(if is_processing {
-                        Theme::accent_red_strong()
-                    } else if can_act {
-                        Theme::accent_mint()
+                .id("sidebar-primary-cta-btn")
+                .w_full()
+                .gap(px(Theme::SPACE_2))
+                .bg(if is_processing {
+                    Theme::accent_red_strong()
+                } else if can_act {
+                    Theme::accent_mint()
+                } else {
+                    Theme::bg_disabled()
+                })
+                .border_1()
+                .border_color(if is_processing {
+                    Theme::tint_red_border()
+                } else if can_act {
+                    Theme::tint_mint_border()
+                } else {
+                    Theme::border_strong()
+                })
+                .text_color(if is_processing {
+                    // 转写中按钮是深红实心块，文字恒白
+                    Theme::text_on_saturated()
+                } else if can_act {
+                    Theme::text_on_accent()
+                } else {
+                    Theme::text_muted()
+                })
+                .hover(move |s| {
+                    if can_act || is_processing {
+                        s.opacity(0.9)
                     } else {
-                        Theme::bg_disabled()
-                    })
-                    .border_1()
-                    .border_color(if is_processing {
-                        Theme::tint_red_border()
-                    } else if can_act {
-                        Theme::tint_mint_border()
-                    } else {
-                        Theme::border_strong()
-                    })
-                    .text_color(if is_processing {
-                        // 转写中按钮是深红实心块，文字恒白
-                        Theme::text_on_saturated()
-                    } else if can_act {
-                        Theme::text_on_accent()
-                    } else {
-                        Theme::text_muted()
-                    })
-                    .hover(move |s| {
-                        if can_act || is_processing { s.opacity(0.9) } else { s }
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let processing = matches!(this.state.status, ProcessStatus::Processing { .. });
-                        if processing {
-                            // 真正终止：标记取消请求并强杀识别子进程，事件回传后由收尾逻辑复位状态。
-                            // 批量模式下同时停掉续跑，避免杀完当前项又自动开下一个。
-                            if this.state.batch_running {
-                                this.cancel_batch_queue(cx);
-                            } else {
-                                this.request_cancel_processing(cx);
-                            }
-                        } else if this.state.transcribe_file.is_some() {
-                            this.start_processing(cx);
-                        } else if !this.state.batch_queue.is_empty() {
-                            this.start_batch_queue(cx);
+                        s
+                    }
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let processing = matches!(this.state.status, ProcessStatus::Processing { .. });
+                    if processing {
+                        // 真正终止：标记取消请求并强杀识别子进程，事件回传后由收尾逻辑复位状态。
+                        // 批量模式下同时停掉续跑，避免杀完当前项又自动开下一个。
+                        if this.state.batch_running {
+                            this.cancel_batch_queue(cx);
                         } else {
-                            this.choose_file(cx);
+                            this.request_cancel_processing(cx);
                         }
-                    }))
+                    } else if this.state.transcribe_file.is_some() {
+                        this.start_processing(cx);
+                    } else if !this.state.batch_queue.is_empty() {
+                        this.start_batch_queue(cx);
+                    } else {
+                        this.choose_file(cx);
+                    }
+                })),
             )
     }
 
@@ -302,10 +372,24 @@ impl MainWindow {
             .gap(px(Theme::SPACE_1))
             .rounded(px(Theme::RADIUS_LG))
             .border_1()
-            .border_color(if is_sel { Theme::tint_blue_border() } else { Theme::transparent() })
-            .bg(if is_sel { Theme::tint_blue_badge() } else { Theme::bg_raised() })
+            .border_color(if is_sel {
+                Theme::tint_blue_border()
+            } else {
+                Theme::transparent()
+            })
+            .bg(if is_sel {
+                Theme::tint_blue_badge()
+            } else {
+                Theme::bg_raised()
+            })
             .cursor_pointer()
-            .hover(move |s| if is_sel { s } else { s.bg(Theme::tint_neutral()) })
+            .hover(move |s| {
+                if is_sel {
+                    s
+                } else {
+                    s.bg(Theme::tint_neutral())
+                }
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.state.whisper_model_tier = tier;
                 cx.notify();
@@ -313,14 +397,26 @@ impl MainWindow {
             .child(
                 div()
                     .text_size(px(Theme::TEXT_SMALL))
-                    .font_weight(if is_sel { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                    .text_color(if is_sel { Theme::accent_blue() } else { Theme::text_primary() })
+                    .font_weight(if is_sel {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .text_color(if is_sel {
+                        Theme::accent_blue()
+                    } else {
+                        Theme::text_primary()
+                    })
                     .child(name),
             )
             .child(
                 div()
                     .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(if is_sel { Theme::accent_blue() } else { Theme::text_muted() })
+                    .text_color(if is_sel {
+                        Theme::accent_blue()
+                    } else {
+                        Theme::text_muted()
+                    })
                     .child(speed),
             );
         if full_width {
@@ -356,6 +452,14 @@ impl MainWindow {
             "qwen"
         };
         let thread_sel = self.state.whisper_threads.to_string();
+        // 线程候选项与性能页同源：上限取本机逻辑核心数，并并入配置当前值
+        let thread_options: Vec<(String, String)> = thread_presets(
+            self.state.whisper_threads,
+            crate::app::AppState::logical_cores(),
+        )
+        .into_iter()
+        .map(|n| (n.to_string(), format!("{n} 线程")))
+        .collect();
         // 说话人数量：选项与收敛区间都以 diarization::MAX_SPEAKERS 为准，
         // 不在这里另写一份字面量。引擎把人数收敛到 2..=MAX_SPEAKERS，
         // UI 若还留着旧的固定 4，用户选了也白选。
@@ -420,6 +524,10 @@ impl MainWindow {
                 lang_sel,
                 |this, sel, cx| {
                     this.state.language = sel.to_string();
+                    // 与同卡片其它项一致：状态 + config.toml 双写。此前只改 state，
+                    // 重启后 `AppState::with_hardware` 从配置读回的仍是旧语言。
+                    this.state.config.pipeline.language = sel.to_string();
+                    let _ = this.state.config.save_to_file("config.toml");
                     cx.notify();
                 },
                 cx,
@@ -438,6 +546,9 @@ impl MainWindow {
                 fmt_sel,
                 |this, sel, cx| {
                     this.state.output_format = sel.to_string();
+                    // 同上：不落盘的话，重启后配置里的旧格式会把这次选择覆盖掉
+                    this.state.config.pipeline.output_format = sel.to_string();
+                    let _ = this.state.config.save_to_file("config.toml");
                     cx.notify();
                 },
                 cx,
@@ -473,7 +584,8 @@ impl MainWindow {
                         "off" => this.state.config.pipeline.enable_diarization = false,
                         n => {
                             this.state.config.pipeline.enable_diarization = true;
-                            this.state.config.pipeline.speaker_count = n.parse::<u32>().unwrap_or(2);
+                            this.state.config.pipeline.speaker_count =
+                                n.parse::<u32>().unwrap_or(2);
                         }
                     }
                     let _ = this.state.config.save_to_file("config.toml");
@@ -483,20 +595,33 @@ impl MainWindow {
             ))
             .child(self.param_group(
                 "转写线程",
-                vec![("4", "4 线程"), ("8", "8 线程"), ("16", "16 线程")],
+                thread_options,
                 &thread_sel,
                 |this, sel, cx| {
-                    this.state.whisper_threads = sel.parse::<u32>().unwrap_or(8);
-                    cx.notify();
+                    let v = sel.parse::<u32>().unwrap_or(8);
+                    if this.state.whisper_threads != v {
+                        this.state.whisper_threads = v;
+                        // 与性能页滑条同一落盘口径（见 views/performance.rs）
+                        this.state.config.pipeline.whisper_threads = v;
+                        let _ = this.state.config.save_to_file("config.toml");
+                        cx.notify();
+                    }
                 },
                 cx,
             ))
             .child(self.param_group(
                 "音频加速",
-                vec![("1.00", "关闭"), ("1.15", "1.15x"), ("1.25", "1.25x"), ("1.35", "1.35x"), ("1.50", "1.50x")],
+                vec![
+                    ("1.00", "关闭"),
+                    ("1.15", "1.15x"),
+                    ("1.25", "1.25x"),
+                    ("1.35", "1.35x"),
+                    ("1.50", "1.50x"),
+                ],
                 &audio_speed_sel,
                 |this, sel, cx| {
-                    this.state.config.pipeline.whisper_audio_speed = sel.parse::<f64>().unwrap_or(1.0);
+                    this.state.config.pipeline.whisper_audio_speed =
+                        sel.parse::<f64>().unwrap_or(1.0);
                     let _ = this.state.config.save_to_file("config.toml");
                     cx.notify();
                 },
@@ -507,7 +632,8 @@ impl MainWindow {
                 vec![("0.50", "标准"), ("0.55", "稍积极"), ("0.60", "积极")],
                 &vad_threshold_sel,
                 |this, sel, cx| {
-                    this.state.config.pipeline.whisper_vad_threshold = sel.parse::<f64>().unwrap_or(0.50);
+                    this.state.config.pipeline.whisper_vad_threshold =
+                        sel.parse::<f64>().unwrap_or(0.50);
                     let _ = this.state.config.save_to_file("config.toml");
                     cx.notify();
                 },
@@ -516,14 +642,18 @@ impl MainWindow {
     }
 
     /// 参数分组：小标题 + 分段选择器行
-    fn param_group(
+    fn param_group<K, L>(
         &mut self,
         label: &'static str,
-        options: Vec<(&'static str, &'static str)>,
+        options: Vec<(K, L)>,
         selected: &str,
-        on_select: impl Fn(&mut Self, &'static str, &mut Context<Self>) + Copy + 'static,
+        on_select: impl Fn(&mut Self, &str, &mut Context<Self>) + Copy + 'static,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> Div
+    where
+        K: Into<SharedString> + Clone + 'static,
+        L: Into<SharedString>,
+    {
         div()
             .flex()
             .flex_col()
@@ -533,20 +663,27 @@ impl MainWindow {
     }
 
     /// 通用分段选择器：一行等宽胶囊，单击切换
-    fn pill_row(
+    fn pill_row<K, L>(
         &mut self,
-        options: Vec<(&'static str, &'static str)>,
+        options: Vec<(K, L)>,
         selected: &str,
-        on_select: impl Fn(&mut Self, &'static str, &mut Context<Self>) + Copy + 'static,
+        on_select: impl Fn(&mut Self, &str, &mut Context<Self>) + Copy + 'static,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> Div
+    where
+        K: Into<SharedString> + Clone + 'static,
+        L: Into<SharedString>,
+    {
         let mut row = primitives::segmented_row();
         for (key, label) in options {
-            let is_sel = key == selected;
+            let key: SharedString = key.into();
+            let is_sel = key.as_str() == selected;
+            // 元素 id 沿用选项值本身（与改动前逐字一致），避免影响既有交互命中
+            let pill_id = key.clone();
             row = row.child(
                 primitives::segmented(label, is_sel, true)
-                    .id(key)
-                    .on_click(cx.listener(move |this, _, _, cx| on_select(this, key, cx))),
+                    .id(pill_id)
+                    .on_click(cx.listener(move |this, _, _, cx| on_select(this, key.as_str(), cx))),
             );
         }
         row
@@ -573,21 +710,17 @@ impl MainWindow {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(
-                        primitives::field_label("系统监控"),
-                    )
+                    .child(primitives::field_label("系统监控"))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(
-                                primitives::stat_dot_sm(if m.is_model_running {
-                                    Theme::accent_mint()
-                                } else {
-                                    Theme::text_muted()
-                                }),
-                            )
+                            .child(primitives::stat_dot_sm(if m.is_model_running {
+                                Theme::accent_mint()
+                            } else {
+                                Theme::text_muted()
+                            }))
                             .child(
                                 div()
                                     .text_size(px(Theme::TEXT_CAPTION))
@@ -618,11 +751,13 @@ impl MainWindow {
                                     .flex()
                                     .items_center()
                                     .gap_1()
-                                    .child(div().text_color(Theme::text_muted()).child(if m.is_model_running {
-                                        "CPU (大模型):"
-                                    } else {
-                                        "CPU (应用待机):"
-                                    }))
+                                    .child(div().text_color(Theme::text_muted()).child(
+                                        if m.is_model_running {
+                                            "CPU (大模型):"
+                                        } else {
+                                            "CPU (应用待机):"
+                                        },
+                                    ))
                                     .child(
                                         div()
                                             .font_weight(FontWeight::BOLD)
@@ -637,13 +772,11 @@ impl MainWindow {
                             ),
                     )
                     // 双层条
-                    .child(
-                        primitives::meter_bar(
-                            sys_cpu_pct / 100.0,
-                            proc_cpu_pct / 100.0,
-                            Theme::accent_mint(),
-                        ),
-                    ),
+                    .child(primitives::meter_bar(
+                        sys_cpu_pct / 100.0,
+                        proc_cpu_pct / 100.0,
+                        Theme::accent_mint(),
+                    )),
             )
             // 2. 内存对比条
             .child(
@@ -662,16 +795,20 @@ impl MainWindow {
                                     .flex()
                                     .items_center()
                                     .gap_1()
-                                    .child(div().text_color(Theme::text_muted()).child(if m.is_model_running {
-                                        "内存 (大模型):"
-                                    } else {
-                                        "内存 (应用待机):"
-                                    }))
+                                    .child(div().text_color(Theme::text_muted()).child(
+                                        if m.is_model_running {
+                                            "内存 (大模型):"
+                                        } else {
+                                            "内存 (应用待机):"
+                                        },
+                                    ))
                                     .child(
                                         div()
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(Theme::accent_blue())
-                                            .child(crate::app::ResourceMetrics::format_bytes(m.proc_mem)),
+                                            .child(crate::app::ResourceMetrics::format_bytes(
+                                                m.proc_mem,
+                                            )),
                                     ),
                             )
                             .child(
@@ -681,13 +818,11 @@ impl MainWindow {
                             ),
                     )
                     // 双层内存条
-                    .child(
-                        primitives::meter_bar(
-                            sys_mem_pct / 100.0,
-                            proc_mem_pct / 100.0,
-                            Theme::accent_blue(),
-                        ),
-                    ),
+                    .child(primitives::meter_bar(
+                        sys_mem_pct / 100.0,
+                        proc_mem_pct / 100.0,
+                        Theme::accent_blue(),
+                    )),
             )
     }
 }

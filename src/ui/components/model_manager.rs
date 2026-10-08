@@ -40,7 +40,11 @@ fn human_size(bytes: u64) -> String {
 impl MainWindow {
     /// 模型管理卡片。`compact` 为真时只显示缺失项与一个「一键补齐」按钮
     /// （用于侧栏），否则显示完整清单（用于独立页面）。
-    pub(crate) fn render_model_manager(&mut self, compact: bool, cx: &mut gpui::Context<Self>) -> AnyElement {
+    pub(crate) fn render_model_manager(
+        &mut self,
+        compact: bool,
+        cx: &mut gpui::Context<Self>,
+    ) -> AnyElement {
         let is_downloading = self.state.is_downloading;
         let done = self.state.download_done_bytes;
         let total = self.state.download_total_bytes;
@@ -57,24 +61,20 @@ impl MainWindow {
         };
 
         // ── 顶部：标题 + 缺失计数 ──
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(Theme::SPACE_2))
-                    .child(primitives::section_title("模型与组件"))
-                    .child(if missing == 0 {
-                        primitives::badge("已就绪")
-                    } else if missing_required > 0 {
-                        primitives::badge_danger(format!("缺 {missing_required} 个必需"))
-                    } else {
-                        primitives::badge(format!("缺 {missing} 个可选"))
-                    }),
-            );
+        let header = div().flex().items_center().justify_between().child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(Theme::SPACE_2))
+                .child(primitives::section_title("模型与组件"))
+                .child(if missing == 0 {
+                    primitives::badge("已就绪")
+                } else if missing_required > 0 {
+                    primitives::badge_danger(format!("缺 {missing_required} 个必需"))
+                } else {
+                    primitives::badge(format!("缺 {missing} 个可选"))
+                }),
+        );
 
         // ── 说明行：明确告知「不需要梯子」──
         let note = div()
@@ -132,7 +132,11 @@ impl MainWindow {
                     human_size(total)
                 )
             } else {
-                format!("{}  {}", current.as_deref().unwrap_or("准备中"), human_size(done))
+                format!(
+                    "{}  {}",
+                    current.as_deref().unwrap_or("准备中"),
+                    human_size(done)
+                )
             };
             Some(
                 div()
@@ -288,9 +292,7 @@ impl MainWindow {
                                     .text_color(Theme::text_muted())
                                     .child(human_size(item.size)),
                             )
-                            .when(item.required, |d| {
-                                d.child(primitives::badge_danger("必需"))
-                            }),
+                            .when(item.required, |d| d.child(primitives::badge_danger("必需"))),
                     )
                     .child(
                         div()

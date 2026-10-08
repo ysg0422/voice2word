@@ -14,7 +14,7 @@
 //! WCAG AA 正文要求 ≥ 4.5:1）：
 //! - 深色：`text_primary` 13.5~17.5、`text_secondary` 5.8~7.5、`text_muted` 4.9~6.3
 //! - 浅色：`text_primary` 15.8~17.2、`text_secondary` 6.2~7.1、`text_muted` 4.6~5.2
-//! `text_disabled` 只用于禁用态，不参与正文对比度要求。
+//!   `text_disabled` 只用于禁用态，不参与正文对比度要求。
 
 use gpui::{rgb, rgba, Rgba};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,153 +49,336 @@ impl Theme {
 
     // ==================== 背景层次（由深到浅） ====================
     /// 窗口最底色
-    #[inline] pub fn bg_app() -> Rgba { Self::c(0x0e0e11, 0xf2f2f5) }
+    #[inline]
+    pub fn bg_app() -> Rgba {
+        Self::c(0x0e0e11, 0xf2f2f5)
+    }
     /// 视频监视器 / 样式预览条底色。
     ///
     /// **随主题翻转**：深色主题下是接近纯黑（视频画面的常规衬底），浅色主题下是
     /// 一层浅灰——浅色主题里留一整块纯黑面板会非常突兀，也会把整个界面的明度
     /// 拉塌。真正「必须恒深」的只有压在图片上的角标条（见 [`Self::bg_overlay`]）。
-    #[inline] pub fn bg_media() -> Rgba { Self::c(0x09090b, 0xe8e8ee) }
+    #[inline]
+    pub fn bg_media() -> Rgba {
+        Self::c(0x09090b, 0xe8e8ee)
+    }
     /// 监视器视口内屏（比 bg_media 再深一档，用于区分「画面区」与「画面外的衬底」）
-    #[inline] pub fn bg_media_deep() -> Rgba { Self::c(0x050507, 0xdedee6) }
+    #[inline]
+    pub fn bg_media_deep() -> Rgba {
+        Self::c(0x050507, 0xdedee6)
+    }
     /// 比窗口底更深的容器
-    #[inline] pub fn bg_deep() -> Rgba { Self::c(0x0a0a0f, 0xececf0) }
+    #[inline]
+    pub fn bg_deep() -> Rgba {
+        Self::c(0x0a0a0f, 0xececf0)
+    }
     /// 左侧导航 / 标题栏 / 状态栏 / 时间轴
-    #[inline] pub fn bg_sidebar() -> Rgba { Self::c(0x131316, 0xfafafc) }
+    #[inline]
+    pub fn bg_sidebar() -> Rgba {
+        Self::c(0x131316, 0xfafafc)
+    }
     /// 输入框 / 代码块 / 内嵌凹槽
-    #[inline] pub fn bg_input() -> Rgba { Self::c(0x161619, 0xffffff) }
+    #[inline]
+    pub fn bg_input() -> Rgba {
+        Self::c(0x161619, 0xffffff)
+    }
     /// 主内容面板
-    #[inline] pub fn bg_panel() -> Rgba { Self::c(0x18181c, 0xf7f7fa) }
+    #[inline]
+    pub fn bg_panel() -> Rgba {
+        Self::c(0x18181c, 0xf7f7fa)
+    }
     /// 面板内的次级内嵌区块
-    #[inline] pub fn bg_inset() -> Rgba { Self::c(0x181820, 0xeeeef2) }
+    #[inline]
+    pub fn bg_inset() -> Rgba {
+        Self::c(0x181820, 0xeeeef2)
+    }
     /// 抬升一级的区块（比 bg_inset 略亮）
-    #[inline] pub fn bg_raised() -> Rgba { Self::c(0x1a1a24, 0xf1f1f5) }
+    #[inline]
+    pub fn bg_raised() -> Rgba {
+        Self::c(0x1a1a24, 0xf1f1f5)
+    }
     /// 禁用态底色
-    #[inline] pub fn bg_disabled() -> Rgba { Self::c(0x1e1e26, 0xe8e8ee) }
+    #[inline]
+    pub fn bg_disabled() -> Rgba {
+        Self::c(0x1e1e26, 0xe8e8ee)
+    }
     /// 卡片底色
-    #[inline] pub fn bg_card() -> Rgba { Self::c(0x202024, 0xffffff) }
+    #[inline]
+    pub fn bg_card() -> Rgba {
+        Self::c(0x202024, 0xffffff)
+    }
     /// 进度条轨道 / 分组底槽
-    #[inline] pub fn bg_track() -> Rgba { Self::c(0x22222a, 0xe4e4ea) }
+    #[inline]
+    pub fn bg_track() -> Rgba {
+        Self::c(0x22222a, 0xe4e4ea)
+    }
     /// 卡片悬停底色
-    #[inline] pub fn bg_card_hover() -> Rgba { Self::c(0x242428, 0xf4f4f8) }
+    #[inline]
+    pub fn bg_card_hover() -> Rgba {
+        Self::c(0x242428, 0xf4f4f8)
+    }
     /// 通用悬停底色
-    #[inline] pub fn bg_hover() -> Rgba { Self::c(0x27272e, 0xeaeaef) }
+    #[inline]
+    pub fn bg_hover() -> Rgba {
+        Self::c(0x27272e, 0xeaeaef)
+    }
     /// 强悬停 / 选中态底色
-    #[inline] pub fn bg_hover_strong() -> Rgba { Self::c(0x282832, 0xe2e2e9) }
+    #[inline]
+    pub fn bg_hover_strong() -> Rgba {
+        Self::c(0x282832, 0xe2e2e9)
+    }
     /// 弹窗遮罩
-    #[inline] pub fn bg_scrim() -> Rgba { Self::a(0x000000cc, 0x1a1a2066) }
+    #[inline]
+    pub fn bg_scrim() -> Rgba {
+        Self::a(0x000000cc, 0x1a1a2066)
+    }
     /// 卡片内浮层的浅遮罩（如缩略图底部信息条，恒为深色半透明）
-    #[inline] pub fn bg_scrim_soft() -> Rgba { rgba(0x0a0a0fb8) }
+    #[inline]
+    pub fn bg_scrim_soft() -> Rgba {
+        rgba(0x0a0a0fb8)
+    }
     /// 恒为深色的浮层底（缩略图上的角标条）。
     ///
     /// 与 [`Self::bg_scrim_soft`] 同名同色但语义不同：`bg_scrim_soft` 是**遮罩**
     /// （压暗底下的图，可以很淡），本 token 是**承载文字的底**（必须足够深，
     /// 否则上面的浅色文字在浅色主题下会糊掉）。用它时文字取 `text_on_media`。
-    #[inline] pub fn bg_overlay() -> Rgba { rgba(0x0a0a0fcc) }
+    #[inline]
+    pub fn bg_overlay() -> Rgba {
+        rgba(0x0a0a0fcc)
+    }
     /// 资源监控里的「系统占用」衬底条
-    #[inline] pub fn bg_stat_track() -> Rgba { Self::c(0x4a4a58, 0xc8c8d2) }
+    #[inline]
+    pub fn bg_stat_track() -> Rgba {
+        Self::c(0x4a4a58, 0xc8c8d2)
+    }
     /// 空态状态点
-    #[inline] pub fn bg_dot_idle() -> Rgba { Self::c(0x3a3a44, 0xc4c4ce) }
+    #[inline]
+    pub fn bg_dot_idle() -> Rgba {
+        Self::c(0x3a3a44, 0xc4c4ce)
+    }
 
     // ==================== 边框 ====================
     /// 极弱分隔（卡片内分组）
-    #[inline] pub fn border_subtle() -> Rgba { Self::c(0x242430, 0xececf2) }
+    #[inline]
+    pub fn border_subtle() -> Rgba {
+        Self::c(0x242430, 0xececf2)
+    }
     /// 常规分隔线
-    #[inline] pub fn border() -> Rgba { Self::c(0x2c2c34, 0xdedee6) }
+    #[inline]
+    pub fn border() -> Rgba {
+        Self::c(0x2c2c34, 0xdedee6)
+    }
     /// 中间档边界（内嵌区块、输入框）
-    #[inline] pub fn border_mid() -> Rgba { Self::c(0x282832, 0xe4e4ea) }
+    #[inline]
+    pub fn border_mid() -> Rgba {
+        Self::c(0x282832, 0xe4e4ea)
+    }
     /// 强调边界 / 悬停边框
-    #[inline] pub fn border_strong() -> Rgba { Self::c(0x383842, 0xc6c6d2) }
+    #[inline]
+    pub fn border_strong() -> Rgba {
+        Self::c(0x383842, 0xc6c6d2)
+    }
     /// 兼容旧名，等同于 border_strong
-    #[inline] pub fn border_light() -> Rgba { Self::c(0x383842, 0xc6c6d2) }
+    #[inline]
+    pub fn border_light() -> Rgba {
+        Self::c(0x383842, 0xc6c6d2)
+    }
 
     // ==================== 文字 ====================
     /// 主文字
-    #[inline] pub fn text_primary() -> Rgba { Self::c(0xf3f4f6, 0x18181b) }
+    #[inline]
+    pub fn text_primary() -> Rgba {
+        Self::c(0xf3f4f6, 0x18181b)
+    }
     /// 高对比文字（选中项、深色胶囊上的文字）
-    #[inline] pub fn text_white() -> Rgba { Self::c(0xffffff, 0x18181b) }
+    #[inline]
+    pub fn text_white() -> Rgba {
+        Self::c(0xffffff, 0x18181b)
+    }
     /// 次要说明
-    #[inline] pub fn text_secondary() -> Rgba { Self::c(0xa1a1aa, 0x5c5c66) }
+    #[inline]
+    pub fn text_secondary() -> Rgba {
+        Self::c(0xa1a1aa, 0x5c5c66)
+    }
     /// 弱化标签 / 元信息（仍满足 AA）
-    #[inline] pub fn text_muted() -> Rgba { Self::c(0x94949e, 0x6b6b76) }
+    #[inline]
+    pub fn text_muted() -> Rgba {
+        Self::c(0x94949e, 0x6b6b76)
+    }
     /// 禁用态文字（不参与正文对比度要求）
-    #[inline] pub fn text_disabled() -> Rgba { Self::c(0x6b7280, 0xa1a1aa) }
+    #[inline]
+    pub fn text_disabled() -> Rgba {
+        Self::c(0x6b7280, 0xa1a1aa)
+    }
     /// 等宽代码 / 时间戳
-    #[inline] pub fn text_code() -> Rgba { Self::c(0x38bdf8, 0x0284c7) }
+    #[inline]
+    pub fn text_code() -> Rgba {
+        Self::c(0x38bdf8, 0x0284c7)
+    }
     /// **亮色**强调底（薄荷 / 橙色）上的文字，两种主题下都取深色。
     ///
     /// 判定依据是实测对比度，不是「深色主题下看着顺眼」：
     /// - 薄荷浅色值 `0x0d9668`：黑字 5.6:1（AA 通过），白字 3.8:1（不通过）
     /// - 薄荷深色值 `0x10b981`：黑字 7.8:1
-    /// 所以薄荷底在黑/白两种主题下都该配黑字。
+    ///   所以薄荷底在黑/白两种主题下都该配黑字。
     ///
     /// 反例：蓝色 `0x4f46e5`、红色 `0xbe123c` 这类**深色**强调底必须配恒白文字，
     /// 见 [`Self::text_on_saturated`]；拿本 token 去配它们会变成深字压深底。
-    #[inline] pub fn text_on_accent() -> Rgba { rgb(0x09090b) }
+    #[inline]
+    pub fn text_on_accent() -> Rgba {
+        rgb(0x09090b)
+    }
     /// 视频画面 / 纯黑底上的字幕字形颜色，恒为白色（不随主题变化）。
     /// 与 [`Self::text_on_media`] 的分工：本 token 给「视频里的字幕」，后者给「界面文字」。
-    #[inline] pub fn text_subtitle() -> Rgba { rgb(0xffffff) }
+    #[inline]
+    pub fn text_subtitle() -> Rgba {
+        rgb(0xffffff)
+    }
     /// 监视器衬底上的界面文字（「正在提取视频帧…」这类占位提示）。
     /// 随主题翻转：深色主题浅灰字，浅色主题深灰字。
-    #[inline] pub fn text_on_media() -> Rgba { Self::c(0xd4d4d8, 0x5c5c66) }
+    #[inline]
+    pub fn text_on_media() -> Rgba {
+        Self::c(0xd4d4d8, 0x5c5c66)
+    }
     /// 监视器衬底上的强调文字（「正在同步视频画面…」）。
-    #[inline] pub fn accent_on_media() -> Rgba { Self::c(0x34d399, 0x0d9668) }
+    #[inline]
+    pub fn accent_on_media() -> Rgba {
+        Self::c(0x34d399, 0x0d9668)
+    }
     /// 压在**图片**上的角标条文字（缩略图的 MP4 / 时长角标）。
     /// 恒为浅色——角标条底色 `bg_overlay` 恒深，不随主题变。
-    #[inline] pub fn text_on_overlay() -> Rgba { rgb(0xd4d4d8) }
+    #[inline]
+    pub fn text_on_overlay() -> Rgba {
+        rgb(0xd4d4d8)
+    }
     /// 饱和色块（时间轴胶囊）上的文字，恒为白色
-    #[inline] pub fn text_on_saturated() -> Rgba { rgb(0xffffff) }
+    #[inline]
+    pub fn text_on_saturated() -> Rgba {
+        rgb(0xffffff)
+    }
 
     // ==================== 强调色 ====================
-    #[inline] pub fn accent_primary() -> Rgba { Self::c(0x6366f1, 0x4f46e5) }
+    #[inline]
+    pub fn accent_primary() -> Rgba {
+        Self::c(0x6366f1, 0x4f46e5)
+    }
     /// 标识与重音（与 accent_primary 同色，语义区分）
-    #[inline] pub fn accent_blue() -> Rgba { Self::c(0x6366f1, 0x4f46e5) }
+    #[inline]
+    pub fn accent_blue() -> Rgba {
+        Self::c(0x6366f1, 0x4f46e5)
+    }
     /// 成功 / 开始 / 进度条
-    #[inline] pub fn accent_mint() -> Rgba { Self::c(0x10b981, 0x0d9668) }
+    #[inline]
+    pub fn accent_mint() -> Rgba {
+        Self::c(0x10b981, 0x0d9668)
+    }
     /// 薄荷深档（时间轴激活块等需要压暗的场合）
-    #[inline] pub fn accent_mint_deep() -> Rgba { Self::c(0x059669, 0x047857) }
+    #[inline]
+    pub fn accent_mint_deep() -> Rgba {
+        Self::c(0x059669, 0x047857)
+    }
     /// 取消 / 错误
-    #[inline] pub fn accent_red() -> Rgba { Self::c(0xf43f5e, 0xe11d48) }
+    #[inline]
+    pub fn accent_red() -> Rgba {
+        Self::c(0xf43f5e, 0xe11d48)
+    }
     /// 终止按钮等需要更强的红
-    #[inline] pub fn accent_red_strong() -> Rgba { Self::c(0xe11d48, 0xbe123c) }
+    #[inline]
+    pub fn accent_red_strong() -> Rgba {
+        Self::c(0xe11d48, 0xbe123c)
+    }
     /// 阶段高亮 / 播放态
-    #[inline] pub fn accent_orange() -> Rgba { Self::c(0xf59e0b, 0xd97706) }
+    #[inline]
+    pub fn accent_orange() -> Rgba {
+        Self::c(0xf59e0b, 0xd97706)
+    }
 
     // ==================== 强调色浅底 / 描边（每色三档，不再逐处调 alpha） ====================
     /// 薄荷 · 浅底（徽标、选中行）
-    #[inline] pub fn tint_mint_soft() -> Rgba { Self::a(0x10b9811a, 0x10b98126) }
+    #[inline]
+    pub fn tint_mint_soft() -> Rgba {
+        Self::a(0x10b9811a, 0x10b98126)
+    }
     /// 薄荷 · 徽标底
-    #[inline] pub fn tint_mint_badge() -> Rgba { Self::a(0x10b98126, 0x10b98133) }
+    #[inline]
+    pub fn tint_mint_badge() -> Rgba {
+        Self::a(0x10b98126, 0x10b98133)
+    }
     /// 薄荷 · 描边
-    #[inline] pub fn tint_mint_border() -> Rgba { Self::a(0x10b98144, 0x10b98166) }
+    #[inline]
+    pub fn tint_mint_border() -> Rgba {
+        Self::a(0x10b98144, 0x10b98166)
+    }
     /// 蓝 · 浅底
-    #[inline] pub fn tint_blue_soft() -> Rgba { Self::a(0x38bdf81a, 0x38bdf826) }
+    #[inline]
+    pub fn tint_blue_soft() -> Rgba {
+        Self::a(0x38bdf81a, 0x38bdf826)
+    }
     /// 蓝 · 徽标底
-    #[inline] pub fn tint_blue_badge() -> Rgba { Self::a(0x38bdf826, 0x38bdf833) }
+    #[inline]
+    pub fn tint_blue_badge() -> Rgba {
+        Self::a(0x38bdf826, 0x38bdf833)
+    }
     /// 蓝 · 描边
-    #[inline] pub fn tint_blue_border() -> Rgba { Self::a(0x38bdf866, 0x38bdf899) }
+    #[inline]
+    pub fn tint_blue_border() -> Rgba {
+        Self::a(0x38bdf866, 0x38bdf899)
+    }
     /// 琥珀 · 浅底（提示 / 复核标记，如术语表疑似未命中）
-    #[inline] pub fn tint_warn_soft() -> Rgba { Self::a(0xf59e0b1f, 0xd9770626) }
+    #[inline]
+    pub fn tint_warn_soft() -> Rgba {
+        Self::a(0xf59e0b1f, 0xd9770626)
+    }
     /// 琥珀 · 描边
-    #[inline] pub fn tint_warn_border() -> Rgba { Self::a(0xf59e0b55, 0xd9770677) }
+    #[inline]
+    pub fn tint_warn_border() -> Rgba {
+        Self::a(0xf59e0b55, 0xd9770677)
+    }
     /// 红 · 浅底
-    #[inline] pub fn tint_red_soft() -> Rgba { Self::a(0xf43f5e14, 0xf43f5e1f) }
+    #[inline]
+    pub fn tint_red_soft() -> Rgba {
+        Self::a(0xf43f5e14, 0xf43f5e1f)
+    }
     /// 红 · 描边
-    #[inline] pub fn tint_red_border() -> Rgba { Self::a(0xf43f5e38, 0xf43f5e59) }
+    #[inline]
+    pub fn tint_red_border() -> Rgba {
+        Self::a(0xf43f5e38, 0xf43f5e59)
+    }
     /// 主重音 · 浅底
-    #[inline] pub fn tint_primary_soft() -> Rgba { Self::a(0x6366f11a, 0x6366f126) }
+    #[inline]
+    pub fn tint_primary_soft() -> Rgba {
+        Self::a(0x6366f11a, 0x6366f126)
+    }
     /// 主重音 · 徽标底
-    #[inline] pub fn tint_primary_badge() -> Rgba { Self::a(0x6366f126, 0x6366f133) }
+    #[inline]
+    pub fn tint_primary_badge() -> Rgba {
+        Self::a(0x6366f126, 0x6366f133)
+    }
     /// 主重音 · 描边
-    #[inline] pub fn tint_primary_border() -> Rgba { Self::a(0x6366f166, 0x6366f199) }
+    #[inline]
+    pub fn tint_primary_border() -> Rgba {
+        Self::a(0x6366f166, 0x6366f199)
+    }
     /// 中性 · 浅底（悬停、选中叠加）
-    #[inline] pub fn tint_neutral() -> Rgba { Self::a(0xffffff0d, 0x0000000d) }
+    #[inline]
+    pub fn tint_neutral() -> Rgba {
+        Self::a(0xffffff0d, 0x0000000d)
+    }
     /// 中性 · 描边（字幕框、浮层边）
-    #[inline] pub fn tint_neutral_border() -> Rgba { Self::a(0xffffff28, 0x00000024) }
+    #[inline]
+    pub fn tint_neutral_border() -> Rgba {
+        Self::a(0xffffff28, 0x00000024)
+    }
     /// 监视器衬底上的中性描边（随主题翻转）
-    #[inline] pub fn tint_on_media_border() -> Rgba { Self::a(0xffffff28, 0x00000024) }
+    #[inline]
+    pub fn tint_on_media_border() -> Rgba {
+        Self::a(0xffffff28, 0x00000024)
+    }
     /// 完全透明（GPUI 里表示「无填充」）
-    #[inline] pub fn transparent() -> Rgba { rgba(0x00000000) }
+    #[inline]
+    pub fn transparent() -> Rgba {
+        rgba(0x00000000)
+    }
 
     // ==================== 字号阶梯（px） ====================
     /// 极小标注 / 徽标

@@ -5,17 +5,79 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use crate::app::state::{ProcessStatus, QueueState, WorkspaceTab};
-use crate::core::PipelineEvent;
-use crate::subtitle::SubtitleWriter;
 use super::types::{BatchSummary, CompletionDialogInfo};
 use super::{EditorExportFormat, MainWindow};
+use crate::app::state::{ProcessStatus, QueueState, WorkspaceTab};
+use crate::core::PipelineEvent;
+use crate::subtitle::writer::export_spec_for;
+use crate::subtitle::Segment;
+use crate::subtitle::SubtitleWriter;
+
+/// `EditorExportFormat`（剪辑台的状态枚举）与配置字符串（`state.output_format`）
+/// 之间的唯一桥梁：返回 `writer::write_in_place` / `export_spec_for` 认的规范格式名。
+///
+/// 之所以只映射到**格式字符串**、扩展名与过滤器名交给
+/// [`export_spec_for`] 再算一次：这几项字面量原本在 `perform_editor_export`
+/// 里被内联重复了一遍，两份表一旦漂移就会出现「文件叫 `.ttml`、过滤器却写
+/// 别的格式」。`src/ui/mod.rs` 的枚举定义不动，此处只做「枚举 -> 字符串」，
+/// 扩展名/过滤器名仍只有 `writer.rs` 一个来源。
+///
+/// 剪映（含导出到文件夹）/ FCPXML / Premiere XML 不走这条单文件链路
+/// （整个草稿目录或专用 exporter），由 `perform_editor_export` 的 `match`
+/// 提前分流，不会走到这里。
+fn editor_export_format_string(fmt: EditorExportFormat) -> &'static str {
+    match fmt {
+        EditorExportFormat::Srt => "srt",
+        EditorExportFormat::Ass => "ass",
+        EditorExportFormat::Txt => "txt",
+        EditorExportFormat::Vtt => "vtt",
+        EditorExportFormat::Json => "json",
+        EditorExportFormat::EbuTtD => "ttml",
+        EditorExportFormat::NetflixTtal => "ttal",
+        // 上面那几个是唯一会走到单文件导出的分支；其余三档在上层已分流。
+        // 真被漏到这里时给最保守的 srt（writer 一定写得出来的格式），
+        // 也比 panic 掉整个 UI 线程好。
+        _ => "srt",
+    }
+}
 
 /// 支持导入的音视频扩展名。文件对话框、拖放、批量队列三处共用同一份，
 /// 避免某个入口悄悄漏掉一种格式。
 pub(crate) const MEDIA_EXTS: [&str; 10] = [
     "mp4", "mkv", "mov", "avi", "flv", "webm", "mp3", "wav", "flac", "m4a",
 ];
+
+/// 应有译文的句数：**源文非空**的句子。
+///
+/// 空源句（静音段、纯空白行）没有任何可译内容，引擎也永远不会给它译文
+/// （引擎挑待译句的口径就是 `!seg.translate_source().trim().is_empty()`）。
+/// 若把它们算进分母，一次成功的整片翻译也会永远差几句，界面只能显示
+/// 「部分完成」——分母必须与引擎的可译口径一致。
+pub(crate) fn expected_translation_count(segments: &[Segment]) -> usize {
+    segments
+        .iter()
+        .filter(|s| !s.translate_source().trim().is_empty())
+        .count()
+}
+
+/// 当前目标语言下**实际译出**的句数：非空译文（`has_translation`）且语言匹配。
+///
+/// 两个条件缺一不可：只要译文是空串/纯空白（引擎解析失败时可能写入，照样带
+/// `translation_lang`），就不算「译出」——这正是界面「已全部翻译」不能骗人的关键。
+pub(crate) fn translated_out_count(segments: &[Segment], target: &str) -> usize {
+    segments
+        .iter()
+        .filter(|s| s.has_translation() && s.translation_matches(target))
+        .count()
+}
+
+/// 翻译收尾的统计口径（纯函数，便于单测）：`(实际译出句数, 应有译文句数)`。
+///
+/// 分子只认**目标语言 + 非空译文**（空串/纯空白不算），分母只算源文非空的句子。
+pub(crate) fn translation_coverage(segments: &[Segment], target: &str) -> (usize, usize) {
+    let done = translated_out_count(segments, target);
+    (done, expected_translation_count(segments))
+}
 
 impl MainWindow {
     /// 裁剪视频库的界面缓存，只保留仍存在于列表里的条目。
@@ -33,11 +95,12 @@ impl MainWindow {
         self.library_selected.retain(|id| live.contains(id));
     }
 
-    /// 把视频库里勾选的多个任务一次性导出为 SRT 到同一目录。
+    /// 把视频库里勾选的多个任务一次性导出到同一目录。
     ///
     /// 与单条「导出字幕」同源：字幕按 id 现取（列表记录不含正文），导出内容模式
-    /// 沿用导出栏的「原文 / 仅译文 / 双语」。逐条写盘，失败的记下来一次性汇总提示，
-    /// 不让一条坏数据中断整批。
+    /// 沿用导出栏的「原文 / 仅译文 / 双语」，导出格式沿用配置抽屉的
+    /// 「字幕输出格式」（经 [`export_spec_for`]，未知值回落 srt）。逐条写盘，
+    /// 失败的记下来一次性汇总提示，不让一条坏数据中断整批。
     pub(crate) fn export_selected_library_tasks(&mut self, cx: &mut Context<Self>) {
         if self.library_export_busy {
             return;
@@ -55,6 +118,15 @@ impl MainWindow {
         }
 
         let export_mode = self.state.export_mode_from_config();
+        // 格式在派发前就定下来：整批共用同一份 spec（同一扩展名、同一写出格式），
+        // 与单条「导出字幕」走的是同一个 helper，不再各写一份字面量。
+        let (fmt_ext, _fmt_label) = export_spec_for(&self.state.output_format);
+        // 样式同样在派发前 clone 出来（与剪辑台 `perform_editor_export` 同法）：
+        // 后台闭包是 `'static` 的，拿不到 `this`，必须先复制一份。此前批量导出
+        // 调用的是无样式的 `write_to_file_with_mode`，用户在配置里把单行最大字数
+        // 调小后，库里批量导出的字幕依旧不折行（中→英译文本会超屏），
+        // 与剪辑台逐条导出的结果不一致。
+        let style = self.state.config.subtitle_style.clone();
         let db = self.state.db.clone();
         self.library_export_busy = true;
         cx.notify();
@@ -93,13 +165,25 @@ impl MainWindow {
                                 continue;
                             }
                         };
-                        // 文件名沿用工程名，剥掉原扩展名再加 .srt，避免「xx.mp4.srt」
+                        // 文件名沿用工程名，剥掉原扩展名再补上所选格式的扩展名，
+                        // 避免「xx.mp4.srt」。此前扩展名与写出格式都硬编码为
+                        // "srt"，用户在配置里选了 JSON，批量导出却仍是 SRT 文件。
                         let stem = std::path::Path::new(name)
                             .file_stem()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| format!("task_{id}"));
-                        let out = dir_for_write.join(format!("{stem}.srt"));
-                        match SubtitleWriter::write_to_file_with_mode(&segs, &out, "srt", export_mode) {
+                        let out = dir_for_write.join(format!("{stem}.{fmt_ext}"));
+                        // 走带样式的入口：srt / vtt / ass 按 `max_chars_per_line` 折行。
+                        // 其余格式（json / ttml / ttal / txt）在
+                        // `write_to_file_with_style` 内部**原样回落**到
+                        // `write_to_file_with_mode`，不会因为这次接线而报错或改变字节。
+                        match SubtitleWriter::write_to_file_with_style(
+                            &segs,
+                            &out,
+                            fmt_ext,
+                            export_mode,
+                            &style,
+                        ) {
                             Ok(()) => ok += 1,
                             Err(e) => failed.push(format!("{name}（写出失败: {e}）")),
                         }
@@ -114,7 +198,12 @@ impl MainWindow {
                 if failed.is_empty() {
                     this.notice = Some(format!("已导出 {ok} 份字幕到 {}", dir.display()));
                 } else {
-                    let preview = failed.iter().take(3).cloned().collect::<Vec<_>>().join("；");
+                    let preview = failed
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("；");
                     let more = if failed.len() > 3 {
                         format!("等 {} 项", failed.len())
                     } else {
@@ -206,10 +295,8 @@ impl MainWindow {
     /// 各写一套时长探测逻辑而产生行为漂移。
     pub(crate) fn adopt_media_file(&mut self, file: PathBuf, cx: &mut Context<Self>) {
         if !file.is_file() {
-            self.state.status = ProcessStatus::Failed(format!(
-                "无法导入：{} 不是有效文件",
-                file.display()
-            ));
+            self.state.status =
+                ProcessStatus::Failed(format!("无法导入：{} 不是有效文件", file.display()));
             cx.notify();
             return;
         }
@@ -272,9 +359,8 @@ impl MainWindow {
             _ => {
                 let added = self.state.enqueue_files(media);
                 if added == 0 {
-                    self.state.status = ProcessStatus::Failed(
-                        "这些文件已经在批量队列里，未重复添加".to_string(),
-                    );
+                    self.state.status =
+                        ProcessStatus::Failed("这些文件已经在批量队列里，未重复添加".to_string());
                     cx.notify();
                     return;
                 }
@@ -433,9 +519,8 @@ impl MainWindow {
             }
         }
         let Some(next) = self.state.queue_next_actionable() else {
-            self.state.status = ProcessStatus::Failed(
-                "队列中的文件都已转写完成，无需重复处理".to_string(),
-            );
+            self.state.status =
+                ProcessStatus::Failed("队列中的文件都已转写完成，无需重复处理".to_string());
             cx.notify();
             return;
         };
@@ -585,6 +670,12 @@ impl MainWindow {
         let (tx, mut rx) = mpsc::unbounded_channel();
         self.state.clear_streaming();
         self.state.cancel_requested = false;
+        // 尽早在 UI 线程作废上一轮的取消状态（管线侧 + 引擎侧）。**必须留在 UI 线程、
+        // 且早于下面 spawn 任务线程**：把它挪进任务线程就是原本那条「终止转写失效」
+        // 的竞态——线程刚起来、还没跑到复位，用户已点「终止」置了位，随后被任务自己
+        // 清零，转写照跑完。放在这里之后，任务线程里不再有任何清标志的写方，派发口
+        // 又由函数开头的 `status != Processing` 守卫兜底，上一轮的取消不会误伤新任务。
+        self.state.pipeline.begin_task();
         self.state.status = ProcessStatus::Processing {
             stage: "准备中...".to_string(),
             progress: 0.0,
@@ -644,7 +735,20 @@ impl MainWindow {
                 .unwrap();
             rt.block_on(async move {
                 if let Err(err) = pipeline
-                    .run_with_options(in_file, None, lang, fmt, polish, polish_mode, threads, model_override, rescue_logprob, whisper_options, diarization, tx.clone())
+                    .run_with_options(
+                        in_file,
+                        None,
+                        lang,
+                        fmt,
+                        polish,
+                        polish_mode,
+                        threads,
+                        model_override,
+                        rescue_logprob,
+                        whisper_options,
+                        diarization,
+                        tx.clone(),
+                    )
                     .await
                 {
                     let _ = tx.send(PipelineEvent::Error(format!("转写失败: {err}")));
@@ -668,155 +772,168 @@ impl MainWindow {
                 let _ = this.update(cx, |this, cx| {
                     for event in events {
                         match event {
-                                PipelineEvent::StageChanged(stage) => {
-                                    if let ProcessStatus::Processing { stage: ref mut s, .. } =
-                                        &mut this.state.status
-                                    {
-                                        *s = stage;
-                                    }
+                            PipelineEvent::StageChanged(stage) => {
+                                if let ProcessStatus::Processing {
+                                    stage: ref mut s, ..
+                                } = &mut this.state.status
+                                {
+                                    *s = stage;
                                 }
-                                PipelineEvent::Progress { stage, progress, detail } => {
-                                    this.state.status = ProcessStatus::Processing {
-                                        stage,
-                                        progress,
-                                        detail,
+                            }
+                            PipelineEvent::Progress {
+                                stage,
+                                progress,
+                                detail,
+                            } => {
+                                this.state.status = ProcessStatus::Processing {
+                                    stage,
+                                    progress,
+                                    detail,
+                                };
+                            }
+                            PipelineEvent::SegmentStream(seg) => {
+                                this.state.push_stream_segment(seg);
+                            }
+                            PipelineEvent::Finished(segments, metrics) => {
+                                this.state.clear_streaming();
+                                if this.state.cancel_requested {
+                                    // 用户主动终止：静默收尾，不弹完成框、不写历史库
+                                    this.state.cancel_requested = false;
+                                    this.state.status = ProcessStatus::Idle;
+                                    this.state.transcribe_file = None;
+                                    this.state.transcribe_duration = 0.0;
+                                    // 批量模式下终止：当前项记为取消，并停掉续跑。
+                                    // 已经跑完的条目保留结果，不清零。
+                                    this.state
+                                        .finish_active_queue_item(Err("已取消".to_string()));
+                                    this.state.batch_running = false;
+                                } else if segments.is_empty() {
+                                    this.state.status = ProcessStatus::Failed(
+                                        "未能识别出任何有效字幕，请检查音频音量或识别语言设置"
+                                            .to_string(),
+                                    );
+                                    this.state.finish_active_queue_item(Err(
+                                        "未识别出有效字幕".to_string()
+                                    ));
+                                } else {
+                                    let finished_file = this.state.transcribe_file.take();
+                                    let file_path =
+                                        finished_file.or_else(|| this.state.selected_file.clone());
+                                    let filename = file_path
+                                        .as_ref()
+                                        .and_then(|p| p.file_name())
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("media.mp4")
+                                        .to_string();
+                                    let total_dur = if this.state.transcribe_duration > 0.0 {
+                                        this.state.transcribe_duration
+                                    } else if this.state.total_duration > 0.0 {
+                                        this.state.total_duration
+                                    } else {
+                                        segments.last().map(|s| s.end).unwrap_or(0.0)
                                     };
-                                }
-                                PipelineEvent::SegmentStream(seg) => {
-                                    this.state.push_stream_segment(seg);
-                                }
-                                PipelineEvent::Finished(segments, metrics) => {
-                                    this.state.clear_streaming();
-                                    if this.state.cancel_requested {
-                                        // 用户主动终止：静默收尾，不弹完成框、不写历史库
-                                        this.state.cancel_requested = false;
-                                        this.state.status = ProcessStatus::Idle;
-                                        this.state.transcribe_file = None;
-                                        this.state.transcribe_duration = 0.0;
-                                        // 批量模式下终止：当前项记为取消，并停掉续跑。
-                                        // 已经跑完的条目保留结果，不清零。
-                                        this.state.finish_active_queue_item(Err("已取消".to_string()));
-                                        this.state.batch_running = false;
-                                    } else if segments.is_empty() {
-                                        this.state.status = ProcessStatus::Failed("未能识别出任何有效字幕，请检查音频音量或识别语言设置".to_string());
-                                        this.state.finish_active_queue_item(Err("未识别出有效字幕".to_string()));
+                                    let seg_count = segments.len();
+                                    // 用 batch_running 而不是 batch_active 判断：用户删掉队列里
+                                    // 正在跑的条目时 batch_active 会被清空，但这一批仍在续跑。
+                                    // 若按 batch_active 判断，就会在批量中途弹出单文件完成框
+                                    // 并逐条重抽波形。
+                                    let in_batch = this.state.batch_running;
+
+                                    // 1. 存入数据库历史记录 (包含 5 阶段性能统计指标)
+                                    let mut new_task_id: Option<i64> = None;
+                                    if let Some(ref path) = file_path {
+                                        new_task_id = this
+                                            .state
+                                            .db
+                                            .insert_task(
+                                                &path.to_string_lossy(),
+                                                &filename,
+                                                total_dur,
+                                                "completed",
+                                                &segments,
+                                                Some(&metrics),
+                                            )
+                                            .ok();
+                                        this.state.refresh_recent_tasks();
+                                        // 刚写入了新记录 → 让「0 秒命中」缓存失效，
+                                        // 否则再次选中同一文件会显示旧的命中状态
+                                        this.state.invalidate_cached_transcription();
+                                    }
+
+                                    // 2. 将本次成果同步至剪辑校对工作台。
+                                    // 覆盖前先把上一个工程的未保存改动落库：批量连跑时
+                                    // 用户可能在上一支片子上改过字幕，不能默默丢掉。
+                                    // 注意顺序：这一步必须用**旧**的 active_task_id 写回，
+                                    // 所以新 id 要等 segments 换完之后才登记。
+                                    this.state.flush_segments_if_dirty();
+                                    if let Some(path) = file_path {
+                                        this.state.selected_file = Some(path.clone());
+                                        this.state.preview_source = Some(path);
+                                    }
+                                    this.state.segments = segments;
+                                    this.state.active_task_id = new_task_id;
+                                    // 新一轮转写的结果替换了整份文档：撤销栈里还是上一支
+                                    // 片子的快照，留着的话 Ctrl+Z 会把上一支的字幕灌进这一支，
+                                    // 并按新的 active_task_id 落库覆盖刚写好的记录。
+                                    this.state.reset_edit_history();
+                                    this.state.bump_segments_revision();
+                                    if let Some(first) = this.state.segments.first() {
+                                        this.state.select_segment(first.index);
+                                    }
+                                    this.state.total_duration = total_dur;
+
+                                    // 3. 语音转写界面彻底解耦复位（等待下一次导入）
+                                    this.state.status = ProcessStatus::Idle;
+                                    this.state.transcribe_file = None;
+                                    this.state.transcribe_duration = 0.0;
+
+                                    if in_batch {
+                                        // 批量模式：只结算这一条。波形提取与完成弹窗都留到
+                                        // 队列跑完再一次性处理，否则每完成一条都要重抽一次
+                                        // 波形，纯属白烧解码。
+                                        this.state.finish_active_queue_item(Ok(seg_count));
                                     } else {
-                                        let finished_file = this.state.transcribe_file.take();
-                                        let file_path = finished_file.or_else(|| this.state.selected_file.clone());
-                                        let filename = file_path
-                                            .as_ref()
-                                            .and_then(|p| p.file_name())
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("media.mp4")
-                                            .to_string();
-                                        let total_dur = if this.state.transcribe_duration > 0.0 {
-                                            this.state.transcribe_duration
-                                        } else if this.state.total_duration > 0.0 {
-                                            this.state.total_duration
-                                        } else {
-                                            segments.last().map(|s| s.end).unwrap_or(0.0)
-                                        };
-                                        let seg_count = segments.len();
-                                        // 用 batch_running 而不是 batch_active 判断：用户删掉队列里
-                                        // 正在跑的条目时 batch_active 会被清空，但这一批仍在续跑。
-                                        // 若按 batch_active 判断，就会在批量中途弹出单文件完成框
-                                        // 并逐条重抽波形。
-                                        let in_batch = this.state.batch_running;
+                                        this.ensure_waveform(cx);
 
-                                        // 1. 存入数据库历史记录 (包含 5 阶段性能统计指标)
-                                        let mut new_task_id: Option<i64> = None;
-                                        if let Some(ref path) = file_path {
-                                            new_task_id = this
-                                                .state
-                                                .db
-                                                .insert_task(
-                                                    &path.to_string_lossy(),
-                                                    &filename,
-                                                    total_dur,
-                                                    "completed",
-                                                    &segments,
-                                                    Some(&metrics),
-                                                )
-                                                .ok();
-                                            this.state.refresh_recent_tasks();
-                                            // 刚写入了新记录 → 让「0 秒命中」缓存失效，
-                                            // 否则再次选中同一文件会显示旧的命中状态
-                                            this.state.invalidate_cached_transcription();
-                                        }
-
-                                        // 2. 将本次成果同步至剪辑校对工作台。
-                                        // 覆盖前先把上一个工程的未保存改动落库：批量连跑时
-                                        // 用户可能在上一支片子上改过字幕，不能默默丢掉。
-                                        // 注意顺序：这一步必须用**旧**的 active_task_id 写回，
-                                        // 所以新 id 要等 segments 换完之后才登记。
-                                        this.state.flush_segments_if_dirty();
-                                        if let Some(path) = file_path {
-                                            this.state.selected_file = Some(path.clone());
-                                            this.state.preview_source = Some(path);
-                                        }
-                                        this.state.segments = segments;
-                                        this.state.active_task_id = new_task_id;
-                                        // 新一轮转写的结果替换了整份文档：撤销栈里还是上一支
-                                        // 片子的快照，留着的话 Ctrl+Z 会把上一支的字幕灌进这一支，
-                                        // 并按新的 active_task_id 落库覆盖刚写好的记录。
-                                        this.state.reset_edit_history();
-                                        this.state.bump_segments_revision();
-                                        if let Some(first) = this.state.segments.first() {
-                                            this.state.select_segment(first.index);
-                                        }
-                                        this.state.total_duration = total_dur;
-
-                                        // 3. 语音转写界面彻底解耦复位（等待下一次导入）
-                                        this.state.status = ProcessStatus::Idle;
-                                        this.state.transcribe_file = None;
-                                        this.state.transcribe_duration = 0.0;
-
-                                        if in_batch {
-                                            // 批量模式：只结算这一条。波形提取与完成弹窗都留到
-                                            // 队列跑完再一次性处理，否则每完成一条都要重抽一次
-                                            // 波形，纯属白烧解码。
-                                            this.state.finish_active_queue_item(Ok(seg_count));
-                                        } else {
-                                            this.ensure_waveform(cx);
-
-                                            // 4. 弹出全屏转写完成提醒弹窗 (包含性能基准看板)
-                                            this.completion_dialog = Some(CompletionDialogInfo {
-                                                file_name: filename,
-                                                segment_count: seg_count,
-                                                total_duration: total_dur,
-                                                metrics: Some(metrics),
-                                                batch: None,
-                                            });
-                                        }
-                                    }
-                                    // 批量续跑：队列没跑完就立刻取下一条，跑完则弹批量汇总
-                                    if this.state.batch_running {
-                                        this.advance_batch_queue(cx);
+                                        // 4. 弹出全屏转写完成提醒弹窗 (包含性能基准看板)
+                                        this.completion_dialog = Some(CompletionDialogInfo {
+                                            file_name: filename,
+                                            segment_count: seg_count,
+                                            total_duration: total_dur,
+                                            metrics: Some(metrics),
+                                            batch: None,
+                                        });
                                     }
                                 }
-                                PipelineEvent::Error(err) => {
-                                    if this.state.cancel_requested {
-                                        // 终止导致的子进程报错按取消处理，不显示为失败
-                                        this.state.cancel_requested = false;
-                                        this.state.status = ProcessStatus::Idle;
-                                        this.state.transcribe_file = None;
-                                        this.state.transcribe_duration = 0.0;
-                                        this.state.finish_active_queue_item(Err("已取消".to_string()));
-                                        this.state.batch_running = false;
-                                    } else if this.state.batch_running {
-                                        // 批量模式：单个文件出错不该拖垮整批。失败原因记在队列卡片上，
-                                        // 立刻续跑下一个，最后在汇总弹窗里一并点名。
-                                        // 这里同样按 batch_running 判断，理由见 Finished 分支。
-                                        this.state.transcribe_file = None;
-                                        this.state.transcribe_duration = 0.0;
-                                        this.state.finish_active_queue_item(Err(err));
-                                    } else {
-                                        this.state.status = ProcessStatus::Failed(err);
-                                    }
-                                    if this.state.batch_running {
-                                        this.advance_batch_queue(cx);
-                                    }
+                                // 批量续跑：队列没跑完就立刻取下一条，跑完则弹批量汇总
+                                if this.state.batch_running {
+                                    this.advance_batch_queue(cx);
                                 }
+                            }
+                            PipelineEvent::Error(err) => {
+                                if this.state.cancel_requested {
+                                    // 终止导致的子进程报错按取消处理，不显示为失败
+                                    this.state.cancel_requested = false;
+                                    this.state.status = ProcessStatus::Idle;
+                                    this.state.transcribe_file = None;
+                                    this.state.transcribe_duration = 0.0;
+                                    this.state
+                                        .finish_active_queue_item(Err("已取消".to_string()));
+                                    this.state.batch_running = false;
+                                } else if this.state.batch_running {
+                                    // 批量模式：单个文件出错不该拖垮整批。失败原因记在队列卡片上，
+                                    // 立刻续跑下一个，最后在汇总弹窗里一并点名。
+                                    // 这里同样按 batch_running 判断，理由见 Finished 分支。
+                                    this.state.transcribe_file = None;
+                                    this.state.transcribe_duration = 0.0;
+                                    this.state.finish_active_queue_item(Err(err));
+                                } else {
+                                    this.state.status = ProcessStatus::Failed(err);
+                                }
+                                if this.state.batch_running {
+                                    this.advance_batch_queue(cx);
+                                }
+                            }
                         }
                     }
                     cx.notify();
@@ -834,7 +951,9 @@ impl MainWindow {
         default_name: String,
         filter_label: &str,
         filter_ext: String,
-        write_file: impl FnOnce(&[crate::subtitle::Segment], &std::path::Path) -> anyhow::Result<()> + Send + 'static,
+        write_file: impl FnOnce(&[crate::subtitle::Segment], &std::path::Path) -> anyhow::Result<()>
+            + Send
+            + 'static,
     ) {
         if self.state.segments.is_empty() {
             return;
@@ -896,27 +1015,35 @@ impl MainWindow {
         // 工程文件按「导出模式」（原文 / 仅译文 / 双语）写入；有译文时压成单行。
         let mode = self.editor_export_mode;
         let video_path = self.state.selected_file.clone();
-        let stem = self.state.selected_file.as_ref()
+        let stem = self
+            .state
+            .selected_file
+            .as_ref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
             .unwrap_or("Voice2Word")
             .to_string();
 
         cx.spawn(async move |this, cx| {
-            let res = cx.background_executor().spawn(async move {
-                crate::subtitle::JianYingExporter::inject_to_local_jianying(
-                    &segments,
-                    video_path.as_deref(),
-                    &stem,
-                    mode,
-                )
-            }).await;
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::subtitle::JianYingExporter::inject_to_local_jianying(
+                        &segments,
+                        video_path.as_deref(),
+                        &stem,
+                        mode,
+                    )
+                })
+                .await;
 
             let _ = this.update(cx, |this, cx| {
                 match res {
                     Ok(draft_path) => {
                         info!("成功注入剪映草稿: {:?}", draft_path);
-                        let _ = std::process::Command::new("explorer").arg(&draft_path).spawn();
+                        let _ = std::process::Command::new("explorer")
+                            .arg(&draft_path)
+                            .spawn();
                         this.state.status = ProcessStatus::Idle;
                         // 已经打开了资源管理器，但仍给一条提示说明「注入了什么」：
                         // 只弹窗不说明的话，用户不知道这是导入成功还是碰巧打开了目录。
@@ -926,12 +1053,14 @@ impl MainWindow {
                     }
                     Err(e) => {
                         tracing::error!("剪映草稿注入失败: {:?}", e);
-                        this.state.status = ProcessStatus::Failed(format!("剪映草稿注入失败: {}", e));
+                        this.state.status =
+                            ProcessStatus::Failed(format!("剪映草稿注入失败: {}", e));
                     }
                 }
                 cx.notify();
             });
-        }).detach();
+        })
+        .detach();
     }
 
     /// 导出剪映草稿至指定独立文件夹
@@ -943,7 +1072,10 @@ impl MainWindow {
         let segments = self.state.segments.clone();
         let mode = self.editor_export_mode;
         let video_path = self.state.selected_file.clone();
-        let stem = self.state.selected_file.as_ref()
+        let stem = self
+            .state
+            .selected_file
+            .as_ref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
             .unwrap_or("Voice2Word")
@@ -956,15 +1088,18 @@ impl MainWindow {
                 .await;
             if let Some(folder_handle) = handle {
                 let target_dir = folder_handle.path().join(&stem);
-                let res = cx.background_executor().spawn(async move {
-                    crate::subtitle::JianYingExporter::export_to_folder(
-                        &segments,
-                        video_path.as_deref(),
-                        &target_dir,
-                        &stem,
-                        mode,
-                    )
-                }).await;
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        crate::subtitle::JianYingExporter::export_to_folder(
+                            &segments,
+                            video_path.as_deref(),
+                            &target_dir,
+                            &stem,
+                            mode,
+                        )
+                    })
+                    .await;
 
                 let _ = this.update(cx, |this, cx| {
                     match res {
@@ -979,13 +1114,15 @@ impl MainWindow {
                             ));
                         }
                         Err(e) => {
-                            this.state.status = ProcessStatus::Failed(format!("剪映草稿导出失败: {}", e));
+                            this.state.status =
+                                ProcessStatus::Failed(format!("剪映草稿导出失败: {}", e));
                         }
                     }
                     cx.notify();
                 });
             }
-        }).detach();
+        })
+        .detach();
     }
 
     /// 导出 FCPXML (Final Cut Pro / 达芬奇) 工程文件
@@ -993,7 +1130,10 @@ impl MainWindow {
         if self.state.segments.is_empty() {
             return;
         }
-        let stem = self.state.selected_file.as_ref()
+        let stem = self
+            .state
+            .selected_file
+            .as_ref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
             .unwrap_or("subtitle")
@@ -1005,7 +1145,9 @@ impl MainWindow {
             format!("{}.fcpxml", stem),
             "Final Cut Pro XML (*.fcpxml)",
             "fcpxml".to_string(),
-            move |segs, path| crate::subtitle::FcpXmlExporter::write_to_file(segs, path, &stem, mode),
+            move |segs, path| {
+                crate::subtitle::FcpXmlExporter::write_to_file(segs, path, &stem, mode)
+            },
         );
     }
 
@@ -1014,7 +1156,10 @@ impl MainWindow {
         if self.state.segments.is_empty() {
             return;
         }
-        let stem = self.state.selected_file.as_ref()
+        let stem = self
+            .state
+            .selected_file
+            .as_ref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
             .unwrap_or("subtitle")
@@ -1026,7 +1171,9 @@ impl MainWindow {
             format!("{}.xml", stem),
             "Premiere Pro XML (*.xml)",
             "xml".to_string(),
-            move |segs, path| crate::subtitle::PremiereXmlExporter::write_to_file(segs, path, &stem, mode),
+            move |segs, path| {
+                crate::subtitle::PremiereXmlExporter::write_to_file(segs, path, &stem, mode)
+            },
         );
     }
 
@@ -1042,17 +1189,22 @@ impl MainWindow {
         }
         self.state.flush_segments_if_dirty();
 
-        let subtitle_path = std::env::temp_dir().join(format!(
-            "voice2word_preview_{}.srt",
-            std::process::id()
-        ));
+        let subtitle_path =
+            std::env::temp_dir().join(format!("voice2word_preview_{}.srt", std::process::id()));
         // 复用同一临时文件名，写新前先清旧，避免历次预览 SRT 在 temp 无限累积
         let _ = std::fs::remove_file(&subtitle_path);
         // FFplay 弹窗预览与主界面/导出同源：按当前导出内容模式生成预览字幕。
         let preview_mode = self.editor_export_mode;
-        if let Err(error) =
-            SubtitleWriter::write_srt_with_mode(&self.state.segments, &subtitle_path, preview_mode)
-        {
+        // 预览与最终导出同源：带上配置里的字幕样式，按 `max_chars_per_line` 折行。
+        // ffplay 的 `subtitles` 滤镜按 SRT 规范渲染多行 cue，折行对它是**正向**的
+        // （预览看到的分行就是导出得到的分行）；不折反而会让「预览正常、导出超屏」。
+        let preview_style = self.state.config.subtitle_style.clone();
+        if let Err(error) = SubtitleWriter::write_srt_with_style(
+            &self.state.segments,
+            &subtitle_path,
+            preview_mode,
+            &preview_style,
+        ) {
             self.state.status = ProcessStatus::Failed(format!("生成预览字幕失败: {}", error));
             cx.notify();
             return;
@@ -1178,7 +1330,9 @@ impl MainWindow {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { crate::engines::waveform::extract(&ffmpeg, &extract_target, buckets) })
+                .spawn(async move {
+                    crate::engines::waveform::extract(&ffmpeg, &extract_target, buckets)
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.state.waveform_busy_for.as_ref() == Some(&media) {
@@ -1203,7 +1357,9 @@ impl MainWindow {
     /// 异步根据当前播放时间抽取单帧画面（单飞队列：最多 1 个 FFmpeg 实例并发，合并多余拖动请求）
     pub(crate) fn trigger_extract_frame(&mut self, cx: &mut Context<Self>) {
         self.probe_video_dimensions(cx);
-        let Some(video_path) = self.state.preview_media().cloned() else { return; };
+        let Some(video_path) = self.state.preview_media().cloned() else {
+            return;
+        };
         if !video_path.exists() {
             return;
         }
@@ -1216,12 +1372,16 @@ impl MainWindow {
         }
 
         // 如果当前已有后台抽帧 worker 在运行，直接返回！运行中的 worker 抽完后会自动接取 pending_time
-        if self.is_extracting_frame.compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        ).is_err() {
+        if self
+            .is_extracting_frame
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
             return;
         }
 
@@ -1246,12 +1406,16 @@ impl MainWindow {
                         is_extracting.store(false, std::sync::atomic::Ordering::SeqCst);
                         // 双重检查避免竞态退出
                         let has_more = pending_time.lock().unwrap().is_some();
-                        if has_more && is_extracting.compare_exchange(
-                            false,
-                            true,
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                        ).is_ok() {
+                        if has_more
+                            && is_extracting
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                )
+                                .is_ok()
+                        {
                             continue;
                         }
                         break;
@@ -1262,9 +1426,12 @@ impl MainWindow {
                 let ffmpeg_clone = ffmpeg.clone();
                 let cache_clone = cache.clone();
 
-                let frame_result = cx.background_executor().spawn(async move {
-                    cache_clone.get_or_extract(&video_clone, time, &ffmpeg_clone)
-                }).await;
+                let frame_result =
+                    cx.background_executor()
+                        .spawn(async move {
+                            cache_clone.get_or_extract(&video_clone, time, &ffmpeg_clone)
+                        })
+                        .await;
 
                 let is_latest = {
                     let lock = pending_time.lock().unwrap();
@@ -1278,14 +1445,18 @@ impl MainWindow {
                             // 在这里判一次存在性：`get_or_extract` 正常返回的路径都已落盘，
                             // 但磁盘帧目录会按「最近使用」裁剪——把存在性收敛到后台更新点，
                             // 渲染路径就不必每帧对预览帧 `path.exists()`。
-                            this.state.preview_frame_path =
-                                if frame_path.exists() { Some(frame_path) } else { None };
+                            this.state.preview_frame_path = if frame_path.exists() {
+                                Some(frame_path)
+                            } else {
+                                None
+                            };
                             cx.notify();
                         });
                     }
                 }
             }
-        }).detach();
+        })
+        .detach();
     }
 
     pub(crate) fn halt_preview_playback(&mut self) {
@@ -1300,7 +1471,9 @@ impl MainWindow {
 
     /// 上一句字幕
     pub(crate) fn jump_prev_segment(&mut self, cx: &mut Context<Self>) {
-        if self.state.segments.is_empty() { return; }
+        if self.state.segments.is_empty() {
+            return;
+        }
         self.halt_preview_playback();
         let cur_idx = self.state.selected_segment_index.unwrap_or(1);
         let new_idx = if cur_idx > 1 { cur_idx - 1 } else { 1 };
@@ -1311,10 +1484,16 @@ impl MainWindow {
 
     /// 下一句字幕
     pub(crate) fn jump_next_segment(&mut self, cx: &mut Context<Self>) {
-        if self.state.segments.is_empty() { return; }
+        if self.state.segments.is_empty() {
+            return;
+        }
         self.halt_preview_playback();
         let cur_idx = self.state.selected_segment_index.unwrap_or(1);
-        let new_idx = if cur_idx < self.state.segments.len() { cur_idx + 1 } else { self.state.segments.len() };
+        let new_idx = if cur_idx < self.state.segments.len() {
+            cur_idx + 1
+        } else {
+            self.state.segments.len()
+        };
         self.state.select_segment(new_idx);
         self.trigger_extract_frame(cx);
         cx.notify();
@@ -1341,10 +1520,12 @@ impl MainWindow {
             self.play_tick_generation = tick_gen;
 
             let player = self.state.video_player.clone();
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(std::time::Duration::from_millis(40)).await;
-                    let should_continue = this.update(cx, |this, cx| {
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(40))
+                    .await;
+                let should_continue = this
+                    .update(cx, |this, cx| {
                         if this.play_tick_generation != tick_gen {
                             return false;
                         }
@@ -1368,18 +1549,24 @@ impl MainWindow {
                         }
 
                         this.state.current_time = play_time;
-                        if let Some(seg) = this.state.segments.iter().find(|s| s.start <= play_time && play_time <= s.end) {
+                        if let Some(seg) = this
+                            .state
+                            .segments
+                            .iter()
+                            .find(|s| s.start <= play_time && play_time <= s.end)
+                        {
                             this.state.selected_segment_index = Some(seg.index);
                         }
                         cx.notify();
                         true
-                    }).unwrap_or(false);
+                    })
+                    .unwrap_or(false);
 
-                    if !should_continue {
-                        break;
-                    }
+                if !should_continue {
+                    break;
                 }
-            }).detach();
+            })
+            .detach();
             cx.notify();
         }
     }
@@ -1391,7 +1578,10 @@ impl MainWindow {
             return;
         }
 
-        let stem = self.state.selected_file.as_ref()
+        let stem = self
+            .state
+            .selected_file
+            .as_ref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
             .unwrap_or("subtitle")
@@ -1409,33 +1599,15 @@ impl MainWindow {
             | EditorExportFormat::Json
             | EditorExportFormat::EbuTtD
             | EditorExportFormat::NetflixTtal => {
-                let ext = match self.editor_export_format {
-                    EditorExportFormat::Srt => "srt",
-                    EditorExportFormat::Ass => "ass",
-                    EditorExportFormat::Txt => "txt",
-                    EditorExportFormat::Vtt => "vtt",
-                    // 专业 / 结构化格式（P1-10）：扩展名即管线里的格式标识，
-                    // 由 `SubtitleWriter::write_to_file_with_style` 统一分派。
-                    EditorExportFormat::Json => "json",
-                    EditorExportFormat::EbuTtD => "ttml",
-                    EditorExportFormat::NetflixTtal => "ttal",
-                    _ => unreachable!(),
-                };
+                // 枚举先归一成格式字符串（`ui/mod.rs` 不动），再交给
+                // `export_spec_for` 求扩展名与对话框过滤器名——这样这两份
+                // 字面量只存在于 `writer.rs` 一处，不会再与 writer 的分派表漂移。
+                let fmt = editor_export_format_string(self.editor_export_format);
+                let (ext, filter_label) = export_spec_for(fmt);
                 // 直接按目标扩展名导出，不再临时改写全局 output_format（避免副作用泄漏到后续管线调用）
                 // ASS 会带上主界面配置的字幕样式（字号/字间距/底边距/预设配色）
                 let style = self.state.config.subtitle_style.clone();
                 let mode = self.editor_export_mode;
-                // 保存对话框的文件类型说明按格式给全，用户一眼能看出在导什么。
-                let filter_label = match self.editor_export_format {
-                    EditorExportFormat::Srt => "SRT 字幕",
-                    EditorExportFormat::Ass => "ASS 特效字幕",
-                    EditorExportFormat::Txt => "TXT 纯文本",
-                    EditorExportFormat::Vtt => "VTT 网页字幕",
-                    EditorExportFormat::Json => "JSON 结构化字幕",
-                    EditorExportFormat::EbuTtD => "EBU-TT-D 广播字幕",
-                    EditorExportFormat::NetflixTtal => "Netflix TTAL 字幕",
-                    _ => "Subtitle",
-                };
                 self.export_with_save_dialog(
                     cx,
                     format!("{}.{}", stem, ext),
@@ -1461,14 +1633,20 @@ impl MainWindow {
         // 会踩到这个坑：用户把目标语言从 English 改成 日本語 后，旧英文译文仍算
         // 「已完成」，于是 100% 时这里直接 return——点「开始翻译」毫无反应，
         // 用户完全不知道为什么。现在只有「当前语言全部译完」才提前返回。
+        // 另：这里与收尾文案用**同一套**统计口径，避免“按钮说已完成、收尾又说部分完成”自相矛盾。
         let target_now = self.state.translate_target_lang.clone();
-        let done_now = self.state.translated_count_for(&target_now);
-        if self.state.segments.is_empty() {
+        // 「已完成」用**实际译出**口径：分子只认非空译文 + 目标语言匹配，
+        // 分母只算源文非空的句子（空源句没有可译内容，计入分母会永远差几句）。
+        let done_now = translated_out_count(&self.state.segments, &target_now);
+        let expected_now = expected_translation_count(&self.state.segments);
+        if expected_now == 0 {
+            self.state.translate_status_msg = "没有可翻译的文本（所有字幕行都是空的）".to_string();
+            cx.notify();
             return;
         }
-        if done_now == self.state.segments.len() {
+        if done_now >= expected_now {
             self.state.translate_status_msg =
-                format!("{} 句已全部翻译为{}", self.state.segments.len(), target_now);
+                format!("{} 句已全部翻译为{}", expected_now, target_now);
             cx.notify();
             return;
         }
@@ -1478,21 +1656,26 @@ impl MainWindow {
         self.state.translate_progress = 0.0;
         self.state.translate_status_msg = match mode {
             crate::engines::TranslateMode::OnlineApi => {
-                format!("正在初始化在线翻译引擎 ({})...", self.state.config.translate.api_model)
+                format!(
+                    "正在初始化在线翻译引擎 ({})...",
+                    self.state.config.translate.api_model
+                )
             }
-            crate::engines::TranslateMode::OfflineQwen => {
-                "正在初始化 Qwen 翻译引擎...".to_string()
-            }
+            crate::engines::TranslateMode::OfflineQwen => "正在初始化 Qwen 翻译引擎...".to_string(),
         };
         cx.notify();
 
         let segments = self.state.segments.clone();
         let target_lang = self.state.translate_target_lang.clone();
-        // 另存一份给收尾提示用：	arget_lang 会被 move 进下面的异步块
+        // 另存一份给收尾统计用：`target_lang` 会被 move 进下面的异步块。
+        // 收尾必须按本轮目标语言数：否则用户换语言后，旧语言的译文
+        // 会被当成本轮成果，界面又会说「已译出 N 句」而实际一句没译。
         let target_lang_for_msg = target_lang.clone();
         let online_cfg = self.state.online_translate_config();
-        let llama_cli = crate::utils::config::AppConfig::resolve_path(&self.state.config.paths.llama_cli);
-        let llm_model = crate::utils::config::AppConfig::resolve_path(&self.state.config.paths.llm_model);
+        let llama_cli =
+            crate::utils::config::AppConfig::resolve_path(&self.state.config.paths.llama_cli);
+        let llm_model =
+            crate::utils::config::AppConfig::resolve_path(&self.state.config.paths.llm_model);
         let llm_ctx = self.state.config.pipeline.llm_ctx;
         let llm_threads = self.state.config.pipeline.llm_threads;
         // 术语表提示：离线链路要显式注入到 LLM 引擎（在线链路已随 online_cfg 一起带）。
@@ -1540,7 +1723,8 @@ impl MainWindow {
                         cx.notify();
                     });
                 }
-            }).detach();
+            })
+            .detach();
 
             let result = handle.await;
             // 取消位要在 update 闭包里读、在闭包里复位——中间不能被别的任务改掉
@@ -1559,24 +1743,48 @@ impl MainWindow {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(translated_segs) => {
-                        // 按本轮目标语言统计：这样「翻译已完成（N 句）」里的 N
-                        // 不会混入之前译成别的语言的句子，否则用户会以为本轮
-                        // 译了 1000 句，实际只补了 20 句。
-                        let done = translated_segs
-                            .iter()
-                            .filter(|s| s.translation_matches(&target_lang_for_msg))
-                            .count();
+                        // 收尾统计用「实际译出」口径，而不是「引擎有没有给语言标签」：
+                        // 引擎解析失败时可能写下空串/纯空白译文（照样带 translation_lang），
+                        // 只按标签计数就会把一片空白显示成「翻译完成」。
+                        // `translation_coverage` 的分子只认 `has_translation()`（忽略空串/纯空白），
+                        // 分母只算源文非空的句子。
+                        let (done, expected) =
+                            translation_coverage(&translated_segs, &target_lang_for_msg);
                         // 引擎在取消时返回**已完成的偏序结果**而非错误，所以这里必须
                         // 显式区分「跑完了」与「被取消了」。不区分的话，用户点了取消
-                        // 却看到「翻译已完成（N 句）」，会以为取消没生效。
+                        // 却看到「翻译完成（N 句）」，会以为取消没生效。
                         if was_cancelled {
                             info!("字幕多语言翻译已取消（已完成 {} 句）", done);
                             this.state.translate_status_msg =
                                 format!("已取消翻译（保留已完成的 {} 句）", done);
-                        } else {
-                            info!("字幕多语言翻译成功完成 ({} 句带译文)", done);
+                        } else if expected == 0 || done >= expected {
+                            // 全部译出（或整片都是空源句， expected == 0，本轮无遗留）
+                            info!("字幕多语言翻译完成（{}/{} 句带译文）", done, expected);
                             this.state.translate_progress = 1.0;
-                            this.state.translate_status_msg = format!("翻译已完成（{} 句）", done);
+                            this.state.translate_status_msg = format!("翻译完成（{} 句）", done);
+                        } else if done == 0 {
+                            // 一句都没译出：引擎本该返 Err（见 engines 的 fail-fast），
+                            // 这里再兜一层——只要没有任何实际译文就绝不能显示「完成」，
+                            // 否则就是「点了翻译、界面说成功、字幕全是空白」的假成功。
+                            let msg = format!(
+                                "翻译失败：应有 {expected} 句译文，但引擎未译出任何一句。请检查翻译引擎配置（在线模式看地址/密钥/模型名，离线模式看 Qwen 模型与 llama.cpp）后重试。"
+                            );
+                            tracing::warn!("{}", msg);
+                            // 统一收口（见 AppState::note_translate_failure）：转写进行中
+                            // 时只写翻译面板，绝不覆盖转写进度态。
+                            this.state.note_translate_failure(msg);
+                        } else {
+                            // 部分译出：说清「差多少」，并明确可以再点一次补齐——
+                            // 引擎是增量翻译，不会把已译好的重译一遍。
+                            let missing = expected - done;
+                            info!(
+                                "字幕多语言翻译部分完成（{}/{} 句，{} 句未译出）",
+                                done, expected, missing
+                            );
+                            this.state.translate_progress = done as f32 / expected as f32;
+                            this.state.translate_status_msg = format!(
+                                "翻译部分完成：{done} / {expected} 句已译出，剩余 {missing} 句未译出（可再次点击「开始翻译」补齐）"
+                            );
                         }
                         // 译文**按句合并**回当前字幕表，而不是整表覆盖。
                         //
@@ -1592,9 +1800,15 @@ impl MainWindow {
                         this.state.flush_segments_if_dirty();
                     }
                     Err(e) => {
+                        // 引擎在「一句都没译出」（密钥/地址/模型名错、Qwen 起不来）时
+                        // 会返回带真实原因的 Err（见 engines 的 fail-fast），这里把它
+                        // 失败统一走 `note_translate_failure`：它在没有转写在跑时才占用
+                        // 全局 `ProcessStatus::Failed` 横幅，避免翻译失败把转写进度态冲掉。
                         tracing::warn!("字幕多语言翻译过程报错: {}", e);
-                        this.state.translate_progress = 0.0;
-                        this.state.translate_status_msg = format!("翻译失败: {}", e);
+                        let msg = format!("翻译失败：{e}");
+                        // 统一收口（见 AppState::note_translate_failure）：转写进行中
+                        // 时只写翻译面板，绝不覆盖转写进度态。
+                        this.state.note_translate_failure(msg);
                     }
                 }
                 cx.notify();
@@ -1648,7 +1862,18 @@ impl MainWindow {
     pub(crate) fn apply_glossary_from_file(&mut self, cx: &mut Context<Self>) {
         match self.state.reload_glossary_from_temp_file() {
             Ok(n) => {
-                self.glossary_status = Some(format!("已应用术语表，共 {n} 条生效"));
+                // 同样按**实际生效**数报：`glossary_prompt` 只注入前
+                // `MAX_GLOSSARY_ENTRIES` 条，超限部分静默丢弃。
+                // 这里说「共 N 条生效」而实际只生效 80 条就是对用户撒谎。
+                let limit = self.state.config.translate.effective_glossary_limit();
+                let effective = super::views::performance::effective_glossary_count(n, limit);
+                if effective < n {
+                    self.glossary_status = Some(format!(
+                        "已应用术语表：共 {n} 条，其中 {effective} 条生效（受上限 {limit} 条限制）"
+                    ));
+                } else {
+                    self.glossary_status = Some(format!("已应用术语表，共 {n} 条生效"));
+                }
             }
             Err(e) => {
                 self.glossary_status = Some(format!(
@@ -1669,9 +1894,18 @@ impl MainWindow {
             cx.notify();
             return;
         }
-        if self.state.config.translate.effective_api_key().trim().is_empty() {
-            self.translate_probe_msg =
-                Some((false, "请先填写 API Key（或设置环境变量 VOICE2WORD_API_KEY）".to_string()));
+        if self
+            .state
+            .config
+            .translate
+            .effective_api_key()
+            .trim()
+            .is_empty()
+        {
+            self.translate_probe_msg = Some((
+                false,
+                "请先填写 API Key（或设置环境变量 VOICE2WORD_API_KEY）".to_string(),
+            ));
             cx.notify();
             return;
         }
@@ -1684,9 +1918,7 @@ impl MainWindow {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    crate::engines::TranslateEngine::online(cfg).probe_online()
-                })
+                .spawn(async move { crate::engines::TranslateEngine::online(cfg).probe_online() })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.is_probing_translate = false;
@@ -1767,9 +1999,12 @@ impl MainWindow {
                         info!("模型下载成功: {}", path.display());
                         // 压缩包类组件（如 llama.cpp）多一步解压，提示语要区分开，
                         // 否则用户以为只下了个包、不知道程序已经到位可用了。
-                        let verb = if item.is_archive { "下载并解压完成" } else { "下载完成" };
-                        this.state.download_status_msg =
-                            format!("{} {verb}", item.label);
+                        let verb = if item.is_archive {
+                            "下载并解压完成"
+                        } else {
+                            "下载完成"
+                        };
+                        this.state.download_status_msg = format!("{} {verb}", item.label);
                         // 重新扫描：新文件就位后界面上的「缺失」标记要立即消失
                         this.state.refresh_model_presence();
                         // 模型换了，硬件档案里的推荐配置与预览代理可能要重算
@@ -1852,7 +2087,11 @@ impl MainWindow {
                             Box::new(move |done, tot, id| {
                                 let _ = tx_cb.send((done, tot, id.to_string()));
                             });
-                        crate::utils::model_download::download_one(&item_copy, &cancel_cb, Some(&cb))
+                        crate::utils::model_download::download_one(
+                            &item_copy,
+                            &cancel_cb,
+                            Some(&cb),
+                        )
                     })
                     .await;
                 match r {
@@ -1884,3 +2123,70 @@ impl MainWindow {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{editor_export_format_string, export_spec_for};
+    use crate::ui::EditorExportFormat;
+
+    /// 回归（重构护栏）：`perform_editor_export` 里原本内联着两份 match
+    /// （枚举 -> 扩展名、枚举 -> 对话框过滤器名）。收敛成
+    /// `editor_export_format_string` + `export_spec_for` 之后，这里逐档断言
+    /// **结果与重构前的字面量完全一致**，确保这次去重没有改变任何用户可见行为。
+    #[test]
+    fn editor_export_spec_matches_previous_inline_literals() {
+        for (fmt, ext, label) in [
+            (EditorExportFormat::Srt, "srt", "SRT 字幕"),
+            (EditorExportFormat::Ass, "ass", "ASS 特效字幕"),
+            (EditorExportFormat::Txt, "txt", "TXT 纯文本"),
+            (EditorExportFormat::Vtt, "vtt", "VTT 网页字幕"),
+            (EditorExportFormat::Json, "json", "JSON 结构化字幕"),
+            (EditorExportFormat::EbuTtD, "ttml", "EBU-TT-D 广播字幕"),
+            (EditorExportFormat::NetflixTtal, "ttal", "Netflix TTAL 字幕"),
+        ] {
+            let spec = export_spec_for(editor_export_format_string(fmt));
+            assert_eq!(spec.0, ext, "{fmt:?} 的扩展名变了");
+            assert_eq!(spec.1, label, "{fmt:?} 的对话框过滤器名变了");
+        }
+    }
+
+    /// 上层的 `match` 已经替剪映 / FCPXML / Premiere XML 分流，它们不会走到
+    /// 单文件导出；万一漏进来，也必须落在一个 writer 一定写得出来的格式上，
+    /// 而不是 `unreachable!()` 把 UI 线程打挂。
+    #[test]
+    fn non_single_file_formats_degrade_to_srt_instead_of_panicking() {
+        for fmt in [
+            EditorExportFormat::JianYing,
+            EditorExportFormat::JianYingFolder,
+            EditorExportFormat::Fcpxml,
+            EditorExportFormat::PremiereXml,
+        ] {
+            assert_eq!(
+                editor_export_format_string(fmt),
+                "srt",
+                "{fmt:?} 应回落 srt"
+            );
+        }
+    }
+
+    /// 回归（P2）：收尾统计必须用「实际译出」口径——
+    /// 引擎可能给空串/纯空白译文打上 `translation_lang`，只数标签就会把
+    /// 空白显示成「翻译完成」；分母还必须排除空源句，否则会永远「部分完成」。
+    #[test]
+    fn translation_coverage_ignores_blank_translations_and_empty_sources() {
+        use crate::subtitle::Segment;
+        let mut with_blank = Segment::new(1, 0.0, 1.0, "你好");
+        with_blank.translation = Some("   ".to_string());
+        with_blank.translation_lang = Some("English".to_string()); // 脏标签：有标签无译文
+        let mut good = Segment::new(2, 1.0, 2.0, "世界");
+        good.translation = Some("World".to_string());
+        good.translation_lang = Some("English".to_string());
+        let empty_source = Segment::new(3, 2.0, 3.0, "   ");
+        let missing = Segment::new(4, 3.0, 4.0, "未译");
+        let segs = vec![with_blank, good, empty_source, missing];
+        // 分子：只有 good 算译出（空串被忽略）；分母： 3 句有源文，空源句不计。
+        assert_eq!(super::translation_coverage(&segs, "English"), (1, 3));
+        // 换目标语言：旧译文不能算成本轮成果（否则又会出现「换语言后显示已译出」）
+        assert_eq!(super::translation_coverage(&segs, "日本語"), (0, 3));
+        assert_eq!(super::translated_out_count(&segs, "English"), 1);
+    }
+}

@@ -3,10 +3,10 @@
 use gpui::prelude::*;
 use gpui::*;
 
-use crate::app::state::ProcessStatus;
 use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::MainWindow;
+use crate::app::state::ProcessStatus;
 
 impl MainWindow {
     /// 全局失败提示条。
@@ -50,7 +50,9 @@ impl MainWindow {
                     .text_size(px(Theme::TEXT_BODY))
                     .text_color(Theme::accent_red())
                     // 说明后果，而不只是报错：用户需要知道「现在关程序会丢东西」
-                    .child(format!("{msg}（改动尚未写入历史库，请检查磁盘空间或文件权限）")),
+                    .child(format!(
+                        "{msg}（改动尚未写入历史库，请检查磁盘空间或文件权限）"
+                    )),
             )
             .child(
                 div()
@@ -182,7 +184,9 @@ impl MainWindow {
         // 而它是 `String`——每帧 `clone()` 一个可能非空的详情串纯属浪费。改为只借用。
         let (stage_text, progress_val) = match &self.state.status {
             ProcessStatus::Idle => ("就绪", 0.0),
-            ProcessStatus::Processing { stage, progress, .. } => (stage.as_str(), *progress),
+            ProcessStatus::Processing {
+                stage, progress, ..
+            } => (stage.as_str(), *progress),
             ProcessStatus::Completed => ("转写完成", 1.0),
             ProcessStatus::Failed(_) => ("出错", 0.0),
         };
@@ -199,105 +203,95 @@ impl MainWindow {
             .items_center()
             .justify_between()
             // 左侧状态指示
-            .child(
+            .child(div().flex().items_center().gap_3().child(if is_processing {
+                let total_dur = self.state.transcribe_duration;
+                let cur_sec = self.state.streaming_current_sec;
+                let cur_mm = (cur_sec / 60.0) as u32;
+                let cur_ss = (cur_sec % 60.0) as u32;
+                let tot_mm = (total_dur / 60.0) as u32;
+                let tot_ss = (total_dur % 60.0) as u32;
+                let display_ratio = if total_dur > 0.0 && cur_sec > 0.0 {
+                    (cur_sec / total_dur).clamp(0.0, 1.0)
+                } else {
+                    progress_val.clamp(0.0, 1.0)
+                };
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(Theme::text_primary())
+                                    .child(stage_text.to_string()),
+                            )
+                            .child(if total_dur > 0.0 {
+                                div()
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .text_color(Theme::text_secondary())
+                                    .child(format!(
+                                        "{cur_mm:02}:{cur_ss:02} / {tot_mm:02}:{tot_ss:02}"
+                                    ))
+                            } else {
+                                div()
+                            })
+                            .child(primitives::badge_accent(format!(
+                                "{:.1}%",
+                                display_ratio * 100.0
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .w(px(Theme::PROGRESS_W))
+                            .child(primitives::progress_bar(display_ratio as f32)),
+                    )
+            } else if self.state.transcribe_file.is_some() {
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .gap_2()
+                    .child(primitives::stat_dot_sm(Theme::accent_blue()))
                     .child(
-                        if is_processing {
-                            let total_dur = self.state.transcribe_duration;
-                            let cur_sec = self.state.streaming_current_sec;
-                            let cur_mm = (cur_sec / 60.0) as u32;
-                            let cur_ss = (cur_sec % 60.0) as u32;
-                            let tot_mm = (total_dur / 60.0) as u32;
-                            let tot_ss = (total_dur % 60.0) as u32;
-                            let display_ratio = if total_dur > 0.0 && cur_sec > 0.0 {
-                                (cur_sec / total_dur).clamp(0.0, 1.0)
-                            } else {
-                                progress_val.clamp(0.0, 1.0)
-                            };
-
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .text_size(px(Theme::TEXT_BODY))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(Theme::text_primary())
-                                                .child(stage_text.to_string()),
-                                        )
-                                        .child(
-                                            if total_dur > 0.0 {
-                                                div()
-                                                    .text_size(px(Theme::TEXT_SMALL))
-                                                    .text_color(Theme::text_secondary())
-                                                    .child(format!("{cur_mm:02}:{cur_ss:02} / {tot_mm:02}:{tot_ss:02}"))
-                                            } else {
-                                                div()
-                                            }
-                                        )
-                                        .child(
-                                            primitives::badge_accent(format!(
-                                                "{:.1}%",
-                                                display_ratio * 100.0
-                                            )),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(Theme::PROGRESS_W))
-                                        .child(primitives::progress_bar(display_ratio as f32)),
-                                )
-                        } else if self.state.transcribe_file.is_some() {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(primitives::stat_dot_sm(Theme::accent_blue()))
-                                .child(
-                                    div()
-                                        .text_size(px(Theme::TEXT_BODY))
-                                        .text_color(Theme::text_secondary())
-                                        .child("文件已就绪"),
-                                )
-                        } else if has_batch {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(primitives::stat_dot_sm(Theme::accent_mint()))
-                                .child(
-                                    div()
-                                        .text_size(px(Theme::TEXT_BODY))
-                                        .text_color(Theme::text_secondary())
-                                        .child(format!(
-                                            "批量队列已就绪 · {} 个待处理",
-                                            self.state.queue_pending_count()
-                                        )),
-                                )
-                        } else {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(primitives::stat_dot_sm(Theme::bg_dot_idle()))
-                                .child(
-                                    div()
-                                        .text_size(px(Theme::TEXT_BODY))
-                                        .text_color(Theme::text_muted())
-                                        .child("就绪"),
-                                )
-                        }
+                        div()
+                            .text_size(px(Theme::TEXT_BODY))
+                            .text_color(Theme::text_secondary())
+                            .child("文件已就绪"),
                     )
-            )
+            } else if has_batch {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(primitives::stat_dot_sm(Theme::accent_mint()))
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_BODY))
+                            .text_color(Theme::text_secondary())
+                            .child(format!(
+                                "批量队列已就绪 · {} 个待处理",
+                                self.state.queue_pending_count()
+                            )),
+                    )
+            } else {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(primitives::stat_dot_sm(Theme::bg_dot_idle()))
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_BODY))
+                            .text_color(Theme::text_muted())
+                            .child("就绪"),
+                    )
+            }))
             // 右侧核心操作按钮 (iOS 椭圆胶囊 Pill Buttons)
             .child(
                 div()
@@ -316,7 +310,11 @@ impl MainWindow {
                         // 「开始处理 / 开始全部」：实心薄荷胶囊，禁用时退化为中性底槽
                         primitives::pill_btn_solid_state(
                             if is_processing {
-                                if self.state.batch_running { "批量处理中..." } else { "处理中..." }
+                                if self.state.batch_running {
+                                    "批量处理中..."
+                                } else {
+                                    "处理中..."
+                                }
                             } else if has_file {
                                 "开始处理"
                             } else if has_batch {

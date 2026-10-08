@@ -3,13 +3,15 @@
 use gpui::prelude::*;
 use gpui::*;
 
-use crate::app::state::{ProcessStatus, QueueState, WorkspaceTab};
-use crate::subtitle::Segment;
-use crate::utils::time::format_duration_short;
 use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::types::{ConfirmAction, ConfirmDialogInfo};
 use super::super::MainWindow;
+use crate::app::state::{ProcessStatus, QueueState, WorkspaceTab};
+// 质检报告是 `segment.rs` 里的纯逻辑：这里只把结果画出来，不在界面层重算判据。
+use crate::subtitle::segment::{quality_report, QualityReport};
+use crate::subtitle::Segment;
+use crate::utils::time::format_duration_short;
 
 impl MainWindow {
     /// 渲染智能生成模式主体布局 (中间是工作区，右侧是配置和选项)
@@ -41,7 +43,8 @@ impl MainWindow {
     pub(crate) fn render_main_workspace(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let current_tab = self.state.active_tab;
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
-        let is_sensevoice = self.state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
+        let is_sensevoice =
+            self.state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
 
         // 页面外壳统一走 primitives::page_shell：底色 / 内边距 / 分区间距与其余三个
         // 工作台页同源，切页时中央列不再横向跳动；`.flex_1()` 保留它在左右分栏里
@@ -141,8 +144,13 @@ impl MainWindow {
                                             .justify_center()
                                             .text_size(px(Theme::TEXT_SMALL))
                                             .font_weight(FontWeight::BOLD)
-                                            // 选中态是蓝色饱和块，数字恒白；未选中是中性底槽，同样恒白
-                                            .text_color(Theme::text_on_saturated())
+                                            // 未选中态是**翻转**的中性底槽（浅色主题下约 0xe2e2e9），数字必须跟着
+                                            // 底色一起翻转，取 text_primary（与步骤 1/2/4 一致，依据见
+                                            // docs/UI设计规范.md §3.2「中性底槽 → text_primary（翻转）」）。
+                                            // 这里**不能**用 text_on_saturated：它是恒白 token，在深色主题的深底槽上
+                                            // 看着正常，浅色主题下却是白字压浅底，几乎不可见——正是「底翻转、字恒白」
+                                            // 这个最常见错误。只有选中态（蓝色饱和块，恒深）才配 text_on_saturated。
+                                            .text_color(if current_tab == WorkspaceTab::Editor && !self.state.segments.is_empty() { Theme::text_on_saturated() } else { Theme::text_primary() })
                                             .child("3"),
                                     )
                                     .child(
@@ -518,6 +526,15 @@ impl MainWindow {
                         }
                     };
 
+                    // 转写质检摘要 (P1-9)：只在「工作区当前载入的字幕就是这张卡片对应的媒体」时展示。
+                    // 用户刚挑了一个还没转写的新文件时 `transcribe_file` 已换成新路径，而
+                    // `segments` 里还是上一支片子的结果——拿它算质检等于把上一支的问题挂到新文件头上。
+                    let quality_card = if self.state.selected_file.as_ref() == self.state.transcribe_file.as_ref() {
+                        self.render_quality_summary(cx)
+                    } else {
+                        None
+                    };
+
                     div()
                         .id("transcribe-file-ready-dashboard")
                         .flex_1()
@@ -582,32 +599,33 @@ impl MainWindow {
                                 // 文件主标题
                                 .child(primitives::page_title(fname))
                                 // 缓存提示卡片
-                                .children(if let Some(ref cached) = cached_opt {
-                                    Some(
-                                        div()
-                                            .w_full()
-                                            .px(px(Theme::SPACE_3))
-                                            .py(px(Theme::SPACE_1_5))
-                                            .rounded(px(Theme::CARD_RADIUS))
-                                            .bg(Theme::tint_mint_soft())
-                                            .border_1()
-                                            .border_color(Theme::tint_mint_border())
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .gap(px(Theme::SPACE_2))
-                                            .child(primitives::stat_dot_sm(Theme::accent_mint()))
-                                            .child(
-                                                div()
-                                                    .text_size(px(Theme::TEXT_BODY))
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .text_color(Theme::accent_mint())
-                                                    .child(format!("命中本地转写缓存 (含 {} 句字幕)", cached.segments.len())),
-                                            ),
-                                    )
-                                } else {
-                                    None
-                                })
+                                // （`cached_opt` 已是 `Option<Arc<TaskRecord>>`，直接 `map`：
+                                //   写成 `if let Some(..) { Some(..) } else { None }` 会被
+                                //   clippy 判成 `manual_map`。）
+                                .children(cached_opt.as_ref().map(|cached| {
+                                    div()
+                                        .w_full()
+                                        .px(px(Theme::SPACE_3))
+                                        .py(px(Theme::SPACE_1_5))
+                                        .rounded(px(Theme::CARD_RADIUS))
+                                        .bg(Theme::tint_mint_soft())
+                                        .border_1()
+                                        .border_color(Theme::tint_mint_border())
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap(px(Theme::SPACE_2))
+                                        .child(primitives::stat_dot_sm(Theme::accent_mint()))
+                                        .child(
+                                            div()
+                                                .text_size(px(Theme::TEXT_BODY))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(Theme::accent_mint())
+                                                .child(format!("命中本地转写缓存 (含 {} 句字幕)", cached.segments.len())),
+                                        )
+                                }))
+                                // 转写质检摘要（已在卡片上方算好；无字幕时为 None）
+                                .children(quality_card)
                                 // 核心操作按钮组：主行动 Lg/Primary，其余 Lg/Secondary，
                                 // 按钮骨架（高度 / 内边距 / 文字色）交给 btn 原语统一
                                 .child(
@@ -661,6 +679,13 @@ impl MainWindow {
                         .into_any_element()
                 } else {
                     // 空闲就绪引导工作区 (Studio Dropzone)
+                    //
+                    // 「转写完成后的看板」实际就落在本分支：`actions.rs` 在 `Finished` 里
+                    // 会把 `transcribe_file` 清空并回到这里（随后弹出的完成弹窗盖在上面）。
+                    // 因此质检摘要挂在这里，用户一关弹窗就能看到「哪几句要复核」，
+                    // 而不是只剩一张「导入音视频文件」的空态卡。
+                    // 没有已载入字幕时 `render_quality_summary` 返回 None，布局与从前一致。
+                    let quality_card = self.render_quality_summary(cx);
                     div()
                         .id("lightweight-idle-dashboard")
                         .flex_1()
@@ -669,7 +694,9 @@ impl MainWindow {
                         .flex_col()
                         .items_center()
                         .justify_center()
+                        .gap(px(Theme::SPACE_4))
                         .p(px(Theme::PAGE_PAD))
+                        .children(quality_card)
                         .child(
                             // 空态卡片外壳走 card()，内边距升一档让引导区更舒展
                             primitives::card_with_pad(Theme::SPACE_6)
@@ -729,6 +756,262 @@ impl MainWindow {
                         .into_any_element()
                 },
             )
+    }
+
+    // ── 转写质检摘要 (P1-9)：把 `segment.rs` 的质检报告变成用户可见的复核清单 ──
+
+    /// 当前工程的质检报告；没有字幕时返回 `None`（此时不该渲染质检块）。
+    ///
+    /// 术语违规一栏取 `cached_glossary_violations` 而不是就地重算：那份缓存按
+    /// 「术语表文本 + `segments_revision`」失效，剪辑台的字幕清单用的也是它，
+    /// 于是同一份数据在两个页面给出同一个数字（不会「这页 3 句、那页 5 句」），
+    /// 渲染开销也只在术语表或字幕真的变了时付一次。
+    fn quality_report_snapshot(&mut self) -> Option<QualityReport> {
+        if self.state.segments.is_empty() {
+            return None;
+        }
+        // 「未翻译」只在用户已经翻译过时才算缺陷：整篇没译文是「还没开始翻译」，
+        // 不是漏译。用「已有多少句带译文」当开关。
+        let check_untranslated = self.state.translated_count() > 0;
+        // 先按「无术语表」跑一遍拿到其余三项判据（术语表为空时 `glossary_violations`
+        // 会立刻返回），再把上面那份缓存里的违规下标填进同一结构——
+        // 计数与一键定位因此与剪辑台的高亮严格同源。
+        // 阈值来自配置（`pipeline.whisper_low_confidence`，默认 -0.35），与常量同值；
+        // 常量仅作为缺省来源，两者由 config.rs 的单测锁死同值。
+        let threshold = self.state.config.pipeline.whisper_low_confidence;
+        let mut report = quality_report(&self.state.segments, &[], threshold, check_untranslated);
+        report.glossary_violations = self.cached_glossary_violations();
+        Some(report)
+    }
+
+    /// 「下一处」的落点：当前选中句之后的第一处待复核；已是最后一处则回卷到第一处。
+    /// 一处待复核都没有时返回 `None`（`jump_to_quality_issue` 会安全忽略）。
+    fn quality_next_issue(&mut self) -> Option<usize> {
+        let report = self.quality_report_snapshot()?;
+        let all = report.all_issues();
+        let after_current = self
+            .state
+            .selected_segment_index
+            .and_then(|cur| all.iter().copied().find(|&idx| idx > cur));
+        after_current.or_else(|| all.first().copied())
+    }
+
+    /// 一键定位：切回剪辑台 + 选中目标句 + 让字幕清单重新跟随滚动。
+    ///
+    /// 全部走 `AppState` 的公开面（`select_segment` / `active_tab` 字段），
+    /// 不需要 `actions.rs` / `editor.rs` 提供额外入口；`subtitle_list_followed_sel`
+    /// 置 `None` 是为了强制清单重新定位——切换页面本身不会滚动虚拟列表，
+    /// 用户会「跳是跳过去了，视线还停在原地」。
+    fn jump_to_quality_issue(&mut self, cx: &mut Context<Self>, target: Option<usize>) {
+        let Some(index) = target else {
+            return;
+        };
+        self.state.select_segment(index);
+        // 剪辑台才是「选中某一句」的目的地：只选中不切页，用户还得自己找过去。
+        self.state.active_tab = WorkspaceTab::Editor;
+        self.subtitle_list_followed_sel = None;
+        // 剪辑台的监视器与时间轴需要波形（与载入缓存后的处理同源）。
+        self.ensure_waveform(cx);
+        cx.notify();
+    }
+
+    /// 质检摘要卡片。返回 `None` 表示这一帧不加任何东西（无字幕 / 不属于转写完成态）。
+    ///
+    /// 只由「转写完成后的看板」调用（文件就绪卡与空闲引导卡），转写进行中走的是
+    /// 进度看板分支，不会渲染到这里。
+    fn render_quality_summary(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let report = self.quality_report_snapshot()?;
+        let total = report.total_issues();
+        let scored = report.confidence_scored;
+        let missing = report.confidence_missing;
+        let no_confidence = report.confidence_unavailable();
+        // 「开始复核」的第一跳落点。必须在这里算好：下面给每个胶囊挂 `cx.listener`
+        // 时要可变借用 `this`，闭包里再读 `report` 就与借用打架
+        // （与 `render_batch_queue_panel` 先抽纯值是同一个处理）。
+        let first_issue = report.first_issue();
+
+        // 四类判据的展示配置：低置信走玫红、术语违规走琥珀（与剪辑台的琥珀色行提示同色）、
+        // 未翻译走蓝、空/超短句走中性灰。配色全部取自 Theme 的 tint_* / accent_* 阶梯，
+        // 调用点不出现裸色值。
+        // 元组字段（用别名收窄，免得 clippy 判 `type_complexity`）：
+        // 标签 / 句数 / 该类第一处序号 / 浅底 / 描边 / 前景。
+        type QualityChip = (&'static str, usize, Option<usize>, Rgba, Rgba, Rgba);
+        let rows: [QualityChip; 4] = [
+            (
+                "低置信",
+                report.low_confidence.len(),
+                report.low_confidence.first().copied(),
+                Theme::tint_red_soft(),
+                Theme::tint_red_border(),
+                Theme::accent_red(),
+            ),
+            (
+                "术语违规",
+                report.glossary_violations.len(),
+                report.glossary_violations.first().copied(),
+                Theme::tint_warn_soft(),
+                Theme::tint_warn_border(),
+                Theme::accent_orange(),
+            ),
+            (
+                "未翻译",
+                report.untranslated.len(),
+                report.untranslated.first().copied(),
+                Theme::tint_blue_soft(),
+                Theme::tint_blue_border(),
+                Theme::accent_blue(),
+            ),
+            (
+                "空/超短句",
+                report.empty_or_short.len(),
+                report.empty_or_short.first().copied(),
+                Theme::tint_neutral(),
+                Theme::tint_neutral_border(),
+                Theme::text_muted(),
+            ),
+        ];
+
+        // 标题行：左「转写质检」，右状态药丸（有问题是「待复核 N 项」，全通过是「质检通过」）
+        let header = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_BODY_LG))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(Theme::text_primary())
+                    .child("转写质检"),
+            )
+            .child(if total == 0 {
+                primitives::badge_accent("质检通过")
+            } else {
+                primitives::badge_danger(format!("待复核 {total} 项"))
+            });
+
+        // 判据胶囊行：非零项按类着色并可点击定位；零项**保留计数但置灰不可点**——
+        // 用户要看得出「这一项确实检查过、结果是 0」，而不是被悄悄藏掉。
+        let chips = div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .children(rows.into_iter().enumerate().map(
+                |(slot, (label, count, first, soft, border, text))| {
+                    if count == 0 {
+                        return primitives::tag_tinted(
+                            format!("{label} 0 句"),
+                            Theme::tint_neutral(),
+                            Theme::tint_neutral_border(),
+                            Theme::text_muted(),
+                        )
+                        .into_any_element();
+                    }
+                    primitives::tag_tinted(format!("{label} {count} 句"), soft, border, text)
+                        // 元素 id 用「槽位序号」而不是标签：`ElementId` 只接受
+                        // `&'static str` / `SharedString` / 数字，`(&str, &str)` 装不进去。
+                        .id(("quality-chip", slot))
+                        .cursor_pointer()
+                        .hover(|s| s.opacity(0.85))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.jump_to_quality_issue(cx, first);
+                        }))
+                        .into_any_element()
+                },
+            ));
+
+        // 置信度覆盖面：SenseVoice / 旧记录 / 流式预览片段都没有逐句置信度，
+        // 此时「低置信」一栏恒为空，必须说清是「判不了」而不是「没问题」。
+        let coverage = if missing == 0 {
+            format!("置信度已评估 {scored} 句")
+        } else if no_confidence {
+            format!("当前引擎不提供逐句置信度（{missing} 句缺该项数据），低置信复核不可用")
+        } else {
+            format!("置信度已评估 {scored} 句 · {missing} 句缺该项数据")
+        };
+
+        let body: AnyElement = if total == 0 {
+            // 零问题：给正向状态，而不是一排 0/0/0 的空壳。
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(Theme::SPACE_2))
+                .child(primitives::stat_dot_sm(Theme::accent_mint()))
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_BODY))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(Theme::accent_mint())
+                        .child("质检通过：未发现低置信、术语违规或碎片句"),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(Theme::SPACE_2))
+                .child(chips)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(Theme::SPACE_2))
+                        .child(
+                            primitives::btn(
+                                "开始复核",
+                                primitives::BtnSize::Sm,
+                                primitives::BtnVariant::Primary,
+                            )
+                            .id("quality-review-first")
+                            .cursor_pointer()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.jump_to_quality_issue(cx, first_issue);
+                                },
+                            )),
+                        )
+                        .child(
+                            primitives::btn(
+                                "下一处",
+                                primitives::BtnSize::Sm,
+                                primitives::BtnVariant::Secondary,
+                            )
+                            .id("quality-review-next")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let next = this.quality_next_issue();
+                                this.jump_to_quality_issue(cx, next);
+                            })),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_SMALL))
+                                .text_color(Theme::text_muted())
+                                .child("点某一类可定位该类第一处"),
+                        ),
+                )
+                .into_any_element()
+        };
+
+        Some(
+            primitives::card_sm()
+                .w_full()
+                .max_w(px(Theme::CONTENT_MAX_W))
+                .gap(px(Theme::SPACE_2))
+                .child(header)
+                .child(body)
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(Theme::text_muted())
+                        .child(coverage),
+                )
+                .into_any_element(),
+        )
     }
 
     /// 批量转写队列面板 (F-012)：文件清单 + 「开始全部 / 终止 / 清空」操作组。

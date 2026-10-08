@@ -57,4 +57,3 @@ pub struct ConfirmDialogInfo {
     pub danger: bool,
     pub action: ConfirmAction,
 }
-

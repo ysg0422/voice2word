@@ -3,8 +3,8 @@
 use gpui::prelude::*;
 use gpui::*;
 
-use super::super::MainWindow;
 use super::super::theme::Theme;
+use super::super::MainWindow;
 use crate::app::state::WorkspaceTab;
 
 /// 导航项高度。比常规控件（32）略高，因为它是页面级入口、需要更大的点击热区。
@@ -180,7 +180,8 @@ impl MainWindow {
                 if selected {
                     s
                 } else {
-                    s.bg(Theme::tint_neutral()).text_color(Theme::text_primary())
+                    s.bg(Theme::tint_neutral())
+                        .text_color(Theme::text_primary())
                 }
             })
             .on_click(cx.listener(move |this, _, _, cx| {
