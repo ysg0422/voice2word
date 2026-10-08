@@ -802,6 +802,9 @@ fn request_batch_translation(
     // 即命中（实测该网关即使 `enable_thinking:false` 也照常返回思考文本）。
     // 同时把思考长度记进日志，供 P1-3 诊断，**绝不**写进字幕。
     let observed = reasoning_content_len(&value);
+    // 「本批之前」是否已经知道对面是推理模型。若已知，说明当前预算已是推理预算，
+    // 只回思考就不再徒劳重试（重试会命中同样的预算）。
+    let known_reasoning = profile.is_reasoning();
     if observed > 0 {
         let first = profile.mark_reasoning(observed);
         debug!(
@@ -821,7 +824,7 @@ fn request_batch_translation(
     let mut content = extract_message_content(&value).unwrap_or_default();
     // 没有 `content`、却明明有思考文本：几乎必然是 `max_tokens` 被思考吃光后截断。
     // 此时**不**把思考当译文，而是用「思考量 + 译文预算」的更大预算重试一次。
-    if content.trim().is_empty() && observed > 0 && !profile.is_reasoning() {
+    if content.trim().is_empty() && observed > 0 && !known_reasoning {
         let retry_tokens = max_output_tokens(batch, 0, true);
         warn!(
             reasoning_chars = observed,
@@ -1130,7 +1133,7 @@ mod tests {
         assert_eq!(extract_message_content(&legacy).as_deref(), Some("你好"));
 
         // 推理模型：`reasoning_content` 是**思考过程**，不是译文。
-        // 实测 `cn:deepseek-v4.1-flash` 的思考里混着「或 この内容は…」「带"呢"语气：…」
+        // 实测（某网关的推理型模型）的思考里混着「或 この内容は…」「带"呢"语气：…」
         // 这类元话语；把它当译文会直接污染字幕。content 为空时必须返回 None，
         // 让上层走「空内容 / 输出被思考吃光」的错误分支。
         let reasoner = serde_json::json!({
@@ -2125,20 +2128,53 @@ mod tests {
             "推理模型预算不得超过上限: {reasoning}"
         );
 
-        // 长批同样受上限约束（不会因源文本长而顶爆）
-        let long_text = "字".repeat(4_000);
-        let long = [Segment::new(1, 0.0, 1.0, &long_text)];
-        let long_refs: Vec<&Segment> = long.iter().collect();
+        // 中等长批：译文预算 + 思考余量，不撞上限
+        let mid_text = "字".repeat(4_000);
+        let mid = [Segment::new(1, 0.0, 1.0, &mid_text)];
+        let mid_refs: Vec<&Segment> = mid.iter().collect();
+        let mid_budget = max_output_tokens(&mid_refs, 0, true);
+        assert!(
+            mid_budget > REASONING_THINKING_TOKENS && mid_budget <= MAX_REASONING_OUTPUT_TOKENS,
+            "中等长批应叠加思考余量且不超上限: {mid_budget}"
+        );
+
+        // 超长批：必须被推理上限截住，不会无限膨胀
+        let huge_text = "字".repeat(20_000);
+        let huge = [Segment::new(1, 0.0, 1.0, &huge_text)];
+        let huge_refs: Vec<&Segment> = huge.iter().collect();
         assert_eq!(
-            max_output_tokens(&long_refs, 0, true),
+            max_output_tokens(&huge_refs, 0, true),
             MAX_REASONING_OUTPUT_TOKENS
         );
+    }
+
+    /// 请求体里的 `max_tokens`。
+    fn max_tokens_of(body: &str) -> usize {
+        body.split("\"max_tokens\":")
+            .nth(1)
+            .and_then(|s| s.trim().split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|s| s.parse().ok())
+            .expect("请求体里应有 max_tokens")
+    }
+
+    /// 请求体 user 消息里出现的 `[N] ` 序号。
+    fn requested_indexes(body: &str) -> Vec<usize> {
+        body.split("[")
+            .skip(1)
+            .filter_map(|s| {
+                s.split(']')
+                    .next()
+                    .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|d| d.parse().ok())
+            })
+            .collect()
     }
 
     /// P0-2：首批响应暴露推理模型后，**剩余**批次应缩到 [`REASONING_BATCH_LINES`]
     /// 条并改用推理预算；同时必须记录一条日志说明「已调整批次/预算」。
     #[test]
     fn reasoning_model_shrinks_remaining_batches_and_raises_budget() {
+        // 首批 8 条，顺带带回思考文本 → 判定推理模型
         let first = serde_json::json!({
             "choices": [{
                 "message": {
@@ -2148,16 +2184,22 @@ mod tests {
             }]
         })
         .to_string();
-        let second = serde_json::json!({
-            "choices": [{
-                "message": { "content": "[9] T9.\n[10] T10.\n[11] T11.\n[12] T12." }
-            }]
+        let six_a = serde_json::json!({
+            "choices": [{ "message": { "content": "[9] T9.\n[10] T10.\n[11] T11.\n[12] T12.\n[13] T13.\n[14] T14." } }]
         })
         .to_string();
-        let (addr, seen) = spawn_mock_server(vec![first, second]);
-        let cfg = online_cfg_for(&addr); // batch_size = 20
+        let six_b = serde_json::json!({
+            "choices": [{ "message": { "content": "[15] T15.\n[16] T16.\n[17] T17.\n[18] T18.\n[19] T19.\n[20] T20." } }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![first, six_a, six_b]);
+        // 首批限 8 条：首批响应暴露推理模型后，剩余 12 条应按 6 条/批重排。
+        let cfg = OnlineApiConfig {
+            batch_size: 8,
+            ..online_cfg_for(&addr)
+        };
 
-        let segs: Vec<Segment> = (1..=12)
+        let segs: Vec<Segment> = (1..=20)
             .map(|i| Segment::new(i, 0.0, 1.0, "短句"))
             .collect();
         let out = translate_via_online_api(
@@ -2169,33 +2211,38 @@ mod tests {
         )
         .expect("推理模型应能译完");
 
-        assert_eq!(out.len(), 12);
-        assert_eq!(out[11].translation.as_deref(), Some("T12."));
-        assert_eq!(
-            seen.lock().unwrap().len(),
-            2,
-            "应恰好两批：首批 8 条 + 剩余 4 条"
-        );
+        assert_eq!(out.len(), 20);
+        assert!(out.iter().all(|s| s.has_translation()), "20 句都应译出");
 
         let bodies = seen.lock().unwrap().clone();
-        let second_body = &bodies[1];
-        assert!(
-            second_body.contains("[9] ") && second_body.contains("[12] "),
-            "剩余批应只含第 9~12 句: {second_body}"
+        assert_eq!(
+            bodies.len(),
+            3,
+            "首批 8 条 + 剩余 12 条按 6 条/批 = 共 3 次请求"
         );
+        // 剩余批必须被缩到 REASONING_BATCH_LINES 条（而不是继续按 8 条切）
+        for body in &bodies[1..] {
+            let idx = requested_indexes(body);
+            assert!(
+                idx.len() <= REASONING_BATCH_LINES,
+                "识别出推理模型后每批不得超过 {} 条，实际 {:?}",
+                REASONING_BATCH_LINES,
+                idx
+            );
+            assert!(
+                max_tokens_of(body) >= REASONING_THINKING_TOKENS,
+                "剩余批必须改用推理预算: {}",
+                max_tokens_of(body)
+            );
+        }
+        // 不得重发已译句子
+        let later: Vec<usize> = bodies[1..]
+            .iter()
+            .flat_map(|b| requested_indexes(b))
+            .collect();
         assert!(
-            !second_body.contains("[8] "),
-            "已译的句子不得重发: {second_body}"
-        );
-        let mt: usize = second_body
-            .split("\"max_tokens\":")
-            .nth(1)
-            .and_then(|s| s.trim().split(|c: char| !c.is_ascii_digit()).next())
-            .and_then(|s| s.parse().ok())
-            .expect("请求体里应有 max_tokens");
-        assert!(
-            mt >= REASONING_THINKING_TOKENS,
-            "识别出推理模型后剩余批必须改用推理预算: {mt}"
+            later.iter().all(|i| *i >= 9),
+            "已译的第 1~8 句不得重发: {later:?}"
         );
     }
 
