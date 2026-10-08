@@ -17,13 +17,14 @@ pub struct JianYingExporter;
 
 impl JianYingExporter {
     /// XML 特殊字符转义：字幕文本直接拼入 content 的内嵌 XML，
-    /// 未转义的 & < > " 会使剪映解析草稿失败
+    /// 未转义的 & < > " 会使剪映解析草稿失败。
+    ///
+    /// 委托到共用的 [`super::xml_util::escape_attr`]，而不是各写一份：共用实现
+    /// 除了五个保留字符，还会**剔除 XML 1.0 非法的控制字符**。ASR 输出或剪贴板
+    /// 粘贴偶尔会带进 U+0000–U+001F，它们既不能原样写出、也不能写成 `&#x1;`
+    /// 这类非法实体——留在草稿里会让剪映读不出整个工程，而导出看起来是成功的。
     fn xml_escape(s: &str) -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;")
+        super::xml_util::escape_attr(s)
     }
 
     /// 自动探测本地剪映草稿工程根目录
@@ -41,7 +42,9 @@ impl JianYingExporter {
                 if let Ok(val) = serde_json::from_str::<Value>(&content) {
                     if let Some(store) = val.get("all_draft_store").and_then(|s| s.as_array()) {
                         if let Some(first) = store.first() {
-                            if let Some(root) = first.get("draft_root_path").and_then(|r| r.as_str()) {
+                            if let Some(root) =
+                                first.get("draft_root_path").and_then(|r| r.as_str())
+                            {
                                 let p = PathBuf::from(root);
                                 if p.exists() {
                                     return Some(p);
@@ -577,8 +580,9 @@ impl JianYingExporter {
         base_name: &str,
         mode: ExportMode,
     ) -> Result<PathBuf> {
-        let draft_root = Self::detect_local_draft_root()
-            .context("未在系统中探测到剪映专业版（JianyingPro）草稿安装目录，请先安装或启动一次剪映")?;
+        let draft_root = Self::detect_local_draft_root().context(
+            "未在系统中探测到剪映专业版（JianyingPro）草稿安装目录，请先安装或启动一次剪映",
+        )?;
 
         let now_fmt = chrono::Local::now().format("%m月%d日_%H%M%S").to_string();
         let project_name = format!("{}_{}", base_name, now_fmt);
@@ -640,7 +644,10 @@ impl JianYingExporter {
                         "tm_duration": duration_us
                     });
 
-                    if let Some(store) = root_val.get_mut("all_draft_store").and_then(|s| s.as_array_mut()) {
+                    if let Some(store) = root_val
+                        .get_mut("all_draft_store")
+                        .and_then(|s| s.as_array_mut())
+                    {
                         store.insert(0, new_store_entry);
                     }
                     if let Some(ids) = root_val.get_mut("draft_ids").and_then(|i| i.as_u64()) {
@@ -668,7 +675,13 @@ mod tests {
         ];
 
         let temp_dir = std::env::temp_dir().join("test_voice2word_draft");
-        let result = JianYingExporter::export_to_folder(&segs, None, &temp_dir, "单元测试草稿", ExportMode::RawOnly);
+        let result = JianYingExporter::export_to_folder(
+            &segs,
+            None,
+            &temp_dir,
+            "单元测试草稿",
+            ExportMode::RawOnly,
+        );
         assert!(result.is_ok());
 
         let content_file = temp_dir.join("draft_content.json");
@@ -689,10 +702,24 @@ mod tests {
         let segs = vec![Segment::new(1, 0.0, 1.0, r#"A&B<C>"引号'"#)];
         let val = JianYingExporter::build_draft_content(&segs, None, 1.0, ExportMode::RawOnly);
         let content = val["materials"]["texts"][0]["content"].as_str().unwrap();
-        assert!(content.contains("A&amp;B&lt;C&gt;&quot;引号&apos;"), "未正确转义: {content}");
+        assert!(
+            content.contains("A&amp;B&lt;C&gt;&quot;引号&apos;"),
+            "未正确转义: {content}"
+        );
         assert!(!content.contains("A&B"), "原始特殊字符泄漏进了内嵌 XML");
     }
 
+    /// 内嵌 XML 里的非法控制字符必须被剔除：它们既不能原样写出，写成实体
+    /// (`&#x1;`) 也是非法的，会让剪映解析整份草稿失败。
+    #[test]
+    fn content_xml_strips_illegal_control_chars() {
+        let segs = vec![Segment::new(1, 0.0, 1.0, "前\u{0}中\u{1}后\u{7}")];
+        let val = JianYingExporter::build_draft_content(&segs, None, 1.0, ExportMode::RawOnly);
+        let content = val["materials"]["texts"][0]["content"].as_str().unwrap();
+        assert!(content.contains("前中后"), "控制字符应被剔除: {content:?}");
+        assert!(!content.contains('\u{0}'), "NUL 不应残留");
+        assert!(!content.contains("&#"), "不应写成非法实体");
+    }
 
     /// 双语导出：译文必须出现在 draft_content.json 的 content 字段里
     /// （回归「剪映草稿丢译文」）。
@@ -706,11 +733,16 @@ mod tests {
         let val = JianYingExporter::build_draft_content(&segs, None, 1.0, ExportMode::Bilingual);
         let content = val["materials"]["texts"][0]["content"].as_str().unwrap();
         assert!(content.contains("你好世界"), "缺原文: {content}");
-        assert!(content.contains("Hello world"), "双语草稿丢了译文: {content}");
+        assert!(
+            content.contains("Hello world"),
+            "双语草稿丢了译文: {content}"
+        );
 
         let raw = JianYingExporter::build_draft_content(&segs, None, 1.0, ExportMode::RawOnly);
         let content_raw = raw["materials"]["texts"][0]["content"].as_str().unwrap();
-        assert!(!content_raw.contains("Hello world"), "关闭双语时不应出现译文");
+        assert!(
+            !content_raw.contains("Hello world"),
+            "关闭双语时不应出现译文"
+        );
     }
 }
-

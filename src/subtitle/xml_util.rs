@@ -31,7 +31,9 @@ pub fn escape_text(s: &str) -> String {
 
 /// 转义 XML 属性值（在文本规则之上再加 `"` 与 `'`）。
 pub fn escape_attr(s: &str) -> String {
-    escape_text(s).replace('"', "&quot;").replace('\'', "&apos;")
+    escape_text(s)
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 #[cfg(test)]
@@ -41,7 +43,10 @@ mod tests {
     #[test]
     fn escapes_five_entities_in_the_right_places() {
         assert_eq!(escape_text("a & b < c > d"), "a &amp; b &lt; c &gt; d");
-        assert_eq!(escape_attr("say \"hi\" & 'bye'"), "say &quot;hi&quot; &amp; &apos;bye&apos;");
+        assert_eq!(
+            escape_attr("say \"hi\" & 'bye'"),
+            "say &quot;hi&quot; &amp; &apos;bye&apos;"
+        );
         // 文本节点里引号无需转义（转义了也不算错，但不必要）
         assert_eq!(escape_text("\"q\""), "\"q\"");
     }

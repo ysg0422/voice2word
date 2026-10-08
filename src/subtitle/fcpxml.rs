@@ -38,15 +38,33 @@ impl FcpXmlExporter {
         writeln!(file, r#"<!DOCTYPE fcpxml>"#)?;
         writeln!(file, r#"<fcpxml version="1.9">"#)?;
         writeln!(file, r#"    <resources>"#)?;
-        writeln!(file, r#"        <format id="r1" name="FFVideoFormat1080p30" frameDuration="1/30s" width="1920" height="1080"/>"#)?;
-        writeln!(file, r#"        <effect id="r2" name="Basic Title" uid=".../Titles.localized/Bumper:Opener.localized/Basic Title.localized/Basic Title.moti"/>"#)?;
+        writeln!(
+            file,
+            r#"        <format id="r1" name="FFVideoFormat1080p30" frameDuration="1/30s" width="1920" height="1080"/>"#
+        )?;
+        writeln!(
+            file,
+            r#"        <effect id="r2" name="Basic Title" uid=".../Titles.localized/Bumper:Opener.localized/Basic Title.localized/Basic Title.moti"/>"#
+        )?;
         writeln!(file, r#"    </resources>"#)?;
         writeln!(file, r#"    <library>"#)?;
         writeln!(file, r#"        <event name="Voice2Word">"#)?;
-        writeln!(file, r#"            <project name="{}">"#, escaped_project_name)?;
-        writeln!(file, r#"                <sequence format="r1" duration="{:.3}s">"#, total_dur)?;
+        writeln!(
+            file,
+            r#"            <project name="{}">"#,
+            escaped_project_name
+        )?;
+        writeln!(
+            file,
+            r#"                <sequence format="r1" duration="{:.3}s">"#,
+            total_dur
+        )?;
         writeln!(file, r#"                    <spine>"#)?;
-        writeln!(file, r#"                        <gap name="Gap" offset="0s" duration="{:.3}s" start="0s">"#, total_dur)?;
+        writeln!(
+            file,
+            r#"                        <gap name="Gap" offset="0s" duration="{:.3}s" start="0s">"#,
+            total_dur
+        )?;
 
         for (i, seg) in segments.iter().enumerate() {
             let start = seg.start;
@@ -55,12 +73,27 @@ impl FcpXmlExporter {
             let escaped_text = Self::escape_xml(&text);
             let ts_id = format!("ts{}", i + 1);
 
-            writeln!(file, r#"                            <title ref="r2" offset="{:.3}s" duration="{:.3}s" start="0s" name="{}">"#, start, dur, escaped_text)?;
+            writeln!(
+                file,
+                r#"                            <title ref="r2" offset="{:.3}s" duration="{:.3}s" start="0s" name="{}">"#,
+                start, dur, escaped_text
+            )?;
             writeln!(file, r#"                                <text>"#)?;
-            writeln!(file, r#"                                    <text-style ref="{}">{}</text-style>"#, ts_id, escaped_text)?;
+            writeln!(
+                file,
+                r#"                                    <text-style ref="{}">{}</text-style>"#,
+                ts_id, escaped_text
+            )?;
             writeln!(file, r#"                                </text>"#)?;
-            writeln!(file, r#"                                <text-style-def id="{}">"#, ts_id)?;
-            writeln!(file, r#"                                    <text-style font="PingFang SC" fontSize="48" fontColor="1 1 1 1" alignment="center"/>"#)?;
+            writeln!(
+                file,
+                r#"                                <text-style-def id="{}">"#,
+                ts_id
+            )?;
+            writeln!(
+                file,
+                r#"                                    <text-style font="PingFang SC" fontSize="48" fontColor="1 1 1 1" alignment="center"/>"#
+            )?;
             writeln!(file, r#"                                </text-style-def>"#)?;
             writeln!(file, r#"                            </title>"#)?;
         }
@@ -83,9 +116,7 @@ mod tests {
 
     #[test]
     fn test_fcpxml_export() {
-        let segs = vec![
-            Segment::new(1, 0.5, 2.0, "测试 FCPXML 字幕 & 符号 <转义>"),
-        ];
+        let segs = vec![Segment::new(1, 0.5, 2.0, "测试 FCPXML 字幕 & 符号 <转义>")];
 
         let temp_file = std::env::temp_dir().join("test_fcpxml.fcpxml");
         let res = FcpXmlExporter::write_to_file(&segs, &temp_file, "测试工程", ExportMode::RawOnly);
@@ -109,7 +140,8 @@ mod tests {
         let segs = vec![seg];
 
         let temp_file = std::env::temp_dir().join("test_fcpxml_bi.fcpxml");
-        FcpXmlExporter::write_to_file(&segs, &temp_file, "双向工程", ExportMode::Bilingual).unwrap();
+        FcpXmlExporter::write_to_file(&segs, &temp_file, "双向工程", ExportMode::Bilingual)
+            .unwrap();
         let content = std::fs::read_to_string(&temp_file).unwrap();
         assert!(content.contains("你好世界"), "缺原文");
         assert!(content.contains("Hello world"), "双语导出丢了译文");
@@ -123,4 +155,3 @@ mod tests {
         let _ = std::fs::remove_file(temp2);
     }
 }
-

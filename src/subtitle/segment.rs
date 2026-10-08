@@ -90,10 +90,11 @@ impl Segment {
     /// 不做模糊匹配——把 "English" 与 "英语" 视作同一语言的猜测一旦猜错，
     /// 就会静默跳过本该重译的句子。
     pub fn translation_matches(&self, target_lang: &str) -> bool {
-        match (self.translation.as_deref(), self.translation_lang.as_deref()) {
-            (Some(text), Some(lang)) => {
-                !text.trim().is_empty() && lang == target_lang
-            }
+        match (
+            self.translation.as_deref(),
+            self.translation_lang.as_deref(),
+        ) {
+            (Some(text), Some(lang)) => !text.trim().is_empty() && lang == target_lang,
             _ => false,
         }
     }
@@ -226,6 +227,187 @@ pub fn glossary_violations(segments: &[Segment], entries: &[(String, String)]) -
     out
 }
 
+/// 低置信判定的默认阈值（`avg_logprob`，越小越不可靠）。
+///
+/// # 依据
+///
+/// 1. **与自动救场同口径**。`core/pipeline.rs::plan_rescue_spans` 用
+///    `confidence < threshold` 挑二段重解码窗口，阈值来自
+///    `PipelineConfig::whisper_rescue_logprob`（`config.toml` 当前为 `0.0`＝关闭）。
+///    给用户看的复核清单若另起一套数值语义，会出现「管线判它没问题、界面却标红」
+///    的自相矛盾，因此这里沿用同一条 `avg_logprob` 越小越可疑的判据，
+///    只是复核清单必须**先给一个能用的默认值**（救场的默认是「关」，不能拿来做界面阈值）。
+/// 2. **真实分布实测**。本机 `ggml-small-q5_0` + Silero VAD 0.50、`-ojf` 全量 token 概率，
+///    对 `testVideo/03.1.3概率不等式.mp4` 的 05:05–10:05 真实片段自算 `avg_logprob`
+///    （与 `WhisperEngine::tokens_avg_logprob` 同一算法，过滤 `[_BEG_]` 类特殊 token）：
+///    - 190 句全部有置信度，区间 `[-0.673, -0.004]`，均值 -0.171、中位数 -0.139；
+///    - 分位：p10 -0.350、p25 -0.226、p75 -0.062、p90 -0.021；
+///    - 命中比例：`< -0.20` → 31.6%、`< -0.35` → 10.0%、`< -0.50` → 4.2%、
+///      `< -0.65` → 1.6%；**没有任何一句低于 -0.75**。
+/// 3. **取 -0.35**。它落在实测 p10 上，约 10% 的句子进复核清单——「一键定位 + 人工过一遍」
+///    是用户能真的做完的工作量；更松（如 -0.20）要把三成句子标黄，清单会被淹掉；
+///    更紧（如 -0.65）只剩 1.6%，等于放过绝大多数可改进的句子。
+///    注意本样本是**纯讲课、无背景音乐**的干净音频；含噪素材整条分布会整体下移，
+///    所以这里不再往松的方向留余量（宁可多标，评测量级上 10% 仍可人工消化）。
+/// 4. 与 `pipeline.rs` 里的 `0.35` 数值相同**纯属巧合**：那是「低置信片段的**时长占比**
+///    超过 35% 就放弃救场」的上限，与 `avg_logprob` 无关，别当成同一个阈值。
+///
+/// TODO(接入配置)：位于 `src/utils/config.rs` 的 `PipelineConfig` 才是它该待的地方。
+/// 建议落在 `whisper_rescue_logprob` 旁边（`config.rs:544-547` 附近），字段形如
+/// `pub whisper_low_confidence: f64`（`#[serde(default = "default_low_confidence")]`，
+/// 默认 -0.35），由界面暴露滑杆；本线程无权改 `config.rs`，故先固化成具名常量。
+pub const DEFAULT_LOW_CONFIDENCE_THRESHOLD: f64 = -0.35;
+
+/// 空/超短句判据：`display_text()` 去空白后字符数**少于**该值即视为 ASR 碎片噪声。
+///
+/// `optimize_segments` 已经剔掉了空文本与时长 <= 0.05s 的无效片段，但「单字碎音」
+/// （「嗯」「啊」）与标点恢复前的孤立字仍会留下：它们在字幕里几乎没有信息量，
+/// 却会明显拉低观感，值得进复核清单。取 2 而不是 1——单个汉字（「是」「对」）
+/// 本身可能就是一句完整回答，只按 1 个字符判会把正常短答也标出来。
+pub const MIN_SEGMENT_TEXT_CHARS: usize = 2;
+
+/// 一次转写质检的结果。
+///
+/// 四个判据各自持有一串**句序号**（`Segment::index`）。这是与
+/// `AppState::select_segment(index)` 同一套编号，因此可以原样拿去定位——
+/// 不需要再做「列表下标 ↔ 句序号」的换算（`glossary_violations` 也是返回 `seg.index`）。
+///
+/// # 同一句命中多条时**不去重**
+///
+/// 一个句子可以同时「低置信 + 术语违规 + 超短」，这三条是**互相独立**的缺陷：
+/// 去重会丢掉「这句有两个毛病」的信息，也会让每个判据的计数与它自己列表的长度对不上。
+/// 所以分类列表各自保留该句、允许交叉。需要「一句只看一次」的地方（一键定位、
+/// 「下一处」这类按句推进的复核动作）走 [`QualityReport::all_issues`]，
+/// 由它做合并 + 升序 + 去重。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QualityReport {
+    /// 低置信：`confidence` 有值且**严格小于**阈值。等于阈值不算（与
+    /// `plan_rescue_spans` 的 `c < threshold` 一致）。`None` **不计入**——见 [`quality_report`]。
+    pub low_confidence: Vec<usize>,
+    /// 疑似未遵守术语表（原样转发 [`glossary_violations`]，与剪辑台琥珀色提示同源）。
+    pub glossary_violations: Vec<usize>,
+    /// 未翻译：原文非空但 [`Segment::has_translation`] 为假。
+    /// 仅在调用方要求检查时非空——整篇未翻译是「还没开始」而不是缺陷。
+    pub untranslated: Vec<usize>,
+    /// 空句或超短句：`display_text()` 去空白后为空，或字符数 < [`MIN_SEGMENT_TEXT_CHARS`]。
+    pub empty_or_short: Vec<usize>,
+    /// 有多少句**带**置信度（界面上用来交代低置信判据的覆盖面）。
+    pub confidence_scored: usize,
+    /// 有多少句**没有**置信度（SenseVoice / 旧记录 / 流式预览片段）。
+    ///
+    /// 这个数字是本次质检的**能力缺口**：这些句子**没有**被算成低置信
+    /// （`None` 既不是「可靠」也不是「不可靠」），所以 `low_confidence` 对它们恒为空，
+    /// SenseVoice 用户拿不到低置信复核。
+    pub confidence_missing: usize,
+}
+
+impl QualityReport {
+    /// 四个判据的计数之和。同一句命中多条会被重复计数——它是「待复核**条目**数」，
+    /// 不是「有问题的**句子**数」（后者看 [`QualityReport::all_issues`] 的长度）。
+    pub fn total_issues(&self) -> usize {
+        self.low_confidence.len()
+            + self.glossary_violations.len()
+            + self.untranslated.len()
+            + self.empty_or_short.len()
+    }
+
+    /// 是否一条待复核都没有。
+    pub fn is_clean(&self) -> bool {
+        self.total_issues() == 0
+    }
+
+    /// 合并四个判据的句序号，升序去重。供「一键定位」「下一处」这类按句推进的动作使用。
+    pub fn all_issues(&self) -> Vec<usize> {
+        let mut all: Vec<usize> = self
+            .low_confidence
+            .iter()
+            .chain(&self.glossary_violations)
+            .chain(&self.untranslated)
+            .chain(&self.empty_or_short)
+            .copied()
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
+    /// 第一处待复核的句序号（无问题时 `None`）。这就是「一键定位」的落点。
+    pub fn first_issue(&self) -> Option<usize> {
+        self.all_issues().into_iter().next()
+    }
+
+    /// 置信度是否**完全**缺席：此时低置信判据对所有句子都不可用，界面应说明原因
+    /// 而不是显示「低置信 0 句」让用户误以为这段音频很干净。
+    pub fn confidence_unavailable(&self) -> bool {
+        self.confidence_scored == 0 && self.confidence_missing > 0
+    }
+}
+
+/// 对一批字幕跑一次质检，产出可单测的纯报告（不碰界面、不碰 IO、不做任何修改）。
+///
+/// - `confidence_threshold`：`avg_logprob` 下限，**严格小于**才判低置信；
+///   传 [`DEFAULT_LOW_CONFIDENCE_THRESHOLD`] 即产品默认值。
+/// - `check_untranslated`：是否把「有原文无译文」算作缺陷。由**调用方**决定，
+///   因为整篇未翻译时那不是缺陷而是「还没开始翻译」（见 [`QualityReport::untranslated`]）。
+///
+/// # `confidence` 为 `None` 的取舍
+///
+/// `None` **不计入** `low_confidence`，只累加到 `confidence_missing`。
+///
+/// 理由：`None` 的语义是「这条链路根本不产生逐句置信度」，而不是「不可靠」：
+/// - SenseVoice 两条构造路径都写死 `confidence: None`
+///   （`src/engines/sensevoice.rs:492`、`:529`）；
+/// - Whisper 自己也只在 `-ojf`（救场开启）时才有 token 概率
+///   （`src/engines/whisper.rs:945` 是唯一填充点，`:803` 的流式预览与 `:1047` 的
+///   stdout 回退同样是 `None`）。
+///
+/// 若把 `None` 一律当低置信，SenseVoice 用户会看到**满屏标红**（几千句全命中），
+/// 复核清单直接失去意义、还被误当成真缺陷；反之若静默忽略，用户会把
+/// 「低置信 0 句」读成「质检通过」。所以这里显式统计进 `confidence_missing`，
+/// 由界面提示「当前引擎不提供逐句置信度」——即记录能力缺口，而不是伪造判据结果。
+pub fn quality_report(
+    segments: &[Segment],
+    entries: &[(String, String)],
+    confidence_threshold: f64,
+    check_untranslated: bool,
+) -> QualityReport {
+    let mut report = QualityReport::default();
+    for seg in segments {
+        match seg.confidence {
+            Some(c) => {
+                report.confidence_scored += 1;
+                if c < confidence_threshold {
+                    report.low_confidence.push(seg.index);
+                }
+            }
+            None => report.confidence_missing += 1,
+        }
+
+        let text_len = seg.display_text().trim().chars().count();
+        if check_untranslated && text_len > 0 && !seg.has_translation() {
+            report.untranslated.push(seg.index);
+        }
+        if text_len < MIN_SEGMENT_TEXT_CHARS {
+            report.empty_or_short.push(seg.index);
+        }
+    }
+
+    // 术语违规直接复用现成判据（只查已带译文的句子），保证与剪辑台的琥珀色提示同源：
+    // 同一份数据在转写页与剪辑页给出同一个数字，不会「这页 3 句、那页 5 句」。
+    report.glossary_violations = glossary_violations(segments, entries);
+    report
+}
+
+/// 便捷入口：不检查未翻译、也不看术语表，只按置信度与碎片句给出基础报告。
+///
+/// 保留它的理由：完整形态的 [`quality_report`] 需要调用方提供术语表条目与
+/// 「是否检查未翻译」的开关，而这两样都由界面层掌握（术语表在 `AppState`，
+/// 未翻译与否取决于用户是否已经翻译过）。只想要低置信 / 碎片句这两项的调用点
+/// 与单测，不必先拼一份空术语表。
+pub fn quality_report_basic(segments: &[Segment], confidence_threshold: f64) -> QualityReport {
+    quality_report(segments, &[], confidence_threshold, false)
+}
+
 /// 这一批字幕里是否存在说话人标签。
 ///
 /// 导出时以「整批」为单位决定是否加前缀：只有部分行带前缀会看起来像漏标，
@@ -301,8 +483,8 @@ pub fn export_text_for(seg: &Segment, mode: ExportMode, with_speaker: bool) -> S
 /// 2. 剔除无效片段 (duration <= 0.05s) 以及模型幻读重叠鬼影 (< 0.25s 且与后句同时间启动)
 /// 3. 消除时间戳倒退与重叠冲突（前句尾部不超出后句头部）
 /// 4. 长句自动拆分：超过 6 秒 / 60 字的大句按标点就近均分，时间按字数比例分配
-/// 5. 广播级极短句平滑：短句 (< 0.8s) 在间隙允许范围内适当延展，避免 0.1s~0.4s 闪烁过快导致人眼无法阅读
-/// 6. 用第 2 步同一判据复扫一遍：消重叠/拆分/平滑都只动边界，可能在本次造出新的无效或鬼影片段
+/// 5. 用第 2 步同一判据复扫一遍：消重叠/拆分都只动边界，可能在本次造出新的无效或鬼影片段
+/// 6. 广播级极短句平滑：短句 (< 0.8s) 在间隙允许范围内适当延展，避免 0.1s~0.4s 闪烁过快导致人眼无法阅读
 /// 7. 重新编排连续序号 (1, 2, 3...)
 ///
 /// **必须幂等**：`AppState` 每次载入工程（`load_task_with`、`load_from_cache`）都会调用本函数，
@@ -313,7 +495,11 @@ pub fn optimize_segments(segments: &mut Vec<Segment>) {
     }
 
     // 1. 排序
-    segments.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    segments.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // 2. 剔除无效时长与同时间戳鬼影片段
     let mut filtered = Vec::with_capacity(segments.len());
@@ -338,9 +524,22 @@ pub fn optimize_segments(segments: &mut Vec<Segment>) {
     }
 
     // 4. 长句自动拆分：转写初始阶段就把 8 秒级大句按标点切短，句长可控且画面字幕不超屏
-    let mut filtered = split_long_segments(filtered);
+    let filtered = split_long_segments(filtered);
 
-    // 5. 极短句平滑延展 (最低停留 0.8 秒，若有空隙则延长显示，防止字闪)
+    // 5. 复扫：第 3 步消重叠只改边界，可能把前句尾部收到 `start + 0.1`，
+    // 造出一条「时长过短 + 与后句几乎同时开始」的鬼影碎片；第 4 步拆分也可能
+    // 留下类似的短碎片。若留到下一次载入才由第 2 步剔除，用户看到的就是
+    // 「点开一次两条、再点开少一条」，而且那条碎条的文本被静默丢弃。
+    // 这里用与第 2 步完全相同的判据复扫到稳定（复扫只会删、不会改边界）。
+    //
+    // 必须排在**平滑之前**：平滑会把这类碎条的尾部往 `next.start - 0.04` 推，
+    // 一旦推得比「本句起点 + 0.15」还远，它就**不再是鬼影**而被保留下来——
+    // 于是同一个工程第一次载入留下 N 条、第二次载入（此时碎条已消失、平滑
+    // 的邻居与可延展空间都变了）得到 N-1 条，且两次的 `end` 也不相同。
+    // 先复扫再平滑，则平滑的输入是稳定集合，两次载入逐字节一致。
+    let mut filtered = drop_invalid_and_ghosts_until_stable(filtered);
+
+    // 6. 极短句平滑延展 (最低停留 0.8 秒，若有空隙则延长显示，防止字闪)
     const MIN_READABLE_DUR: f64 = 0.8;
     let n = filtered.len();
     for j in 0..n {
@@ -359,13 +558,6 @@ pub fn optimize_segments(segments: &mut Vec<Segment>) {
             }
         }
     }
-
-    // 6. 复扫：第 3 步消重叠只改边界，可能把前句尾部收到 `start + 0.1`，
-    // 造出一条「时长过短 + 与后句几乎同时开始」的鬼影碎片；第 4/5 步拆分与平滑
-    // 也可能留下类似的短碎片。若留到下一次载入才由第 2 步剔除，用户看到的就是
-    // 「点开一次两条、再点开少一条」，而且那条碎条的文本被静默丢弃。
-    // 这里用与第 2 步完全相同的判据复扫到稳定（复扫只会删、不会改边界）。
-    filtered = drop_invalid_and_ghosts_until_stable(filtered);
 
     // 7. 重新编排序号
     for (idx, seg) in filtered.iter_mut().enumerate() {
@@ -387,7 +579,9 @@ fn should_drop_segment(seg: &Segment, next: Option<&Segment>) -> bool {
     }
     // 同时间段重叠的极短鬼影碎片：例如消重叠后被压到 0.1s、又与后句起点只差 50ms
     match next {
-        Some(n) => seg.end - seg.start < GHOST_MAX_DUR && (n.start - seg.start).abs() < GHOST_START_TOL,
+        Some(n) => {
+            seg.end - seg.start < GHOST_MAX_DUR && (n.start - seg.start).abs() < GHOST_START_TOL
+        }
         None => false,
     }
 }
@@ -450,7 +644,7 @@ fn split_index_at_ratio(text: &str, ratio: f64) -> Option<usize> {
             continue;
         }
         let dist = (left_len as i64 - target as i64).abs();
-        if best.map_or(true, |(_, best_dist)| dist < best_dist) {
+        if best.is_none_or(|(_, best_dist)| dist < best_dist) {
             best = Some((left_len, dist));
         }
     }
@@ -716,14 +910,26 @@ mod tests {
     #[test]
     fn test_display_text_prefers_polished_then_falls_back() {
         let mut seg = Segment::new(1, 0.0, 1.0, "原始识别文本");
-        assert_eq!(seg.display_text(), "原始识别文本", "polished 为空时回退 text");
+        assert_eq!(
+            seg.display_text(),
+            "原始识别文本",
+            "polished 为空时回退 text"
+        );
 
         seg.polished = "润色后的文本。".to_string();
-        assert_eq!(seg.display_text(), "润色后的文本。", "polished 非空时优先返回");
+        assert_eq!(
+            seg.display_text(),
+            "润色后的文本。",
+            "polished 非空时优先返回"
+        );
 
         // 纯空白不算「有润色」，仍回退原文
         seg.polished = "   ".to_string();
-        assert_eq!(seg.display_text(), "原始识别文本", "空白 polished 仍回退 text");
+        assert_eq!(
+            seg.display_text(),
+            "原始识别文本",
+            "空白 polished 仍回退 text"
+        );
 
         // 导出路径同样吃到润色文本，译文行不受影响
         seg.polished = "润色后的文本。".to_string();
@@ -819,7 +1025,10 @@ mod tests {
         assert_eq!(segs.len(), 2, "8 秒大句应被拆成两段");
         for s in &segs {
             assert!(
-                s.translation.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false),
+                s.translation
+                    .as_deref()
+                    .map(|t| !t.trim().is_empty())
+                    .unwrap_or(false),
                 "右半段丢了译文：{:?}",
                 s
             );
@@ -1118,7 +1327,11 @@ mod tests {
 
         let segs = vec![good, bad, no_trans, unrelated];
         let bad_idx = glossary_violations(&segs, &entries);
-        assert_eq!(bad_idx, vec![2], "只应标记未按术语译出的第 2 句: {bad_idx:?}");
+        assert_eq!(
+            bad_idx,
+            vec![2],
+            "只应标记未按术语译出的第 2 句: {bad_idx:?}"
+        );
     }
 
     /// 空术语表 → 零标记；大小写不敏感。
@@ -1166,7 +1379,8 @@ mod tests {
         // 所以这里给 `text` 本身带标点，才能真的走到「拆成多段」的分支。
         let mut seg = Segment::new(1, 0.0, 10.0, "前面这半句讲的是背景，后面这半句讲的是结论。");
         seg.polished = "前面这半句讲的是背景，后面这半句讲的是结论。".to_string();
-        seg.translation = Some("The first half is background, the second half is the conclusion.".to_string());
+        seg.translation =
+            Some("The first half is background, the second half is the conclusion.".to_string());
         seg.translation_lang = Some("English".to_string());
 
         let out = split_long_segments(vec![seg]);
@@ -1199,17 +1413,17 @@ mod tests {
         b.language = Some("ja".to_string());
         let mut c = Segment::new(3, 2.0, 3.0, "三");
         c.language = Some("en".to_string());
-        let segs = vec![a, b, c];
+        let segs = [a, b, c];
         assert_eq!(dominant_language(segs.iter()).as_deref(), Some("ja"));
 
         // 全空 → None
-        let none = vec![Segment::new(1, 0.0, 1.0, "x")];
+        let none = [Segment::new(1, 0.0, 1.0, "x")];
         assert_eq!(dominant_language(none.iter()), None);
 
         // 空串语言码同样忽略
         let mut blank = Segment::new(1, 0.0, 1.0, "x");
         blank.language = Some("   ".to_string());
-        let blank_segs = vec![blank];
+        let blank_segs = [blank];
         assert_eq!(dominant_language(blank_segs.iter()), None);
     }
 
@@ -1219,13 +1433,28 @@ mod tests {
     fn project_export_text_single_line_by_mode() {
         let mut seg = Segment::new(1, 0.0, 1.0, "第 一 行\n第 二 行");
         // 无译文：三种模式都退回原文（且压平换行）
-        assert_eq!(seg.project_export_text(ExportMode::RawOnly), "第 一 行 第 二 行");
-        assert_eq!(seg.project_export_text(ExportMode::TranslationOnly), "第 一 行 第 二 行");
-        assert_eq!(seg.project_export_text(ExportMode::Bilingual), "第 一 行 第 二 行");
+        assert_eq!(
+            seg.project_export_text(ExportMode::RawOnly),
+            "第 一 行 第 二 行"
+        );
+        assert_eq!(
+            seg.project_export_text(ExportMode::TranslationOnly),
+            "第 一 行 第 二 行"
+        );
+        assert_eq!(
+            seg.project_export_text(ExportMode::Bilingual),
+            "第 一 行 第 二 行"
+        );
 
         seg.translation = Some("first\nsecond".to_string());
-        assert_eq!(seg.project_export_text(ExportMode::RawOnly), "第 一 行 第 二 行");
-        assert_eq!(seg.project_export_text(ExportMode::TranslationOnly), "first second");
+        assert_eq!(
+            seg.project_export_text(ExportMode::RawOnly),
+            "第 一 行 第 二 行"
+        );
+        assert_eq!(
+            seg.project_export_text(ExportMode::TranslationOnly),
+            "first second"
+        );
         // 双语 = 译文␠␠原文（与 export_text 的 Bilingual 同序），压成一行
         assert_eq!(
             seg.project_export_text(ExportMode::Bilingual),
@@ -1234,6 +1463,163 @@ mod tests {
 
         // 空白译文不算译文
         seg.translation = Some("   \n  ".to_string());
-        assert_eq!(seg.project_export_text(ExportMode::Bilingual), "第 一 行 第 二 行");
+        assert_eq!(
+            seg.project_export_text(ExportMode::Bilingual),
+            "第 一 行 第 二 行"
+        );
+    }
+
+    // ==================== 质检报告 (P1-9) ====================
+
+    /// 有 / 无置信度混合：`None` 只进 `confidence_missing`，**绝不**进低置信。
+    #[test]
+    fn quality_report_none_confidence_is_never_low_confidence() {
+        let mut low = Segment::new(1, 0.0, 1.0, "低置信的一句");
+        low.confidence = Some(-0.9);
+        let mut ok = Segment::new(2, 1.0, 2.0, "正常的一句话");
+        ok.confidence = Some(-0.05);
+        // SenseVoice：confidence 恒为 None
+        let none = Segment::new(3, 2.0, 3.0, "没有置信度的一句");
+
+        let r = quality_report(
+            &[low, ok, none],
+            &[],
+            DEFAULT_LOW_CONFIDENCE_THRESHOLD,
+            false,
+        );
+        assert_eq!(r.low_confidence, vec![1], "只有 -0.9 那句低于阈值");
+        assert_eq!(r.confidence_scored, 2);
+        assert_eq!(r.confidence_missing, 1);
+        assert!(!r.confidence_unavailable(), "并不是全部缺置信度");
+        assert_eq!(r.total_issues(), 1);
+    }
+
+    /// 阈值边界：**等于**阈值不算低置信（与 `plan_rescue_spans` 的 `c < threshold` 一致）。
+    #[test]
+    fn quality_report_threshold_is_strict() {
+        let mut eq = Segment::new(1, 0.0, 1.0, "正好等于阈值");
+        eq.confidence = Some(-0.35);
+        let mut below = Segment::new(2, 1.0, 2.0, "略低于阈值");
+        below.confidence = Some(-0.350_001);
+        let mut above = Segment::new(3, 2.0, 3.0, "略高于阈值");
+        above.confidence = Some(-0.349_999);
+
+        let r = quality_report(&[eq, below, above], &[], -0.35, false);
+        assert_eq!(r.low_confidence, vec![2], "严格小于才算");
+        assert_eq!(r.confidence_scored, 3);
+        assert_eq!(r.total_issues(), 1);
+    }
+
+    /// 空输入 → 判为通过，且**不**谎报「置信度不可用」。
+    #[test]
+    fn quality_report_empty_input_is_clean() {
+        let r = quality_report(&[], &[], DEFAULT_LOW_CONFIDENCE_THRESHOLD, true);
+        assert!(r.is_clean());
+        assert_eq!(r.total_issues(), 0);
+        assert_eq!(r.first_issue(), None);
+        assert_eq!(r.confidence_scored, 0);
+        assert_eq!(r.confidence_missing, 0);
+        assert!(!r.confidence_unavailable(), "空输入没有能力缺口可言");
+    }
+
+    /// 同一句命中多条：分类列表**不去重**（保留「这句有两个毛病」），
+    /// 只有 `all_issues`（一键定位用）合并去重。
+    #[test]
+    fn quality_report_multi_hit_per_category_kept_but_all_issues_deduped() {
+        // 单字符 → 空/超短；-1.2 → 低置信；译文里没有「变换器」→ 术语违规
+        let mut seg = Segment::new(7, 0.0, 1.0, "T");
+        seg.confidence = Some(-1.2);
+        seg.translation = Some("no term here".to_string());
+        let entries = vec![("T".to_string(), "变换器".to_string())];
+
+        let r = quality_report(&[seg], &entries, DEFAULT_LOW_CONFIDENCE_THRESHOLD, true);
+        assert_eq!(r.low_confidence, vec![7]);
+        assert_eq!(r.glossary_violations, vec![7]);
+        assert_eq!(r.empty_or_short, vec![7]);
+        assert!(r.untranslated.is_empty(), "有译文就不算未翻译");
+        assert_eq!(r.total_issues(), 3, "同一句命中三条，按条目计数");
+        assert_eq!(r.all_issues(), vec![7], "一键定位的合并列表去重");
+        assert_eq!(r.first_issue(), Some(7));
+    }
+
+    /// 多个判据混排时 `all_issues` 升序去重。
+    #[test]
+    fn quality_report_all_issues_sorted_and_deduped() {
+        let mut a = Segment::new(5, 0.0, 1.0, "低置信");
+        a.confidence = Some(-2.0);
+        let b = Segment::new(2, 1.0, 2.0, "嗯");
+        let mut c = Segment::new(5, 2.0, 3.0, "低置信且超短的 5 号句");
+        c.confidence = Some(-2.0);
+        let mut d = Segment::new(9, 3.0, 4.0, "嗯");
+        d.confidence = Some(-2.0);
+        let r = quality_report(&[a, b, c, d], &[], -0.35, false);
+        assert_eq!(r.all_issues(), vec![2, 5, 9]);
+        assert_eq!(r.first_issue(), Some(2));
+    }
+
+    /// 「未翻译」由调用方开关决定；空句不重复计入未翻译。
+    #[test]
+    fn quality_report_untranslated_is_behind_caller_switch() {
+        let raw = Segment::new(1, 0.0, 1.0, "有原文没有译文");
+        let off = quality_report(
+            std::slice::from_ref(&raw),
+            &[],
+            DEFAULT_LOW_CONFIDENCE_THRESHOLD,
+            false,
+        );
+        assert!(off.untranslated.is_empty(), "整篇未翻译时不算缺陷");
+        let on = quality_report(&[raw], &[], DEFAULT_LOW_CONFIDENCE_THRESHOLD, true);
+        assert_eq!(on.untranslated, vec![1]);
+
+        // 纯空白译文等同没有译文；但它同时是空句，不该在未翻译里重复出现
+        let mut blank = Segment::new(2, 1.0, 2.0, "   ");
+        blank.translation = Some("  ".to_string());
+        let r = quality_report(&[blank], &[], DEFAULT_LOW_CONFIDENCE_THRESHOLD, true);
+        assert!(r.untranslated.is_empty(), "空句不进未翻译清单");
+        assert_eq!(r.empty_or_short, vec![2]);
+    }
+
+    /// 空 / 超短句判据：空白与单字符命中，两字符与正常句不命中。
+    /// 同时验证「整批都没有置信度」→ 低置信判据标记为不可用。
+    #[test]
+    fn quality_report_flags_empty_and_short_only() {
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "   "),
+            Segment::new(2, 1.0, 2.0, "嗯"),
+            Segment::new(3, 2.0, 3.0, "好吧"),
+            Segment::new(4, 3.0, 4.0, "这是一句正常的话"),
+        ];
+        let r = quality_report(&segs, &[], DEFAULT_LOW_CONFIDENCE_THRESHOLD, false);
+        assert_eq!(r.empty_or_short, vec![1, 2]);
+        assert_eq!(r.confidence_missing, 4);
+        assert!(r.confidence_unavailable(), "全缺置信度 → 低置信判据不可用");
+        assert!(r.low_confidence.is_empty());
+    }
+
+    /// 超短判据看的是 `display_text()`（润色优先），不是裸 `text`。
+    #[test]
+    fn quality_report_short_check_uses_display_text() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "嗯");
+        seg.polished = "嗯，这里其实有一整句话。".to_string();
+        let r = quality_report(&[seg], &[], DEFAULT_LOW_CONFIDENCE_THRESHOLD, false);
+        assert!(r.empty_or_short.is_empty(), "润色后不短了");
+    }
+
+    /// 术语违规与 `glossary_violations` 逐项一致（同源，不另起判据）；空术语表零结果。
+    #[test]
+    fn quality_report_reuses_glossary_violations() {
+        let entries = vec![("GPT".to_string(), "生成式预训练模型".to_string())];
+        let mut good = Segment::new(1, 0.0, 1.0, "GPT 模型");
+        good.translation = Some("生成式预训练模型 works".to_string());
+        let mut bad = Segment::new(2, 1.0, 2.0, "GPT 是核心");
+        bad.translation = Some("GPT is the core.".to_string());
+        let segs = vec![good, bad];
+
+        let r = quality_report(&segs, &entries, DEFAULT_LOW_CONFIDENCE_THRESHOLD, false);
+        assert_eq!(r.glossary_violations, glossary_violations(&segs, &entries));
+        assert_eq!(r.glossary_violations, vec![2]);
+
+        let empty = quality_report(&segs, &[], DEFAULT_LOW_CONFIDENCE_THRESHOLD, false);
+        assert!(empty.glossary_violations.is_empty(), "空术语表不产生违规");
     }
 }

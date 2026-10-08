@@ -105,7 +105,14 @@ mod tests {
         let segs = vec![s, Segment::new(2, 1.5, 2.0, "第二句")];
 
         let p = tmp("lossless");
-        JsonSubtitleExporter::write_to_file(&segs, &p, Some("demo.mp4"), ExportMode::Bilingual, Some("English")).unwrap();
+        JsonSubtitleExporter::write_to_file(
+            &segs,
+            &p,
+            Some("demo.mp4"),
+            ExportMode::Bilingual,
+            Some("English"),
+        )
+        .unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).expect("必须是合法 JSON");
         assert_eq!(v["segment_count"], 2);
@@ -127,7 +134,8 @@ mod tests {
         s.translation = Some("Hello".to_string());
         let p = tmp("rawonly");
         JsonSubtitleExporter::write_to_file(&[s], &p, None, ExportMode::RawOnly, None).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(v["segments"][0]["translation"], "Hello");
         assert_eq!(v["segments"][0]["text"], "你好");
         assert_eq!(v["export_mode"], "raw");
@@ -138,7 +146,8 @@ mod tests {
     fn empty_segments_still_produces_valid_document() {
         let p = tmp("empty");
         JsonSubtitleExporter::write_to_file(&[], &p, None, ExportMode::RawOnly, None).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(v["segment_count"], 0);
         assert!(v["segments"].as_array().unwrap().is_empty());
         let _ = std::fs::remove_file(p);

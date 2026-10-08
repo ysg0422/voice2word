@@ -52,7 +52,10 @@ impl PremiereXmlExporter {
         writeln!(file, r#"          <samplecharacteristics>"#)?;
         writeln!(file, r#"            <width>1920</width>"#)?;
         writeln!(file, r#"            <height>1080</height>"#)?;
-        writeln!(file, r#"            <pixelaspectratio>square</pixelaspectratio>"#)?;
+        writeln!(
+            file,
+            r#"            <pixelaspectratio>square</pixelaspectratio>"#
+        )?;
         writeln!(file, r#"            <rate>"#)?;
         writeln!(file, r#"              <timebase>30</timebase>"#)?;
         writeln!(file, r#"              <ntsc>FALSE</ntsc>"#)?;
@@ -68,7 +71,11 @@ impl PremiereXmlExporter {
             let text = seg.project_export_text(mode);
             let escaped_text = Self::escape_xml(&text);
 
-            writeln!(file, r#"          <generatoritem id="generatoritem-{}">"#, i + 1)?;
+            writeln!(
+                file,
+                r#"          <generatoritem id="generatoritem-{}">"#,
+                i + 1
+            )?;
             writeln!(file, r#"            <name>{}</name>"#, escaped_text)?;
             writeln!(file, r#"            <duration>{}</duration>"#, dur_frames)?;
             writeln!(file, r#"            <rate>"#)?;
@@ -82,7 +89,10 @@ impl PremiereXmlExporter {
             writeln!(file, r#"            <effect>"#)?;
             writeln!(file, r#"              <name>Text</name>"#)?;
             writeln!(file, r#"              <effectid>Text</effectid>"#)?;
-            writeln!(file, r#"              <effectcategory>Text</effectcategory>"#)?;
+            writeln!(
+                file,
+                r#"              <effectcategory>Text</effectcategory>"#
+            )?;
             writeln!(file, r#"              <effecttype>generator</effecttype>"#)?;
             writeln!(file, r#"              <mediatype>video</mediatype>"#)?;
             writeln!(file, r#"              <parameter>"#)?;
@@ -96,7 +106,10 @@ impl PremiereXmlExporter {
             writeln!(file, r#"                <value>Microsoft YaHei</value>"#)?;
             writeln!(file, r#"              </parameter>"#)?;
             writeln!(file, r#"              <parameter>"#)?;
-            writeln!(file, r#"                <parameterid>fontsize</parameterid>"#)?;
+            writeln!(
+                file,
+                r#"                <parameterid>fontsize</parameterid>"#
+            )?;
             writeln!(file, r#"                <name>Size</name>"#)?;
             writeln!(file, r#"                <valuemin>0</valuemin>"#)?;
             writeln!(file, r#"                <valuemax>1000</valuemax>"#)?;
@@ -122,12 +135,15 @@ mod tests {
 
     #[test]
     fn test_premiere_xml_export() {
-        let segs = vec![
-            Segment::new(1, 1.0, 3.5, "测试 PR XML 序列导出"),
-        ];
+        let segs = vec![Segment::new(1, 1.0, 3.5, "测试 PR XML 序列导出")];
 
         let temp_file = std::env::temp_dir().join("test_pr.xml");
-        let res = PremiereXmlExporter::write_to_file(&segs, &temp_file, "测试PR序列", ExportMode::RawOnly);
+        let res = PremiereXmlExporter::write_to_file(
+            &segs,
+            &temp_file,
+            "测试PR序列",
+            ExportMode::RawOnly,
+        );
         assert!(res.is_ok());
         assert!(temp_file.exists());
 
@@ -148,17 +164,18 @@ mod tests {
         let segs = vec![seg];
 
         let temp_file = std::env::temp_dir().join("test_pr_bi.xml");
-        PremiereXmlExporter::write_to_file(&segs, &temp_file, "双向PR工程", ExportMode::Bilingual).unwrap();
+        PremiereXmlExporter::write_to_file(&segs, &temp_file, "双向PR工程", ExportMode::Bilingual)
+            .unwrap();
         let content = std::fs::read_to_string(&temp_file).unwrap();
         assert!(content.contains("你好世界"), "缺原文");
         assert!(content.contains("Hello world"), "双语导出丢了译文");
         let _ = std::fs::remove_file(temp_file);
 
         let temp2 = std::env::temp_dir().join("test_pr_raw.xml");
-        PremiereXmlExporter::write_to_file(&segs, &temp2, "单向PR工程", ExportMode::RawOnly).unwrap();
+        PremiereXmlExporter::write_to_file(&segs, &temp2, "单向PR工程", ExportMode::RawOnly)
+            .unwrap();
         let content2 = std::fs::read_to_string(&temp2).unwrap();
         assert!(!content2.contains("Hello world"), "关闭双语时不应出现译文");
         let _ = std::fs::remove_file(temp2);
     }
 }
-

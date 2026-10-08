@@ -64,6 +64,14 @@ impl TtmlProfile {
     }
 }
 
+/// 说话人编号 → `ttm:agent` 的 `xml:id`。
+///
+/// 与 [`super::segment::Segment::speaker_label`]（`说话人 N`，N 从 1 起）保持同一编号，
+/// 界面里看到的「说话人 2」在文档里就是 `spk2`，便于对稿。
+fn speaker_agent_id(speaker: u32) -> String {
+    format!("spk{}", speaker + 1)
+}
+
 pub struct TtmlExporter;
 
 impl TtmlExporter {
@@ -86,15 +94,22 @@ impl TtmlExporter {
         }
         let mut file = File::create(path).with_context(|| "创建 TTML 文件失败")?;
 
-        let lang = if doc_lang.trim().is_empty() { "zh" } else { doc_lang.trim() };
+        let lang = if doc_lang.trim().is_empty() {
+            "zh"
+        } else {
+            doc_lang.trim()
+        };
         let target = target_lang.map(str::trim).filter(|s| !s.is_empty());
         // 双语需要目标语言标记才有意义；没有就按单语走（不写半截 span）。
         let bilingual = mode == ExportMode::Bilingual && target.is_some();
 
         writeln!(file, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
+        // 命名空间必须**全部**声明在根元素上：`ttm:` 前缀在 head 的元数据里用到
+        // （`ttm:agent` 说话人声明），若只在某个子元素上临时声明，既不合法也难以被
+        // 读稿系统按名空间索引。
         writeln!(
             file,
-            r#"<tt xmlns="http://www.w3.org/ns/ttml" xmlns:tts="http://www.w3.org/ns/ttml#styling" xmlns:ttp="http://www.w3.org/ns/ttml#parameter" xmlns:ebuttm="urn:ebu:tt:metadata" xml:lang="{}" {}>"#,
+            r#"<tt xmlns="http://www.w3.org/ns/ttml" xmlns:tts="http://www.w3.org/ns/ttml#styling" xmlns:ttp="http://www.w3.org/ns/ttml#parameter" xmlns:ttm="http://www.w3.org/ns/ttml#metadata" xmlns:ebuttm="urn:ebu:tt:metadata" xml:lang="{}" {}>"#,
             escape_attr(lang),
             profile.root_attrs()
         )?;
@@ -104,11 +119,29 @@ impl TtmlExporter {
         match profile {
             TtmlProfile::EbuTtD => {
                 writeln!(file, "      <ebuttm:documentMetadata>")?;
-                writeln!(file, "        <ebuttm:documentEbuttVersion>v1.0</ebuttm:documentEbuttVersion>")?;
+                writeln!(
+                    file,
+                    "        <ebuttm:documentEbuttVersion>v1.0</ebuttm:documentEbuttVersion>"
+                )?;
                 writeln!(file, "      </ebuttm:documentMetadata>")?;
             }
             TtmlProfile::NetflixTtal => {
-                writeln!(file, "      <ttm:title xmlns:ttm=\"http://www.w3.org/ns/ttml#metadata\">Voice2Word</ttm:title>")?;
+                writeln!(file, "      <ttm:title>Voice2Word</ttm:title>")?;
+            }
+        }
+        // 说话人：有标签时把每个说话人声明成 `ttm:agent`，并在正文的 <p> 上引用。
+        // 不声明就没有可引用的 id，读稿系统只能看到正文里的「说话人 N:」前缀文本。
+        let with_speaker = super::segment::has_speaker_labels(segments);
+        if with_speaker {
+            let mut speakers: Vec<u32> = segments.iter().filter_map(|s| s.speaker).collect();
+            speakers.sort_unstable();
+            speakers.dedup();
+            for spk in &speakers {
+                writeln!(
+                    file,
+                    "      <ttm:agent xml:id=\"{}\" type=\"person\" />",
+                    speaker_agent_id(*spk)
+                )?;
             }
         }
         writeln!(file, "    </metadata>")?;
@@ -134,7 +167,6 @@ impl TtmlExporter {
         // ── body ──
         writeln!(file, "  <body>")?;
         writeln!(file, "    <div>")?;
-        let with_speaker = super::segment::has_speaker_labels(segments);
         for (i, seg) in segments.iter().enumerate() {
             let begin = crate::utils::time::seconds_to_timestamp(seg.start);
             let end = crate::utils::time::seconds_to_timestamp(seg.end);
@@ -161,15 +193,23 @@ impl TtmlExporter {
                 )
             } else {
                 escape_text(
-                    &super::segment::export_text_for(seg, mode, with_speaker).replace(['\r', '\n'], " "),
+                    &super::segment::export_text_for(seg, mode, with_speaker)
+                        .replace(['\r', '\n'], " "),
                 )
+            };
+            // 说话人：与 SRT/ASS 一致，仅在整批确有标签时才给每条 <p> 加 ttm:agent，
+            // 避免只有个别句带标签时看起来像漏标。
+            let agent_attr = match seg.speaker.filter(|_| with_speaker) {
+                Some(spk) => format!(" ttm:agent=\"{}\"", speaker_agent_id(spk)),
+                None => String::new(),
             };
             writeln!(
                 file,
-                "      <p xml:id=\"p{}\" begin=\"{}\" end=\"{}\" region=\"bottom\" style=\"s0\">{}</p>",
+                "      <p xml:id=\"p{}\" begin=\"{}\" end=\"{}\" region=\"bottom\" style=\"s0\"{}>{}</p>",
                 i + 1,
                 begin,
                 end,
+                agent_attr,
                 body
             )?;
         }
@@ -196,7 +236,15 @@ mod tests {
     fn ebu_tt_d_has_profile_attrs_and_metadata() {
         let segs = vec![seg(1, 0.0, 1.5, "第一句")];
         let p = tmp("ebu");
-        TtmlExporter::write_to_file(&segs, &p, "zh", None, ExportMode::RawOnly, TtmlProfile::EbuTtD).unwrap();
+        TtmlExporter::write_to_file(
+            &segs,
+            &p,
+            "zh",
+            None,
+            ExportMode::RawOnly,
+            TtmlProfile::EbuTtD,
+        )
+        .unwrap();
         let t = std::fs::read_to_string(&p).unwrap();
         assert!(t.contains("ebuttm:conformsToStandard"), "{t}");
         assert!(t.contains("documentEbuttVersion"), "{t}");
@@ -211,7 +259,15 @@ mod tests {
     fn netflix_ttal_declares_content_profile() {
         let segs = vec![seg(1, 0.0, 1.0, "hi")];
         let p = tmp("ttal");
-        TtmlExporter::write_to_file(&segs, &p, "en", None, ExportMode::RawOnly, TtmlProfile::NetflixTtal).unwrap();
+        TtmlExporter::write_to_file(
+            &segs,
+            &p,
+            "en",
+            None,
+            ExportMode::RawOnly,
+            TtmlProfile::NetflixTtal,
+        )
+        .unwrap();
         let t = std::fs::read_to_string(&p).unwrap();
         assert!(t.contains("contentProfiles"), "{t}");
         assert!(t.contains("ntflx-ttal-1.0"), "{t}");
@@ -226,7 +282,12 @@ mod tests {
         let segs = vec![s];
         let p = tmp("bi");
         TtmlExporter::write_to_file(
-            &segs, &p, "zh", Some("en"), ExportMode::Bilingual, TtmlProfile::EbuTtD,
+            &segs,
+            &p,
+            "zh",
+            Some("en"),
+            ExportMode::Bilingual,
+            TtmlProfile::EbuTtD,
         )
         .unwrap();
         let t = std::fs::read_to_string(&p).unwrap();
@@ -251,7 +312,12 @@ mod tests {
         let segs = vec![s];
         let p = tmp("nolang");
         TtmlExporter::write_to_file(
-            &segs, &p, "zh", None, ExportMode::Bilingual, TtmlProfile::EbuTtD,
+            &segs,
+            &p,
+            "zh",
+            None,
+            ExportMode::Bilingual,
+            TtmlProfile::EbuTtD,
         )
         .unwrap();
         let t = std::fs::read_to_string(&p).unwrap();
@@ -265,10 +331,99 @@ mod tests {
     fn escapes_special_chars_in_text() {
         let segs = vec![seg(1, 0.0, 1.0, "A & B <tag>")];
         let p = tmp("esc");
-        TtmlExporter::write_to_file(&segs, &p, "en", None, ExportMode::RawOnly, TtmlProfile::EbuTtD).unwrap();
+        TtmlExporter::write_to_file(
+            &segs,
+            &p,
+            "en",
+            None,
+            ExportMode::RawOnly,
+            TtmlProfile::EbuTtD,
+        )
+        .unwrap();
         let t = std::fs::read_to_string(&p).unwrap();
         assert!(t.contains("A &amp; B &lt;tag&gt;"), "{t}");
         assert!(!t.contains("<tag>"), "原始尖括号不应泄漏: {t}");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// 说话人：每个说话人声明一个 `ttm:agent`，正文 `<p>` 引用对应 id。
+    #[test]
+    fn speaker_agents_are_declared_and_referenced() {
+        let mut a = seg(1, 0.0, 1.0, "甲说");
+        a.speaker = Some(0);
+        let mut b = seg(2, 1.0, 2.0, "乙说");
+        b.speaker = Some(1);
+        let c = seg(3, 2.0, 3.0, "旁白");
+        let p = tmp("spk");
+        TtmlExporter::write_to_file(
+            &[a, b, c],
+            &p,
+            "zh",
+            None,
+            ExportMode::RawOnly,
+            TtmlProfile::EbuTtD,
+        )
+        .unwrap();
+        let t = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            t.contains("<ttm:agent xml:id=\"spk1\""),
+            "缺说话人声明: {t}"
+        );
+        assert!(
+            t.contains("<ttm:agent xml:id=\"spk2\""),
+            "缺说话人声明: {t}"
+        );
+        assert!(t.contains("ttm:agent=\"spk1\""), "第 1 句未引用说话人: {t}");
+        assert!(t.contains("ttm:agent=\"spk2\""), "第 2 句未引用说话人: {t}");
+        // 无标签的句子不应被强加 agent
+        let p3 = t.lines().find(|l| l.contains("p3")).expect("应有第 3 段");
+        assert!(
+            !p3.contains("ttm:agent"),
+            "无说话人的句子不该带 agent: {p3}"
+        );
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// 无说话人标签时不应出现任何 `ttm:agent`（保持旧行为）。
+    #[test]
+    fn no_speaker_agents_without_labels() {
+        let segs = vec![seg(1, 0.0, 1.0, "独白")];
+        let p = tmp("nospk");
+        TtmlExporter::write_to_file(
+            &segs,
+            &p,
+            "zh",
+            None,
+            ExportMode::RawOnly,
+            TtmlProfile::EbuTtD,
+        )
+        .unwrap();
+        let t = std::fs::read_to_string(&p).unwrap();
+        assert!(!t.contains("ttm:agent"), "无说话人不应声明 agent: {t}");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// `ttm:` 命名空间只在根元素声明一次——子元素上再声明会让同一个前缀
+    /// 绑到不同作用域，读稿系统的名空间索引会拿不到 `ttm:agent`。
+    #[test]
+    fn ttm_namespace_is_declared_once_on_root() {
+        let segs = vec![seg(1, 0.0, 1.0, "hi")];
+        let p = tmp("ns");
+        TtmlExporter::write_to_file(
+            &segs,
+            &p,
+            "en",
+            None,
+            ExportMode::RawOnly,
+            TtmlProfile::NetflixTtal,
+        )
+        .unwrap();
+        let t = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            t.matches("xmlns:ttm=").count(),
+            1,
+            "ttm 命名空间应只在根声明一次: {t}"
+        );
         let _ = std::fs::remove_file(p);
     }
 }
