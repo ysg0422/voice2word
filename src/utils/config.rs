@@ -104,6 +104,16 @@ pub struct TranslateConfig {
     /// 注入翻译提示词，保证全篇一致。空则完全不注入，不影响默认行为。
     #[serde(default)]
     pub glossary: String,
+    /// 注入提示词的术语上限（实际生效值，`clamp(1, 1000)`）。
+    ///
+    /// 默认 [`TranslateConfig::MAX_GLOSSARY_ENTRIES`]（80）。暴露成字段是为了让
+    /// 「术语表被静默截断」可被用户自行放宽，而不是只能改代码。
+    #[serde(default = "default_max_glossary_entries")]
+    pub max_glossary_entries: usize,
+}
+
+fn default_max_glossary_entries() -> usize {
+    TranslateConfig::MAX_GLOSSARY_ENTRIES
 }
 
 fn default_translate_target_lang() -> String {
@@ -121,6 +131,7 @@ impl Default for TranslateConfig {
             timeout_secs: 120,
             target_lang: default_translate_target_lang(),
             glossary: String::new(),
+            max_glossary_entries: default_max_glossary_entries(),
         }
     }
 }
@@ -166,7 +177,7 @@ impl TranslateConfig {
 
     /// 把术语表拼成注入提示词的一行指令。空表返回空串（调用方据此跳过注入）。
     ///
-    /// 只取前 [`Self::MAX_GLOSSARY_ENTRIES`] 条：提示词预算有限，术语太多反而稀释
+    /// 只取前 [`Self::effective_glossary_limit`] 条：提示词预算有限，术语太多反而稀释
     /// 正文注意力，且绝大多数场景几十条足够覆盖专名。
     pub fn glossary_prompt(&self) -> String {
         let entries = self.glossary_entries();
@@ -175,17 +186,35 @@ impl TranslateConfig {
         }
         let listed = entries
             .iter()
-            .take(Self::MAX_GLOSSARY_ENTRIES)
+            .take(self.effective_glossary_limit())
             .map(|(a, b)| format!("{a}={b}"))
             .collect::<Vec<_>>()
             .join("；");
-        format!(
-            "术语表（以下词条必须按给定译法翻译，不得改写）：{listed}。"
-        )
+        format!("术语表（以下词条必须按给定译法翻译，不得改写）：{listed}。")
     }
 
-    /// 注入提示词的术语上限。
+    /// 注入提示词的术语上限**默认值**（实际生效值见
+    /// [`Self::effective_glossary_limit`]，可被 `max_glossary_entries` 覆盖）。
+    ///
+    /// 保留为常量而不是删掉：`ui/views/performance.rs` 的
+    /// `effective_glossary_count` 与 `ui/actions.rs` / `ui/editor.rs` 的提示文案
+    /// 都直接引用它。语义从「硬上限」变为「默认值」后，界面在用户没改配置时
+    /// 仍显示同一个数（80），行为不变；用户改大后界面数字会偏小，见报告中的说明。
     pub const MAX_GLOSSARY_ENTRIES: usize = 80;
+
+    /// 实际生效的术语表注入上限：把配置值夹到 `[1, 1000]`。
+    ///
+    /// 上界取 1000 而不是无限：术语表是**每批重复注入**的固定开销，其长度由
+    /// `engines/llm.rs` 的 `fixed_prompt_tokens` 从 `batch_char_budget` 里显式扣掉。
+    /// 上限拉满会把单批能装下的字幕条数压到下限（`want.max(128)`），翻译往返次数
+    /// 与总耗时反而上升；1000 条（每条 ≤60 字符）已接近 4096 上下文窗口的一半，
+    /// 再大只会挤掉待译正文。
+    ///
+    /// 下界取 1 而不是 0：`.take(0)` 会把整张术语表静默丢空，与界面「已启用 N 条术语」
+    /// 的提示直接矛盾——宁可只注入 1 条，也不给出「说生效、实则全丢」的假象。
+    pub fn effective_glossary_limit(&self) -> usize {
+        self.max_glossary_entries.clamp(1, 1000)
+    }
 
     /// 实际使用的密钥：配置优先，其次环境变量
     pub fn effective_api_key(&self) -> String {
@@ -212,6 +241,7 @@ impl TranslateConfig {
 /// `font_size` / `letter_spacing` / `bottom_margin` 均以 **1080p 画面**为基准：
 /// - 导出 ASS 时直接写入 PlayResY=1080 的样式表（1:1）；
 /// - 预览时按 `PREVIEW_SCALE` 等比映射到监视器画面。
+///
 /// 这样「预览所见」与「导出所得」是同一套参数，不会各调各的。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubtitleStyleConfig {
@@ -287,7 +317,8 @@ impl SubtitleStyleConfig {
     }
 }
 
-/// GPU 资源占用总闸：给桌面/其他应用留显卡
+/// GPU 资源占用总闸：给桌面/其他应用留显卡。
+///
 /// - hwaccel_decode: 预览播放/拖动的显卡硬解 (-hwaccel auto)，关闭后走 CPU 软解
 /// - whisper_offload: 转写推理的 Vulkan GPU 加速 (whisper-vulkan)，关闭后走纯 CPU（转写变慢）
 /// - onnx_provider: SenseVoice / CT-Punc 两个 ONNX 引擎的执行后端。
@@ -304,6 +335,7 @@ impl SubtitleStyleConfig {
 ///   16 线程 / 680M）：
 ///     - 让路开：GPU 均值 62.7%、峰值 78.9%、耗时 18.4s
 ///     - 让路关：GPU 均值 65.1%、峰值 80.2%、耗时 19.7s
+///
 ///   即让路几乎不损失速度，却把调度优先权还给桌面。设为 false 可换回满速抢占。
 /// - gpu_limit_percent: GPU 占用上限（百分比，100 = 不限速）。
 ///   让路模式只降低进程调度优先级，管不到「已经排进 GPU 队列」的命令缓冲：
@@ -448,7 +480,8 @@ impl Default for PathsConfig {
     fn default() -> Self {
         Self {
             ffmpeg: "tools/ffmpeg.exe".to_string(),
-            whisper_cli: "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe".to_string(),
+            whisper_cli: "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"
+                .to_string(),
             whisper_model: "models/whisper/ggml-small-q5_0.bin".to_string(),
             vad_model: Some("models/whisper/ggml-silero-v6.2.0.bin".to_string()),
             punc_model: Some("models/punc/model.int8.onnx".to_string()),
@@ -497,6 +530,14 @@ fn default_rescue_logprob() -> f64 {
     0.0
 }
 
+fn default_low_confidence() -> f64 {
+    // 默认 -0.35：真实素材实测（`testVideo/03.1.3概率不等式.mp4` 05:05-10:05，
+    // 190 句，ggml-small-q5_0）的 avg_logprob 分布 p10 ≈ -0.35，即约一成句子
+    // 进复核清单——量级上可人工消化。与 `subtitle/segment.rs` 的
+    // `DEFAULT_LOW_CONFIDENCE_THRESHOLD` 同值，后者是本次接线前的固化常量。
+    -0.35
+}
+
 fn default_max_context() -> u32 {
     32
 }
@@ -543,6 +584,10 @@ pub struct PipelineConfig {
     /// 0.0 = 关闭救场（默认，救场是顺序冷启动进程，开销远大于收益）
     #[serde(default = "default_rescue_logprob")]
     pub whisper_rescue_logprob: f64,
+    /// 转写质检「低置信」阈值（avg_logprob 下限，严格小于才判低置信）。
+    /// 默认 -0.35：真实素材实测 p10（190 句，见 segment.rs 常量注释）。
+    #[serde(default = "default_low_confidence")]
+    pub whisper_low_confidence: f64,
     /// 跨句自注意力上下文 token 上限 (-mc，原硬编码 32，暴露出来供 A/B 实验)
     #[serde(default = "default_max_context")]
     pub whisper_max_context: u32,
@@ -621,8 +666,7 @@ impl Default for AppConfig {
                 sensevoice_model: Some("models/sensevoice/model.int8.onnx".to_string()),
                 sensevoice_tokens: Some("models/sensevoice/tokens.txt".to_string()),
                 sensevoice_vad: Some("models/sensevoice/silero_vad.onnx".to_string()),
-                llama_cli: "tools/llama-completion.exe"
-                    .to_string(),
+                llama_cli: "tools/llama-completion.exe".to_string(),
                 llm_model: "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string(),
                 python: "python".to_string(),
             },
@@ -636,6 +680,7 @@ impl Default for AppConfig {
                 whisper_processors: 1,
                 whisper_no_fallback: true,
                 whisper_rescue_logprob: 0.0,
+                whisper_low_confidence: default_low_confidence(),
                 whisper_max_context: 32,
                 whisper_audio_speed: 1.0,
                 whisper_vad_threshold: 0.50,
@@ -749,7 +794,13 @@ impl LocalOverride {
             if let Some(v) = p.python.as_ref() {
                 cfg.paths.python = v.clone();
             }
-            apply_path!(vad_model, punc_model, sensevoice_model, sensevoice_tokens, sensevoice_vad);
+            apply_path!(
+                vad_model,
+                punc_model,
+                sensevoice_model,
+                sensevoice_tokens,
+                sensevoice_vad
+            );
             touched.push("paths");
         }
 
@@ -764,6 +815,10 @@ impl LocalOverride {
 impl AppConfig {
     /// 机器本地覆盖文件名（与 config.toml 同目录，不进版本库）。
     pub const LOCAL_OVERRIDE: &'static str = "config.local.toml";
+
+    /// 覆盖项目根目录的环境变量名。**唯一定义处**：`app_root_dir()` 只经这个常量
+    /// 取名字，不要在别处再写字面量——否则改名时必漏一处。
+    pub const HOME_ENV: &'static str = "VOICE2WORD_HOME";
 
     /// 读取配置，并在其后叠加机器本地覆盖文件 `config.local.toml`。
     ///
@@ -783,7 +838,6 @@ impl AppConfig {
     /// 覆盖是**逐字段**而非「整段替换」：本地文件里只写 `[paths] ffmpeg` 一项时，
     /// 其余路径仍取 `config.toml` 的值，不必把整段复制一遍。
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-
         let full_path = Self::resolve_path(path.as_ref().to_str().unwrap_or("config.toml"));
         let mut cfg = if full_path.exists() {
             let content = std::fs::read_to_string(&full_path)
@@ -869,8 +923,21 @@ impl AppConfig {
             };
         }
 
-        strip_required!(ffmpeg, whisper_cli, whisper_model, llama_cli, llm_model, python);
-        strip_optional!(vad_model, punc_model, sensevoice_model, sensevoice_tokens, sensevoice_vad);
+        strip_required!(
+            ffmpeg,
+            whisper_cli,
+            whisper_model,
+            llama_cli,
+            llm_model,
+            python
+        );
+        strip_optional!(
+            vad_model,
+            punc_model,
+            sensevoice_model,
+            sensevoice_tokens,
+            sensevoice_vad
+        );
 
         (shared, local)
     }
@@ -899,8 +966,7 @@ impl AppConfig {
                 paths: Some(local_paths),
                 gpu: None,
             };
-            let text =
-                toml::to_string_pretty(&local).with_context(|| "序列化本机配置覆盖失败")?;
+            let text = toml::to_string_pretty(&local).with_context(|| "序列化本机配置覆盖失败")?;
             let body = format!(
                 "# 本机专属配置（由程序自动维护，不进版本库）\n\
                  #\n\
@@ -921,8 +987,7 @@ impl AppConfig {
 
         let mut on_disk = self.clone();
         on_disk.paths = shared_paths;
-        let content =
-            toml::to_string_pretty(&on_disk).with_context(|| "序列化配置为 TOML 失败")?;
+        let content = toml::to_string_pretty(&on_disk).with_context(|| "序列化配置为 TOML 失败")?;
         // 与本机覆盖同理：内容没变就不重复落盘。UI 上每敲一个键都会走到
         // 这里（见 `commit_api_field`），而在 API Key / 模型名里输入时共享配置并不改变——
         // 没必要每个字符都做一次写盘 + rename。
@@ -951,67 +1016,44 @@ impl AppConfig {
         Ok(())
     }
 
-    /// 获取应用真实的根目录（优先查找当前目录、exe所在目录、或exe上上级目录）
+    /// 获取应用真实的根目录（多级回退）。
+    ///
+    /// # 为什么不能只看当前工作目录
+    ///
+    /// cwd 是**启动器**决定的，不是应用决定的：从开始菜单/桌面快捷方式、任务栏
+    /// 固定项、`runas` 提权、或被别的程序（编辑器、脚本宿主）拉起时，cwd 会变成
+    /// `C:\Windows\System32` 或用户主目录。此时 `cwd/models` 不存在，
+    /// `resolve_path("models/...")` 全部落空，用户看到的是「引擎未就绪」——
+    /// 绿色版解压到 D 盘、或将来做安装版（P0-4）时必然踩到。
+    ///
+    /// # 回退链（优先级从高到低）
+    ///
+    /// 1. 环境变量 [`Self::HOME_ENV`]（`VOICE2WORD_HOME`）：显式覆盖，便携版/测试用；
+    /// 2. 编译期清单目录 `CARGO_MANIFEST_DIR`：**仅 debug 构建**。`cargo test` 的 exe
+    ///    落在 `target/debug/deps/` 下，从那里向上找不到项目根，所以这一级必须排在
+    ///    exe 目录**之前**；release 构建里该路径是开发机的、对用户无意义，用
+    ///    `cfg!(debug_assertions)` 关掉（避免把开发机路径烧进发布包）；
+    /// 3. exe 所在目录及其祖先：发布版**最可靠**的锚点——安装目录 / 绿色版解压目录
+    ///    就在 exe 旁边，与 cwd、快捷方式怎么起都无关；
+    /// 4. 当前工作目录及其祖先：保留旧逻辑，向后兼容「cd 到仓库根再跑」的用法。
+    ///
+    /// 每级判据只有一个：目录下存在 `models/`（见 [`pick_app_root`]）。全都不命中时
+    /// 返回旧逻辑的结果（`current_dir()`），**不 panic**，让调用方按既有方式退化。
     pub fn app_root_dir() -> PathBuf {
-        // 1. 如果当前工作目录包含 models 目录，直接返回当前目录
-        let cur = std::env::current_dir().unwrap_or_default();
-        if cur.join("models").is_dir() {
-            return cur;
-        }
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let env_home = std::env::var_os(Self::HOME_ENV).map(PathBuf::from);
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
+        // 仅 debug 构建启用：清单目录必然产自本仓库，是「从任意 cwd 跑 dev 版」的锚点。
+        #[cfg(debug_assertions)]
+        let manifest_dir = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        #[cfg(not(debug_assertions))]
+        let manifest_dir: Option<PathBuf> = None;
 
-        // 2. 如果是通过 exe 启动，优先判断是否在 target/debug 或 target/release 下
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                // 如果是在 target/debug 或 target/release 下，向上寻找项目根目录
-                let dir_name = exe_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if dir_name.eq_ignore_ascii_case("debug")
-                    || dir_name.eq_ignore_ascii_case("release")
-                {
-                    if let Some(target_dir) = exe_dir.parent() {
-                        if target_dir.file_name().and_then(|s| s.to_str()) == Some("target") {
-                            if let Some(root) = target_dir.parent() {
-                                if root.join("models").is_dir() {
-                                    return root.to_path_buf();
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 如果 exe 所在目录本身就包含 models
-                if exe_dir.join("models").is_dir() {
-                    return exe_dir.to_path_buf();
-                }
-
-                // 向上逐级寻找包含 models 的祖先目录
-                let mut p = exe_dir.to_path_buf();
-                for _ in 0..5 {
-                    if p.join("models").is_dir() {
-                        return p;
-                    }
-                    if let Some(parent) = p.parent() {
-                        p = parent.to_path_buf();
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // 3. 兜底逐级向上查找包含 models 的目录
-        let mut p = cur.clone();
-        for _ in 0..5 {
-            if p.join("models").is_dir() {
-                return p;
-            }
-            if let Some(parent) = p.parent() {
-                p = parent.to_path_buf();
-            } else {
-                break;
-            }
-        }
-
-        cur
+        let candidates =
+            root_candidates(env_home, manifest_dir.as_deref(), exe_dir.as_deref(), &cwd);
+        pick_app_root(candidates).unwrap_or(cwd)
     }
 
     /// 解析相对路径为相对于项目根目录的绝对路径
@@ -1038,6 +1080,59 @@ impl AppConfig {
     }
 }
 
+/// 向上查找的最大层数（含起点自身）。与旧实现保持一致，避免「深几层就找不到」。
+const ROOT_SEARCH_DEPTH: usize = 5;
+
+/// 一个目录是否是「项目根」：判据只有一个——下面存在 `models/`。
+fn is_app_root(dir: &Path) -> bool {
+    dir.join("models").is_dir()
+}
+
+/// 从候选目录里挑第一个「项目根」；一个都不命中返回 `None`。
+///
+/// 抽成纯函数是为了**可测**：测试用临时目录构造候选即可，完全不必去改进程级的
+/// cwd / 环境变量——那两样是全局状态，并行跑测试时会互相踩踏（见 `mod tests`）。
+fn pick_app_root(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|dir| is_app_root(dir))
+}
+
+/// `base` 起（含自身）向上最多 `depth` 级的目录序列。
+fn ancestors_within(base: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(depth + 1);
+    let mut current = Some(base.to_path_buf());
+    for _ in 0..=depth {
+        let Some(dir) = current.take() else { break };
+        current = dir.parent().map(Path::to_path_buf);
+        out.push(dir);
+    }
+    out
+}
+
+/// 按优先级拼出项目根候选序列：环境变量 > 清单目录（仅 debug，由调用处传入）>
+/// exe 所在目录及其祖先 > 当前工作目录及其祖先。
+///
+/// 顺序即优先级：排在前面的一旦命中就**不再看后面**，因此「exe 旁边有 models/」
+/// 永远胜过「cwd 恰好也有一个 models/」——前者才是用户真正安装/解压的位置。
+fn root_candidates(
+    env_home: Option<PathBuf>,
+    manifest_dir: Option<&Path>,
+    exe_dir: Option<&Path>,
+    cwd: &Path,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = env_home {
+        out.push(home);
+    }
+    if let Some(dir) = manifest_dir {
+        out.push(dir.to_path_buf());
+    }
+    if let Some(dir) = exe_dir {
+        out.extend(ancestors_within(dir, ROOT_SEARCH_DEPTH));
+    }
+    out.extend(ancestors_within(cwd, ROOT_SEARCH_DEPTH));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{TranslateConfig, UiConfig};
@@ -1051,7 +1146,10 @@ mod tests {
         };
         let toggled = ui.toggled();
         assert!(toggled.is_light(), "默认深色切换后应为浅色");
-        assert_eq!(toggled.export_mode, "translation", "切主题不应重置导出内容偏好");
+        assert_eq!(
+            toggled.export_mode, "translation",
+            "切主题不应重置导出内容偏好"
+        );
         // 再切一次回深色，导出内容仍保留
         assert_eq!(toggled.toggled().export_mode, "translation");
     }
@@ -1071,11 +1169,11 @@ mod tests {
                 "# 这是注释",
                 "Transformer=变换器",
                 "  GPT -> 生成式预训练模型  ",
-                "注意力机制：注意力机制",   // 中文冒号，两侧相同也保留
+                "注意力机制：注意力机制", // 中文冒号，两侧相同也保留
                 "坏行没有分隔符",
                 "=缺左边",
                 "缺右边=",
-                "时间:12:30 开始",         // 取第一个冒号切分，译文含冒号不受影响
+                "时间:12:30 开始", // 取第一个冒号切分，译文含冒号不受影响
                 "",
             ]
             .join("\n"),
@@ -1083,9 +1181,18 @@ mod tests {
         };
         let entries = cfg.glossary_entries();
         assert_eq!(entries.len(), 4, "注释/空行/残缺行都应跳过: {entries:?}");
-        assert_eq!(entries[0], ("Transformer".to_string(), "变换器".to_string()));
-        assert_eq!(entries[1], ("GPT".to_string(), "生成式预训练模型".to_string()));
-        assert_eq!(entries[2], ("注意力机制".to_string(), "注意力机制".to_string()));
+        assert_eq!(
+            entries[0],
+            ("Transformer".to_string(), "变换器".to_string())
+        );
+        assert_eq!(
+            entries[1],
+            ("GPT".to_string(), "生成式预训练模型".to_string())
+        );
+        assert_eq!(
+            entries[2],
+            ("注意力机制".to_string(), "注意力机制".to_string())
+        );
         assert_eq!(entries[3], ("时间".to_string(), "12:30 开始".to_string()));
     }
 
@@ -1114,10 +1221,133 @@ mod tests {
         assert!(!prompt.contains("term100="), "超出上限的条目不应注入");
     }
 
+    /// 质检阈值：默认 -0.35，旧配置缺字段时反序列化必须落到同一个默认值。
+    #[test]
+    fn low_confidence_threshold_defaults_and_deserializes() {
+        let cfg = super::AppConfig::default();
+        assert_eq!(cfg.pipeline.whisper_low_confidence, -0.35);
+        // 出厂 config.toml 尚未写入该键：缺字段必须落到默认值而不是 0.0
+        let parsed: super::PipelineConfig = toml::from_str(
+            r#"
+            language = "zh"
+            output_format = "srt"
+            enable_polish = false
+            whisper_threads = 8
+            llm_threads = 8
+            llm_ctx = 4096
+            "#,
+        )
+        .expect("旧配置应能解析");
+        assert_eq!(parsed.whisper_low_confidence, -0.35);
+
+        // 显式写入的值必须被尊重（用户想要更严/更松的复核都可以）
+        let tuned: super::PipelineConfig = toml::from_str(
+            r#"
+            language = "zh"
+            output_format = "srt"
+            enable_polish = false
+            whisper_threads = 8
+            llm_threads = 8
+            llm_ctx = 4096
+            whisper_low_confidence = -0.75
+            "#,
+        )
+        .expect("带显式阈值的配置应能解析");
+        assert_eq!(tuned.whisper_low_confidence, -0.75);
+
+        // 与 segment.rs 的产品默认常量同值：接线后两处不能漂移。
+        assert_eq!(
+            cfg.pipeline.whisper_low_confidence,
+            crate::subtitle::segment::DEFAULT_LOW_CONFIDENCE_THRESHOLD
+        );
+    }
+
+    /// 术语上限：默认 80；clamp 到 [1, 1000]（0 会把整表静默丢空，故抬到 1）。
+    #[test]
+    fn max_glossary_entries_defaults_and_clamps() {
+        let cfg = TranslateConfig::default();
+        assert_eq!(
+            cfg.max_glossary_entries,
+            TranslateConfig::MAX_GLOSSARY_ENTRIES
+        );
+        assert_eq!(cfg.effective_glossary_limit(), 80);
+
+        // 缺字段的旧配置落到默认值
+        // TranslateConfig 的 mode / api_base 等是必填项（无 serde default），
+        // 这里给一份「只写必填、不含 max_glossary_entries」的旧配置。
+        let parsed: TranslateConfig = toml::from_str(
+            r#"
+            mode = "offline_qwen"
+            api_base = "https://api.deepseek.com/v1"
+            api_key = ""
+            api_model = "deepseek-chat"
+            batch_size = 20
+            timeout_secs = 120
+            glossary = ""
+            "#,
+        )
+        .expect("旧配置应能解析");
+        assert_eq!(parsed.max_glossary_entries, 80);
+
+        let with = |n: usize| TranslateConfig {
+            max_glossary_entries: n,
+            ..TranslateConfig::default()
+        };
+        assert_eq!(
+            with(0).effective_glossary_limit(),
+            1,
+            "0 会丢空整表，抬到 1"
+        );
+        assert_eq!(with(1).effective_glossary_limit(), 1);
+        assert_eq!(with(300).effective_glossary_limit(), 300);
+        assert_eq!(with(1000).effective_glossary_limit(), 1000);
+        assert_eq!(with(5000).effective_glossary_limit(), 1000, "上界夹到 1000");
+        assert_eq!(with(usize::MAX).effective_glossary_limit(), 1000);
+    }
+
+    /// `glossary_prompt()` 必须按**实例**上限截断，而不是永远用默认常量。
+    #[test]
+    fn glossary_prompt_respects_instance_limit() {
+        let entries = (0..120)
+            .map(|i| format!("term{i}=术语{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 未超上限：全部注入
+        let small = TranslateConfig {
+            glossary: entries.clone(),
+            max_glossary_entries: 200,
+            ..TranslateConfig::default()
+        };
+        let prompt = small.glossary_prompt();
+        assert!(prompt.contains("term119=术语119"), "200 条上限下应全部注入");
+
+        // 超过上限：只取前 N 条
+        let capped = TranslateConfig {
+            glossary: entries.clone(),
+            max_glossary_entries: 50,
+            ..TranslateConfig::default()
+        };
+        let prompt = capped.glossary_prompt();
+        assert!(prompt.contains("term49=术语49"));
+        assert!(!prompt.contains("term50="), "第 51 条起不应注入");
+        assert!(!prompt.contains("term119="));
+
+        // 放宽到 120 后，原先被截断的条目重新进入提示词
+        let widened = TranslateConfig {
+            max_glossary_entries: 120,
+            ..capped
+        };
+        assert!(widened.glossary_prompt().contains("term119=术语119"));
+    }
+
     #[test]
     fn chat_completions_url_tolerates_trailing_slash_and_full_path() {
-        let mut cfg = TranslateConfig::default();
-        cfg.api_base = "https://api.deepseek.com/v1".to_string();
+        // 一次构造：clippy::field_reassign_with_default 会拦「先 default 再改字段」
+        let mut cfg = TranslateConfig {
+            api_base: "https://api.deepseek.com/v1".to_string(),
+            ..TranslateConfig::default()
+        };
         assert_eq!(
             cfg.chat_completions_url(),
             "https://api.deepseek.com/v1/chat/completions"
@@ -1238,7 +1468,8 @@ mod tests {
         let mut cfg = super::AppConfig::default();
         // 三个必填项各来一个绝对路径 + 一个相对路径
         cfg.paths.ffmpeg = r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe".to_string();
-        cfg.paths.llama_cli = r"A:\cppsoft\llama.cpp\build\bin\Release\llama-completion.exe".to_string();
+        cfg.paths.llama_cli =
+            r"A:\cppsoft\llama.cpp\build\bin\Release\llama-completion.exe".to_string();
         cfg.paths.whisper_cli = "tools/whisper-vulkan/whisper.exe".to_string();
         // Option 项同样要有覆盖
         cfg.paths.punc_model = Some(r"D:\models\punc\model.int8.onnx".to_string());
@@ -1258,7 +1489,10 @@ mod tests {
         );
 
         // 机器路径原样记录在本地覆盖里
-        assert_eq!(local.ffmpeg.as_deref(), Some(r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe"));
+        assert_eq!(
+            local.ffmpeg.as_deref(),
+            Some(r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe")
+        );
         assert_eq!(
             local.punc_model.as_deref(),
             Some(r"D:\models\punc\model.int8.onnx")
@@ -1334,7 +1568,10 @@ mod tests {
         // 读回来：机器路径复原，共享调参也保留
         let back = super::AppConfig::load_from_file(&main_path).expect("load");
         assert_eq!(back.paths.ffmpeg, r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe");
-        assert_eq!(back.paths.llama_cli, r"A:\cppsoft\llama.cpp\llama-completion.exe");
+        assert_eq!(
+            back.paths.llama_cli,
+            r"A:\cppsoft\llama.cpp\llama-completion.exe"
+        );
         assert_eq!(back.pipeline.whisper_threads, 12);
         assert_eq!(back.ui.theme, "light");
 
@@ -1352,12 +1589,18 @@ mod tests {
 
         let cfg = super::AppConfig::default();
         cfg.save_to_file(&main_path).expect("first save");
-        let mtime1 = std::fs::metadata(&main_path).expect("meta").modified().expect("mtime");
+        let mtime1 = std::fs::metadata(&main_path)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
 
         // 确保时间戳可区分（一些文件系统粒度较粗）
         std::thread::sleep(std::time::Duration::from_millis(20));
         cfg.save_to_file(&main_path).expect("second save");
-        let mtime2 = std::fs::metadata(&main_path).expect("meta").modified().expect("mtime");
+        let mtime2 = std::fs::metadata(&main_path)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
 
         assert_eq!(mtime1, mtime2, "内容未变时不应重写文件");
 
@@ -1399,5 +1642,221 @@ mod tests {
             "#,
         );
         assert!(parsed.is_err(), "拼错的键名应被拒绝");
+    }
+
+    // ─────────── 项目根定位：多级回退（app_root_dir）───────────
+    //
+    // 这些测试**刻意不改进程级的 cwd / 环境变量**：`set_var` / `set_current_dir`
+    // 是全局状态，`cargo test` 默认多线程并行，改了会与同进程内的其它测试互相
+    // 踩踏，制造出偶发失败。回退链本身被抽成了纯函数（`root_candidates` +
+    // `pick_app_root`），用临时目录构造候选即可覆盖全部分支；直接读进程状态的
+    // 只有最后两条，且它们不修改任何东西。
+
+    /// 造一个「像项目根」的临时目录：下面挂一个空的 `models/`。
+    fn fake_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("v2w_root_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("models")).expect("mkdir models");
+        dir
+    }
+
+    /// 不像项目根的普通目录（没有 models/）。
+    fn plain_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("v2w_plain_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn idx(candidates: &[std::path::PathBuf], needle: &std::path::Path) -> usize {
+        candidates
+            .iter()
+            .position(|c| c == needle)
+            .unwrap_or_else(|| panic!("候选里应含 {}: {candidates:?}", needle.display()))
+    }
+
+    /// 候选顺序即优先级：环境变量 > 清单目录 > exe 目录及祖先 > cwd 及祖先。
+    #[test]
+    fn root_candidates_order_is_env_manifest_exe_cwd() {
+        let repo = fake_root("order_repo");
+        let env = fake_root("order_env");
+        let exe_dir = repo.join("target").join("debug");
+        let cwd = plain_dir("order_cwd");
+
+        let candidates = super::root_candidates(
+            Some(env.clone()),
+            Some(repo.as_path()),
+            Some(exe_dir.as_path()),
+            &cwd,
+        );
+
+        assert_eq!(candidates[0], env, "环境变量必须排在第一位");
+        assert_eq!(candidates[1], repo, "清单目录紧随其后（仅 debug 传入）");
+        // exe 目录自身 + 祖先都在候选里，且整段排在 cwd 段之前
+        assert!(idx(&candidates, &exe_dir) < idx(&candidates, &cwd));
+        assert!(idx(&candidates, &repo.join("target")) < idx(&candidates, &cwd));
+        // cwd 是最后一段的起点：其后还剩 depth 个祖先
+        assert_eq!(
+            idx(&candidates, &cwd),
+            candidates.len() - super::ROOT_SEARCH_DEPTH - 1
+        );
+
+        for d in [&env, &repo, &cwd] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// 只有一个候选含 `models/` 时必然选中它——顺序无关。
+    #[test]
+    fn pick_app_root_finds_the_only_candidate_with_models() {
+        let root = fake_root("pick_hit");
+        let a = plain_dir("pick_a");
+        let b = plain_dir("pick_b");
+
+        let picked = super::pick_app_root(vec![a.clone(), root.clone(), b.clone()]);
+        assert_eq!(picked.as_deref(), Some(root.as_path()));
+
+        for d in [&root, &a, &b] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// 一个候选都不含 `models/` 时返回 `None`——由调用方退回到旧逻辑，不 panic。
+    #[test]
+    fn pick_app_root_returns_none_when_nothing_matches() {
+        let a = plain_dir("pick_none_a");
+        let b = plain_dir("pick_none_b");
+        assert!(super::pick_app_root(vec![a.clone(), b.clone()]).is_none());
+        for d in [&a, &b] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// **发布阻断的回归测试**：从「开始菜单/桌面快捷方式」启动时 cwd 是
+    /// `C:/Windows/System32`，exe 在 `target/debug` 下。此时必须仍然解析到项目根，
+    /// 而不是被无关的 cwd 带偏。
+    #[test]
+    fn shortcut_launch_with_unrelated_cwd_still_resolves_project_root() {
+        let repo = fake_root("shortcut_repo");
+        let exe_dir = repo.join("target").join("debug");
+        std::fs::create_dir_all(&exe_dir).expect("mkdir exe dir");
+        // 快捷方式的 cwd：与项目毫无关系
+        let system32 = std::path::PathBuf::from("C:/Windows/System32");
+
+        let candidates = super::root_candidates(
+            None, // 没有设 VOICE2WORD_HOME
+            None, // 这里是「发布版语义」：清单目录不可用
+            Some(exe_dir.as_path()),
+            &system32,
+        );
+        assert_eq!(
+            super::pick_app_root(candidates).as_deref(),
+            Some(repo.as_path()),
+            "exe 在 target/debug 时应向上找到项目根"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// 绿色版/安装版：exe 与 `models/` 同级，cwd 无关紧要。
+    #[test]
+    fn portable_exe_next_to_models_wins_over_cwd() {
+        let install = fake_root("portable_install");
+        let cwd = plain_dir("portable_cwd");
+
+        let candidates = super::root_candidates(None, None, Some(install.as_path()), &cwd);
+        assert_eq!(
+            super::pick_app_root(candidates).as_deref(),
+            Some(install.as_path())
+        );
+
+        let _ = std::fs::remove_dir_all(&install);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// 环境变量覆盖优先级最高：便携版把数据目录指到别处时应立即生效。
+    #[test]
+    fn env_override_beats_exe_and_cwd() {
+        let portable = fake_root("env_portable");
+        let exe_root = fake_root("env_exe_root");
+        let cwd = plain_dir("env_cwd");
+
+        let candidates =
+            super::root_candidates(Some(portable.clone()), None, Some(exe_root.as_path()), &cwd);
+        assert_eq!(
+            super::pick_app_root(candidates).as_deref(),
+            Some(portable.as_path()),
+            "VOICE2WORD_HOME 必须胜过 exe 旁边 / cwd"
+        );
+
+        for d in [&portable, &exe_root, &cwd] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// 环境变量指向的目录**不存在 models/** 时，不能挡住后面的 exe 回退。
+    #[test]
+    fn bogus_env_override_does_not_block_exe_fallback() {
+        let bogus = plain_dir("env_bogus");
+        let exe_root = fake_root("env_bogus_exe");
+
+        let candidates =
+            super::root_candidates(Some(bogus.clone()), None, Some(exe_root.as_path()), &bogus);
+        assert_eq!(
+            super::pick_app_root(candidates).as_deref(),
+            Some(exe_root.as_path())
+        );
+
+        for d in [&bogus, &exe_root] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// 全都不命中时的兜底：返回 `current_dir()`，且**绝不 panic**。
+    #[test]
+    fn app_root_dir_never_panics() {
+        let dir = super::AppConfig::app_root_dir();
+        assert!(dir.is_absolute(), "app_root_dir 应返回绝对路径: {dir:?}");
+    }
+
+    /// `resolve_path` 走的是同一条回退链：项目根下的相对路径必须被拼成绝对路径。
+    #[test]
+    fn resolve_path_joins_relative_paths_onto_app_root() {
+        let resolved = super::AppConfig::resolve_path("models/whisper/ggml-small-q5_0.bin");
+        assert!(resolved.is_absolute(), "相对路径应被展开为绝对路径");
+        assert!(
+            resolved.ends_with("models/whisper/ggml-small-q5_0.bin")
+                || resolved.ends_with(r"models\whisper\ggml-small-q5_0.bin"),
+            "展开结果应保留相对尾部: {}",
+            resolved.display()
+        );
+        // 绝对路径原样返回
+        let abs = super::AppConfig::resolve_path("C:/somewhere/x.bin");
+        assert_eq!(abs, std::path::PathBuf::from("C:/somewhere/x.bin"));
+    }
+
+    /// 直接读进程状态的一致性检查：**当前**这次 `cargo test` 里，`app_root_dir()`
+    /// 必须解析到项目根（即 `CARGO_MANIFEST_DIR`），与 cwd 无关。
+    ///
+    /// 这条覆盖的正是 exe 落在 `target/debug/deps/` 的测试进程：清单目录这一级
+    /// （`cfg!(debug_assertions)`）与 exe 祖先这两级都能命中，谁也不依赖 cwd。
+    #[test]
+    fn app_root_dir_resolves_to_manifest_dir_under_cargo_test() {
+        if std::env::var_os(super::AppConfig::HOME_ENV).is_some() {
+            eprintln!("跳过：本机设了 VOICE2WORD_HOME，覆盖了默认回退链");
+            return;
+        }
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        if !manifest.join("models").is_dir() {
+            eprintln!("跳过：仓库根没有 models/，无法断言项目根=清单目录");
+            return;
+        }
+        assert_eq!(
+            super::AppConfig::app_root_dir(),
+            manifest,
+            "cargo test 下 app_root_dir() 必须解析到项目根"
+        );
+        // 同理，项目根的 config.toml 必须能命中（这就是启动时 load_from_file 走的路）
+        assert!(super::AppConfig::resolve_path("config.toml").is_file());
     }
 }

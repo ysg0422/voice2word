@@ -23,6 +23,14 @@
 //! 采样哈希理论上可能对「大小相同、首尾 256 KB 相同、仅中间不同」的两个文件
 //! 误判为同一份。对教学视频/录音这类真实素材几乎不可能发生，且**误判的代价
 //! 只是缓存命中（用户可手动重转）**，远小于全量哈希的性能代价。
+//!
+//! # 读取失败为什么整份放弃
+//!
+//! 文件被外部程序**截断**（重新导出同名视频的常见形态）时，读取量会小于采样窗口。
+//! 这种情况下继续算出的指纹是「部分内容」的哈希，与完整文件的指纹不同，却又是
+//! **确定**的：只要该文件停在那个截断状态，它每次都会命中同一条（错误的）缓存。
+//! 因此这里在读到 EOF 时返回 `None`（「指纹未知」），调用方退回按路径命中——
+//! 宁可少一次跨路径命中，也不能给出一个建立在半截文件上的稳定指纹。
 
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
@@ -47,6 +55,8 @@ pub fn media_fingerprint<P: AsRef<Path>>(path: P) -> Option<String> {
     if head_len > 0 {
         let mut buf = vec![0u8; head_len as usize];
         if file.read_exact(&mut buf).is_err() {
+            // 读不满窗口 = 文件在 metadata 之后被截断/换掉：返回「指纹未知」，
+            // 绝不能拿半截内容算出一个看似确定的指纹（见模块文档）。
             return None;
         }
         hasher.update(&buf);
@@ -124,5 +134,20 @@ mod tests {
         let p = std::env::temp_dir().join("v2w_fp_definitely_missing_zzz.bin");
         let _ = std::fs::remove_file(&p);
         assert!(media_fingerprint(&p).is_none());
+    }
+
+    /// 边界：空文件与「恰好一个采样窗口」的文件都必须能算出指纹（不能因为
+    /// 窗口边界算错而返回 None，那会让小文件永远无法跨路径命中）。
+    #[test]
+    fn boundary_sizes_produce_fingerprints() {
+        let empty = write_temp("empty.bin", b"");
+        assert!(media_fingerprint(&empty).is_some(), "空文件也应有指纹");
+        let _ = std::fs::remove_file(&empty);
+
+        // 恰好 SAMPLE_BYTES：不该走「尾部再读一遍」的分支（那会重复喂同一段数据）
+        let exact = write_temp("exact.bin", &vec![5u8; SAMPLE_BYTES as usize]);
+        let fp = media_fingerprint(&exact).expect("恰好一个窗口应有指纹");
+        assert_eq!(fp.len(), 64);
+        let _ = std::fs::remove_file(&exact);
     }
 }

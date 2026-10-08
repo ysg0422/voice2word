@@ -223,12 +223,12 @@ mod tests {
         b[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualAddress
         b[sec + 16..sec + 20].copy_from_slice(&0x200u32.to_le_bytes()); // SizeOfRawData
         b[sec + 20..sec + 24].copy_from_slice(&0x400u32.to_le_bytes()); // PointerToRawData
-        // 导入描述符（RVA 0x1000 → 文件 0x400）
+                                                                        // 导入描述符（RVA 0x1000 → 文件 0x400）
         let d0 = 0x400;
         b[d0..d0 + 4].copy_from_slice(&0x1030u32.to_le_bytes()); // OriginalFirstThunk
         b[d0 + 12..d0 + 16].copy_from_slice(&0x1020u32.to_le_bytes()); // Name RVA
         b[d0 + 16..d0 + 20].copy_from_slice(&0x1040u32.to_le_bytes()); // FirstThunk
-        // 名字字符串（RVA 0x1020 → 文件 0x420）
+                                                                       // 名字字符串（RVA 0x1020 → 文件 0x420）
         b[0x420..0x429].copy_from_slice(b"test.dll\0");
         b
     }
@@ -266,7 +266,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // 1) api-ms-win-* 永远视为可解析
         let e1 = dir.join("a.exe");
-        std::fs::write(&e1, synthetic_pe_importing("api-ms-win-core-synch-l1-1-0.dll")).unwrap();
+        std::fs::write(
+            &e1,
+            synthetic_pe_importing("api-ms-win-core-synch-l1-1-0.dll"),
+        )
+        .unwrap();
         assert!(missing_imports(&e1).is_empty());
         // 2) 同目录存在该 DLL → 可解析
         let e2 = dir.join("b.exe");
@@ -292,6 +296,33 @@ mod tests {
         let mut pe = synthetic_pe();
         pe.truncate(0x80);
         assert_eq!(imported_dll_names(&pe), None);
+    }
+
+    /// 穷举截断点：合法的 PE 在任何位置被截断都只能返回 `None`，绝不能 panic。
+    /// 解析端所有的索引读取都必须走有界检查——这条测试就是那道防线的回归网。
+    #[test]
+    fn truncation_at_every_offset_never_panics() {
+        let pe = synthetic_pe();
+        for cut in 0..pe.len() {
+            let _ = imported_dll_names(&pe[..cut]);
+        }
+    }
+
+    /// 字节翻转：随机破坏头部关键字段（e_lfanew / 节数 / 数据目录偏移等）
+    /// 也不能 panic，只能返回 `None` 或一个（可能不完整的）列表。
+    #[test]
+    fn corrupted_header_fields_never_panic() {
+        let base = synthetic_pe();
+        // 这些位置分别覆盖 e_lfanew、COFF 节数/可选头大小、可选头魔数、数据目录项
+        for off in [0x3c, 0x3d, 0x46, 0x54, 0x58, 0x60, 0xc8, 0xcc, 0xd0] {
+            for val in [0x00u8, 0x01, 0x7f, 0x80, 0xff] {
+                let mut pe = base.clone();
+                if off < pe.len() {
+                    pe[off] = val;
+                    let _ = imported_dll_names(&pe);
+                }
+            }
+        }
     }
 
     /// 真实系统文件冒烟：解析 `cmd.exe` 应能列出它导入的系统 DLL。

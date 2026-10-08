@@ -5,7 +5,7 @@
 //! - 文件签名使同路径被覆盖为新视频后旧帧自动失效；
 //! - 哈希采用跨进程稳定的 FNV-1a，保证重启后磁盘帧文件仍可命中复用。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,6 +28,11 @@ const PRUNE_EVERY: usize = 32;
 ///
 /// 只删 `.jpg`，其它文件一概不动；任何一步失败都静默跳过——磁盘裁剪只是
 /// 缓存维护，不该影响抽帧结果。
+///
+/// **只删真正的帧文件**：抽帧的中间产物形如 `<key>.<pid>-<seq>.part.jpg`，
+/// 但 `Path::extension()` 对它是 `"jpg"`。若把它一起算进候选并按「最旧」删掉，
+/// 就可能在另一个线程刚写完、正要做 rename 时被本函数删除，导致该次抽帧
+/// 白跑一趟（rename 失败）。因此这里显式排除 `.part.jpg` 中间名。
 fn prune_disk_dir(dir: &Path, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -39,6 +44,9 @@ fn prune_disk_dir(dir: &Path, keep: usize) {
             if path.extension().and_then(|s| s.to_str()) != Some("jpg") {
                 return None;
             }
+            if is_partial_frame_name(&e.file_name().to_string_lossy()) {
+                return None;
+            }
             let modified = e.metadata().and_then(|m| m.modified()).ok()?;
             Some((modified, path))
         })
@@ -48,10 +56,15 @@ fn prune_disk_dir(dir: &Path, keep: usize) {
         return;
     }
     // 新的排在前面，跳过最近 keep 个后剩下的都是最旧的
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
     for (_, path) in files.into_iter().skip(keep) {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// 是否是抽帧中间产物（`<key>.<pid>-<seq>.part.jpg`）。
+fn is_partial_frame_name(name: &str) -> bool {
+    name.ends_with(".part.jpg")
 }
 
 pub struct FrameCache {
@@ -163,14 +176,39 @@ impl FrameCache {
 
         // 检查磁盘是否已存在抽取过的帧，存在则直接复用
         if out_jpg.exists() {
-            self.cache.lock().unwrap().insert(key.clone(), out_jpg.clone(), self.max_size);
+            self.cache
+                .lock()
+                .unwrap()
+                .insert(key.clone(), out_jpg.clone(), self.max_size);
             return Ok(out_jpg);
         }
 
-        ffmpeg.extract_frame(video_path, time_sec, &out_jpg)?;
+        // 抽帧先落到**本进程独占**的临时文件，成功后 rename 到最终名。
+        //
+        // 为什么不能直接 `extract_frame(..., &out_jpg)`：`ffmpeg` 是流式写盘的，
+        // 中途失败/被取消会在最终名上留下**半截 JPG**。那个文件一旦存在，
+        // 「磁盘已存在则复用」的分支下次就会把它当成可用帧返回，界面显示一张
+        // 损坏图，且此后每次拖动时间轴都稳定复现。rename 在同目录内是原子的，
+        // 因此最终名要么不存在，要么是一张完整可用的 JPG。
+        let tmp_jpg = temp_dir.join(format!("{}.{}-{}.part.jpg", key, std::process::id(), {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        }));
+        if let Err(err) = ffmpeg.extract_frame(video_path, time_sec, &tmp_jpg) {
+            let _ = std::fs::remove_file(&tmp_jpg);
+            return Err(err);
+        }
+        if let Err(err) = std::fs::rename(&tmp_jpg, &out_jpg) {
+            let _ = std::fs::remove_file(&tmp_jpg);
+            return Err(err).with_context(|| format!("转存抽帧结果失败: {}", out_jpg.display()));
+        }
 
         // 限制缓存大小，FIFO 淘汰
-        self.cache.lock().unwrap().insert(key, out_jpg.clone(), self.max_size);
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(key, out_jpg.clone(), self.max_size);
         // 磁盘目录也要有上限，否则长期使用后 v2w_frames 会只增不减
         self.note_disk_write(&temp_dir);
 
@@ -265,6 +303,39 @@ mod tests {
         assert_eq!(jpgs.len(), 2, "只应保留最近 2 个 jpg: {jpgs:?}");
         assert!(jpgs.contains(&"f4.jpg".to_string()), "最新的一帧必须留下");
         assert!(dir.join("keep_me.txt").exists(), "非 jpg 文件不该被删");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 抽帧中间产物（`.part.jpg`）绝不能进裁剪候选：它可能在另一个线程
+    /// 刚写完、正要做 rename，被删掉就白跑一趟。
+    #[test]
+    fn prune_disk_dir_never_deletes_in_flight_partials() {
+        let dir = std::env::temp_dir().join(format!("v2w_prune_part_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 先放 3 个「旧」正式帧
+        for i in 0..3 {
+            std::fs::write(dir.join(format!("f{i}.jpg")), b"x").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        // 再放一个中间产物（比正式帧更新，但即便更旧也不能被删）
+        std::fs::write(dir.join("abc.123-0.part.jpg"), b"partial").unwrap();
+
+        prune_disk_dir(&dir, 1);
+
+        assert!(
+            dir.join("abc.123-0.part.jpg").exists(),
+            "进行中的中间产物不能被裁剪删除"
+        );
+        let formal = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".jpg") && !n.ends_with(".part.jpg"))
+            .count();
+        assert_eq!(formal, 1, "正式帧应只保留最近 1 个");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -115,7 +115,6 @@ mod job {
         let _ = job_handle();
     }
 
-
     /// 按 PID 把进程并入全局 Job（spawn 成功后调用）。
     pub fn assign_pid(pid: u32) {
         let Some(job) = job_handle() else { return };
@@ -250,7 +249,11 @@ mod tests {
         // 等它自行退出，再登记一个新进程：register 内部应先回收掉旧条目
         std::thread::sleep(Duration::from_millis(800));
         register(spawn_short_lived());
-        assert_eq!(count(), 1, "已退出的子进程必须在下次登记时被回收，不能越堆越多");
+        assert_eq!(
+            count(),
+            1,
+            "已退出的子进程必须在下次登记时被回收，不能越堆越多"
+        );
         retire_all();
         assert_eq!(count(), 0);
     }

@@ -50,12 +50,20 @@ pub struct TempPathGuard {
 impl TempPathGuard {
     /// 守卫一个临时**文件**：`Drop` 时 `remove_file`。
     pub fn file<P: Into<PathBuf>>(path: P) -> Self {
-        Self { path: path.into(), kind: Kind::File, armed: true }
+        Self {
+            path: path.into(),
+            kind: Kind::File,
+            armed: true,
+        }
     }
 
     /// 守卫一个临时**目录**：`Drop` 时 `remove_dir_all`（递归删掉里面所有切片）。
     pub fn dir<P: Into<PathBuf>>(path: P) -> Self {
-        Self { path: path.into(), kind: Kind::Dir, armed: true }
+        Self {
+            path: path.into(),
+            kind: Kind::Dir,
+            armed: true,
+        }
     }
 
     /// 查看被守卫的路径（守卫仍持有清理责任）。
@@ -123,7 +131,12 @@ mod tests {
     /// 每个测试用独立文件名，避免并行执行时互相踩。
     fn scratch(tag: &str) -> PathBuf {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("v2w_guard_test_{}_{}_{}", std::process::id(), tag, n))
+        std::env::temp_dir().join(format!(
+            "v2w_guard_test_{}_{}_{}",
+            std::process::id(),
+            tag,
+            n
+        ))
     }
 
     fn make_file(tag: &str) -> PathBuf {

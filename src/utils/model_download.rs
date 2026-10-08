@@ -303,7 +303,7 @@ pub const ITEMS: &[DownloadItem] = &[
     DownloadItem {
         id: "ffmpeg",
         label: "FFmpeg",
-        note: "音视频解码与抽音，**必需**组件",
+        note: "音视频解码与抽音，必需组件",
         dest: "tools/ffmpeg.exe",
         urls: &[
             "https://hf-mirror.com/lj1995/VoiceConversionWebUI/resolve/main/ffmpeg.exe",
@@ -501,7 +501,10 @@ fn companion_missing(path: &Path, item: &DownloadItem, entry_len: u64) -> bool {
     if entry_len >= SELF_CONTAINED_ENTRY_FLOOR {
         return false;
     }
-    !path.parent().map(|d| d.join(companion).exists()).unwrap_or(false)
+    !path
+        .parent()
+        .map(|d| d.join(companion).exists())
+        .unwrap_or(false)
 }
 
 /// 目标文件是否像是**用户自编译的构建**（自包含单文件，或带 GPU 后端 DLL）。
@@ -645,7 +648,12 @@ fn configured_path_for(item: &DownloadItem, cfg: &Option<AppConfig>) -> Option<P
         "whisper-small" | "whisper-base" | "whisper-turbo-q5" | "whisper-turbo-q8"
     ) {
         let configured_name = raw
-            .map(|p| p.rsplit(['/', '\\']).next().unwrap_or("").to_ascii_lowercase())
+            .map(|p| {
+                p.rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+            })
             .unwrap_or_default();
         let item_name = item
             .dest
@@ -704,19 +712,21 @@ pub fn download_one(
     // GPU 支持会凭空消失且毫无提示）。让他先自行处理，或把 config 指向别处。
     if looks_like_custom_build(item, &dest) {
         bail!(
-            "{} 处已有一个**自编译的单文件构建**（入口约 {:.1} MB、同目录没有 {}）。\
+            "{} 处已有一个自编译的单文件构建（入口约 {:.1} MB、同目录没有 {}）。\
              为避免覆盖你自己的构建（例如带 Vulkan 的 whisper-cli），已中止下载。\
              若确实想换成本项目提供的包，请先手动移走该文件；\
              若只是想继续用它，则无需下载。",
             dest.display(),
-            fs::metadata(&dest).map(|m| m.len() as f64 / 1048576.0).unwrap_or(0.0),
+            fs::metadata(&dest)
+                .map(|m| m.len() as f64 / 1048576.0)
+                .unwrap_or(0.0),
             item.companion.unwrap_or("DLL")
         );
     }
     // `.part` 后缀让它天然被「是否已就位」判定排除（目标名不存在）。
     // 用共用构造函数，保证与 `sweep_stale_parts` 的命名规则一致。
-    let part = part_path_for(&dest)
-        .ok_or_else(|| anyhow!("无法为 {} 构造临时文件名", dest.display()))?;
+    let part =
+        part_path_for(&dest).ok_or_else(|| anyhow!("无法为 {} 构造临时文件名", dest.display()))?;
 
     let mut last_err: Option<anyhow::Error> = None;
     for url in item.urls {
@@ -884,8 +894,8 @@ fn fetch_to_file(
         .unwrap_or(0);
 
     let mut reader = resp.into_reader();
-    let mut file = fs::File::create(part)
-        .with_context(|| format!("创建临时文件失败: {}", part.display()))?;
+    let mut file =
+        fs::File::create(part).with_context(|| format!("创建临时文件失败: {}", part.display()))?;
 
     let mut buf = vec![0u8; 256 * 1024];
     let mut written: u64 = 0;
@@ -1135,10 +1145,7 @@ mod tests {
 
         // 只有入口文件 → 仍判为缺失（伴生文件不在）
         fs::write(&real, vec![0u8; 10]).unwrap();
-        assert!(
-            !is_present(&item),
-            "缺少伴生文件时必须判为缺失"
-        );
+        assert!(!is_present(&item), "缺少伴生文件时必须判为缺失");
 
         // 补上伴生文件 → 判为已就位
         fs::write(dir.join("tool-server.exe"), vec![0u8; 10]).unwrap();
@@ -1172,10 +1179,7 @@ mod tests {
         };
         // 入口 5 MB（> 2 MB 阈值）且没有 tool.dll → 应判为已就位
         fs::write(&real, vec![0u8; 5_000_000]).unwrap();
-        assert!(
-            is_present(&item),
-            "静态自包含构建不应因缺 DLL 被判为缺失"
-        );
+        assert!(is_present(&item), "静态自包含构建不应因缺 DLL 被判为缺失");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1349,7 +1353,11 @@ mod tests {
             companion: Some("tool-server.exe"),
         };
         let part = dir.join("tool.exe.part");
-        fs::write(&part, tiny_zip(&[("tool.exe", b"exe"), ("tool-server.exe", b"server")])).unwrap();
+        fs::write(
+            &part,
+            tiny_zip(&[("tool.exe", b"exe"), ("tool-server.exe", b"server")]),
+        )
+        .unwrap();
         let dest = dir.join("tool.exe");
 
         unpack_archive(&item, &part, &dest).unwrap();
@@ -1385,7 +1393,10 @@ mod tests {
         fs::write(&part, tiny_zip(&[("tool.exe", b"exe")])).unwrap();
         let dest = dir.join("tool.exe");
 
-        assert!(unpack_archive(&item, &part, &dest).is_err(), "缺伴生文件应报错");
+        assert!(
+            unpack_archive(&item, &part, &dest).is_err(),
+            "缺伴生文件应报错"
+        );
         assert!(part.exists(), "失败时 .part 应保留以便清理");
 
         let _ = fs::remove_dir_all(&dir);
@@ -1426,7 +1437,10 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.paths.ffmpeg = fake_ffmpeg.to_string_lossy().to_string();
 
-        let ffmpeg_item = ITEMS.iter().find(|i| i.id == "ffmpeg").expect("有 ffmpeg 条目");
+        let ffmpeg_item = ITEMS
+            .iter()
+            .find(|i| i.id == "ffmpeg")
+            .expect("有 ffmpeg 条目");
         // 默认路径下什么都没有，但配置指向的文件存在 → 必须判为已就位
         assert!(
             is_present_with(ffmpeg_item, &Some(cfg)),
@@ -1452,7 +1466,10 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.paths.llama_cli = custom.to_string_lossy().to_string();
 
-        let item = ITEMS.iter().find(|i| i.id == "llama-cpp").expect("有 llama-cpp 条目");
+        let item = ITEMS
+            .iter()
+            .find(|i| i.id == "llama-cpp")
+            .expect("有 llama-cpp 条目");
         assert!(
             is_present_with(item, &Some(cfg)),
             "配置指向自构建时，不应要求同目录必有伴生文件"

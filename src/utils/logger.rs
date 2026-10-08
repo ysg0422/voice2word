@@ -81,7 +81,7 @@ fn prune_old_logs(logs_dir: &Path, keep: usize) {
         return;
     }
     // 新的排在前面，跳过头 keep 个后剩下的都是最旧的
-    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    logs.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
     for (_, path) in logs.into_iter().skip(keep) {
         let _ = fs::remove_file(path);
     }
@@ -100,7 +100,6 @@ pub fn init_logger() -> anyhow::Result<PathBuf> {
 
     let file = OpenOptions::new()
         .create(true)
-        .write(true)
         .append(true)
         .open(&log_path)?;
 
@@ -151,11 +150,19 @@ pub fn init_logger() -> anyhow::Result<PathBuf> {
         eprintln!("{}", panic_msg);
 
         // 追加写入到当前日志与 latest.txt
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&panic_log_path) {
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&panic_log_path)
+        {
             let _ = f.write_all(panic_msg.as_bytes());
             let _ = f.flush();
         }
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&panic_latest_path) {
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&panic_latest_path)
+        {
             let _ = f.write_all(panic_msg.as_bytes());
             let _ = f.flush();
         }
@@ -184,7 +191,11 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         for i in 0..4 {
-            fs::write(dir.join(format!("voice2word_2026010{i}_000000.txt")), b"log").unwrap();
+            fs::write(
+                dir.join(format!("voice2word_2026010{i}_000000.txt")),
+                b"log",
+            )
+            .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(12));
         }
         fs::write(dir.join("latest.txt"), b"latest").unwrap();
@@ -197,9 +208,18 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(remaining.iter().filter(|n| n.starts_with("voice2word_")).count(), 2);
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|n| n.starts_with("voice2word_"))
+                .count(),
+            2
+        );
         assert!(dir.join("latest.txt").exists(), "latest.txt 不能被删");
-        assert!(dir.join("_warn_now.log").exists(), "非 voice2word_ 前缀的文件不能被删");
+        assert!(
+            dir.join("_warn_now.log").exists(),
+            "非 voice2word_ 前缀的文件不能被删"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

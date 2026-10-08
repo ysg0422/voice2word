@@ -1,7 +1,9 @@
 //! 系统与本地大模型硬件资源监控器 (CPU / 内存占用对比)
 
 use std::time::Duration;
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{
+    CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
+};
 use tokio::sync::watch;
 
 use crate::app::state::ResourceMetrics;
@@ -9,6 +11,12 @@ use crate::app::state::ResourceMetrics;
 pub struct SystemMonitor {
     system: System,
     current_pid: Option<sysinfo::Pid>,
+}
+
+impl Default for SystemMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SystemMonitor {
@@ -43,7 +51,7 @@ impl SystemMonitor {
         let mut is_model_running = false;
 
         // 查找当前正在工作的模型或多媒体子进程
-        for (_pid, process) in self.system.processes() {
+        for process in self.system.processes().values() {
             let name = process.name().to_string_lossy().to_lowercase();
             if name.contains("llama") || name.contains("whisper") || name.contains("ffmpeg") {
                 is_model_running = true;

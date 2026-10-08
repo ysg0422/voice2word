@@ -73,6 +73,11 @@ fn is_safe_name(name: &str) -> bool {
     if name.ends_with('/') || name.ends_with('\\') {
         return false;
     }
+    // NUL 截断类：`a\0.txt` 在部分下游 API 里会被截成 `a`，行为不可预期，直接拒绝。
+    if name.contains('\0') {
+        return false;
+    }
+    // `..` 出现在任何位置都拒绝（`a..b` 这种无害名也一并拒掉，换取规则简单可靠）
     if name.contains("..") {
         return false;
     }
@@ -87,6 +92,15 @@ fn is_safe_name(name: &str) -> bool {
     // 既简化实现又避免「写到子目录里」这种没被校验覆盖的情况）
     !name.contains('/') && !name.contains('\\')
 }
+
+/// 单个条目解压后的**硬上限**。中央目录声明的 `uncomp_size` 是攻击者可控的
+/// 字段，不可信；因此按「声明值留出余量」再解压，多余字节直接拒绝，
+/// 避免一个几十 KB 的 deflate 包解出几十 GB 把内存/磁盘打满。
+///
+/// 本项目最大组件（llama.cpp 全量包）解压后约 500 MB，1 GB 上限足够宽松。
+const MAX_ENTRY_UNCOMPRESSED: u64 = 1024 * 1024 * 1024;
+/// 所有条目解压后的累计上限（同一个包可能塞很多条）。
+const MAX_TOTAL_UNCOMPRESSED: u64 = 2 * 1024 * 1024 * 1024;
 
 /// 把 zip 字节解压到 `dest_dir`，返回写出的文件数。
 ///
@@ -112,6 +126,7 @@ pub fn extract_zip(bytes: &[u8], dest_dir: &Path) -> Result<usize> {
         .with_context(|| format!("创建目录失败: {}", dest_dir.display()))?;
 
     let mut written = 0usize;
+    let mut total_out: u64 = 0;
     for e in &entries {
         let name = strip
             .as_deref()
@@ -121,15 +136,55 @@ pub fn extract_zip(bytes: &[u8], dest_dir: &Path) -> Result<usize> {
             continue;
         }
         let data = read_entry_data(bytes, e)?;
-        let mut out = Vec::with_capacity(e.uncomp_size as usize);
+        // 声明值不可信，只用来给 `Vec` 预留容量（并设上限，避免预留本身就把内存打满）。
+        let per_entry_cap = entry_size_cap(e.uncomp_size)?;
+        let mut out = Vec::with_capacity((e.uncomp_size as usize).min(1 << 20));
         match e.method {
-            0 => out.extend_from_slice(data),
+            0 => {
+                // 存储法没有「压缩比」可爆炸，但声明的未压缩长度与实际字节数不一致
+                // 说明包结构已损坏：直接拒绝，避免下游按错误长度解读文件。
+                if data.len() as u64 != u64::from(e.uncomp_size) {
+                    bail!(
+                        "存储条目长度不一致: {}（声明 {} 字节，实际 {} 字节）",
+                        name,
+                        e.uncomp_size,
+                        data.len()
+                    );
+                }
+                out.extend_from_slice(data);
+            }
             8 => {
-                let mut dec = flate2::read::DeflateDecoder::new(data);
+                // 多读 1 字节：能读出第 cap+1 个字节就说明实际内容超过上限，
+                // 据此判定解压炸弹，而不是等到内存耗尽。
+                let mut dec = flate2::read::DeflateDecoder::new(data).take(per_entry_cap + 1);
                 dec.read_to_end(&mut out)
                     .with_context(|| format!("解压 deflate 条目失败: {name}"))?;
             }
             other => bail!("不支持的压缩方法 {other}: {name}"),
+        }
+        if out.len() as u64 > per_entry_cap {
+            bail!(
+                "解压后体积超出预期（条目 {} 声明 {} 字节，实际已超上限 {} 字节），\
+                 疑似损坏的压缩包或解压炸弹",
+                name,
+                e.uncomp_size,
+                per_entry_cap
+            );
+        }
+        // deflate 条目：解压长度必须与声明一致。`FlateDecoder` 在数据被截断时
+        // 会返回错误（已在上面 `?` 掉），但「声明 1 MB、实际只解出 1 字节」这种
+        // 内部不一致的包仍要拦住——落盘一个残缺的 DLL 比报错更难排查。
+        if e.method == 8 && out.len() as u64 != u64::from(e.uncomp_size) {
+            bail!(
+                "解压条目长度与声明不符: {}（声明 {} 字节，实际 {} 字节）",
+                name,
+                e.uncomp_size,
+                out.len()
+            );
+        }
+        total_out = total_out.saturating_add(out.len() as u64);
+        if total_out > MAX_TOTAL_UNCOMPRESSED {
+            bail!("解压总输出超过 {MAX_TOTAL_UNCOMPRESSED} 字节上限，已中止");
         }
 
         let target: PathBuf = dest_dir.join(name);
@@ -140,6 +195,18 @@ pub fn extract_zip(bytes: &[u8], dest_dir: &Path) -> Result<usize> {
         written += 1;
     }
     Ok(written)
+}
+
+/// 单个条目允许解压出的最大字节数：以中央目录的声明值为准，但留出余量，
+/// 并夹在全局上限内。声明值本身就是畸形（大到离谱）时直接拒绝。
+fn entry_size_cap(declared: u32) -> Result<u64> {
+    let declared = u64::from(declared);
+    if declared > MAX_ENTRY_UNCOMPRESSED {
+        bail!("条目声明的解压体积过大: {declared} 字节");
+    }
+    Ok(declared
+        .saturating_add(64 * 1024)
+        .min(MAX_ENTRY_UNCOMPRESSED))
 }
 
 /// 一个待解压的条目（已从中央目录解析出来）。
@@ -164,7 +231,11 @@ fn parse_central_directory(bytes: &[u8]) -> Result<Vec<ZipEntry>> {
     if cd_off == 0xffff_ffff || cd_size == 0xffff_ffff || total == 0xffff {
         bail!("不支持 Zip64 格式的压缩包");
     }
-    if cd_off.checked_add(cd_size).map(|end| end > bytes.len()).unwrap_or(true) {
+    if cd_off
+        .checked_add(cd_size)
+        .map(|end| end > bytes.len())
+        .unwrap_or(true)
+    {
         bail!("zip 中央目录越界（文件截断）");
     }
 
@@ -446,6 +517,91 @@ mod tests {
         assert_eq!(n, 1, "只有根下的文件应被写出");
         assert!(dir.join("root.exe").exists());
         assert!(!dir.join("sub").exists(), "不应创建子目录");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 路径穿越的各种写法都必须被 `is_safe_name` 挡住。
+    /// 这些名字一旦漏过一条，解压就会写到目标目录之外。
+    #[test]
+    fn safe_name_rejects_traversal_and_absolute_forms() {
+        // 不安全
+        for bad in [
+            "",
+            "../evil.exe",
+            "..\\evil.exe",
+            "a/../../evil.exe",
+            "sub/../../../evil.exe",
+            "/etc/passwd",
+            "\\windows\\system32\\evil.dll",
+            "C:/Windows/evil.dll",
+            "c:evil.dll",
+            "sub/inner.dll",  // 内嵌目录
+            "sub\\inner.dll", // 内嵌目录（反斜杠）
+            "dir/",           // 目录条目
+            "dir\\",          // 目录条目
+            "a\0b.dll",       // NUL 截断
+        ] {
+            assert!(!is_safe_name(bad), "应拒绝不安全条目名: {bad:?}");
+        }
+        // 安全：普通扁平文件名
+        for good in ["llama.dll", "whisper-cli.exe", "ggml-base.bin"] {
+            assert!(is_safe_name(good), "应接受普通文件名: {good:?}");
+        }
+    }
+
+    /// 目录穿越条目在真实解压流程里也必须被跳过（端到端，而不只是单测判定函数）。
+    #[test]
+    fn extract_skips_all_traversal_variants() {
+        let zip = build_stored_zip(&[
+            ("..\\evil.exe", b"x"),
+            ("C:/evil.dll", b"x"),
+            ("sub/../evil2.dll", b"x"),
+            ("ok.exe", b"y"),
+        ]);
+        let dir = tmp_dir("trav2");
+        let n = extract_zip(&zip, &dir).unwrap();
+        assert_eq!(n, 1, "只应写出 ok.exe");
+        assert!(dir.join("ok.exe").exists());
+        assert!(!dir.parent().unwrap().join("evil.exe").exists());
+        assert!(!dir.parent().unwrap().join("evil2.dll").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 解压炸弹：deflate 包声明小体积但实际解出远超声明的内容时，必须报错中止，
+    /// 而不是无上限地读进内存。
+    #[test]
+    fn rejects_decompression_bomb() {
+        // 用全零构造一个高度可压缩的大负载（4 MB），但把中央目录里的
+        // uncomp_size 谎报成 1 字节——真实解压结果会远超「声明 + 余量」。
+        let raw = vec![0u8; 4 * 1024 * 1024];
+        let mut zip = build_deflate_zip("bomb.bin", &raw);
+        // 找到中央目录条目里的 uncomp_size（+24）改成 1
+        let eocd = find_eocd(&zip).unwrap();
+        let cd_off = read_u32(&zip, eocd + 16).unwrap() as usize;
+        zip[cd_off + 24..cd_off + 28].copy_from_slice(&1u32.to_le_bytes());
+
+        let dir = tmp_dir("bomb");
+        let err = extract_zip(&zip, &dir).unwrap_err();
+        assert!(
+            err.to_string().contains("超出预期") || err.to_string().contains("不符"),
+            "应报出解压体积异常: {err}"
+        );
+        assert!(!dir.join("bomb.bin").exists(), "超限条目不应落盘");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 存储条目声明长度与实际长度不一致时必须报错，而不是按错误长度落盘。
+    #[test]
+    fn rejects_stored_entry_with_mismatched_declared_size() {
+        let mut zip = build_stored_zip(&[("a.exe", b"hello")]);
+        // 把中央目录里的 uncomp_size 从 5 改成 999
+        let eocd = find_eocd(&zip).unwrap();
+        let cd_off = read_u32(&zip, eocd + 16).unwrap() as usize;
+        zip[cd_off + 24..cd_off + 28].copy_from_slice(&999u32.to_le_bytes());
+
+        let dir = tmp_dir("mismatch");
+        let err = extract_zip(&zip, &dir).unwrap_err();
+        assert!(err.to_string().contains("长度不一致"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
