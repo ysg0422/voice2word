@@ -11,10 +11,10 @@ use crate::app::state::WhisperModelTier;
 /// 性能等级
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PerformanceLevel {
-    Low,     // 入门 / 轻量级设备 (如 <=4 核或 <=8GB 内存)
-    Medium,  // 主流配置 (如 6~8 核, 16GB 内存, 轻薄本/主流台式机)
-    High,    // 性能级配置 (如 8+ 核 16+ 线程, 16GB~32GB 内存, 或配备独立 GPU)
-    Ultra,   // 旗舰 / 工作站配置 (如 16+ 核 32+ 线程, >=32GB 内存, 高性能 GPU)
+    Low,    // 入门 / 轻量级设备 (如 <=4 核或 <=8GB 内存)
+    Medium, // 主流配置 (如 6~8 核, 16GB 内存, 轻薄本/主流台式机)
+    High,   // 性能级配置 (如 8+ 核 16+ 线程, 16GB~32GB 内存, 或配备独立 GPU)
+    Ultra,  // 旗舰 / 工作站配置 (如 16+ 核 32+ 线程, >=32GB 内存, 高性能 GPU)
 }
 
 impl PerformanceLevel {
@@ -38,10 +38,10 @@ impl PerformanceLevel {
 
     pub fn color_hex(self) -> u32 {
         match self {
-            Self::Low => 0xeab308,     // 黄色
-            Self::Medium => 0x38bdf8,  // 天蓝
-            Self::High => 0x4ade80,    // 亮绿
-            Self::Ultra => 0xa855f7,   // 紫色
+            Self::Low => 0xeab308,    // 黄色
+            Self::Medium => 0x38bdf8, // 天蓝
+            Self::High => 0x4ade80,   // 亮绿
+            Self::Ultra => 0xa855f7,  // 紫色
         }
     }
 }
@@ -49,10 +49,10 @@ impl PerformanceLevel {
 /// 用户策略
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UserStrategy {
-    Speed,      // 速度优先：追求极速转写与低延迟
+    Speed, // 速度优先：追求极速转写与低延迟
     #[default]
-    Balanced,   // 平衡模式：兼顾速度与准确率
-    Quality,    // 精度优先：追求最高识别准确率与深度语义润色
+    Balanced, // 平衡模式：兼顾速度与准确率
+    Quality, // 精度优先：追求最高识别准确率与深度语义润色
 }
 
 impl UserStrategy {
@@ -129,7 +129,9 @@ impl HardwareInfo {
             .unwrap_or_else(|| "未知 CPU".to_string());
         let cpu_frequency_mhz = cpus.first().map(|c| c.frequency()).unwrap_or(0);
         let logical_threads = cpus.len().max(1);
-        let physical_cores = system.physical_core_count().unwrap_or(logical_threads.max(1));
+        let physical_cores = system
+            .physical_core_count()
+            .unwrap_or(logical_threads.max(1));
 
         let total_memory_bytes = system.total_memory();
         let available_memory_bytes = system.available_memory();
@@ -153,7 +155,13 @@ impl HardwareInfo {
                 has_discrete_gpu = true;
             }
 
-            if is_discrete || is_integrated || !matches!(info.device_type, wgpu::DeviceType::Cpu | wgpu::DeviceType::Other) {
+            if is_discrete
+                || is_integrated
+                || !matches!(
+                    info.device_type,
+                    wgpu::DeviceType::Cpu | wgpu::DeviceType::Other
+                )
+            {
                 let backend_str = format!("{:?}", info.backend);
                 gpus.push(GpuInfo {
                     name: info.name,
@@ -201,7 +209,9 @@ impl HardwareInfo {
             .unwrap_or_else(|| "未知 CPU".to_string());
         let cpu_frequency_mhz = cpus.first().map(|c| c.frequency()).unwrap_or(0);
         let logical_threads = cpus.len().max(1);
-        let physical_cores = system.physical_core_count().unwrap_or(logical_threads.max(1));
+        let physical_cores = system
+            .physical_core_count()
+            .unwrap_or(logical_threads.max(1));
         let total_memory_bytes = system.total_memory();
         let available_memory_bytes = system.available_memory();
 
@@ -338,8 +348,20 @@ impl InferenceProfile {
         let concurrency = match level {
             PerformanceLevel::Low => 1,
             PerformanceLevel::Medium => 1,
-            PerformanceLevel::High => if strategy == UserStrategy::Speed { 2 } else { 1 },
-            PerformanceLevel::Ultra => if strategy == UserStrategy::Speed { 3 } else { 2 },
+            PerformanceLevel::High => {
+                if strategy == UserStrategy::Speed {
+                    2
+                } else {
+                    1
+                }
+            }
+            PerformanceLevel::Ultra => {
+                if strategy == UserStrategy::Speed {
+                    3
+                } else {
+                    2
+                }
+            }
         };
 
         match (level, strategy) {
@@ -353,7 +375,8 @@ impl InferenceProfile {
                 llm_threads,
                 gpu_offload: has_gpu,
                 max_concurrency: 1,
-                recommendation_reason: "入门级硬件下采用极速 Base 模型并强制开启 VAD 跳过静音段，保障流畅运行。".into(),
+                recommendation_reason:
+                    "入门级硬件下采用极速 Base 模型并强制开启 VAD 跳过静音段，保障流畅运行。".into(),
             },
             (PerformanceLevel::Low, UserStrategy::Balanced) => Self {
                 whisper_tier: WhisperModelTier::Fast,
@@ -364,7 +387,8 @@ impl InferenceProfile {
                 llm_threads,
                 gpu_offload: has_gpu,
                 max_concurrency: 1,
-                recommendation_reason: "入门配置推荐 Base 模型配合适度线程，防止 CPU 满载导致系统卡顿。".into(),
+                recommendation_reason:
+                    "入门配置推荐 Base 模型配合适度线程，防止 CPU 满载导致系统卡顿。".into(),
             },
             (PerformanceLevel::Low, UserStrategy::Quality) => Self {
                 whisper_tier: WhisperModelTier::Balanced,
@@ -388,7 +412,8 @@ impl InferenceProfile {
                 llm_threads,
                 gpu_offload: has_gpu,
                 max_concurrency: 1,
-                recommendation_reason: "主流配置结合速度策略，转写耗时可降至视频时长的 5% 以下。".into(),
+                recommendation_reason: "主流配置结合速度策略，转写耗时可降至视频时长的 5% 以下。"
+                    .into(),
             },
             (PerformanceLevel::Medium, UserStrategy::Balanced) => Self {
                 whisper_tier: WhisperModelTier::Balanced,
@@ -399,7 +424,8 @@ impl InferenceProfile {
                 llm_threads,
                 gpu_offload: has_gpu,
                 max_concurrency: 1,
-                recommendation_reason: "主流 CPU 推荐 Small 档位 + VAD 加速，兼具高识别率与适中处理速度。".into(),
+                recommendation_reason:
+                    "主流 CPU 推荐 Small 档位 + VAD 加速，兼具高识别率与适中处理速度。".into(),
             },
             (PerformanceLevel::Medium, UserStrategy::Quality) => Self {
                 whisper_tier: WhisperModelTier::Precise,
@@ -410,7 +436,8 @@ impl InferenceProfile {
                 llm_threads,
                 gpu_offload: has_gpu,
                 max_concurrency: 1,
-                recommendation_reason: "选用 Large-v3-Turbo 模型获取极高识别精度，配合多核 CPU 并行计算。".into(),
+                recommendation_reason:
+                    "选用 Large-v3-Turbo 模型获取极高识别精度，配合多核 CPU 并行计算。".into(),
             },
 
             // ── 性能级 ──
@@ -423,7 +450,8 @@ impl InferenceProfile {
                 llm_threads,
                 gpu_offload: has_gpu,
                 max_concurrency: concurrency,
-                recommendation_reason: "多核性能机速度优先：多线程驱动 Small 模型，快速交付准确字幕。".into(),
+                recommendation_reason:
+                    "多核性能机速度优先：多线程驱动 Small 模型，快速交付准确字幕。".into(),
             },
             (PerformanceLevel::High, UserStrategy::Balanced) => Self {
                 whisper_tier: WhisperModelTier::Precise,
@@ -434,7 +462,8 @@ impl InferenceProfile {
                 llm_threads,
                 gpu_offload: has_gpu,
                 max_concurrency: 1,
-                recommendation_reason: "性能级电脑推荐以 Large-v3-Turbo 为基准，提供工业级转写质量。".into(),
+                recommendation_reason:
+                    "性能级电脑推荐以 Large-v3-Turbo 为基准，提供工业级转写质量。".into(),
             },
             (PerformanceLevel::High, UserStrategy::Quality) => Self {
                 whisper_tier: WhisperModelTier::Precise,
@@ -445,7 +474,8 @@ impl InferenceProfile {
                 llm_threads,
                 gpu_offload: has_gpu,
                 max_concurrency: 1,
-                recommendation_reason: "精度极致模式：全音频精细扫描，配合深度 LLM 标点纠错。".into(),
+                recommendation_reason: "精度极致模式：全音频精细扫描，配合深度 LLM 标点纠错。"
+                    .into(),
             },
 
             // ── 旗舰级 / 工作站 ──
@@ -458,7 +488,8 @@ impl InferenceProfile {
                 llm_threads,
                 gpu_offload: true,
                 max_concurrency: concurrency,
-                recommendation_reason: "顶级算力下开启批处理并发，实现超实时极速字幕批量生成。".into(),
+                recommendation_reason: "顶级算力下开启批处理并发，实现超实时极速字幕批量生成。"
+                    .into(),
             },
             (PerformanceLevel::Ultra, UserStrategy::Balanced) => Self {
                 whisper_tier: WhisperModelTier::Precise,
@@ -469,7 +500,8 @@ impl InferenceProfile {
                 llm_threads,
                 gpu_offload: true,
                 max_concurrency: concurrency,
-                recommendation_reason: "旗舰配置以 Large-v3-Turbo 满速运行，兼具极速与最高准确度。".into(),
+                recommendation_reason: "旗舰配置以 Large-v3-Turbo 满速运行，兼具极速与最高准确度。"
+                    .into(),
             },
             (PerformanceLevel::Ultra, UserStrategy::Quality) => Self {
                 whisper_tier: WhisperModelTier::Precise,
@@ -480,7 +512,8 @@ impl InferenceProfile {
                 llm_threads,
                 gpu_offload: true,
                 max_concurrency: 1,
-                recommendation_reason: "工作站旗舰精度：多线程高精度模型深度解码，无损解析每一个微弱发音。".into(),
+                recommendation_reason:
+                    "工作站旗舰精度：多线程高精度模型深度解码，无损解析每一个微弱发音。".into(),
             },
         }
     }

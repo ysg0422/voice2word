@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use crate::core::TaskPipeline;
 use crate::engines::TranslateMode;
+use crate::engines::{HardwareProfile, ProxyManager};
 use crate::storage::{Database, TaskRecord};
 use crate::subtitle::{plan_time_edit, Segment, MIN_EDIT_DUR};
 use crate::utils::{AppConfig, FrameCache};
-use crate::engines::{HardwareProfile, ProxyManager};
 
 /// 字幕翻译目标语言可选清单（主界面翻译面板与状态栏共用同一份，避免两处漂移）
 pub const TRANSLATE_TARGET_LANGS: [&str; 8] = [
@@ -25,7 +25,11 @@ pub const TRANSLATE_TARGET_LANGS: [&str; 8] = [
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProcessStatus {
     Idle,
-    Processing { stage: String, progress: f64, detail: String },
+    Processing {
+        stage: String,
+        progress: f64,
+        detail: String,
+    },
     Completed,
     Failed(String),
 }
@@ -110,14 +114,14 @@ pub fn next_pending_index(queue: &[QueueItem]) -> Option<usize> {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResourceMetrics {
-    pub sys_cpu: f32,          // 系统总 CPU (0.0 ~ 100.0)
-    pub sys_mem_used: u64,     // 系统已用内存 (bytes)
-    pub sys_mem_total: u64,    // 系统总内存 (bytes)
+    pub sys_cpu: f32,       // 系统总 CPU (0.0 ~ 100.0)
+    pub sys_mem_used: u64,  // 系统已用内存 (bytes)
+    pub sys_mem_total: u64, // 系统总内存 (bytes)
 
-    pub proc_name: String,     // 进程标识 (如 "Qwen2.5 LLM" 或 "Voice2Word")
-    pub proc_cpu: f32,         // 进程 CPU (0.0 ~ 100.0)
-    pub proc_mem: u64,         // 进程占用内存 (bytes)
-    pub is_model_running: bool,// 是否有模型正在工作
+    pub proc_name: String,      // 进程标识 (如 "Qwen2.5 LLM" 或 "Voice2Word")
+    pub proc_cpu: f32,          // 进程 CPU (0.0 ~ 100.0)
+    pub proc_mem: u64,          // 进程占用内存 (bytes)
+    pub is_model_running: bool, // 是否有模型正在工作
 }
 
 impl ResourceMetrics {
@@ -135,29 +139,29 @@ impl ResourceMetrics {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceTab {
-    Editor,       // 剪辑校对工作台 (主界面，默认)
-    Generate,     // 智能转写生成 (轻量化无卡顿进度)
-    Library,      // 历史解析视频库 (视频资产库)
-    Performance,  // 性能与推理设置 (硬件检测、性能评估、AI 推理决策)
+    Editor,      // 剪辑校对工作台 (主界面，默认)
+    Generate,    // 智能转写生成 (轻量化无卡顿进度)
+    Library,     // 历史解析视频库 (视频资产库)
+    Performance, // 性能与推理设置 (硬件检测、性能评估、AI 推理决策)
 }
 
 /// 模型档位：控制 Whisper 模型大小与量化精度，平衡速度与抗口音能力
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WhisperModelTier {
-    SenseVoice,  // 阿里 SenseVoice 极速 — model.int8.onnx (非自回归单次出字，极致提速 5~8 倍)
-    Fast,        // 极速 Base — ggml-base.bin (39M 参数)
+    SenseVoice, // 阿里 SenseVoice 极速 — model.int8.onnx (非自回归单次出字，极致提速 5~8 倍)
+    Fast,       // 极速 Base — ggml-base.bin (39M 参数)
     #[default]
-    Balanced,    // 均衡 Small — ggml-small.bin (244M 参数)
-    TurboSpeed,  // 极速 Turbo — ggml-large-v3-turbo-q5_0.bin (Q5 破带宽版，提速 25%~30%)
-    Precise,     // 高精 Turbo — ggml-large-v3-turbo-q8_0.bin (Q8 旗舰版，抗口音吞音)
+    Balanced, // 均衡 Small — ggml-small.bin (244M 参数)
+    TurboSpeed, // 极速 Turbo — ggml-large-v3-turbo-q5_0.bin (Q5 破带宽版，提速 25%~30%)
+    Precise,    // 高精 Turbo — ggml-large-v3-turbo-q8_0.bin (Q8 旗舰版，抗口音吞音)
 }
 
 /// 润色模式：CT-Punc 极速标点恢复 vs Qwen 大模型深度润色
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PolishMode {
     #[default]
-    PuncFast,  // 极速标点 (CT-Punc · 仅数秒)
-    QwenDeep,  // 深度润色 (Qwen · 较慢)
+    PuncFast, // 极速标点 (CT-Punc · 仅数秒)
+    QwenDeep, // 深度润色 (Qwen · 较慢)
 }
 
 impl PolishMode {
@@ -168,7 +172,7 @@ impl PolishMode {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_label(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "qwen" | "llm" => PolishMode::QwenDeep,
             _ => PolishMode::PuncFast,
@@ -194,10 +198,10 @@ impl WhisperModelTier {
     pub fn model_filename(self) -> &'static str {
         match self {
             Self::SenseVoice => "model.int8.onnx",
-            Self::Fast       => "ggml-base.bin",
-            Self::Balanced   => "ggml-small-q5_0.bin",
+            Self::Fast => "ggml-base.bin",
+            Self::Balanced => "ggml-small-q5_0.bin",
             Self::TurboSpeed => "ggml-large-v3-turbo-q5_0.bin",
-            Self::Precise    => "ggml-large-v3-turbo-q8_0.bin",
+            Self::Precise => "ggml-large-v3-turbo-q8_0.bin",
         }
     }
 
@@ -205,7 +209,7 @@ impl WhisperModelTier {
     pub fn model_relative_path(self) -> String {
         match self {
             Self::SenseVoice => "models/sensevoice/model.int8.onnx".to_string(),
-            Self::Fast       => "models/whisper/ggml-base.bin".to_string(),
+            Self::Fast => "models/whisper/ggml-base.bin".to_string(),
             Self::Balanced => {
                 let preferred = "models/whisper/ggml-small-q5_0.bin".to_string();
                 if crate::utils::AppConfig::resolve_path(&preferred).exists() {
@@ -222,7 +226,7 @@ impl WhisperModelTier {
                     preferred
                 }
             }
-            Self::Precise    => "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string(),
+            Self::Precise => "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string(),
         }
     }
 
@@ -233,10 +237,10 @@ impl WhisperModelTier {
             // 旧值 0.4/32 来自早期预估，实际偏低 5.5 倍，会把「预计耗时」
             // 显示成 24 秒而用户要等 2 分多钟，属于误导，故按实测重标。
             Self::SenseVoice => 2.4 / 32.0,
-            Self::Fast       => 1.5 / 32.0,
-            Self::Balanced   => 3.8 / 32.0, // Small-Q5 CPU 16 线程约 2.8 分钟/32 分钟样片
+            Self::Fast => 1.5 / 32.0,
+            Self::Balanced => 3.8 / 32.0, // Small-Q5 CPU 16 线程约 2.8 分钟/32 分钟样片
             Self::TurboSpeed => 5.6 / 32.0, // Q5 降低内存带宽传输，提速约 30%
-            Self::Precise    => 8.0 / 32.0,
+            Self::Precise => 8.0 / 32.0,
         }
     }
 
@@ -348,6 +352,11 @@ pub struct EditSnapshot {
     pub current_time: f64,
     pub editing_text: String,
 }
+
+/// 「0 秒智能缓存命中」查询结果的共享槽位：(文件路径, 命中记录)。
+/// `None` 表示「查过库、确实没有缓存」。抽成别名只为给这个嵌套类型起个名字，
+/// 暴露出的形状与语义和原字段完全一致。
+pub type CachedTranscription = Arc<std::sync::Mutex<Option<(String, Option<Arc<TaskRecord>>)>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -507,7 +516,7 @@ pub struct AppState {
     ///
     /// 用 `Arc<Mutex<…>>` 而非普通字段：渲染只有 `&self` 无法回填，
     /// 而 `AppState` 本身是 `Clone` 的（`Mutex` 不实现 `Clone`）。
-    pub cached_transcription: Arc<std::sync::Mutex<Option<(String, Option<Arc<TaskRecord>>)>>>,
+    pub cached_transcription: CachedTranscription,
     /// 已就位条目的缓存快照：`is_present` 要 stat 磁盘，
     /// 每帧对全部条目路径做 stat 会拖慢渲染，因此只在启动/下载完成后刷新。
     pub model_present: std::collections::HashMap<String, bool>,
@@ -539,18 +548,21 @@ impl AppState {
         let lang = config.pipeline.language.clone();
         let fmt = config.pipeline.output_format.clone();
         let polish = config.pipeline.enable_polish;
-        let polish_mode = PolishMode::from_str(&config.pipeline.polish_mode);
-        let translate_mode = TranslateMode::from_str(&config.translate.mode);
+        let polish_mode = PolishMode::parse_label(&config.pipeline.polish_mode);
+        let translate_mode = TranslateMode::parse_mode(&config.translate.mode);
         // 线程数按本机逻辑核心数收敛：既保证与设置页滑条量程一致，
         // 也避免把小于 8 的用户设置强行抬到 8 导致滑条取值无法持久化。
         let threads = config
             .pipeline
             .whisper_threads
             .clamp(2, Self::logical_cores().max(2));
-        let whisper_model_tier = WhisperModelTier::from_model_path(&config.paths.whisper_model)
-            .unwrap_or_default();
+        let whisper_model_tier =
+            WhisperModelTier::from_model_path(&config.paths.whisper_model).unwrap_or_default();
         // 并行进程数交给管线（0 = 自动，按核数推导）
         pipeline.set_parallel_workers(config.pipeline.parallel_workers as usize);
+        // 自动导出用的字幕样式交给管线：转写收尾的落盘拿不到 config，
+        // 只能由这里在构造时把首份快照写进去（后续变更见 `save_subtitle_style`）。
+        pipeline.set_subtitle_style(config.subtitle_style.clone());
         let ffmpeg_path = AppConfig::resolve_path(&config.paths.ffmpeg);
         let proxy_manager = Arc::new(ProxyManager::new(&ffmpeg_path));
         let proxy_enabled = hardware.force_proxy;
@@ -570,11 +582,8 @@ impl AppState {
         let hardware_info = crate::core::HardwareInfo::detect_with_media_profile(&hardware);
         let performance_level = hardware_info.evaluate_performance();
         let user_strategy = crate::core::UserStrategy::Balanced;
-        let recommended_profile = crate::core::InferenceProfile::decide(
-            performance_level,
-            user_strategy,
-            &hardware_info,
-        );
+        let recommended_profile =
+            crate::core::InferenceProfile::decide(performance_level, user_strategy, &hardware_info);
 
         // 目标语言在 config 被 move 进 state 之前取出（否则借用已移动的值）
         let translate_target_lang = config.translate.target_lang.clone();
@@ -697,7 +706,8 @@ impl AppState {
         // 并行进程数回归「自动」：由引擎按本机核数推导，推荐档位不再干预这一项
         self.config.pipeline.parallel_workers = 0;
         self.pipeline.set_parallel_workers(0);
-        self.pipeline.set_llm_threads(self.config.pipeline.llm_threads);
+        self.pipeline
+            .set_llm_threads(self.config.pipeline.llm_threads);
 
         let rel_path = self.recommended_profile.whisper_tier.model_relative_path();
         if AppConfig::resolve_path(&rel_path).exists() {
@@ -719,6 +729,10 @@ impl AppState {
 
     /// 设置页 / 主界面调整字幕样式后落盘，避免重启丢失
     pub fn save_subtitle_style(&self) {
+        // 同步一份给管线：转写收尾的自动导出没有别的途径拿到样式，
+        // 而这里正是「样式刚被改过」的唯一收口（滑条 / 预设 / 预览框宽都走它）。
+        self.pipeline
+            .set_subtitle_style(self.config.subtitle_style.clone());
         let _ = self.config.save_to_file("config.toml");
     }
 
@@ -727,7 +741,14 @@ impl AppState {
     /// 存在 `config.ui.export_mode` 而不是 `subtitle` 里：`utils` 不该反过来依赖
     /// `subtitle` 的枚举，用稳定的字符串做持久化边界，映射放在这层。
     pub fn export_mode_from_config(&self) -> crate::subtitle::ExportMode {
-        match self.config.ui.export_mode.trim().to_ascii_lowercase().as_str() {
+        match self
+            .config
+            .ui
+            .export_mode
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "raw" | "raw_only" | "rawonly" => crate::subtitle::ExportMode::RawOnly,
             "translation" | "translation_only" | "translationonly" => {
                 crate::subtitle::ExportMode::TranslationOnly
@@ -850,6 +871,35 @@ impl AppState {
             .filter(|seg| seg.translation_matches(target_lang))
             .count()
     }
+
+    /// 是否正在转写（`ProcessStatus::Processing`）。
+    ///
+    /// `status` 是**全局单一**的进程态：转写进度、导出/预览失败横幅都复用它。因此任何
+    /// 与转写无关的长任务（典型是翻译）在写失败态之前，都必须先问这一句。
+    pub fn is_processing(&self) -> bool {
+        matches!(self.status, ProcessStatus::Processing { .. })
+    }
+
+    /// 翻译失败的统一收口：写翻译面板文案，**仅在没有转写在跑时**才写全局 `status`。
+    ///
+    /// # 为什么不能无条件写全局 `status`
+    ///
+    /// `status` 只有一个格子。转写通常要跑几分钟，而这段时间里用户完全可以另起一个
+    /// 翻译（翻译是纯后处理，入口只挡 `is_translating` / 空字幕表，不挡转写）。翻译失败
+    /// 若在这里无条件 `status = Failed`，用户会看到「翻译失败」横幅、而状态栏里的转写
+    /// 进度**凭空消失**——转写其实还在跑，界面却没有任何地方显示它。反过来，只在
+    /// `translate_status_msg` 里记一句又会让「剪辑台上点翻译失败」这种没有翻译面板的
+    /// 场景静默无声，所以按「有没有转写在跑」分流：没有转写才占用全局横幅。
+    pub fn note_translate_failure(&mut self, msg: String) {
+        self.translate_progress = 0.0;
+        self.translate_status_msg = msg.clone();
+        if self.is_processing() {
+            // 转写在跑：只记日志 + 翻译面板，绝不碰转写进度态
+            tracing::warn!("转写进行中，翻译失败只记录在翻译面板，不覆盖转写进度态: {msg}");
+        } else {
+            self.status = ProcessStatus::Failed(msg);
+        }
+    }
     /// 把翻译结果**按句合并**回当前字幕表，而不是整表覆盖。
     ///
     /// # 为什么不能直接 `self.segments = translated`
@@ -891,7 +941,6 @@ impl AppState {
         }
         self.bump_segments_revision();
     }
-
 
     /// 切换目标语言并落盘。目标语言是长期偏好，必须持久化，
     /// 否则重启后又跳回默认语言，用户会以为设置没生效。
@@ -954,7 +1003,9 @@ impl AppState {
         self.proxy_busy = false;
         if self.proxy_enabled {
             if let Some(src) = self.selected_file.as_ref() {
-                let h = self.proxy_manager.preview_height(src, !self.hardware.use_gpu_pipeline());
+                let h = self
+                    .proxy_manager
+                    .preview_height(src, !self.hardware.use_gpu_pipeline());
                 if let Some(existing) = self.proxy_manager.existing_proxy(src, h) {
                     self.preview_source = Some(existing);
                 }
@@ -974,10 +1025,15 @@ impl AppState {
         self.refresh_recent_tasks();
 
         if let Some(task) = deleted_task {
-            let is_current = self.selected_file.as_ref().map(|p| {
-                p == &PathBuf::from(&task.file_path)
-                    || p.to_string_lossy().replace('\\', "/") == task.file_path.replace('\\', "/")
-            }).unwrap_or(false);
+            let is_current = self
+                .selected_file
+                .as_ref()
+                .map(|p| {
+                    p == &PathBuf::from(&task.file_path)
+                        || p.to_string_lossy().replace('\\', "/")
+                            == task.file_path.replace('\\', "/")
+                })
+                .unwrap_or(false);
 
             if is_current {
                 if let Some(next_task) = self.recent_tasks.first().cloned() {
@@ -1084,7 +1140,12 @@ impl AppState {
         }
         // 未命中：查一次库并**回填**（用 Mutex 而非 `&mut self`，
         // 因为渲染路径只能拿到 `&self`）。每换一个文件只会走一次。
-        let hit = self.db.find_cached_task(&path_str).ok().flatten().map(Arc::new);
+        let hit = self
+            .db
+            .find_cached_task(&path_str)
+            .ok()
+            .flatten()
+            .map(Arc::new);
         if let Ok(mut slot) = self.cached_transcription.lock() {
             *slot = Some((path_str.to_string(), hit.clone()));
         }
@@ -1197,13 +1258,24 @@ impl AppState {
     }
 
     /// 从队列里移除一条（等待中或已完成的条目都能删）。
-    /// 删除会让后续下标整体前移，因此活动指针直接作废，不做位移修正。
+    ///
+    /// 删除会让后续下标整体前移，所以活动指针必须跟着修正。
+    ///
+    /// 唯一允许被删的「正在跑的那条」是其**尚在排队**（`batch_active` 尚未指向它）
+    /// 的条目：真正 `Running` 的项在界面上不给删（见 `render_batch_queue_panel`）。
+    /// 因此被删条目不可能恰是 `batch_active` 指向的那条，指针只需处理「前移」情形。
     pub fn remove_queue_item(&mut self, idx: usize) -> bool {
         if idx >= self.batch_queue.len() {
             return false;
         }
         self.batch_queue.remove(idx);
-        self.batch_active = None;
+        self.batch_active = match self.batch_active {
+            // 被删的正是活动项（理论上不会发生，防御性处理）：没有归属了，作废
+            Some(active) if active == idx => None,
+            // 删的是它前面的条目：整条队列前移一格，指针跟着前移
+            Some(active) if active > idx => Some(active - 1),
+            other => other,
+        };
         true
     }
 
@@ -1217,6 +1289,12 @@ impl AppState {
     }
 
     /// 结算当前正在处理的队列项（成功后 `batch_active` 归位，避免重复结算）
+    ///
+    /// 结算完必须把 `ProcessStatus` 收回 `Idle`：调用点都在「一条转写已经结束」
+    /// 之后，此刻没有任何东西在跑。批量**失败**路径若漏掉这一步，状态会一直停在
+    /// `Processing`，而续跑入口 `start_processing_for` 见到 `Processing` 会直接
+    /// return——一个坏文件就能让整批卡死在「转写中」，后面的文件永远不开跑
+    /// （队列看着在跑、进度条也不动，用户只能手动「终止批量」才出得来）。
     pub fn finish_active_queue_item(&mut self, outcome: Result<usize, String>) {
         if let Some(idx) = self.batch_active.take() {
             if let Some(item) = self.batch_queue.get_mut(idx) {
@@ -1225,6 +1303,13 @@ impl AppState {
                     Err(reason) => QueueState::Failed(reason),
                 };
             }
+        }
+        // 无论有没有结算到具体条目（用户可能把正在跑的那条从队列里删了，
+        // 于是 `batch_active` 已作废），这一条转写都结束了，状态都必须归位。
+        // 只收「还在处理中」的状态：调用点可能已经先写入了更具体的失败原因
+        // （如「未识别出任何有效字幕」），那类提示要留给用户看，不能被抹掉。
+        if matches!(self.status, ProcessStatus::Processing { .. }) {
+            self.status = ProcessStatus::Idle;
         }
     }
 
@@ -1305,7 +1390,9 @@ impl AppState {
     /// 避免选中某句时画面字幕仍显示上一句
     pub fn get_active_segment(&self) -> Option<&Segment> {
         let t = self.current_time;
-        self.segments.iter().find(|seg| t >= seg.start && t < seg.end)
+        self.segments
+            .iter()
+            .find(|seg| t >= seg.start && t < seg.end)
     }
 
     /// 选中指定索引的字幕片段
@@ -1345,16 +1432,37 @@ impl AppState {
 
     /// 保存当前选中字幕片段的修改文本（仅内存，去抖后统一落库）
     pub fn save_selected_text(&mut self) {
-        let Some(idx) = self.selected_segment_index else { return; };
+        let Some(idx) = self.selected_segment_index else {
+            return;
+        };
         let new_text = self.editing_text.trim().to_string();
         // 文本编辑是逐键触发的，若每敲一个字都压一层撤销栈，用户按一次 Ctrl+Z
         // 只会退掉一个字符，栈也会被一次输入撑满。所以同一句的连续输入合并成
         // 一层：只有「换了一句」或「中间夹了别的编辑」时才另起一层。
         self.snapshot_for_text_edit(idx);
+        // P0-2：改原文必须让**旧译文失效**。`translation_matches` 只看「译文非空 +
+        // 语言标记匹配」，而 `Segment` 里没有源文本哈希，所以只改原文不动标记时，
+        // 这条会一直算「已完成」：表格里长期并列显示「新原文 + 旧译文」，点「开始翻译」
+        // 还回一句「已全部翻译」——译文与原文已经对不上，却没有任何机制纠正。
         if let Some(seg) = self.segments.iter_mut().find(|s| s.index == idx) {
+            // 只有原文**真的变了**才动标记。本函数逐键触发，若「点进来又点出去」
+            // 这种没改字的调用也清标记，用户会莫名其妙丢掉完成状态。
+            // 用 `display_text()` 比较：界面与翻译实际取用的就是它（优先 `polished`），
+            // 与下面赋值分支的口径一致（有 `polished` 时只改 `polished`）。
+            let text_changed = seg.display_text() != new_text.as_str();
             seg.text = new_text.clone();
             if !seg.polished.is_empty() {
                 seg.polished = new_text;
+            }
+            // 方案 A（最小侵入）：只清语言标记、**保留译文文本**——用户仍能看到旧译文
+            // 作参考（界面不显示「—」），但 `translation_matches` 立刻失效，
+            // 下一次翻译会把这一句重译。没有译文（含只有空白）时不动标记：
+            // 没有「陈旧译文」可言，也就无需失效。
+            // 残留风险：`has_translation()` 仍为 true，双语导出仍会带出这条陈旧译文；
+            // 彻底解决需要给 `Segment` 加「译文是否对应当前原文」的标记或源文本哈希，
+            // 但 `src/subtitle/segment.rs` 不在本次可改清单内。
+            if text_changed && seg.has_translation() {
+                seg.translation_lang = None;
             }
         }
         // 去抖：编辑逐键触发，若每次都全量序列化全部片段写 SQLite，长视频输入时是隐形 I/O 热点。
@@ -1371,19 +1479,41 @@ impl AppState {
     ///
     /// 传入空白串视为「清除译文」，回到无译文状态（对照表显示「—」）。
     pub fn set_selected_translation(&mut self, text: &str) {
-        let Some(idx) = self.selected_segment_index else { return; };
+        let Some(idx) = self.selected_segment_index else {
+            return;
+        };
         self.snapshot_for_undo();
         let cleaned = text.trim().to_string();
+        // P0-1：用户此刻是在「当前目标语言」下手工写这条译文，这个动作表达的就是
+        // 「这条译文属于当前目标语言」，所以下面非空分支要**无条件**用当前目标语言
+        // 覆盖标记。绝不能保留旧标记——那正是本缺陷的根因：English 译文 → 切到 日本語
+        // → 手工改成日文，若标记仍是 "English"，`translation_matches("日本語")` 返回
+        // false，这句被当**待译**，下一次翻译收尾就用机翻结果覆盖掉用户手写的日文；
+        // 而全仓库没有任何 UI 写 `translation_lang`，用户没有「把这条标成日语」的入口，
+        // 界面层无法自救，只能在这里落定。
+        //
+        // 取值来源与有效性：`translate_target_lang` 构造时取自
+        // `config.translate.target_lang`（默认 "简体中文"，见
+        // `default_translate_target_lang`），唯一写入方 `set_translate_target_lang`
+        // 只接受 `TRANSLATE_TARGET_LANGS` 里的显示名，因此正常路径下必是非空显示名。
+        // 防御：真出现空串时回落到配置值；两者都空则**不动标记**——写个空标记同样
+        // 匹配不上任何语言，只会让这句反复被重译。
+        let target_lang = if self.translate_target_lang.trim().is_empty() {
+            self.config.translate.target_lang.clone()
+        } else {
+            self.translate_target_lang.clone()
+        };
         if let Some(seg) = self.segments.iter_mut().find(|s| s.index == idx) {
             if cleaned.is_empty() {
                 seg.translation = None;
                 seg.translation_lang = None;
             } else {
                 seg.translation = Some(cleaned);
-                // 保留原有目标语言标记；若原先没有（例如用户凭空补一条译文），
-                // 用当前目标语言补上，避免 `translation_matches` 判定它「未完成」。
-                if seg.translation_lang.is_none() {
-                    seg.translation_lang = Some(self.translate_target_lang.clone());
+                // 无条件覆盖标记（理由见函数开头的 P0-1 说明）。修前这里是
+                // `if seg.translation_lang.is_none()`：只补「原先没有标记」的情况，
+                // 于是「已有别的语言标记」的句子改完仍带着旧标记，下次翻译必然重译并覆盖。
+                if !target_lang.trim().is_empty() {
+                    seg.translation_lang = Some(target_lang.clone());
                 }
             }
         }
@@ -1490,7 +1620,9 @@ impl AppState {
 
     /// 撤销最近一次字幕编辑，成功返回 `true`
     pub fn undo(&mut self) -> bool {
-        let Some(snap) = self.undo_stack.pop() else { return false; };
+        let Some(snap) = self.undo_stack.pop() else {
+            return false;
+        };
         let current = self.current_snapshot();
         self.redo_stack.push(current);
         if self.redo_stack.len() > Self::MAX_UNDO_DEPTH {
@@ -1502,7 +1634,9 @@ impl AppState {
 
     /// 重做最近一次被撤销的编辑，成功返回 `true`
     pub fn redo(&mut self) -> bool {
-        let Some(snap) = self.redo_stack.pop() else { return false; };
+        let Some(snap) = self.redo_stack.pop() else {
+            return false;
+        };
         let current = self.current_snapshot();
         self.undo_stack.push(current);
         if self.undo_stack.len() > Self::MAX_UNDO_DEPTH {
@@ -1521,8 +1655,12 @@ impl AppState {
     /// 「点几下微调，字幕没了，怎么改都回不来」。所以这里统一交给
     /// [`plan_time_edit`] 规划，宁可连带动一下邻居的边界，也不留下非法区间。
     pub fn adjust_selected_times(&mut self, delta_start: f64, delta_end: f64) {
-        let Some(idx) = self.selected_segment_index else { return; };
-        let Some(pos) = self.segments.iter().position(|s| s.index == idx) else { return; };
+        let Some(idx) = self.selected_segment_index else {
+            return;
+        };
+        let Some(pos) = self.segments.iter().position(|s| s.index == idx) else {
+            return;
+        };
 
         let cur = self.segments[pos].clone();
         let prev = pos
@@ -1559,8 +1697,12 @@ impl AppState {
     /// 切分时间点按字数的比例落在原时间区间内，而不是永远取中点，
     /// 否则在长句末尾断句时后半句会被拉到明显错误的时间位置。
     pub fn split_selected_segment(&mut self, split_at: Option<usize>) {
-        let Some(idx) = self.selected_segment_index else { return; };
-        let Some(pos) = self.segments.iter().position(|s| s.index == idx) else { return; };
+        let Some(idx) = self.selected_segment_index else {
+            return;
+        };
+        let Some(pos) = self.segments.iter().position(|s| s.index == idx) else {
+            return;
+        };
         let orig = self.segments[pos].clone();
 
         let cur_text = orig.display_text().to_string();
@@ -1568,9 +1710,7 @@ impl AppState {
         if char_count <= 1 {
             return;
         }
-        let split_pos = split_at
-            .unwrap_or(char_count / 2)
-            .clamp(1, char_count - 1);
+        let split_pos = split_at.unwrap_or(char_count / 2).clamp(1, char_count - 1);
         let ratio = split_pos as f64 / char_count as f64;
         // 时间切点跟着文字比例走，但必须保证拆出来的两半都够长：时长短于
         // [`MIN_EDIT_DUR`] 且与邻句起点相近的片段会在下次载入时被 `optimize_segments`
@@ -1585,6 +1725,27 @@ impl AppState {
         let part1: String = cur_text.chars().take(split_pos).collect();
         let part2: String = cur_text.chars().skip(split_pos).collect();
 
+        // P0-3：译文必须**按同一个 ratio 切开**，左右各拿一半，绝不能整条复制给两半
+        // （修前是 `translation: orig.translation.clone()`）：复制会让双语导出出现两个
+        // cue 显示同一条完整译文（原文却已正确切开），而且本函数收尾立刻 flush 落库，
+        // 重复译文会被持久化。切分策略与自动拆分（`subtitle::segment` 里的
+        // `split_following`，目前是私有函数、无法直接复用）逐条一致：先按标点就近切、
+        // 找不到标点再按比例硬切，**绝不让后半段落空**。
+        let (trans_left, trans_right) = match orig.translation.as_deref() {
+            Some(t) if !t.trim().is_empty() => {
+                let (l, r) = split_text_by_ratio(t, ratio);
+                (Some(l), r)
+            }
+            // 没有译文（或只有空白）时两半都不带译文：不能凭空造出 `Some("")`，
+            // 那会让双语导出多出一行空白。
+            _ => (None, None),
+        };
+        let trans_lang = if trans_left.is_some() {
+            orig.translation_lang.clone()
+        } else {
+            None
+        };
+
         self.snapshot_for_undo();
         self.segments[pos].end = split_time;
         if !self.segments[pos].polished.is_empty() {
@@ -1592,15 +1753,22 @@ impl AppState {
         } else {
             self.segments[pos].text = part1;
         }
+        // 左半段也要换成切分后的译文；原样保留（修前行为）等于把整条译文复制一份。
+        self.segments[pos].translation = trans_left;
+        self.segments[pos].translation_lang = trans_lang.clone();
 
         let new_seg = Segment {
             index: orig.index + 1,
             start: split_time,
             end: orig.end,
             text: part2.clone(),
-            translation: orig.translation.clone(),
-            translation_lang: orig.translation_lang.clone(),
-            polished: if !orig.polished.is_empty() { part2 } else { String::new() },
+            translation: trans_right,
+            translation_lang: trans_lang,
+            polished: if !orig.polished.is_empty() {
+                part2
+            } else {
+                String::new()
+            },
             language: orig.language.clone(),
             confidence: orig.confidence,
             speaker: orig.speaker,
@@ -1617,12 +1785,28 @@ impl AppState {
 
     /// 将当前选中字幕与下一段字幕合并
     pub fn merge_selected_with_next(&mut self) {
-        let Some(idx) = self.selected_segment_index else { return; };
-        let Some(pos) = self.segments.iter().position(|s| s.index == idx) else { return; };
-        if pos + 1 >= self.segments.len() { return; }
+        let Some(idx) = self.selected_segment_index else {
+            return;
+        };
+        let Some(pos) = self.segments.iter().position(|s| s.index == idx) else {
+            return;
+        };
+        if pos + 1 >= self.segments.len() {
+            return;
+        }
 
         self.snapshot_for_undo();
         let next = self.segments.remove(pos + 1);
+        // P0-4：译文不能丢。`next` 被 remove 之后它的译文就没了，而原文是「拼接」的，
+        // 合并后的 cue 理应对应两段译文的拼接。修前这里完全没碰译文：首句无译文、
+        // 次句有译文时，合并后译文直接消失（双语导出少一行），且立刻落库。
+        // 必须在 `cur` 被可变借用之前把两边的译文取出来。
+        let (merged_translation, merged_translation_lang) = merge_concat_translations(
+            self.segments[pos].translation.as_deref(),
+            self.segments[pos].translation_lang.as_deref(),
+            next.translation.as_deref(),
+            next.translation_lang.as_deref(),
+        );
         let cur = &mut self.segments[pos];
         cur.end = next.end;
         let combined = format!("{}{}", cur.display_text(), next.display_text());
@@ -1631,6 +1815,8 @@ impl AppState {
         } else {
             cur.text = combined;
         }
+        cur.translation = merged_translation;
+        cur.translation_lang = merged_translation_lang;
 
         self.reindex_segments();
         self.bump_segments_revision();
@@ -1641,8 +1827,12 @@ impl AppState {
 
     /// 删除当前选中的字幕片段
     pub fn delete_selected_segment(&mut self) {
-        let Some(idx) = self.selected_segment_index else { return; };
-        let Some(pos) = self.segments.iter().position(|s| s.index == idx) else { return; };
+        let Some(idx) = self.selected_segment_index else {
+            return;
+        };
+        let Some(pos) = self.segments.iter().position(|s| s.index == idx) else {
+            return;
+        };
         self.snapshot_for_undo();
         self.segments.remove(pos);
 
@@ -1740,9 +1930,107 @@ impl AppState {
     }
 }
 
+/// 按 `ratio` 把文本切成前后两半，供手工拆分时译文跟随切点。
+///
+/// 必须与 `crate::subtitle::segment` 里自动拆分用的 `split_following` **保持同一套
+/// 策略**：优先在标点处切（切点标点归前段），找不到可用标点再按比例硬切，
+/// **绝不让后半段落空**——否则右半段会退化成「没有译文」，双语导出时整句译文
+/// 全挂在左行，右行只剩原文。两份实现分家会重新长出「同一句话自动拆和手工拆得到
+/// 不同的译文切点」这类不一致；`split_following` 目前是 `subtitle` 模块的私有函数，
+/// 无法直接复用（建议把它提升为 `pub` 供这里调用，见任务报告）。
+///
+/// 文本长度不足 2 无法切分时返回 `(原文, None)`，由调用方按「不切」处理。
+fn split_text_by_ratio(text: &str, ratio: f64) -> (String, Option<String>) {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n <= 1 {
+        return (text.to_string(), None);
+    }
+    let cut = split_index_at_ratio(text, ratio).unwrap_or_else(|| {
+        let c = (n as f64 * ratio.clamp(0.0, 1.0)).round() as usize;
+        c.clamp(1, n - 1)
+    });
+    let left: String = chars[..cut].iter().collect();
+    let right: String = chars[cut..].iter().collect();
+    (left, Some(right))
+}
+
+/// 可作为切分点的中英文标点（与 `subtitle::segment::is_split_punct` 同集合）
+fn is_split_punct(c: char) -> bool {
+    matches!(
+        c,
+        '，' | '。' | '！' | '？' | '；' | '、' | '：' | '…' | ',' | '.' | '!' | '?' | ';' | ':'
+    )
+}
+
+/// 在 `text` 中寻找最接近 `ratio` 位置的标点切点（切点标点归前段）。
+/// 与 `subtitle::segment::split_index_at_ratio` 逐条同规则：切点强制落在 25%~75%
+/// 区间、两侧各留至少 2 字符；无合理切点返回 `None`。
+fn split_index_at_ratio(text: &str, ratio: f64) -> Option<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n < 4 {
+        return None;
+    }
+    let target = (n as f64 * ratio.clamp(0.0, 1.0)) as usize;
+    let lo = ((n as f64) * 0.25) as usize;
+    let hi = ((n as f64) * 0.75).ceil() as usize;
+    let mut best: Option<(usize, i64)> = None;
+    for (i, &c) in chars.iter().enumerate() {
+        if !is_split_punct(c) {
+            continue;
+        }
+        let left_len = i + 1;
+        if left_len < 2 || n - left_len < 2 || left_len < lo || left_len > hi {
+            continue;
+        }
+        let dist = (left_len as i64 - target as i64).abs();
+        if best.is_none_or(|(_, best_dist)| dist < best_dist) {
+            best = Some((left_len, dist));
+        }
+    }
+    best.map(|(cut, _)| cut)
+}
+
+/// 「合并下句」时把首句与次句的译文拼成一条。
+///
+/// 三种组合：
+/// - 两边都没有（含只有空白）→ `(None, None)`，不造 `Some("")`；
+/// - 只有一边有 → 原样保留那一边的译文与它的语言标记；
+/// - 两边都有 → 用换行拼接（双语导出本来就是「译文在上、原文在下」，
+///   译文里多一行是自洽的，SRT/ASS 都会原样保留换行）。
+///
+/// 语言标记：两边相同 → 保留（拼接后的 cue 仍是该语言的译文）；不同 → 置 `None`。
+/// 理由：一条 cue 里混着两种目标语言的译文，任何单一标记都是谎报——留下任一边的标记，
+/// `translation_matches` 会宣称整条都已是那个语言、永远不会重译；置 `None` 则让这条
+/// 在下一次翻译里被当待译重译，同时译文文本仍在（界面不显示「—」）。
+fn merge_concat_translations(
+    cur: Option<&str>,
+    cur_lang: Option<&str>,
+    next: Option<&str>,
+    next_lang: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let cur_text = cur.filter(|t| !t.trim().is_empty());
+    let next_text = next.filter(|t| !t.trim().is_empty());
+    let cur_lang = cur_lang.filter(|l| !l.trim().is_empty());
+    let next_lang = next_lang.filter(|l| !l.trim().is_empty());
+    match (cur_text, next_text) {
+        (None, None) => (None, None),
+        (Some(t), None) => (Some(t.to_string()), cur_lang.map(str::to_string)),
+        (None, Some(t)) => (Some(t.to_string()), next_lang.map(str::to_string)),
+        (Some(a), Some(b)) => {
+            let lang = match (cur_lang, next_lang) {
+                (Some(l), Some(r)) if l == r => Some(l.to_string()),
+                _ => None,
+            };
+            (Some(format!("{a}\n{b}")), lang)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AppState, WhisperModelTier};
+    use super::{AppState, ProcessStatus, WhisperModelTier};
     use crate::subtitle::Segment;
 
     /// 构造一个最小可用、不碰显卡/磁盘/子进程的 AppState：内存 SQLite + 假路径引擎，
@@ -1802,7 +2090,10 @@ mod tests {
         let t8 = WhisperModelTier::Balanced.estimate_seconds(d, 8, false, false);
         let t16 = WhisperModelTier::Balanced.estimate_seconds(d, 16, false, false);
         assert!(t4 > t8, "4 threads ({t4}) should be slower than 8 ({t8})");
-        assert!(t8 > t16, "8 threads ({t8}) should be slower than 16 ({t16})");
+        assert!(
+            t8 > t16,
+            "8 threads ({t8}) should be slower than 16 ({t16})"
+        );
         assert_ne!(
             WhisperModelTier::format_eta(t4),
             WhisperModelTier::format_eta(t16)
@@ -1835,7 +2126,10 @@ mod tests {
             "GPU 加速比应随模型变大而增大：fast={fast:.3} balanced={balanced:.3} turbo={turbo:.3}"
         );
         // 实测核显：Turbo 的 GPU/CPU 约 0.20，留出余量取 0.28 上限。
-        assert!(turbo < 0.28, "Turbo GPU ETA 不应再被 0.28 系数高估：{turbo:.3}");
+        assert!(
+            turbo < 0.28,
+            "Turbo GPU ETA 不应再被 0.28 系数高估：{turbo:.3}"
+        );
     }
 
     /// 失败项不能被续跑逻辑自动重挑，否则一个坏文件会让整批卡在死循环里。
@@ -1879,6 +2173,90 @@ mod tests {
         assert!(!done.is_failed());
 
         assert!(QueueState::Pending.is_pending());
+    }
+
+    /// 批量续跑的关键点：`finish_active_queue_item` 必须把 `ProcessStatus` 收回 `Idle`。
+    ///
+    /// 修前失败路径只改了队列卡片，状态仍停在 `Processing`；而续跑入口
+    /// `start_processing_for` 一见 `Processing` 就 `return`——一个坏文件足以让整批
+    /// 卡死在「转写中」，后面的文件永远不开跑，用户只能手动「终止批量」才出得来。
+    #[test]
+    fn finishing_active_item_clears_processing_status() {
+        use super::{ProcessStatus, QueueItem, QueueState};
+        use std::path::PathBuf;
+
+        let mut state = test_state(Vec::new());
+        state.batch_queue = vec![QueueItem::new(PathBuf::from("a.mp4"))];
+        state.batch_active = Some(0);
+        state.batch_queue[0].state = QueueState::Running;
+        state.status = ProcessStatus::Processing {
+            stage: "转写中".to_string(),
+            progress: 0.3,
+            detail: String::new(),
+        };
+
+        state.finish_active_queue_item(Err("坏文件".to_string()));
+
+        assert!(state.batch_queue[0].state.is_failed());
+        assert!(state.batch_active.is_none());
+        assert_eq!(
+            state.status,
+            ProcessStatus::Idle,
+            "批量失败后状态必须归位，否则续跑入口会把整批卡死"
+        );
+
+        // 调用点可能已经先写入了更具体的失败原因（如「未识别出有效字幕」），
+        // 那类提示要留给用户看，不能被归位成 Idle 抹掉。
+        state.status = ProcessStatus::Failed("未识别出有效字幕".to_string());
+        state.batch_active = Some(0);
+        state.batch_queue[0].state = QueueState::Running;
+        state.finish_active_queue_item(Err("未识别出有效字幕".to_string()));
+        assert_eq!(
+            state.status,
+            ProcessStatus::Failed("未识别出有效字幕".to_string()),
+            "更具体的失败原因必须保留"
+        );
+    }
+
+    /// 从队列里删条目时，活动指针必须跟着位移：删掉正在跑那条**之前**的条目后，
+    /// 指针若不作废就会指向别人——`finish_active_queue_item` 会把完成/失败记到
+    /// 另一条卡片上，而真正在跑的那条永远停在「转写中」。
+    #[test]
+    fn removing_queue_item_keeps_active_pointer_on_the_running_item() {
+        use super::{QueueItem, QueueState};
+        use std::path::PathBuf;
+
+        let mut state = test_state(Vec::new());
+        state.batch_queue = vec![
+            QueueItem::new(PathBuf::from("a.mp4")),
+            QueueItem::new(PathBuf::from("b.mp4")),
+            QueueItem::new(PathBuf::from("c.mp4")),
+        ];
+        // b.mp4 正在跑（下标 1）
+        state.batch_active = Some(1);
+        state.batch_queue[1].state = QueueState::Running;
+
+        // 删掉它前面的 a.mp4：指针必须前移到 0，仍指向 b.mp4
+        assert!(state.remove_queue_item(0));
+        assert_eq!(state.batch_active, Some(0));
+        assert_eq!(state.batch_queue[0].name, "b.mp4");
+
+        state.finish_active_queue_item(Ok(7));
+        assert_eq!(
+            state.batch_queue[0].state,
+            QueueState::Done { segments: 7 },
+            "结算必须落在真正在跑的那条上"
+        );
+
+        // 删掉正在跑的那条：指针作废，不再指到别人头上
+        state.batch_active = Some(1);
+        assert!(state.remove_queue_item(1));
+        assert_eq!(state.batch_active, None);
+
+        // 越界删除是安全空操作，且不动指针
+        state.batch_active = Some(0);
+        assert!(!state.remove_queue_item(9));
+        assert_eq!(state.batch_active, Some(0));
     }
 
     /// 反复点「起点 +0.5」不能把当前句推过下一句：交叉区间会被
@@ -1981,7 +2359,10 @@ mod tests {
         ]);
         state.selected_segment_index = Some(1);
         state.adjust_selected_times(0.0, 0.5);
-        assert!(state.can_undo(), "前置条件：甲工程里应当攒下了一次可撤销的编辑");
+        assert!(
+            state.can_undo(),
+            "前置条件：甲工程里应当攒下了一次可撤销的编辑"
+        );
 
         let other = TaskRecord {
             id: 2,
@@ -2024,10 +2405,7 @@ mod tests {
         assert!(state.segments.is_empty());
         assert!(!state.can_undo(), "清空工作区后不应还有可撤销的步骤");
         assert!(!state.undo());
-        assert!(
-            state.segments.is_empty(),
-            "撤销把已经清空的工程片段复活了"
-        );
+        assert!(state.segments.is_empty(), "撤销把已经清空的工程片段复活了");
     }
 
     /// 手工把一句拆成前后两段时，时间切点也必须有下限：否则短的那半会落进
@@ -2047,11 +2425,19 @@ mod tests {
             "前半句内容，后半句内容在这里呢",
         )]);
         state.selected_segment_index = Some(1);
-        let before_len: usize = state.segments.iter().map(|s| s.display_text().chars().count()).sum();
+        let before_len: usize = state
+            .segments
+            .iter()
+            .map(|s| s.display_text().chars().count())
+            .sum();
         state.split_selected_segment(Some(1));
         assert_eq!(state.segments.len(), 2, "应当拆成两段");
         assert_eq!(
-            state.segments.iter().map(|s| s.display_text().chars().count()).sum::<usize>(),
+            state
+                .segments
+                .iter()
+                .map(|s| s.display_text().chars().count())
+                .sum::<usize>(),
             before_len,
             "拆分不该丢字"
         );
@@ -2066,7 +2452,11 @@ mod tests {
         // 模拟下次载入工程时的规范化：两段都必须存活
         let mut after = state.segments.clone();
         optimize_segments(&mut after);
-        assert_eq!(after.len(), 2, "拆出的片段被 optimize_segments 当鬼影删掉了");
+        assert_eq!(
+            after.len(),
+            2,
+            "拆出的片段被 optimize_segments 当鬼影删掉了"
+        );
         let joined: String = after.iter().map(|s| s.display_text().to_string()).collect();
         assert!(
             joined.contains('前') && joined.contains('后'),
@@ -2112,7 +2502,12 @@ mod tests {
     fn streaming_window_stays_bounded() {
         let mut state = test_state(Vec::new());
         for i in 1..=500 {
-            state.push_stream_segment(Segment::new(i, (i as f64) * 2.0, (i as f64) * 2.0 + 1.0, "句子"));
+            state.push_stream_segment(Segment::new(
+                i,
+                (i as f64) * 2.0,
+                (i as f64) * 2.0 + 1.0,
+                "句子",
+            ));
         }
         assert!(
             state.streaming_segments.len() <= AppState::STREAMING_WINDOW,
@@ -2414,5 +2809,425 @@ mod tests {
             Some("Second."),
             "剩余句（start 2.0）必须拿到自己的译文，而不是被重排后的 index 撞上的第一句译文"
         );
+    }
+
+    // ───────────── P0-1：手工订正译文必须表达「属于当前目标语言」─────────────
+
+    /// English 译文 → 切到 日本語 → 手工改译文，标记必须变成 日本語。
+    ///
+    /// 修前只补「原先没有标记」的情况，已有 "English" 的句子改完仍带旧标记，
+    /// 于是这句会被下一次翻译当**待译**，收尾时用机翻结果覆盖掉用户手写的日文。
+    #[test]
+    fn manual_translation_retags_to_current_target_lang() {
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "你好")]);
+        // 先按 English 译过一遍
+        state.segments[0].translation = Some("Hello".to_string());
+        state.segments[0].translation_lang = Some("English".to_string());
+        // 用户把目标语言切到 日本語（直接改字段，避免单测落盘 config.toml）
+        state.translate_target_lang = "日本語".to_string();
+
+        state.select_segment(1);
+        state.set_selected_translation("こんにちは");
+
+        assert_eq!(state.segments[0].translation.as_deref(), Some("こんにちは"));
+        assert_eq!(
+            state.segments[0].translation_lang.as_deref(),
+            Some("日本語"),
+            "手工订正发生在当前目标语言下，标记必须无条件改成当前目标语言"
+        );
+        assert!(
+            !state.segments[0].translation_matches("English"),
+            "旧语言标记必须被覆盖，否则这句会被判成「已是 English」"
+        );
+        assert!(state.segments[0].translation_matches("日本語"));
+    }
+
+    /// 核心防回归断言：手工订正后这句**不会**再被当待译，因此下一次翻译不会覆盖它。
+    ///
+    /// 这里复刻两条翻译链路共用的增量判据
+    /// （`!translate_source().trim().is_empty() && !translation_matches(target)`，
+    /// 见 `engines::llm` 与 `engines::translate`），并走一遍 `merge_translations` 收尾。
+    #[test]
+    fn manual_translation_is_not_pending_on_next_translate() {
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "你好")]);
+        state.segments[0].translation = Some("Hello".to_string());
+        state.segments[0].translation_lang = Some("English".to_string());
+        state.translate_target_lang = "日本語".to_string();
+
+        state.select_segment(1);
+        state.set_selected_translation("こんにちは");
+
+        let target = "日本語";
+        let pending: Vec<usize> = state
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                !s.translate_source().trim().is_empty() && !s.translation_matches(target)
+            })
+            .map(|(pos, _)| pos)
+            .collect();
+        assert!(
+            pending.is_empty(),
+            "手写的日文译文仍被判为待译，下一次翻译会把它覆盖掉：{pending:?}"
+        );
+        // 「已完成 N/M」同样按当前目标语言判定（UI 用它决定按钮是否可点）
+        assert_eq!(state.translated_count_for(target), 1);
+
+        // 端到端：引擎在「无待译」时原样返回快照，合并收尾不能改动用户的译文
+        let engine_snapshot = state.segments.clone();
+        state.merge_translations(engine_snapshot);
+        assert_eq!(
+            state.segments[0].translation.as_deref(),
+            Some("こんにちは"),
+            "用户手写的日文被翻译收尾覆盖了"
+        );
+        assert_eq!(
+            state.segments[0].translation_lang.as_deref(),
+            Some("日本語")
+        );
+
+        // 反向对照：若标记仍是 English（修前行为），这句必然落进 pending
+        state.segments[0].translation_lang = Some("English".to_string());
+        assert!(
+            !state.segments[0].translation_matches(target),
+            "对照：旧标记下这句应被判为待译（这正是修前的缺陷链）"
+        );
+    }
+
+    /// 空串仍表示「清除译文」：translation 与 translation_lang 双双置 None（现有行为不能破坏）。
+    #[test]
+    fn clearing_manual_translation_nulls_both_fields() {
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "你好")]);
+        state.translate_target_lang = "日本語".to_string();
+        state.select_segment(1);
+        state.set_selected_translation("こんにちは");
+        assert!(state.segments[0].has_translation());
+
+        state.set_selected_translation("   ");
+        assert!(state.segments[0].translation.is_none());
+        assert!(state.segments[0].translation_lang.is_none());
+        assert!(!state.segments[0].has_translation());
+    }
+
+    // ───────────── P0-2：改原文必须让旧译文失效 ─────────────
+
+    /// 有译文的句子改原文 → `translation_matches(原目标语言)` 变 false，译文文本仍在。
+    #[test]
+    fn editing_source_invalidates_stale_translation() {
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "旧原文")]);
+        state.segments[0].translation = Some("Old translation".to_string());
+        state.segments[0].translation_lang = Some("English".to_string());
+
+        state.select_segment(1);
+        state.editing_text = "新原文".to_string();
+        state.save_selected_text();
+
+        assert_eq!(state.segments[0].text, "新原文");
+        assert!(
+            !state.segments[0].translation_matches("English"),
+            "原文已改，旧译文不该再算「已完成」，否则下一次翻译会直接跳过这句"
+        );
+        assert_eq!(
+            state.segments[0].translation.as_deref(),
+            Some("Old translation"),
+            "只清语言标记、保留译文文本，用户仍能看到旧译文作参考"
+        );
+        // 残留风险（已知）：has_translation() 仍为 true，双语导出仍会带出这条陈旧译文。
+        assert!(state.segments[0].has_translation());
+    }
+
+    /// 原文未变（同一文本重复保存）→ 标记不动。
+    #[test]
+    fn saving_unchanged_source_keeps_translation_lang() {
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "原文没动")]);
+        state.segments[0].translation = Some("Untouched".to_string());
+        state.segments[0].translation_lang = Some("English".to_string());
+
+        state.select_segment(1);
+        // 选中时 editing_text 已被填成 display_text；再保存一次属于「没改字」
+        state.save_selected_text();
+        assert_eq!(
+            state.segments[0].translation_lang.as_deref(),
+            Some("English"),
+            "原文没变时不该清标记，否则点进来又点出去就丢掉完成状态"
+        );
+        assert!(state.segments[0].translation_matches("English"));
+    }
+
+    /// 无译文的句子改原文 → 不 panic、无副作用（不该凭空写出标记或译文）。
+    #[test]
+    fn editing_source_without_translation_is_noop() {
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "还没翻译")]);
+        state.select_segment(1);
+        state.editing_text = "改过但还没翻译".to_string();
+        state.save_selected_text();
+
+        assert_eq!(state.segments[0].text, "改过但还没翻译");
+        assert!(state.segments[0].translation.is_none());
+        assert!(state.segments[0].translation_lang.is_none());
+        assert!(!state.segments[0].has_translation());
+    }
+
+    /// 展示文本取自 `polished` 时，改 `polished` 同样要判为「原文变了」。
+    #[test]
+    fn editing_polished_source_invalidates_translation() {
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "原始识别")]);
+        state.segments[0].polished = "润色后的原文".to_string();
+        state.segments[0].translation = Some("Stale".to_string());
+        state.segments[0].translation_lang = Some("English".to_string());
+
+        state.select_segment(1);
+        assert_eq!(state.editing_text, "润色后的原文");
+        state.editing_text = "又改过的润色原文".to_string();
+        state.save_selected_text();
+
+        assert!(!state.segments[0].translation_matches("English"));
+        assert_eq!(state.segments[0].polished, "又改过的润色原文");
+    }
+
+    // ───────────── P0-3：手工拆分必须按 ratio 切开译文 ─────────────
+
+    /// 有译文的一句在中间拆分 → 左右各拿一半，两半不相同、拼起来等于原译文。
+    #[test]
+    fn manual_split_splits_translation_by_ratio() {
+        let mut state = test_state(vec![Segment::new(
+            1,
+            0.0,
+            10.0,
+            "前面这半句讲的是背景，后面这半句讲的是结论。",
+        )]);
+        let original = "The first half is background, the second half is the conclusion.";
+        state.segments[0].translation = Some(original.to_string());
+        state.segments[0].translation_lang = Some("English".to_string());
+
+        state.select_segment(1);
+        state.editing_text = state.segments[0].display_text().to_string();
+        state.split_selected_segment(None);
+
+        assert_eq!(state.segments.len(), 2, "应拆成两段");
+        let left = state.segments[0]
+            .translation
+            .clone()
+            .expect("左半段应带译文");
+        let right = state.segments[1]
+            .translation
+            .clone()
+            .expect("右半段应带译文");
+        assert_ne!(left, right, "两半译文不该是同一条（修前就是整条复制）");
+        assert_eq!(
+            format!("{left}{right}"),
+            original,
+            "两半译文拼起来应等于原译文"
+        );
+        // 两半都保留目标语言标记，否则拆完会被判「未完成」而重复请求翻译
+        assert!(state.segments[0].translation_matches("English"));
+        assert!(state.segments[1].translation_matches("English"));
+        assert!(state.segments[0].has_translation());
+        assert!(state.segments[1].has_translation());
+    }
+
+    /// 无译文的一句拆分 → 两半都无译文（不能凭空造出译文）。
+    #[test]
+    fn manual_split_without_translation_stays_none() {
+        let mut state = test_state(vec![Segment::new(
+            1,
+            0.0,
+            10.0,
+            "前面这半句讲的是背景，后面这半句讲的是结论。",
+        )]);
+        state.select_segment(1);
+        state.editing_text = state.segments[0].display_text().to_string();
+        state.split_selected_segment(None);
+
+        assert_eq!(state.segments.len(), 2);
+        for seg in &state.segments {
+            assert!(seg.translation.is_none(), "不该凭空造出译文");
+            assert!(seg.translation_lang.is_none());
+            assert!(!seg.has_translation());
+        }
+    }
+
+    /// 译文只有空白 → 拆分后两半都不带 `Some("")`（双语导出会多出一行空白）。
+    #[test]
+    fn manual_split_blank_translation_stays_none() {
+        let mut state = test_state(vec![Segment::new(
+            1,
+            0.0,
+            10.0,
+            "前面这半句讲的是背景，后面这半句讲的是结论。",
+        )]);
+        state.segments[0].translation = Some("   ".to_string());
+        state.segments[0].translation_lang = Some("English".to_string());
+        state.select_segment(1);
+        state.editing_text = state.segments[0].display_text().to_string();
+        state.split_selected_segment(None);
+
+        assert_eq!(state.segments.len(), 2);
+        for seg in &state.segments {
+            assert!(seg.translation.is_none());
+            assert!(seg.translation_lang.is_none());
+        }
+    }
+
+    // ───────────── P0-4：合并下句不能丢译文 ─────────────
+
+    /// 首句无译文、次句有译文 → 合并后保留次句译文（修前直接丢）。
+    #[test]
+    fn merge_keeps_next_translation_when_cur_has_none() {
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 2.0, "第一句"),
+            Segment::new(2, 2.0, 4.0, "第二句"),
+        ]);
+        state.segments[1].translation = Some("Second.".to_string());
+        state.segments[1].translation_lang = Some("English".to_string());
+        state.selected_segment_index = Some(1);
+
+        state.merge_selected_with_next();
+
+        assert_eq!(state.segments.len(), 1);
+        assert_eq!(
+            state.segments[0].translation.as_deref(),
+            Some("Second."),
+            "次句译文不该随被删片段一起消失"
+        );
+        assert_eq!(
+            state.segments[0].translation_lang.as_deref(),
+            Some("English")
+        );
+    }
+
+    /// 首句有译文、次句无 → 保留首句译文与标记。
+    #[test]
+    fn merge_keeps_cur_translation_when_next_has_none() {
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 2.0, "第一句"),
+            Segment::new(2, 2.0, 4.0, "第二句"),
+        ]);
+        state.segments[0].translation = Some("First.".to_string());
+        state.segments[0].translation_lang = Some("English".to_string());
+        state.selected_segment_index = Some(1);
+
+        state.merge_selected_with_next();
+
+        assert_eq!(state.segments.len(), 1);
+        assert_eq!(state.segments[0].translation.as_deref(), Some("First."));
+        assert_eq!(
+            state.segments[0].translation_lang.as_deref(),
+            Some("English")
+        );
+    }
+
+    /// 两边都有、语言相同 → 译文拼接（换行）、语言标记保留。
+    #[test]
+    fn merge_concats_translations_with_same_lang() {
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 2.0, "第一句"),
+            Segment::new(2, 2.0, 4.0, "第二句"),
+        ]);
+        state.segments[0].translation = Some("First.".to_string());
+        state.segments[0].translation_lang = Some("English".to_string());
+        state.segments[1].translation = Some("Second.".to_string());
+        state.segments[1].translation_lang = Some("English".to_string());
+        state.selected_segment_index = Some(1);
+
+        state.merge_selected_with_next();
+
+        assert_eq!(state.segments.len(), 1);
+        assert_eq!(
+            state.segments[0].translation.as_deref(),
+            Some("First.\nSecond."),
+            "两边都有译文时应拼接，而不是只留一边"
+        );
+        assert_eq!(
+            state.segments[0].translation_lang.as_deref(),
+            Some("English"),
+            "两半语言相同，拼接后仍是该语言的译文"
+        );
+    }
+
+    /// 两边都有、语言不同 → 拼接译文但**清掉语言标记**，让下一次翻译重译这条混合语言 cue。
+    #[test]
+    fn merge_drops_lang_when_languages_differ() {
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 2.0, "第一句"),
+            Segment::new(2, 2.0, 4.0, "第二句"),
+        ]);
+        state.segments[0].translation = Some("First.".to_string());
+        state.segments[0].translation_lang = Some("English".to_string());
+        state.segments[1].translation = Some("二番目。".to_string());
+        state.segments[1].translation_lang = Some("日本語".to_string());
+        state.selected_segment_index = Some(1);
+
+        state.merge_selected_with_next();
+
+        assert_eq!(state.segments.len(), 1);
+        assert_eq!(
+            state.segments[0].translation.as_deref(),
+            Some("First.\n二番目。")
+        );
+        assert!(
+            state.segments[0].translation_lang.is_none(),
+            "一条 cue 混了两种语言，任何单一标记都是谎报，应置 None 迫使重译"
+        );
+        assert!(!state.segments[0].translation_matches("English"));
+        assert!(!state.segments[0].translation_matches("日本語"));
+        // 译文文本仍在：界面不显示「—」，用户还能看到内容
+        assert!(state.segments[0].has_translation());
+    }
+
+    /// 两边都没译文 → 合并后仍无译文（不造 `Some("")`）。
+    #[test]
+    fn merge_without_translations_stays_none() {
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 2.0, "第一句"),
+            Segment::new(2, 2.0, 4.0, "第二句"),
+        ]);
+        state.selected_segment_index = Some(1);
+
+        state.merge_selected_with_next();
+
+        assert_eq!(state.segments.len(), 1);
+        assert!(state.segments[0].translation.is_none());
+        assert!(state.segments[0].translation_lang.is_none());
+        assert!(!state.segments[0].has_translation());
+    }
+    /// 转写进行中（Processing）时翻译失败**不得**覆盖全局 `status`：否则状态栏里的
+    /// 转写进度会凭空消失。失败信息只落在翻译面板自己的 `translate_status_msg`。
+    #[test]
+    fn translate_failure_does_not_clobber_processing_status() {
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "第一句")]);
+        state.status = ProcessStatus::Processing {
+            stage: "识别中".to_string(),
+            progress: 0.42,
+            detail: "whisper 正在解码".to_string(),
+        };
+        assert!(state.is_processing());
+
+        state.note_translate_failure("翻译失败：接口超时".to_string());
+
+        assert!(
+            state.is_processing(),
+            "翻译失败不能把转写进度态冲掉: {:?}",
+            state.status
+        );
+        assert_eq!(state.translate_progress, 0.0);
+        assert_eq!(state.translate_status_msg, "翻译失败：接口超时");
+    }
+
+    /// 没有转写在跑时照旧写全局 `status`（剪辑台 / 视频库这些没有翻译面板的地方，
+    /// 仍要靠跨页错误横幅把失败告诉用户）。
+    #[test]
+    fn translate_failure_sets_status_when_not_processing() {
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "第一句")]);
+        assert!(!state.is_processing());
+
+        state.note_translate_failure("翻译失败：密钥无效".to_string());
+
+        assert_eq!(
+            state.status,
+            ProcessStatus::Failed("翻译失败：密钥无效".to_string())
+        );
+        assert_eq!(state.translate_status_msg, "翻译失败：密钥无效");
     }
 }

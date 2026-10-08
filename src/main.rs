@@ -22,11 +22,17 @@ use voice2word::utils::{self, AppConfig};
 use anyhow::Result;
 use gpui::*;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{info, warn};
 
 fn main() -> Result<()> {
+    // 冷启动量化（P1-A9）：从进程入口开始打点，每完成一个阶段就记一次耗时。
+    // 只在启动路径上，之后不再有任何开销。
+    let mut startup = StartupTimer::new();
+
     // 1. 初始化双写日志系统 (同时输出至控制台与 logs/ 文本文件，并拦截记录 panic 堆栈)
     let _log_file = utils::init_logger()?;
+    startup.mark("logger_init");
 
     info!("==========================================");
     info!("Voice2Word 启动中 (Rust + GPUI Edition)...");
@@ -45,13 +51,34 @@ fn main() -> Result<()> {
     if parts > 0 {
         info!("启动清扫：已删除 {parts} 个残留的下载中间文件");
     }
+    startup.mark("startup_sweep");
 
     // 2. 加载配置文件
     let config = AppConfig::load_from_file("config.toml")?;
     info!("配置加载成功: {:?}", config);
+    startup.mark("config_load");
     // 主题必须在任何界面构建之前设定：颜色 token 在渲染时才读取全局开关
     ui::theme::Theme::set_light(config.ui.is_light());
     info!("界面主题: {}", config.ui.label());
+    // 硬件档案预热（P1-A9）：`HardwareInfo` 的 CPU/内存采集由 sysinfo 负责，
+    // 而 sysinfo 的刷新结果缓存在**进程级**静态状态里，首次调用约 850 ms
+    // （实测 16 核机器），之后同一进程内再取只要 ~1 ms。
+    //
+    // 这一步本来被压在 `AppState::with_hardware` 里、串行地卡在首帧之前。
+    // 现在把它提前到一个后台线程：下面的 wgpu 适配器枚举要花 ~2.7 s（同样实测），
+    // 两者互不共享任何锁（`HardwareProfile::detect` 走 wgpu，sysinfo 走 Win32
+    // API），完全可以在不同的核上并行。于是这 850 ms 被整段藏进 wgpu 的等待窗口，
+    // 首帧前的串行耗时直接少掉它。
+    //
+    // 结论只是「预热」：返回值丢弃，真正的判定仍在 `with_hardware` 里按真实
+    // `hardware` 档案算。预热慢于 wgpu（例如无独显、wgpu 秒回）时退化为
+    // 「什么都没省」——不会更慢，也不会改变任何语义。
+    let hardware_warm = std::thread::spawn(|| {
+        let _ = voice2word::core::HardwareInfo::detect_with_media_profile(
+            &engines::HardwareProfile::cpu_only(),
+        );
+    });
+
     let mut hardware = if !config.gpu.hwaccel_decode && !config.gpu.whisper_offload {
         engines::HardwareProfile::cpu_only()
     } else {
@@ -95,10 +122,20 @@ fn main() -> Result<()> {
         vendor = hardware.vendor.map(|v| v.label()).unwrap_or("—"),
         "媒体渲染后端已选择"
     );
+    startup.mark("hardware_detect");
 
     // 3. 打开 SQLite 数据库
-    let db = Database::open("voice2word.db")?;
-    info!("SQLite 数据库已连接");
+    //
+    // 路径必须经 `resolve_path` 锚到**项目根**，不能直接把相对名交给 SQLite：
+    // 相对路径是相对 cwd 解析的，而 cwd 由启动器决定。从开始菜单/桌面快捷方式
+    // 启动时 cwd 是 `C:\Windows\System32`，SQLite 会试图在系统目录下建库并因
+    // 无写权限而失败——`Database::open` 返回 Err，`main` 直接 `?` 退出，
+    // **用户连界面都看不到**（实测报错：`unable to open database file`）。
+    // 库仍然留在项目根（与旧行为一致），只是不再随 cwd 漂移。
+    let db_path = AppConfig::resolve_path("voice2word.db");
+    let db = Database::open(&db_path)?;
+    info!(db = %db_path.display(), "SQLite 数据库已连接");
+    startup.mark("db_open");
 
     // 3.5 外部依赖体检：把「路径配错」从「转写跑到一半才失败」提前到启动时暴露。
     //
@@ -106,7 +143,13 @@ fn main() -> Result<()> {
     // 可能来自 config.local.toml。若两者都没命中，用户看到的会是转写中途的
     // 「找不到文件」，而根因（某台机器的 SDK/工具装别处去了）很难定位。
     // 这里在启动时逐项核对并一次性打印，缺失的给出可操作的修复指引。
-    check_external_dependencies(&config);
+    // 外部依赖体检是**纯诊断**（只做文件探测 + 写日志），不参与任何决策：
+    // 引擎该用什么路径、GPU 策略怎么定，都不看它的结论。它却要在启动关键路径上
+    // 花 ~30-50ms（含 PE 导入表递归解析）。丢到后台线程，与后面的建库/引擎初始化
+    // 重叠，从「首帧之前」的时间轴上整个移走。
+    let dep_config = config.clone();
+    std::thread::spawn(move || check_external_dependencies(&dep_config));
+    startup.mark("dependency_check_deferred");
 
     // 4. 初始化底层计算引擎
     let ffmpeg = Arc::new(FFmpegEngine::new(AppConfig::resolve_path(
@@ -157,24 +200,41 @@ fn main() -> Result<()> {
 
     let sensevoice = {
         let runner = AppConfig::resolve_path("tools/sensevoice_runner.py");
-        let model = config.paths.sensevoice_model.as_ref().map(|p| AppConfig::resolve_path(p))
+        let model = config
+            .paths
+            .sensevoice_model
+            .as_ref()
+            .map(|p| AppConfig::resolve_path(p))
             .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/model.int8.onnx"));
-        let tokens = config.paths.sensevoice_tokens.as_ref().map(|p| AppConfig::resolve_path(p))
+        let tokens = config
+            .paths
+            .sensevoice_tokens
+            .as_ref()
+            .map(|p| AppConfig::resolve_path(p))
             .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/tokens.txt"));
-        let vad = config.paths.sensevoice_vad.as_ref().map(|p| AppConfig::resolve_path(p))
+        let vad = config
+            .paths
+            .sensevoice_vad
+            .as_ref()
+            .map(|p| AppConfig::resolve_path(p))
             .unwrap_or_else(|| AppConfig::resolve_path("models/sensevoice/silero_vad.onnx"));
         if runner.exists() && model.exists() && tokens.exists() && vad.exists() {
             let provider = config.gpu.resolve_onnx_provider();
-            info!("SenseVoice 极速非自回归语音识别引擎已就绪: {:?} (provider={provider})", model);
-            Some(Arc::new(engines::SenseVoiceEngine::with_python_and_provider(
-                runner,
-                model,
-                tokens,
-                vad,
-                config.pipeline.whisper_threads,
-                python_path.clone(),
-                provider,
-            )))
+            info!(
+                "SenseVoice 极速非自回归语音识别引擎已就绪: {:?} (provider={provider})",
+                model
+            );
+            Some(Arc::new(
+                engines::SenseVoiceEngine::with_python_and_provider(
+                    runner,
+                    model,
+                    tokens,
+                    vad,
+                    config.pipeline.whisper_threads,
+                    python_path.clone(),
+                    provider,
+                ),
+            ))
         } else {
             warn!(
                 "SenseVoice 引擎未就绪 (runner={}, model={}, tokens={}, vad={})",
@@ -189,33 +249,52 @@ fn main() -> Result<()> {
 
     let punc = {
         let runner = AppConfig::resolve_path("tools/punc_runner.py");
-        let model = config.paths.punc_model.as_ref().map(|p| AppConfig::resolve_path(p))
+        let model = config
+            .paths
+            .punc_model
+            .as_ref()
+            .map(|p| AppConfig::resolve_path(p))
             .unwrap_or_else(|| AppConfig::resolve_path("models/punc/model.int8.onnx"));
         if runner.exists() && model.exists() {
             let provider = config.gpu.resolve_onnx_provider();
-            info!("CT-Transformer 极速标点引擎已就绪: {:?} (provider={provider})", model);
-            Some(Arc::new(engines::PunctuationEngine::with_python_and_provider(
-                runner,
-                model,
-                4,
-                python_path.clone(),
-                provider,
-            )))
+            info!(
+                "CT-Transformer 极速标点引擎已就绪: {:?} (provider={provider})",
+                model
+            );
+            Some(Arc::new(
+                engines::PunctuationEngine::with_python_and_provider(
+                    runner,
+                    model,
+                    4,
+                    python_path.clone(),
+                    provider,
+                ),
+            ))
         } else {
-            warn!("CT-Transformer 极速标点引擎未就绪 (runner={}, model={})", runner.exists(), model.exists());
+            warn!(
+                "CT-Transformer 极速标点引擎未就绪 (runner={}, model={})",
+                runner.exists(),
+                model.exists()
+            );
             None
         }
     };
 
+    startup.mark("engine_init");
+
+    // 与预热线程汇合：此刻它早已跑完（wgpu 那 2.7 s 足够），join 不产生等待，
+    // 但保证了 `with_hardware` 里那次采集必定命中已预热的缓存。
+    let _ = hardware_warm.join();
+
     // 5. 编排流水线管线
     let pipeline = Arc::new(TaskPipeline::new(ffmpeg, whisper, sensevoice, llm, punc));
-
 
     // 6. 初始化全局应用状态
     let state = AppState::with_hardware(config, db, pipeline, hardware);
     // 退出时要对数据库做收尾维护（WAL checkpoint），但 `state` 会被 move 进
     // GPUI 的 run 闭包；`Database` 内部是 `Arc<Mutex<Connection>>`，先克隆一份句柄。
     let db_for_shutdown = state.db.clone();
+    startup.mark("app_state_init");
 
     // 7. 启动 GPUI 应用程序
     Application::new().run(move |cx: &mut App| {
@@ -234,9 +313,16 @@ fn main() -> Result<()> {
                 }),
                 ..Default::default()
             },
-            |_window, cx| cx.new(|cx| MainWindow::new(state.clone(), cx)),
+            |window, cx| {
+                let root = cx.new(|cx| MainWindow::new(state.clone(), cx));
+                // 系统级关窗（Alt+F4 / 任务栏右键 / 系统关闭按钮）也要过一遍脏数据守卫，
+                // 否则用户改完字幕直接关窗会丢掉最后一段未落库的编辑。
+                ui::install_window_close_guard(window, &root, cx);
+                root
+            },
         )
         .expect("打开主窗口失败");
+        startup.mark("first_window");
     });
 
     // 8. 退出收尾：预览用的 ffplay 进程「发起后没人 wait」，`-autoexit` 只在正常播完
@@ -250,6 +336,31 @@ fn main() -> Result<()> {
     db_for_shutdown.maintain_on_shutdown();
 
     Ok(())
+}
+
+/// 启动阶段耗时打点器：`mark()` 打印「上一阶段 → 此刻」与「进程入口 → 此刻」的
+/// 毫秒数。用来量化冷启动各阶段（P1-A9），不做任何常驻开销。
+struct StartupTimer {
+    last: Instant,
+    start: Instant,
+}
+
+impl StartupTimer {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            last: now,
+            start: now,
+        }
+    }
+
+    fn mark(&mut self, stage: &str) {
+        let now = Instant::now();
+        let stage_ms = now.duration_since(self.last).as_millis() as u64;
+        let total_ms = now.duration_since(self.start).as_millis() as u64;
+        info!(stage, stage_ms, total_ms, "启动耗时");
+        self.last = now;
+    }
 }
 
 /// 启动时核对关键外部依赖是否就位，缺失项一次性汇总打印。
@@ -321,7 +432,10 @@ fn check_external_dependencies(config: &AppConfig) {
     // 一次扫描算完两个数：分别调用会各读一遍 config.toml（判定要按配置路径找文件）
     // 复用 main 开头已加载的 config，不再读一次 TOML
     let ctx = voice2word::utils::model_download::PresenceContextRef::new(config);
-    let absent = voice2word::utils::ITEMS.iter().filter(|i| !ctx.is_present(i)).count();
+    let absent = voice2word::utils::ITEMS
+        .iter()
+        .filter(|i| !ctx.is_present(i))
+        .count();
     if absent > 0 {
         let required = voice2word::utils::ITEMS
             .iter()
@@ -351,7 +465,7 @@ fn check_external_dependencies(config: &AppConfig) {
 /// 早期版本无条件去查 MinGW 三件套。把 whisper-cli 换成**官方 MSVC 构建**后，
 /// 它根本不导入 libgcc/libstdc++，于是每次启动都误报「运行库缺失」，把用户往
 /// 错误的修复方向带。正确做法是**解析 PE 导入表**，只对「这份二进制真正需要、
-/// 却在任何搜索路径都找不到」的 DLL 报警（见 [`crate::utils::pe_imports`]）。
+/// 却在任何搜索路径都找不到」的 DLL 报警（见 [`voice2word::utils::pe_imports`]）。
 ///
 /// 这里只**报告**不阻断：缺失时在启动日志里明确点出缺哪个，并给可操作的修复指引。
 fn check_whisper_cli_runtime_deps(config: &AppConfig) {
@@ -363,16 +477,16 @@ fn check_whisper_cli_runtime_deps(config: &AppConfig) {
     // 沿同目录 DLL 递归展开导入闭包，逐个判定能否被加载器解析。
     // 官方 whisper.cpp 构建里 VCOMP140 藏在 ggml-cpu.dll 的导入表里，
     // 只看入口 exe 会漏掉它——见 utils::pe_imports::missing_imports。
-    let missing = crate::utils::pe_imports::missing_imports(&cli);
+    let missing = voice2word::utils::pe_imports::missing_imports(&cli);
     if missing.is_empty() {
         return;
     }
 
     // 按构建类型给出更贴切的修复指引：MinGW 缺的是编译器运行库，
     // MSVC 缺的是 VC++ 运行库（装一次 VC++ Redistributable 即可）。
-    let mingw = missing.iter().any(|d| {
-        d.starts_with("libgcc") || d.starts_with("libstdc++") || d.starts_with("libgomp")
-    });
+    let mingw = missing
+        .iter()
+        .any(|d| d.starts_with("libgcc") || d.starts_with("libstdc++") || d.starts_with("libgomp"));
     let hint = if mingw {
         "把缺失的 DLL 与 whisper-cli 放到同一目录，或用「性能设置 → 模型与组件」重新下载官方包"
     } else {
@@ -384,4 +498,3 @@ fn check_whisper_cli_runtime_deps(config: &AppConfig) {
         hint
     );
 }
-
