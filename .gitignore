@@ -83,3 +83,7 @@ dist/
 # Local binaries & Python caches
 *.exe
 __pycache__/
+
+# 协作者（子智能体）遗留的临时补丁脚本，绝不入库
+.t[0-9]*_*.py
+.tmp_*.py
