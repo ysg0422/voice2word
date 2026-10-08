@@ -225,15 +225,250 @@ impl TranslateConfig {
         std::env::var("VOICE2WORD_API_KEY").unwrap_or_default()
     }
 
-    /// 目标 URL：容错拼接，允许用户把基址写成带或不带尾部斜杠、甚至直接写到 /chat/completions
+    /// 目标 URL：容错拼接，允许用户把基址写成带或不带尾部斜杠、甚至直接写到
+    /// `/chat/completions`。名字保留是为了不打断既有调用点，逻辑见
+    /// [`Self::resolved_endpoint`]。
     pub fn chat_completions_url(&self) -> String {
+        self.resolved_endpoint()
+    }
+
+    /// 归一化后的 `/chat/completions` 端点。
+    ///
+    /// 下列任意一种基址写法都必须能跑通（用户实测时就是这么填的）：
+    /// - `https://host/v1`（标准写法）
+    /// - `https://host/v1/`（多一个尾斜杠）
+    /// - `https://host/v1/chat/completions`（直接抄了完整端点）
+    /// - `https://host/v1/chat/completions/`（完整端点 + 尾斜杠）
+    ///
+    /// 刻意**不**替用户补 `/v1`：各服务端的路径前缀并不统一（Ollama 用 `/v1`，
+    /// 部分自建 vLLM 直接在根），凭空补一段会把本来能用的地址改坏。基址少了
+    /// `/v1` 的情形由 404 时的 [`online_error_hint`] 明确指出，而不是猜着改。
+    pub fn resolved_endpoint(&self) -> String {
         let base = self.api_base.trim().trim_end_matches('/');
+        if base.is_empty() {
+            return String::new();
+        }
         if base.ends_with("/chat/completions") {
             base.to_string()
         } else {
             format!("{base}/chat/completions")
         }
     }
+
+    /// 归一化后的 `/models` 端点（「拉取模型列表」用）。
+    ///
+    /// 与 [`Self::resolved_endpoint`] 同一套容错：尾斜杠被吃掉；基址若已写成
+    /// 完整端点，则把结尾的 `/chat/completions` 换成 `/models`。
+    pub fn models_url(&self) -> String {
+        let base = self.api_base.trim().trim_end_matches('/');
+        if base.is_empty() {
+            return String::new();
+        }
+        if let Some(prefix) = base.strip_suffix("/chat/completions") {
+            return format!("{prefix}/models");
+        }
+        if base.ends_with("/models") {
+            return base.to_string();
+        }
+        format!("{base}/models")
+    }
+
+    /// 基址里没有 `/v1` 时的兜底候选 `{base}/v1/models`；已经带 `/v1` 时返回 `None`。
+    ///
+    /// 实测网关只认 `/v1/models`：基址填成 `http://host:3021` 会拿到 404。拉取模型
+    /// 列表时对 404 再做一次带 `/v1` 的尝试，成功后界面直接提示把基址补全，
+    /// 而不是让用户对着一个 404 猜。
+    pub fn models_url_v1_fallback(&self) -> Option<String> {
+        let base = self.api_base.trim().trim_end_matches('/');
+        if base.is_empty() || base.ends_with("/models") {
+            return None;
+        }
+        let base = base.strip_suffix("/chat/completions").unwrap_or(base);
+        if base.ends_with("/v1") || base.contains("/v1/") {
+            return None;
+        }
+        Some(format!("{base}/v1/models"))
+    }
+
+    /// 模型名输入处必须显示的说明文案。
+    ///
+    /// 用户实测踩到的坑：模型 id 少了 `cn:` 前缀，网关回 400 `model_unavailable`
+    /// （`model [deepseek4.1flash] service info not found`），而界面此前只说「HTTP 400」，
+    /// 用户不知道是模型名不对，也不知道该去 `/v1/models` 查。
+    pub const MODEL_ID_HELP: &'static str =
+        "模型 id 必须与服务端 /v1/models 返回的 id 完全一致（例如本网关需要 cn: / global: 前缀）；写错只会拿到 400 model_unavailable。";
+}
+
+/// 在线翻译 `/models` 列表里的单个模型条目。
+///
+/// 真实网关的字段是可选的（`supports_reasoning` / `only_reasoning` / `name` 都可能
+/// 缺席），因此除 `id` 外一律按缺省处理：解析代码不能因为少一个字段就整表失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    /// 服务端模型 id，**必须原样**写进 `TranslateConfig::api_model`
+    /// （本网关要求 `cn:` / `global:` 前缀，去掉前缀就是 400 model_unavailable）。
+    pub id: String,
+    /// 展示名（`name`），缺失时界面上退回 `id`
+    pub name: Option<String>,
+    /// 是否推理模型（`supports_reasoning`）：推理模型翻译前先「思考」，慢且吃预算
+    pub supports_reasoning: bool,
+    /// 是否**只能**推理（`only_reasoning`）：无法关掉思考，翻译批量不宜开大
+    pub only_reasoning: bool,
+    /// 上下文窗口（`context_length`）
+    pub context_length: Option<u64>,
+    /// 单次最大输出 token（`max_output_tokens`）
+    pub max_output_tokens: Option<u64>,
+}
+
+impl ModelInfo {
+    /// 列表里显示的一行文案：`id`（展示名与 id 不同则并列展示）。
+    ///
+    /// 两个都显示是有意的：用户要复制的是 `id`（必须一字不差），但 `name` 才是
+    /// 认得出来的东西（`Deepseek-V4.1-Flash` vs `cn:deepseek-v4.1-flash`）。
+    pub fn display_label(&self) -> String {
+        match self
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            Some(name) if name != self.id => format!("{}  ·  {}", self.id, name),
+            _ => self.id.clone(),
+        }
+    }
+
+    /// 推理模型标记；非推理模型返回 `None`（界面上不出现多余徽标）。
+    pub fn reasoning_tag(&self) -> Option<&'static str> {
+        if self.only_reasoning {
+            Some("仅推理")
+        } else if self.supports_reasoning {
+            Some("推理")
+        } else {
+            None
+        }
+    }
+}
+
+/// 解析 `/v1/models` 响应体（纯函数，便于单测）。
+///
+/// 兼容范围：
+/// - 标准形态 `{"data":[{"id":...,"name":...,"supports_reasoning":...}]}`；
+/// - 字段缺失（只认 `id`，其余按缺省）；
+/// - `data` 里混入非对象项 / `id` 为空串的项 —— 跳过而不是整表失败（写进配置
+///   只会得到一次 400）；
+/// - 响应体不是 JSON、或没有 `data` 数组 —— 返回错误，由调用方显示原文。
+pub fn parse_model_list(body: &str) -> Result<Vec<ModelInfo>> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).with_context(|| "模型列表响应不是合法 JSON")?;
+    let data = value
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| anyhow::anyhow!("模型列表响应缺少 data 数组"))?;
+    let mut out = Vec::with_capacity(data.len());
+    for item in data {
+        let Some(id) = item.get("id").and_then(|v| v.as_str()).map(str::trim) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(ToOwned::to_owned);
+        out.push(ModelInfo {
+            id: id.to_string(),
+            name,
+            supports_reasoning: item
+                .get("supports_reasoning")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            only_reasoning: item
+                .get("only_reasoning")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            context_length: item.get("context_length").and_then(|v| v.as_u64()),
+            max_output_tokens: item.get("max_output_tokens").and_then(|v| v.as_u64()),
+        });
+    }
+    Ok(out)
+}
+
+/// 从网关错误响应体里取出**可操作**的信息：`error.message`（网关原文，里面往往
+/// 嵌着上游的 `model [...] service info not found`）加上 `error.gateway_hint`。
+///
+/// 只显示「HTTP 400」是没用的：用户看不出到底是模型名错、密钥错还是账号池空了。
+/// `error` 直接是字符串（部分网关这么写）时原样返回。
+pub fn gateway_error_summary(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let err = value.get("error")?;
+    if let Some(s) = err.as_str() {
+        let s = s.trim();
+        return if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        };
+    }
+    let message = err
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let hint = err
+        .get("gateway_hint")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (message, hint) {
+        (Some(m), Some(h)) => Some(format!("{m}（网关提示：{h}）")),
+        (Some(m), None) => Some(m.to_string()),
+        (None, Some(h)) => Some(format!("网关提示：{h}")),
+        (None, None) => None,
+    }
+}
+
+/// 把在线接口的错误文案翻成**下一步该做什么**；没有额外可说的返回 `None`。
+///
+/// 覆盖实测踩到的坑：
+/// - `model_unavailable` / `service info not found`：模型 id 不对（本网关必须带
+///   `cn:` / `global:` 前缀），引导用户用「拉取模型列表」选；
+/// - `no_healthy_account`：网关账号池空了，不是本地配置问题；
+/// - 401/403 与 `invalid_api_key`：密钥问题（含环境变量回退）；
+/// - 404：基址少了 `/v1` 之类的前缀。
+pub fn online_error_hint(msg: &str) -> Option<String> {
+    let lower = msg.to_ascii_lowercase();
+    let has = |needle: &str| lower.contains(&needle.to_ascii_lowercase());
+    if has("model_unavailable") || has("service info not found") || has("no such model") {
+        return Some(
+            "模型 id 不存在：请点「拉取模型列表」，从服务端返回的 id 里选一个（本网关必须带 cn: / global: 前缀，且要与服务端 id 完全一致）。"
+                .to_string(),
+        );
+    }
+    if has("no_healthy_account") || has("no healthy account") {
+        return Some(
+            "网关账号池暂无可用账号（no_healthy_account）：这是服务端状态，稍后重试或换个模型即可。"
+                .to_string(),
+        );
+    }
+    if has("invalid_api_key") || has("http 401") || has("http 403") || has("unauthorized") {
+        return Some(
+            "API Key 无效或无权限：检查「API Key」输入框，或设置环境变量 VOICE2WORD_API_KEY。"
+                .to_string(),
+        );
+    }
+    if has("http 404") || has("404 page not found") {
+        return Some(
+            "接口地址不存在：基址通常要带 /v1（例如 http://host:port/v1），末尾不要多加路径。"
+                .to_string(),
+        );
+    }
+    if has("http 429") || has("rate limit") {
+        return Some("触发限流：把「每批条数」调小或稍后重试。".to_string());
+    }
+    None
 }
 
 /// 字幕全局样式与排版配置。
@@ -1829,8 +2064,6 @@ mod tests {
         }
     }
 
-    /// 全都不命中时的兜底：返回 `current_dir()`，且**绝不 panic**。
-    #[test]
     /// 瘦包场景：exe 旁边**没有** `models/` 时，必须锚到 exe 目录，
     /// 而不是退回 `current_dir()`（快捷方式启动时那是 System32，会写坏数据）。
     ///
@@ -1869,6 +2102,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// 全都不命中时的兜底：返回 `current_dir()`，且**绝不 panic**。
+    #[test]
     fn app_root_dir_never_panics() {
         let dir = super::AppConfig::app_root_dir();
         assert!(dir.is_absolute(), "app_root_dir 应返回绝对路径: {dir:?}");
@@ -1913,5 +2148,234 @@ mod tests {
         );
         // 同理，项目根的 config.toml 必须能命中（这就是启动时 load_from_file 走的路）
         assert!(super::AppConfig::resolve_path("config.toml").is_file());
+    }
+
+    // ─────────── 在线翻译：端点归一化 / 模型列表 / 错误提示 ───────────
+
+    /// 端点归一化：带/不带尾斜杠、带/不带 `/v1`、直接写完整端点，都要拼成同一个 URL。
+    #[test]
+    fn resolved_endpoint_tolerates_slash_v1_and_full_path() {
+        let mut cfg = TranslateConfig {
+            api_base: "http://119.29.217.28:3021/v1".to_string(),
+            ..TranslateConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_endpoint(),
+            "http://119.29.217.28:3021/v1/chat/completions"
+        );
+        // 尾斜杠
+        cfg.api_base = "http://119.29.217.28:3021/v1/".to_string();
+        assert_eq!(
+            cfg.resolved_endpoint(),
+            "http://119.29.217.28:3021/v1/chat/completions"
+        );
+        // 基址不带 /v1：不替用户补，原样拼（网关侧 404 时由 online_error_hint 指路）
+        cfg.api_base = "http://119.29.217.28:3021".to_string();
+        assert_eq!(
+            cfg.resolved_endpoint(),
+            "http://119.29.217.28:3021/chat/completions"
+        );
+        // 直接写了完整端点 / 完整端点 + 尾斜杠
+        cfg.api_base = "https://api.openai.com/v1/chat/completions".to_string();
+        assert_eq!(
+            cfg.resolved_endpoint(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        cfg.api_base = " https://api.openai.com/v1/chat/completions/ ".to_string();
+        assert_eq!(
+            cfg.resolved_endpoint(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        // 空基址不应拼出一个孤零零的 "/chat/completions"
+        cfg.api_base = "   ".to_string();
+        assert_eq!(cfg.resolved_endpoint(), "");
+        // 旧名字仍指向同一套逻辑（既有调用点不受影响）
+        cfg.api_base = "http://host/v1".to_string();
+        assert_eq!(cfg.chat_completions_url(), cfg.resolved_endpoint());
+    }
+
+    /// `/models` 端点归一化：同一套容错，且完整端点写法要把尾段换成 `/models`。
+    #[test]
+    fn models_url_normalizes_like_chat_endpoint() {
+        let mut cfg = TranslateConfig {
+            api_base: "http://119.29.217.28:3021/v1".to_string(),
+            ..TranslateConfig::default()
+        };
+        assert_eq!(
+            cfg.models_url(),
+            "http://119.29.217.28:3021/v1/models"
+        );
+        cfg.api_base = "http://119.29.217.28:3021/v1/".to_string();
+        assert_eq!(cfg.models_url(), "http://119.29.217.28:3021/v1/models");
+        cfg.api_base = "https://api.openai.com/v1/chat/completions".to_string();
+        assert_eq!(cfg.models_url(), "https://api.openai.com/v1/models");
+        cfg.api_base = "https://host/v1/models".to_string();
+        assert_eq!(cfg.models_url(), "https://host/v1/models");
+        cfg.api_base = String::new();
+        assert_eq!(cfg.models_url(), "");
+    }
+
+    /// 基址少 `/v1` 时的兜底候选：只有「没写 /v1」才给，避免对合法基址瞎试一轮。
+    #[test]
+    fn models_v1_fallback_only_for_bare_base() {
+        let mut cfg = TranslateConfig {
+            api_base: "http://119.29.217.28:3021".to_string(),
+            ..TranslateConfig::default()
+        };
+        assert_eq!(
+            cfg.models_url_v1_fallback().as_deref(),
+            Some("http://119.29.217.28:3021/v1/models")
+        );
+        // 已带 /v1 → 不必再试
+        cfg.api_base = "http://119.29.217.28:3021/v1".to_string();
+        assert_eq!(cfg.models_url_v1_fallback(), None);
+        cfg.api_base = "http://119.29.217.28:3021/v1/".to_string();
+        assert_eq!(cfg.models_url_v1_fallback(), None);
+        // 完整端点写法：去掉尾段后同样已有 /v1
+        cfg.api_base = "https://api.openai.com/v1/chat/completions".to_string();
+        assert_eq!(cfg.models_url_v1_fallback(), None);
+        // 已经写到 /models 就不要再叠
+        cfg.api_base = "https://host/v1/models".to_string();
+        assert_eq!(cfg.models_url_v1_fallback(), None);
+        // 空基址没有候选
+        cfg.api_base = String::new();
+        assert_eq!(cfg.models_url_v1_fallback(), None);
+    }
+
+    /// 模型列表解析：真实网关响应片段，字段缺失按缺省、脏项跳过。
+    #[test]
+    fn parse_model_list_handles_real_gateway_shape() {
+        // 摘自实测响应（http://119.29.217.28:3021/v1/models，节选 + 人工构造的缺字段项）
+        let body = r#"{"data":[
+            {"id":"cn:hy4-preview-f","name":"Hy4 preview","object":"model",
+             "context_length":1000000,"max_output_tokens":64000,
+             "only_reasoning":true,"supports_reasoning":true,"credits":"x0.29"},
+            {"id":"cn:deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash",
+             "context_length":1000000,"max_output_tokens":393216,
+             "can_disable_thinking":true,"only_reasoning":true,"supports_reasoning":true},
+            {"id":"global:gpt-5.6-sol","name":"GPT-5.6-Sol","supports_reasoning":true},
+            {"id":"global:o4-mini","name":"GPT-4o-Mini","context_length":104000,
+             "max_output_tokens":24000},
+            {"id":"cn:only-id"},
+            {"name":"没有 id 的项"},
+            {"id":"   "},
+            "不是对象"
+        ],"object":"list"}"#;
+        let models = super::parse_model_list(body).expect("应能解析");
+        assert_eq!(models.len(), 5, "无 id / 空 id / 非对象项都应跳过: {models:?}");
+
+        let first = &models[0];
+        assert_eq!(first.id, "cn:hy4-preview-f");
+        assert_eq!(first.name.as_deref(), Some("Hy4 preview"));
+        assert!(first.supports_reasoning && first.only_reasoning);
+        assert_eq!(first.context_length, Some(1_000_000));
+        assert_eq!(first.max_output_tokens, Some(64_000));
+        assert_eq!(first.reasoning_tag(), Some("仅推理"));
+
+        // 缺 only_reasoning 时是「推理」，不是「仅推理」
+        let sol = models.iter().find(|m| m.id == "global:gpt-5.6-sol").unwrap();
+        assert!(sol.supports_reasoning);
+        assert!(!sol.only_reasoning);
+        assert_eq!(sol.reasoning_tag(), Some("推理"));
+        assert_eq!(sol.context_length, None, "缺字段应为 None 而不是 0");
+
+        // 非推理模型：无徽标
+        let o4 = models.iter().find(|m| m.id == "global:o4-mini").unwrap();
+        assert!(!o4.supports_reasoning);
+        assert_eq!(o4.reasoning_tag(), None);
+
+        // name 缺失时展示文案退回 id
+        let only_id = models.iter().find(|m| m.id == "cn:only-id").unwrap();
+        assert_eq!(only_id.name, None);
+        assert_eq!(only_id.display_label(), "cn:only-id");
+
+        // name 与 id 都显示：用户要复制 id，但要认得 name
+        assert_eq!(first.display_label(), "cn:hy4-preview-f  ·  Hy4 preview");
+    }
+
+    /// 响应体不是 JSON / 没有 data 数组：报错而不是静默返回空表（空表会显示成
+    /// 「没有模型」，把服务端故障说成「模型列表为空」）。
+    #[test]
+    fn parse_model_list_rejects_non_json_and_missing_data() {
+        assert!(super::parse_model_list("404 page not found").is_err());
+        assert!(super::parse_model_list(r#"{"object":"list"}"#).is_err());
+        assert!(super::parse_model_list(r#"{"data":{}}"#).is_err());
+        // data 为空数组是**合法**的：服务端就是没开模型
+        assert_eq!(super::parse_model_list(r#"{"data":[]}"#).unwrap().len(), 0);
+    }
+
+    /// 网关错误体摘要：`error.message` 原文 + `gateway_hint`。
+    #[test]
+    fn gateway_error_summary_keeps_message_and_hint() {
+        // 实测 400：message 里嵌着上游原文，gateway_hint 才是「该换模型」的依据
+        let model_unavailable = r#"{"error":{"code":"model_unavailable","gateway_hint":"upstream has no such model on this backend; switch model or retry on another account","message":"{\"code\":11102,\"msg\":\"model [deepseek4.1flash] service info not found\"}","type":"api_error"}}"#;
+        let summary = super::gateway_error_summary(model_unavailable).expect("应取到摘要");
+        assert!(summary.contains("model [deepseek4.1flash] service info not found"));
+        assert!(summary.contains("switch model or retry on another account"));
+
+        // 实测 503：账号池空
+        let no_account = r#"{"error":{"code":"no_healthy_account","gateway_hint":"no healthy account available in pool; check /status or retry later","message":"all accounts are temporarily unavailable, please retry later","type":"api_error"}}"#;
+        let summary = super::gateway_error_summary(no_account).expect("应取到摘要");
+        assert!(summary.contains("all accounts are temporarily unavailable"));
+
+        // 实测 401：只有 message
+        let invalid = r#"{"error":{"code":"invalid_api_key","message":"missing or invalid API key","type":"api_error"}}"#;
+        assert_eq!(
+            super::gateway_error_summary(invalid).as_deref(),
+            Some("missing or invalid API key")
+        );
+
+        // error 直接是字符串 / 没有可用字段 / 根本不是 JSON
+        assert_eq!(
+            super::gateway_error_summary(r#"{"error":"boom"}"#).as_deref(),
+            Some("boom")
+        );
+        assert_eq!(super::gateway_error_summary(r#"{"error":{"code":"x"}}"#), None);
+        assert_eq!(super::gateway_error_summary("404 page not found"), None);
+    }
+
+    /// 错误提示：把「模型名不对」这类坑翻成下一步动作。
+    #[test]
+    fn online_error_hint_maps_known_failures() {
+        // 实测 400 原文：模型 id 少了 cn: 前缀
+        let model_unavailable = r#"在线接口返回 HTTP 400: {"error":{"code":"model_unavailable","gateway_hint":"upstream has no such model on this backend; switch model or retry on another account","message":"{\"code\":11102,\"msg\":\"model [deepseek4.1flash] service info not found\"}"}}"#;
+        let hint = super::online_error_hint(model_unavailable).expect("应给出针对性提示");
+        assert!(hint.contains("拉取模型列表"), "应引导去拉列表: {hint}");
+        assert!(hint.contains("cn:"), "应点明前缀要求: {hint}");
+
+        // 只有上游原文（没有 model_unavailable 字样）也要命中
+        let upstream_only = "在线接口返回 HTTP 400: model [deepseek4.1flash] service info not found";
+        assert!(super::online_error_hint(upstream_only).is_some());
+
+        // 503 账号池空：不是本地配置问题
+        let no_account = r#"在线接口返回 HTTP 503: {"error":{"code":"no_healthy_account","gateway_hint":"no healthy account available in pool; check /status or retry later","message":"all accounts are temporarily unavailable, please retry later"}}"#;
+        let hint = super::online_error_hint(no_account).expect("应给出针对性提示");
+        assert!(hint.contains("账号池"), "{hint}");
+
+        // 401：指到密钥（含环境变量回退）
+        let unauthorized = r#"在线接口返回 HTTP 401（API Key 无效或无权限）: {"error":{"code":"invalid_api_key","message":"missing or invalid API key"}}"#;
+        let hint = super::online_error_hint(unauthorized).expect("应给出针对性提示");
+        assert!(hint.contains("API Key"), "{hint}");
+        assert!(hint.contains("VOICE2WORD_API_KEY"), "{hint}");
+        // 只有状态码、没有错误体时也要命中
+        assert!(super::online_error_hint("在线接口返回 HTTP 401: ").is_some());
+
+        // 404：基址少了 /v1
+        let not_found = "在线接口返回 HTTP 404: 404 page not found";
+        let hint = super::online_error_hint(not_found).expect("应给出针对性提示");
+        assert!(hint.contains("/v1"), "{hint}");
+
+        // 没有额外信息可说的普通错误：返回 None，由调用方显示原文（不吞信息）
+        assert_eq!(super::online_error_hint("在线接口返回 HTTP 400: bad request"), None);
+        assert_eq!(super::online_error_hint("在线接口返回 HTTP 500: boom"), None);
+    }
+
+    /// 模型 id 说明文案必须点明「要与 /v1/models 的 id 完全一致」与前缀要求。
+    #[test]
+    fn model_id_help_mentions_models_endpoint_and_prefix() {
+        let help = TranslateConfig::MODEL_ID_HELP;
+        assert!(help.contains("/v1/models"), "{help}");
+        assert!(help.contains("cn:"), "{help}");
+        assert!(help.contains("400"), "{help}");
     }
 }

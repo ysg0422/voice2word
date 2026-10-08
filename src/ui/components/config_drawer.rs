@@ -8,7 +8,7 @@ use gpui::*;
 use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::MainWindow;
-use crate::app::state::ProcessStatus;
+use crate::app::state::{ProcessStatus, WorkspaceTab};
 use crate::app::{PolishMode, WhisperModelTier};
 use crate::engines::MAX_SPEAKERS;
 use crate::utils::time::format_duration_short;
@@ -237,6 +237,8 @@ impl MainWindow {
             .child(self.render_engine_card(cx))
             // ── 4. 转写参数（语言 / 格式 / 润色 / 线程）──
             .child(self.render_params_card(cx))
+            // ── 4.5 字幕翻译（只读摘要 + 跳转性能设置；翻译参数不在这一栏调）──
+            .child(self.render_translate_summary_card(cx))
             // ── 5. 硬件监控看板 ──
             .child(self.render_hardware_monitor_card(cx))
             // ── 5.5 模型缺失引导（仅在缺组件时出现，就绪后自动消失）──
@@ -319,6 +321,74 @@ impl MainWindow {
                     }
                 })),
             )
+    }
+
+    /// 「字幕翻译」摘要卡：当前模式 / 端点 / 模型 + 一个跳转按钮。
+    ///
+    /// 为什么只做摘要不做控件：这一栏是 350px 的窄抽屉（[`Theme::DRAWER_W`]），
+    /// 而在线翻译要填基址、密钥、模型并拉取模型列表，塞进来会把「转写参数」挤成
+    /// 一屏半。真正的配置都在性能设置页的翻译卡上（含「拉取模型列表」），
+    /// 这里只解决用户实测的那个坑：**配置项在界面上根本没有入口**，
+    /// 之前只能手改 `config.toml`。摘要 + 一次点击即到配置处。
+    fn render_translate_summary_card(&mut self, cx: &mut Context<Self>) -> Div {
+        let translate = &self.state.config.translate;
+        let is_online = translate.is_online();
+        let mode_label = if is_online { "在线 API" } else { "本地 Qwen" };
+        // 端点只显示到主机级别：密钥与完整路径不该在这一栏多露一次
+        let endpoint = if is_online {
+            let url = translate.resolved_endpoint();
+            match url.split("://").nth(1).and_then(|rest| rest.split('/').next()) {
+                Some(host) if !host.is_empty() => host.to_string(),
+                _ => url,
+            }
+        } else {
+            "本地推理，无需网络".to_string()
+        };
+        let model = if is_online {
+            let model = translate.api_model.trim();
+            if model.is_empty() {
+                "未填写模型名".to_string()
+            } else {
+                model.to_string()
+            }
+        } else {
+            String::new()
+        };
+
+        let mut card = primitives::card_sm()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(primitives::section_title("字幕翻译"))
+                    .child(primitives::badge(mode_label)),
+            )
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .truncate()
+                    .child(endpoint),
+            );
+        if !model.is_empty() {
+            card = card.child(
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_secondary())
+                    .truncate()
+                    .child(model),
+            );
+        }
+        card.child(
+            primitives::chip_clickable("在性能设置中配置", false, false)
+                .id("sidebar-translate-config-btn")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.state.active_tab = WorkspaceTab::Performance;
+                    cx.notify();
+                })),
+        )
     }
 
     /// 「识别引擎」卡片：五档模型栅格（SenseVoice 独占整行）

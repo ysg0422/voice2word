@@ -5,10 +5,13 @@
 
 use gpui::prelude::*;
 use gpui::*;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::MainWindow;
+use crate::utils::config::{ModelInfo, TranslateConfig};
 
 /// 术语表**实际生效**的条数（纯函数，便于单测）。
 ///
@@ -61,6 +64,193 @@ pub(crate) fn provider_status_line(
         return ("CPU（未配置加速）".to_string(), false);
     }
     (format!("{configured}（实际生效）"), false)
+}
+
+// ==================== 在线翻译：模型列表拉取 ====================
+
+/// 「拉取模型列表」的结果缓存。
+///
+/// 为什么不挂在 `MainWindow` 上：本文件的改动范围只到 `performance.rs`，`ui/mod.rs`
+/// 里的窗口字段不能动。列表是进程级的临时数据（拉一次用一阵），放静态量不影响正确性：
+/// 渲染时按 `(api_base, api_key)` 指纹比对，配置一改旧列表立即作废，不会拿过期结果
+/// 去覆盖用户新填的基址。
+static MODEL_LIST: Mutex<Option<ModelListCache>> = Mutex::new(None);
+
+struct ModelListCache {
+    /// 拉取时的配置指纹（基址 + 生效密钥），用于判断列表是否已过期
+    fingerprint: String,
+    /// 拉取中：按钮显示「拉取中…」并置灰，避免连点发多轮请求
+    loading: bool,
+    /// `(是否成功, 文案)`，`None` = 还没拉过
+    status: Option<(bool, String)>,
+    /// 服务端返回的模型（顺序与响应一致）
+    models: Vec<ModelInfo>,
+}
+
+/// 模型列表是否已过期：基址或密钥变了，旧列表就不能再往配置里写。
+pub(crate) fn model_cache_fingerprint(cfg: &TranslateConfig) -> String {
+    format!("{}|{}", cfg.api_base.trim(), cfg.effective_api_key().trim())
+}
+
+/// 加锁访问缓存；锁中毒（渲染线程 panic 后）也继续用，不把一次 panic 升级成永久空白。
+fn with_model_cache<R>(f: impl FnOnce(&mut Option<ModelListCache>) -> R) -> R {
+    match MODEL_LIST.lock() {
+        Ok(mut guard) => f(&mut guard),
+        Err(poisoned) => f(&mut poisoned.into_inner()),
+    }
+}
+
+/// 取当前配置下的缓存快照 `(loading, status, models)`；指纹不匹配一律当作「没拉过」。
+fn model_cache_snapshot(cfg: &TranslateConfig) -> (bool, Option<(bool, String)>, Vec<ModelInfo>) {
+    let fingerprint = model_cache_fingerprint(cfg);
+    with_model_cache(|slot| match slot.as_ref() {
+        Some(cache) if cache.fingerprint == fingerprint => {
+            (cache.loading, cache.status.clone(), cache.models.clone())
+        }
+        _ => (false, None, Vec::new()),
+    })
+}
+
+/// 拉取模型列表的失败信息。`raw` 是 `HTTP {code}: {响应体}` 原文，用来匹配
+/// [`crate::utils::config::online_error_hint`]。
+struct ModelFetchError {
+    /// 有状态码时带上，`None` 表示连不上（DNS / 拒绝连接）
+    status: Option<u16>,
+    /// 响应体里 `error.message` / `gateway_hint` 摘出来的可读说明
+    detail: String,
+    /// 原始文案（供错误提示匹配）
+    raw: String,
+}
+
+impl ModelFetchError {
+    /// 兜底：连不上或响应体读不出来时用。
+    fn transport(message: String) -> Self {
+        Self {
+            status: None,
+            detail: message.clone(),
+            raw: message,
+        }
+    }
+}
+
+/// 拉取成功后的结果。
+struct ModelFetchOutcome {
+    models: Vec<ModelInfo>,
+    /// 实际命中的 URL
+    url: String,
+    /// 需要额外提醒用户的事（如「基址少了 /v1」）
+    note: Option<String>,
+}
+
+/// 响应体片段：出错时贴给用户看，太长就截断（密钥不会出现在 `/models` 响应里）。
+fn body_snippet(body: &str) -> String {
+    let snippet: String = body.chars().take(300).collect();
+    if snippet.trim().is_empty() {
+        "(空响应体)".to_string()
+    } else {
+        snippet
+    }
+}
+
+/// 把「拉取失败」拼成一句可操作的话：**原样**带上网关的 `error.message` /
+/// `gateway_hint`（只显示「HTTP 400」等于什么都没说），再附上针对性提示。
+pub(crate) fn model_fetch_error_message(
+    status: Option<u16>,
+    detail: &str,
+    raw: &str,
+) -> String {
+    let mut msg = match status {
+        Some(code) => format!("拉取失败（HTTP {code}）：{detail}"),
+        None => format!("拉取失败：{detail}"),
+    };
+    if let Some(hint) = crate::utils::config::online_error_hint(raw) {
+        msg.push('\n');
+        msg.push_str("提示：");
+        msg.push_str(&hint);
+    }
+    msg
+}
+
+/// 拉取成功的状态文案（含「基址少了 /v1」这类提醒）。
+pub(crate) fn model_fetch_success_message(url: &str, count: usize, note: Option<&str>) -> String {
+    let mut msg = format!("已从 {url} 拉取到 {count} 个模型，点击即写入模型名");
+    if let Some(note) = note {
+        msg.push('\n');
+        msg.push_str(note);
+    }
+    msg
+}
+
+/// 拉取成功后的收尾：解析响应体（解析失败 / 空列表都算失败，界面要说清原因）。
+fn finish_model_fetch(
+    body: String,
+    url: String,
+    note: Option<String>,
+) -> Result<ModelFetchOutcome, String> {
+    let models = crate::utils::config::parse_model_list(&body)
+        .map_err(|e| format!("{url} 的响应无法解析：{e}\n响应片段：{}", body_snippet(&body)))?;
+    if models.is_empty() {
+        return Err(format!(
+            "{url} 返回了 0 个模型（服务端未开放任何模型）\n响应片段：{}",
+            body_snippet(&body)
+        ));
+    }
+    Ok(ModelFetchOutcome { models, url, note })
+}
+
+/// GET `{api_base}/models`（带 Bearer 密钥）。非 2xx 也返回 `Err`，由调用方决定是否重试。
+fn http_get_models(url: &str, key: &str, timeout_secs: u64) -> Result<String, ModelFetchError> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(timeout_secs.clamp(5, 60)))
+        .build();
+    let response = agent
+        .get(url)
+        .set("Authorization", &format!("Bearer {}", key.trim()))
+        .call();
+    match response {
+        Ok(resp) => resp
+            .into_string()
+            .map_err(|e| ModelFetchError::transport(format!("读取 {url} 的响应失败: {e}"))),
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            let detail = crate::utils::config::gateway_error_summary(&body)
+                .unwrap_or_else(|| body_snippet(&body));
+            Err(ModelFetchError {
+                status: Some(code),
+                detail,
+                raw: format!("在线接口返回 HTTP {code}: {body}"),
+            })
+        }
+        Err(e) => Err(ModelFetchError::transport(format!("无法连接 {url}: {e}"))),
+    }
+}
+
+/// 拉取模型列表：先打归一化后的 `/models`；若 404 且基址没带 `/v1`，再试一次
+/// `{基址}/v1/models`（实测网关只认带 `/v1` 的路径），命中后顺带提示补全基址。
+///
+/// 全过程是阻塞式 HTTP，调用方必须放进 `background_executor`（见
+/// [`MainWindow::fetch_translate_models`]）。
+fn fetch_model_list(cfg: &TranslateConfig, key: &str) -> Result<ModelFetchOutcome, String> {
+    let primary = cfg.models_url();
+    if primary.is_empty() {
+        return Err("请先填写「接口基址」（例如 http://host:3021/v1）".to_string());
+    }
+    let err = match http_get_models(&primary, key, cfg.timeout_secs) {
+        Ok(body) => return finish_model_fetch(body, primary, None),
+        Err(err) => err,
+    };
+    if err.status == Some(404) {
+        if let Some(alt) = cfg.models_url_v1_fallback() {
+            if let Ok(body) = http_get_models(&alt, key, cfg.timeout_secs) {
+                let base = cfg.api_base.trim().trim_end_matches('/');
+                let note = format!(
+                    "注意：基址缺少 /v1（本次用 {alt} 拉取成功），建议把「接口基址」改成 {base}/v1"
+                );
+                return finish_model_fetch(body, alt, Some(note));
+            }
+        }
+    }
+    Err(model_fetch_error_message(err.status, &err.detail, &err.raw))
 }
 
 /// 从管线里取 ONNX 后端的**实况**（请求值, 实际生效值）。`None` = 尚无引擎回报。
@@ -324,6 +514,16 @@ impl MainWindow {
             }))
             .into_any_element();
 
+        // 模型选择区：说明文案 + 「拉取模型列表」按钮 + 点击即用的下拉。
+        // 用户实测踩到的第一个坑就是模型 id 少了 `cn:` 前缀 → 400 model_unavailable，
+        // 所以这一段既给「去哪查 id」的入口，也把「必须完全一致」写在旁边。
+        let model_fetch_row = self.render_model_fetch_row(is_online, cx);
+        let model_choice_row = if is_online {
+            Some(self.render_model_choice_row(cx))
+        } else {
+            None
+        };
+
         // 离线档下把在线参数整块调暗：仍然可见可编辑（方便提前填好），但明确提示未生效
         let dim = move |el: AnyElement| -> AnyElement {
             if is_online {
@@ -339,6 +539,31 @@ impl MainWindow {
             .child(Self::render_setting_row("接口基址", dim(base_control)))
             .child(Self::render_setting_divider())
             .child(Self::render_setting_row("模型名", dim(model_control)))
+            .child(
+                // 自己写一行而不是走 render_setting_row：说明文案 + 按钮 + 会换行的
+                // 下拉列表塞进「左标签 + 右对齐控件」骨架会被折成右对齐的窄条
+                // （写法参照同文件的 render_onnx_provider_row）。
+                div()
+                    .w_full()
+                    .py(px(Theme::SPACE_2))
+                    .child(dim(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px(Theme::SPACE_2))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_muted())
+                                    .child(TranslateConfig::MODEL_ID_HELP),
+                            )
+                            .child(model_fetch_row)
+                            .children(model_choice_row)
+                            .into_any_element(),
+                    )),
+            )
             .child(Self::render_setting_divider())
             .child(Self::render_setting_row("API Key", dim(key_control)))
             .child(Self::render_setting_divider())
@@ -602,6 +827,209 @@ impl MainWindow {
                             .child(*desc),
                     )
             }))
+    }
+
+    /// 拉取在线翻译服务端的 `/models` 列表（性能页「拉取模型列表」按钮）。
+    ///
+    /// 请求全程在 `background_executor` 里跑（与 `actions.rs::probe_online_translate_api`
+    /// 同一套 `cx.spawn` 写法）：慢网关下绝不能卡住 UI 线程。结果写回
+    /// [`MODEL_LIST`] 缓存，渲染用的就是缓存快照。
+    fn fetch_translate_models(&mut self, cx: &mut Context<Self>) {
+        if model_cache_snapshot(&self.state.config.translate).0 {
+            // 已在拉取中：连点不该再发一轮请求
+            return;
+        }
+        let cfg = self.state.config.translate.clone();
+        let key = cfg.effective_api_key();
+        if cfg.api_base.trim().is_empty() {
+            with_model_cache(|slot| {
+                *slot = Some(ModelListCache {
+                    fingerprint: model_cache_fingerprint(&cfg),
+                    loading: false,
+                    status: Some((false, "请先填写「接口基址」（例如 http://host:3021/v1）".to_string())),
+                    models: Vec::new(),
+                })
+            });
+            cx.notify();
+            return;
+        }
+        if key.trim().is_empty() {
+            with_model_cache(|slot| {
+                *slot = Some(ModelListCache {
+                    fingerprint: model_cache_fingerprint(&cfg),
+                    loading: false,
+                    status: Some((
+                        false,
+                        "请先填写 API Key（或设置环境变量 VOICE2WORD_API_KEY）".to_string(),
+                    )),
+                    models: Vec::new(),
+                })
+            });
+            cx.notify();
+            return;
+        }
+
+        let fingerprint = model_cache_fingerprint(&cfg);
+        with_model_cache(|slot| {
+            let models = slot
+                .as_ref()
+                .filter(|c| c.fingerprint == fingerprint)
+                .map(|c| c.models.clone())
+                .unwrap_or_default();
+            *slot = Some(ModelListCache {
+                fingerprint: fingerprint.clone(),
+                loading: true,
+                status: None,
+                models,
+            });
+        });
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { fetch_model_list(&cfg, &key) })
+                .await;
+            let _ = this.update(cx, |_this, cx| {
+                with_model_cache(|slot| {
+                    *slot = Some(match result {
+                        Ok(outcome) => ModelListCache {
+                            fingerprint,
+                            loading: false,
+                            status: Some((
+                                true,
+                                model_fetch_success_message(
+                                    &outcome.url,
+                                    outcome.models.len(),
+                                    outcome.note.as_deref(),
+                                ),
+                            )),
+                            models: outcome.models,
+                        },
+                        Err(message) => ModelListCache {
+                            fingerprint,
+                            loading: false,
+                            status: Some((false, message)),
+                            models: Vec::new(),
+                        },
+                    });
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 把下拉里选中的模型写进 `config.translate.api_model` 并落盘。
+    ///
+    /// `id` 一字不改地写入：本网关要求 `cn:` / `global:` 前缀，任何「顺手裁一下」
+    /// 都会换来 400 model_unavailable。同时回填窗口上的编辑缓冲，
+    /// 让「模型名」输入框立刻显示新值（否则要点一下输入框才会落旧值回去）。
+    fn apply_translate_model(&mut self, id: &str, cx: &mut Context<Self>) {
+        let id = id.trim();
+        if id.is_empty() {
+            return;
+        }
+        self.state.config.translate.api_model = id.to_string();
+        self.api_model_input = id.to_string();
+        self.state.save_translate_config();
+        cx.notify();
+    }
+
+    /// 模型下拉所在行的「行尾」内容：拉取按钮 + 结果状态小字。
+    fn render_model_fetch_row(&self, is_online: bool, cx: &mut Context<Self>) -> AnyElement {
+        const MODEL_FETCH_MSG_MAX_W: f32 = 420.0;
+        let cfg = self.state.config.translate.clone();
+        let (loading, status, models) = model_cache_snapshot(&cfg);
+        let model_selected = self
+            .state
+            .config
+            .translate
+            .api_model
+            .trim()
+            .to_string();
+        let has_selection = models.iter().any(|m| m.id == model_selected);
+
+        let mut button = primitives::chip(
+            if loading { "拉取中…" } else { "拉取模型列表" },
+            false,
+            false,
+        )
+        .id("perf-translate-models-btn");
+        if !loading && is_online {
+            button = button
+                .cursor_pointer()
+                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                .on_click(cx.listener(|this, _, _, cx| this.fetch_translate_models(cx)));
+        }
+
+        let mut row = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(px(Theme::SPACE_2))
+            .child(button);
+        if let Some((ok, text)) = status {
+            row = row.children(text.lines().map(move |line| {
+                div()
+                    .max_w(px(MODEL_FETCH_MSG_MAX_W))
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(if ok { Theme::accent_mint() } else { Theme::accent_red() })
+                    .child(line.to_string())
+            }));
+        }
+        // 列表拉到了、但当前模型名不在列表里：直接提示，免得用户拿着一个
+        // 会 400 的 id 去点「测试连接」
+        if !loading && !models.is_empty() && !has_selection {
+            row = row.child(
+                div()
+                    .max_w(px(MODEL_FETCH_MSG_MAX_W))
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::accent_orange())
+                    .child("当前模型名不在服务端列表内，点下方的 id 直接替换"),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// 服务端模型的下拉列表：点击即写入模型名（复用 `segmented` 范式，不自造样式）。
+    fn render_model_choice_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (loading, _, models) = model_cache_snapshot(&self.state.config.translate);
+        if loading || models.is_empty() {
+            return div().into_any_element();
+        }
+        let selected = self.state.config.translate.api_model.trim().to_string();
+        let mut row = div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .gap(px(Theme::SPACE_1_5))
+            .pb(px(Theme::SPACE_2));
+        for model in models {
+            let id = model.id.clone();
+            let is_sel = id == selected;
+            let mut pill = primitives::segmented(model.display_label(), is_sel, false)
+                .id(SharedString::from(format!("perf-translate-model-{id}")))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.apply_translate_model(&id, cx);
+                }));
+            if let Some(tag) = model.reasoning_tag() {
+                // 推理模型标记：推理模型翻译更慢、更吃输出预算，正是用户踩过的坑
+                pill = pill.child(
+                    div()
+                        .ml(px(Theme::SPACE_1))
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(if is_sel {
+                            Theme::accent_blue()
+                        } else {
+                            Theme::accent_orange()
+                        })
+                        .child(tag),
+                );
+            }
+            row = row.child(pill);
+        }
+        row.into_any_element()
     }
 
     /// 设置行通用布局：左侧名称，右侧单行等级选择器（简约，无描述小字）
