@@ -74,6 +74,12 @@ image/
 # 编译脚本 scripts/build_whisper_msvc_vulkan.bat 会下载源码到这里。
 _whisper_build/
 
+# 打包产物（scripts/package_release.ps1 的输出）
+dist/
+
+# 本机 release 构建的 fxc 覆盖（若用户选择写文件而非用环境变量）
+.cargo/config.local.toml
+
 # Local binaries & Python caches
 *.exe
 __pycache__/
