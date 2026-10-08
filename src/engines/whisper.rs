@@ -26,9 +26,19 @@ pub struct WhisperEngine {
     no_fallback: bool,
     /// 跨句自注意力上下文 token 上限 (-mc)
     max_context: u32,
-    /// 是否收集 token 级概率：仅置信度救场开启时需要 -ojf 全量 JSON；
+    /// 是否收集 token 级概率：置信度救场开启时需要 -ojf 全量 JSON；
     /// 救场关闭时用轻量 -oj，避免为已禁用的功能支付 JSON 体积与解析成本
     need_token_probs: AtomicBool,
+    /// 转写质检是否需要逐句置信度（`Segment::confidence`）。与 `need_token_probs`
+    /// 分开存是为了让两者互不覆盖：救场由管线按 `rescue_logprob < 0` 每轮置位，
+    /// 质检则默认恒开——若共用一个标志，管线那句「救场关闭」的写入会把质检需求一并抹掉。
+    ///
+    /// 默认 true 的依据是实测代价可忽略（5 分钟真实素材、ggml-small-q5_0、
+    /// Vulkan GPU：-oj 墙钟 16.25 s / JSON 37 KB / 峰值内存 499 MB；
+    /// -ojf 墙钟 16.10 s / JSON 419 KB / 峰值内存 514 MB——耗时差落在噪声内，
+    /// 体积 +382 KB、内存 +15 MB；190 句的 serde 解析 0.57 ms）。
+    /// 完整实测表见 [`Self::set_need_token_probs_for_quality`] 的说明。
+    need_token_probs_for_quality: AtomicBool,
     vad_threshold_bits: AtomicU64,
     cancel: Arc<AtomicBool>,
     active_children: Arc<Mutex<Vec<ChildEntry>>>,
@@ -234,6 +244,9 @@ impl WhisperEngine {
             no_fallback,
             max_context: max_context.clamp(0, 448),
             need_token_probs: AtomicBool::new(false),
+            // 质检置信度默认开启：实测 -ojf 相对 -oj 的耗时差落在噪声内（见字段注释），
+            // 而它正是「转写质检 → 低置信复核」唯一的置信度来源，出厂配置必须可用。
+            need_token_probs_for_quality: AtomicBool::new(true),
             vad_threshold_bits: AtomicU64::new(0.50f64.to_bits()),
             cancel: Arc::new(AtomicBool::new(false)),
             active_children: Arc::new(Mutex::new(Vec::new())),
@@ -246,9 +259,30 @@ impl WhisperEngine {
         self.need_token_probs.store(need, Ordering::SeqCst);
     }
 
+    /// 质检专用：转写质检需要逐句 `Segment::confidence`（来自 -ojf 的 token 概率）。
+    ///
+    /// 与 [`Self::set_need_token_probs`]（救场专用）互不覆盖，两者取「或」决定是否加
+    /// `-ojf`。默认 `true`——实测代价可忽略，而关掉它质检的「低置信」一栏会恒为空
+    /// （`confidence: None` 只累加 `QualityReport::confidence_missing`，不进
+    /// `low_confidence`），出厂配置下等于该功能不存在。
+    ///
+    /// 管线侧的接线建议（`src/core/pipeline.rs:638`，本线程无权改该文件）：
+    /// 在现有 `set_need_token_probs(rescue_logprob < 0.0 && !is_sensevoice)` 之后
+    /// 补一行 `self.whisper.set_need_token_probs_for_quality(!is_sensevoice);`；
+    /// 若将来把开关暴露成配置项，则传该配置值。
+    pub fn set_need_token_probs_for_quality(&self, need: bool) {
+        self.need_token_probs_for_quality
+            .store(need, Ordering::SeqCst);
+    }
+
     pub fn set_vad_threshold(&self, threshold: f64) {
-        let valid = if threshold.is_finite() { threshold.clamp(0.3, 0.8) } else { 0.5 };
-        self.vad_threshold_bits.store(valid.to_bits(), Ordering::SeqCst);
+        let valid = if threshold.is_finite() {
+            threshold.clamp(0.3, 0.8)
+        } else {
+            0.5
+        };
+        self.vad_threshold_bits
+            .store(valid.to_bits(), Ordering::SeqCst);
     }
 
     pub fn uses_gpu(&self) -> bool {
@@ -267,7 +301,12 @@ impl WhisperEngine {
         }
     }
 
-    /// 复位取消标志（每次新任务开始前由管线调用）
+    /// 复位取消标志。调用点是 [`crate::core::TaskPipeline::begin_task`]，且必须发生在
+    /// 「派发任务线程 / 把状态切成转写中」**之前**——它绝不能出现在任务线程内部。
+    ///
+    /// 早先这一步跟在 `run_with_options` 开头，于是「用户在线程刚起来时点终止」会被
+    /// 任务自己清零，终止静默失效；把复位前移到派发之前后，任务线程里不再有任何清
+    /// 标志的写方，那条竞态才真正闭合（完整时序见 `TaskPipeline::begin_task`）。
     pub fn reset(&self) {
         self.cancel.store(false, Ordering::SeqCst);
     }
@@ -303,7 +342,7 @@ impl WhisperEngine {
         language: Option<&str>,
         threads: Option<u32>,
         total_duration: Option<f64>,
-        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+        progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
         self.transcribe_with_model(
             audio_path,
@@ -323,7 +362,7 @@ impl WhisperEngine {
         threads: Option<u32>,
         total_duration: Option<f64>,
         model_path_override: Option<&Path>,
-        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+        progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
         self.transcribe_input(
             AudioInput::Path(audio_path.as_ref()),
@@ -346,7 +385,7 @@ impl WhisperEngine {
         threads: Option<u32>,
         total_duration: Option<f64>,
         model_path_override: Option<&Path>,
-        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+        progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
         self.transcribe_input_with_processors(
             AudioInput::Path(audio_path.as_ref()),
@@ -368,7 +407,7 @@ impl WhisperEngine {
         threads: Option<u32>,
         total_duration: Option<f64>,
         model_path_override: Option<&Path>,
-        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+        progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
         self.transcribe_input(
             AudioInput::Stream(stream),
@@ -390,7 +429,7 @@ impl WhisperEngine {
         threads: Option<u32>,
         total_duration: Option<f64>,
         model_path_override: Option<&Path>,
-        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+        progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
         self.transcribe_input(
             AudioInput::Stream(stream),
@@ -405,6 +444,7 @@ impl WhisperEngine {
 
     /// 统一入口：根据 AudioInput 分发文件路径模式或纯内存管道推流模式。
     /// `force_fallback` 为 true 时不附加 -nf，即使引擎配置了禁用回退。
+    #[allow(clippy::too_many_arguments)] // 见 `transcribe_input_with_processors` 的说明
     pub fn transcribe_input<'a>(
         &self,
         audio_input: AudioInput<'a>,
@@ -413,7 +453,7 @@ impl WhisperEngine {
         total_duration: Option<f64>,
         model_path_override: Option<&Path>,
         force_fallback: bool,
-        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+        progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
         self.transcribe_input_with_processors(
             audio_input,
@@ -427,6 +467,9 @@ impl WhisperEngine {
         )
     }
 
+    // 参数确实是逐层透传的既有公开/内部签名，拆成参数结构体会连带改掉 3 处调用点，
+    // 与本轮「只清 warning、最小 diff」的目标相悖，故就地 allow。
+    #[allow(clippy::too_many_arguments)]
     fn transcribe_input_with_processors<'a>(
         &self,
         audio_input: AudioInput<'a>,
@@ -436,7 +479,7 @@ impl WhisperEngine {
         model_path_override: Option<&Path>,
         force_fallback: bool,
         processors_override: Option<u32>,
-        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+        progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
         let temp_dir = std::env::temp_dir();
         let unique = std::time::SystemTime::now()
@@ -513,7 +556,10 @@ impl WhisperEngine {
                     .arg("-vm")
                     .arg(vad_path)
                     .arg("-vt")
-                    .arg(format!("{:.2}", f64::from_bits(self.vad_threshold_bits.load(Ordering::SeqCst))))
+                    .arg(format!(
+                        "{:.2}",
+                        f64::from_bits(self.vad_threshold_bits.load(Ordering::SeqCst))
+                    ))
                     .arg("-vsd")
                     .arg("250"); // 最小静音间隔 250ms，剥离无效停顿，全自动时间戳映射还原
             }
@@ -543,9 +589,18 @@ impl WhisperEngine {
             .arg("-sns") // 抑制非语音标记(音乐/掌声/杂音)，杜绝自回归发散与幻读
             .arg("-of")
             .arg(&prefix);
-        // token 概率只在救场开启时收集：-ojf 全量 JSON 带 token 级概率，用于自算 avg_logprob；
-        // 救场关闭时用轻量 -oj，输出体积小一个数量级，解析也更快（默认路径）
-        if self.need_token_probs.load(Ordering::SeqCst) {
+        // token 概率在「救场开启」或「质检需要逐句置信度」时收集：-ojf 全量 JSON 带
+        // token 级概率，据此自算 avg_logprob。两者都不需要时才降级轻量 -oj。
+        //
+        // 为什么质检默认也走 -ojf：实测（5 分钟真实素材、ggml-small-q5_0、Vulkan GPU）
+        //   -oj ：墙钟 16.35 / 15.93 / 16.47 s，JSON 37,355 B，峰值内存 499.1 MB
+        //   -ojf：墙钟 16.12 / 16.72 / 15.46 s，JSON 419,237 B，峰值内存 514.2 MB
+        // 耗时差 ±0.3 s 落在噪声内（两个标志只改 JSON 序列化，不改解码），代价是
+        // 体积 ×11.2（+382 KB）、内存 +15 MB、190 句 serde 解析 0.07 → 0.57 ms。
+        // 折算到 32 分钟素材约 +2.4 MB / 解析 ~4 ms，不构成「显著变慢或内存爆掉」。
+        if self.need_token_probs.load(Ordering::SeqCst)
+            || self.need_token_probs_for_quality.load(Ordering::SeqCst)
+        {
             cmd.arg("-ojf");
         } else {
             cmd.arg("-oj");
@@ -709,7 +764,10 @@ impl WhisperEngine {
                 }
                 tail.push_back(line);
             }
-            (vad_ms / 1000.0, tail.into_iter().collect::<Vec<_>>().join("\n"))
+            (
+                vad_ms / 1000.0,
+                tail.into_iter().collect::<Vec<_>>().join("\n"),
+            )
         });
 
         let proc_count = processors;
@@ -792,8 +850,8 @@ impl WhisperEngine {
                             // `streaming_segments` 会让界面显示「一句几秒钟说不完的话」，而它
                             // 结束后才会被 `optimize_segments` 按标点拆开。这里在推流出口先按同一
                             // 规则拆短，让实时字幕流与最终字幕表逐条对齐。
-                            let preview_segs = opt_seg
-                                .map(|seg| crate::subtitle::split_long_segments(vec![seg]));
+                            let preview_segs =
+                                opt_seg.map(|seg| crate::subtitle::split_long_segments(vec![seg]));
 
                             let display_sec = if proc_count > 1 && dur > 0.0 {
                                 ratio * dur
@@ -816,9 +874,8 @@ impl WhisperEngine {
 
                             // 有新句子时立即推送；无新句子时按进度推进节流推送
                             let has_seg = preview_segs.as_ref().is_some_and(|v| !v.is_empty());
-                            let should_emit = has_seg
-                                || ratio + 0.0001 >= last_emit + 0.01
-                                || ratio >= 0.999;
+                            let should_emit =
+                                has_seg || ratio + 0.0001 >= last_emit + 0.01 || ratio >= 0.999;
                             if should_emit {
                                 last_emit = ratio;
                                 if let Some(cb) = cb_clone.as_ref() {
@@ -971,17 +1028,31 @@ impl WhisperEngine {
     /// 从单行 whisper-cli 日志中提取 VAD 耗时（毫秒），非 VAD 行返回 None。
     ///
     /// 抽成行级函数是为了让 stderr 能在读取线程里流式累加 VAD 耗时，
-    /// 而不必先把整份日志存进内存。
+    /// 而不必先把整份日志存进内存。whisper.cpp 的原串是
+    /// `whisper_print_timings: vad time = %.2f ms processing %d samples`。
+    ///
+    /// 此前按 `"ms"` 找终止符：该行末尾的 `samples` 里也含 `ms`，一旦数值与 `ms`
+    /// 之间夹了空白（`vad time = 123.45  ms`）就会把 `123.45` 之外的杂质一起喂给
+    /// `parse`，解析失败 → 返回 None → 该行 VAD 耗时被静默丢弃（总时长偏小）。
+    /// 这里改成「取 `vad time =` 之后的第一段连续数字（含小数点）」，
+    /// 对多余空白、尾随单位与额外文字都免疫。
     fn parse_vad_ms_line(line: &str) -> Option<f64> {
-        let pos = line.find("vad time =")?;
-        let rest = &line[pos + 10..];
-        let end = rest.find("ms")?;
-        rest[..end].trim().parse::<f64>().ok()
+        let rest = line.split_once("vad time =")?.1;
+        let num: String = rest
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        num.parse::<f64>().ok()
     }
 
     /// 从完整 stderr 文本中提取 Silero VAD 总耗时 (秒)
     pub fn parse_vad_time(stderr: &str) -> f64 {
-        stderr.lines().filter_map(Self::parse_vad_ms_line).sum::<f64>() / 1000.0
+        stderr
+            .lines()
+            .filter_map(Self::parse_vad_ms_line)
+            .sum::<f64>()
+            / 1000.0
     }
 
     /// 解析形如 [00:00:00.000 --> 00:00:02.500]  文本 的标准输出
@@ -1022,16 +1093,25 @@ impl WhisperEngine {
         segments
     }
 
+    /// 解析 `HH:MM:SS.mmm` 形式的时间戳，并容忍常见的简写与脏输入。
+    ///
+    /// 为什么不能只认 `HH:MM:SS`：此前 `split(':').len() != 3` 一律返回 0.0，
+    /// 于是 `MM:SS.mmm`（部分 whisper 输出省略小时）与 SRT 风格的逗号小数
+    /// （`00:00:01,250`）都被静默变成 0.0——一条 `0 → 0` 的片段随后被
+    /// `optimize_segments` 按「无效时长」剔除，用户看到的是整段字幕凭空消失，
+    /// 日志里却没有任何线索。这里按 1/2/3 段分别解释，解析失败的那一段按 0 计。
     fn parse_time_str(s: &str) -> f64 {
-        // HH:MM:SS.mmm
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() == 3 {
-            let h: f64 = parts[0].parse().unwrap_or(0.0);
-            let m: f64 = parts[1].parse().unwrap_or(0.0);
-            let s: f64 = parts[2].parse().unwrap_or(0.0);
-            h * 3600.0 + m * 60.0 + s
-        } else {
-            0.0
+        let parts: Vec<f64> = s
+            .trim()
+            .split(':')
+            .map(|p| p.trim().replace(',', ".").parse::<f64>().unwrap_or(0.0))
+            .collect();
+        match parts.as_slice() {
+            [h, m, sec] => h * 3600.0 + m * 60.0 + sec,
+            [m, sec] => m * 60.0 + sec,
+            [sec] => *sec,
+            // 空串 / 乱码 / 段数异常：保持原行为返回 0.0，不 panic
+            _ => 0.0,
         }
     }
 }
@@ -1107,10 +1187,88 @@ mod tests {
         assert!(WhisperEngine::tokens_avg_logprob(&[tok("词", 0.0)]).is_none());
     }
 
+    /// 质检置信度开关：默认开启（出厂配置下 `-ojf` 必须被加上，否则质检低置信恒空），
+    /// 且与救场开关互不覆盖——两者任一为真都应产出 `-ojf`。
+    #[test]
+    fn quality_confidence_flag_defaults_on_and_is_independent_of_rescue() {
+        let engine = engine_with_dummy_paths();
+        assert!(
+            engine.need_token_probs_for_quality.load(Ordering::SeqCst),
+            "质检置信度必须默认开启：关掉它低置信复核会恒为空"
+        );
+        assert!(
+            !engine.need_token_probs.load(Ordering::SeqCst),
+            "救场开关仍应默认关闭，两者不是同一个标志"
+        );
+
+        // 质检关掉、救场也没开 → 才退回轻量 -oj
+        engine.set_need_token_probs_for_quality(false);
+        assert!(!engine.need_token_probs_for_quality.load(Ordering::SeqCst));
+
+        // 关掉质检不得连带关掉救场；反之亦然。
+        engine.set_need_token_probs(true);
+        assert!(engine.need_token_probs.load(Ordering::SeqCst));
+        engine.set_need_token_probs_for_quality(true);
+        engine.set_need_token_probs(false);
+        assert!(
+            engine.need_token_probs_for_quality.load(Ordering::SeqCst),
+            "救场关停不得抹掉质检需求（这正是拆成两个标志的原因）"
+        );
+    }
+
     #[test]
     fn gbk_bytes_decode_to_han() {
         let (bytes, _, _) = encoding_rs::GBK.encode("切比雪夫不等式");
         assert_eq!(decode_cli_bytes(&bytes), "切比雪夫不等式");
+    }
+
+    /// 时间戳解析必须容忍简写与脏输入：此前只认 `HH:MM:SS`，把 `MM:SS.mmm`
+    /// 与 SRT 逗号小数都静默算成 0.0，整条字幕会被当无效片段剔除。
+    #[test]
+    fn parse_time_str_accepts_short_and_dirty_forms() {
+        assert!((WhisperEngine::parse_time_str("00:01:02.500") - 62.5).abs() < 1e-9);
+        // 省略小时：MM:SS.mmm
+        assert!((WhisperEngine::parse_time_str("01:02.500") - 62.5).abs() < 1e-9);
+        // SRT 风格逗号小数
+        assert!((WhisperEngine::parse_time_str("00:00:01,250") - 1.25).abs() < 1e-9);
+        // 纯秒数
+        assert!((WhisperEngine::parse_time_str("12.5") - 12.5).abs() < 1e-9);
+        // 前后空白不影响
+        assert!((WhisperEngine::parse_time_str(" 00:00:02.000 ") - 2.0).abs() < 1e-9);
+        // 脏输入不 panic，按 0 计
+        assert_eq!(WhisperEngine::parse_time_str(""), 0.0);
+        assert_eq!(WhisperEngine::parse_time_str("乱码"), 0.0);
+        // 段数异常（四段）保持旧行为 0.0
+        assert_eq!(WhisperEngine::parse_time_str("00:00:00:00"), 0.0);
+    }
+
+    /// VAD 耗时解析对「数值与 ms 之间夹空白」以及行内其它含 `ms` 的词都免疫：
+    /// 旧实现按 `"ms"` 找终止符，`samples` 里的 `ms` 会把杂质喂进 `parse` 而丢掉这一行。
+    #[test]
+    fn parse_vad_ms_line_tolerates_spacing_and_trailing_text() {
+        assert_eq!(
+            WhisperEngine::parse_vad_ms_line(
+                "whisper_print_timings: vad time = 123.45 ms processing 16000 samples"
+            ),
+            Some(123.45)
+        );
+        // 数值与单位之间夹多个空格
+        assert_eq!(
+            WhisperEngine::parse_vad_ms_line("vad time = 123.45  ms processing 1 samples"),
+            Some(123.45)
+        );
+        // 无尾随单位也能取到数值
+        assert_eq!(WhisperEngine::parse_vad_ms_line("vad time = 7"), Some(7.0));
+        // 非 VAD 行
+        assert_eq!(
+            WhisperEngine::parse_vad_ms_line("load time = 100.00 ms"),
+            None
+        );
+        assert_eq!(WhisperEngine::parse_vad_ms_line(""), None);
+        // 整段求和走同一条解析（parse_vad_time 即逐行累加）
+        let stderr = "whisper_print_timings: vad time = 100.00 ms processing 1 samples\n\
+                      whisper_print_timings: vad time = 250.00 ms processing 2 samples\n";
+        assert!((WhisperEngine::parse_vad_time(stderr) - 0.35).abs() < 1e-9);
     }
 
     #[test]
@@ -1123,7 +1281,10 @@ mod tests {
 
         // 集成性质测试：四个外部依赖（Vulkan whisper-cli、模型、ffmpeg、样片）
         // 缺任何一个都不跑，而不是 fail——干净 CI / 新机器上这些都不存在。
-        if !cli_path.exists() || !model_path.exists() || !ffmpeg_path.exists() || !sample_media.exists()
+        if !cli_path.exists()
+            || !model_path.exists()
+            || !ffmpeg_path.exists()
+            || !sample_media.exists()
         {
             eprintln!(
                 "跳过 test_in_memory_stream_transcribe：外部依赖未就位 \
@@ -1148,14 +1309,8 @@ mod tests {
         // 转写本身可能因机器没有可用的 Vulkan 运行时 / GPU 而失败（whisper-cli 的
         // stderr 走的是进程退出通道，失败时这里拿到的错误串可能为空）。这种失败是
         // **环境**问题而非代码回归：跳过硬断言，只报告，不 red。
-        let outcome = engine.transcribe_stream(
-            Box::new(stdout),
-            Some("zh"),
-            Some(4),
-            Some(6.0),
-            None,
-            None,
-        );
+        let outcome =
+            engine.transcribe_stream(Box::new(stdout), Some("zh"), Some(4), Some(6.0), None, None);
 
         let _ = child.wait();
         match outcome {
@@ -1225,6 +1380,60 @@ mod tests {
         }
     }
 
+    /// 端到端证据（默认 `#[ignore]`，不进常规 `cargo test --lib`）：
+    /// 出厂配置下 `Segment::confidence` 必须非 `None`——这是「转写质检」低置信
+    /// 一栏能否非空的前提。
+    ///
+    /// 用真实素材跑一遍真引擎（Vulkan whisper-cli + ggml-small-q5_0 + Silero VAD），
+    /// 断言：所有片段都有置信度，且数值落在 avg_logprob 的合理区间（< 0）。
+    /// 缺素材/缺引擎时跳过而不是 fail——干净 CI 上这些都不存在。
+    #[test]
+    #[ignore = "端到端实测：需要真实素材与 Vulkan whisper-cli"]
+    fn real_audio_confidence_is_populated_by_default() {
+        let cli_path =
+            PathBuf::from("tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe");
+        let model_path = PathBuf::from("models/whisper/ggml-small-q5_0.bin");
+        let vad_path = Some(PathBuf::from("models/whisper/ggml-silero-v6.2.0.bin"));
+        // 5 分钟真实讲课片段（由 testVideo/03.1.3概率不等式.mp4 的 05:05-10:05 裁出）
+        let audio = PathBuf::from("target/test_5min_confidence.wav");
+        if !cli_path.exists() || !model_path.exists() || !audio.exists() {
+            eprintln!(
+                "跳过 real_audio_confidence_is_populated_by_default：依赖未就位 \
+                 (cli={}, model={}, audio={})",
+                cli_path.exists(),
+                model_path.exists(),
+                audio.exists()
+            );
+            return;
+        }
+
+        let engine =
+            WhisperEngine::with_device(cli_path, model_path, vad_path, 10, 1, true, true, 32, 100);
+        // 出厂默认：质检需要置信度（管线若不显式设置，默认值就是它）
+        assert!(engine.need_token_probs_for_quality.load(Ordering::SeqCst));
+
+        let (segs, _vad) = engine
+            .transcribe_with_model(&audio, Some("zh"), Some(10), Some(300.0), None, None)
+            .expect("转写应成功");
+
+        let scored = segs.iter().filter(|s| s.confidence.is_some()).count();
+        let mut vals: Vec<f64> = segs.iter().filter_map(|s| s.confidence).collect();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p10 = vals[vals.len() / 10];
+        println!(
+            "端到端：{} 句，{} 句带置信度，区间 [{:.3}, {:.3}]，中位数 {:.3}，p10 {:.3}，< -0.35 占 {:.1}%",
+            segs.len(),
+            scored,
+            vals.first().copied().unwrap_or(0.0),
+            vals.last().copied().unwrap_or(0.0),
+            vals[vals.len() / 2],
+            p10,
+            100.0 * vals.iter().filter(|v| **v < -0.35).count() as f64 / vals.len().max(1) as f64,
+        );
+        assert_eq!(scored, segs.len(), "默认配置下每一句都必须带置信度");
+        assert!(vals.iter().all(|v| *v < 0.0), "avg_logprob 必须为负");
+    }
+
     // ---- ChildPidGuard：子进程 PID 登记的生命周期 ----
     //
     // 这些测试直接针对「陈旧 PID 会被 kill_process_tree 误杀」这条风险链的源头：
@@ -1276,10 +1485,7 @@ mod tests {
             // 默认并行跑用例，别的用例可能先领走 0——断言具体数值会让这条测试随机翻车。
             assert_eq!(entries[0].0, 777, "登记的应是该子进程 PID");
         }
-        assert!(
-            registered(&registry).is_empty(),
-            "子进程结束后守卫负责注销"
-        );
+        assert!(registered(&registry).is_empty(), "子进程结束后守卫负责注销");
     }
 
     #[test]
@@ -1359,7 +1565,11 @@ mod tests {
         drop(reaped);
 
         let left = registered(&registry);
-        assert_eq!(left.len(), 1, "只应摘掉自己那一行，不能牵连同 PID 的他人条目");
+        assert_eq!(
+            left.len(),
+            1,
+            "只应摘掉自己那一行，不能牵连同 PID 的他人条目"
+        );
         assert_eq!(take_live_pids(&registry), vec![1001]);
     }
 

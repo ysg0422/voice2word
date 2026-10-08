@@ -234,10 +234,11 @@ impl CompactionPlan {
         if self.map.is_empty() {
             return t;
         }
-        let idx = match self
-            .map
-            .binary_search_by(|p| p.compact_start.partial_cmp(&t).unwrap_or(std::cmp::Ordering::Equal))
-        {
+        let idx = match self.map.binary_search_by(|p| {
+            p.compact_start
+                .partial_cmp(&t)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
             Ok(i) => i,
             Err(0) => 0,
             Err(i) => i - 1,
@@ -275,10 +276,13 @@ fn frame_db(pcm: &[i16], frame: usize) -> Vec<f64> {
         if chunk.is_empty() {
             continue;
         }
-        let sum: f64 = chunk.iter().map(|&s| {
-            let v = s as f64;
-            v * v
-        }).sum();
+        let sum: f64 = chunk
+            .iter()
+            .map(|&s| {
+                let v = s as f64;
+                v * v
+            })
+            .sum();
         let rms = (sum / chunk.len() as f64).sqrt();
         let db = if rms <= 1.0 {
             -100.0
@@ -483,20 +487,45 @@ mod tests {
     fn filter_chain_orders_denoise_before_normalize_and_resample_last() {
         let opts = SpeechFilterOptions::default();
         let chain = opts.chain().unwrap();
-        let pos = |needle: &str| chain.find(needle).unwrap_or_else(|| panic!("缺少 {needle}: {chain}"));
+        let pos = |needle: &str| {
+            chain
+                .find(needle)
+                .unwrap_or_else(|| panic!("缺少 {needle}: {chain}"))
+        };
         assert!(pos("highpass") < pos("afftdn"), "高通应在降噪前: {chain}");
-        assert!(pos("afftdn") < pos("dynaudnorm"), "降噪必须在归一之前: {chain}");
-        assert!(pos("dynaudnorm") < pos("aresample"), "重采样必须是最后一级: {chain}");
+        assert!(
+            pos("afftdn") < pos("dynaudnorm"),
+            "降噪必须在归一之前: {chain}"
+        );
+        assert!(
+            pos("dynaudnorm") < pos("aresample"),
+            "重采样必须是最后一级: {chain}"
+        );
         assert!(chain.contains("resampler=soxr"), "应使用 soxr: {chain}");
-        assert!(!chain.contains("atempo"), "1.0 倍速不应插入 atempo: {chain}");
+        assert!(
+            !chain.contains("atempo"),
+            "1.0 倍速不应插入 atempo: {chain}"
+        );
     }
 
     #[test]
     fn filter_chain_inserts_atempo_before_resample() {
-        let chain = SpeechFilterOptions::default().chain_with_speed(1.35).unwrap();
-        let pos = |needle: &str| chain.find(needle).unwrap_or_else(|| panic!("缺少 {needle}: {chain}"));
-        assert!(pos("dynaudnorm") < pos("atempo"), "变速应在归一之后: {chain}");
-        assert!(pos("atempo") < pos("aresample"), "变速应在重采样之前: {chain}");
+        let chain = SpeechFilterOptions::default()
+            .chain_with_speed(1.35)
+            .unwrap();
+        let pos = |needle: &str| {
+            chain
+                .find(needle)
+                .unwrap_or_else(|| panic!("缺少 {needle}: {chain}"))
+        };
+        assert!(
+            pos("dynaudnorm") < pos("atempo"),
+            "变速应在归一之后: {chain}"
+        );
+        assert!(
+            pos("atempo") < pos("aresample"),
+            "变速应在重采样之前: {chain}"
+        );
         assert!(chain.contains("atempo=1.350"));
     }
 
@@ -523,9 +552,18 @@ mod tests {
 
         let plan = plan_compaction(&pcm, rate, &CompactionConfig::default());
         assert_eq!(plan.total_samples, total);
-        assert!(plan.is_worthwhile(0.20), "5s 静音应被判定为值得压实: ratio={}", plan.ratio());
+        assert!(
+            plan.is_worthwhile(0.20),
+            "5s 静音应被判定为值得压实: ratio={}",
+            plan.ratio()
+        );
         assert!(plan.ratio() < 0.55, "保留比例应显著下降: {}", plan.ratio());
-        assert_eq!(plan.spans.len(), 2, "两段语音各留一个区间: {:?}", plan.spans);
+        assert_eq!(
+            plan.spans.len(),
+            2,
+            "两段语音各留一个区间: {:?}",
+            plan.spans
+        );
         // 第一段保留区间的起点不应早于 0，末尾不应吞掉第二段
         assert_eq!(plan.spans[0].0, 0);
         assert!(plan.spans[1].1 == total);
@@ -561,7 +599,11 @@ mod tests {
         // 压实音频里的 0s 对应原音频 0s
         assert!((plan.to_original(0.0) - 0.0).abs() < 1e-6);
         // 压实音频里的 1.5s 仍在第一段语音内 → 原时间轴同样约 1.5s
-        assert!((plan.to_original(1.5) - 1.5).abs() < 1e-6, "{}", plan.to_original(1.5));
+        assert!(
+            (plan.to_original(1.5) - 1.5).abs() < 1e-6,
+            "{}",
+            plan.to_original(1.5)
+        );
         // 第二段语音的起点在压实时间轴上约 2.1s（2s 语音 + 120ms 过渡），
         // 但映射回原时间轴必须是 7s 左右
         let second = plan.map.last().unwrap();
@@ -571,7 +613,10 @@ mod tests {
             second.orig_start
         );
         let remapped = plan.to_original(second.compact_start);
-        assert!((remapped - 7.0).abs() < 0.3, "压实 2.1s → 原始 7s，实得 {remapped}");
+        assert!(
+            (remapped - 7.0).abs() < 0.3,
+            "压实 2.1s → 原始 7s，实得 {remapped}"
+        );
 
         // 映射必须单调不减
         let mut prev = -1.0;
@@ -601,6 +646,92 @@ mod tests {
     }
 
     #[test]
+    fn identity_plan_remaps_without_touching_timeline() {
+        let rate = 16_000u32;
+        let plan = CompactionPlan::identity(4 * rate as usize, rate);
+        assert!(plan.is_identity());
+        // 恒等映射：任意时刻原样返回，含右边界与边界外
+        for t in [0.0, 1.5, 4.0, 9.0] {
+            assert!((plan.to_original(t) - t).abs() < 1e-9, "t={t}");
+        }
+        // 空映射（total_samples == 0）也必须恒等，而不是回落到 0
+        let empty = CompactionPlan::identity(0, rate);
+        assert!(empty.map.is_empty());
+        assert!(empty.spans.is_empty());
+        assert_eq!(empty.to_original(3.0), 3.0);
+        assert_eq!(empty.to_original(-1.0), -1.0);
+        assert_eq!(empty.ratio(), 1.0);
+    }
+
+    #[test]
+    fn to_original_span_never_inverts_and_is_monotonic_at_boundaries() {
+        let rate = 16_000u32;
+        let mut pcm = tone(2.0, rate, 8000);
+        pcm.extend(silence(5.0, rate));
+        pcm.extend(tone(2.0, rate, 8000));
+        let plan = plan_compaction(&pcm, rate, &CompactionConfig::default());
+
+        // 末尾与越过末尾都必须单调外推，且区间不反转
+        let kept_sec = plan.kept_samples as f64 / rate as f64;
+        let (s, e) = plan.to_original_span(kept_sec, kept_sec + 1.0);
+        assert!(e >= s, "区间不可反转: {s}..{e}");
+        // 起点在前、终点在后时同样不反转
+        let (s2, e2) = plan.to_original_span(1.0, 0.0);
+        assert!(e2 >= s2);
+        // 映射结果永不早于 0
+        assert!(plan.to_original(-5.0) >= 0.0);
+    }
+
+    #[test]
+    fn wav_header_fields_match_pcm16_mono() {
+        let dir = std::env::temp_dir().join("v2w_audio_prep_hdr_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hdr.wav");
+        // 奇数个样本：data 段长度为偶数（2 字节/样本），且头里不能出现补齐字节
+        let samples = [7i16, -7, 1234];
+        write_wav_mono16(&path, &samples, 16_000).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len(), 44 + samples.len() * 2, "16 位单声道不应有补齐");
+        assert_eq!(&raw[0..4], b"RIFF");
+        assert_eq!(
+            u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
+            36 + (samples.len() * 2) as u32,
+            "RIFF 块大小应为 36 + data 长度"
+        );
+        assert_eq!(&raw[8..12], b"WAVE");
+        assert_eq!(&raw[12..16], b"fmt ");
+        assert_eq!(u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]), 16);
+        assert_eq!(u16::from_le_bytes([raw[20], raw[21]]), 1, "格式应为 PCM");
+        assert_eq!(u16::from_le_bytes([raw[22], raw[23]]), 1, "通道数应为 1");
+        assert_eq!(
+            u32::from_le_bytes([raw[24], raw[25], raw[26], raw[27]]),
+            16_000
+        );
+        assert_eq!(
+            u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]),
+            16_000 * 2,
+            "字节率应为 rate * 块对齐"
+        );
+        assert_eq!(u16::from_le_bytes([raw[32], raw[33]]), 2, "块对齐应为 2");
+        assert_eq!(u16::from_le_bytes([raw[34], raw[35]]), 16, "位深应为 16");
+        assert_eq!(&raw[36..40], b"data");
+        assert_eq!(
+            u32::from_le_bytes([raw[40], raw[41], raw[42], raw[43]]),
+            (samples.len() * 2) as u32
+        );
+        // 小端样本逐个对齐
+        for (i, s) in samples.iter().enumerate() {
+            let off = 44 + i * 2;
+            assert_eq!(
+                i16::from_le_bytes([raw[off], raw[off + 1]]),
+                *s,
+                "第 {i} 个样本"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn wav_round_trip_header() {
         let dir = std::env::temp_dir().join("v2w_audio_prep_test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -611,7 +742,10 @@ mod tests {
         assert_eq!(&raw[0..4], b"RIFF");
         assert_eq!(&raw[8..12], b"WAVE");
         assert_eq!(raw.len(), 44 + samples.len() * 2);
-        assert_eq!(u32::from_le_bytes([raw[24], raw[25], raw[26], raw[27]]), 16_000);
+        assert_eq!(
+            u32::from_le_bytes([raw[24], raw[25], raw[26], raw[27]]),
+            16_000
+        );
         assert_eq!(u16::from_le_bytes([raw[22], raw[23]]), 1);
         let _ = std::fs::remove_file(&path);
     }

@@ -15,7 +15,14 @@ use super::media_pipeline::{apply_background_priority, apply_no_window, DecodePo
 
 pub const PLAYER_WIDTH: u32 = 1280;
 pub const PLAYER_HEIGHT: u32 = 720;
-pub const FRAME_BYTES: usize = (PLAYER_WIDTH * PLAYER_HEIGHT * 4) as usize;
+
+/// 播放位置 = 本次播放 / 恢复的基准秒 + 已流逝的墙钟秒。
+///
+/// 抽成纯函数便于单测（不依赖真实播放）。时钟**只**由墙钟推进：视频帧落后时
+/// 允许出帧线程丢帧追上，而不是让时钟等帧（旧实现见 `current_play_time`）。
+fn play_time_at(base: f64, wall_sec: f64) -> f64 {
+    base + wall_sec.max(0.0)
+}
 
 /// 一帧解码输出：BGRA 像素 + 本帧实际尺寸（随视频真实宽高比动态变化，UI 据此构建纹理）
 pub struct PlayerFrame {
@@ -43,7 +50,6 @@ pub struct VideoPlayerEngine {
     audio_feeder_proc: Arc<Mutex<Option<Child>>>,
     play_start_instant: Arc<Mutex<Option<Instant>>>,
     play_start_seconds: Arc<Mutex<f64>>,
-    current_frame_index: Arc<AtomicU64>,
 }
 
 impl VideoPlayerEngine {
@@ -80,7 +86,6 @@ impl VideoPlayerEngine {
             audio_feeder_proc: Arc::new(Mutex::new(None)),
             play_start_instant: Arc::new(Mutex::new(None)),
             play_start_seconds: Arc::new(Mutex::new(0.0)),
-            current_frame_index: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -132,16 +137,17 @@ impl VideoPlayerEngine {
         if !self.is_playing() {
             return base;
         }
-        let frame_idx = self.current_frame_index.load(Ordering::SeqCst);
         if let Some(instant) = *self
             .play_start_instant
             .lock()
             .unwrap_or_else(|e| e.into_inner())
         {
-            let wall_sec = instant.elapsed().as_secs_f64();
-            let frame_sec = (frame_idx as f64) / 25.0;
-            // 毫秒级锁定画面与字幕：以真实出帧进度为基准，杜绝启动延迟导致的跑飞
-            base + frame_sec.min(wall_sec)
+            // 以墙钟（≈音频进度）为唯一基准推进播放位置，不再拿视频帧号兜底。
+            // 旧实现取 `min(frame_sec, wall_sec)`：解码一旦落后，视频帧号停在旧帧，
+            // 该表达式退化成 frame_sec，时钟被帧号拖住；而音频（ffplay 管道）仍按
+            // 墙钟前进，长片就会持续累积音画漂移。视频帧只是画面，跟不上时应由出帧
+            // 线程丢帧追上（见 `play` 内出帧线程），时钟不该等它。
+            play_time_at(base, instant.elapsed().as_secs_f64())
         } else {
             base
         }
@@ -170,6 +176,15 @@ impl VideoPlayerEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         self.kill_procs();
+        // 连同最后一帧一起丢弃。`stop()` 的三个调用点（开始转写、时间轴跳转/上下句、
+        // 引擎析构）语义都是「结束这次预览」，而跳转路径紧接着会抽一张**新位置**的
+        // 静态帧（`trigger_extract_frame`）。若这里留着旧的实时帧，`render_monitor_picture`
+        // 只要 `get_frame()` 有值就永远走实时帧分支、静态帧分支根本到不了，用户跳转后
+        // 看到的是跳转前那张画面，与时间轴/字幕完全对不上。
+        // 注意：暂停（`pause_clock`）**不**清帧——那里要保留最后一帧作定格。
+        if let Ok(mut lock) = self.current_frame.lock() {
+            *lock = None;
+        }
     }
 
     fn kill_procs(&self) {
@@ -212,59 +227,60 @@ impl VideoPlayerEngine {
             .play_start_instant
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
-        self.current_frame_index.store(0, Ordering::SeqCst);
         self.is_playing.store(true, Ordering::SeqCst);
 
         // 启动音频管线：通过 FFmpeg 容器级关键帧快速寻轨 (100ms 响应，杜绝原生 ffplay 耗费 9.7 秒解码卡死的严重音画脱节)
         if self.ffplay_path.exists() {
             let mut feeder_cmd = Command::new(&self.ffmpeg_path);
             apply_no_window(&mut feeder_cmd);
-            feeder_cmd.args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-ss",
-                &start_sec_str,
-                "-i",
-            ])
-            .arg(&video_path)
-            .args([
-                "-vn",
-                "-sn",
-                "-dn",
-                "-acodec",
-                "pcm_s16le",
-                "-ar",
-                "44100",
-                "-ac",
-                "2",
-                "-f",
-                "wav",
-                "pipe:1",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            feeder_cmd
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-ss",
+                    &start_sec_str,
+                    "-i",
+                ])
+                .arg(&video_path)
+                .args([
+                    "-vn",
+                    "-sn",
+                    "-dn",
+                    "-acodec",
+                    "pcm_s16le",
+                    "-ar",
+                    "44100",
+                    "-ac",
+                    "2",
+                    "-f",
+                    "wav",
+                    "pipe:1",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
 
             if let Ok(mut feeder_child) = feeder_cmd.spawn() {
                 crate::utils::child_registry::adopt(&feeder_child);
                 if let Some(feeder_stdout) = feeder_child.stdout.take() {
                     let mut player_cmd = Command::new(&self.ffplay_path);
                     apply_no_window(&mut player_cmd);
-                    player_cmd.args([
-                        "-nodisp",
-                        "-autoexit",
-                        "-loglevel",
-                        "quiet",
-                        "-nostats",
-                        "-f",
-                        "wav",
-                        "-i",
-                        "pipe:0",
-                    ])
-                    .stdin(feeder_stdout)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
+                    player_cmd
+                        .args([
+                            "-nodisp",
+                            "-autoexit",
+                            "-loglevel",
+                            "quiet",
+                            "-nostats",
+                            "-f",
+                            "wav",
+                            "-i",
+                            "pipe:0",
+                        ])
+                        .stdin(feeder_stdout)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
 
                     if let Ok(player_child) = player_cmd.spawn() {
                         crate::utils::child_registry::adopt(&player_child);
@@ -292,32 +308,33 @@ impl VideoPlayerEngine {
         let frame_bytes = frame_w as usize * frame_h as usize * 4;
 
         let mut used_hwaccel = self.policy.try_hwaccel;
-        let mut video_child = match self.spawn_video(&video_path, &start_sec_str, used_hwaccel, frame_w, frame_h) {
-            Ok(child) => child,
-            Err(e) if used_hwaccel => {
-                warn!(error = %e, "硬件解码启动失败，回退软解");
-                used_hwaccel = false;
-                match self.spawn_video(&video_path, &start_sec_str, false, frame_w, frame_h) {
-                    Ok(child) => child,
-                    Err(e) => {
-                        error!("启动 FFmpeg 视频流失败: {}", e);
-                        self.is_playing.store(false, Ordering::SeqCst);
-                        // 音频管线（ffplay + ffmpeg feeder）在视频流之前就已启动并
-                        // 存进 audio_proc / audio_feeder_proc。这里只置 is_playing
-                        // 而不回收，界面显示「未播放」却仍有声音，且两进程一直占着
-                        // 视频文件句柄。必须与 `stop()` 同源地把整条管线收掉。
-                        self.kill_procs();
-                        return;
+        let mut video_child =
+            match self.spawn_video(&video_path, &start_sec_str, used_hwaccel, frame_w, frame_h) {
+                Ok(child) => child,
+                Err(e) if used_hwaccel => {
+                    warn!(error = %e, "硬件解码启动失败，回退软解");
+                    used_hwaccel = false;
+                    match self.spawn_video(&video_path, &start_sec_str, false, frame_w, frame_h) {
+                        Ok(child) => child,
+                        Err(e) => {
+                            error!("启动 FFmpeg 视频流失败: {}", e);
+                            self.is_playing.store(false, Ordering::SeqCst);
+                            // 音频管线（ffplay + ffmpeg feeder）在视频流之前就已启动并
+                            // 存进 audio_proc / audio_feeder_proc。这里只置 is_playing
+                            // 而不回收，界面显示「未播放」却仍有声音，且两进程一直占着
+                            // 视频文件句柄。必须与 `stop()` 同源地把整条管线收掉。
+                            self.kill_procs();
+                            return;
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                error!("启动 FFmpeg 视频流失败: {}", e);
-                self.is_playing.store(false, Ordering::SeqCst);
-                self.kill_procs();
-                return;
-            }
-        };
+                Err(e) => {
+                    error!("启动 FFmpeg 视频流失败: {}", e);
+                    self.is_playing.store(false, Ordering::SeqCst);
+                    self.kill_procs();
+                    return;
+                }
+            };
 
         let mut stdout = match video_child.stdout.take() {
             Some(s) => s,
@@ -340,7 +357,6 @@ impl VideoPlayerEngine {
         let is_playing_flag = self.is_playing.clone();
         let generation = self.generation.clone();
         let play_instant_target = self.play_start_instant.clone();
-        let frame_index_target = self.current_frame_index.clone();
 
         std::thread::Builder::new()
             .name(format!("v2w-preview-{gen}"))
@@ -360,6 +376,9 @@ impl VideoPlayerEngine {
                             if generation.load(Ordering::SeqCst) != gen {
                                 break;
                             }
+                            // 墙钟锚点取「第一帧真正到达」的时刻（音频管线先行启动），
+                            // 避免启动延迟被算进时钟造成初始跳变；出帧节奏与时钟同源，
+                            // 之后的落后只可能来自解码跟不上。
                             if active_start.is_none() {
                                 let now = Instant::now();
                                 active_start = Some(now);
@@ -367,7 +386,7 @@ impl VideoPlayerEngine {
                                     *lock = Some(now);
                                 }
                             }
-                            let start_inst = active_start.unwrap();
+                            let start_inst = active_start.unwrap_or_else(Instant::now);
                             let target_time = start_inst + FRAME_DURATION * (frame_index as u32);
                             let now = Instant::now();
                             if target_time > now {
@@ -375,8 +394,8 @@ impl VideoPlayerEngine {
                             } else if now.saturating_duration_since(target_time)
                                 > FRAME_DURATION * 2
                             {
+                                // 解码落后于墙钟：丢掉这一帧直接追上，而不是让时钟等帧。
                                 frame_index += 1;
-                                frame_index_target.store(frame_index, Ordering::SeqCst);
                                 continue;
                             }
                             if let Ok(mut lock) = frame_target.lock() {
@@ -388,7 +407,6 @@ impl VideoPlayerEngine {
                                 frame_version_target.fetch_add(1, Ordering::SeqCst);
                             }
                             frame_index += 1;
-                            frame_index_target.store(frame_index, Ordering::SeqCst);
                         }
                         Err(_) => break,
                     }
@@ -396,14 +414,14 @@ impl VideoPlayerEngine {
             })
             .ok();
 
-            info!(
-                start = start_seconds,
-                hwaccel = used_hwaccel,
-                gen,
-                width = frame_w,
-                height = frame_h,
-                "内嵌播放器已启动 (BGRA 等比出帧 @ 25fps)"
-            );
+        info!(
+            start = start_seconds,
+            hwaccel = used_hwaccel,
+            gen,
+            width = frame_w,
+            height = frame_h,
+            "内嵌播放器已启动 (BGRA 等比出帧 @ 25fps)"
+        );
     }
 
     fn spawn_video(
@@ -483,10 +501,7 @@ impl VideoPlayerEngine {
                 Ok(Some(status)) if !status.success() => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "hwaccel ffmpeg exited",
-                    ));
+                    return Err(std::io::Error::other("hwaccel ffmpeg exited"));
                 }
                 _ => {}
             }
@@ -498,5 +513,90 @@ impl VideoPlayerEngine {
 impl Drop for VideoPlayerEngine {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame_struct() -> Arc<PlayerFrame> {
+        Arc::new(PlayerFrame {
+            data: vec![0u8; 4 * 4 * 4],
+            width: 4,
+            height: 4,
+        })
+    }
+
+    /// `stop()` 必须清掉最后一帧，否则时间轴跳转后监视器仍显示跳转前的旧画面。
+    #[test]
+    fn stop_discards_last_frame() {
+        let engine = VideoPlayerEngine::new("ffmpeg");
+        *engine.current_frame.lock().unwrap() = Some(frame_struct());
+        engine.stop();
+        assert!(engine.get_frame().is_none(), "stop() 后不应残留上一帧");
+    }
+
+    /// 暂停要保留定格画面（只是停时钟），不能顺手把帧清掉。
+    #[test]
+    fn pause_keeps_last_frame_as_still() {
+        let engine = VideoPlayerEngine::new("ffmpeg");
+        *engine.current_frame.lock().unwrap() = Some(frame_struct());
+        engine.pause_clock();
+        assert!(engine.get_frame().is_some(), "暂停应保留定格帧");
+    }
+
+    /// 缺陷 1 回归：播放位置必须只由墙钟推进。解码落后时视频帧号停在旧帧，
+    /// 旧实现 `min(frame_sec, wall_sec)` 会让时钟被帧号拖住，而音频继续前进。
+    #[test]
+    fn play_time_follows_wall_clock_not_frame_index() {
+        // 帧只走到第 25 帧（1.0s），墙钟已到 3.0s —— 模拟解码落后 2 秒
+        let frame_lagging_sec = 25.0 / 25.0;
+        let wall_sec = 3.0;
+        assert!(
+            play_time_at(0.0, wall_sec) > frame_lagging_sec,
+            "时钟必须按墙钟推进，不能被落后的帧号拖住"
+        );
+        // 与旧实现对比：旧值会退化成 frame_lagging_sec，新值等于墙钟
+        assert!((play_time_at(0.0, wall_sec) - wall_sec).abs() < 1e-9);
+        assert!((play_time_at(120.0, 0.5) - 120.5).abs() < 1e-9);
+        // 暂停后恢复（重锚 120.5s）不应跳变：新基线 + 新的墙钟流逝
+        assert!((play_time_at(play_time_at(120.0, 0.5), 0.25) - 120.75).abs() < 1e-9);
+        // 负的墙钟流逝（时钟被回拨）不得把进度往回带
+        assert!((play_time_at(5.0, -1.0) - 5.0).abs() < 1e-9);
+    }
+
+    /// 缺陷 1 回归（时钟集成）：播放位置随时间推进，且暂停后停在基线位置，
+    /// 恢复播放从该位置继续、不产生跳变。用真实时钟但只断言单调/基线语义。
+    #[test]
+    fn clock_advances_and_pause_resume_does_not_jump() {
+        let engine = VideoPlayerEngine::new("ffmpeg");
+        // 未播放：时钟就是基线，不推进
+        assert_eq!(engine.current_play_time(), 0.0);
+
+        // 模拟 play() 已设置起点：is_playing=true + 锚点已落地
+        engine.is_playing.store(true, Ordering::SeqCst);
+        *engine.play_start_seconds.lock().unwrap() = 10.0;
+        *engine.play_start_instant.lock().unwrap() = Some(Instant::now());
+
+        let t0 = engine.current_play_time();
+        assert!((10.0..11.0).contains(&t0), "应从 10.0s 起推进: {t0}");
+
+        // 暂停：时钟停在当前值，不再推进
+        engine.pause_clock();
+        let paused = engine.current_play_time();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(engine.current_play_time(), paused, "暂停后时钟不得推进");
+
+        // 恢复：play_start_seconds 已经重锚为 paused，新的锚点从这里继续
+        engine.is_playing.store(true, Ordering::SeqCst);
+        *engine.play_start_instant.lock().unwrap() = Some(Instant::now());
+        let resumed = engine.current_play_time();
+        assert!(
+            resumed >= paused && resumed < paused + 0.5,
+            "恢复应从暂停点继续、不得跳变: paused={paused} resumed={resumed}"
+        );
+
+        engine.stop();
     }
 }

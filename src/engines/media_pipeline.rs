@@ -54,13 +54,22 @@ impl Vendor {
         if n.contains("radeon") || n.contains("amd") {
             return Some(Vendor::Amd);
         }
-        if n.contains("nvidia") || n.contains("geforce") || n.contains("quadro") || n.contains("rtx") {
+        if n.contains("nvidia")
+            || n.contains("geforce")
+            || n.contains("quadro")
+            || n.contains("rtx")
+        {
             return Some(Vendor::Nvidia);
         }
         if n.contains("intel") || n.contains("iris") || n.contains("uhd") || n.contains("arc") {
             return Some(Vendor::Intel);
         }
-        if n.contains("apple") || n.contains("m1") || n.contains("m2") || n.contains("m3") || n.contains("m4") {
+        if n.contains("apple")
+            || n.contains("m1")
+            || n.contains("m2")
+            || n.contains("m3")
+            || n.contains("m4")
+        {
             return Some(Vendor::Other);
         }
         None
@@ -72,6 +81,31 @@ impl Vendor {
             Vendor::Nvidia => "NVIDIA",
             Vendor::Intel => "Intel",
             Vendor::Other => "其他",
+        }
+    }
+}
+
+/// FFmpeg 输入侧硬解后端。
+///
+/// 本项目只面向 Windows，候选就这两种：`d3d11va` 覆盖面最广（AMD / Intel /
+/// NVIDIA 通吃，是唯一「一个后端打通三家」的选择），`d3d12va` 更新但老驱动更挑剔。
+/// `None`（= 不加 `-hwaccel`）才是默认：无 GPU、厂商未知、或用户在设置页关掉
+/// `gpu.hwaccel_decode` 时都走纯软解。
+///
+/// 只用于**预览 / 代理**链路（见 [`proxy_args`]）；抽音频 / 转写链路一律纯软解，
+/// 边界见 `ffmpeg.rs` 顶部说明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HwAccel {
+    D3d11va,
+    D3d12va,
+}
+
+impl HwAccel {
+    /// 传给 FFmpeg `-hwaccel` 的字面量。
+    pub fn flag(&self) -> &'static str {
+        match self {
+            HwAccel::D3d11va => "d3d11va",
+            HwAccel::D3d12va => "d3d12va",
         }
     }
 }
@@ -153,11 +187,142 @@ impl HardwareProfile {
             software_threads: 0, // ffmpeg 0 = auto
         }
     }
+
+    /// 预览 / 代理链路的输入侧硬解后端（`-hwaccel` 的取值）。
+    ///
+    /// 规则（路线图 P0-A3）：
+    /// - AMD / Intel / NVIDIA → `d3d11va`。三家的 D3D11 驱动都实现了
+    ///   D3D11 Video Decoder，是 Windows 上唯一能一家通吃的后端；NVIDIA 的
+    ///   `cuda`/`nvdec` 在核显机器上不可用，故不在此分流。
+    /// - 无 GPU（软件后端 / 纯 CPU 档案）、厂商未知、`Vendor::Other` → `None`，
+    ///   保持纯软解。
+    ///
+    /// 注意这只是**候选**：是否真用上由构造者选定（
+    /// `ProxyManager::with_hwaccel`），默认构造不加任何 `-hwaccel`。
+    /// [`ProxyManager::ensure_proxy`] 会自动回退纯软解。
+    pub fn hwaccel_backend(&self) -> Option<HwAccel> {
+        let supported = matches!(
+            self.vendor,
+            Some(Vendor::Amd) | Some(Vendor::Nvidia) | Some(Vendor::Intel)
+        );
+        (self.hardware_decode && supported).then_some(HwAccel::D3d11va)
+    }
+}
+
+/// 代理转码的执行器：跑一次硬解/软解尝试，返回该次是否成功。
+///
+/// 抽成 `FnMut` 不是为了好看，而是为了**可测**：硬解在部分素材/驱动上真的会失败，
+/// 而在任何一台机器上都无法保证构造出「d3d11va 必然失败」的素材来跑端到端测试。
+/// 把「失败后怎么办」从「怎么跑」里切出来后，回退逻辑可以用一个假执行器
+/// 完整覆盖（见 `hardware_failure_retries_once_with_software`）。
+type ProxyAttempt<'a> = Box<dyn FnMut(Option<HwAccel>) -> Result<bool> + 'a>;
+
+/// 跑代理转码，**硬解失败时自动用纯软解重试恰好一次**；返回最终是否成功。
+///
+/// # 为什么这条回退是必须的
+///
+/// `-hwaccel` 能不能用起来取决于素材编码、显卡驱动版本、图形会话类型（本地 /
+/// RDP / 虚拟显示器）等本进程看不见的因素。不加回退，「加硬解」就等于
+/// 「原本能转的素材现在转不了」——净负收益。回退走的是同一套参数，只把
+/// `-hwaccel` 去掉，因此结果必然等价于加硬解之前的历史行为。
+///
+/// 只重试一次：软解是最后兜底，再失败就是素材本身的问题，重试没有意义。
+fn transcode_with_fallback(hwaccel: Option<HwAccel>, mut run: ProxyAttempt<'_>) -> Result<bool> {
+    let Some(hw) = hwaccel else {
+        // 本来就是软解：没有可回退的东西，失败即失败。
+        return run(None);
+    };
+    if run(Some(hw))? {
+        return Ok(true);
+    }
+    warn!(
+        hwaccel = hw.flag(),
+        "hardware decode failed; retrying this proxy with pure software decode"
+    );
+    run(None)
+}
+
+/// 代理转码的输出侧参数（`-i <src>` 之后的那一段）。
+///
+/// `-hwaccel` **绝不**出现在这里：硬解属于输入侧，且只有 [`proxy_args`] 的
+/// 策略判定有权决定加不加。抽出来是为了让「硬解开关只影响输入侧」这件事
+/// 有一个单一出口，也方便单测直接比对软解 / 硬解两条路径。
+fn soft_encode_args(vf: &str, threads: u32, out: &Path) -> Vec<String> {
+    vec![
+        "-vf".to_string(),
+        vf.to_string(),
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        "veryfast".to_string(),
+        "-crf".to_string(),
+        "28".to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+        "-profile:v".to_string(),
+        "baseline".to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-b:a".to_string(),
+        "96k".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        "-threads".to_string(),
+        threads.to_string(),
+        out.to_string_lossy().into_owned(),
+    ]
+}
+
+/// 预览 / 代理转码的完整参数向量（**预览链路专用**）。
+///
+/// 多抽这一层的目的是「硬解策略可测」：`ensure_proxy` 过去把整条命令内联在
+/// `Command::new(...).args([...])` 里，硬解与否只能靠真跑一次进程才知道，
+/// 于是这条策略一直没人敢动。拆成「构造 `Vec<String>` → 喂给 `Command`」后，
+/// 硬解 / 软解 / 回退三条路径都能在单测里逐参数断言。
+///
+/// 硬解写法刻意保守：只加 `-hwaccel <backend>`，**不加**
+/// `-hwaccel_output_format`，让 FFmpeg 自己把帧下载回系统内存——这样后面的
+/// `-vf scale` 与 `libx264` 都仍面对普通软件帧，滤镜链与编码器一行都不用改。
+///
+/// `hwaccel = None`（厂商未知 / 无 GPU / 用户关掉开关 / 硬解回退）时产出的
+/// 参数与加硬解之前的历史版本**逐参数相同**。
+pub fn proxy_args(
+    source: &Path,
+    out: &Path,
+    height: u32,
+    hwaccel: Option<HwAccel>,
+    threads: u32,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-y".to_string(),
+    ];
+    // 输入侧硬解：必须落在 `-i` 之前。放在 `-i` 之后 FFmpeg 会把它当成输出
+    // 选项，轻则忽略、重则报错。
+    if let Some(hw) = hwaccel {
+        args.push("-hwaccel".to_string());
+        args.push(hw.flag().to_string());
+    }
+    args.push("-i".to_string());
+    args.push(source.to_string_lossy().into_owned());
+    let vf = format!("scale=-2:{}", height);
+    args.extend(soft_encode_args(&vf, threads, out));
+    args
 }
 
 /// H.264 proxy generator. Proxy files are never HEVC.
 pub struct ProxyManager {
     ffmpeg_path: PathBuf,
+    /// 代理转码的输入侧硬解后端；`None` = 纯软解。
+    ///
+    /// 为什么是**实例字段**而不是进程级全局量：`ProxyManager` 在 `app::state`、
+    /// UI 预览与测试里都有构造点，但真正决定「这台机器要不要硬解」的是
+    /// [`HardwareProfile`]——把它显式传进来，比藏一个全局开关更难配错，也不会
+    /// 出现「设置页关了硬解、代理却还在用」的错位。默认构造（[`Self::new`]）
+    /// 取 `None`，与加硬解之前的历史行为逐字节相同。
+    hwaccel: Option<HwAccel>,
     lock: Mutex<()>,
     height_cache: Mutex<HashMap<PathBuf, (FileSignature, Option<u32>)>>,
 }
@@ -187,12 +352,59 @@ fn file_signature(path: &Path) -> FileSignature {
 }
 
 impl ProxyManager {
+    /// 默认构造：**纯软解**，与加硬解之前的历史行为完全一致。
     pub fn new<P: AsRef<Path>>(ffmpeg_path: P) -> Self {
+        Self::with_hwaccel(ffmpeg_path, None)
+    }
+
+    /// 指定输入侧硬解后端（`None` = 纯软解）。
+    ///
+    /// 调用方应传入 [`HardwareProfile::hwaccel_backend`] 的结果——厂商归类与
+    /// 「无 GPU / 厂商未知就不加」的规则都在那里，本类型只负责用它拼命令。
+    pub fn with_hwaccel<P: AsRef<Path>>(ffmpeg_path: P, hwaccel: Option<HwAccel>) -> Self {
         Self {
             ffmpeg_path: ffmpeg_path.as_ref().to_path_buf(),
+            hwaccel,
             lock: Mutex::new(()),
             height_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 按硬件档案构造：一条语句就把「厂商归类 → 后端选择」接进代理链路。
+    ///
+    /// ```ignore
+    /// let proxy_manager = Arc::new(ProxyManager::with_profile(&ffmpeg_path, &hardware));
+    /// ```
+    ///
+    /// 之所以要显式传 [`HardwareProfile`] 而不是在内部自己 `detect()`：`hardware_decode`
+    /// 在 `main.rs` 里会被 `gpu.hwaccel_decode` 覆盖过，内部重新探测会丢掉这个覆盖，
+    /// 出现「设置页关了硬解、代理仍在用显卡」的错位。
+    pub fn with_profile<P: AsRef<Path>>(ffmpeg_path: P, profile: &HardwareProfile) -> Self {
+        Self::with_hwaccel(ffmpeg_path, profile.hwaccel_backend())
+    }
+
+    /// 本实例当前配置的硬解后端（`None` = 纯软解）。
+    pub fn hwaccel(&self) -> Option<HwAccel> {
+        self.hwaccel
+    }
+
+    /// 组装代理转码命令——**唯一的构造点**，参数全部来自 [`proxy_args`]。
+    ///
+    /// 硬解 / 软解 / 回退三种情形都走这里，因此不可能出现「某一分支漏了
+    /// `-threads`」或「回退路径偷偷带着半截硬解参数」这类漂移。让路优先级
+    /// （[`apply_background_priority`]）也在这里统一套用。
+    pub fn proxy_cmd(
+        &self,
+        source: &Path,
+        out: &Path,
+        height: u32,
+        hwaccel: Option<HwAccel>,
+        threads: u32,
+    ) -> Command {
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        apply_background_priority(&mut cmd);
+        cmd.args(proxy_args(source, out, height, hwaccel, threads));
+        cmd
     }
 
     pub fn preview_height<P: AsRef<Path>>(&self, source: P, cpu_machine: bool) -> u32 {
@@ -248,7 +460,10 @@ impl ProxyManager {
         let source = source.as_ref();
         if let Some(h) = self.probe_height(source) {
             if h <= height {
-                info!(height = h, "source already within proxy resolution; skip transcode");
+                info!(
+                    height = h,
+                    "source already within proxy resolution; skip transcode"
+                );
                 return Ok(source.to_path_buf());
             }
         }
@@ -259,55 +474,54 @@ impl ProxyManager {
             return Ok(out);
         }
 
+        // 输入侧硬解策略：构造时由 [`HardwareProfile::hwaccel_backend`] 决定，`None` 即纯软解。
+        let hwaccel = self.hwaccel;
         info!(
             source = %source.display(),
             height,
             out = %out.display(),
+            hwaccel = hwaccel.map(|hw| hw.flag()).unwrap_or("software"),
             "generating H.264 proxy (libx264, never HEVC)"
         );
 
-        let vf = format!("scale=-2:{}", height);
-        let mut cmd = Command::new(&self.ffmpeg_path);
-        apply_background_priority(&mut cmd);
         let encode_threads = proxy_encode_threads();
         info!(
             threads = encode_threads,
             "proxy transcode runs at below-normal priority with a bounded thread budget"
         );
-        let status = cmd
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-            .arg(source)
-            .args([
-                "-vf",
-                &vf,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "28",
-                "-pix_fmt",
-                "yuv420p",
-                "-profile:v",
-                "baseline",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "96k",
-                "-movflags",
-                "+faststart",
-            ])
-            .arg("-threads")
-            .arg(encode_threads.to_string())
-            .arg(&out)
-            .status()
-            .with_context(|| format!("启动代理生成失败: {:?}", self.ffmpeg_path))?;
 
-        if !status.success() {
+        // 硬解失败自动回退软解（只重试一次，决策逻辑见 `transcode_with_fallback`）。
+        // 每次尝试前先清掉半成品：失败的那次可能已经写出了截断的 mp4，`-y` 虽然
+        // 会覆盖，但残留文件会让「成功判定」之外的下游误以为代理已就绪。
+        let ok = transcode_with_fallback(
+            hwaccel,
+            Box::new(|backend| {
+                let _ = std::fs::remove_file(&out);
+                self.run_proxy(source, &out, height, backend, encode_threads)
+                    .map(|status| status.success())
+            }),
+        )?;
+
+        if !ok {
             let _ = std::fs::remove_file(&out);
             anyhow::bail!("FFmpeg 代理生成失败");
         }
         Ok(out)
+    }
+
+    /// 跑一次代理转码，只负责「启动 + 等退出码」，成败判定留给调用方
+    /// （[`Self::ensure_proxy`] 需要据退出码决定要不要回退重试）。
+    fn run_proxy(
+        &self,
+        source: &Path,
+        out: &Path,
+        height: u32,
+        hwaccel: Option<HwAccel>,
+        threads: u32,
+    ) -> Result<std::process::ExitStatus> {
+        let mut cmd = self.proxy_cmd(source, out, height, hwaccel, threads);
+        cmd.status()
+            .with_context(|| format!("启动代理生成失败: {:?}", self.ffmpeg_path))
     }
 
     fn probe_height(&self, source: &Path) -> Option<u32> {
@@ -484,7 +698,10 @@ impl GpuThrottle {
         let limit = limit_percent.clamp(20, 95);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        info!(limit_percent = limit, "GPU 限速已开启：按占空比给桌面留出 GPU 空窗");
+        info!(
+            limit_percent = limit,
+            "GPU 限速已开启：按占空比给桌面留出 GPU 空窗"
+        );
         let worker = std::thread::Builder::new()
             .name("gpu-duty-throttle".into())
             .spawn(move || {
@@ -565,12 +782,12 @@ mod nt_process {
     fn api() -> Option<&'static Api> {
         static API: OnceLock<Option<Api>> = OnceLock::new();
         API.get_or_init(|| unsafe {
-            let module = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+            let module = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
             if module.is_null() {
                 return None;
             }
-            let suspend = GetProcAddress(module, b"NtSuspendProcess\0".as_ptr());
-            let resume = GetProcAddress(module, b"NtResumeProcess\0".as_ptr());
+            let suspend = GetProcAddress(module, c"NtSuspendProcess".as_ptr().cast());
+            let resume = GetProcAddress(module, c"NtResumeProcess".as_ptr().cast());
             if suspend.is_null() || resume.is_null() {
                 return None;
             }
@@ -646,6 +863,15 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
 /// CPU fallback of the same BT.601 limited-range conversion (R,G,B,A).
 pub fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    // NV12 的 UV 平面是 2x2 下采样：宽（或高）为奇数时 `col & !1` / `row / 2` 会
+    // 算出越过 UV 平面末尾的下标——例如 w=3, h=2 时 y_size=6、UV 平面只有 3 字节，
+    // 而最后一列取到 `uv_plane[3]`，直接 index out of bounds panic。
+    // GPU 路径（`Nv12Renderer::new`）已经要求偶数尺寸，这里补齐同一条约束，
+    // 让非法尺寸走可恢复的 Err 而不是在渲染线程里崩溃。
+    anyhow::ensure!(
+        width.is_multiple_of(2) && height.is_multiple_of(2),
+        "NV12 尺寸必须为偶数: {width}x{height}"
+    );
     let w = width as usize;
     let h = height as usize;
     let y_size = w.checked_mul(h).context("nv12 size overflow")?;
@@ -753,7 +979,10 @@ pub struct Nv12Renderer {
 
 impl Nv12Renderer {
     pub fn new(prefer_gpu: bool, width: u32, height: u32) -> Result<Self> {
-        anyhow::ensure!(width % 2 == 0 && height % 2 == 0, "NV12 size must be even");
+        anyhow::ensure!(
+            width.is_multiple_of(2) && height.is_multiple_of(2),
+            "NV12 size must be even"
+        );
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let mut adapters = instance.enumerate_adapters(wgpu::Backends::all());
         adapters.sort_by_key(|a| {
@@ -765,7 +994,11 @@ impl Nv12Renderer {
                 wgpu::DeviceType::Cpu => 4,
                 wgpu::DeviceType::Other => 5,
             };
-            if prefer_gpu { ty } else { 4u8.saturating_sub(ty.min(4)) }
+            if prefer_gpu {
+                ty
+            } else {
+                4u8.saturating_sub(ty.min(4))
+            }
         });
         let adapter = adapters
             .into_iter()
@@ -1054,7 +1287,7 @@ impl Nv12Renderer {
 
 fn padded_bytes_per_row(unpadded: u32) -> u32 {
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    ((unpadded + align - 1) / align) * align
+    unpadded.div_ceil(align) * align
 }
 
 pub fn convert_nv12_frame(
@@ -1088,6 +1321,18 @@ mod tests {
             assert!(px[0] < 8 && px[1] < 8 && px[2] < 8);
             assert_eq!(px[3], 255);
         }
+    }
+
+    #[test]
+    fn nv12_odd_dimensions_return_error_not_panic() {
+        // 宽为奇数时 UV 平面比色度采样需要的短一行：过去这里会越界 panic
+        let nv12 = vec![16u8; 3 * 2 + 3];
+        let err = nv12_to_rgba(&nv12, 3, 2).unwrap_err();
+        assert!(err.to_string().contains("偶数"), "{err}");
+        // 高为奇数同理
+        assert!(nv12_to_rgba(&nv12, 2, 3).is_err());
+        // 合法偶数尺寸仍照常工作
+        assert!(nv12_to_rgba(&[16u8; 6 + 3], 2, 2).is_ok());
     }
 
     #[test]
@@ -1128,12 +1373,30 @@ mod tests {
 
     #[test]
     fn vendor_classifies_common_adapter_names() {
-        assert_eq!(Vendor::from_adapter_name("AMD Radeon RX 7900 XTX"), Some(Vendor::Amd));
-        assert_eq!(Vendor::from_adapter_name("Radeon 680M Graphics"), Some(Vendor::Amd));
-        assert_eq!(Vendor::from_adapter_name("NVIDIA GeForce RTX 4090"), Some(Vendor::Nvidia));
-        assert_eq!(Vendor::from_adapter_name("Intel(R) Iris(R) Xe Graphics"), Some(Vendor::Intel));
-        assert_eq!(Vendor::from_adapter_name("Intel(R) Arc(TM) A770"), Some(Vendor::Intel));
-        assert_eq!(Vendor::from_adapter_name("Microsoft Basic Render Driver"), None);
+        assert_eq!(
+            Vendor::from_adapter_name("AMD Radeon RX 7900 XTX"),
+            Some(Vendor::Amd)
+        );
+        assert_eq!(
+            Vendor::from_adapter_name("Radeon 680M Graphics"),
+            Some(Vendor::Amd)
+        );
+        assert_eq!(
+            Vendor::from_adapter_name("NVIDIA GeForce RTX 4090"),
+            Some(Vendor::Nvidia)
+        );
+        assert_eq!(
+            Vendor::from_adapter_name("Intel(R) Iris(R) Xe Graphics"),
+            Some(Vendor::Intel)
+        );
+        assert_eq!(
+            Vendor::from_adapter_name("Intel(R) Arc(TM) A770"),
+            Some(Vendor::Intel)
+        );
+        assert_eq!(
+            Vendor::from_adapter_name("Microsoft Basic Render Driver"),
+            None
+        );
         assert_eq!(Vendor::from_adapter_name(""), None);
     }
 
@@ -1141,7 +1404,10 @@ mod tests {
     fn vendor_classification_is_case_insensitive() {
         assert_eq!(Vendor::from_adapter_name("radeon"), Some(Vendor::Amd));
         assert_eq!(Vendor::from_adapter_name("NVIDIA"), Some(Vendor::Nvidia));
-        assert_eq!(Vendor::from_adapter_name("INTEL UHD Graphics 770"), Some(Vendor::Intel));
+        assert_eq!(
+            Vendor::from_adapter_name("INTEL UHD Graphics 770"),
+            Some(Vendor::Intel)
+        );
     }
 
     #[test]
@@ -1149,7 +1415,7 @@ mod tests {
         let w = 16u32;
         let h = 16u32;
         let mut nv12 = vec![16u8; (w * h) as usize];
-        nv12.extend(std::iter::repeat(128u8).take((w * h / 2) as usize));
+        nv12.extend(std::iter::repeat_n(128u8, (w * h / 2) as usize));
         let renderer = Nv12Renderer::new(false, w, h).expect("software wgpu adapter required");
         let rgba = renderer.convert(&nv12).expect("shader convert");
         assert_eq!(rgba.len(), (w * h * 4) as usize);
@@ -1158,6 +1424,361 @@ mod tests {
             assert_eq!(px[3], 255);
         }
     }
+    // ─────────── 预览 / 代理链路硬解（路线图 P0-A3） ───────────
+
+    fn amd_profile(hw: bool) -> HardwareProfile {
+        HardwareProfile {
+            backend: RenderBackend::Gpu,
+            adapter_name: "AMD Radeon 680M".into(),
+            hardware_decode: hw,
+            force_proxy: false,
+            is_discrete: false,
+            vendor: Some(Vendor::Amd),
+        }
+    }
+
+    fn vendor_profile(vendor: Option<Vendor>, hw: bool) -> HardwareProfile {
+        HardwareProfile {
+            backend: RenderBackend::Gpu,
+            adapter_name: "fixture adapter".into(),
+            hardware_decode: hw,
+            force_proxy: false,
+            is_discrete: false,
+            vendor,
+        }
+    }
+
+    /// `-hwaccel` 是输入侧选项，必须整段落在 `-i` 之前，且只出现一次。
+    fn assert_hwaccel_before_input(args: &[String], backend: &str) {
+        let flag = args
+            .iter()
+            .position(|a| a == "-hwaccel")
+            .unwrap_or_else(|| panic!("missing -hwaccel in {args:?}"));
+        let input = args
+            .iter()
+            .position(|a| a == "-i")
+            .unwrap_or_else(|| panic!("missing -i in {args:?}"));
+        assert_eq!(
+            args.get(flag + 1).map(String::as_str),
+            Some(backend),
+            "unexpected backend in {args:?}"
+        );
+        assert!(flag < input, "-hwaccel must precede -i: {args:?}");
+        assert_eq!(
+            args.iter().filter(|a| *a == "-hwaccel").count(),
+            1,
+            "duplicate -hwaccel in {args:?}"
+        );
+    }
+
+    /// AMD / Intel / NVIDIA 三家都走 d3d11va——它是 Windows 上唯一能一家通吃的后端。
+    #[test]
+    fn hwaccel_backend_uses_d3d11va_for_known_vendors() {
+        for vendor in [Vendor::Amd, Vendor::Nvidia, Vendor::Intel] {
+            assert_eq!(
+                vendor_profile(Some(vendor), true).hwaccel_backend(),
+                Some(HwAccel::D3d11va),
+                "{vendor:?} 应选 d3d11va"
+            );
+        }
+    }
+
+    /// 厂商未知 / `Vendor::Other` / 无 GPU / 用户关掉开关 → 不加 `-hwaccel`。
+    #[test]
+    fn hwaccel_backend_is_none_without_a_known_gpu() {
+        assert_eq!(vendor_profile(None, true).hwaccel_backend(), None);
+        assert_eq!(
+            vendor_profile(Some(Vendor::Other), true).hwaccel_backend(),
+            None
+        );
+        // `hardware_decode=false`（用户拨到「软解预览」）优先于厂商
+        assert_eq!(amd_profile(false).hwaccel_backend(), None);
+        assert_eq!(HardwareProfile::cpu_only().hwaccel_backend(), None);
+        assert_eq!(
+            HardwareProfile::detect().hwaccel_backend().is_some(),
+            HardwareProfile::detect().hardware_decode
+        );
+    }
+
+    /// 硬解开启时，代理参数里必须带 `-hwaccel d3d11va`，且在 `-i` 之前。
+    #[test]
+    fn proxy_args_adds_d3d11va_for_amd_and_intel() {
+        for vendor in [Vendor::Amd, Vendor::Intel] {
+            let policy = vendor_profile(Some(vendor), true).decode_policy();
+            assert!(policy.try_hwaccel, "{vendor:?} 应开启硬解");
+            let args = proxy_args(
+                Path::new("C:/media/demo.mp4"),
+                Path::new("C:/tmp/out.mp4"),
+                720,
+                vendor_profile(Some(vendor), true).hwaccel_backend(),
+                proxy_encode_threads(),
+            );
+            assert_hwaccel_before_input(&args, "d3d11va");
+            assert!(args.iter().any(|a| a == "-c:v"));
+            assert!(args.iter().any(|a| a == "libx264"));
+        }
+    }
+
+    /// 软解路径（无 GPU / 用户关开关）逐参数等价于历史版本：整条命令里没有 `-hwaccel`。
+    #[test]
+    fn proxy_args_never_mentions_hwaccel_on_software_paths() {
+        let soft = proxy_args(
+            Path::new("C:/media/demo.mkv"),
+            Path::new("C:/tmp/out.mp4"),
+            540,
+            None,
+            proxy_encode_threads(),
+        );
+        assert!(
+            !soft.iter().any(|a| a.contains("hwaccel")),
+            "软解参数不得出现 -hwaccel: {soft:?}"
+        );
+        assert_eq!(soft[0], "-hide_banner");
+        assert_eq!(soft[3], "-y");
+        assert_eq!(soft[4], "-i", "-i 必须紧跟通用开关之后");
+
+        // 关掉硬件解码的档案同样产出软解参数
+        assert_eq!(
+            amd_profile(false).hwaccel_backend(),
+            None,
+            "hardware_decode=false 时后端必须是 None"
+        );
+        assert_eq!(
+            proxy_args(
+                Path::new("C:/media/demo.mkv"),
+                Path::new("C:/tmp/out.mp4"),
+                540,
+                amd_profile(false).hwaccel_backend(),
+                proxy_encode_threads(),
+            ),
+            soft,
+        );
+    }
+
+    /// 硬解 / 软解两条路径只差 `-hwaccel <backend>` 两个 token，其余完全一致。
+    /// 回退实现正是靠「把后端置 None 再跑一次」，这条断言就是回退正确性的证明。
+    #[test]
+    fn software_retry_differs_from_hwaccel_only_by_the_hwaccel_flag() {
+        let src = Path::new("C:/media/demo.mkv");
+        let out = Path::new("C:/tmp/out.mp4");
+        let threads = proxy_encode_threads();
+        let hw = proxy_args(src, out, 720, Some(HwAccel::D3d11va), threads);
+        let sw = proxy_args(src, out, 720, None, threads);
+
+        let mut stripped = hw.clone();
+        let at = stripped
+            .iter()
+            .position(|a| a == "-hwaccel")
+            .expect("hardware args contain -hwaccel");
+        stripped.drain(at..at + 2);
+        assert_eq!(stripped, sw, "去掉 -hwaccel 后必须与软解参数逐参数相同");
+    }
+
+    /// 硬解失败必须自动回退软解**恰好一次**——本任务最重要的健壮性约束。
+    ///
+    /// 用假执行器覆盖「怎么跑」之外的全部决策逻辑；真实 ffmpeg 调用只在
+    /// `real_ffmpeg_proxy_falls_back_when_hwaccel_is_unavailable` 里端到端验证。
+    #[test]
+    fn hardware_failure_retries_once_with_software() {
+        // 第一次带 d3d11va 失败 → 第二次不带 -hwaccel，且必须成功
+        let mut attempts: Vec<Option<HwAccel>> = Vec::new();
+        let ok = transcode_with_fallback(
+            Some(HwAccel::D3d11va),
+            Box::new(|backend| {
+                attempts.push(backend);
+                Ok(backend.is_none())
+            }),
+        )
+        .expect("fallback must not surface an error");
+        assert!(ok, "回退后的软解尝试成功，整体应判成功");
+        assert_eq!(
+            attempts,
+            vec![Some(HwAccel::D3d11va), None],
+            "必须恰好「先硬解、再软解」各一次"
+        );
+    }
+
+    /// 硬解一次成功时**不得**多跑一遍软解（避免凭空多一次全片转码）。
+    #[test]
+    fn successful_hardware_decode_does_not_retry() {
+        let mut attempts: Vec<Option<HwAccel>> = Vec::new();
+        let ok = transcode_with_fallback(
+            Some(HwAccel::D3d11va),
+            Box::new(|backend| {
+                attempts.push(backend);
+                Ok(true)
+            }),
+        )
+        .unwrap();
+        assert!(ok);
+        assert_eq!(attempts, vec![Some(HwAccel::D3d11va)]);
+    }
+
+    /// 软解路径（后端本来就是 None）失败时不再重试——重试没有意义，直接报错。
+    #[test]
+    fn software_only_path_does_not_retry_and_reports_failure() {
+        let mut attempts: Vec<Option<HwAccel>> = Vec::new();
+        let ok = transcode_with_fallback(
+            None,
+            Box::new(|backend| {
+                attempts.push(backend);
+                Ok(false)
+            }),
+        )
+        .unwrap();
+        assert!(!ok, "软解也失败时整体判失败，交给调用方 bail!");
+        assert_eq!(attempts, vec![None], "不得重试");
+    }
+
+    /// 硬解 + 软解都失败：只重试一次就收手，不得无限循环。
+    #[test]
+    fn both_attempts_failing_stops_after_one_retry() {
+        let mut attempts: Vec<Option<HwAccel>> = Vec::new();
+        let ok = transcode_with_fallback(
+            Some(HwAccel::D3d11va),
+            Box::new(|backend| {
+                attempts.push(backend);
+                Ok(false)
+            }),
+        )
+        .unwrap();
+        assert!(!ok);
+        assert_eq!(attempts, vec![Some(HwAccel::D3d11va), None]);
+    }
+
+    /// 执行器自身报错（启动失败）时把错误原样上抛，不再吞掉去重试。
+    #[test]
+    fn attempt_error_is_propagated() {
+        let mut calls = 0;
+        let err = transcode_with_fallback(
+            Some(HwAccel::D3d11va),
+            Box::new(|_| {
+                calls += 1;
+                Err(anyhow::anyhow!("spawn failed"))
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("spawn failed"));
+        assert_eq!(calls, 1);
+    }
+
+    /// 用**真实 ffmpeg** 跑一遍生产代码 `ensure_proxy`，硬解开 / 关两条路径都要
+    /// 产出可播放的代理。前面几条测的是「参数构造与回退决策」，这条测的是
+    /// 「参数真的能喂进 ffmpeg 并转出文件」——`-hwaccel` 放在错误位置、
+    /// 或 `-vf scale` 与硬解不兼容，都只有真跑一次才会暴露。
+    ///
+    /// 本机（AMD Radeon 680M）能解析出 ffmpeg 时会实际执行；解析不到时静默跳过，
+    /// 保证在没装 ffmpeg 的机器上测试套件依然全绿。
+    #[test]
+    fn real_ffmpeg_proxy_runs_with_and_without_hwaccel() {
+        let ffmpeg = crate::utils::AppConfig::load_from_file("config.toml")
+            .map(|c| crate::utils::AppConfig::resolve_path(&c.paths.ffmpeg))
+            .unwrap_or_default();
+        if !ffmpeg.is_file() {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("v2w_hwaccel_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir e2e");
+        let src = dir.join("clip.mp4");
+
+        // 3 秒 640x360 的 H.264 素材，够 ensure_proxy 走完整条转码分支
+        let gen = Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg("testsrc2=size=640x360:rate=15:duration=3")
+            .args([
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&src)
+            .status();
+        if !gen.map(|s| s.success()).unwrap_or(false) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // 生成素材失败（缺 lavfi 等）：跳过而不是误报
+        }
+
+        // 硬解实例（本机是 AMD 核显 → d3d11va）
+        let hw_mgr = ProxyManager::with_hwaccel(&ffmpeg, Some(HwAccel::D3d11va));
+        let hw = hw_mgr.ensure_proxy(&src, 240).expect("hardware proxy");
+        assert!(
+            hw.metadata().map(|m| m.len() > 1024).unwrap_or(false),
+            "硬解代理未产出有效文件: {hw:?}"
+        );
+
+        // 纯软解实例——目标高度不同以绕开「已有代理」缓存
+        let sw_mgr = ProxyManager::new(&ffmpeg);
+        assert_eq!(sw_mgr.hwaccel(), None, "默认构造必须是纯软解");
+        let sw = sw_mgr.ensure_proxy(&src, 238).expect("software proxy");
+        assert!(
+            sw.metadata().map(|m| m.len() > 1024).unwrap_or(false),
+            "软解代理未产出有效文件: {sw:?}"
+        );
+
+        let _ = std::fs::remove_file(&hw);
+        let _ = std::fs::remove_file(&sw);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 硬解策略挂在 [`ProxyManager`] 实例上，且默认必须是纯软解——加硬解是
+    /// 显式选择，不能让「没改过调用点的旧代码」突然开始用 GPU。
+    #[test]
+    fn proxy_manager_defaults_to_software_and_can_opt_into_hwaccel() {
+        let off = ProxyManager::new("ffmpeg");
+        assert_eq!(off.hwaccel(), None);
+
+        let on = ProxyManager::with_hwaccel("ffmpeg", Some(HwAccel::D3d11va));
+        assert_eq!(on.hwaccel(), Some(HwAccel::D3d11va));
+
+        // 档案驱动的构造：AMD 核显 + hardware_decode=true → d3d11va
+        let from_amd = ProxyManager::with_profile("ffmpeg", &amd_profile(true));
+        assert_eq!(from_amd.hwaccel(), Some(HwAccel::D3d11va));
+        // 用户关掉硬解（hardware_decode=false）→ 纯软解
+        assert_eq!(
+            ProxyManager::with_profile("ffmpeg", &amd_profile(false)).hwaccel(),
+            None
+        );
+        // 无 GPU / 厂商未知 → 纯软解
+        assert_eq!(
+            ProxyManager::with_profile("ffmpeg", &vendor_profile(None, true)).hwaccel(),
+            None
+        );
+        assert_eq!(
+            ProxyManager::with_profile("ffmpeg", &HardwareProfile::cpu_only()).hwaccel(),
+            None
+        );
+
+        // 实例策略要真的反映进命令：默认实例拼出的参数里没有 -hwaccel
+        let soft_args = proxy_args(
+            Path::new("C:/media/demo.mp4"),
+            Path::new("C:/tmp/out.mp4"),
+            720,
+            off.hwaccel(),
+            proxy_encode_threads(),
+        );
+        let hw_args = proxy_args(
+            Path::new("C:/media/demo.mp4"),
+            Path::new("C:/tmp/out.mp4"),
+            720,
+            on.hwaccel(),
+            proxy_encode_threads(),
+        );
+        assert!(!soft_args.iter().any(|a| a.contains("hwaccel")));
+        assert_hwaccel_before_input(&hw_args, "d3d11va");
+    }
+
     // ─────────── 让路模式开关 ───────────
 
     /// 全局开关必须能读回写入的值（它决定所有子进程是否降优先级）。

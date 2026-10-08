@@ -153,7 +153,11 @@ mod tests {
         let data = build(&PathBuf::from("a.wav"), &samples, 8_000, 8);
         assert_eq!(data.peaks.len(), 8);
         assert!((data.duration - 4.0).abs() < 1e-9);
-        assert!(data.peaks.iter().all(|p| (*p - 1.0).abs() < 1e-6), "{:?}", data.peaks);
+        assert!(
+            data.peaks.iter().all(|p| (*p - 1.0).abs() < 1e-6),
+            "{:?}",
+            data.peaks
+        );
     }
 
     #[test]
@@ -172,6 +176,16 @@ mod tests {
         assert_eq!(mid.start, 50);
         assert!(mid.end >= 51 && mid.end <= 52, "{mid:?}");
         assert_eq!(data.bucket_range(-3.0, 0.5).start, 0);
+    }
+
+    #[test]
+    fn zero_buckets_do_not_panic_and_yield_one_column() {
+        // 线上调用方会传常量桶数，但 `build` 是公开 API：buckets=0 过去会走进
+        // `div_ceil(0)` 直接 panic。现在收敛为 1 个桶。
+        let samples = pcm(800, i16::MAX);
+        let data = build(&PathBuf::from("a.wav"), &samples, 8_000, 0);
+        assert_eq!(data.peaks.len(), 1);
+        assert!((data.peaks[0] - 1.0).abs() < 1e-6);
     }
 
     #[test]

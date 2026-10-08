@@ -79,9 +79,19 @@ pub fn detect_speakers(
         return vec![None; segments.len()];
     }
 
+    // 过滤掉越界时间戳（例如上游用 `-ss` 输入侧 seek 后仍按全片时间轴回填）：
+    // 不滤的话，落在末尾之后的段会被 `min(samples.len())` 压成一个极短片段，
+    // 甚至多段塌到同一处，白白喂给聚类一堆伪特征。越界段一律不给说话人标签，
+    // 与「纯静音段」的处理一致。
+    let total_sec = samples.len() as f64 / sample_rate as f64;
     let stats: Vec<Option<SegmentStats>> = segments
         .iter()
-        .map(|seg| segment_stats(samples, sample_rate, seg))
+        .map(|seg| {
+            if seg.end <= 0.0 || seg.start >= total_sec {
+                return None;
+            }
+            segment_stats(samples, sample_rate, seg)
+        })
         .collect();
 
     // 静音门限取全体有效段的 RMS 中位数，自动适配素材整体音量，
@@ -260,7 +270,11 @@ fn frame_features(frame: &[i16], sample_rate: u32) -> FrameFeatures {
             }
         }
     }
-    let norm = if r0 > 1e-6 { (best_val / r0) as f32 } else { 0.0 };
+    let norm = if r0 > 1e-6 {
+        (best_val / r0) as f32
+    } else {
+        0.0
+    };
     let voiced = norm >= VOICED_THRESHOLD && best_lag > 0;
     let pitch = if voiced {
         sample_rate as f32 / best_lag as f32
@@ -322,6 +336,12 @@ fn zscore_normalize(vectors: &[FeatureVec]) -> Vec<FeatureVec> {
 /// 返回每个输入点的簇号。之所以不用随机初始化：同一份素材每次点「说话人分离」
 /// 应该得到同样的结果，否则用户会以为程序在乱猜。
 fn kmeans(vectors: &[FeatureVec], k: usize) -> Vec<u32> {
+    // 空输入直接返回：下面的质心布点会访问 `order[slot]`，而空输入的
+    // `vectors.len() - 1` 会下溢成 usize::MAX，越界 panic。当前调用方
+    // （detect_speakers）已保证非空，这里把该前置条件钉成函数自身的不变量。
+    if vectors.is_empty() {
+        return Vec::new();
+    }
     let k = k.min(vectors.len()).max(1);
     let mut order: Vec<usize> = (0..vectors.len()).collect();
     // 必须按基频维排序。若按能量维排序，遇到整段音量一致的素材（很常见）
@@ -468,10 +488,44 @@ mod tests {
     }
 
     #[test]
+    fn out_of_range_segments_get_no_label_but_keep_alignment() {
+        let sample_rate = 8_000u32;
+        // 4 秒音频，前 4 句落在范围内、第 5 句整个落在末尾之后
+        let mut samples = Vec::new();
+        for i in 0..4 {
+            let freq = if i % 2 == 0 { 120.0 } else { 260.0 };
+            samples.extend(tone(sample_rate as usize, freq, sample_rate, 12_000));
+        }
+        let mut segs: Vec<Segment> = (0..4)
+            .map(|i| seg(i + 1, i as f64, i as f64 + 1.0))
+            .collect();
+        segs.push(seg(5, 90.0, 91.0)); // 越界段
+
+        let labels = detect_speakers(&samples, sample_rate, &segs, 2);
+        assert_eq!(labels.len(), segs.len(), "标签长度必须与 segments 对齐");
+        assert_eq!(labels[4], None, "越界段不应被强行打标签");
+        assert!(labels[..4].iter().all(|l| l.is_some()), "{labels:?}");
+    }
+
+    #[test]
     fn zscore_handles_constant_dimension_without_nan() {
         let vectors = vec![[1.0, 5.0, 0.0, 0.0], [2.0, 5.0, 0.0, 0.0]];
         let out = zscore_normalize(&vectors);
         assert!(out.iter().flatten().all(|v| v.is_finite()), "{out:?}");
         assert_eq!(out[0][1], 0.0);
+    }
+
+    #[test]
+    fn kmeans_handles_degenerate_inputs() {
+        // 空输入过去会在 `vectors.len() - 1` 处下溢 panic
+        assert!(kmeans(&[], 2).is_empty());
+        // 单点：簇数被压到 1，且不能有下标越界
+        let one = vec![[0.0f32, 0.0, 1.0, 0.0]];
+        assert_eq!(kmeans(&one, 4), vec![0]);
+        // 特征完全相同的多点：质心顺延逻辑不能死循环
+        let same = vec![[1.0f32, 0.0, 2.0, 0.0]; 5];
+        let labels = kmeans(&same, 3);
+        assert_eq!(labels.len(), 5);
+        assert!(labels.iter().all(|c| *c < 3));
     }
 }
