@@ -45,6 +45,12 @@ struct SenseVoiceStreamLine {
     elapsed_sec: f64,
     #[serde(default)]
     segments: Vec<SenseVoiceOutputItem>,
+    /// `event == "provider"` 时由 runner 回传：请求的 provider。
+    #[serde(default)]
+    requested: String,
+    /// `event == "provider"` 时由 runner 回传：实际生效的 provider。
+    #[serde(default)]
+    actual: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +61,52 @@ struct SenseVoiceOutputItem {
     text: String,
     #[serde(default)]
     polished: String,
+}
+
+/// ONNX 执行后端的实况：请求值 vs runner 回报的实际生效值。
+///
+/// 「静默回落」的可见化载体——引擎把它记在 `Arc<Mutex<..>>` 里，供上层读取
+/// （日志 / 未来的 UI 横幅）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderStatus {
+    /// 配置里请求的 provider（Rust 侧已归一：`dml` | `cpu`）。
+    pub requested: String,
+    /// runner 回报的实际生效 provider（如 `cpu`）。
+    pub actual: String,
+}
+
+impl ProviderStatus {
+    /// 是否发生了「请求非 cpu、实际却落到别的值」的回落。
+    pub fn fell_back(&self) -> bool {
+        provider_fallback_notice(&self.requested, &self.actual).is_some()
+    }
+}
+
+/// 判定「请求了非 cpu 的 provider、实际却落到别的值」，命中则给出可操作告警文案。
+///
+/// 这是「静默回落」的唯一判定入口，抽成纯函数以便单测（不需要真跑子进程）。
+/// 返回 `None` 表示请求就是 cpu（本就无需 GPU）、或实际值与请求一致（真吃到了）。
+pub fn provider_fallback_notice(requested: &str, actual: &str) -> Option<String> {
+    let req = requested.trim().to_ascii_lowercase();
+    let act = actual.trim().to_ascii_lowercase();
+    if req.is_empty() || act.is_empty() || req == "cpu" || req == act {
+        return None;
+    }
+    Some(format!(
+        "ONNX provider 回落：配置请求 `{req}`，实际生效 `{act}`。\
+         这通常是 Python 环境里的 sherpa-onnx 绑定了 CPU-only 版 onnxruntime（未编译进 \
+         DirectML）。修复：`pip install onnxruntime-directml` 并改用 DirectML 版 \
+         sherpa-onnx；若暂时不升级，请在「性能设置」里把 provider 切回 `cpu` 以消除误导。"
+    ))
+}
+
+/// 从子进程 stderr 文本里识别 sherpa-onnx 的 provider 回落特征串。
+///
+/// 作为 `provider` JSON 事件的兜底通道：旧版 runner 不回传该事件时仍能检出。
+pub fn stderr_provider_fallback(stderr: &str) -> bool {
+    stderr.contains("Fallback to cpu")
+        || stderr.contains("Unsupported string:")
+        || stderr.contains("Available providers:")
 }
 
 #[derive(Clone)]
@@ -70,6 +122,10 @@ pub struct SenseVoiceEngine {
     /// `dml` 只有在 Python 环境装了 DirectML 版 sherpa-onnx 时才真正生效，
     /// 否则 runner 会静默回落 cpu。收敛规则与 `GpuConfig::resolve_onnx_provider` 一致。
     provider: String,
+    /// 回落可见化：runner 回报的 provider 实况（首个回报为准）。
+    provider_status: Arc<Mutex<Option<ProviderStatus>>>,
+    /// 回落告警只打一次：并行切块时每个 worker 进程都回报一条，不能刷屏。
+    fallback_reported: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     active_children: Arc<Mutex<Vec<ChildEntry>>>,
 }
@@ -93,7 +149,13 @@ impl SenseVoiceEngine {
     }
 
     /// 指定 Python 解释器（用于 PATH 上有多个 Python、默认 `python` 缺依赖的场景）
-    pub fn with_python<P1: AsRef<Path>, P2: AsRef<Path>, P3: AsRef<Path>, P4: AsRef<Path>, P5: AsRef<Path>>(
+    pub fn with_python<
+        P1: AsRef<Path>,
+        P2: AsRef<Path>,
+        P3: AsRef<Path>,
+        P4: AsRef<Path>,
+        P5: AsRef<Path>,
+    >(
         runner_path: P1,
         model_path: P2,
         tokens_path: P3,
@@ -113,7 +175,13 @@ impl SenseVoiceEngine {
     }
 
     /// 完整指定：解释器 + ONNX 执行后端（`cpu` | `dml`）。
-    pub fn with_python_and_provider<P1: AsRef<Path>, P2: AsRef<Path>, P3: AsRef<Path>, P4: AsRef<Path>, P5: AsRef<Path>>(
+    pub fn with_python_and_provider<
+        P1: AsRef<Path>,
+        P2: AsRef<Path>,
+        P3: AsRef<Path>,
+        P4: AsRef<Path>,
+        P5: AsRef<Path>,
+    >(
         runner_path: P1,
         model_path: P2,
         tokens_path: P3,
@@ -134,6 +202,8 @@ impl SenseVoiceEngine {
             threads: threads.max(1),
             python_path: python_path.as_ref().to_path_buf(),
             provider,
+            provider_status: Arc::new(Mutex::new(None)),
+            fallback_reported: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
             active_children: Arc::new(Mutex::new(Vec::new())),
         }
@@ -152,8 +222,45 @@ impl SenseVoiceEngine {
     }
 
     /// 复位取消标志（每次新任务开始前由管线调用）
+    ///
+    /// 刻意不复位 `provider_status` / `fallback_reported`：provider 是否可用是
+    /// **进程级事实**（Python 环境装了什么），不随任务切换而变；每任务重报一次
+    /// 只会把同一条回落告警刷进日志。
     pub fn reset(&self) {
         self.cancel.store(false, Ordering::SeqCst);
+    }
+
+    /// 记录 runner 回报的 provider 实况；命中回落时打印一次可操作告警。
+    ///
+    /// 首次回报为准：并行切块时多个 worker 进程回报的是同一条事实，后到的只算重复。
+    fn record_provider(&self, requested: &str, actual: &str) {
+        let status = ProviderStatus {
+            requested: requested.trim().to_string(),
+            actual: actual.trim().to_string(),
+        };
+        let mut slot = self
+            .provider_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(status.clone());
+        }
+        drop(slot);
+        if let Some(notice) = provider_fallback_notice(&status.requested, &status.actual) {
+            if !self.fallback_reported.swap(true, Ordering::SeqCst) {
+                warn!("{notice}");
+            }
+        }
+    }
+
+    /// 读取 runner 回报的 provider 实况（尚未跑过推理时为 `None`）。
+    ///
+    /// 供上层把「配置了 dml 却回落 cpu」显示到界面上；引擎不感知 UI。
+    pub fn provider_status(&self) -> Option<ProviderStatus> {
+        self.provider_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 登记子进程 PID，并回报「登记这一刻取消是否已经到达」。
@@ -192,12 +299,14 @@ impl SenseVoiceEngine {
         language: Option<&str>,
         threads: Option<u32>,
         total_duration: Option<f64>,
-        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+        progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
         let audio_path = audio_path.as_ref();
         info!(
             "SenseVoice 启动极速非自回归转写: {:?}, 语言: {:?}, 线程: {}",
-            audio_path, language, threads.unwrap_or(self.threads)
+            audio_path,
+            language,
+            threads.unwrap_or(self.threads)
         );
 
         let mut cmd = Command::new(&self.python_path);
@@ -207,13 +316,20 @@ impl SenseVoiceEngine {
 
         let th = threads.unwrap_or(self.threads);
         cmd.arg(&self.runner_path)
-            .arg("--model").arg(&self.model_path)
-            .arg("--tokens").arg(&self.tokens_path)
-            .arg("--vad-model").arg(&self.vad_model_path)
-            .arg("--input").arg(audio_path)
-            .arg("--threads").arg(th.to_string())
-            .arg("--language").arg(language.unwrap_or("auto"))
-            .arg("--provider").arg(&self.provider);
+            .arg("--model")
+            .arg(&self.model_path)
+            .arg("--tokens")
+            .arg(&self.tokens_path)
+            .arg("--vad-model")
+            .arg(&self.vad_model_path)
+            .arg("--input")
+            .arg(audio_path)
+            .arg("--threads")
+            .arg(th.to_string())
+            .arg("--language")
+            .arg(language.unwrap_or("auto"))
+            .arg("--provider")
+            .arg(&self.provider);
 
         if let Some(dur) = total_duration {
             if dur > 0.0 {
@@ -235,7 +351,7 @@ impl SenseVoiceEngine {
         language: Option<&str>,
         threads: Option<u32>,
         total_duration: Option<f64>,
-        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+        progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
         info!("SenseVoice 启动纯内存管道非自回归推流转写 (0 磁盘 I/O)");
 
@@ -246,13 +362,20 @@ impl SenseVoiceEngine {
 
         let th = threads.unwrap_or(self.threads);
         cmd.arg(&self.runner_path)
-            .arg("--model").arg(&self.model_path)
-            .arg("--tokens").arg(&self.tokens_path)
-            .arg("--vad-model").arg(&self.vad_model_path)
-            .arg("--input").arg("-")
-            .arg("--threads").arg(th.to_string())
-            .arg("--language").arg(language.unwrap_or("auto"))
-            .arg("--provider").arg(&self.provider);
+            .arg("--model")
+            .arg(&self.model_path)
+            .arg("--tokens")
+            .arg(&self.tokens_path)
+            .arg("--vad-model")
+            .arg(&self.vad_model_path)
+            .arg("--input")
+            .arg("-")
+            .arg("--threads")
+            .arg(th.to_string())
+            .arg("--language")
+            .arg(language.unwrap_or("auto"))
+            .arg("--provider")
+            .arg(&self.provider);
 
         if let Some(dur) = total_duration {
             if dur > 0.0 {
@@ -271,7 +394,7 @@ impl SenseVoiceEngine {
         &self,
         mut cmd: Command,
         input_stream: Option<Box<dyn std::io::Read + Send + 'static>>,
-        progress_cb: Option<Box<dyn Fn(f64, &str, Option<Segment>) + Send + Sync>>,
+        progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
         // spawn 前的取消早退：若取消在准备区（拼参数、选解释器…）期间就已到达，就没必要
         // 真的把 runner 拉起来再靠 register_child 的复查把它杀掉——那几毫秒里进程创建与
@@ -289,7 +412,9 @@ impl SenseVoiceEngine {
             return Ok((Vec::new(), 0.0));
         }
 
-        let mut child = cmd.spawn().with_context(|| format!("启动 SenseVoice 进程失败: {:?}", self.runner_path))?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("启动 SenseVoice 进程失败: {:?}", self.runner_path))?;
         crate::utils::child_registry::adopt(&child);
 
         // 登记子进程 PID，供用户「终止转写」时强杀。
@@ -309,7 +434,10 @@ impl SenseVoiceEngine {
 
         // 若有内存音频流输入，启动泵送线程写入子进程 stdin
         let stream_handle = if let Some(stream) = input_stream {
-            let stdin = child.stdin.take().context("获取 SenseVoice 标准输入管道失败")?;
+            let stdin = child
+                .stdin
+                .take()
+                .context("获取 SenseVoice 标准输入管道失败")?;
             Some(std::thread::spawn(move || {
                 use std::io::{copy, BufReader, BufWriter, Write};
                 let mut reader = BufReader::with_capacity(128 * 1024, stream);
@@ -321,8 +449,14 @@ impl SenseVoiceEngine {
             None
         };
 
-        let stdout = child.stdout.take().context("获取 SenseVoice 标准输出管道失败")?;
-        let stderr = child.stderr.take().context("获取 SenseVoice 标准错误管道失败")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("获取 SenseVoice 标准输出管道失败")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("获取 SenseVoice 标准错误管道失败")?;
 
         let stderr_handle = std::thread::spawn(move || {
             use std::io::Read;
@@ -398,6 +532,11 @@ impl SenseVoiceEngine {
                             }
                         }
                     }
+                    "provider" => {
+                        // runner 主动回报「请求 vs 实际」；比解析 stderr 文本稳。
+                        self.record_provider(&parsed.requested, &parsed.actual);
+                    }
+                    // 未知事件一律忽略：协议只增不改，旧引擎遇到新事件必须安全跳过。
                     _ => {}
                 }
             }
@@ -416,13 +555,34 @@ impl SenseVoiceEngine {
         }
         let stderr_str = stderr_handle.join().unwrap_or_default();
 
+        // 兜底通道：runner 未回传 `provider` 事件（旧版脚本）时，从 stderr 特征串识别
+        // 回落。`record_provider` 首次为准，故与事件通道同时命中也不会重复告警。
+        if stderr_provider_fallback(&stderr_str) {
+            let requested = self.provider.clone();
+            self.record_provider(&requested, "cpu");
+        }
+
         // 用户主动终止：被杀进程的退出码不重要，按空结果返回，由管线走取消收尾
         if self.cancel.load(Ordering::SeqCst) {
             return Ok((Vec::new(), 0.0));
         }
 
         if !status.success() {
-            warn!("SenseVoice 退出状态非 0: {:?}, 错误日志: {}", status.code(), stderr_str);
+            warn!(
+                "SenseVoice 退出状态非 0: {:?}, 错误日志: {}",
+                status.code(),
+                stderr_str
+            );
+            // stderr 为空时的裸报错等于让用户猜谜：python 解释器找不到、依赖缺失
+            // 这类启动失败往往只留下退出码。按可操作的方向补一句提示。
+            if stderr_str.trim().is_empty() {
+                anyhow::bail!(
+                    "SenseVoice 识别失败：runner 退出码 {:?} 且无任何输出。\
+                     通常是 Python 解释器或依赖未就位——请确认「性能设置 → 模型与组件」里的 \
+                     python 路径正确，且已安装 sherpa-onnx / numpy（见 tools/sensevoice_runner.py 头部说明）。",
+                    status.code()
+                );
+            }
             anyhow::bail!("SenseVoice 识别失败: {}", stderr_str.trim());
         }
 
@@ -430,10 +590,18 @@ impl SenseVoiceEngine {
         crate::subtitle::optimize_segments(&mut segments);
 
         if let Some(ref cb) = progress_cb {
-            cb(1.0, &format!("SenseVoice 转写完成，共 {} 句", segments.len()), None);
+            cb(
+                1.0,
+                &format!("SenseVoice 转写完成，共 {} 句", segments.len()),
+                None,
+            );
         }
 
-        info!(segments = segments.len(), elapsed = inference_elapsed, "SenseVoice 转写完成");
+        info!(
+            segments = segments.len(),
+            elapsed = inference_elapsed,
+            "SenseVoice 转写完成"
+        );
         Ok((segments, inference_elapsed))
     }
 }
@@ -495,10 +663,7 @@ mod tests {
             // 默认并行跑用例，别的用例可能先领走 0——断言具体数值会让这条测试随机翻车。
             assert_eq!(entries[0].0, 777, "登记的应是该子进程 PID");
         }
-        assert!(
-            registered(&registry).is_empty(),
-            "子进程结束后守卫负责注销"
-        );
+        assert!(registered(&registry).is_empty(), "子进程结束后守卫负责注销");
     }
 
     #[test]
@@ -790,13 +955,10 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
 
         let mut cmd = Command::new("cmd");
-        cmd.args([
-            "/C",
-            &format!("echo spawned> \"{}\"", marker.display()),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        cmd.args(["/C", &format!("echo spawned> \"{}\"", marker.display())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let (segments, _) = engine
             .run_process_and_parse(cmd, None, None)
@@ -809,5 +971,119 @@ mod tests {
             !traced,
             "取消已置位时不得真的拉起子进程（否则会留下痕迹文件）"
         );
+    }
+
+    // ---- provider 回落可见化：判定纯函数 + 事件消费 ----
+
+    #[test]
+    fn fallback_notice_fires_when_dml_silently_falls_back() {
+        let notice =
+            provider_fallback_notice("dml", "cpu").expect("请求 dml 却落到 cpu，必须给出告警文案");
+        assert!(notice.contains("dml"), "告警应点出请求值: {notice}");
+        assert!(notice.contains("cpu"), "告警应点出实际值: {notice}");
+        assert!(
+            notice.contains("onnxruntime-directml"),
+            "告警应给出可操作修复指引: {notice}"
+        );
+    }
+
+    #[test]
+    fn fallback_notice_is_silent_when_request_is_cpu() {
+        assert!(
+            provider_fallback_notice("cpu", "cpu").is_none(),
+            "配置就是 cpu 时不该报警（本就无需 GPU）"
+        );
+    }
+
+    #[test]
+    fn fallback_notice_is_silent_when_provider_really_engaged() {
+        assert!(
+            provider_fallback_notice("dml", "dml").is_none(),
+            "真吃到 DML 时不该报警"
+        );
+        assert!(
+            provider_fallback_notice("directml", "directml").is_none(),
+            "真吃到 DirectML 时不该报警"
+        );
+    }
+
+    #[test]
+    fn fallback_notice_tolerates_case_and_whitespace() {
+        assert!(
+            provider_fallback_notice(" DML ", "CPU").is_some(),
+            "大小写/空白差异不应漏报回落"
+        );
+        assert!(
+            provider_fallback_notice("", "cpu").is_none(),
+            "空请求值视作未配置，不报警"
+        );
+    }
+
+    #[test]
+    fn stderr_scan_detects_sherpa_fallback_markers() {
+        assert!(stderr_provider_fallback(
+            "csrc/provider.cc:StringToProvider:35 Unsupported string: dml. Fallback to cpu"
+        ));
+        assert!(stderr_provider_fallback(
+            "csrc/session.cc:GetSessionOptionsImpl:369 DirectML is for Windows only. Fallback to cpu!"
+        ));
+        assert!(stderr_provider_fallback(
+            "session.cc:351 Available providers: CPUExecutionProvider, . Fallback to cpu!"
+        ));
+        assert!(
+            !stderr_provider_fallback("Silero VAD 模型未找到"),
+            "无关 stderr 不得误报回落"
+        );
+    }
+
+    #[test]
+    fn provider_status_fell_back_reflects_request_vs_actual() {
+        let fell_back = ProviderStatus {
+            requested: "dml".into(),
+            actual: "cpu".into(),
+        };
+        assert!(fell_back.fell_back());
+
+        let engaged = ProviderStatus {
+            requested: "dml".into(),
+            actual: "dml".into(),
+        };
+        assert!(!engaged.fell_back());
+
+        let plain_cpu = ProviderStatus {
+            requested: "cpu".into(),
+            actual: "cpu".into(),
+        };
+        assert!(!plain_cpu.fell_back());
+    }
+
+    /// runner 回报的 `provider` 事件必须被消费成引擎状态；告警只打一次。
+    #[test]
+    fn provider_event_is_recorded_and_only_reported_once() {
+        let engine = engine_with_dummy_paths();
+        assert!(engine.provider_status().is_none(), "未回报前应为 None");
+
+        engine.record_provider("dml", "cpu");
+        let status = engine.provider_status().expect("回报后应有实况");
+        assert_eq!(status.requested, "dml");
+        assert_eq!(status.actual, "cpu");
+        assert!(status.fell_back());
+
+        // 首个回报为准：并行 worker 的后续重复回报不得改写已记录的实况。
+        engine.record_provider("dml", "dml");
+        assert_eq!(
+            engine.provider_status().expect("实况仍在").actual,
+            "cpu",
+            "首个回报为准，后续重复不得覆盖"
+        );
+    }
+
+    /// `provider` 事件与 stderr 兜底同时命中时，实况仍以首个为准、不重复告警。
+    #[test]
+    fn stderr_fallback_does_not_override_recorded_provider() {
+        let engine = engine_with_dummy_paths();
+        engine.record_provider("dml", "cpu");
+        engine.record_provider("dml", "cpu");
+        assert_eq!(engine.provider_status().unwrap().actual, "cpu");
     }
 }

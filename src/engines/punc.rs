@@ -6,10 +6,16 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{info, warn};
 
 use crate::subtitle::Segment;
+
+// provider 实况的判定与承载与 SenseVoice 同源：两处必须是同一套口径，否则
+// 「SenseVoice 说回落、标点说正常」会自相矛盾。
+use super::sensevoice::{provider_fallback_notice, stderr_provider_fallback, ProviderStatus};
 
 /// RAII 守卫：持有「已 `spawn()` 但尚未 `wait()`」的子进程，守卫离开作用域时若句柄仍在，
 /// 就 `kill()` + `wait()` 回收它。
@@ -61,6 +67,10 @@ pub struct PunctuationEngine {
     /// ONNX 执行后端：`cpu` | `dml`。默认 `cpu`（零回归）；
     /// `dml` 只有在 Python 环境装了 DirectML 版 sherpa-onnx 时才真正生效。
     provider: String,
+    /// 回落可见化：runner 回报的 provider 实况（首个回报为准）。
+    provider_status: Arc<Mutex<Option<ProviderStatus>>>,
+    /// 回落告警只打一次。
+    fallback_reported: Arc<AtomicBool>,
 }
 
 impl PunctuationEngine {
@@ -69,12 +79,7 @@ impl PunctuationEngine {
         model_path: P2,
         threads: u32,
     ) -> Self {
-        Self::with_python(
-            runner_script,
-            model_path,
-            threads,
-            PathBuf::from("python"),
-        )
+        Self::with_python(runner_script, model_path, threads, PathBuf::from("python"))
     }
 
     /// 指定 Python 解释器（用于 PATH 上有多个 Python、默认 `python` 缺依赖的场景）
@@ -105,6 +110,8 @@ impl PunctuationEngine {
             threads,
             python_path: python_path.as_ref().to_path_buf(),
             provider,
+            provider_status: Arc::new(Mutex::new(None)),
+            fallback_reported: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -112,17 +119,49 @@ impl PunctuationEngine {
         self.model_path.exists() && self.runner_script.exists()
     }
 
+    /// 记录 runner 回报的 provider 实况；命中回落时打印一次可操作告警。
+    fn record_provider(&self, requested: &str, actual: &str) {
+        let status = ProviderStatus {
+            requested: requested.trim().to_string(),
+            actual: actual.trim().to_string(),
+        };
+        let mut slot = self
+            .provider_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(status.clone());
+        }
+        drop(slot);
+        if let Some(notice) = provider_fallback_notice(&status.requested, &status.actual) {
+            if !self.fallback_reported.swap(true, Ordering::SeqCst) {
+                warn!("{notice}");
+            }
+        }
+    }
+
+    /// 读取 runner 回报的 provider 实况（尚未跑过标点时可能为 `None`）。
+    pub fn provider_status(&self) -> Option<ProviderStatus> {
+        self.provider_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn add_punctuation(
         &self,
         mut segments: Vec<Segment>,
-        progress_cb: Option<Box<dyn Fn(f64, &str) + Send>>,
+        progress_cb: Option<crate::engines::TextProgressCb>,
     ) -> Result<Vec<Segment>> {
         if segments.is_empty() {
             return Ok(segments);
         }
 
         if !self.is_available() {
-            warn!("CT-Punc 模型或脚本未就绪: {:?}, 跳过极速标点", self.model_path);
+            warn!(
+                "CT-Punc 模型或脚本未就绪: {:?}, 跳过极速标点",
+                self.model_path
+            );
             return Ok(segments);
         }
 
@@ -146,8 +185,7 @@ impl PunctuationEngine {
             })
             .collect();
 
-        let input_json = serde_json::to_vec(&items)
-            .context("序列化字幕输入失败")?;
+        let input_json = serde_json::to_vec(&items).context("序列化字幕输入失败")?;
 
         let mut cmd = Command::new(&self.python_path);
         cmd.arg(&self.runner_script)
@@ -163,7 +201,9 @@ impl PunctuationEngine {
 
         // 让路模式：标点恢复也是 Python 子进程，同样要跟随用户的开关
         super::media_pipeline::apply_default_child_flags(&mut cmd);
-        let child = cmd.spawn().context("启动 CT-Transformer 标点恢复子进程失败")?;
+        let child = cmd
+            .spawn()
+            .context("启动 CT-Transformer 标点恢复子进程失败")?;
         crate::utils::child_registry::adopt(&child);
         // 从这里到 wait_with_output() 之间的任何提前退出都由守卫兜底回收子进程
         let mut reaper = ChildReaper::new(child);
@@ -188,10 +228,27 @@ impl PunctuationEngine {
             anyhow::bail!("CT-Punc 执行失败: {}", stderr);
         }
 
+        // 兜底通道：runner 未回报 provider（旧版脚本）时，从 stderr 特征串识别回落。
+        // 与 stdout 的 `provider` 字段同源，`record_provider` 首次为准，不会重复告警。
+        if stderr_provider_fallback(&String::from_utf8_lossy(&output.stderr)) {
+            let requested = self.provider.clone();
+            self.record_provider(&requested, "cpu");
+        }
+
         #[derive(serde::Deserialize)]
         struct OutputResult {
             index: usize,
             polished: String,
+        }
+
+        /// runner 顶层回报的 provider 实况。老版本 runner 没有这个键，`Option`
+        /// 让缺省成为「未回报」而不是解析失败。
+        #[derive(serde::Deserialize)]
+        struct OutputProvider {
+            #[serde(default)]
+            requested: String,
+            #[serde(default)]
+            actual: String,
         }
 
         #[derive(serde::Deserialize)]
@@ -200,11 +257,17 @@ impl PunctuationEngine {
             count: usize,
             #[allow(dead_code)]
             elapsed_sec: f64,
+            #[serde(default)]
+            provider: Option<OutputProvider>,
             results: Vec<OutputResult>,
         }
 
-        let payload: OutputPayload = serde_json::from_slice(&output.stdout)
-            .context("解析标点输出 JSON 失败")?;
+        let payload: OutputPayload =
+            serde_json::from_slice(&output.stdout).context("解析标点输出 JSON 失败")?;
+
+        if let Some(p) = payload.provider.as_ref() {
+            self.record_provider(&p.requested, &p.actual);
+        }
 
         let map: HashMap<usize, String> = payload
             .results
@@ -307,5 +370,33 @@ mod tests {
         let pid = child.id();
         let mut reaper = ChildReaper::new(child);
         assert_eq!(reaper.child_mut().id(), pid);
+    }
+
+    // ---- provider 回落可见化（与 SenseVoice 共用同一套判定） ----
+
+    /// 造一个不依赖真实 python/model 的引擎，只验证状态机。
+    fn punc_engine_for_provider_state() -> PunctuationEngine {
+        PunctuationEngine::with_python_and_provider("runner.py", "model.onnx", 1, "python", "dml")
+    }
+
+    #[test]
+    fn punc_records_provider_fallback_from_runner_report() {
+        let engine = punc_engine_for_provider_state();
+        assert!(engine.provider_status().is_none());
+        engine.record_provider("directml", "cpu");
+        let status = engine.provider_status().expect("回报后应有实况");
+        assert!(status.fell_back(), "请求 directml 落到 cpu 必须判为回落");
+    }
+
+    #[test]
+    fn punc_provider_status_keeps_first_report() {
+        let engine = punc_engine_for_provider_state();
+        engine.record_provider("dml", "cpu");
+        engine.record_provider("dml", "dml");
+        assert_eq!(
+            engine.provider_status().unwrap().actual,
+            "cpu",
+            "首个回报为准，后续重复不得覆盖"
+        );
     }
 }
