@@ -5,13 +5,13 @@
 //! - `OnlineApi`：任意 OpenAI 兼容的 `/chat/completions` 接口
 //!   （DeepSeek / OpenAI / 通义 / Kimi / 本地 vLLM / Ollama 均可）。
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::engines::llm::{
     chinese_variant_target, convert_chinese_variant, is_untranslated_copy, CopyRate,
@@ -65,6 +65,51 @@ pub struct OnlineApiConfig {
     /// 术语表提示（由 `TranslateConfig::glossary_prompt` 生成，空串表示无）。
     /// 离线与在线两条链路共用同一份注入文本。
     pub glossary_hint: String,
+}
+
+/// 在线模型能力画像：是否为「推理模型」（先输出思考、再输出译文）。
+///
+/// 一次整片翻译共享一份（`Arc`），因为**首批**才能暴露对面是不是推理模型，而
+/// 后续所有批次（含折半补译）都要按这个结论调整预算与批大小。每个
+/// [`TranslateEngine`] 任务各持一份，同进程内并发翻译不会互相污染。
+#[derive(Debug, Default)]
+struct ModelProfile {
+    /// 是否已判定为推理模型（响应里出现过非空 `reasoning_content`）。
+    reasoning: AtomicBool,
+    /// 首批是否已跑完（跑完才谈得上「据此调整剩余批次」）。
+    probed: AtomicBool,
+    /// 观察到的思考文本长度（字符），诊断用。
+    reasoning_chars: AtomicUsize,
+    /// 「推理较慢」警告是否已打过（每次任务最多一条，避免刷屏）。
+    slow_warned: AtomicBool,
+}
+
+impl ModelProfile {
+    fn is_reasoning(&self) -> bool {
+        self.reasoning.load(Ordering::Relaxed)
+    }
+
+    /// 标记为推理模型并记录思考长度；返回是否**首次**判定（用于只打一条日志）。
+    fn mark_reasoning(&self, chars: usize) -> bool {
+        self.reasoning_chars.fetch_max(chars, Ordering::Relaxed);
+        !self.reasoning.swap(true, Ordering::Relaxed)
+    }
+
+    fn reasoning_chars(&self) -> usize {
+        self.reasoning_chars.load(Ordering::Relaxed)
+    }
+
+    fn is_probed(&self) -> bool {
+        self.probed.load(Ordering::Relaxed)
+    }
+
+    fn mark_probed(&self) {
+        self.probed.store(true, Ordering::Relaxed);
+    }
+
+    fn mark_slow_warned(&self) -> bool {
+        !self.slow_warned.swap(true, Ordering::Relaxed)
+    }
 }
 
 pub struct TranslateEngine {
@@ -255,7 +300,15 @@ fn translate_via_online_api(
         ONLINE_SYSTEM_PROMPT_CHARS + cfg.glossary_hint.chars().count() + ONLINE_SRC_HINT_CHARS;
     let char_budget = online_char_budget(fixed_chars);
 
-    for chunk in plan_online_batches(&translatable, &segments, batch_size, char_budget) {
+    // P0-2：推理模型的思考 token 与译文共享 `max_tokens`，必须缩批 + 加大预算。
+    // `profile` 在整片翻译内共享：首批响应里出现非空 `reasoning_content` 即判定
+    // 对面是推理模型，随后把**剩余**句子按更小的批重排。
+    let profile = Arc::new(ModelProfile::default());
+    let mut batch_size = batch_size;
+    let mut queue: VecDeque<Vec<usize>> =
+        plan_online_batches(&translatable, &segments, batch_size, char_budget).into();
+
+    while let Some(chunk) = queue.pop_front() {
         // 每批开始前检查取消：单批最长可达 `timeout_secs`（默认 120s），
         // 不在批次之间检查的话，用户点「取消」要等当前批跑完才生效。
         if cancel.load(Ordering::Relaxed) {
@@ -266,7 +319,13 @@ fn translate_via_online_api(
         // 单批失败重试：整片刻一两千句、每批几十次请求，任何一次 429/网络抖动
         // 都会让「整片翻译」前功尽弃。重试有上限，超限后跳过本批继续后面的句子，
         // 把已经译好的部分保住（与取消时的语义一致：返回偏序结果而非丢弃）。
-        let translations = match request_batch_with_retry(cfg, &batch, target_lang, &cancel) {
+        let translations = match request_batch_with_retry(
+            cfg,
+            &batch,
+            target_lang,
+            &cancel,
+            &profile,
+        ) {
             Ok(map) => map,
             Err(err) => {
                 // 取消（而非真实错误）：保留已完成的部分，按取消语义返回偏序结果。
@@ -304,6 +363,22 @@ fn translate_via_online_api(
                 continue;
             }
         };
+
+        // P0-2：首批响应即可判定对面是不是推理模型；命中后把**剩余**句子按更小的
+        // 批重排——推理模型的思考量会随批大小与预算上浮，大批很容易再次撞满预算。
+        if !profile.is_probed() {
+            profile.mark_probed();
+            if profile.is_reasoning() {
+                batch_size = batch_size.min(REASONING_BATCH_LINES);
+                let remaining: Vec<usize> = queue.iter().flatten().copied().collect();
+                queue = plan_online_batches(&remaining, &segments, batch_size, char_budget).into();
+                info!(
+                    "检测到推理模型（思考过程约 {} 字符），每批条数 {batch_size}，\
+                     输出预算提高到「译文 + {REASONING_THINKING_TOKENS}」以容纳思考过程",
+                    profile.reasoning_chars()
+                );
+            }
+        }
         let mut matched = 0usize;
         // 被判为「复制原文」的句子：折半重试**之后**仍未译出才计入复制率。
         let mut copy_candidates: Vec<usize> = Vec::new();
@@ -329,7 +404,7 @@ fn translate_via_online_api(
                 .filter(|&pos| !segments[pos].translation_matches(target_lang))
                 .collect();
             let recovered =
-                retry_missing_online(cfg, &mut segments, &missing, target_lang, &cancel);
+                retry_missing_online(cfg, &mut segments, &missing, target_lang, &cancel, &profile);
             if recovered < missing.len() {
                 soft_failed_batches += 1;
                 warn!(
@@ -416,6 +491,7 @@ fn retry_missing_online(
     missing: &[usize],
     target_lang: &str,
     cancel: &AtomicBool,
+    profile: &ModelProfile,
 ) -> usize {
     if missing.is_empty() {
         return 0;
@@ -435,7 +511,7 @@ fn retry_missing_online(
                 return recovered;
             }
             let batch: Vec<&Segment> = sub.iter().map(|&pos| &segments[pos]).collect();
-            match request_batch_with_retry(cfg, &batch, target_lang, cancel) {
+            match request_batch_with_retry(cfg, &batch, target_lang, cancel, profile) {
                 Ok(map) => {
                     for &pos in sub {
                         if let Some(text) = map.get(&segments[pos].index) {
@@ -478,13 +554,14 @@ fn request_batch_with_retry(
     batch: &[&Segment],
     target_lang: &str,
     cancel: &AtomicBool,
+    profile: &ModelProfile,
 ) -> Result<HashMap<usize, String>> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..MAX_BATCH_RETRIES {
         if cancel.load(Ordering::Relaxed) {
             return Err(anyhow!("翻译已取消"));
         }
-        match request_batch_translation(cfg, batch, target_lang) {
+        match request_batch_translation(cfg, batch, target_lang, profile) {
             Ok(map) => return Ok(map),
             Err(err) => {
                 if !is_retryable(&err) {
@@ -599,12 +676,44 @@ const OUTPUT_TOKENS_PER_CHAR: usize = 1;
 /// 不能只算“译文本身需要多少 token”——很多在线模型是**推理模型**，
 /// 会先花几百 token “思考”再输出译文，而这些思考 token 也占 `max_tokens`。
 /// 下限太低时，模型思考到一半就被截断，译文根本没开始写。
-/// 实测（deepseek-v4-flash，三条短字幕）：思考占 ~184 token、译文 ~50 token。
+/// 实测（某推理型模型，三条短字幕）：思考占 ~184 token、译文 ~50 token。
 /// 取 512 作为下限，给推理模型留出足够的思考空间。
 const MIN_OUTPUT_TOKENS: usize = 512;
 
-/// 输出 token 的宽松上限：防个别服务对超大值报错。
+/// 非推理模型的输出 token 宽松上限：防个别服务对超大值报错。
+///
+/// 复核依据：这是按「8K 上下文」推出来的保守值，**只对普通 chat 模型**成立。
+/// 推理模型的上限大得多（网关 `/v1/models` 实测报 `max_output_tokens = 393216`），
+/// 8192 根本不够它把思考 + 译文写完，因此推理模型走
+/// [`MAX_REASONING_OUTPUT_TOKENS`]，不受这里限制。
 const MAX_OUTPUT_TOKENS: usize = 8_192;
+
+/// 推理模型单批的「思考余量」token。
+///
+/// 实测（某网关的推理型模型，`only_reasoning: true`，且思考不省 token）：
+/// - 12 句标准字幕一批：`max_tokens=512` → 思考 512 就把预算吃光，
+///   `finish_reason=length`、`content` 为空（0/12 译出）；2048 → 思考 2048，同样 0/12；
+///   4096 → 思考 4089，`content` 只剩 `[1] 皆さん` 一行；8192 → 思考 2.6k~6.4k，12/12。
+///   可见思考量会**随预算上浮**，预算必须给足，不能靠 clamp 从译文预算里挤。
+/// - 单批思考实测区间 1.4k~6.0k token。
+///
+/// 取 8192：覆盖实测思考峰值（~6k）后仍给译文留 ~2k，且远低于该网关 393216
+/// 的输出上限，服务端接受。
+const REASONING_THINKING_TOKENS: usize = 8_192;
+
+/// 推理模型单批输出预算上限。
+///
+/// 实测 16384 / 32768 均被服务端接受，但 32768 时思考涨到 5.5k、单批耗时翻倍——
+/// 预算给得越大，模型越想得越久。取 16384：够「思考余量 + 长批译文」，又不会
+/// 让每批明显变慢。
+const MAX_REASONING_OUTPUT_TOKENS: usize = 16_384;
+
+/// 推理模型每批最大条数：把思考摊薄到更小的批。
+///
+/// 实测 12 句/8192 可以 12/12，但思考量波动大（1.4k~6.0k），批越大越容易撞上
+/// 单批预算。压到 6 条：单批源文本 ~150 字符，预算 = 译文 + 8192 思考余量，
+/// 实测 5/6/8 条 × 8192 全部 `finish_reason=stop`、条条译全。
+const REASONING_BATCH_LINES: usize = 6;
 
 /// 按本批源文本长度推导 `max_tokens`。
 ///
@@ -616,12 +725,23 @@ const MAX_OUTPUT_TOKENS: usize = 8_192;
 /// P0-C：`prompt_chars` 是**固定开销**（system 提示词模板 + 源语言线索 + 术语表）的
 /// 字符数——它和源文本一起占用上下文，必须从「源文本 + 输出」之外扣掉，否则术语表
 /// 一长，源文本的 token 预算就会被高估，输出被服务端截断。
-fn max_output_tokens(batch: &[&Segment], prompt_chars: usize) -> usize {
+///
+/// P0-2：`reasoning` 为真表示已判定对面是推理模型——思考 token 与译文共享
+/// `max_tokens`，此时改用「译文预算 + [`REASONING_THINKING_TOKENS`]」，
+/// 不再受 8K 上下文裁剪（推理模型上下文远大于 8K）。
+fn max_output_tokens(batch: &[&Segment], prompt_chars: usize, reasoning: bool) -> usize {
     let chars: usize = batch
         .iter()
         .map(|seg| seg.translate_source().chars().count())
         .sum();
     let wanted = chars * OUTPUT_TOKENS_PER_CHAR;
+    if reasoning {
+        // 思考量随预算上浮（512→512、4096→4089），所以是「译文预算 **加上**
+        // 一笔思考余量」，而不是把译文预算 clamp 大——后者仍会被思考吃光。
+        return wanted
+            .saturating_add(REASONING_THINKING_TOKENS)
+            .clamp(MIN_OUTPUT_TOKENS, MAX_REASONING_OUTPUT_TOKENS);
+    }
     // 最保守地按 8K 上下文与「中文约 1 token/字符」估算可用空间：
     // 上下文 - （固定开销 + 源文本）就是能给输出的部分，再夹在 [MIN, MAX] 之间。
     let available = 8_192usize.saturating_sub(prompt_chars + chars);
@@ -631,11 +751,15 @@ fn max_output_tokens(batch: &[&Segment], prompt_chars: usize) -> usize {
     )
 }
 
-/// 请求一批字幕的译文，返回 `序号 -> 译文` 映射
+/// 请求一批字幕的译文，返回 `序号 -> 译文` 映射。
+///
+/// `profile` 承载「对面是不是推理模型」的判定：本次响应一旦出现非空
+/// `reasoning_content` 就置位，并让 `max_tokens` 立刻按推理模型给足。
 fn request_batch_translation(
     cfg: &OnlineApiConfig,
     batch: &[&Segment],
     target_lang: &str,
+    profile: &ModelProfile,
 ) -> Result<HashMap<usize, String>> {
     let source = batch
         .iter()
@@ -666,13 +790,57 @@ fn request_batch_translation(
         "temperature": 0.2,
         "max_tokens": max_output_tokens(
             batch,
-            ONLINE_SYSTEM_PROMPT_CHARS + cfg.glossary_hint.chars().count() + ONLINE_SRC_HINT_CHARS
+            ONLINE_SYSTEM_PROMPT_CHARS + cfg.glossary_hint.chars().count() + ONLINE_SRC_HINT_CHARS,
+            profile.is_reasoning()
         ),
         "stream": false,
     });
 
-    let value = post_chat_completions(cfg, &payload)?;
-    let content = extract_message_content(&value).unwrap_or_default();
+    let mut value = post_chat_completions(cfg, &payload)?;
+
+    // P0-2：判定对面是不是推理模型——响应里出现**非空** `reasoning_content`
+    // 即命中（实测该网关即使 `enable_thinking:false` 也照常返回思考文本）。
+    // 同时把思考长度记进日志，供 P1-3 诊断，**绝不**写进字幕。
+    let observed = reasoning_content_len(&value);
+    if observed > 0 {
+        let first = profile.mark_reasoning(observed);
+        debug!(
+            reasoning_chars = observed,
+            first_detection = first,
+            "在线翻译响应含推理模型思考过程（reasoning_content，仅用于诊断，不进入译文）"
+        );
+        // 思考量逼近预算时提醒一次：推理模型确实更慢、更贵。
+        if observed >= REASONING_THINKING_TOKENS / 2 && profile.mark_slow_warned() {
+            warn!(
+                reasoning_chars = observed,
+                "该模型是推理模型（思考过程较长，约 {observed} 字符），在线翻译会更慢、token 消耗更高"
+            );
+        }
+    }
+
+    let mut content = extract_message_content(&value).unwrap_or_default();
+    // 没有 `content`、却明明有思考文本：几乎必然是 `max_tokens` 被思考吃光后截断。
+    // 此时**不**把思考当译文，而是用「思考量 + 译文预算」的更大预算重试一次。
+    if content.trim().is_empty() && observed > 0 && !profile.is_reasoning() {
+        let retry_tokens = max_output_tokens(batch, 0, true);
+        warn!(
+            reasoning_chars = observed,
+            retry_max_tokens = retry_tokens,
+            "在线接口只返回了思考过程、没有译文，疑似输出预算不足，改用推理模型预算重试该批"
+        );
+        if let Some(mut p) = payload.as_object().cloned() {
+            p.insert(
+                "max_tokens".to_string(),
+                serde_json::Value::from(retry_tokens),
+            );
+            value = post_chat_completions(cfg, &serde_json::Value::Object(p))?;
+            let retry_observed = reasoning_content_len(&value);
+            if retry_observed > 0 {
+                profile.mark_reasoning(retry_observed);
+            }
+            content = extract_message_content(&value).unwrap_or_default();
+        }
+    }
     if content.trim().is_empty() {
         return Err(anyhow!(
             "在线接口返回了空内容。若使用的是推理模型（如 deepseek-reasoner），请改用非推理模型"
@@ -703,6 +871,13 @@ fn request_batch_translation(
                 batch = batch.len(),
                 "在线翻译输出被截断，丢弃末条并交由折半重试补齐"
             );
+        } else if profile.is_reasoning() {
+            // 一条都没解析出来、对面又是推理模型：输出预算被思考吃光了，
+            // `content` 里根本没有译文。折半重试会命中同样的预算，徒劳；
+            // 这里显式报错，让上层按「本批失败」跳过而不是误判成「空内容」。
+            return Err(anyhow!(
+                "推理模型思考过程耗尽输出预算，本批未产出译文（thinking 约占 {REASONING_THINKING_TOKENS} token，可降低每批条数后重试）"
+            ));
         }
     }
 
@@ -768,9 +943,22 @@ fn post_chat_completions(
 }
 
 /// 从 OpenAI 兼容响应里取出回复文本。
-/// 兼容三种形态：`chat/completions` 的 `message.content`、
-/// 推理模型的 `message.reasoning_content`（content 为空时的兜底）、
+/// 兼容两种形态：`chat/completions` 的 `message.content`、
 /// 以及旧版 `completions` 的 `choices[0].text`。
+///
+/// **绝不回退到 `message.reasoning_content`。** 那是推理模型的**思考过程**，
+/// 不是译文；把它当译文会直接污染字幕。实测（某网关的推理型模型）
+/// （`only_reasoning: true`）的思考文本里混着大量元话语与候选方案，例如：
+///
+/// ```text
+/// 这部分内容呢主要是两块 -> この部分の内容はですね、主に二つです。
+/// 或 この内容は主に２つに分かれます。带"呢"语气：...
+/// ```
+///
+/// 这种文本一旦回填进 `segment.translation`，用户看到的字幕里就带着
+/// 「或…」「带"呢"语气：…」这类模型自问自答。正确行为是：`content` 为空时
+/// 返回 `None`，让上层走「空内容 / 输出被思考吃光」的错误分支（可重试或提示用户），
+/// 而不是把思考当译文静默吞下。思考文本只允许进日志（见 [`reasoning_content_len`]）。
 fn extract_message_content(value: &serde_json::Value) -> Option<String> {
     let choice = value.get("choices")?.get(0)?;
     let direct = choice
@@ -780,19 +968,26 @@ fn extract_message_content(value: &serde_json::Value) -> Option<String> {
     if direct.is_some() {
         return direct;
     }
-    let legacy = choice
+    choice
         .get("text")
         .and_then(|t| t.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned);
-    if legacy.is_some() {
-        return legacy;
-    }
-    choice
-        .get("message")
+        .map(ToOwned::to_owned)
+}
+
+/// 推理模型思考文本（`message.reasoning_content`）的字符数；没有则 0。
+///
+/// 只用于**诊断与预算判定**：思考文本绝不进入字幕（见 [`extract_message_content`]）。
+fn reasoning_content_len(value: &serde_json::Value) -> usize {
+    value
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|choice| choice.get("message"))
         .and_then(|m| m.get("reasoning_content"))
         .and_then(content_to_text)
+        .map(|s| s.chars().count())
+        .unwrap_or(0)
 }
 
 /// 把 `content` 字段还原成文本。
@@ -934,14 +1129,20 @@ mod tests {
         let legacy = serde_json::json!({ "choices": [{ "text": "你好" }] });
         assert_eq!(extract_message_content(&legacy).as_deref(), Some("你好"));
 
-        // 推理模型：content 为空时退回 reasoning_content，而不是判定失败
+        // 推理模型：`reasoning_content` 是**思考过程**，不是译文。
+        // 实测 `cn:deepseek-v4.1-flash` 的思考里混着「或 この内容は…」「带"呢"语气：…」
+        // 这类元话语；把它当译文会直接污染字幕。content 为空时必须返回 None，
+        // 让上层走「空内容 / 输出被思考吃光」的错误分支。
         let reasoner = serde_json::json!({
             "choices": [{ "message": { "content": "", "reasoning_content": "[1] 你好。" } }]
         });
-        assert_eq!(
-            extract_message_content(&reasoner).as_deref(),
-            Some("[1] 你好。")
+        assert!(
+            extract_message_content(&reasoner).is_none(),
+            "思考过程不得当作译文返回"
         );
+        // 思考文本只允许用于诊断：长度可读，且**不**受 content 影响
+        assert_eq!(reasoning_content_len(&reasoner), 7);
+        assert_eq!(reasoning_content_len(&standard), 0);
 
         let broken = serde_json::json!({ "error": { "message": "boom" } });
         assert!(extract_message_content(&broken).is_none());
@@ -1251,8 +1452,14 @@ mod tests {
 
         let batch = [Segment::new(1, 0.0, 1.0, "你好")];
         let refs: Vec<&Segment> = batch.iter().collect();
-        let map = request_batch_with_retry(&cfg, &refs, "English", &AtomicBool::new(false))
-            .expect("429 之后重试应成功");
+        let map = request_batch_with_retry(
+            &cfg,
+            &refs,
+            "English",
+            &AtomicBool::new(false),
+            &ModelProfile::default(),
+        )
+        .expect("429 之后重试应成功");
         assert_eq!(map.get(&1).map(String::as_str), Some("Hello."));
         assert_eq!(seen.lock().unwrap().len(), 2, "429 后必须重发一次请求");
     }
@@ -1274,8 +1481,14 @@ mod tests {
 
         let batch = [Segment::new(1, 0.0, 1.0, "你好")];
         let refs: Vec<&Segment> = batch.iter().collect();
-        let err = request_batch_with_retry(&cfg, &refs, "English", &AtomicBool::new(false))
-            .expect_err("401 必须直接失败");
+        let err = request_batch_with_retry(
+            &cfg,
+            &refs,
+            "English",
+            &AtomicBool::new(false),
+            &ModelProfile::default(),
+        )
+        .expect_err("401 必须直接失败");
         assert!(err.to_string().contains("401"), "错误信息应带状态码: {err}");
         assert_eq!(
             seen.lock().unwrap().len(),
@@ -1297,8 +1510,14 @@ mod tests {
 
         let batch = [Segment::new(1, 0.0, 1.0, "你好")];
         let refs: Vec<&Segment> = batch.iter().collect();
-        let err = request_batch_with_retry(&cfg, &refs, "English", &AtomicBool::new(false))
-            .expect_err("重试用尽后应返回错误");
+        let err = request_batch_with_retry(
+            &cfg,
+            &refs,
+            "English",
+            &AtomicBool::new(false),
+            &ModelProfile::default(),
+        )
+        .expect_err("重试用尽后应返回错误");
         assert!(err.to_string().contains("429"), "{err}");
         assert_eq!(
             seen.lock().unwrap().len(),
@@ -1315,7 +1534,7 @@ mod tests {
         let short = [Segment::new(1, 0.0, 1.0, "你好")];
         let short_refs: Vec<&Segment> = short.iter().collect();
         assert_eq!(
-            max_output_tokens(&short_refs, 0),
+            max_output_tokens(&short_refs, 0, false),
             MIN_OUTPUT_TOKENS,
             "极短批也应给足最小生成空间"
         );
@@ -1325,7 +1544,7 @@ mod tests {
             .map(|i| Segment::new(i, 0.0, 1.0, &long_text))
             .collect();
         let long_refs: Vec<&Segment> = long.iter().collect();
-        let budget = max_output_tokens(&long_refs, 0);
+        let budget = max_output_tokens(&long_refs, 0, false);
         assert!(
             budget > MIN_OUTPUT_TOKENS,
             "长批的输出预算应显著大于下限，实际 {budget}"
@@ -1801,8 +2020,8 @@ mod tests {
         let segs: Vec<Segment> = (1..=20).map(|i| Segment::new(i, 0.0, 1.0, &long)).collect();
         let refs: Vec<&Segment> = segs.iter().collect();
 
-        let without = max_output_tokens(&refs, 0);
-        let with = max_output_tokens(&refs, 4_000);
+        let without = max_output_tokens(&refs, 0, false);
+        let with = max_output_tokens(&refs, 4_000, false);
         assert!(
             with < without,
             "固定开销应压缩输出预算: {with} vs {without}"
@@ -1837,5 +2056,195 @@ mod tests {
         );
         assert!(body.contains("译文长度尽量与原文相当"), "{body}");
         assert!(body.contains("格式严格为「[序号] 译文」"), "{body}");
+    }
+
+    // ─────────── P0-1 / P0-2 / P1-3：推理模型（reasoning_content）专项 ───────────
+
+    /// P0-1：`reasoning_content` 是思考过程，**绝不能**回填成译文。
+    ///
+    /// 回归：修前 `extract_message_content` 在 content 为空时回退到
+    /// `reasoning_content`，于是模型的自问自答（「或 …」「带"呢"语气：…」）
+    /// 被当成译文写进字幕。这里断言：思考文本既不出现在译文里，也不出现在
+    /// 错误信息里；`content` 为空就该失败（上层可重试或提示用户）。
+    #[test]
+    fn reasoning_content_never_becomes_translation() {
+        let thought = "这部分内容呢主要是两块 -> 或 带\"呢\"语气：候选一；候选二。";
+        let reply = serde_json::json!({
+            "choices": [{ "message": { "content": "", "reasoning_content": thought } }]
+        })
+        .to_string();
+        // 空内容会被「思考吃光预算」分支重试一次，给足两条响应
+        let (addr, seen) = spawn_mock_server(vec![reply.clone(), reply]);
+        let cfg = online_cfg_for(&addr);
+
+        let segs = vec![Segment::new(1, 0.0, 1.0, "你好")];
+        let err = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect_err("content 为空时必须失败，而不是把思考当译文");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("空内容"),
+            "应报「空内容」而不是静默成功: {msg}"
+        );
+        assert!(
+            !msg.contains("候选一"),
+            "思考原文不得出现在错误信息里: {msg}"
+        );
+        // 至少发过一次「加大预算重试」，说明走了推理模型分支
+        assert!(
+            seen.lock().unwrap().len() >= 2,
+            "空内容 + 有思考时应加大预算重试"
+        );
+    }
+
+    /// P0-2：推理模型的 `max_tokens` 必须给「译文预算 + 思考余量」，而不是 512。
+    #[test]
+    fn reasoning_budget_adds_thinking_allowance() {
+        let short = [Segment::new(1, 0.0, 1.0, "你好")];
+        let refs: Vec<&Segment> = short.iter().collect();
+
+        let plain = max_output_tokens(&refs, 0, false);
+        let reasoning = max_output_tokens(&refs, 0, true);
+        assert_eq!(plain, MIN_OUTPUT_TOKENS, "非推理模型仍是原来的下限");
+        assert!(
+            reasoning >= REASONING_THINKING_TOKENS,
+            "推理模型至少要能装下思考余量: {reasoning}"
+        );
+        assert!(
+            reasoning > plain,
+            "推理模型预算必须显著大于非推理模型: {reasoning} vs {plain}"
+        );
+        assert!(
+            reasoning <= MAX_REASONING_OUTPUT_TOKENS,
+            "推理模型预算不得超过上限: {reasoning}"
+        );
+
+        // 长批同样受上限约束（不会因源文本长而顶爆）
+        let long_text = "字".repeat(4_000);
+        let long = [Segment::new(1, 0.0, 1.0, &long_text)];
+        let long_refs: Vec<&Segment> = long.iter().collect();
+        assert_eq!(
+            max_output_tokens(&long_refs, 0, true),
+            MAX_REASONING_OUTPUT_TOKENS
+        );
+    }
+
+    /// P0-2：首批响应暴露推理模型后，**剩余**批次应缩到 [`REASONING_BATCH_LINES`]
+    /// 条并改用推理预算；同时必须记录一条日志说明「已调整批次/预算」。
+    #[test]
+    fn reasoning_model_shrinks_remaining_batches_and_raises_budget() {
+        let first = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "[1] T1.\n[2] T2.\n[3] T3.\n[4] T4.\n[5] T5.\n[6] T6.\n[7] T7.\n[8] T8.",
+                    "reasoning_content": "先想想怎么翻这八句……"
+                }
+            }]
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "choices": [{
+                "message": { "content": "[9] T9.\n[10] T10.\n[11] T11.\n[12] T12." }
+            }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![first, second]);
+        let cfg = online_cfg_for(&addr); // batch_size = 20
+
+        let segs: Vec<Segment> = (1..=12)
+            .map(|i| Segment::new(i, 0.0, 1.0, "短句"))
+            .collect();
+        let out = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("推理模型应能译完");
+
+        assert_eq!(out.len(), 12);
+        assert_eq!(out[11].translation.as_deref(), Some("T12."));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "应恰好两批：首批 8 条 + 剩余 4 条"
+        );
+
+        let bodies = seen.lock().unwrap().clone();
+        let second_body = &bodies[1];
+        assert!(
+            second_body.contains("[9] ") && second_body.contains("[12] "),
+            "剩余批应只含第 9~12 句: {second_body}"
+        );
+        assert!(
+            !second_body.contains("[8] "),
+            "已译的句子不得重发: {second_body}"
+        );
+        let mt: usize = second_body
+            .split("\"max_tokens\":")
+            .nth(1)
+            .and_then(|s| s.trim().split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|s| s.parse().ok())
+            .expect("请求体里应有 max_tokens");
+        assert!(
+            mt >= REASONING_THINKING_TOKENS,
+            "识别出推理模型后剩余批必须改用推理预算: {mt}"
+        );
+    }
+
+    /// P0-2 方案 C：首批只回思考、没回译文时，应**加大预算重试**，而不是把思考
+    /// 当译文或直接判失败。
+    #[test]
+    fn reasoning_model_retries_with_bigger_budget_when_thought_eats_output() {
+        let thought_only = serde_json::json!({
+            "choices": [{ "message": { "content": "", "reasoning_content": "思考中……" } }]
+        })
+        .to_string();
+        let ok = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] Hello.\n[2] World." } }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![thought_only, ok]);
+        let cfg = online_cfg_for(&addr);
+
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "你好"),
+            Segment::new(2, 1.0, 2.0, "世界"),
+        ];
+        let out = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("加大预算重试后应拿到译文");
+
+        assert_eq!(out[0].translation.as_deref(), Some("Hello."));
+        assert_eq!(out[1].translation.as_deref(), Some("World."));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "应发出「失败首批 + 加大预算重试」"
+        );
+
+        let bodies = seen.lock().unwrap().clone();
+        let mt: usize = bodies[1]
+            .split("\"max_tokens\":")
+            .nth(1)
+            .and_then(|s| s.trim().split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|s| s.parse().ok())
+            .expect("重试请求体里应有 max_tokens");
+        assert!(
+            mt >= REASONING_THINKING_TOKENS,
+            "重试必须给足推理预算: {mt}"
+        );
     }
 }
