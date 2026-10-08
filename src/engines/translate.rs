@@ -13,6 +13,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use tracing::{info, warn};
 
+use crate::engines::llm::{
+    chinese_variant_target, convert_chinese_variant, is_untranslated_copy, CopyRate,
+};
 use crate::engines::LLMEngine;
 use crate::subtitle::Segment;
 
@@ -34,7 +37,7 @@ impl TranslateMode {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_mode(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "online" | "online_api" | "api" => TranslateMode::OnlineApi,
             _ => TranslateMode::OfflineQwen,
@@ -101,16 +104,45 @@ impl TranslateEngine {
         &self,
         segments: Vec<Segment>,
         target_lang: &str,
-        progress_cb: Option<Box<dyn Fn(f64, &str) + Send>>,
+        progress_cb: Option<crate::engines::TextProgressCb>,
         cancel: Arc<AtomicBool>,
     ) -> Result<Vec<Segment>> {
-        info!("开始执行字幕翻译 (目标语言: {}, 引擎: {:?})", target_lang, self.mode);
+        info!(
+            "开始执行字幕翻译 (目标语言: {}, 引擎: {:?})",
+            target_lang, self.mode
+        );
+        // P0-A：目标语言是**中文变体**时短路，不走 LLM。
+        //
+        // 本项目源字幕本来就是中文，而目标清单里含「简体中文 / 繁体中文」。若交给
+        // 小模型，提示词会变成自相矛盾的「源语言为中文；……翻译为地道的繁体中文。」，
+        // 它最省力的输出就是**原样复制**——实测 8/8 句与原文一模一样，界面却显示
+        // 「翻译已完成（8 句）」。中文变体之间是确定性字符映射，用 zhconv 直接转换
+        // 即可（简→繁 / 繁→简），既准确又不花推理时间。
+        //
+        // 例外：目标「简体中文」而源本来就是简体（绝大多数情况）时，转换结果 == 原文。
+        // 这是**正确行为**（中文→简体中文本就该是原文），不是失败，因此这里照常写入
+        // `translation`，不参与「译文==原文」的复制检测。
+        if let Some(variant) = chinese_variant_target(target_lang) {
+            return convert_chinese_variant(segments, target_lang, variant, progress_cb, &cancel);
+        }
         match self.mode {
             TranslateMode::OfflineQwen => {
                 let engine = self
                     .llm_engine
                     .as_ref()
                     .ok_or_else(|| anyhow!("离线翻译引擎未初始化"))?;
+                // P0-A（离线侧）：中文变体目标同样短路——`LLMEngine::translate` 是
+                // 公开入口，可能被直接调用，判定下沉到那里同样成立（见
+                // `LLMEngine::translate` 的短路分支）。
+                if let Some(variant) = chinese_variant_target(target_lang) {
+                    return convert_chinese_variant(
+                        segments,
+                        target_lang,
+                        variant,
+                        progress_cb,
+                        &cancel,
+                    );
+                }
                 // 取消标志下沉到引擎：润色/翻译都是分批长循环，取消必须能在批次之间生效
                 engine.install_cancel_flag(cancel);
                 engine.translate(segments, target_lang, progress_cb)
@@ -154,7 +186,7 @@ fn translate_via_online_api(
     cfg: &OnlineApiConfig,
     mut segments: Vec<Segment>,
     target_lang: &str,
-    progress_cb: Option<Box<dyn Fn(f64, &str) + Send>>,
+    progress_cb: Option<crate::engines::TextProgressCb>,
     cancel: Arc<AtomicBool>,
 ) -> Result<Vec<Segment>> {
     if cfg.api_key.trim().is_empty() {
@@ -164,7 +196,9 @@ fn translate_via_online_api(
         ));
     }
     if cfg.model.trim().is_empty() {
-        return Err(anyhow!("未配置在线翻译模型名（如 deepseek-chat / gpt-4o-mini）"));
+        return Err(anyhow!(
+            "未配置在线翻译模型名（如 deepseek-chat / gpt-4o-mini）"
+        ));
     }
     // 接口地址为空时，`chat_completions_url()` 会拼出 "/chat/completions"——
     // ureq 会报一句难懂的 URL 解析错误。这里提前给出可操作的中文提示。
@@ -211,8 +245,17 @@ fn translate_via_online_api(
     let mut completed = 0usize;
     // 失败但**不需要中止整片**的批次数（重试用尽、或本批解析不完整）
     let mut soft_failed_batches = 0usize;
+    // P0-B：整批的「译文 == 原文」复制率统计
+    let mut copy = CopyRate::default();
 
-    for chunk in plan_online_batches(&translatable, &segments, batch_size) {
+    // P0-C：单批源文本预算必须扣掉**每批重复注入**的固定开销——system 提示词模板
+    // （含源语言线索与术语表）。术语表理论上限约 9.7k 字符，不扣就会顶爆小上下文
+    // 服务端（400）或让输出被截断。
+    let fixed_chars =
+        ONLINE_SYSTEM_PROMPT_CHARS + cfg.glossary_hint.chars().count() + ONLINE_SRC_HINT_CHARS;
+    let char_budget = online_char_budget(fixed_chars);
+
+    for chunk in plan_online_batches(&translatable, &segments, batch_size, char_budget) {
         // 每批开始前检查取消：单批最长可达 `timeout_secs`（默认 120s），
         // 不在批次之间检查的话，用户点「取消」要等当前批跑完才生效。
         if cancel.load(Ordering::Relaxed) {
@@ -262,8 +305,16 @@ fn translate_via_online_api(
             }
         };
         let mut matched = 0usize;
+        // 被判为「复制原文」的句子：折半重试**之后**仍未译出才计入复制率。
+        let mut copy_candidates: Vec<usize> = Vec::new();
+        copy.checked += chunk.len();
         for &pos in &chunk {
             if let Some(text) = translations.get(&segments[pos].index) {
+                // P0-B：模型把原文原样吐回来时不算译出——走已有的折半重试路径补译。
+                if is_untranslated_copy(&segments[pos].translate_source(), text) {
+                    copy_candidates.push(pos);
+                    continue;
+                }
                 segments[pos].translation = Some(text.clone());
                 segments[pos].translation_lang = Some(target_lang.to_string());
                 matched += 1;
@@ -277,13 +328,8 @@ fn translate_via_online_api(
                 .copied()
                 .filter(|&pos| !segments[pos].translation_matches(target_lang))
                 .collect();
-            let recovered = retry_missing_online(
-                cfg,
-                &mut segments,
-                &missing,
-                target_lang,
-                &cancel,
-            );
+            let recovered =
+                retry_missing_online(cfg, &mut segments, &missing, target_lang, &cancel);
             if recovered < missing.len() {
                 soft_failed_batches += 1;
                 warn!(
@@ -292,12 +338,20 @@ fn translate_via_online_api(
                 );
             }
         }
+        // 重试之后仍没译出的复制句，才真正计入复制率。
+        copy.rejected += copy_candidates
+            .iter()
+            .filter(|&&pos| !segments[pos].translation_matches(target_lang))
+            .count();
         completed += chunk.len();
         if let Some(ref cb) = progress_cb {
             let progress = completed as f64 / pending_total.max(1) as f64;
             cb(
                 progress,
-                &format!("在线翻译中: {completed}/{pending_total} 条（{}）", cfg.model),
+                &format!(
+                    "在线翻译中: {completed}/{pending_total} 条（{}）",
+                    cfg.model
+                ),
             );
         }
     }
@@ -310,14 +364,41 @@ fn translate_via_online_api(
             .iter()
             .filter(|&&pos| segments[pos].translation_matches(target_lang))
             .count();
+        // P0-B 兜底：复制率过半说明模型整体在复制原文，不能静默返回 Ok 让界面显示
+        // 「翻译已完成（N 句）」的假成功。**排在「一句都没译出」之前**：整篇复制时
+        // 它才是真正的原因，比笼统的「未能译出任何一句」更能指导用户换模型。
+        if copy.is_alarming() {
+            warn!(
+                rejected = copy.rejected,
+                checked = copy.checked,
+                "在线翻译复制率过高（{:.0}%）：译文与原文相同，疑似模型未真正翻译",
+                copy.rate() * 100.0
+            );
+            return Err(anyhow!(
+                "在线翻译质量异常：{}/{} 句译文与原文完全相同（复制率 {:.0}%），已按「未译出」处理。请检查模型是否适合该目标语言（可换更大的模型）。",
+                copy.rejected,
+                copy.checked,
+                copy.rate() * 100.0
+            ));
+        }
         if ok == 0 {
             return Err(anyhow!(
                 "在线翻译未能译出任何一句（共 {pending_total} 句待译）。请用「性能设置 → 在线翻译 API → 测试连接」检查地址、密钥与模型名。"
             ));
         }
+        if copy.rejected > 0 {
+            warn!(
+                rejected = copy.rejected,
+                checked = copy.checked,
+                "在线翻译有 {} 句译文与原文相同，已判为未译出",
+                copy.rejected
+            );
+        }
     }
     if soft_failed_batches > 0 {
-        info!("在线 API 字幕翻译完成（{soft_failed_batches} 批未成功，可再次点击「开始翻译」补译）");
+        info!(
+            "在线 API 字幕翻译完成（{soft_failed_batches} 批未成功，可再次点击「开始翻译」补译）"
+        );
     } else {
         info!("在线 API 字幕翻译完成");
     }
@@ -358,9 +439,14 @@ fn retry_missing_online(
                 Ok(map) => {
                     for &pos in sub {
                         if let Some(text) = map.get(&segments[pos].index) {
-                            segments[pos].translation = Some(text.clone());
-                            segments[pos].translation_lang = Some(target_lang.to_string());
-                            recovered += 1;
+                            // 折半后仍原样复制 → 就是没译出：保持未译，计入软失败。
+                            if is_untranslated_copy(&segments[pos].translate_source(), text) {
+                                still.push(pos);
+                            } else {
+                                segments[pos].translation = Some(text.clone());
+                                segments[pos].translation_lang = Some(target_lang.to_string());
+                                recovered += 1;
+                            }
                         } else {
                             still.push(pos);
                         }
@@ -448,9 +534,15 @@ fn http_status_code(msg: &str) -> Option<u16> {
 /// （本地 vLLM / Ollama 或 32K 以外的自建网关），服务端返回 400；而 `is_retryable`
 /// 把 4xx 判为**不可重试**，于是整片翻译在第一批就带着「在线翻译中止」失败。
 ///
-/// 这里复用同一套字符预算思路：单批源文本（含 `[序号] ` 前缀）超过 [`ONLINE_CHAR_BUDGET`]
-/// 就提前收口，单条自身超预算时仍单独成批（交回服务端处理总好过在这里死循环）。
-fn plan_online_batches(pending: &[usize], segments: &[Segment], max_lines: usize) -> Vec<Vec<usize>> {
+/// 这里复用同一套字符预算思路：单批源文本（含 `[序号] ` 前缀）超过 `char_budget`
+/// （由 [`online_char_budget`] 按固定开销折算）就提前收口，单条自身超预算时仍单独成批
+/// （交回服务端处理总好过在这里死循环）。
+fn plan_online_batches(
+    pending: &[usize],
+    segments: &[Segment],
+    max_lines: usize,
+    char_budget: usize,
+) -> Vec<Vec<usize>> {
     let max_lines = max_lines.max(1);
     let mut batches: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
@@ -459,7 +551,7 @@ fn plan_online_batches(pending: &[usize], segments: &[Segment], max_lines: usize
         // 序号文本（"[123] "）也算输入，粗估 6 字符
         let cost = segments[pos].translate_source().chars().count() + 6;
         let would_overflow = !current.is_empty()
-            && (current.len() >= max_lines || current_chars + cost > ONLINE_CHAR_BUDGET);
+            && (current.len() >= max_lines || current_chars + cost > char_budget);
         if would_overflow {
             batches.push(std::mem::take(&mut current));
             current_chars = 0;
@@ -473,16 +565,31 @@ fn plan_online_batches(pending: &[usize], segments: &[Segment], max_lines: usize
     batches
 }
 
-/// 在线链路单批的**源文本字符预算**（含 `[序号] ` 前缀）。
+/// 在线链路**不含固定开销**时单批源文本的字符上限（含 `[序号] ` 前缀）。
 ///
 /// 推导：按最保守的 8K token 上下文估算——中文约 1 token/字符，一批要同时装下
-/// 「输入 prompt」与「模型输出」，再给系统提示词留 ~200 token，于是单批源文本
-/// 与译文各约 (8192 - 200) / 2 ≈ 4000 字符；再压到 3500 留安全余量。
+/// 「输入 prompt」与「模型输出」，于是单批源文本与译文各约 8192 / 2 = 4096 字符；
+/// 再压到 3500 留安全余量。
 ///
 /// 注意这只是**安全上限**：普通字幕（每行 < 60 字）即便 40 行也才 ~2400 字符，
 /// 根本够不到预算，因此常规批次仍由条数上限（20/40 条）决定，不会变慢；
 /// 只有出现**超长行**时预算才会提前收口——那正是顶爆小上下文服务端的场景。
-const ONLINE_CHAR_BUDGET: usize = 3_500;
+const ONLINE_CHAR_CAP: usize = 3_500;
+
+/// 在线 system 提示词模板（含格式约束）的字符数：约 130 汉字。
+const ONLINE_SYSTEM_PROMPT_CHARS: usize = 130;
+/// 在线源语言线索（`源语言为中文；`）的字符数。
+const ONLINE_SRC_HINT_CHARS: usize = 10;
+
+/// 在线链路单批的**可用源文本字符预算**：从 [`ONLINE_CHAR_CAP`] 里扣掉
+/// **每批重复注入**的 system 提示词（含源语言线索与术语表）的实际长度。
+///
+/// 术语表（`config.rs` 允许 80 条 × 左右各 60 字符 ≈ 9.7k 字符）若不计入，
+/// 一批字幕加提示词就会顶爆小上下文服务端（返回 400，而 4xx 被 `is_retryable`
+/// 判为不可重试 → 整片翻译第一批就中止）。这里让预算显式感知它。
+fn online_char_budget(fixed_chars: usize) -> usize {
+    ONLINE_CHAR_CAP.saturating_sub(fixed_chars).max(1_024)
+}
 
 /// 一条字幕译文大致需要的输出 token（本地 Qwen2.5 实测中→英约 0.84 token/字符，
 /// 按 1.0 封顶给膨胀型目标语言留余量）。
@@ -505,12 +612,23 @@ const MAX_OUTPUT_TOKENS: usize = 8_192;
 /// 截断**——返回的译文行数少于请求行数，而 `parse_batch_response` 只认能解析出的行，
 /// 少掉的那几句就原样留空。这里按源字符数给足预算（不再依赖服务端默认），
 /// 同时用一个宽松上限防止个别服务对超大值报错。
-fn max_output_tokens(batch: &[&Segment]) -> usize {
+///
+/// P0-C：`prompt_chars` 是**固定开销**（system 提示词模板 + 源语言线索 + 术语表）的
+/// 字符数——它和源文本一起占用上下文，必须从「源文本 + 输出」之外扣掉，否则术语表
+/// 一长，源文本的 token 预算就会被高估，输出被服务端截断。
+fn max_output_tokens(batch: &[&Segment], prompt_chars: usize) -> usize {
     let chars: usize = batch
         .iter()
         .map(|seg| seg.translate_source().chars().count())
         .sum();
-    (chars * OUTPUT_TOKENS_PER_CHAR).clamp(MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS)
+    let wanted = chars * OUTPUT_TOKENS_PER_CHAR;
+    // 最保守地按 8K 上下文与「中文约 1 token/字符」估算可用空间：
+    // 上下文 - （固定开销 + 源文本）就是能给输出的部分，再夹在 [MIN, MAX] 之间。
+    let available = 8_192usize.saturating_sub(prompt_chars + chars);
+    wanted.clamp(
+        MIN_OUTPUT_TOKENS,
+        MAX_OUTPUT_TOKENS.min(available.max(MIN_OUTPUT_TOKENS)),
+    )
 }
 
 /// 请求一批字幕的译文，返回 `序号 -> 译文` 映射
@@ -537,7 +655,8 @@ fn request_batch_translation(
                 "role": "system",
                 "content": format!(
                     "你是专业字幕翻译专家。{src_hint}{glossary}把用户给出的带序号字幕逐条翻译为地道的{target_lang}，\
-                     保持原意与语气，语言通顺紧凑。\
+                     保持原意与语气，语言通顺紧凑；译文长度尽量与原文相当，避免明显长于原文。\
+                     数字、公式、变量名、编号与专有名词原样保留，不得改写、不得意译。\
                      必须逐行输出，格式严格为「[序号] 译文」，不得解释、不得合并、不得遗漏、不得改动序号。",
                     glossary = cfg.glossary_hint
                 )
@@ -545,7 +664,10 @@ fn request_batch_translation(
             { "role": "user", "content": source }
         ],
         "temperature": 0.2,
-        "max_tokens": max_output_tokens(batch),
+        "max_tokens": max_output_tokens(
+            batch,
+            ONLINE_SYSTEM_PROMPT_CHARS + cfg.glossary_hint.chars().count() + ONLINE_SRC_HINT_CHARS
+        ),
         "stream": false,
     });
 
@@ -605,7 +727,9 @@ fn finish_reason_is_length(value: &serde_json::Value) -> bool {
                 .and_then(|m| m.get("finish_reason"))
                 .and_then(|r| r.as_str())
         });
-    reason.map(|r| r.eq_ignore_ascii_case("length")).unwrap_or(false)
+    reason
+        .map(|r| r.eq_ignore_ascii_case("length"))
+        .unwrap_or(false)
 }
 
 /// 统一 POST 到 `/chat/completions` 并解析 JSON 响应体
@@ -639,10 +763,7 @@ fn post_chat_completions(
             };
             Err(anyhow!("在线接口返回 HTTP {code}{hint}: {snippet}"))
         }
-        Err(e) => Err(anyhow!(
-            "无法连接在线翻译接口 {}: {e}",
-            cfg.endpoint
-        )),
+        Err(e) => Err(anyhow!("无法连接在线翻译接口 {}: {e}", cfg.endpoint)),
     }
 }
 
@@ -684,7 +805,11 @@ fn extract_message_content(value: &serde_json::Value) -> Option<String> {
 fn content_to_text(c: &serde_json::Value) -> Option<String> {
     if let Some(s) = c.as_str() {
         let t = s.trim();
-        return if t.is_empty() { None } else { Some(t.to_string()) };
+        return if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        };
     }
     let parts = c.as_array()?;
     let joined = parts
@@ -717,10 +842,22 @@ mod tests {
 
     #[test]
     fn mode_roundtrips_between_str_and_enum() {
-        assert_eq!(TranslateMode::from_str("online_api"), TranslateMode::OnlineApi);
-        assert_eq!(TranslateMode::from_str("Online"), TranslateMode::OnlineApi);
-        assert_eq!(TranslateMode::from_str("offline_qwen"), TranslateMode::OfflineQwen);
-        assert_eq!(TranslateMode::from_str("随便写的"), TranslateMode::OfflineQwen);
+        assert_eq!(
+            TranslateMode::parse_mode("online_api"),
+            TranslateMode::OnlineApi
+        );
+        assert_eq!(
+            TranslateMode::parse_mode("Online"),
+            TranslateMode::OnlineApi
+        );
+        assert_eq!(
+            TranslateMode::parse_mode("offline_qwen"),
+            TranslateMode::OfflineQwen
+        );
+        assert_eq!(
+            TranslateMode::parse_mode("随便写的"),
+            TranslateMode::OfflineQwen
+        );
         assert_eq!(TranslateMode::OnlineApi.as_str(), "online_api");
     }
 
@@ -731,9 +868,18 @@ mod tests {
             ..sample_cfg()
         };
         let segs = vec![Segment::new(1, 0.0, 1.0, "hello")];
-        let err = translate_via_online_api(&cfg, segs, "简体中文", None, Arc::new(AtomicBool::new(false)))
-            .expect_err("空密钥必须直接报错而不是静默返回原文");
-        assert!(err.to_string().contains("API Key"), "错误信息应指引用户去填密钥: {err}");
+        let err = translate_via_online_api(
+            &cfg,
+            segs,
+            "简体中文",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect_err("空密钥必须直接报错而不是静默返回原文");
+        assert!(
+            err.to_string().contains("API Key"),
+            "错误信息应指引用户去填密钥: {err}"
+        );
     }
 
     #[test]
@@ -743,9 +889,14 @@ mod tests {
             ..sample_cfg()
         };
         let segs = vec![Segment::new(1, 0.0, 1.0, "hello")];
-        let err =
-            translate_via_online_api(&cfg, segs, "简体中文", None, Arc::new(AtomicBool::new(false)))
-                .expect_err("空地址必须直接报错");
+        let err = translate_via_online_api(
+            &cfg,
+            segs,
+            "简体中文",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect_err("空地址必须直接报错");
         assert!(
             err.to_string().contains("接口地址"),
             "错误信息应指向地址配置: {err}"
@@ -759,8 +910,14 @@ mod tests {
             ..sample_cfg()
         };
         let segs = vec![Segment::new(1, 0.0, 1.0, "hello")];
-        let err = translate_via_online_api(&cfg, segs, "简体中文", None, Arc::new(AtomicBool::new(false)))
-            .expect_err("空模型名必须报错");
+        let err = translate_via_online_api(
+            &cfg,
+            segs,
+            "简体中文",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect_err("空模型名必须报错");
         assert!(err.to_string().contains("模型名"), "{err}");
     }
 
@@ -811,20 +968,34 @@ mod tests {
     #[test]
     fn retryable_classification() {
         // 值得重试
-        assert!(is_retryable(&anyhow!("在线接口返回 HTTP 429（触发限流，请降低批量条数或稍后重试）")));
+        assert!(is_retryable(&anyhow!(
+            "在线接口返回 HTTP 429（触发限流，请降低批量条数或稍后重试）"
+        )));
         assert!(is_retryable(&anyhow!("在线接口返回 HTTP 502: bad gateway")));
-        assert!(is_retryable(&anyhow!("无法连接在线翻译接口 https://x/y: timed out")));
+        assert!(is_retryable(&anyhow!(
+            "无法连接在线翻译接口 https://x/y: timed out"
+        )));
         // 不值得重试：密钥/地址/模型名写错，重试多少次都一样
-        assert!(!is_retryable(&anyhow!("在线接口返回 HTTP 401（API Key 无效或无权限）: unauthorized")));
-        assert!(!is_retryable(&anyhow!("在线接口返回 HTTP 403（API Key 无效或无权限）")));
-        assert!(!is_retryable(&anyhow!("在线接口返回 HTTP 404（接口地址或模型名不存在）")));
-        assert!(!is_retryable(&anyhow!("在线接口响应不是合法 JSON: expected value")));
+        assert!(!is_retryable(&anyhow!(
+            "在线接口返回 HTTP 401（API Key 无效或无权限）: unauthorized"
+        )));
+        assert!(!is_retryable(&anyhow!(
+            "在线接口返回 HTTP 403（API Key 无效或无权限）"
+        )));
+        assert!(!is_retryable(&anyhow!(
+            "在线接口返回 HTTP 404（接口地址或模型名不存在）"
+        )));
+        assert!(!is_retryable(&anyhow!(
+            "在线接口响应不是合法 JSON: expected value"
+        )));
         // 4xx 的响应体里提到「HTTP 5xx」时不得被误判为可重试（只看真实状态码）
         assert!(!is_retryable(&anyhow!(
             "在线接口返回 HTTP 400: upstream said HTTP 500, bad request"
         )));
         // 500-系列应重试
-        assert!(is_retryable(&anyhow!("在线接口返回 HTTP 503: service unavailable")));
+        assert!(is_retryable(&anyhow!(
+            "在线接口返回 HTTP 503: service unavailable"
+        )));
     }
 
     /// 增量翻译：已有目标语言译文的句子不该再发请求（在线接口按 token 计费）。
@@ -839,7 +1010,7 @@ mod tests {
         todo.translation = Some("Bonjour".to_string());
         todo.translation_lang = Some("Français".to_string());
 
-        let segs = vec![done, todo];
+        let segs = [done, todo];
         let pending_en: Vec<usize> = segs
             .iter()
             .enumerate()
@@ -864,9 +1035,7 @@ mod tests {
 
     /// 起一个只服务 N 次请求的最小 HTTP 服务，返回固定的 OpenAI 兼容响应体。
     /// 返回 (地址, 收到的请求体列表)。
-    fn spawn_mock_server(
-        replies: Vec<String>,
-    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    fn spawn_mock_server(replies: Vec<String>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         let with_status: Vec<(u16, String)> = replies.into_iter().map(|b| (200, b)).collect();
         spawn_mock_server_status(with_status)
     }
@@ -879,20 +1048,26 @@ mod tests {
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("绑定随机端口");
-        let addr = format!("http://127.0.0.1:{}/v1/chat/completions", listener.local_addr().unwrap().port());
+        let addr = format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            listener.local_addr().unwrap().port()
+        );
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_clone = seen.clone();
 
         std::thread::spawn(move || {
             for reply in replies {
-                let Ok((mut sock, _)) = listener.accept() else { return };
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
                 // 读请求头，再按 Content-Length 读满 body
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 1024];
                 let mut content_len = 0usize;
-                loop {
-                    let Ok(n) = sock.read(&mut tmp) else { break };
-                    if n == 0 { break }
+                while let Ok(n) = sock.read(&mut tmp) {
+                    if n == 0 {
+                        break;
+                    }
                     buf.extend_from_slice(&tmp[..n]);
                     if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                         let head = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
@@ -901,7 +1076,9 @@ mod tests {
                                 content_len = v.trim().parse().unwrap_or(0);
                             }
                         }
-                        if buf.len() >= pos + 4 + content_len { break }
+                        if buf.len() >= pos + 4 + content_len {
+                            break;
+                        }
                     }
                 }
                 if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -974,13 +1151,20 @@ mod tests {
         .to_string();
         let (addr, seen) = spawn_mock_server(vec![reply]);
         let cfg = OnlineApiConfig {
-            glossary_hint: "术语表（以下词条必须按给定译法翻译，不得改写）：生成器=engine。".to_string(),
+            glossary_hint: "术语表（以下词条必须按给定译法翻译，不得改写）：生成器=engine。"
+                .to_string(),
             ..online_cfg_for(&addr)
         };
 
         let segs = vec![Segment::new(1, 0.0, 1.0, "生成器")];
-        let _ = translate_via_online_api(&cfg, segs, "English", None, Arc::new(AtomicBool::new(false)))
-            .expect("mock 服务器应返回成功");
+        let _ = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("mock 服务器应返回成功");
 
         let body = seen.lock().unwrap().join("\n");
         assert!(
@@ -1022,7 +1206,11 @@ mod tests {
         let bodies = seen.lock().unwrap();
         assert_eq!(bodies.len(), 1);
         assert!(bodies[0].contains("[2]"), "请求应包含待译的第 2 句");
-        assert!(!bodies[0].contains("[1]"), "已译的第 1 句不应再发给接口: {}", bodies[0]);
+        assert!(
+            !bodies[0].contains("[1]"),
+            "已译的第 1 句不应再发给接口: {}",
+            bodies[0]
+        );
     }
 
     /// 全部已完成时不发任何请求，直接返回。
@@ -1061,7 +1249,7 @@ mod tests {
         ]);
         let cfg = online_cfg_for(&addr);
 
-        let batch = vec![Segment::new(1, 0.0, 1.0, "你好")];
+        let batch = [Segment::new(1, 0.0, 1.0, "你好")];
         let refs: Vec<&Segment> = batch.iter().collect();
         let map = request_batch_with_retry(&cfg, &refs, "English", &AtomicBool::new(false))
             .expect("429 之后重试应成功");
@@ -1073,17 +1261,27 @@ mod tests {
     #[test]
     fn online_translation_does_not_retry_on_auth_error() {
         let (addr, seen) = spawn_mock_server_status(vec![
-            (401, r#"{"error":{"message":"invalid api key"}}"#.to_string()),
-            (200, r#"{"choices":[{"message":{"content":"[1] 不该走到这里"}}]}"#.to_string()),
+            (
+                401,
+                r#"{"error":{"message":"invalid api key"}}"#.to_string(),
+            ),
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"[1] 不该走到这里"}}]}"#.to_string(),
+            ),
         ]);
         let cfg = online_cfg_for(&addr);
 
-        let batch = vec![Segment::new(1, 0.0, 1.0, "你好")];
+        let batch = [Segment::new(1, 0.0, 1.0, "你好")];
         let refs: Vec<&Segment> = batch.iter().collect();
         let err = request_batch_with_retry(&cfg, &refs, "English", &AtomicBool::new(false))
             .expect_err("401 必须直接失败");
         assert!(err.to_string().contains("401"), "错误信息应带状态码: {err}");
-        assert_eq!(seen.lock().unwrap().len(), 1, "401 不应重试，只应发一次请求");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "401 不应重试，只应发一次请求"
+        );
     }
 
     /// 重试次数用尽后必须返回错误（而不是静默成功），
@@ -1097,7 +1295,7 @@ mod tests {
         );
         let cfg = online_cfg_for(&addr);
 
-        let batch = vec![Segment::new(1, 0.0, 1.0, "你好")];
+        let batch = [Segment::new(1, 0.0, 1.0, "你好")];
         let refs: Vec<&Segment> = batch.iter().collect();
         let err = request_batch_with_retry(&cfg, &refs, "English", &AtomicBool::new(false))
             .expect_err("重试用尽后应返回错误");
@@ -1114,18 +1312,20 @@ mod tests {
     /// 截断——返回行数少于请求行数。这个断言锁死「不再依赖服务端默认」。
     #[test]
     fn online_max_tokens_scales_with_batch() {
-        let short = vec![Segment::new(1, 0.0, 1.0, "你好")];
+        let short = [Segment::new(1, 0.0, 1.0, "你好")];
         let short_refs: Vec<&Segment> = short.iter().collect();
         assert_eq!(
-            max_output_tokens(&short_refs),
+            max_output_tokens(&short_refs, 0),
             MIN_OUTPUT_TOKENS,
             "极短批也应给足最小生成空间"
         );
 
         let long_text = "字".repeat(300);
-        let long: Vec<Segment> = (1..=20).map(|i| Segment::new(i, 0.0, 1.0, &long_text)).collect();
+        let long: Vec<Segment> = (1..=20)
+            .map(|i| Segment::new(i, 0.0, 1.0, &long_text))
+            .collect();
         let long_refs: Vec<&Segment> = long.iter().collect();
-        let budget = max_output_tokens(&long_refs);
+        let budget = max_output_tokens(&long_refs, 0);
         assert!(
             budget > MIN_OUTPUT_TOKENS,
             "长批的输出预算应显著大于下限，实际 {budget}"
@@ -1140,10 +1340,15 @@ mod tests {
     #[test]
     fn plan_online_batches_splits_on_char_budget_and_line_cap() {
         // 短句：应完全受条数上限约束
-        let short: Vec<Segment> = (1..=100).map(|i| Segment::new(i, 0.0, 1.0, "短句")).collect();
+        let short: Vec<Segment> = (1..=100)
+            .map(|i| Segment::new(i, 0.0, 1.0, "短句"))
+            .collect();
         let pending: Vec<usize> = (0..100).collect();
-        let batches = plan_online_batches(&pending, &short, 20);
-        assert!(batches.iter().all(|b| b.len() <= 20), "每批不得超过条数上限");
+        let batches = plan_online_batches(&pending, &short, 20, ONLINE_CHAR_CAP);
+        assert!(
+            batches.iter().all(|b| b.len() <= 20),
+            "每批不得超过条数上限"
+        );
         let mut all: Vec<usize> = batches.iter().flatten().copied().collect();
         all.sort_unstable();
         assert_eq!(all, pending, "不得丢句或重复");
@@ -1152,14 +1357,14 @@ mod tests {
         let long = "字".repeat(500);
         let segs: Vec<Segment> = (1..=40).map(|i| Segment::new(i, 0.0, 1.0, &long)).collect();
         let pending2: Vec<usize> = (0..40).collect();
-        let batches2 = plan_online_batches(&pending2, &segs, 40);
+        let batches2 = plan_online_batches(&pending2, &segs, 40, ONLINE_CHAR_CAP);
         assert!(batches2.len() > 1, "长行批次应被字符预算拆开");
         for b in &batches2 {
             let chars: usize = b
                 .iter()
                 .map(|&p| segs[p].translate_source().chars().count() + 6)
                 .sum();
-            assert!(chars <= ONLINE_CHAR_BUDGET, "单批字符数应受预算约束: {chars}");
+            assert!(chars <= ONLINE_CHAR_CAP, "单批字符数应受预算约束: {chars}");
         }
         let mut all2: Vec<usize> = batches2.iter().flatten().copied().collect();
         all2.sort_unstable();
@@ -1167,13 +1372,12 @@ mod tests {
 
         // 单条自身超预算：仍必须单独成批，不能死循环
         let huge = vec![Segment::new(1, 0.0, 1.0, "字".repeat(20_000))];
-        let b3 = plan_online_batches(&[0], &huge, 40);
+        let b3 = plan_online_batches(&[0], &huge, 40, ONLINE_CHAR_CAP);
         assert_eq!(b3, vec![vec![0]]);
 
         // 空输入不产出空批次
-        assert!(plan_online_batches(&[], &[], 40).is_empty());
+        assert!(plan_online_batches(&[], &[], 40, ONLINE_CHAR_CAP).is_empty());
     }
-
 
     /// 折半重试：第一批返回不完整（缺 [2]），补译请求返回 [2]，最终两句都有译文。
     ///
@@ -1210,7 +1414,11 @@ mod tests {
             Some("World."),
             "第一批漏掉的 [2] 应被折半重试补回"
         );
-        assert_eq!(seen.lock().unwrap().len(), 2, "应发出「首批 + 补译」两次请求");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "应发出「首批 + 补译」两次请求"
+        );
     }
 
     /// 输出被 `max_tokens` 截断（finish_reason=length）时，末条被切一半的译文不能
@@ -1250,7 +1458,11 @@ mod tests {
             Some("Hello, welcome."),
             "被截断的末条不应被接受，应重试拿到完整译文"
         );
-        assert_eq!(seen.lock().unwrap().len(), 2, "应发出「截断首批 + 补译」两次请求");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "应发出「截断首批 + 补译」两次请求"
+        );
     }
 
     /// `finish_reason` 取值判定：只有 "length" 算截断；"stop" / 缺失 / 异常值都不算。
@@ -1274,9 +1486,10 @@ mod tests {
     /// 最终返回错误，让用户看到真正的失败原因，而不是「完成 0 句」的假成功。
     #[test]
     fn online_translation_fails_fast_on_auth_error() {
-        let (addr, _seen) = spawn_mock_server_status(vec![
-            (401, r#"{"error":{"message":"invalid api key"}}"#.to_string()),
-        ]);
+        let (addr, _seen) = spawn_mock_server_status(vec![(
+            401,
+            r#"{"error":{"message":"invalid api key"}}"#.to_string(),
+        )]);
         let cfg = online_cfg_for(&addr);
 
         let segs = vec![Segment::new(1, 0.0, 1.0, "你好")];
@@ -1291,7 +1504,10 @@ mod tests {
 
         let msg = err.to_string();
         assert!(msg.contains("401"), "错误信息应带状态码: {msg}");
-        assert!(msg.contains("在线翻译中止"), "应给出可操作的中止提示: {msg}");
+        assert!(
+            msg.contains("在线翻译中止"),
+            "应给出可操作的中止提示: {msg}"
+        );
     }
 
     /// 全部待译句都译不出（接口持续 429、重试用尽后逐批跳过）时，应返回错误
@@ -1333,15 +1549,293 @@ mod tests {
 
         let segs = vec![Segment::new(1, 0.0, 1.0, "你好")];
         // 起手就置位取消：循环第一件事就是 break，返回原始片段（无译文）而非 Err
+        let out =
+            translate_via_online_api(&cfg, segs, "English", None, Arc::new(AtomicBool::new(true)))
+                .expect("取消应返回偏序结果而非错误");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].translation.is_none(), "取消时不该凭空产生译文");
+    }
+    // ─────────── P0-A：中文变体短路（zhconv 确定性转换） ───────────
+
+    /// 中文变体目标必须短路到 zhconv，不走在线接口，且写出与 LLM 路径一致的
+    /// `translation` / `translation_lang`。
+    #[test]
+    fn chinese_variant_target_short_circuits_without_request() {
+        // mock 服务器准备好一条「绝不会用到」的响应：`seen` 为空即可证明没走网络
+        let unused = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] 不应出现" } }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![unused]);
+        let cfg = online_cfg_for(&addr);
+
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "大家好，下面我们一起来学习概率不等式。"),
+            Segment::new(2, 1.0, 2.0, "这个不等式很直观。"),
+        ];
+        let out = TranslateEngine::online(cfg.clone())
+            .translate_subtitles(segs, "繁体中文", None, Arc::new(AtomicBool::new(false)))
+            .expect("中文变体应短路成功");
+
+        assert_eq!(seen.lock().unwrap().len(), 0, "中文变体不该发任何网络请求");
+        assert!(out
+            .iter()
+            .all(|s| s.translation_lang.as_deref() == Some("繁体中文")));
+        assert!(out.iter().all(|s| s.has_translation()));
+        let t0 = out[0].translation.as_deref().unwrap();
+        assert_ne!(t0, out[0].translate_source(), "简→繁应改变文本");
+        assert!(
+            t0.contains('學') || t0.contains('會') || t0.contains('這'),
+            "应含繁体字: {t0}"
+        );
+    }
+
+    /// 例外：目标「简体中文」而源本来就是简体时，转换结果 == 原文。这是**正确行为**，
+    /// 必须照常写入译文、并打上语言标记（不能被复制检测当成失败）。
+    #[test]
+    fn simplified_target_keeps_identity_but_is_still_success() {
+        let unused = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] 不应出现" } }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![unused]);
+        let cfg = online_cfg_for(&addr);
+
+        let src = "这个概率不等式很直观。";
+        let out = TranslateEngine::online(cfg.clone())
+            .translate_subtitles(
+                vec![Segment::new(1, 0.0, 1.0, src)],
+                "简体中文",
+                None,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("简→简应短路成功");
+
+        assert_eq!(seen.lock().unwrap().len(), 0);
+        assert_eq!(out[0].translation.as_deref(), Some(src), "简→简应等于原文");
+        assert_eq!(out[0].translation_lang.as_deref(), Some("简体中文"));
+        assert!(out[0].has_translation(), "等于原文也算已完成，不是失败");
+    }
+
+    /// 取消标志必须对中文变体短路同样生效。
+    #[test]
+    fn chinese_variant_short_circuit_respects_cancel() {
+        let unused = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] 不应出现" } }]
+        })
+        .to_string();
+        let (addr, _seen) = spawn_mock_server(vec![unused]);
+        let cfg = online_cfg_for(&addr);
+
+        let segs = vec![Segment::new(1, 0.0, 1.0, "这是第一句测试文本。")];
+        let out = TranslateEngine::online(cfg.clone())
+            .translate_subtitles(segs, "繁体中文", None, Arc::new(AtomicBool::new(true)))
+            .expect("取消应返回偏序结果");
+        assert!(out[0].translation.is_none(), "取消时不该写入译文");
+    }
+
+    // ─────────── P0-B：译文 == 原文 复制检测（在线链路） ───────────
+
+    /// 模型把原文原样复制回来时必须判为未译出：走折半重试，重试给出真译文才写回。
+    #[test]
+    fn online_copy_is_rejected_and_retried() {
+        let copy = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] 那么这个概率不等式，其实整体里面考的相对来说不是很多。" } }]
+        })
+        .to_string();
+        let real = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] This probability inequality is not tested very much overall." } }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![copy, real]);
+        let cfg = online_cfg_for(&addr);
+
+        let src = "那么这个概率不等式，其实整体里面考的相对来说不是很多。";
+        let out = translate_via_online_api(
+            &cfg,
+            vec![Segment::new(1, 0.0, 1.0, src)],
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("折半重试后应拿到真译文");
+
+        assert_eq!(
+            out[0].translation.as_deref(),
+            Some("This probability inequality is not tested very much overall.")
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2, "复制应触发一次补译请求");
+    }
+
+    /// 短数字 / 纯公式「译文==原文」是正确结果，不能被判为复制而反复重试。
+    #[test]
+    fn online_short_and_formula_identity_is_accepted() {
+        let reply = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] 1.3\n[2] P(A+B) = P(A) + P(B) - P(AB)" } }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![reply]);
+        let cfg = online_cfg_for(&addr);
+
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "1.3"),
+            Segment::new(2, 1.0, 2.0, "P(A+B) = P(A) + P(B) - P(AB)"),
+        ];
         let out = translate_via_online_api(
             &cfg,
             segs,
             "English",
             None,
-            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
         )
-        .expect("取消应返回偏序结果而非错误");
-        assert_eq!(out.len(), 1);
-        assert!(out[0].translation.is_none(), "取消时不该凭空产生译文");
+        .expect("应成功");
+
+        assert_eq!(out[0].translation.as_deref(), Some("1.3"));
+        assert_eq!(
+            out[1].translation.as_deref(),
+            Some("P(A+B) = P(A) + P(B) - P(AB)")
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1, "短句/公式不该触发重试");
+    }
+
+    /// 整篇复制率过高时必须显式报错，而不是「翻译已完成（N 句）」的假成功。
+    #[test]
+    fn online_copy_rate_above_threshold_reports_error() {
+        let src_lines = [
+            "那么这个概率不等式，其实整体里面考的相对来说不是很多。",
+            "但是大家平常在做一些习题集的时候会经常遇到。",
+            "或者说后面做模拟机员，经常会出现这种类型的题目。",
+            "那么关于这不等式的话，很多同学看到就是两眼一麻黑。",
+        ];
+        let content = src_lines
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("[{}] {}", i + 1, t))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reply = serde_json::json!({
+            "choices": [{ "message": { "content": content } }]
+        })
+        .to_string();
+        // 每句都要折半重试（最多 8 轮），给足响应数
+        let (addr, _seen) = spawn_mock_server(vec![reply; 40]);
+        let cfg = online_cfg_for(&addr);
+
+        let segs: Vec<Segment> = src_lines
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Segment::new(i + 1, i as f64, i as f64 + 1.0, *t))
+            .collect();
+        let err = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect_err("整篇复制必须报错");
+
+        assert!(
+            err.to_string().contains("译文与原文完全相同"),
+            "错误信息应说明复制率异常: {err}"
+        );
+    }
+
+    // ─────────── P0-C：在线预算感知固定开销 ───────────
+
+    /// 在线字符预算必须随固定开销（术语表）单调下降，且不会跌破下限。
+    #[test]
+    fn online_char_budget_shrinks_with_glossary() {
+        let base = online_char_budget(0);
+        assert_eq!(base, ONLINE_CHAR_CAP);
+        let with_glossary = online_char_budget(2_000);
+        assert!(
+            with_glossary < base,
+            "术语表开销必须压缩在线预算: {with_glossary} vs {base}"
+        );
+        // 术语表长到超过上限时也不能归零（留最小可用批）
+        assert!(online_char_budget(50_000) >= 1_024);
+    }
+
+    /// 术语表很长时，在线批次应收缩到「固定开销 + 本批 + 输出」仍能放进上下文。
+    #[test]
+    fn online_batches_shrink_when_glossary_is_huge() {
+        let segs: Vec<Segment> = (1..=60)
+            .map(|i| Segment::new(i, 0.0, 1.0, "字".repeat(200)))
+            .collect();
+        let pending: Vec<usize> = (0..60).collect();
+
+        let no_glossary = plan_online_batches(&pending, &segs, 40, online_char_budget(0));
+        let huge = "术语表（以下词条必须按给定译法翻译，不得改写）：".to_string()
+            + &"甲=乙；".repeat(1_000);
+        let fixed = ONLINE_SYSTEM_PROMPT_CHARS + huge.chars().count() + ONLINE_SRC_HINT_CHARS;
+        let budget = online_char_budget(fixed);
+        let with_glossary = plan_online_batches(&pending, &segs, 40, budget);
+
+        assert!(
+            with_glossary.len() > no_glossary.len(),
+            "术语表越长批次数应越多: {} vs {}",
+            with_glossary.len(),
+            no_glossary.len()
+        );
+        for b in &with_glossary {
+            let chars: usize = b
+                .iter()
+                .map(|&p| segs[p].translate_source().chars().count() + 6)
+                .sum();
+            assert!(
+                chars <= budget,
+                "单批字符数应受预算约束: {chars} > {budget}"
+            );
+        }
+        // 不得丢句或重复
+        let mut all: Vec<usize> = with_glossary.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, pending);
+    }
+
+    /// 输出预算也要扣固定开销：术语表越长，`max_tokens` 越小（但仍给足下限）。
+    #[test]
+    fn online_max_tokens_accounts_for_glossary() {
+        let long = "字".repeat(300);
+        let segs: Vec<Segment> = (1..=20).map(|i| Segment::new(i, 0.0, 1.0, &long)).collect();
+        let refs: Vec<&Segment> = segs.iter().collect();
+
+        let without = max_output_tokens(&refs, 0);
+        let with = max_output_tokens(&refs, 4_000);
+        assert!(
+            with < without,
+            "固定开销应压缩输出预算: {with} vs {without}"
+        );
+        assert!(with >= MIN_OUTPUT_TOKENS);
+    }
+
+    /// P1-E：两套提示词都必须带「数字/公式/变量名/编号/专有名词原样保留」与长度约束，
+    /// 且格式说明用引号包裹、无「；」歧义。
+    #[test]
+    fn prompts_carry_symbol_and_length_constraints() {
+        // 在线 prompt 由 request_batch_translation 现场拼装：用一个 mock 服务器抓请求体
+        let reply = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] Hello." } }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![reply]);
+        let cfg = online_cfg_for(&addr);
+        let segs = vec![Segment::new(1, 0.0, 1.0, "你好")];
+        let _ = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("应成功");
+        let body = seen.lock().unwrap().join("\n");
+        assert!(
+            body.contains("数字、公式、变量名、编号与专有名词原样保留"),
+            "{body}"
+        );
+        assert!(body.contains("译文长度尽量与原文相当"), "{body}");
+        assert!(body.contains("格式严格为「[序号] 译文」"), "{body}");
     }
 }
