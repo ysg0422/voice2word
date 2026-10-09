@@ -1268,6 +1268,21 @@ impl MainWindow {
                     .w_full()
                     .max_h(px(Theme::QUEUE_LIST_MAX_H))
                     .overflow_y_scroll()
+                    .track_scroll(&self.batch_queue_scroll)
+                    // 内嵌队列自己吃掉滚轮：还有余量时不让事件继续冒泡到外层页面壳，
+                    // 避免「队列与页面一起滚」（判据同编辑台字幕清单）。
+                    // 到边界时放行，由页面接管。
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                        let delta_y = match event.delta {
+                            ScrollDelta::Lines(p) => p.y,
+                            ScrollDelta::Pixels(p) => f32::from(p.y),
+                        };
+                        let offset_y = f32::from(this.batch_queue_scroll.offset().y);
+                        let max_h = f32::from(this.batch_queue_scroll.max_offset().height);
+                        if crate::ui::primitives::should_consume_scroll(delta_y, offset_y, max_h) {
+                            cx.stop_propagation();
+                        }
+                    }))
                     .flex()
                     .flex_col()
                     .gap(px(Theme::SPACE_1))

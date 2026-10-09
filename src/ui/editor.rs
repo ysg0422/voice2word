@@ -1847,6 +1847,25 @@ impl MainWindow {
                                 .track_scroll(self.subtitle_list_scroll.clone())
                                 .flex_1()
                                 .w_full()
+                                // 内嵌清单自己吃掉滚轮：清单还有余量时不让事件继续冒泡到
+                                // 外层可滚动面板，避免「清单与外层面板一起滚」（见
+                                // `should_consume_scroll` 的说明）。到边界时放行，外层接管。
+                                .on_scroll_wheel(cx.listener(
+                                    |this, event: &ScrollWheelEvent, _window, cx| {
+                                        let delta_y = match event.delta {
+                                            ScrollDelta::Lines(p) => p.y,
+                                            ScrollDelta::Pixels(p) => f32::from(p.y),
+                                        };
+                                        let state = this.subtitle_list_scroll.0.borrow();
+                                        let offset_y =
+                                            f32::from(state.base_handle.offset().y);
+                                        let max_h = f32::from(state.base_handle.max_offset().height);
+                                        drop(state);
+                                        if primitives::should_consume_scroll(delta_y, offset_y, max_h) {
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
                             }),
                     )
             )
@@ -4305,6 +4324,7 @@ impl MainWindow {
 mod tests {
     use super::translated_out_count;
     use crate::subtitle::Segment;
+    use crate::ui::primitives::should_consume_scroll;
 
     /// 回归（P2）：「已全部翻译」的判定必须用**实际译出**口径。
     /// 引擎可能给空串/纯空白译文打上 `translation_lang`（或直接复制原文），
@@ -4326,5 +4346,42 @@ mod tests {
         assert_eq!(translated_out_count(&segs, "English"), 1);
         assert_eq!(translated_out_count(&segs, "Français"), 1);
         assert_eq!(translated_out_count(&segs, "日本語"), 0);
+    }
+
+    /// 内嵌清单滚轮判据：有余量就吃掉（阻止冒泡），到边界才放行给外层。
+    ///
+    /// 回归现象：在字幕清单里滚轮，整个右侧面板也跟着滚。根因是 GPUI 的滚动
+    /// 监听不 `stop_propagation`，内嵌清单与外层可滚动面板同时吃同一个事件。
+    #[test]
+    fn nested_list_consumes_scroll_until_it_hits_the_edge() {
+        // 可滚动区间 100px：offset 从 0（顶部）到 -100（底部）
+        let max_h = 100.0;
+
+        // 在中段：两个方向都有余量，清单自己吃掉
+        assert!(should_consume_scroll(-3.0, -50.0, max_h), "中段向下应吃掉");
+        assert!(should_consume_scroll(3.0, -50.0, max_h), "中段向上应吃掉");
+
+        // 顶部再往上滚：清单已没余量，放行给外层
+        assert!(
+            !should_consume_scroll(3.0, 0.0, max_h),
+            "顶部继续上滚应放行"
+        );
+        // 顶部向下滚：有余量，吃掉
+        assert!(should_consume_scroll(-3.0, 0.0, max_h), "顶部向下应吃掉");
+
+        // 底部再往下滚：放行
+        assert!(
+            !should_consume_scroll(-3.0, -max_h, max_h),
+            "底部继续下滚应放行"
+        );
+        // 底部向上滚：有余量，吃掉
+        assert!(should_consume_scroll(3.0, -max_h, max_h), "底部向上应吃掉");
+
+        // 内容没超框（max_h≈0）：一律放行，交给外层
+        assert!(!should_consume_scroll(-3.0, 0.0, 0.0), "不可滚时应放行");
+        assert!(!should_consume_scroll(3.0, 0.0, 0.0), "不可滚时应放行");
+
+        // 横向滚轮（dy == 0）不拦
+        assert!(!should_consume_scroll(0.0, -50.0, max_h), "横向滚轮应放行");
     }
 }

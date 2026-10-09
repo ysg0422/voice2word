@@ -408,6 +408,12 @@ pub struct MainWindow {
     pub(crate) cached_live_image: Option<(u64, u32, u32, Arc<RenderImage>)>,
     /// 字幕清单虚拟列表的滚动位置句柄（uniform_list 仅渲染可视行）
     pub(crate) subtitle_list_scroll: UniformListScrollHandle,
+    /// 批量转写队列清单的滚动句柄。
+    ///
+    /// 该清单嵌在可滚动的页面壳里（`page_shell` 带
+    /// `overflow_y_scroll`），而 GPUI 的滚轮监听不 `stop_propagation`：
+    /// 没有句柄就无法判断清单是否到边界，也就无法避免「清单与页面一起滚」。
+    pub(crate) batch_queue_scroll: ScrollHandle,
     /// 上次清单跟随滚动到的选中序号，用于选中变化时自动滚动跟随
     pub(crate) subtitle_list_followed_sel: Option<usize>,
     /// 视频库卡片首帧缩略图缓存：task_id -> 首帧 JPG 路径（磁盘级缓存，跨会话命中）
@@ -726,6 +732,7 @@ impl MainWindow {
             text_cursor_pos: 0,
             cached_live_image: None,
             subtitle_list_scroll: UniformListScrollHandle::new(),
+            batch_queue_scroll: ScrollHandle::new(),
             subtitle_list_followed_sel: None,
             library_thumbs: HashMap::new(),
             library_thumb_inflight: HashSet::new(),
