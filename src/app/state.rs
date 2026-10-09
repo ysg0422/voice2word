@@ -1351,7 +1351,75 @@ impl AppState {
             self.batch_queue.push(QueueItem::new(path));
             added += 1;
         }
+        if added > 0 {
+            // 入队即落盘：用户排好队就去干别的了，此刻不存的话一关窗就白排。
+            self.persist_queue();
+        }
         added
+    }
+
+    /// 批量队列的持久化路径（与 `config.toml` 同目录）。
+    ///
+    /// 为什么用 `resolve_path` 而不是相对当前目录：程序可能从开始菜单 / 快捷方式
+    /// 启动，cwd 会变成 `C:\Windows\System32`，相对路径会把队列文件写到系统目录。
+    pub fn queue_file_path() -> std::path::PathBuf {
+        AppConfig::resolve_path(crate::utils::queue_store::QUEUE_FILE_NAME)
+    }
+
+    /// 把当前队列落盘（原子写）。
+    ///
+    /// 队列是**易失状态**，所以这里刻意不返回错误、失败只记日志：一次写盘失败不该
+    /// 打断用户正在做的事（他可能刚点了「开始全部」）。代价是极端情况下队列没存上，
+    /// 那也比因为一个可选的辅助文件而报错强。
+    pub fn persist_queue(&self) {
+        let items: Vec<crate::utils::queue_store::StoredQueueItem> = self
+            .batch_queue
+            .iter()
+            .map(|q| crate::utils::queue_store::StoredQueueItem {
+                path: q.path.to_string_lossy().to_string(),
+                duration: q.duration,
+                status: match &q.state {
+                    QueueState::Pending => "pending".to_string(),
+                    QueueState::Running => "pending".to_string(),
+                    QueueState::Done { .. } => "done".to_string(),
+                    QueueState::Failed(_) => "failed".to_string(),
+                },
+            })
+            .collect();
+        let path = Self::queue_file_path();
+        if let Err(e) = crate::utils::queue_store::save_queue(&path, &items) {
+            tracing::warn!(error = %e, "批量队列落盘失败（不影响本次会话）");
+        }
+    }
+
+    /// 启动时恢复上次的队列。
+    ///
+    /// `running` 状态**恢复为等待中**：上次退出时正在跑的那条要么已经跑完（DB 里
+    /// 有记录，`find_cached_task` 会命中）、要么被中断，无论哪种都不该显示成
+    /// 「转写中…」——那会让用户以为程序还在干活。
+    pub fn restore_queue(&mut self) {
+        let items = crate::utils::queue_store::load_queue(&Self::queue_file_path());
+        if items.is_empty() {
+            return;
+        }
+        self.batch_queue = items
+            .into_iter()
+            .map(|stored| {
+                let mut item = QueueItem::new(std::path::PathBuf::from(&stored.path));
+                item.duration = stored.duration;
+                item.state = match stored.status.as_str() {
+                    s if crate::utils::queue_store::is_finished(s) => {
+                        // 句数未知（磁盘上只存了状态）：显示「已完成」，具体句数在
+                        // 用户点开 / 重跑时才需要。写 0 而不是编一个数。
+                        QueueState::Done { segments: 0 }
+                    }
+                    "failed" => QueueState::Failed("上次运行未完成".to_string()),
+                    _ => QueueState::Pending,
+                };
+                item
+            })
+            .collect();
+        tracing::info!(count = self.batch_queue.len(), "已恢复上次的批量队列");
     }
 
     /// 下一个还需要处理的队列下标。
@@ -1390,6 +1458,8 @@ impl AppState {
             return false;
         }
         self.batch_queue.remove(idx);
+        // 删条目同样落盘（否则下次启动它又回来了）。
+        self.persist_queue();
         self.batch_active = match self.batch_active {
             // 被删的正是活动项（理论上不会发生，防御性处理）：没有归属了，作废
             Some(active) if active == idx => None,
@@ -1424,6 +1494,9 @@ impl AppState {
                     Err(reason) => QueueState::Failed(reason),
                 };
             }
+            // 每条结算都落盘：批量跑几十条时用户随时可能关窗，进度必须留下，
+            // 否则重启后「已完成」的条目又变回等待中，整批白跑。
+            self.persist_queue();
         }
         // 无论有没有结算到具体条目（用户可能把正在跑的那条从队列里删了，
         // 于是 `batch_active` 已作废），这一条转写都结束了，状态都必须归位。
@@ -1471,6 +1544,8 @@ impl AppState {
         self.batch_queue.clear();
         self.batch_running = false;
         self.batch_active = None;
+        // 清空也要落盘：否则下次启动会把「已经清掉的队列」又恢复回来。
+        self.persist_queue();
     }
 
     /// 视频画面宽高比（探测未完成或失败时回退 16:9）
@@ -2362,6 +2437,44 @@ mod tests {
             small_q5.is_file() || small_plain.is_file(),
             "Balanced 不应跟着 config 指向的 turbo-q8 一起变已就位"
         );
+    }
+
+    /// 队列落盘 → 读回：状态映射必须保真，且「转写中」要恢复成等待中。
+    ///
+    /// 这条锁住的是「关窗不丢队列」的接线。最容易错的映射是 `Running`：直接照搬
+    /// 会让重启后的界面显示「转写中…」，而实际上什么都没在跑——用户会一直等下去。
+    #[test]
+    fn queue_roundtrip_restores_states_and_demotes_running() {
+        use crate::utils::queue_store::{load_queue, save_queue, StoredQueueItem};
+        let dir = std::env::temp_dir().join(format!("v2w_qtest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("q.json");
+
+        // 模拟 persist_queue 写出的三条：等待 / 完成 / 转写中
+        let items = vec![
+            StoredQueueItem {
+                path: r"D:\a.mp4".to_string(),
+                duration: 12.5,
+                status: "pending".to_string(),
+            },
+            StoredQueueItem {
+                path: r"D:\b.mp4".to_string(),
+                duration: 30.0,
+                status: "done".to_string(),
+            },
+            StoredQueueItem {
+                path: r"D:\c.mp4".to_string(),
+                duration: 0.0,
+                status: "pending".to_string(), // Running 也写 pending，见 persist_queue
+            },
+        ];
+        save_queue(&path, &items).expect("落盘应成功");
+        let back = load_queue(&path);
+        assert_eq!(back, items, "往返必须逐字保真");
+        assert_eq!(back[1].duration, 30.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 编辑必须留下审计记录，且**破坏性操作要能追回被删的内容**。

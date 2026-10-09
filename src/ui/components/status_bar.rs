@@ -171,6 +171,68 @@ impl MainWindow {
             .into_any_element()
     }
 
+    /// 上次运行崩溃的提示条（可关闭，且带「导出诊断」入口）。
+    ///
+    /// # 为什么单独一条、不复用 `notice`
+    ///
+    /// `notice` 是「刚刚做了一件事」的一次性反馈，会被下一个操作覆盖掉；崩溃提示必须
+    /// **一直挂着**直到用户明确关掉，否则启动后随手点个按钮就再也看不见了，而这个
+    /// 提示的全部价值就在于让用户知道「上次崩过、日志在哪、怎么反馈」。
+    ///
+    /// 配色用琥珀（与术语违规、provider 回落同源）：崩溃是「需要注意」但不是「当前
+    /// 出错」——程序此刻是好的，用户不必紧张。
+    pub(crate) fn render_crash_banner(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(msg) = self.crash_notice.clone() else {
+            return div().into_any_element();
+        };
+        div()
+            .id("crash-notice-banner")
+            .w_full()
+            .flex_shrink_0()
+            .px(px(Theme::PAGE_PAD))
+            .py(px(Theme::SPACE_2))
+            .bg(Theme::tint_warn_soft())
+            .border_b_1()
+            .border_color(Theme::tint_warn_border())
+            .flex()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .child(primitives::stat_dot_sm(Theme::accent_orange()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(Theme::TEXT_BODY))
+                    .text_color(Theme::text_secondary())
+                    .child(msg),
+            )
+            .child(
+                primitives::chip_clickable("导出诊断", false, false)
+                    .id("crash-banner-export")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.export_diagnostics(cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("crash-banner-dismiss")
+                    .flex_shrink_0()
+                    .px(px(Theme::SPACE_2))
+                    .py_0p5()
+                    .rounded(px(Theme::RADIUS_SM))
+                    .cursor_pointer()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.crash_notice = None;
+                        cx.notify();
+                    }))
+                    .child("知道了"),
+            )
+            .into_any_element()
+    }
+
     /// 渲染底部状态与操作栏 (iOS Minimal Toolbar 规范)
     pub(crate) fn render_bottom_timeline(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });

@@ -144,6 +144,13 @@ pub enum ApiField {
     LocalModelPath,
 }
 
+/// 视频库查询缓存的键：`(关键字, 只看译文, 只看原文, 排序, 记录数, 首条 id)`。
+///
+/// 抽成别名有两个理由：clippy 会拒绝对裸元组当场写两层泛型（`type_complexity`），
+/// 而更重要的是**这个键的形状就是缓存正确性的契约**——哪几项能影响结果，一眼可见。
+/// 少一项就会返回过期结果，多一项只是多一点无谓重算。
+pub(crate) type LibraryQueryKey = (String, bool, bool, u8, usize, i64);
+
 /// 「查找替换」面板里的两个文本输入框。
 ///
 /// 与 [`ApiField`] 同一套理由：自绘输入框要一个可 `Copy` 的「当前是哪个框」标记，
@@ -487,6 +494,27 @@ pub struct MainWindow {
     pub(crate) is_probing_translate: bool,
     /// `(是否成功, 提示文案)`；`None` 表示尚未测试过
     pub(crate) translate_probe_msg: Option<(bool, String)>,
+    /// 视频库的筛选条件（关键字 + 未翻译/已翻译）。
+    ///
+    /// 放在界面层而不是 `AppState`：它纯粹是「当前这一页怎么显示」，与工程数据无关，
+    /// 也不该被持久化到 `config.toml`（用户下次打开想看到全部）。
+    pub(crate) library_filter: crate::utils::library_query::LibraryFilter,
+    /// 视频库排序方式
+    pub(crate) library_sort: crate::utils::library_query::LibrarySort,
+    /// 筛选关键字输入框的焦点与光标（与字幕搜索同法）
+    pub(crate) library_search_focus: FocusHandle,
+    pub(crate) library_search_focused: bool,
+    pub(crate) library_search_cursor: usize,
+    /// `query()` 的结果缓存：键为 `(筛选, 排序, 记录数, 最近一条 id)`。
+    ///
+    /// 为什么不每帧重算：卡片列表没有虚拟化，40 条 × 多次大小写转换的字符串匹配
+    /// 看着不多，但播放/编辑期间每帧都在重绘。记录数 + 首条 id 足以侦测「库变了」。
+    pub(crate) library_query_cache: Option<(LibraryQueryKey, Vec<i64>)>,
+    /// 上次运行崩溃的提示（启动时检测一次；`None` 表示没有）。
+    ///
+    /// 与 `notice` 分开：`notice` 是「刚刚做了一件事」的一次性反馈，会被后续操作
+    /// 覆盖；崩溃提示要一直挂到用户点掉它，否则启动后随便点个按钮就看不见了。
+    pub(crate) crash_notice: Option<String>,
     /// 视频库批量导出的选中任务 id 集合。
     ///
     /// 历史库里一条条点「导出字幕」很费手，尤其是「同一部片子重跑了几版、
@@ -738,10 +766,24 @@ impl MainWindow {
             api_key_visible: false,
             is_probing_translate: false,
             translate_probe_msg: None,
+            library_filter: crate::utils::library_query::LibraryFilter::default(),
+            library_sort: crate::utils::library_query::LibrarySort::default(),
+            library_search_focus: cx.focus_handle(),
+            library_search_focused: false,
+            library_search_cursor: 0,
+            library_query_cache: None,
+            crash_notice: None,
             library_selected: HashSet::new(),
             library_export_busy: false,
             command_palette: None,
         };
+
+        // 恢复上次的批量队列：队列原本只在内存里，关窗 / 崩溃就全丢，用户排好的
+        // 几十条与「已完成」的进度都得重来。
+        window.state.restore_queue();
+        // 检测上次运行是否崩溃过：panic 钩子只把堆栈写进日志，没有任何机制告诉用户，
+        // 于是「崩了、重开、能用」的 bug 永远没人上报。
+        window.crash_notice = Self::detect_crash_notice();
 
         // 若启动已载入历史视频工程，立即触发首帧提取，并按硬件策略补代理
         if window.state.selected_file.is_some() {
@@ -751,6 +793,19 @@ impl MainWindow {
         }
 
         window
+    }
+
+    /// 检测上次运行的崩溃并生成一条待显示的中性提示（无崩溃则 `None`）。
+    ///
+    /// 抽成关联函数而不是内联：启动路径上已经够长，而这段逻辑与窗口状态无关
+    /// （只读日志目录），单独可读、也可在别处复用。
+    fn detect_crash_notice() -> Option<String> {
+        let log_dir = crate::utils::AppConfig::resolve_path("logs");
+        let record = crate::utils::crash_report::detect_previous_crash(&log_dir)?;
+        Some(format!(
+            "{}　（「性能设置 → 模型与组件 → 导出诊断」可一并附上日志）",
+            crate::utils::crash_report::short_summary(&record)
+        ))
     }
 
     /// 关窗前的脏数据守卫（系统关窗路径 Alt+F4 / 任务栏右键 / 系统关闭按钮，
@@ -1684,6 +1739,7 @@ impl Render for MainWindow {
             .child(self.render_db_error_banner(cx))
             // 1.6 一次性中性提示条：成功类反馈（如「已删除该记录」）与错误条同处一列，
             // 但配色中性——操作成功不该被误读成出错。两者同时存在时错误条在上。
+            .child(self.render_crash_banner(cx))
             .child(self.render_notice_banner(cx))
             // 2. 左中右专业工作台架构
             .child(

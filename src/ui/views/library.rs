@@ -12,6 +12,7 @@ use super::super::MainWindow;
 use crate::app::state::{ProcessStatus, WorkspaceTab};
 use crate::subtitle::writer::export_spec_for;
 use crate::subtitle::SubtitleWriter;
+use crate::ui::apply_line_edit;
 use crate::utils::time::format_duration_short;
 
 impl MainWindow {
@@ -81,6 +82,8 @@ impl MainWindow {
                             ),
                     ),
             )
+            // 检索栏：关键字 + 未翻译筛选 + 排序 + 命中摘要。只有空库时才隐藏。
+            .children((total_count > 0).then(|| self.render_library_toolbar(cx)))
             // 批量操作栏：有记录才出现。勾选卡片后可一次性导出，省去逐条点「导出字幕」。
             .child(if total_count == 0 {
                 div().into_any_element()
@@ -93,6 +96,206 @@ impl MainWindow {
             } else {
                 self.render_library_cards(cx)
             })
+    }
+
+    /// 视频库检索栏：关键字输入 + 未翻译筛选 + 排序 + 命中摘要。
+    ///
+    /// # 为什么要有它
+    ///
+    /// 此前视频库是一条平铺到底的列表，40 条以上只能靠滚动找。用户想找「上个月那门课」
+    /// 或「还没翻译的那几个」时没有任何入口——而这两件事恰恰是回头翻库的**唯一**理由。
+    ///
+    /// # 与「字幕搜索」的区别
+    ///
+    /// 那个过滤的是**句**，这个过滤的是**记录**；两者互不相干，所以是两个独立缓冲，
+    /// 不共用输入框。
+    fn render_library_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::utils::library_query::{describe, LibrarySort};
+        let total = self.state.recent_tasks.len();
+        let shown = self.library_visible_ids().len();
+        let filter = self.library_filter.clone();
+        let filtering = !filter.is_empty();
+        let sort = self.library_sort;
+
+        // 关键字输入框：与字幕搜索同一套最小编辑集合（见 `apply_line_edit`）。
+        let is_focused = self.library_search_focused;
+        let focus = self.library_search_focus.clone();
+        let raw = filter.query.clone();
+        let char_count = raw.chars().count();
+        let cursor = self.library_search_cursor.min(char_count);
+        let before: String = raw.chars().take(cursor).collect();
+        let after: String = raw.chars().skip(cursor).collect();
+        let input = div()
+            .id("library-search-input")
+            .flex_1()
+            .min_w(px(Theme::SEARCH_MIN_W))
+            .h(px(Theme::CTRL_H_XS))
+            .px(px(Theme::SPACE_2))
+            .rounded(px(Theme::RADIUS_MD))
+            .bg(Theme::bg_input())
+            .border_1()
+            .border_color(if is_focused {
+                Theme::accent_mint()
+            } else {
+                Theme::border_mid()
+            })
+            .cursor_text()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .track_focus(&focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    window.focus(&focus);
+                    this.library_search_focused = true;
+                    this.library_search_cursor = this.library_filter.query.chars().count();
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.clear_library_filter(cx);
+                    return;
+                }
+                let buffer = &mut this.library_filter.query;
+                let cursor = &mut this.library_search_cursor;
+                if apply_line_edit(buffer, cursor, event, cx) {
+                    // 关键字变了：缓存必须立刻作废（否则界面还显示旧的命中集合）。
+                    this.library_query_cache = None;
+                    cx.notify();
+                }
+            }))
+            .child(if is_focused {
+                div()
+                    .flex()
+                    .items_center()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_primary())
+                    .child(before)
+                    .child(div().text_color(Theme::accent_mint()).child("▌"))
+                    .child(after)
+                    .into_any_element()
+            } else if char_count == 0 {
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .child("按文件名或路径筛选，Esc 清空")
+                    .into_any_element()
+            } else {
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_primary())
+                    .truncate()
+                    .child(raw)
+                    .into_any_element()
+            });
+
+        // 状态筛选：未翻译 / 已翻译（互斥，点已选的再点一次即取消）。
+        let toggle = |id: &'static str,
+                      label: &'static str,
+                      on: bool,
+                      which: u8,
+                      cx: &mut Context<Self>|
+         -> Stateful<Div> {
+            primitives::segmented(label, on, false)
+                .id(id)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    match which {
+                        1 => {
+                            this.library_filter.untranslated_only =
+                                !this.library_filter.untranslated_only;
+                            if this.library_filter.untranslated_only {
+                                this.library_filter.translated_only = false;
+                            }
+                        }
+                        2 => {
+                            this.library_filter.translated_only =
+                                !this.library_filter.translated_only;
+                            if this.library_filter.translated_only {
+                                this.library_filter.untranslated_only = false;
+                            }
+                        }
+                        _ => {}
+                    }
+                    this.library_query_cache = None;
+                    cx.notify();
+                }))
+        };
+
+        // 排序：下拉式一行胶囊（只有 4 项，不值得为它做一个浮层）。
+        let sort_row = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_muted())
+                    .flex_shrink_0()
+                    .child("排序"),
+            )
+            .children(LibrarySort::ALL.into_iter().map(|s| {
+                primitives::chip_clickable(s.label(), s == sort, false)
+                    .id(SharedString::from(format!("library-sort-{}", s as u8)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.library_sort = s;
+                        this.library_query_cache = None;
+                        cx.notify();
+                    }))
+            }));
+
+        div()
+            .id("library-toolbar")
+            .w_full()
+            .mb(px(Theme::SPACE_3))
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .child("搜索"),
+            )
+            .child(div().flex_1().min_w(px(Theme::SEARCH_MIN_W)).child(input))
+            .child(toggle(
+                "library-filter-untranslated",
+                "未翻译",
+                filter.untranslated_only,
+                1,
+                cx,
+            ))
+            .child(toggle(
+                "library-filter-translated",
+                "已翻译",
+                filter.translated_only,
+                2,
+                cx,
+            ))
+            .children(filtering.then(|| {
+                primitives::chip_clickable("清除筛选", false, false)
+                    .id("library-clear-filter")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.clear_library_filter(cx);
+                    }))
+            }))
+            .child(sort_row)
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_family("Consolas")
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(if filtering && shown == 0 {
+                        Theme::accent_red()
+                    } else {
+                        Theme::text_muted()
+                    })
+                    .child(describe(total, shown, &filter)),
+            )
+            .into_any_element()
     }
 
     /// 视频库批量操作栏：选中计数 + 全选 / 清空 / 导出选中。
@@ -227,8 +430,46 @@ impl MainWindow {
             .into_any_element()
     }
 
-    /// 卡片列表：直接借用 recent_tasks，避免每次渲染克隆全部任务的 segments
-    fn render_library_cards(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// 卡片列表：按筛选/排序结果渲染（仍是借用 `recent_tasks`，不克隆 segments）。
+    ///
+    /// 顺序来自 [`MainWindow::library_visible_ids`]，它按 `(筛选, 排序, 记录数, 首条 id)`
+    /// 缓存——卡片列表没有虚拟化，逐帧重跑 40 次大小写转换的字符串匹配、再每次重排，
+    /// 是白白掉帧。
+    fn render_library_cards(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let ids = self.library_visible_ids();
+        // 命中为空时给一条明确提示：一片空白看起来像「库坏了」而不是「筛掉了」。
+        if ids.is_empty() {
+            return div()
+                .id("library-cards-scroll")
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(Theme::SPACE_2))
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_BODY_LG))
+                        .text_color(Theme::text_muted())
+                        .child("没有符合筛选条件的记录"),
+                )
+                .child(
+                    primitives::chip_clickable("清除筛选", false, false)
+                        .id("library-clear-filter-empty")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.clear_library_filter(cx);
+                        })),
+                )
+                .into_any_element();
+        }
+        let ordered: Vec<_> = ids
+            .iter()
+            .filter_map(|id| self.state.recent_tasks.iter().find(|t| t.id == *id))
+            .collect();
+        let cards: Vec<AnyElement> = ordered
+            .into_iter()
+            .map(|task| self.render_library_card(task, cx).into_any_element())
+            .collect();
         div()
             .id("library-cards-scroll")
             .flex_1()
@@ -236,13 +477,46 @@ impl MainWindow {
             .flex()
             .flex_col()
             .gap(px(Theme::SPACE_3))
-            .children(
-                self.state
-                    .recent_tasks
-                    .iter()
-                    .map(|task| self.render_library_card(task, cx)),
-            )
+            .children(cards)
             .into_any_element()
+    }
+
+    /// 当前可见的记录 id（按筛选 + 排序），带缓存。
+    ///
+    /// 缓存键含「记录数 + 首条 id」：这两项足以侦测「库被刷新/增删了」。只按记录数会
+    /// 漏掉「删一条又加一条」；只按首条 id 会漏掉「只改了列表长度」。
+    pub(crate) fn library_visible_ids(&mut self) -> Vec<i64> {
+        use crate::utils::library_query::query;
+        let key = (
+            self.library_filter.query.clone(),
+            self.library_filter.translated_only,
+            self.library_filter.untranslated_only,
+            self.library_sort as u8,
+            self.state.recent_tasks.len(),
+            self.state.recent_tasks.first().map(|t| t.id).unwrap_or(0),
+        );
+        if let Some((cached_key, ids)) = self.library_query_cache.as_ref() {
+            if cached_key == &key {
+                return ids.clone();
+            }
+        }
+        let ids = query(
+            &self.state.recent_tasks,
+            &self.library_filter,
+            self.library_sort,
+        );
+        self.library_query_cache = Some((key, ids.clone()));
+        ids
+    }
+
+    /// 清除全部筛选（关键字 + 状态筛选，保留排序——排序是显示偏好，不是筛选）。
+    pub(crate) fn clear_library_filter(&mut self, cx: &mut Context<Self>) {
+        self.library_filter.query.clear();
+        self.library_filter.translated_only = false;
+        self.library_filter.untranslated_only = false;
+        self.library_search_cursor = 0;
+        self.library_query_cache = None;
+        cx.notify();
     }
 
     /// 为视频库卡片补齐「文件大小」显示文本（每个任务只探测一次）。
