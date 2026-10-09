@@ -2296,6 +2296,9 @@ impl MainWindow {
         if self.state.is_playing {
             // 暂停：先记下墙钟时间，保留最后一帧，避免闪黑或抽帧滞后。
             self.state.current_time = self.state.video_player.current_play_time();
+            // 暂停点落在切句边界上时，选中句与画面字幕也要一起落在同一句
+            // （判据同 `get_active_segment`）；此刻已停播，编辑缓冲可安全对齐。
+            self.state.sync_selection_to_time(self.is_text_focused);
             self.state.is_playing = false;
             self.state.video_player.pause_clock();
             self.trigger_extract_frame(cx);
@@ -2341,14 +2344,11 @@ impl MainWindow {
                         }
 
                         this.state.current_time = play_time;
-                        if let Some(seg) = this
-                            .state
-                            .segments
-                            .iter()
-                            .find(|s| s.start <= play_time && play_time <= s.end)
-                        {
-                            this.state.selected_segment_index = Some(seg.index);
-                        }
+                        // 选中句 / 编辑缓冲跟随画面字幕。判据与监视器覆盖层
+                        // 同源（`get_active_segment` 的半开区间），否则在切句边界上，
+                        // 右侧列表跳到下一句、画面还在上一句，看着就是对不上。
+                        // 用户正在编辑框里打字时不动编辑缓冲，避免冲掉输入。
+                        this.state.sync_selection_to_time(this.is_text_focused);
                         cx.notify();
                         true
                     })

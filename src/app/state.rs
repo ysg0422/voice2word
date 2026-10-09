@@ -1604,6 +1604,47 @@ impl AppState {
         }
     }
 
+    /// 让「选中句 / 编辑缓冲 / 画面字幕」按**同一个判据**对齐到 `current_time`。
+    ///
+    /// 返回选中句是否发生了变化。
+    ///
+    /// # 为什么必须有这个唯一入口
+    ///
+    /// 监视器画面上压的字幕走 [`Self::get_active_segment`]（按 `current_time` 现算，
+    /// 半开区间 `[start, end)`）；而右侧编辑卡里的正文走 `editing_text`——它是
+    /// 「上一次选中某句时缓存下来的副本」。两者是**两个独立状态**：
+    /// - 播放时钟每 40ms 推进 `current_time`，原先只把 `selected_segment_index`
+    ///   改成命中的新句，**没有**同步 `editing_text`；
+    /// - 于是一旦播到第 N 句，画面上已经是第 N 句的字幕，右侧编辑框却还停在第 N-2 句，
+    ///   看起来就是「视频字幕和右边字幕对不上」。
+    ///
+    /// 本函数把这处归一：一律用 `get_active_segment()` 这一条判据定位命中句，
+    /// 命中且与当前选中不同时，同步 `selected_segment_index` 与 `editing_text`，
+    /// 并结束上一段「连续文本编辑合并」会话（与 `select_segment` 口径一致）。
+    ///
+    /// `preserve_editing`：用户此刻正在编辑框里打字时为 `true`——只跟随选中项、
+    /// **不覆盖** `editing_text`，否则播放推进会把用户敲到一半的字冲掉。失焦后由
+    /// 下一次选中自然对齐。跳转 / 外部驱动时间一律传 `false`。
+    ///
+    /// 注意：只改「视图游标」，不写文档内容——不 flush、不记撤销，才能在 40ms
+    /// 的播放回调里每帧零成本调用。
+    pub fn sync_selection_to_time(&mut self, preserve_editing: bool) -> bool {
+        let Some(seg) = self.get_active_segment() else {
+            return false;
+        };
+        let seg_idx = seg.index;
+        if self.selected_segment_index == Some(seg_idx) {
+            return false;
+        }
+        let text = seg.display_text().to_string();
+        self.selected_segment_index = Some(seg_idx);
+        if !preserve_editing {
+            self.editing_text = text;
+            self.undo_text_coalesce = None;
+        }
+        true
+    }
+
     /// 跳转播放指针时间
     pub fn seek_to(&mut self, time_sec: f64) {
         self.flush_segments_if_dirty();
@@ -1613,17 +1654,8 @@ impl AppState {
             self.segments.last().map(|s| s.end).unwrap_or(3600.0)
         };
         self.current_time = time_sec.clamp(0.0, max_dur);
-
-        // 如果跳转到的时间落在某个字幕内，且当前没有选或者选的不同，自动联动
-        if let Some(seg) = self.get_active_segment() {
-            let seg_idx = seg.index;
-            if self.selected_segment_index != Some(seg_idx) {
-                self.selected_segment_index = Some(seg_idx);
-                if let Some(s) = self.segments.iter().find(|s| s.index == seg_idx) {
-                    self.editing_text = s.display_text().to_string();
-                }
-            }
-        }
+        // 跳转后让「选中句 / 编辑缓冲」跟随落点，判据与画面字幕同源（见上）。
+        self.sync_selection_to_time(false);
     }
 
     /// 保存当前选中字幕片段的修改文本（仅内存，去抖后统一落库）
@@ -3710,5 +3742,73 @@ mod tests {
             ProcessStatus::Failed("翻译失败：密钥无效".to_string())
         );
         assert_eq!(state.translate_status_msg, "翻译失败：密钥无效");
+    }
+
+    /// 回归：播放推进 / 跳转时，「选中句」与「编辑缓冲」必须与
+    /// 画面字幕（`get_active_segment`）同步。
+    ///
+    /// 缺陷现象：播放到第 3 句时，画面上已是第 3 句的字幕，右侧编辑框却还停在
+    /// 第 1 句——因为播放时钟只改 `selected_segment_index`、没同步 `editing_text`。
+    /// 用户看到就是「视频字幕和右边字幕对不上」。
+    #[test]
+    fn playback_advance_keeps_selection_and_edit_buffer_in_sync() {
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 2.0, "第一句"),
+            Segment::new(2, 2.0, 4.0, "第二句"),
+            Segment::new(3, 4.0, 6.0, "第三句"),
+        ]);
+        state.select_segment(1);
+        assert_eq!(state.editing_text, "第一句");
+
+        // 播放推进到 4.5s（落在第 3 句）
+        state.current_time = 4.5;
+        assert!(state.sync_selection_to_time(false));
+        assert_eq!(state.selected_segment_index, Some(3));
+        assert_eq!(
+            state.editing_text, "第三句",
+            "编辑缓冲必须跟上画面字幕，否则就是“对不上”"
+        );
+
+        // 同一句内重复调用不应报「已变化」（避免 40ms 回调里空转）
+        assert!(!state.sync_selection_to_time(false));
+    }
+
+    /// 用户正在编辑框里打字时（`preserve_editing = true`），播放推进只跟随
+    /// 选中项、**不得**覆盖 `editing_text`——否则把用户敲到一半的字冲掉。
+    #[test]
+    fn playback_advance_preserves_in_progress_edit_buffer() {
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 2.0, "第一句"),
+            Segment::new(2, 2.0, 4.0, "第二句"),
+        ]);
+        state.select_segment(1);
+        state.editing_text = "第一句正在打字".to_string();
+
+        state.current_time = 3.0;
+        assert!(state.sync_selection_to_time(true));
+        assert_eq!(state.selected_segment_index, Some(2));
+        assert_eq!(
+            state.editing_text, "第一句正在打字",
+            "正在输入的文本不能被播放推进冲掉"
+        );
+    }
+
+    /// 跳转（时间轴点击 / 上下句外的 seek）也必须同步编辑缓冲。
+    #[test]
+    fn seek_to_aligns_selection_and_edit_buffer_with_overlay() {
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 2.0, "第一句"),
+            Segment::new(2, 2.0, 4.0, "第二句"),
+        ]);
+        state.select_segment(1);
+        state.seek_to(3.2);
+        assert_eq!(state.selected_segment_index, Some(2));
+        assert_eq!(state.editing_text, "第二句");
+
+        // 半开区间：落在切句点 2.0（= 第二句的 start）归第二句，
+        // 与画面字幕取值一致。
+        state.seek_to(2.0);
+        assert_eq!(state.selected_segment_index, Some(2));
+        assert_eq!(state.editing_text, "第二句");
     }
 }
