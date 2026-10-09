@@ -118,11 +118,26 @@ pub fn init_logger() -> anyhow::Result<PathBuf> {
     let writer_for_subscriber = writer.clone();
 
     // 初始化 tracing subscriber
+    // 过滤器：默认 `info`，本 crate 放宽到 `debug`。
+    //
+    // # 为什么不能直接 `try_from_default_env().unwrap_or(...)`
+    //
+    // 那样写有个**实测踩到的**坑：环境里只要存在 `RUST_LOG`（本机就是 `RUST_LOG=warn`，
+    // 由别的工具设的全局变量），它就会**整体接管**过滤规则，本程序自己的诊断日志
+    // 随即变成空白——日志文件建出来了、0 字节，用户来反馈时什么线索都没有。
+    // 一个与业务无关的环境变量不该能静默关掉程序的诊断能力。
+    //
+    // 修法：先解析环境变量（保留用户显式调级别 / 调第三方库的能力），再**追加**一条
+    // 针对本 crate 的指令。`EnvFilter` 按「具体程度」排序指令，带 target 的指令比
+    // 裸级别更具体，因此 `voice2word=debug` 会稳定压过 `warn`，而我们自己的日志
+    // 永远留得住；`RUST_LOG=voice2word=error` 这种更精确的写法仍然说了算。
+    let mut filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if let Ok(directive) = "voice2word=debug".parse() {
+        filter = filter.add_directive(directive);
+    }
     let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,voice2word=debug".into()),
-        )
+        .with_env_filter(filter)
         .with_ansi(false) // txt 文件保持纯文本，无终端转义色块
         .with_writer(writer_for_subscriber)
         .finish();
