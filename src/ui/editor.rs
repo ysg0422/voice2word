@@ -652,12 +652,13 @@ impl MainWindow {
                                     cx.notify();
                                 })),
                             )
-                            // 统计面板：整篇的时长 / 字数 / 语速 / 过长句。
-                            // 这些数字此前无处可看（只能自己数），而 CPS 与「过长句」
-                            // 正是字幕交付会被打回的硬指标。
+                            // 统计与导出面板：整篇的时长 / 字数 / 语速 / 过长句，
+                            // 以及导出内容 / 文件名模板 / 格式选择。这些数字此前无处可看
+                            // （只能自己数），而 CPS 与「过长句」正是字幕交付会被打回的硬指标；
+                            // 导出又正是这份字幕最后的交付动作，两者合并同屏最贴合。
                             .child(
                                 primitives::segmented(
-                                    "字幕统计",
+                                    "统计与导出",
                                     panel == EditorSubtitlePanel::Stats,
                                     false,
                                 )
@@ -1449,7 +1450,17 @@ impl MainWindow {
                         if panel == EditorSubtitlePanel::Translate {
                             self.render_translate_card(cx).into_any_element()
                         } else if panel == EditorSubtitlePanel::Stats {
-                            self.render_subtitle_stats_card(cx).into_any_element()
+                            // 统计与导出同屏：两张卡都是「对整份字幕做事」的收尾动作，
+                            // 一起竖排在同一个面板里。
+                            div()
+                                .w_full()
+                                .flex_none()
+                                .flex()
+                                .flex_col()
+                                .gap(px(Theme::CARD_GAP))
+                                .child(self.render_subtitle_stats_card(cx))
+                                .child(self.render_export_card(cx))
+                                .into_any_element()
                         } else {
                             div().into_any_element()
                         },
@@ -1839,8 +1850,6 @@ impl MainWindow {
                             }),
                     )
             )
-            // ── 底部固定：统一导出控制底栏 ──
-            .child(self.render_editor_export_dock(cx))
     }
 
     /// 字幕预览框：显示当前编辑句的排版效果，两侧把手可拖拽调宽。
@@ -2500,22 +2509,199 @@ impl MainWindow {
         cx.notify();
     }
 
-    /// 渲染剪辑工作台右侧底部的统一导出控制底栏
-    pub(crate) fn render_editor_export_dock(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 导出卡片：导出内容 / 文件名模板 / 编辑日志 / 格式选择 + 导出按钮。
+    ///
+    /// 它原本是**常驻在右侧面板最底部**的一条底栏（`render_editor_export_dock`），
+    /// 无论切到哪个面板都占着约 150px 高。代价是那 150px 从右侧面板的可用高度里
+    /// 切走，字幕清单 / 统计 / 翻译卡都因此少显示几行；而导出本身是**低频动作**，
+    /// 不值得常驻。
+    ///
+    /// 现在收进「统计与导出」面板，成为该面板的第三张卡：三个面板各自占满整个
+    /// 右侧高度，可用空间更宽裕、能多显示内容；导出就在同一页，要用时顺手可及。
+    ///
+    /// 下拉菜单放在触发行**之后**（向下展开）：本卡在可滚动面板里，向下展开比
+    /// 向上顶出更符合阅读方向，也不会一开菜单就把上面的内容挤动。
+    fn render_export_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_open = self.is_export_dropdown_open;
         let cur_fmt = self.editor_export_format;
         let cur_mode = self.editor_export_mode;
 
-        div()
-            .id("editor-export-dock")
-            .w_full()
-            .bg(Theme::bg_sidebar())
-            .border_t_1()
-            .border_color(Theme::border())
-            .p_3()
-            .flex()
-            .flex_col()
-            .gap_2()
+        primitives::card_sm()
+            .flex_none()
+            .gap(px(Theme::SPACE_2))
+            // 卡头：标题 + 本次会话改动数（原先挂在编辑日志那一排尾部）
+            .child(primitives::setting_row(
+                "导出与留档",
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .child(format!("本次会话 {} 条改动", self.state.edit_log.len()))
+                    .into_any_element(),
+            ))
+            .child(primitives::divider())
+            // 导出内容：原文 / 仅译文 / 双语。对字幕与剪辑工程文件统一生效。
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .flex_shrink_0()
+                            .child("导出内容"),
+                    )
+                    .child({
+                        let modes = [
+                            (ExportMode::RawOnly, "仅原文"),
+                            (ExportMode::TranslationOnly, "仅译文"),
+                            (ExportMode::Bilingual, "双语对照"),
+                        ];
+                        div()
+                            .flex()
+                            .gap_1()
+                            .children(modes.into_iter().enumerate().map(|(idx, (mode, label))| {
+                                let selected = mode == cur_mode;
+                                primitives::chip_clickable(label, selected, false)
+                                    .id(("export-mode-opt", idx))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.editor_export_mode = mode;
+                                        // 落盘：下次启动仍用同一模式，避免「选项没生效」的错觉
+                                        this.state.set_export_mode(mode);
+                                        cx.notify();
+                                    }))
+                            }))
+                    }),
+            )
+            // 文件名模板：`{name}` / `{ext}` / `{date}`。同一部片子常要交付多份
+            // （给剪辑的、给外语同事的、按日期归档的），此前只能导出后手工改名。
+            // 默认 `{name}.{ext}` = 历史行为，不动这个输入框的用户完全无感。
+            .child({
+                let tpl = self.state.config.ui.export_name_template.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .flex_shrink_0()
+                            .child("文件名模板"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(self.render_export_name_template_input(cx)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .flex_shrink_0()
+                            .child(if tpl.trim() == "{name}.{ext}" {
+                                "占位符：{name} {ext} {date}"
+                            } else {
+                                "例：{name}.{date}.{ext}"
+                            }),
+                    )
+            })
+            // 编辑日志：与「导出字幕」同一排，因为它导出的是**这次编辑过程的记录**，
+            // 属于「交付/留档」这一类动作。
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .flex_shrink_0()
+                            .child("编辑日志"),
+                    )
+                    .child(
+                        primitives::chip_clickable("CSV", false, false)
+                            .id("export-log-csv")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_edit_log(crate::subtitle::qc::QcFormat::Csv, cx);
+                            })),
+                    )
+                    .child(
+                        primitives::chip_clickable("Markdown", false, false)
+                            .id("export-log-md")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_edit_log(crate::subtitle::qc::QcFormat::Markdown, cx);
+                            })),
+                    ),
+            )
+            // 格式选择 + 导出按钮
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .id("export-format-dropdown-trigger")
+                            .flex_1()
+                            .h(px(Theme::CTRL_H_LG))
+                            .px(px(Theme::SPACE_4))
+                            .rounded(px(Theme::RADIUS_LG))
+                            .bg(Theme::bg_card())
+                            .border_1()
+                            .border_color(if is_open {
+                                Theme::accent_mint()
+                            } else {
+                                Theme::border()
+                            })
+                            .cursor_pointer()
+                            .hover(|s| s.border_color(Theme::accent_mint()))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.is_export_dropdown_open = !this.is_export_dropdown_open;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_BODY_LG))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(Theme::text_primary())
+                                    .child(cur_fmt.label()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_secondary())
+                                    .child(if is_open { "▲" } else { "▼" }),
+                            ),
+                    )
+                    .child({
+                        // 无字幕时置灰：导出链路（`perform_editor_export` 等）在没有
+                        // segments 时都是静默 return，按钮却照常可点，用户会以为程序坏了。
+                        // 同页的 mini_btn 早已有禁用态规范，导出按钮此前漏了这一层。
+                        let can_export = !self.state.segments.is_empty();
+                        primitives::btn_state(
+                            "导出",
+                            primitives::BtnSize::Lg,
+                            primitives::BtnVariant::Primary,
+                            can_export,
+                        )
+                        .id("editor-do-export-btn")
+                        .px(px(Theme::SPACE_6))
+                        .when(can_export, |d| {
+                            d.on_click(cx.listener(|this, _, _, cx| {
+                                this.is_export_dropdown_open = false;
+                                this.perform_editor_export(cx);
+                            }))
+                        })
+                    }),
+            )
+            // 格式下拉菜单（打开时）：放在触发行之后向下展开。
             .child(if is_open {
                 div()
                     .id("export-format-menu")
@@ -2590,174 +2776,6 @@ impl MainWindow {
             } else {
                 div().id("export-format-menu-closed")
             })
-            // 导出内容：原文 / 仅译文 / 双语。对字幕与剪辑工程文件统一生效。
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2p5()
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_muted())
-                            .flex_shrink_0()
-                            .child("导出内容"),
-                    )
-                    .child({
-                        let modes = [
-                            (ExportMode::RawOnly, "仅原文"),
-                            (ExportMode::TranslationOnly, "仅译文"),
-                            (ExportMode::Bilingual, "双语对照"),
-                        ];
-                        div()
-                            .flex()
-                            .gap_1()
-                            .children(modes.into_iter().enumerate().map(|(idx, (mode, label))| {
-                                let selected = mode == cur_mode;
-                                primitives::chip_clickable(label, selected, false)
-                                    .id(("export-mode-opt", idx))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.editor_export_mode = mode;
-                                        // 落盘：下次启动仍用同一模式，避免「选项没生效」的错觉
-                                        this.state.set_export_mode(mode);
-                                        cx.notify();
-                                    }))
-                            }))
-                    }),
-            )
-            // 文件名模板：`{name}` / `{ext}` / `{date}`。同一部片子常要交付多份
-            // （给剪辑的、给外语同事的、按日期归档的），此前只能导出后手工改名。
-            // 默认 `{name}.{ext}` = 历史行为，不动这个输入框的用户完全无感。
-            // 放在导出栏而不是性能页：它只影响「导出」这一件事，就地可改最顺手。
-            .child({
-                let tpl = self.state.config.ui.export_name_template.clone();
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2p5()
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_muted())
-                            .flex_shrink_0()
-                            .child("文件名模板"),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .child(self.render_export_name_template_input(cx)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_muted())
-                            .flex_shrink_0()
-                            .child(if tpl.trim() == "{name}.{ext}" {
-                                "占位符：{name} {ext} {date}"
-                            } else {
-                                "例：{name}.{date}.{ext}"
-                            }),
-                    )
-            })
-            // 编辑日志：与「导出字幕」同一排，因为它导出的是**这次编辑过程的记录**，
-            // 属于「交付/留档」这一类动作。
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2p5()
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_muted())
-                            .flex_shrink_0()
-                            .child("编辑日志"),
-                    )
-                    .child(
-                        primitives::chip_clickable("CSV", false, false)
-                            .id("export-log-csv")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.export_edit_log(crate::subtitle::qc::QcFormat::Csv, cx);
-                            })),
-                    )
-                    .child(
-                        primitives::chip_clickable("Markdown", false, false)
-                            .id("export-log-md")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.export_edit_log(crate::subtitle::qc::QcFormat::Markdown, cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_muted())
-                            .child(format!("本次会话 {} 条改动", self.state.edit_log.len())),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2p5()
-                    .child(
-                        div()
-                            .id("export-format-dropdown-trigger")
-                            .flex_1()
-                            .h(px(Theme::CTRL_H_LG))
-                            .px(px(Theme::SPACE_4))
-                            .rounded(px(Theme::RADIUS_LG))
-                            .bg(Theme::bg_card())
-                            .border_1()
-                            .border_color(if is_open {
-                                Theme::accent_mint()
-                            } else {
-                                Theme::border()
-                            })
-                            .cursor_pointer()
-                            .hover(|s| s.border_color(Theme::accent_mint()))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.is_export_dropdown_open = !this.is_export_dropdown_open;
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .text_size(px(Theme::TEXT_BODY_LG))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(Theme::text_primary())
-                                    .child(cur_fmt.label()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(Theme::TEXT_CAPTION))
-                                    .text_color(Theme::text_secondary())
-                                    .child(if is_open { "▲" } else { "▼" }),
-                            ),
-                    )
-                    .child({
-                        // 无字幕时置灰：导出链路（`perform_editor_export` 等）在没有
-                        // segments 时都是静默 return，按钮却照常可点，用户会以为程序坏了。
-                        // 同页的 mini_btn 早已有禁用态规范，导出按钮此前漏了这一层。
-                        let can_export = !self.state.segments.is_empty();
-                        primitives::btn_state(
-                            "导出",
-                            primitives::BtnSize::Lg,
-                            primitives::BtnVariant::Primary,
-                            can_export,
-                        )
-                        .id("editor-do-export-btn")
-                        .px(px(Theme::SPACE_6))
-                        .when(can_export, |d| {
-                            d.on_click(cx.listener(|this, _, _, cx| {
-                                this.is_export_dropdown_open = false;
-                                this.perform_editor_export(cx);
-                            }))
-                        })
-                    }),
-            )
     }
 
     /// 查找替换面板（展开时才有内容；收起时返回空元素）。
