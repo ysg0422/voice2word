@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,10 +33,36 @@ pub struct UiConfig {
     /// 下次导出就会多出原文行——用户会以为选项没生效。
     #[serde(default = "default_export_mode")]
     pub export_mode: String,
+    /// 剪辑台导出**格式**（`jianying` / `srt` / `ass` / `fcpxml` / …，与
+    /// `ui::EditorExportFormat` 一一对应）。
+    ///
+    /// 与 `export_mode` 同理必须持久化：两者是同一排导出控件上的两个下拉，用户既然
+    /// 记住了「导出内容」，就没有道理忘掉「导出格式」——此前格式每次启动都跳回默认的
+    /// 「剪映草稿」，用户每次都得重选，看起来像选项没生效。
+    ///
+    /// 存字符串而不是枚举：`utils` 不该反过来依赖 `ui` 的类型（同 `export_mode` 的
+    /// 理由），用稳定的字符串做持久化边界，映射放在 UI 层。
+    #[serde(default = "default_export_format")]
+    pub export_format: String,
+    /// 导出文件名模板，占位符 `{name}` / `{ext}` / `{date}`。
+    ///
+    /// 为什么暴露成配置：同一部片子常常要同时交付多份（给剪辑的、给外语同事的、
+    /// 按日期归档的），此前只能导出后手工改名。默认值保持历史行为（`{name}.{ext}`），
+    /// 不设模板的用户完全感知不到这个功能存在。
+    #[serde(default = "default_export_name_template")]
+    pub export_name_template: String,
 }
 
 fn default_export_mode() -> String {
     "bilingual".to_string()
+}
+
+fn default_export_format() -> String {
+    "jianying".to_string()
+}
+
+fn default_export_name_template() -> String {
+    "{name}.{ext}".to_string()
 }
 
 impl Default for UiConfig {
@@ -43,6 +70,8 @@ impl Default for UiConfig {
         Self {
             theme: "dark".to_string(),
             export_mode: default_export_mode(),
+            export_format: default_export_format(),
+            export_name_template: default_export_name_template(),
         }
     }
 }
@@ -64,8 +93,10 @@ impl UiConfig {
     pub fn toggled(&self) -> Self {
         Self {
             theme: if self.is_light() { "dark" } else { "light" }.to_string(),
-            // 切换主题不应重置导出内容偏好
+            // 切换主题不应重置导出偏好（内容模式与格式都不动）
             export_mode: self.export_mode.clone(),
+            export_format: self.export_format.clone(),
+            export_name_template: self.export_name_template.clone(),
         }
     }
 }
@@ -1381,9 +1412,95 @@ fn root_candidates(
     out
 }
 
+/// 校验离线 Qwen 模型（`.gguf`）路径，失败时返回可直接展示给用户的中文原因。
+///
+/// 背景：离线翻译用的 Qwen 权重路径（`paths.llm_model`）过去只能手改
+/// `config.toml`；用户想换成自己下载的 GGUF 时，路径填错要等到真正发起翻译
+/// 才会炸，报错还是 llama.cpp 的晦涩原文——分不清是「文件不存在」「指成了目录」
+/// 还是「下到一半的 .part」。这里把最常见的坑一次性讲清楚：空路径、相对路径基准、
+/// 文件不存在、目录、`.part` 半成品、扩展名不是 gguf、0 字节、体积过小。
+///
+/// 约定：**只提示，不阻断保存**——调用方拿到 `Err` 仍可照常写盘，
+/// 用户完全可以先存路径、后下模型；本函数只负责说明「哪里不对、怎么改」。
+pub fn validate_llm_model_path(p: &str) -> std::result::Result<(), String> {
+    let trimmed = p.trim();
+    if trimmed.is_empty() {
+        return Err("请填写模型文件路径（llama.cpp 只加载 .gguf）".to_string());
+    }
+
+    let resolved = AppConfig::resolve_path(trimmed);
+    if !resolved.exists() {
+        return Err(format!(
+            "找不到模型文件：{}（相对路径以项目根为基准）",
+            resolved.display()
+        ));
+    }
+    if resolved.is_dir() {
+        return Err("这是一个目录，请指向具体的 .gguf 模型文件".to_string());
+    }
+
+    // 文件名校验只看文件名（不含目录）。注意 `qwen.gguf.part` 的扩展名实际是
+    // `part`，所以「.part」必须在扩展名判断**之前**拦下，否则会误报成「不是 .gguf」。
+    let file_name = resolved
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if file_name.to_ascii_lowercase().ends_with(".part") {
+        return Err("这是未完成的下载临时文件（.part），请指向下载完成后的模型文件".to_string());
+    }
+    let ext_is_gguf = resolved
+        .extension()
+        .map(|e| e.to_string_lossy().eq_ignore_ascii_case("gguf"))
+        .unwrap_or(false);
+    if !ext_is_gguf {
+        return Err(format!(
+            "不是 .gguf 文件（llama.cpp 只加载 GGUF 格式）：{}",
+            file_name
+        ));
+    }
+
+    let len = match fs::metadata(&resolved) {
+        Ok(meta) => meta.len(),
+        Err(_) => return Err("模型文件是空的（0 字节），可能下载未完成".to_string()),
+    };
+    if len == 0 {
+        return Err("模型文件是空的（0 字节），可能下载未完成".to_string());
+    }
+    const ONE_MB: u64 = 1024 * 1024;
+    if len < ONE_MB {
+        return Err(format!(
+            "模型文件仅 {}，体积过小，可能下载不完整",
+            human_bytes(len)
+        ));
+    }
+    Ok(())
+}
+
+/// 把字节数格式化成人话（1 KB = 1024 B），例：`123 KB` / `1.2 MB` / `0.9 GB`。
+fn human_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * KB;
+    const GB: f64 = 1024.0 * MB;
+    let b = bytes as f64;
+    let (value, unit) = if b >= GB {
+        (b / GB, "GB")
+    } else if b >= MB {
+        (b / MB, "MB")
+    } else if b >= KB {
+        (b / KB, "KB")
+    } else {
+        return format!("{bytes} B");
+    };
+    // 一位小数足够说明问题；整数值去掉没意义的 `.0`，`123 KB` 比 `123.0 KB` 更像人话。
+    let rounded = format!("{value:.1}");
+    let text = rounded.strip_suffix(".0").unwrap_or(&rounded);
+    format!("{text} {unit}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{TranslateConfig, UiConfig};
+    use std::fs;
 
     /// 切换主题不能顺手把导出内容偏好重置回默认「双语」。
     #[test]
@@ -2385,5 +2502,159 @@ mod tests {
         assert!(help.contains("/v1/models"), "{help}");
         assert!(help.contains("cn:"), "{help}");
         assert!(help.contains("400"), "{help}");
+    }
+
+    // ─────────── 离线 Qwen 模型路径校验 ───────────
+
+    /// 合法 .gguf：存在 + 扩展名对 + 体积过 1MB 门槛，必须放行。
+    #[test]
+    fn validate_llm_model_path_accepts_valid_gguf() {
+        let dir = std::env::temp_dir().join(format!(
+            "v2w_llm_path_{}_{}",
+            std::process::id(),
+            "valid_gguf"
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        let model = dir.join("qwen2.5-0.5b-instruct-q4_k_m.gguf");
+        let file = fs::File::create(&model).expect("create");
+        // 只申请长度、不真写数据：过 1MB 门槛一点点即可，不拖慢测试。
+        file.set_len(1024 * 1024 + 4096).expect("set_len");
+        drop(file);
+
+        let p = model.to_string_lossy().to_string();
+        assert_eq!(super::validate_llm_model_path(&p), Ok(()), "{p}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 空串 / 纯空白：先提示「请填写路径」，别当成相对路径拼出一个假文件。
+    #[test]
+    fn validate_llm_model_path_rejects_blank_input() {
+        for blank in ["", "   ", "\t\r\n"] {
+            let err = super::validate_llm_model_path(blank).expect_err("空白应被拒绝");
+            assert!(err.contains("请填写模型文件路径"), "{blank:?} -> {err}");
+        }
+    }
+
+    /// 文件不存在：错误里要带上解析后的路径，并点明相对路径以项目根为基准。
+    #[test]
+    fn validate_llm_model_path_rejects_missing_file() {
+        let dir =
+            std::env::temp_dir().join(format!("v2w_llm_path_{}_{}", std::process::id(), "missing"));
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        let missing = dir.join("not_downloaded_yet.gguf");
+        let p = missing.to_string_lossy().to_string();
+        let err = super::validate_llm_model_path(&p).expect_err("不存在的文件应被拒绝");
+        assert!(err.contains("找不到模型文件"), "{err}");
+        assert!(err.contains(&p), "错误应回显解析后的路径: {err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 目录：必须给「这是一个目录」的专用提示，而不是笼统的「找不到」或「不是 gguf」。
+    ///
+    /// 故意让目录名以 `.gguf` 结尾：若判断顺序写反（先查扩展名、后查目录），
+    /// 这条就会漏过，因此它是顺序的守门测试。
+    #[test]
+    fn validate_llm_model_path_rejects_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "v2w_llm_path_{}_{}",
+            std::process::id(),
+            "directory"
+        ));
+        let target = dir.join("models.gguf");
+        fs::create_dir_all(&target).expect("mkdir");
+
+        let p = target.to_string_lossy().to_string();
+        let err = super::validate_llm_model_path(&p).expect_err("目录应被拒绝");
+        assert!(err.contains("这是一个目录"), "{err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 扩展名不对（.bin）：要点明「不是 .gguf」并把文件名回显出来。
+    #[test]
+    fn validate_llm_model_path_rejects_wrong_extension() {
+        let dir = std::env::temp_dir().join(format!(
+            "v2w_llm_path_{}_{}",
+            std::process::id(),
+            "wrong_ext"
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        let bin = dir.join("qwen-model.bin");
+        fs::File::create(&bin)
+            .expect("create")
+            .set_len(2 * 1024 * 1024)
+            .expect("set_len");
+
+        let p = bin.to_string_lossy().to_string();
+        let err = super::validate_llm_model_path(&p).expect_err(".bin 应被拒绝");
+        assert!(err.contains("不是 .gguf 文件"), "{err}");
+        assert!(err.contains("qwen-model.bin"), "错误应回显文件名: {err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `.part` 半成品：`.gguf.part` 的扩展名其实是 `part`，必须先按「未完成下载」提示，
+    /// 而不是误报成「不是 .gguf」；后缀大小写不敏感。
+    #[test]
+    fn validate_llm_model_path_rejects_partial_download() {
+        let dir =
+            std::env::temp_dir().join(format!("v2w_llm_path_{}_{}", std::process::id(), "part"));
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        for name in ["qwen.gguf.part", "QWEN.GGUF.PART"] {
+            let f = dir.join(name);
+            fs::File::create(&f)
+                .expect("create")
+                .set_len(2 * 1024 * 1024)
+                .expect("set_len");
+            let p = f.to_string_lossy().to_string();
+            let err = super::validate_llm_model_path(&p).expect_err("半成品应被拒绝");
+            assert!(err.contains("未完成的下载临时文件"), "{name} -> {err}");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 0 字节：下载/拷贝中断留下的空壳，提示要直接点明「0 字节」。
+    #[test]
+    fn validate_llm_model_path_rejects_empty_file() {
+        let dir =
+            std::env::temp_dir().join(format!("v2w_llm_path_{}_{}", std::process::id(), "empty"));
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        let empty = dir.join("empty.gguf");
+        fs::write(&empty, b"").expect("write");
+
+        let p = empty.to_string_lossy().to_string();
+        let err = super::validate_llm_model_path(&p).expect_err("0 字节应被拒绝");
+        assert!(err.contains("0 字节"), "{err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 小于 1MB：体积要格式化成人话（KB），让用户一眼看出是下错了文件。
+    #[test]
+    fn validate_llm_model_path_rejects_tiny_file() {
+        let dir =
+            std::env::temp_dir().join(format!("v2w_llm_path_{}_{}", std::process::id(), "tiny"));
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        let tiny = dir.join("tiny.gguf");
+        fs::File::create(&tiny)
+            .expect("create")
+            .set_len(512 * 1024)
+            .expect("set_len");
+
+        let p = tiny.to_string_lossy().to_string();
+        let err = super::validate_llm_model_path(&p).expect_err("小于 1MB 应被拒绝");
+        assert!(err.contains("体积过小"), "{err}");
+        assert!(err.contains("512 KB"), "体积应格式化为人话: {err}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

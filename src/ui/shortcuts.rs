@@ -45,6 +45,8 @@ actions!(
         Redo,
         /// 打开 / 关闭命令面板 (P1-A10)
         OpenCommandPalette,
+        /// 打开 / 关闭字幕「查找替换」面板
+        OpenReplacePanel,
     ]
 );
 
@@ -64,7 +66,7 @@ pub struct ShortcutSpec {
 }
 
 /// 默认键位表的唯一事实来源：启动时按此注册，速查表也按此校验。
-pub const SHORTCUT_SPECS: [ShortcutSpec; 14] = [
+pub const SHORTCUT_SPECS: [ShortcutSpec; 15] = [
     ShortcutSpec {
         key: "ctrl-space",
         hint_key: "Ctrl+Space",
@@ -137,6 +139,13 @@ pub const SHORTCUT_SPECS: [ShortcutSpec; 14] = [
         hint_key: "Ctrl+Y",
         hint: "重做",
     },
+    // Ctrl+H 是「查找替换」的通用约定（VS Code / Word / 浏览器都是它）。
+    // 搜索已经占了 Ctrl+F，替换若没有独立键位，用户只能靠鼠标去点那个小按钮。
+    ShortcutSpec {
+        key: "ctrl-h",
+        hint_key: "Ctrl+H",
+        hint: "查找替换",
+    },
 ];
 
 /// 把一条键位描述解析成具体的 [`KeyBinding`]。
@@ -160,6 +169,7 @@ fn binding_for(key: &str) -> KeyBinding {
         "ctrl-z" => KeyBinding::new(key, Undo, None),
         "ctrl-shift-z" => KeyBinding::new(key, Redo, None),
         "ctrl-y" => KeyBinding::new(key, Redo, None),
+        "ctrl-h" => KeyBinding::new(key, OpenReplacePanel, None),
         other => panic!("SHORTCUT_SPECS 里有未登记的键位描述: {other}"),
     }
 }
@@ -174,7 +184,7 @@ pub fn bind_default_keys(cx: &mut gpui::App) {
 /// 与 [`SHORTCUT_SPECS`]（真正的绑定表）同一份动作清单，逐条对齐由本文件末尾的
 /// 测试守着——补了绑定却忘了写速查表、或速查表里留着已经删掉的键位，都会先在这里
 /// 失败，而不是让用户对着界面上写错的键位按半天。
-pub const SHORTCUT_HINTS: [(&str, &str); 12] = [
+pub const SHORTCUT_HINTS: [(&str, &str); 13] = [
     ("Ctrl+Space", "播放/暂停"),
     ("Alt+↑↓", "上/下句"),
     ("Alt+←→", "±1 秒"),
@@ -187,6 +197,7 @@ pub const SHORTCUT_HINTS: [(&str, &str); 12] = [
     ("Ctrl+Z", "撤销"),
     ("Ctrl+Shift+Z", "重做"),
     ("Ctrl+Y", "重做"),
+    ("Ctrl+H", "查找替换"),
 ];
 
 #[cfg(test)]

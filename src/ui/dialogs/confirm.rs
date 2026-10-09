@@ -138,6 +138,8 @@ impl MainWindow {
         match action {
             ConfirmAction::ClearBatchQueue => self.clear_batch_queue(cx),
             ConfirmAction::DeleteTaskRecord(id) => self.delete_task_record(id, cx),
+            ConfirmAction::DeleteModelFile(id) => self.delete_model_file(&id, cx),
+            ConfirmAction::RestoreBackup(path) => self.restore_data_backup(&path, cx),
         }
         cx.notify();
     }

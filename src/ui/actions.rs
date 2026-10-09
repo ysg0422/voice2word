@@ -13,6 +13,24 @@ use crate::subtitle::writer::export_spec_for;
 use crate::subtitle::Segment;
 use crate::subtitle::SubtitleWriter;
 
+/// 导入字幕成功后的提示文案。
+///
+/// 抽成自由函数而不是闭包里的内联代码：`this.update(...)` 的闭包已经可变借用了
+/// `MainWindow`，在其中再调 `self.` 的方法会借用冲突；把「纯字符串拼装」拎出来
+/// 就没有这个问题，也顺带让这段文案可读。
+///
+/// TXT 分支必须显式提醒时间轴是合成的——用户很可能接着导出 SRT，而那份时间
+/// 完全不是真的。
+fn self_notice_import(this: &mut MainWindow, stem: &str, count: usize, is_txt: bool) {
+    this.notice = Some(if is_txt {
+        format!(
+            "已导入「{stem}」{count} 句；纯文本没有时间信息，已按字数合成占位时间轴，导出前请核对"
+        )
+    } else {
+        format!("已导入「{stem}」{count} 句字幕")
+    });
+}
+
 /// `EditorExportFormat`（剪辑台的状态枚举）与配置字符串（`state.output_format`）
 /// 之间的唯一桥梁：返回 `writer::write_in_place` / `export_spec_for` 认的规范格式名。
 ///
@@ -127,6 +145,10 @@ impl MainWindow {
         // 调小后，库里批量导出的字幕依旧不折行（中→英译文本会超屏），
         // 与剪辑台逐条导出的结果不一致。
         let style = self.state.config.subtitle_style.clone();
+        // 文件名模板与日期同样要在派发前抽出来：`background_executor().spawn` 的
+        // 闭包必须 `Send`，闭包里读 `self.state.config` 会把 `self` 拖进去。
+        let name_template = self.state.config.ui.export_name_template.clone();
+        let today = chrono::Local::now().format("%Y%m%d").to_string();
         let db = self.state.db.clone();
         self.library_export_busy = true;
         cx.notify();
@@ -172,7 +194,15 @@ impl MainWindow {
                             .file_stem()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| format!("task_{id}"));
-                        let out = dir_for_write.join(format!("{stem}.{fmt_ext}"));
+                        // 文件名走统一模板：库批量导出与剪辑台单条导出必须给出
+                        // 同一套命名规则，否则同一个配置在两个入口行为不同。
+                        let fname = crate::subtitle::writer::export_file_name(
+                            &name_template,
+                            &stem,
+                            fmt_ext,
+                            &today,
+                        );
+                        let out = dir_for_write.join(&fname);
                         // 走带样式的入口：srt / vtt / ass 按 `max_chars_per_line` 折行。
                         // 其余格式（json / ttml / ttal / txt）在
                         // `write_to_file_with_style` 内部**原样回落**到
@@ -289,6 +319,476 @@ impl MainWindow {
         .detach();
     }
 
+    /// 删除某个可下载组件的本地文件（「模型与组件」卡的「删除」按钮走这里）。
+    ///
+    /// 删除逻辑**全部**委托给 `utils::model_download::delete_item_file`：
+    /// 那边是唯一的路径解析 + 安全校验处（拒绝压缩包类组件、拒绝目录、拒绝用户
+    /// 自编译构建），这里只负责把结果翻译成界面反馈，绝不在 UI 层再拼一遍路径——
+    /// 两份实现一旦漂移，就会出现「界面允许删、底层拒绝」或更糟的「删错东西」。
+    ///
+    /// 反馈落在 `download_status_msg`（模型卡里就地显示，成功/失败/中性三色），
+    /// 而不是 `state.status`：后者是红色横幅、且只在转写页可见，用户在性能页
+    /// 点删除根本看不到。
+    pub(crate) fn delete_model_file(&mut self, item_id: &str, cx: &mut Context<Self>) {
+        let label = crate::utils::model_download::item_by_id(item_id)
+            .map(|i| i.label)
+            .unwrap_or(item_id);
+        match crate::utils::model_download::delete_item_file(item_id, &self.state.config) {
+            Ok(Some(path)) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.state.download_status_msg = format!("已删除 {name}，可重新下载");
+                // 删完立刻重扫就位状态：徽标要从「已就位」翻回「下载」，
+                // 否则用户会以为没删掉（卡片还显示已就位）。
+                self.state.refresh_model_presence();
+            }
+            Ok(None) => {
+                self.state.download_status_msg = format!("{label}：磁盘上没有对应文件，无需删除");
+                self.state.refresh_model_presence();
+            }
+            Err(e) => {
+                self.state.download_status_msg = format!("删除失败：{e}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// 一键备份数据目录（库 + 配置）到 `backups/` 下的时间戳归档。
+    ///
+    /// 为什么要有它：整个工程库就是一个 `voice2word.db`，误删或想换机器时用户
+    /// 手上没有任何快照；而**运行中**手工复制这个文件是不安全的——SQLite 的 WAL
+    /// 是独立文件，只拷 `.db` 会丢掉最近几次编辑。备份走 `utils::backup`
+    /// （连 `-wal`/`-shm` 一起打包），把「安全的复制方式」固化成一次点击。
+    ///
+    /// 全程在后台线程做（打包几百 MB 的库会阻塞 UI）；完成后把归档路径写进
+    /// `download_status_msg` 并**在资源管理器里选中它**，让用户立刻看到产物在哪。
+    pub(crate) fn backup_data(&mut self, cx: &mut Context<Self>) {
+        if self.state.is_downloading {
+            return;
+        }
+        let root = crate::utils::AppConfig::app_root_dir();
+        let name = crate::utils::backup::backup_file_name(chrono::Local::now());
+        let dest = root.join("backups").join(&name);
+        self.state.download_status_msg = "正在备份数据…".to_string();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::utils::backup::create_backup(&root, &dest) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(outcome) => {
+                        info!("数据备份完成: {}", outcome.archive.display());
+                        this.state.download_status_msg = format!(
+                            "已备份 {} 个文件（{}）到 backups/",
+                            outcome.included.len(),
+                            crate::utils::model_download::human_size(outcome.bytes)
+                        );
+                        // 打开资源管理器并选中归档：用户下一步多半就是把它拷走。
+                        let _ = std::process::Command::new("explorer")
+                            .arg(format!("/select,{}", outcome.archive.display()))
+                            .spawn();
+                    }
+                    Err(e) => {
+                        this.state.download_status_msg = format!("备份失败：{e}");
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 选择一份备份归档并（在二次确认后）恢复。
+    ///
+    /// 恢复会**写回** `voice2word.db` 等文件，因此先弹确认框；确认后才真正执行
+    /// （走 [`MainWindow::restore_data_backup`]）。底层 `utils::backup::restore_backup`
+    /// 本身拒绝覆盖已存在的文件——这是有意的双保险：即便用户误点确认，也不会
+    /// 悄悄把当前工程库换掉；界面会把「哪些文件因为已存在而被保留」如实报出来。
+    pub(crate) fn choose_backup_to_restore(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("选择要恢复的备份归档")
+                .add_filter("Voice2Word 备份", &["zip"])
+                .pick_file()
+                .await;
+            let Some(handle) = handle else { return };
+            let path = handle.path().to_path_buf();
+            let _ = this.update(cx, |this, cx| {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                this.confirm_dialog = Some(crate::ui::types::ConfirmDialogInfo {
+                    title: "从备份恢复？".to_string(),
+                    message: format!(
+                        "将用「{name}」里的内容恢复数据目录。为保护你当前的工程，**已存在的同名文件不会被覆盖**——\
+                         若确实要用备份替换，请先手动把现有 voice2word.db / config.toml 改名。"
+                    ),
+                    confirm_label: "恢复".to_string(),
+                    danger: true,
+                    action: crate::ui::types::ConfirmAction::RestoreBackup(path),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 执行备份恢复（确认后调用）。结果同样落在 `download_status_msg`。
+    pub(crate) fn restore_data_backup(
+        &mut self,
+        archive: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        let root = crate::utils::AppConfig::app_root_dir();
+        match crate::utils::backup::restore_backup(archive, &root) {
+            Ok(outcome) => {
+                let mut msg = if outcome.restored.is_empty() {
+                    "没有可恢复的文件".to_string()
+                } else {
+                    format!("已恢复 {} 个文件", outcome.restored.len())
+                };
+                if !outcome.skipped_existing.is_empty() {
+                    // 这条提示是恢复功能的**核心安全语义**：用户以为「恢复=替换」，
+                    // 实际是「只补缺失」。不说清他会以为恢复失败或数据没变。
+                    msg.push_str(&format!(
+                        "；{} 已存在，已保留现有版本（如需替换请先手动改名）",
+                        outcome.skipped_existing.join("、")
+                    ));
+                }
+                self.state.download_status_msg = msg;
+                // 恢复的是库与配置：下次启动才读，这里只刷新界面上的就位/库视图。
+                self.state.refresh_model_presence();
+            }
+            Err(e) => {
+                self.state.download_status_msg = format!("恢复失败：{e}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// 打开模型/工具的落地根目录（`models/` 与 `tools/` 所在的目录）。    /// 打开模型/工具的落地根目录（`models/` 与 `tools/` 所在的目录）。
+    ///
+    /// 「打开目录」是为了兜住 `delete_item_file` 明确不肯删的那一类：压缩包组件
+    /// （whisper-cli / llama.cpp）解压后铺在 `tools/` 下、与共享 DLL 混在一起，
+    /// 程序没法安全地替用户删。与其让用户对着提示去手敲路径，不如给一个按钮直接
+    /// 把目录甩到资源管理器里。
+    /// 导出**质检复核表**（CSV / Markdown），供人工复核或交给他人。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 质检结论此前只活在界面里：复核的人只能在剪辑台上一个个点，也没法把「哪些句
+    /// 有问题」交给别人。复核表把结论变成 Excel 能开、工单能贴的东西。
+    ///
+    /// 走系统「保存文件」对话框而不是固定路径：复核表是给**人**用的交付物，
+    /// 落点由用户决定（他要发给谁就放哪）。
+    pub(crate) fn export_review_sheet(
+        &mut self,
+        format: crate::subtitle::qc::QcFormat,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::subtitle::segment::quality_report;
+        if self.state.segments.is_empty() {
+            return;
+        }
+        // 与转写页质检卡同一份判据（阈值取自配置、术语表取自缓存），保证导出的
+        // 数字与界面上看到的一致——两处各算一遍必然出现「界面 3 句、导出 5 句」。
+        let check_untranslated = self.state.translated_count() > 0;
+        let threshold = self.state.config.pipeline.whisper_low_confidence;
+        let mut report = quality_report(&self.state.segments, &[], threshold, check_untranslated);
+        report.glossary_violations = self.cached_glossary_violations();
+        let flagged = report.all_issues().len();
+        let total = self.state.segments.len();
+        let sheet = crate::subtitle::qc::render_review_sheet(&self.state.segments, &report, format);
+        let stem = self
+            .state
+            .selected_file
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "subtitle".to_string());
+        let file_name = format!(
+            "{}.{}",
+            crate::subtitle::qc::review_file_stem(&stem),
+            format.extension()
+        );
+
+        // 空表也给导出：用户点了按钮就该拿到文件（「没有问题」本身是结论），
+        // 但要在提示里说清有几行，免得他以为导出漏了。
+        self.notice = Some(format!("已导出质检表（{flagged} 行待复核，共 {total} 句）"));
+        self.export_text_content(cx, file_name, sheet, format.label());
+    }
+
+    /// 检查视频库里的重复记录，并把结果作为中性提示告诉用户。
+    ///
+    /// # 为什么只提示、不自动清理
+    ///
+    /// 自动删掉「重复」是危险动作：指纹是**采样**哈希（见 `utils::fingerprint` 的
+    /// 模块文档），理论上不同的文件可能撞上；更要紧的是用户可能刻意保留同内容的两条
+    /// 记录（不同字幕版本、不同目标语言）。所以这里只回答「哪些是同一份媒体」，
+    /// 删不删、删哪条由用户决定——`suggested_keeper` 给出建议（保留最早那条，
+    /// 它可能已经人工校对过），但按钮不会替他按下。
+    pub(crate) fn report_library_duplicates(&mut self, cx: &mut Context<Self>) {
+        use crate::utils::duplicates::{describe, group_by_fingerprint, suggested_removals};
+        let groups = group_by_fingerprint(&self.state.recent_tasks);
+        let mut msg = describe(&groups);
+        if let Some(first) = groups.first() {
+            // 附一个具体例子：只说「有 3 组重复」用户不知道从哪下手。
+            let sample: Vec<String> = first.names.clone();
+            msg.push_str(&format!("；例如「{}」", sample.join("」与「")));
+            let removals = suggested_removals(first).len();
+            if removals > 0 {
+                msg.push_str(&format!("（该组可清理 {removals} 条）"));
+            }
+        }
+        // 落在 `notice`（中性）而不是 `status`（红色错误）：重复不是故障，
+        // 是「你可能想清理一下」的信息。
+        self.notice = Some(msg);
+        cx.notify();
+    }
+
+    /// 检查是否有新版本（用户显式点击才发请求，不轮询）。
+    ///
+    /// # 为什么不做成自动检查
+    ///
+    /// 启动即发一个出站请求，对「完全本地运行」是这个项目的核心卖点之一的工具来说
+    /// 是背道而驰的；而且 GitHub 未认证 API 有速率限制，自动轮询很容易把自己查 403。
+    /// 所以这里只在用户点「检查更新」时请求一次，结果缓存进会话状态。
+    ///
+    /// 只**报告**、不下载也不替换 exe：静默替换正在运行的可执行文件是能把安装搞死
+    /// 的操作，那属于单独的、更高风险的一步（见 `utils::update_check` 的模块文档）。
+    pub(crate) fn check_for_update(&mut self, cx: &mut Context<Self>) {
+        if self.state.update_check_busy {
+            return;
+        }
+        self.state.update_check_busy = true;
+        self.state.download_status_msg = "正在检查更新…".to_string();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::utils::update_check::fetch_latest_release(15) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                use crate::utils::update_check::{current_version, describe, is_newer};
+                this.state.update_check_busy = false;
+                match result {
+                    Ok(latest) => {
+                        let current = current_version();
+                        let newer = is_newer(&latest.version, current);
+                        let text = describe(current, &latest.version, newer);
+                        this.state.download_status_msg = text.clone();
+                        this.state.update_check_result = Some((newer, text, latest.page_url));
+                    }
+                    Err(e) => {
+                        // 网络失败不是程序故障：说清「检查不了」而不是让用户以为坏了。
+                        this.state.download_status_msg = format!("检查更新失败：{e}");
+                        this.state.update_check_result = None;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 在浏览器里打开最新版本的下载页（`update_check_result` 里有 URL）。
+    pub(crate) fn open_release_page(&mut self, cx: &mut Context<Self>) {
+        let Some((_, _, url)) = self.state.update_check_result.clone() else {
+            return;
+        };
+        if url.trim().is_empty() {
+            return;
+        }
+        // 用系统默认浏览器打开：不在应用内嵌 WebView（那会引入一个巨大的依赖面，
+        // 只为显示一个下载页）。
+        let _ = open::that(&url);
+        cx.notify();
+    }
+
+    /// 导出**编辑日志**（本次会话改了哪些句、改前改后是什么）。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 撤销栈解决的是「退回去」，解决不了「改了什么」：它只有 50 层、换文档即清空、
+    /// 退出即丢。用户交片给客户、或两周后回头看自己的工程，都需要能查到「这句当时
+    /// 是什么、谁改的、什么时候」。
+    ///
+    /// 展示前先 `coalesced(60)`：文本编辑逐键记一条，不折叠的话单个句子就能刷满
+    /// 整张表。**导出的是折叠后的视图**，折叠只是展示取舍，原始记录仍在内存里。
+    pub(crate) fn export_edit_log(
+        &mut self,
+        format: crate::subtitle::qc::QcFormat,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::subtitle::audit::{render_audit, DEFAULT_COALESCE_SECS};
+        let log = self.state.edit_log.coalesced(DEFAULT_COALESCE_SECS);
+        if log.is_empty() {
+            // 空日志也导出：用户点了就该拿到文件（「本次没有编辑」本身是结论）。
+            self.notice = Some("本次会话没有编辑记录，已导出空表".to_string());
+        } else {
+            self.notice = Some(format!("已导出编辑日志（{} 条记录）", log.len()));
+        }
+        let sheet = render_audit(log.records(), format);
+        let stem = self
+            .state
+            .selected_file
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "subtitle".to_string());
+        let file_name = format!("{stem}-编辑日志.{}", format.extension());
+        self.export_text_content(cx, file_name, sheet, format.label());
+    }
+
+    /// 导出**诊断报告**：把「程序实际解析到的路径、每个组件的状态、运行库能否解析」
+    /// 打成一份可复制的纯文本。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 「说 ffmpeg 缺失，可我明明有 ffmpeg」这类问题此前只能靠零散的日志行来回猜：
+    /// 用户看不到程序把项目根锚到了哪、每个可执行文件实际是哪一个、它的依赖 DLL 是否
+    /// 能解析。报告把这些一次问清楚，用户直接复制粘贴就能求助，把几天来回缩短到一条消息。
+    ///
+    /// 与质检表共用 `export_text_content`（同一套「另存为 + 后台写盘 + 选中文件」），
+    /// 不另造导出链路。
+    pub(crate) fn export_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let root = crate::utils::AppConfig::app_root_dir();
+        let report = crate::utils::diagnostics::build_report(&self.state.config, &root);
+        // 文件名带日期：用户可能对比「改配置前后」两份报告，带日期才分得清。
+        let name = format!(
+            "voice2word-diagnostics-{}.txt",
+            chrono::Local::now().format("%Y%m%d-%H%M")
+        );
+        self.notice = Some("已导出诊断报告，可直接复制粘贴用于排查".to_string());
+        self.export_text_content(cx, name, report, "诊断报告");
+    }
+
+    /// 把一段纯文本内容交给「另存为」对话框写出（质检表这类非字幕产物的共用出口）。    /// 把一段纯文本内容交给「另存为」对话框写出（质检表这类非字幕产物的共用出口）。
+    ///
+    /// 单独抽出来而不是复用 `export_with_save_dialog`：后者绑定的是「字幕片段 +
+    /// SubtitleWriter」这条链路，而质检表是**已经渲染好的字符串**，再套一层写盘
+    /// 适配器只会把两件不相干的事绕在一起。
+    fn export_text_content(
+        &mut self,
+        cx: &mut Context<Self>,
+        default_name: String,
+        content: String,
+        filter_label: &str,
+    ) {
+        let filter = filter_label.to_string();
+        cx.spawn(async move |this, cx| {
+            let ext = default_name.rsplit('.').next().unwrap_or("txt").to_string();
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("导出质检表")
+                .set_file_name(&default_name)
+                .add_filter(&filter, &[ext.as_str()])
+                .save_file()
+                .await;
+            let Some(handle) = handle else { return };
+            let path = handle.path().to_path_buf();
+            // 写盘本身是毫秒级小文件，但保持与其它导出一致的「后台执行」习惯，
+            // 免得将来内容变大时又要改一遍。路径 clone 一份进后台闭包：`path`
+            // 在收尾的成功分支里还要用（打开资源管理器选中它）。
+            let path_for_write = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { std::fs::write(&path_for_write, content.as_bytes()) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        // 打开所在目录并选中文件：用户下一步多半就是把它发出去。
+                        let _ = std::process::Command::new("explorer")
+                            .arg(format!("/select,{}", path.display()))
+                            .spawn();
+                    }
+                    Err(e) => {
+                        this.state.status = ProcessStatus::Failed(format!("质检表写出失败：{e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn open_models_dir(&mut self, cx: &mut Context<Self>) {
+        let dir = crate::utils::AppConfig::resolve_path("models");
+        // 全新解压的瘦包里 `models/` 可能还没建：先建出来，否则资源管理器会报
+        // 「找不到路径」——那看起来像程序出错了，而用户只是还没下过东西。
+        let dir = if dir.is_dir() {
+            dir
+        } else {
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        };
+        let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+        cx.notify();
+    }
+
+    /// 在资源管理器里定位某个可下载组件的文件（找不到就退到它所在目录）。
+    ///
+    /// 用 `explorer /select,<path>`：Windows 的资源管理器会打开父目录并**选中**该
+    /// 文件，比只开目录再让用户自己找友好得多。文件不存在时 `/select` 会静默失败，
+    /// 因此先判断存在性，不存在就退成打开目录。
+    pub(crate) fn reveal_model_file(&mut self, item_id: &str, cx: &mut Context<Self>) {
+        let Some(item) = crate::utils::model_download::item_by_id(item_id) else {
+            self.state.download_status_msg = format!("未知组件：{item_id}");
+            cx.notify();
+            return;
+        };
+        let path = crate::utils::model_download::item_effective_path(item, &self.state.config);
+        let (dir, select) = if path.is_file() {
+            (path.parent().map(|p| p.to_path_buf()), Some(path))
+        } else {
+            (Some(crate::utils::AppConfig::resolve_path(".")), None)
+        };
+        let Some(dir) = dir else { return };
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cmd = std::process::Command::new("explorer");
+        match select {
+            Some(p) => cmd.arg(format!("/select,{}", p.display())),
+            None => cmd.arg(&dir),
+        };
+        let _ = cmd.spawn();
+        cx.notify();
+    }
+
+    /// 打开系统原生文件对话框选择**本地大模型**（离线 Qwen 用的 GGUF 文件）。
+    ///
+    /// 与 [`MainWindow::choose_file`] 同一套写法（`cx.spawn` + `rfd::AsyncFileDialog`）：
+    /// 同步的 `FileDialog` 会起 Win32 模态循环，而 GPUI 在渲染回调里正持有 RefCell
+    /// 借用，模态循环一旦重入就是借用冲突崩溃。异步版把选择过程交给系统，UI 线程
+    /// 不被阻塞，选完再回主线程写配置。
+    ///
+    /// 为什么单独加这个入口：离线模型路径此前只能手改 `config.toml`（用户实测反馈），
+    /// 而「我自己下了个 GGUF 想用」是最自然的诉求——让他手抄一条绝对路径既不友好、
+    /// 也容易抄错。过滤器给出 `.gguf`，但**不锁死**：llama.cpp 只吃 GGUF，
+    /// 让用户先看到文件、再由校验给出可操作提示，比直接藏掉非 gguf 文件更好排错。
+    pub(crate) fn choose_llm_model_file(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("选择本地大模型（GGUF）")
+                .add_filter("GGUF 模型", &["gguf"])
+                .add_filter("所有文件", &["*"])
+                .pick_file()
+                .await;
+            if let Some(file_handle) = handle {
+                let path = file_handle.path().to_path_buf();
+                let _ = this.update(cx, |this, cx| {
+                    this.set_local_model_path(path.to_string_lossy().to_string(), cx);
+                });
+            }
+        })
+        .detach();
+    }
+
     /// 接纳一个刚导入的媒体文件：立刻发布选中状态，再在后台探测时长。
     ///
     /// 「浏览本地文件」与「拖拽文件进窗口」共用这一条路径，避免两种入口
@@ -330,34 +830,138 @@ impl MainWindow {
         .detach();
     }
 
+    /// 导入一个**已有的字幕文件**（SRT / VTT / TXT）作为当前工程，跳过转写。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 项目能写出八种字幕格式却一种都读不回来：手上有一份同事给的 SRT、或想接着改
+    /// 上次的导出，此前只能把视频重新转写一遍。这个入口补上缺失的导入链路。
+    ///
+    /// # 几个刻意的取舍
+    ///
+    /// - **不自动匹配视频**：导入的字幕是否对得上某个视频，程序无从判断（时间轴可能
+    ///   被剪过）。直接发布成当前工程，用户自己决定要不要再选视频。
+    /// - **清空撤销栈**：与「转写完成」同一处理——上一支片子的快照留在栈里，Ctrl+Z
+    ///   会把旧字幕灌回来并按新工程落库，属于数据损坏。
+    /// - **TXT 的时间是编出来的**：`reader` 按字数合成占位时间轴，这里必须明说，
+    ///   否则用户导出 SRT 时会以为时间是准的。
+    /// - **不落库**：导入的工程没有对应的媒体记录，`active_task_id` 置 `None`，
+    ///   用户要留存就自己导出（或后续接一个「另存为工程」）。
+    pub(crate) fn import_subtitle_file(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("导入字幕文件")
+                .add_filter("字幕文件", &["srt", "vtt", "txt"])
+                .pick_file()
+                .await;
+            let Some(handle) = handle else { return };
+            let path = handle.path().to_path_buf();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let segs = crate::subtitle::reader::read_subtitle_file(&path)?;
+                    Ok::<_, anyhow::Error>((path, segs))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok((path, mut segs)) => {
+                        if segs.is_empty() {
+                            this.state.status =
+                                ProcessStatus::Failed("字幕文件里没有可用的字幕行".to_string());
+                            cx.notify();
+                            return;
+                        }
+                        // 句序号重新按输出顺序编号：外部文件的序号常常是错的或重复的，
+                        // 而下游（选中、质检、落库）全部按 `index` 索引。
+                        for (i, seg) in segs.iter_mut().enumerate() {
+                            seg.index = i + 1;
+                        }
+                        let count = segs.len();
+                        let is_txt = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| e.eq_ignore_ascii_case("txt"))
+                            .unwrap_or(false);
+                        let stem = path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "导入的字幕".to_string());
+
+                        this.state.segments = segs;
+                        // 导入的字幕不属于历史库里的任何一条记录：置空避免把编辑
+                        // 写回到别的工程的库行上（那是静默数据损坏）。
+                        this.state.active_task_id = None;
+                        this.state.selected_file = Some(path.clone());
+                        this.state.reset_edit_history();
+                        this.state.bump_segments_revision();
+                        this.state.clear_streaming();
+                        this.state.status = ProcessStatus::Idle;
+                        if let Some(first) = this.state.segments.first() {
+                            this.state.select_segment(first.index);
+                        }
+                        // 导入的是别人的字幕：波形/首帧都对不上，先清掉旧工程的缓存，
+                        // 免得监视器还显示上一支片子的画面。
+                        this.state.preview_source = None;
+                        this.state.waveform = None;
+                        this.state.active_tab = WorkspaceTab::Editor;
+                        this.subtitle_list_followed_sel = None;
+
+                        self_notice_import(this, &stem, count, is_txt);
+                        cx.notify();
+                    }
+                    Err(e) => {
+                        this.state.status = ProcessStatus::Failed(format!("导入字幕失败：{e}"));
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     /// 处理从操作系统拖入窗口的文件（GPUI 把外部文件拖放包装成一次内部 drag/drop）。
     ///
     /// 拖入多个文件时全部进入批量队列 (F-012)：先入队并统一探测时长，再等用户
     /// 点「开始全部」。单个文件仍走原有的「选中 + 探测时长」路径，保持单文件
     /// 交互手感不变。全部扩展名都不支持时给出明确提示，而不是静默无反应。
     pub(crate) fn handle_dropped_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
-        let media: Vec<PathBuf> = paths
-            .iter()
-            .filter(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| MEDIA_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
+        // 拖进来的可能是**目录**（把一门课的文件夹整个拖进来是最自然的动作）。
+        // 此前只按扩展名筛文件、目录被静默丢弃，用户拖了个文件夹进去看到的是
+        // 「不是支持的音视频格式」——既没告诉他目录其实支持，也没说清一个文件都
+        // 没找到。现在统一交给 `media_scan` 展开：目录递归、文件直收、去重、
+        // 跳过原因结构化返回，好让这里的提示是有信息量的。
+        let outcome = crate::utils::media_scan::collect_media_files(
+            paths,
+            &MEDIA_EXTS,
+            crate::utils::media_scan::DEFAULT_MAX_DEPTH,
+        );
+        // 只借用 `files`，不把它 move 出去——后面 `outcome` 还要用来算提示摘要
+        // （收了几个、跳过什么）。`files.len()` 先存下来，避免与借用打架。
+        let media = &outcome.files;
+        let found = media.len();
 
-        match media.len() {
+        match found {
             0 => {
-                self.state.status = ProcessStatus::Failed(
-                    "拖入的文件不是支持的音视频格式（支持 mp4/mkv/mov/avi/flv/webm/mp3/wav/flac/m4a）"
-                        .to_string(),
-                );
+                self.state.status = ProcessStatus::Failed(self.drop_failure_message(&outcome));
                 cx.notify();
             }
-            1 => self.adopt_media_file(media.into_iter().next().unwrap(), cx),
+            1 => {
+                // 单个文件仍走「选中 + 探测时长」的原路径，保持单文件手感不变。
+                // 但从目录里扫出来的这一个文件**不该**变成「当前文件」——用户拖的是
+                // 一个文件夹，期待的是队列，不是把里面第一个文件当成当前工程。
+                if outcome.dirs_scanned > 0 || paths.iter().any(|p| p.is_dir()) {
+                    let added = self.state.enqueue_files(media.clone());
+                    self.state.active_tab = WorkspaceTab::Generate;
+                    self.probe_queue_durations(cx);
+                    self.notice = Some(format!("已从文件夹加入 {added} 个文件到批量队列"));
+                    cx.notify();
+                } else {
+                    self.adopt_media_file(media[0].clone(), cx)
+                }
+            }
             _ => {
-                let added = self.state.enqueue_files(media);
+                let added = self.state.enqueue_files(media.clone());
                 if added == 0 {
                     self.state.status =
                         ProcessStatus::Failed("这些文件已经在批量队列里，未重复添加".to_string());
@@ -368,8 +972,98 @@ impl MainWindow {
                 // 队列面板在转写页，切过去用户才看得见刚入队的东西
                 self.state.active_tab = WorkspaceTab::Generate;
                 self.probe_queue_durations(cx);
+                // 拖了目录、里面有一堆非媒体文件是常态：必须交代「收了多少、跳过了
+                // 什么」，否则用户会以为漏扫了。
+                self.notice = Some(Self::ingest_summary(added, &outcome));
                 cx.notify();
             }
+        }
+    }
+
+    /// 一个文件都没收到时，把「为什么」拼成可操作的中文提示。
+    ///
+    /// 分三类说：① 完全没有可识别文件（附支持的扩展名）；② 有跳过项，逐类汇总次数
+    /// 并给出**第一条**具体路径（全列出来会把状态栏挤爆，而用户通常只需要一个样例
+    /// 就能定位问题）；③ 目录太深——这是唯一「改个设置就能救」的情形，单独点出来。
+    fn drop_failure_message(&self, outcome: &crate::utils::media_scan::ScanOutcome) -> String {
+        const SUPPORTED: &str = "mp4/mkv/mov/avi/flv/webm/mp3/wav/flac/m4a";
+        if outcome.skipped.is_empty() {
+            return format!(
+                "没有找到可处理的音视频文件（支持 {SUPPORTED}）。\
+                 若拖入的是文件夹，请确认里面有这些格式的文件。"
+            );
+        }
+        // 按原因归类计数，并把每类的首个样例路径带上
+        let mut by_reason: Vec<(crate::utils::media_scan::SkipReason, usize, PathBuf)> = Vec::new();
+        for (path, reason) in &outcome.skipped {
+            match by_reason.iter_mut().find(|(r, _, _)| r == reason) {
+                Some((_, n, _)) => *n += 1,
+                // SkipReason 未派生 Copy：clone 一份存进汇总（四个无载荷变体，
+                // 克隆成本为零）。
+                None => by_reason.push((reason.clone(), 1, path.clone())),
+            }
+        }
+        let detail = by_reason
+            .iter()
+            .map(|(reason, n, sample)| {
+                // `SkipReason::message` 取 `self`（四个无载荷变体，clone 零成本）；
+                // 这里拿到的是引用，clone 一份再取文案。
+                format!(
+                    "{}（{n} 项，如 {}）",
+                    reason.clone().message(),
+                    sample.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("；");
+        format!("没有扫描到可处理的音视频文件：{detail}。支持 {SUPPORTED}。")
+    }
+
+    /// 成功导入多个文件时的一行摘要（收了几个、跳过了什么）。
+    fn ingest_summary(added: usize, outcome: &crate::utils::media_scan::ScanOutcome) -> String {
+        let dirs = if outcome.dirs_scanned > 0 {
+            format!("（扫描了 {} 个文件夹）", outcome.dirs_scanned)
+        } else {
+            String::new()
+        };
+        if outcome.skipped.is_empty() {
+            return format!("已加入 {added} 个文件到批量队列{dirs}");
+        }
+        // 只提「值得用户动手」的两类：太深（换个更具体的目录再拖）与不可读
+        // （盘没挂 / 没权限）。**按枚举匹配，不按文案子串匹配**——后者会在
+        // 文案改一个字之后静默失效（提示从此永远为空，且没有任何报错），
+        // 这正是这一版要避免的那类「悄悄坏掉」。
+        //
+        // 「非媒体扩展名」不在这里报：拖一个课程文件夹进来，里面混着 .txt/.pdf
+        // 是常态，逐条报只会把真正要紧的提示淹掉（失败分支才需要展开讲）。
+        use crate::utils::media_scan::SkipReason;
+        // 顺序即提示里出现的顺序：先讲「扫不动」的（太深），再讲「根本没看」的。
+        let mut notable: Vec<String> = Vec::new();
+        for reason in [
+            SkipReason::TooDeep,
+            SkipReason::Unreadable,
+            SkipReason::Symlink,
+        ] {
+            let n = outcome.skipped.iter().filter(|(_, r)| *r == reason).count();
+            if n > 0 {
+                let what = match reason {
+                    SkipReason::TooDeep => "个文件夹层级过深未扫",
+                    SkipReason::Unreadable => "个路径无法读取",
+                    SkipReason::Symlink => "个快捷方式未跟随",
+                    // 上面这个列表不含该类；真加了新变体进来会在编译期报错，
+                    // 强迫作者顺手补一条文案——比运行时兜底更可靠。
+                    SkipReason::UnsupportedExtension => "个非媒体文件已跳过",
+                };
+                notable.push(format!("{n} {what}"));
+            }
+        }
+        if notable.is_empty() {
+            format!("已加入 {added} 个文件到批量队列{dirs}")
+        } else {
+            format!(
+                "已加入 {added} 个文件到批量队列{dirs}；{}",
+                notable.join("、")
+            )
         }
     }
 
@@ -383,19 +1077,60 @@ impl MainWindow {
             let Some(handles) = handles else { return };
             let files: Vec<PathBuf> = handles.iter().map(|h| h.path().to_path_buf()).collect();
             let _ = this.update(cx, |this, cx| {
-                let added = this.state.enqueue_files(files);
-                if added == 0 {
-                    this.state.status =
-                        ProcessStatus::Failed("选中的文件已经在批量队列里".to_string());
-                } else {
-                    info!("批量队列新增 {} 个文件", added);
-                }
-                this.state.active_tab = WorkspaceTab::Generate;
-                this.probe_queue_durations(cx);
-                cx.notify();
+                this.ingest_paths(files, cx);
             });
         })
         .detach();
+    }
+
+    /// 选择一个**文件夹**，把里面（含子目录）的媒体文件全部加入队列。
+    ///
+    /// 与「批量导入文件」分开两个按钮，是因为系统文件对话框一次只能是「选文件」或
+    /// 「选文件夹」二选一，混在一起会让用户点开发现选不了目录而困惑。拖拽那条路
+    /// 则两者都收（见 `handle_dropped_files`）。
+    pub(crate) fn choose_batch_folder(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("选择包含音视频的文件夹")
+                .pick_folder()
+                .await;
+            let Some(handle) = handle else { return };
+            let dir = handle.path().to_path_buf();
+            let _ = this.update(cx, |this, cx| {
+                this.ingest_paths(vec![dir], cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 把一批「用户给的路径」（文件 / 目录混合）展开后入队，并给出有信息量的反馈。
+    ///
+    /// 「批量导入文件」「选择文件夹」两条入口共用它，因此「收了多少、跳过什么、
+    /// 一个都没收到时为什么」这套提示只有一份实现，不会两处漂移。
+    pub(crate) fn ingest_paths(&mut self, inputs: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let outcome = crate::utils::media_scan::collect_media_files(
+            &inputs,
+            &MEDIA_EXTS,
+            crate::utils::media_scan::DEFAULT_MAX_DEPTH,
+        );
+        if outcome.files.is_empty() {
+            self.state.status = ProcessStatus::Failed(self.drop_failure_message(&outcome));
+            cx.notify();
+            return;
+        }
+        let found = outcome.files.len();
+        // clone 而不是 move：`outcome` 后面还要用来生成摘要（收了多少、跳过什么）。
+        let added = self.state.enqueue_files(outcome.files.clone());
+        if added == 0 {
+            self.state.status =
+                ProcessStatus::Failed(format!("这 {found} 个文件已经在批量队列里，未重复添加"));
+        } else {
+            info!("批量队列新增 {} 个文件", added);
+            self.notice = Some(Self::ingest_summary(added, &outcome));
+        }
+        self.state.active_tab = WorkspaceTab::Generate;
+        self.probe_queue_durations(cx);
+        cx.notify();
     }
 
     /// 为队列中尚未探测时长的条目补齐时长（批量完成弹窗要按累计时长做统计）。
@@ -633,12 +1368,59 @@ impl MainWindow {
         self.start_processing_for(file, cx);
     }
 
+    /// 当前选中的识别档位缺什么就返回一句可操作的中文原因；齐备则 `None`。
+    ///
+    /// 抽成函数是为了让「开工守卫」与将来的其它入口（例如快捷键、命令面板）
+    /// 复用同一份判定，而不是各自拼字符串——那类复制粘贴正是「文案一处改、另一处
+    /// 忘了改」的来源。
+    pub(crate) fn missing_engine_reason(&self) -> Option<String> {
+        use crate::app::WhisperModelTier;
+        let tier = self.state.whisper_model_tier;
+        if tier == WhisperModelTier::SenseVoice {
+            if !self.state.model_is_present("sensevoice-model") {
+                return Some(
+                    "SenseVoice 模型未就位：请在「性能设置 → 模型与组件」下载，或改用 Whisper 档位"
+                        .to_string(),
+                );
+            }
+            return None;
+        }
+        // Whisper 各档：判据取**管线真正会加载的那个文件**（`model_relative_path`
+        // 已含「首选量化缺失时平滑回退」的逻辑），而不是 `model_is_present`。
+        // 两者在正常情形下同结论，但用户把 `paths.whisper_model` 指到一个**非档位
+        // 命名**的自备模型时，`model_is_present` 会因「名字对不上任何档位」判为缺失，
+        // 而管线其实跑得起来——用实际路径判定就不会误拦。
+        let will_load = crate::utils::AppConfig::resolve_path(&tier.model_relative_path());
+        (!will_load.is_file()).then(|| {
+            format!(
+                "{} 模型未就位：请在「性能设置 → Whisper 模型档位」点「下载」，或改选已就位的档位",
+                tier.label()
+            )
+        })
+    }
+
     /// 启动一次转写，显式指定输入文件。
     ///
     /// 单文件入口与批量续跑共用这一条启动路径：差别只在「跑完之后做什么」，
     /// 启动前的准备（停预览、拼运行时参数、派发后台线程）完全一致。
     pub(crate) fn start_processing_for(&mut self, file: PathBuf, cx: &mut Context<Self>) {
         if matches!(self.state.status, ProcessStatus::Processing { .. }) {
+            return;
+        }
+        // 开工前先确认**选中的档位**确实有模型。
+        //
+        // 档位下拉现在会明示「已就位 / 未下载」并就地给下载按钮，用户完全可以先选中
+        // 一档再决定要不要下。若这里不拦，`model_override` 会指向一个不存在的文件，
+        // 报错来自 whisper-cli 的 stderr（「failed to load model」之类），
+        // 用户看不出是「档位没下」还是「文件坏了」。这里提前给可操作的中文提示，
+        // 并把他送回能下载的那个界面。
+        //
+        // 只在**单文件入口**拦：批量续跑时若中途某档位文件被删，报错也应落到那一条
+        // 任务上，而不是整批静默停住——不过批量与单文件共用本函数，所以这条守卫对
+        // 两者一致：都停在开工前，都不会把任务跑成半截。
+        if let Some(reason) = self.missing_engine_reason() {
+            self.state.status = ProcessStatus::Failed(reason);
+            cx.notify();
             return;
         }
         // Preview decoding is CPU-heavy on a CPU-only machine. Stop it before
@@ -1142,7 +1924,12 @@ impl MainWindow {
         let mode = self.editor_export_mode;
         self.export_with_save_dialog(
             cx,
-            format!("{}.fcpxml", stem),
+            crate::subtitle::writer::export_file_name(
+                &self.state.config.ui.export_name_template,
+                &stem,
+                "fcpxml",
+                &chrono::Local::now().format("%Y%m%d").to_string(),
+            ),
             "Final Cut Pro XML (*.fcpxml)",
             "fcpxml".to_string(),
             move |segs, path| {
@@ -1168,7 +1955,12 @@ impl MainWindow {
         let mode = self.editor_export_mode;
         self.export_with_save_dialog(
             cx,
-            format!("{}.xml", stem),
+            crate::subtitle::writer::export_file_name(
+                &self.state.config.ui.export_name_template,
+                &stem,
+                "xml",
+                &chrono::Local::now().format("%Y%m%d").to_string(),
+            ),
             "Premiere Pro XML (*.xml)",
             "xml".to_string(),
             move |segs, path| {
@@ -1610,7 +2402,12 @@ impl MainWindow {
                 let mode = self.editor_export_mode;
                 self.export_with_save_dialog(
                     cx,
-                    format!("{}.{}", stem, ext),
+                    crate::subtitle::writer::export_file_name(
+                        &self.state.config.ui.export_name_template,
+                        &stem,
+                        ext,
+                        &chrono::Local::now().format("%Y%m%d").to_string(),
+                    ),
                     filter_label,
                     ext.to_string(),
                     move |segs, path| {

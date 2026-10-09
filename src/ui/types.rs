@@ -44,6 +44,16 @@ pub enum ConfirmAction {
     ClearBatchQueue,
     /// 删除视频库里的一条任务记录
     DeleteTaskRecord(i64),
+    /// 删除某个**可下载组件**的本地文件（释放磁盘空间 / 换回官方包重下）。
+    ///
+    /// 只承载 id 字符串，不承载路径：真正的删除要走
+    /// `utils::model_download::delete_item_file`，由它统一按「配置生效路径」解析并
+    /// 执行安全校验（拒绝压缩包类组件、拒绝目录、拒绝用户自编译构建）。
+    /// 在确认弹窗里再算一遍路径，等于把安全规则复制成第二份，迟早漂移。
+    DeleteModelFile(String),
+    /// 从归档恢复数据（会覆盖式写入磁盘——虽然底层拒绝了覆盖已存在文件，
+    /// 但用户点这一刻的语义仍是「用这份备份替换当前数据」，必须二次确认）。
+    RestoreBackup(std::path::PathBuf),
 }
 
 /// 二次确认弹窗的内容。

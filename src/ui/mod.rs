@@ -56,6 +56,47 @@ impl EditorExportFormat {
         }
     }
 
+    /// 持久化用的稳定字符串（写进 `config.ui.export_format`）。
+    ///
+    /// 刻意不用 `Debug` 名：那是给日志看的，改名会静默作废用户已保存的偏好；
+    /// 这里的取值视为**对外契约**，只在新增格式时追加。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::JianYing => "jianying",
+            Self::JianYingFolder => "jianying_folder",
+            Self::Srt => "srt",
+            Self::Ass => "ass",
+            Self::Fcpxml => "fcpxml",
+            Self::PremiereXml => "premiere_xml",
+            Self::Txt => "txt",
+            Self::Vtt => "vtt",
+            Self::Json => "json",
+            Self::EbuTtD => "ttml",
+            Self::NetflixTtal => "ttal",
+        }
+    }
+
+    /// 从配置字符串还原；未知/空串回落到默认（剪映草稿）。
+    ///
+    /// 容错是必要的：`config.toml` 是用户可以手改的文件，写了个不存在的格式名时
+    /// 应该安静地用默认值启动，而不是让整个界面构造失败。
+    pub fn from_config_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "jianying" | "jianying_local" => Self::JianYing,
+            "jianying_folder" | "jianying_dir" => Self::JianYingFolder,
+            "srt" => Self::Srt,
+            "ass" => Self::Ass,
+            "fcpxml" => Self::Fcpxml,
+            "premiere_xml" | "premiere" | "xml" => Self::PremiereXml,
+            "txt" => Self::Txt,
+            "vtt" => Self::Vtt,
+            "json" => Self::Json,
+            "ttml" | "ebu_tt_d" => Self::EbuTtD,
+            "ttal" | "netflix_ttal" => Self::NetflixTtal,
+            _ => Self::default(),
+        }
+    }
+
     pub fn all() -> &'static [EditorExportFormat] {
         &[
             Self::JianYing,
@@ -85,6 +126,8 @@ pub enum EditorSubtitlePanel {
     Style,
     /// 字幕多语言翻译
     Translate,
+    /// 字幕统计（时长 / 字数 / 语速 / 过长句）
+    Stats,
 }
 
 /// 在线翻译 API 配置卡片里的三个文本输入框，用于把按键派发到正确的缓冲区。
@@ -93,6 +136,23 @@ pub enum ApiField {
     Base,
     Model,
     Key,
+    /// 本地翻译（离线 Qwen）的模型文件路径输入框。
+    ///
+    /// 为什么不复用 `Model`：两者语义不同——`Model` 是在线 API 的**模型名**
+    /// （`cn:deepseek-v4.1-flash`），这里是磁盘上的 **GGUF 文件路径**，
+    /// 落盘字段、校验规则、提示文案都不一样。
+    LocalModelPath,
+}
+
+/// 「查找替换」面板里的两个文本输入框。
+///
+/// 与 [`ApiField`] 同一套理由：自绘输入框要一个可 `Copy` 的「当前是哪个框」标记，
+/// 按键才能派发到正确的缓冲区。用枚举而不是两个独立布尔量，是因为「同时聚焦两个框」
+/// 在逻辑上不可能，布尔量却允许这种非法状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceField {
+    Find,
+    With,
 }
 
 /// 命令面板里一条可执行命令 (P1-A10)。
@@ -114,6 +174,12 @@ pub enum PaletteCommand {
     SwitchToPerformance,
     Undo,
     Redo,
+    /// 打开字幕「查找替换」面板
+    OpenReplace,
+    /// 导出质检复核表（CSV）
+    ExportQcSheet,
+    /// 导出诊断报告
+    ExportDiagnostics,
 }
 
 /// 命令面板里一条命令的展示信息。
@@ -134,7 +200,7 @@ pub struct PaletteCommandSpec {
 ///
 /// 每条命令都直接复用 `MainWindow` 上已有的方法（见 `run_palette_command`），
 /// 这里只做「名字 → 已有入口」的映射，不重写任何业务逻辑。
-pub const PALETTE_COMMANDS: [PaletteCommandSpec; 13] = [
+pub const PALETTE_COMMANDS: [PaletteCommandSpec; 16] = [
     PaletteCommandSpec {
         command: PaletteCommand::OpenFile,
         zh: "打开文件",
@@ -213,6 +279,24 @@ pub const PALETTE_COMMANDS: [PaletteCommandSpec; 13] = [
         en: "redo",
         hint: "Ctrl+Y",
     },
+    PaletteCommandSpec {
+        command: PaletteCommand::OpenReplace,
+        zh: "查找替换",
+        en: "find replace",
+        hint: "Ctrl+H",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::ExportQcSheet,
+        zh: "导出质检表",
+        en: "export qc review sheet",
+        hint: "",
+    },
+    PaletteCommandSpec {
+        command: PaletteCommand::ExportDiagnostics,
+        zh: "导出诊断报告",
+        en: "export diagnostics",
+        hint: "",
+    },
 ];
 
 /// 命令面板打开时的会话状态。
@@ -282,6 +366,12 @@ pub struct MainWindow {
     /// 「取消」按钮置位。任务结束后必须复位（引擎在任务开始前也会复位一次，
     /// 双保险），否则下一次翻译一进来就在第一个批次检查点直接退出。
     pub(crate) translate_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// 性能页「Whisper 模型档位」下拉是否展开。
+    ///
+    /// 与导出格式下拉（`is_export_dropdown_open`）同一套范式：布尔量 + 渲染时内联
+    /// 展开菜单，不引入绝对定位浮层。两者互斥不必特意维护——一个在剪辑台、一个在
+    /// 性能页，同一时刻只可能渲染其中一个。
+    pub(crate) whisper_dropdown_open: bool,
     /// 模型下载的取消标志（与 `translate_cancel` 同一套模式）。
     /// 下载最大 833 MB，慢网下要几十分钟，必须有办法中断。
     pub(crate) model_download_cancel: Arc<std::sync::atomic::AtomicBool>,
@@ -324,6 +414,38 @@ pub struct MainWindow {
     /// 字幕清单搜索关键字（空串表示不过滤）
     pub(crate) subtitle_search: String,
     pub(crate) subtitle_search_focus: FocusHandle,
+    /// 「查找替换」面板是否展开。
+    ///
+    /// 与搜索框分开：搜索只是过滤显示（不改数据），替换会**真的改字幕**，两者
+    /// 混在一个输入框里很容易误操作——用户以为在筛选，结果把整篇的某个词换掉了。
+    pub(crate) replace_panel_open: bool,
+    /// 查找词缓冲
+    pub(crate) replace_find: String,
+    /// 替换词缓冲
+    pub(crate) replace_with: String,
+    /// 是否区分大小写
+    pub(crate) replace_case_sensitive: bool,
+    /// 是否同时替换译文（默认关：机翻结果常是用户已校对的成果，不能被顺手改掉）
+    pub(crate) replace_include_translation: bool,
+    /// 上一次替换的结果提示（`(是否成功, 文案)`），显示在替换面板里。
+    pub(crate) replace_status: Option<(bool, String)>,
+    pub(crate) replace_find_focus: FocusHandle,
+    pub(crate) replace_with_focus: FocusHandle,
+    /// 当前聚焦的替换输入框；`None` 表示两个都没聚焦
+    pub(crate) focused_replace_field: Option<ReplaceField>,
+    /// 替换输入框的光标位置（同一时刻只有一个框聚焦，共用一份）
+    pub(crate) replace_cursor: usize,
+    pub(crate) export_template_focus: FocusHandle,
+    pub(crate) export_template_focused: bool,
+    pub(crate) export_template_cursor: usize,
+    /// 整轨时间轴调整：当前方式（0=未选 / 1=平移 / 2=缩放 / 3=铺满）
+    pub(crate) retime_op: u8,
+    /// 平移量（毫秒，可负）
+    pub(crate) retime_shift_ms: i64,
+    /// 缩放比例（百分比，100 = 不变）
+    pub(crate) retime_scale_pct: u32,
+    /// 铺满目标总时长（秒）
+    pub(crate) retime_target_secs: u32,
     pub(crate) subtitle_search_focused: bool,
     pub(crate) subtitle_search_cursor: usize,
     /// 当前搜索命中的字幕在 `state.segments` 中的下标序列。
@@ -332,6 +454,13 @@ pub struct MainWindow {
     /// `subtitle_filter` 的缓存有效性依据：`(搜索关键字, segments_revision)`。
     /// 两者都没变时直接复用上次算好的下标序列，避免每帧重跑子串匹配。
     pub(crate) subtitle_filter_key: Option<(String, u64)>,
+    /// 低置信句下标的缓存：键为 `(阈值, segments_revision)`。
+    ///
+    /// 与 `glossary_bad_cache` 同一套理由：剪辑台的字幕清单每帧渲染可视行，
+    /// 逐帧重扫「哪些句 confidence 低于阈值」纯属浪费；阈值或字幕变了才重算一次。
+    /// 阈值作为缓存键的一部分是必须的——用户在 `config.toml` 调了
+    /// `whisper_low_confidence` 后，高亮必须立刻跟着变。
+    pub(crate) low_confidence_cache: Option<((u64, u64), Vec<usize>)>,
     /// 术语表疑似未命中句下标的缓存：键为 `(术语表文本, segments_revision)`。
     /// 与 `subtitle_filter` 同理——播放时每 40ms 重绘一次，逐帧对上千句 × 术语条数
     /// 跑子串匹配会白白掉帧。
@@ -343,7 +472,12 @@ pub struct MainWindow {
     pub(crate) api_base_focus: FocusHandle,
     pub(crate) api_model_focus: FocusHandle,
     pub(crate) api_key_focus: FocusHandle,
-    /// 当前聚焦的 API 输入框；`None` 表示三个框都未聚焦
+    /// 本地翻译模型路径的编辑缓冲（`config.paths.llm_model` 的界面镜像）
+    pub(crate) local_model_input: String,
+    pub(crate) local_model_focus: FocusHandle,
+    /// 本地模型路径的即时校验提示：`None` = 无提示 / 路径有效
+    pub(crate) local_model_hint: Option<(bool, String)>,
+    /// 当前聚焦的配置输入框；`None` 表示所有输入框都未聚焦
     pub(crate) focused_api_field: Option<ApiField>,
     /// 单行输入共用的光标位置（同一时刻只有一个框聚焦，无需每框一个）
     pub(crate) line_edit_cursor: usize,
@@ -365,6 +499,29 @@ pub struct MainWindow {
     /// 面板是「非阻塞式冒泡」的轻量浮层而非确认框那种阻塞模态，因此与
     /// `confirm_dialog` 等并存时由渲染顺序决定盖在谁上面（见 `Render::render`）。
     pub(crate) command_palette: Option<CommandPaletteState>,
+}
+
+/// 剪辑台行首「低置信」标记的判据（纯函数，便于单测）。
+///
+/// # 为什么只认「有值且低于阈值」
+///
+/// `confidence == None` 的语义是「这条链路根本不产生逐句置信度」（SenseVoice 全程
+/// 如此、Whisper 也只在质检开启时才有 token 概率），**不是**「识别得不好」。
+/// 若把 `None` 也算低置信，SenseVoice 用户打开剪辑台会看到密密麻麻一整片红点，
+/// 这个提示立刻变成噪声，用户很快就学会无视它——那才是真正丢掉了这个功能。
+///
+/// 判据与转写页质检卡的「低置信」一栏严格同源（同一条 `c < threshold`、
+/// 同一个阈值来源 `pipeline.whisper_low_confidence`），保证同一份数据在两个页面
+/// 给出同一个数字，不会「这页 3 句、那页 5 句」。
+pub(crate) fn low_confidence_indices(
+    segments: &[crate::subtitle::Segment],
+    threshold: f64,
+) -> Vec<usize> {
+    segments
+        .iter()
+        .filter(|s| s.confidence.is_some_and(|c| c < threshold))
+        .map(|s| s.index)
+        .collect()
 }
 
 /// 把一次按键应用到单行文本缓冲区的光标处（自绘输入框的共用编辑核心）。
@@ -491,14 +648,20 @@ impl MainWindow {
         let api_base_focus = cx.focus_handle();
         let api_model_focus = cx.focus_handle();
         let api_key_focus = cx.focus_handle();
+        let local_model_focus = cx.focus_handle();
         let api_base_input = state.config.translate.api_base.clone();
         let api_model_input = state.config.translate.api_model.clone();
         let api_key_input = state.config.translate.api_key.clone();
+        // 本地翻译模型路径：界面缓冲取自配置（`paths.llm_model`，可能是相对或绝对路径）
+        let local_model_input = state.config.paths.llm_model.clone();
         // 预览框宽度：配置里存过就用存的，否则 `preview_box_w` 留空，
         // 由 `MainWindow::subtitle_box_w()` 按「单行最大字数 × 预览字号」自动推算
         let preview_box_w_initial = state.config.subtitle_style.preview_box_w;
         // 导出内容模式是长期偏好：从配置恢复，避免每次重启都跳回默认「双语」。
         let export_mode_initial = state.export_mode_from_config();
+        // 导出格式同样是长期偏好，也必须在 `state` 被 move 进结构体之前取出。
+        let export_format_initial =
+            EditorExportFormat::from_config_str(&state.config.ui.export_format);
         // 启动即绑定全局子进程作业对象：此后所有转写/转码/预览子进程都挂在它名下，
         // 本进程一旦消失（正常退出、关窗、崩溃、被任务管理器结束），Windows 会连根
         // 清掉整棵进程树。这是唯一能覆盖「父进程被强杀」的兜底 —— 单靠退出路径里的
@@ -519,7 +682,10 @@ impl MainWindow {
             notice: None,
             translate_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            editor_export_format: EditorExportFormat::default(),
+            whisper_dropdown_open: false,
+            // 导出格式也是长期偏好（与 `editor_export_mode` 同理）：从配置恢复，
+            // 否则每次启动都跳回「剪映草稿」，用户得重选一遍。
+            editor_export_format: export_format_initial,
             editor_export_mode: export_mode_initial,
             glossary_status: None,
             is_export_dropdown_open: false,
@@ -535,17 +701,38 @@ impl MainWindow {
             library_sizes: HashMap::new(),
             subtitle_search: String::new(),
             subtitle_search_focus,
+            replace_panel_open: false,
+            replace_find: String::new(),
+            replace_with: String::new(),
+            replace_case_sensitive: false,
+            replace_include_translation: false,
+            replace_status: None,
+            replace_find_focus: cx.focus_handle(),
+            replace_with_focus: cx.focus_handle(),
+            focused_replace_field: None,
+            replace_cursor: 0,
+            export_template_focus: cx.focus_handle(),
+            export_template_focused: false,
+            export_template_cursor: 0,
+            retime_op: 0,
+            retime_shift_ms: 0,
+            retime_scale_pct: 100,
+            retime_target_secs: 600,
             subtitle_search_focused: false,
             subtitle_search_cursor: 0,
             subtitle_filter: Vec::new(),
             subtitle_filter_key: None,
             glossary_bad_cache: None,
+            low_confidence_cache: None,
             api_base_input,
             api_model_input,
             api_key_input,
             api_base_focus,
             api_model_focus,
             api_key_focus,
+            local_model_input,
+            local_model_focus,
+            local_model_hint: None,
             focused_api_field: None,
             line_edit_cursor: 0,
             api_key_visible: false,
@@ -638,9 +825,31 @@ impl MainWindow {
         result
     }
 
-    /// 把 API 配置输入框的编辑缓冲写回 `config.toml`。
+    /// 低置信句下标（按 `(阈值, segments_revision)` 缓存）。
+    ///
+    /// 只收 `confidence` 有值的句子——`None` 的语义是「这条链路不产生置信度」
+    /// （SenseVoice 全程如此），把它当低置信会让整片字幕标红，复核提示直接失去意义。
+    /// 因此这里刻意**不**复用 `QualityReport`（那个还带术语/未翻译/碎片句三项，
+    /// 剪辑台的高亮只关心「识别可能不准」这一件事），只取同一判据：`c < 阈值`。
+    ///
+    /// 阈值走配置（`pipeline.whisper_low_confidence`，默认 -0.35），与转写页质检卡
+    /// 同源——同一份数据在两页给出同一个数字，不会「这页 3 句、那页 5 句」。
+    pub(crate) fn cached_low_confidence(&mut self) -> Vec<usize> {
+        let threshold = self.state.config.pipeline.whisper_low_confidence;
+        let key = (threshold.to_bits(), self.state.segments_revision);
+        if let Some((cached_key, cached)) = self.low_confidence_cache.as_ref() {
+            if cached_key == &key {
+                return cached.clone();
+            }
+        }
+        let result = low_confidence_indices(&self.state.segments, threshold);
+        self.low_confidence_cache = Some((key, result.clone()));
+        result
+    }
+
+    /// 把配置输入框的编辑缓冲写回 `config.toml`（在线接口三项 + 本地模型路径）。
     /// 逐键落盘一个几百字节的 TOML 成本可忽略，换来的是「改完即生效、不会丢」。
-    pub(crate) fn commit_api_field(&mut self, field: ApiField) {
+    pub(crate) fn commit_api_field(&mut self, field: ApiField, cx: &mut Context<Self>) {
         match field {
             ApiField::Base => {
                 self.state.config.translate.api_base = self.api_base_input.trim().to_string()
@@ -651,8 +860,56 @@ impl MainWindow {
             ApiField::Key => {
                 self.state.config.translate.api_key = self.api_key_input.trim().to_string()
             }
+            // 本地模型路径的所有副作用都收在 `set_local_model_path`：输入框逐键提交、
+            // 「浏览…」选完文件、「恢复默认」清空，三条界面入口共用同一份
+            // 落盘 / 校验 / 刷新逻辑，不会出现两套实现漂移。
+            ApiField::LocalModelPath => {
+                let path = self.local_model_input.clone();
+                self.set_local_model_path(path, cx);
+                return;
+            }
         }
         self.state.save_translate_config();
+    }
+
+    /// 写入本地大模型（离线 Qwen 的 GGUF）路径：落盘 + 即时校验 + 刷新模型就位判定。
+    ///
+    /// 这是**三条界面入口的唯一汇聚点**：
+    /// 1. 在路径输入框里逐键敲 / 粘贴（`commit_api_field` → 这里；
+    ///    `Ctrl+V` 走 `apply_line_edit`，与逐键同一条路）；
+    /// 2. 点「浏览…」用系统对话框选文件（`choose_llm_model_file` → 这里）；
+    /// 3. 点「恢复默认」清空路径（传空串 → 这里，落回内置 Qwen）。
+    ///
+    /// 三个副作用缺一不可，集中在此避免两套实现漂移：
+    /// - **落盘**：`config.toml` 的 `paths.llm_model`，下次启动仍生效；
+    /// - **校验**：`validate_llm_model_path` 给即时提示，但**不阻止保存**——
+    ///   用户可能先把路径填好、盘稍后才挂载，硬拦会让他没法先填；
+    /// - **刷新就位判定**：`refresh_model_presence` 重扫「qwen-llm / llama-cpp」
+    ///   是否命中新路径，否则性能页的模型管理卡与剪辑台翻译提示还按旧路径显示。
+    ///
+    /// 空串 = 恢复内置默认模型：用户把输入框清空就是在表达这个意图，
+    /// 比起让 `paths.llm_model` 变成空串（那时 `is_present` 恒假、翻译必失败），
+    /// 回退到默认路径更符合直觉。
+    pub(crate) fn set_local_model_path(&mut self, raw: String, cx: &mut Context<Self>) {
+        let path = raw.trim().to_string();
+        // 界面缓冲同步成规范化后的值：粘贴带首尾空格的路径时，输入框不该留着空格。
+        self.local_model_input = path.clone();
+        if path.is_empty() {
+            self.state.config.paths.llm_model =
+                crate::utils::config::PathsConfig::default().llm_model;
+            self.local_model_input = self.state.config.paths.llm_model.clone();
+            self.local_model_hint = Some((true, "已恢复为内置默认模型".to_string()));
+        } else {
+            self.state.config.paths.llm_model = path.clone();
+            self.local_model_hint = crate::utils::config::validate_llm_model_path(&path)
+                .err()
+                .map(|e| (false, e))
+                .or_else(|| Some((true, "路径有效".to_string())));
+        }
+        // 模型换了，重算「已就位」判定（否则模型管理卡还按旧路径显示）
+        self.state.refresh_model_presence();
+        self.state.save_translate_config();
+        cx.notify();
     }
 
     /// 渲染单个 API 配置输入框（在线翻译接口的基址 / 模型名 / 密钥）。
@@ -669,6 +926,7 @@ impl MainWindow {
             ApiField::Base => self.api_base_focus.clone(),
             ApiField::Model => self.api_model_focus.clone(),
             ApiField::Key => self.api_key_focus.clone(),
+            ApiField::LocalModelPath => self.local_model_focus.clone(),
         };
         let is_focused = self.focused_api_field == Some(field);
         // 密钥默认掩码显示，避免录屏/截图把密钥带出去
@@ -677,6 +935,7 @@ impl MainWindow {
             ApiField::Base => self.api_base_input.clone(),
             ApiField::Model => self.api_model_input.clone(),
             ApiField::Key => self.api_key_input.clone(),
+            ApiField::LocalModelPath => self.local_model_input.clone(),
         };
         let char_count = raw.chars().count();
         let cursor = self.line_edit_cursor.min(char_count);
@@ -684,6 +943,7 @@ impl MainWindow {
             ApiField::Base => "https://api.deepseek.com/v1",
             ApiField::Model => "deepseek-chat",
             ApiField::Key => "sk-...（留空则读环境变量 VOICE2WORD_API_KEY）",
+            ApiField::LocalModelPath => "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf",
         };
         let display: String = if masked {
             "•".repeat(char_count)
@@ -705,6 +965,7 @@ impl MainWindow {
                         ApiField::Base => this.api_base_input.chars().count(),
                         ApiField::Model => this.api_model_input.chars().count(),
                         ApiField::Key => this.api_key_input.chars().count(),
+                        ApiField::LocalModelPath => this.local_model_input.chars().count(),
                     };
                     cx.notify();
                 }),
@@ -714,11 +975,11 @@ impl MainWindow {
                     ApiField::Base => &mut this.api_base_input,
                     ApiField::Model => &mut this.api_model_input,
                     ApiField::Key => &mut this.api_key_input,
+                    ApiField::LocalModelPath => &mut this.local_model_input,
                 };
                 let cursor = &mut this.line_edit_cursor;
                 if apply_line_edit(buffer, cursor, event, cx) {
-                    this.commit_api_field(field);
-                    cx.notify();
+                    this.commit_api_field(field, cx);
                 }
             }))
             .child(if is_focused {
@@ -811,6 +1072,12 @@ impl MainWindow {
             }
             PaletteCommand::Undo => self.state.can_undo(),
             PaletteCommand::Redo => self.state.can_redo(),
+            // 「查找替换」要切到剪辑台并展开面板：没有字幕时无事可做，置灰。
+            PaletteCommand::OpenReplace => !self.state.segments.is_empty(),
+            // 两个导出都产出「当前字幕的衍生文件」：没字幕就没内容可导。
+            PaletteCommand::ExportQcSheet => !self.state.segments.is_empty(),
+            // 诊断报告不看字幕——环境坏了、连字幕都没有的时候，恰恰最需要它。
+            PaletteCommand::ExportDiagnostics => true,
         }
     }
 
@@ -864,6 +1131,18 @@ impl MainWindow {
                     self.subtitle_list_followed_sel = None;
                 }
             }
+            PaletteCommand::OpenReplace => {
+                // 与 Ctrl+H 的挂载点同源：切页 + 展开 + 光标置尾（不抢焦点——面板
+                // 已关，用户接下来多半是点输入框；强制抢焦点会让面板看起来「自己
+                // 弹出来还锁住了键盘」）。
+                self.state.active_tab = WorkspaceTab::Editor;
+                self.replace_panel_open = true;
+                self.replace_cursor = self.replace_find.chars().count();
+            }
+            PaletteCommand::ExportQcSheet => {
+                self.export_review_sheet(crate::subtitle::qc::QcFormat::Csv, cx)
+            }
+            PaletteCommand::ExportDiagnostics => self.export_diagnostics(cx),
         }
         cx.notify();
     }
@@ -1141,6 +1420,17 @@ impl Render for MainWindow {
         let api_base_focused = self.api_base_focus.contains_focused(window, cx);
         let api_model_focused = self.api_model_focus.contains_focused(window, cx);
         let api_key_focused = self.api_key_focus.contains_focused(window, cx);
+        let local_model_focused = self.local_model_focus.contains_focused(window, cx);
+        let replace_find_focused = self.replace_find_focus.contains_focused(window, cx);
+        let replace_with_focused = self.replace_with_focus.contains_focused(window, cx);
+        self.export_template_focused = self.export_template_focus.contains_focused(window, cx);
+        self.focused_replace_field = if replace_find_focused {
+            Some(ReplaceField::Find)
+        } else if replace_with_focused {
+            Some(ReplaceField::With)
+        } else {
+            None
+        };
         self.subtitle_search_focused = search_focused;
         self.is_text_focused = text_editor_focused;
         self.focused_api_field = if api_base_focused {
@@ -1149,6 +1439,8 @@ impl Render for MainWindow {
             Some(ApiField::Model)
         } else if api_key_focused {
             Some(ApiField::Key)
+        } else if local_model_focused {
+            Some(ApiField::LocalModelPath)
         } else {
             None
         };
@@ -1366,6 +1658,21 @@ impl Render for MainWindow {
                     this.toggle_command_palette(window, cx);
                 }),
             )
+            .on_action(
+                cx.listener(|this, _: &shortcuts::OpenReplacePanel, window, cx| {
+                    if this.command_palette.is_some() {
+                        return;
+                    }
+                    // Ctrl+H：与 Ctrl+F 同一套「先切页、再展开/聚焦」的写法。
+                    // 展开后把焦点直接给「查找」框——用户按这个键就是想马上打字，
+                    // 再要求他点一下输入框是多余的一步。
+                    this.state.active_tab = WorkspaceTab::Editor;
+                    this.replace_panel_open = true;
+                    this.replace_cursor = this.replace_find.chars().count();
+                    window.focus(&this.replace_find_focus);
+                    cx.notify();
+                }),
+            )
             // 1. 顶部自定义标题栏 (极简沉浸式，包含窗口拖拽与控制按钮)
             .child(self.render_titlebar(cx))
             // 1.5 全局失败提示条：`ProcessStatus::Failed` 的产生点遍布导出 / 预览 /
@@ -1566,5 +1873,82 @@ mod tests {
             );
             assert!(seen.insert(spec.zh), "中文名重复: {}", spec.zh);
         }
+    }
+
+    /// 导出格式的持久化字符串必须**可往返**：`as_str` 写进 config.toml，
+    /// 重启时 `from_config_str` 读回来必须还是同一档。
+    ///
+    /// 这是回归护栏——`editor_export_format` 此前从不落盘，每次启动都跳回默认的
+    /// 「剪映草稿」。往返测试能拦住两类错误：新增格式时忘了加 `as_str` 分支
+    /// （会撞进 `_ =>` 而悄悄落到默认档），以及 `from_config_str` 的别名表与
+    /// `as_str` 取值不一致。
+    #[test]
+    fn export_format_config_string_roundtrips() {
+        for fmt in super::EditorExportFormat::all() {
+            let s = fmt.as_str();
+            assert!(!s.is_empty());
+            assert_eq!(
+                super::EditorExportFormat::from_config_str(s),
+                *fmt,
+                "导出格式 {s} 未能往返"
+            );
+            // 大小写与首尾空白都要容错（config.toml 是用户可手改的文件）
+            assert_eq!(
+                super::EditorExportFormat::from_config_str(&format!("  {}  ", s.to_uppercase())),
+                *fmt,
+                "导出格式 {s} 应容忍大小写与空白"
+            );
+        }
+        // 未知 / 空串安静回落到默认，而不是 panic 或让界面构造失败
+        assert_eq!(
+            super::EditorExportFormat::from_config_str("no-such-format"),
+            super::EditorExportFormat::default()
+        );
+        assert_eq!(
+            super::EditorExportFormat::from_config_str(""),
+            super::EditorExportFormat::default()
+        );
+        // 持久化字符串必须两两不同，否则两档会互相覆盖
+        let mut seen = std::collections::HashSet::new();
+        for fmt in super::EditorExportFormat::all() {
+            assert!(
+                seen.insert(fmt.as_str()),
+                "持久化字符串重复: {}",
+                fmt.as_str()
+            );
+        }
+    }
+
+    /// 低置信判据：`None` **绝不**算低置信，有值时才比阈值；恰好等于阈值不算
+    /// （与 `plan_rescue_spans` / `quality_report` 的 `c < threshold` 同口径）。
+    ///
+    /// 这条锁住剪辑台行首那个红点的显示规则：一旦有人把 `is_some_and` 写成
+    /// `map_or(true, ...)` 之类的「None 也算」，SenseVoice 用户的字幕清单会整片标红。
+    #[test]
+    fn low_confidence_only_flags_scored_segments_below_threshold() {
+        use crate::subtitle::Segment;
+        let mut scored_low = Segment::new(1, 0.0, 1.0, "低");
+        scored_low.confidence = Some(-0.9);
+        let mut scored_ok = Segment::new(2, 1.0, 2.0, "好");
+        scored_ok.confidence = Some(-0.05);
+        let mut on_threshold = Segment::new(3, 2.0, 3.0, "等");
+        on_threshold.confidence = Some(-0.35);
+        let unscored = Segment::new(4, 3.0, 4.0, "缺"); // confidence 默认 None
+        let segs = vec![scored_low, scored_ok, on_threshold, unscored];
+
+        // 默认阈值 -0.35：只有 -0.9 命中；-0.35 恰好等于阈值，不算
+        assert_eq!(
+            super::low_confidence_indices(&segs, -0.35),
+            vec![1],
+            "只有严格低于阈值的句子才标低置信"
+        );
+        // None 永不命中（SenseVoice 全程），阈值放到 +10 也依然是 None 不命中
+        assert_eq!(
+            super::low_confidence_indices(&segs, 10.0),
+            vec![1, 2, 3],
+            "None 不应因为阈值放宽而被算进来"
+        );
+        // 空表不出错
+        assert!(super::low_confidence_indices(&[], 0.0).is_empty());
     }
 }

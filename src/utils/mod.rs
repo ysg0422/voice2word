@@ -1,14 +1,19 @@
+pub mod backup;
 pub mod child_registry;
 pub mod config;
+pub mod diagnostics;
+pub mod duplicates;
 pub mod fingerprint;
 pub mod frame_cache;
 pub mod logger;
+pub mod media_scan;
 pub mod model_download;
 pub mod monitor;
 pub mod pe_imports;
 pub mod temp_cleanup;
 pub mod temp_guard;
 pub mod time;
+pub mod update_check;
 pub mod zip_extract;
 
 pub use config::{AppConfig, SubtitleStyleConfig, SUBTITLE_PRESETS};

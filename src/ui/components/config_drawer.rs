@@ -469,7 +469,9 @@ impl MainWindow {
                 }
             })
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.state.whisper_model_tier = tier;
+                // 走 setter 落盘：侧栏胶囊此前只改内存，重启后档位会被
+                // `config.paths.whisper_model` 反推覆盖回去。
+                this.state.set_whisper_model_tier(tier);
                 cx.notify();
             }))
             .child(
@@ -636,18 +638,15 @@ impl MainWindow {
                 vec![("off", "关闭"), ("punc", "极速标点"), ("qwen", "Qwen 润色")],
                 polish_sel,
                 |this, sel, cx| {
+                    // 统一走 `AppState::set_polish`：状态 + config.toml 双写。
+                    // 此前这里只改内存，重启后润色开关与档位都会被配置里的旧值覆盖。
+                    // 「关闭」时沿用当前档位，只把总开关置假——否则用户关一下再开，
+                    // 引擎会悄悄从 Qwen 变回 CT-Punc。
+                    let mode = this.state.polish_mode;
                     match sel {
-                        "punc" => {
-                            this.state.enable_polish = true;
-                            this.state.polish_mode = PolishMode::PuncFast;
-                        }
-                        "qwen" => {
-                            this.state.enable_polish = true;
-                            this.state.polish_mode = PolishMode::QwenDeep;
-                        }
-                        _ => {
-                            this.state.enable_polish = false;
-                        }
+                        "punc" => this.state.set_polish(true, PolishMode::PuncFast),
+                        "qwen" => this.state.set_polish(true, PolishMode::QwenDeep),
+                        _ => this.state.set_polish(false, mode),
                     }
                     cx.notify();
                 },

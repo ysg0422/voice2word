@@ -161,6 +161,16 @@ impl MainWindow {
                             })),
                     )
                     .child(
+                        // 重复检测：库里的指纹（`content_hash`）能识别「改名 / 复制 /
+                        // 重下」的同一份媒体，但此前没有任何地方用它来提醒。重转一遍
+                        // 40 分钟的课是用户最容易犯、代价最高的错。
+                        primitives::chip_clickable("查重", false, false)
+                            .id("lib-find-dupes-btn")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.report_library_duplicates(cx);
+                            })),
+                    )
+                    .child(
                         primitives::btn_state(
                             if busy { "导出中…" } else { "导出选中" },
                             primitives::BtnSize::Md,

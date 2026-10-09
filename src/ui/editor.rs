@@ -651,6 +651,21 @@ impl MainWindow {
                                     this.subtitle_panel = EditorSubtitlePanel::Translate;
                                     cx.notify();
                                 })),
+                            )
+                            // 统计面板：整篇的时长 / 字数 / 语速 / 过长句。
+                            // 这些数字此前无处可看（只能自己数），而 CPS 与「过长句」
+                            // 正是字幕交付会被打回的硬指标。
+                            .child(
+                                primitives::segmented(
+                                    "字幕统计",
+                                    panel == EditorSubtitlePanel::Stats,
+                                    false,
+                                )
+                                .id("btn-panel-subtitle-stats")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.subtitle_panel = EditorSubtitlePanel::Stats;
+                                    cx.notify();
+                                })),
                             ),
                     ),
             )
@@ -1419,10 +1434,22 @@ impl MainWindow {
                             div().into_any_element()
                         }
                     )
+                    // 2.4 整轨时间轴调整（仅「字幕样式」面板可见）
+                    //
+                    // 与样式卡并列、而不是塞进样式卡内部：它是**整轨级**操作（平移 /
+                    // 缩放 / 铺满），与「观感」是两件事；放在同一页是因为两者都属于
+                    // 「我要调整这一整份字幕」的心智模型。
+                    .child(if panel == EditorSubtitlePanel::Style {
+                        self.render_retime_card(cx).into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
                     // 2.5 字幕多语言翻译面板（仅「字幕翻译」面板可见；后端链路早已就绪）
                     .child(
                         if panel == EditorSubtitlePanel::Translate {
                             self.render_translate_card(cx).into_any_element()
+                        } else if panel == EditorSubtitlePanel::Stats {
+                            self.render_subtitle_stats_card(cx).into_any_element()
                         } else {
                             div().into_any_element()
                         },
@@ -1504,7 +1531,21 @@ impl MainWindow {
                                                 format!("共 {} 句", total)
                                             }),
                                     )
+                                    .child(
+                                        // 查找替换开关：与「搜索」分开成独立面板，因为
+                                        // 搜索只过滤显示、替换会真改字幕，混在一起极易误操作。
+                                        primitives::mini_btn("查找替换", true)
+                                            .id("replace-panel-toggle")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.replace_panel_open = !this.replace_panel_open;
+                                                if !this.replace_panel_open {
+                                                    this.replace_status = None;
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
                             })
+                            .children(self.render_replace_bar(cx))
                             // 表头 (图二标准规格)
                             .child(
                                 div()
@@ -1603,6 +1644,15 @@ impl MainWindow {
                                     .cached_glossary_violations()
                                     .into_iter()
                                     .collect();
+                                // 低置信句集合：同样每帧只算一次（按阈值+revision 缓存），
+                                // 供行首一个小标记提示「这句识别可能不准」。与术语违规
+                                // 分开取，是因为两者的判据与配色不同：术语是「译法没按你
+                                // 的约定」，低置信是「原文本身可能听错」——混成一色会让
+                                // 用户分不清该改译文还是该重听。
+                                let low_conf: std::collections::HashSet<usize> = self
+                                    .cached_low_confidence()
+                                    .into_iter()
+                                    .collect();
                                 uniform_list(
                                     "inspector-segments-virtual",
                                     row_count,
@@ -1610,6 +1660,7 @@ impl MainWindow {
                                         let sel = this.state.selected_segment_index;
                                         let cur_time = this.state.current_time;
                                         let glossary_bad = glossary_bad.clone();
+                                        let low_conf = low_conf.clone();
                                         visible_range
                                             .map(|i| {
                                                 // 行数必须与请求区间严格一致：uniform_list 的
@@ -1642,6 +1693,11 @@ impl MainWindow {
                                                 let speaker = seg.speaker;
                                                 // 术语表疑似未命中：给这一行一个琥珀色提示条
                                                 let glossary_flagged = glossary_bad.contains(&seg_idx);
+                                                // 低置信：原文可能听错，行首给一个红色小点。
+                                                // 与术语的整行琥珀底色区分开——底色只有一个，
+                                                // 两者同时命中时底色归术语（那是有操作指引的），
+                                                // 低置信用小点，信息不丢。
+                                                let low_conf_flagged = low_conf.contains(&seg_idx);
 
                                                 div()
                                                     .id(("table-row-seg", seg_idx))
@@ -1669,6 +1725,18 @@ impl MainWindow {
                                                     .flex()
                                                     .items_center()
                                                     .gap(px(SUBTITLE_TABLE_GAP))
+                                                    // 低置信小点（占位宽度恒定，避免有/无标记时列宽跳动）
+                                                    .child(
+                                                        div()
+                                                            .w(px(Theme::SPACE_2))
+                                                            .flex_shrink_0()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .children(low_conf_flagged.then(|| {
+                                                                primitives::stat_dot_sm(Theme::accent_red())
+                                                            })),
+                                                    )
                                                     // 序号
                                                     .child(
                                                         div()
@@ -1945,6 +2013,493 @@ impl MainWindow {
         }
     }
 
+    /// 整轨时间轴调整卡：平移 / 缩放 / 铺满目标时长。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 字幕的时间轴几乎从不对上最终成片：片子剪掉了 12 秒就要整轨平移；开头加了一段
+    /// 片头就要「某点之后平移」；25 分钟的成片复用 22 分钟的版本就要整体缩放；TXT
+    /// 导入合成的时间轴更是完全假的、必须铺满真实时长。此前这些只能一行行拖。
+    ///
+    /// # 设计要点
+    ///
+    /// - **先算后应用**：规划在 `subtitle::timing`（纯函数、16 条单测），这里只负责
+    ///   取参数、显示预览摘要、点「应用」才写回。用户可以反复试参数而不用担心
+    ///   把时间轴改坏——没点应用就没有任何副作用。
+    /// - **应用前记撤销快照**：整轨操作一改就是几百句，必须有路可退。
+    /// - **重叠自纠**：变换后若产生重叠（缩放比例与原始空隙不一致时常见），应用时
+    ///   自动过一遍 `resolve_overlaps`，保证结果仍能原样通过 `optimize_segments`
+    ///   ——否则用户下次载入工程会被「排序 + 截断重叠」再改一遍，看起来像怎么改都丢。
+    fn render_retime_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::subtitle::timing::{describe, plan_retime, suggest_fit, TimeShift};
+        let segments = &self.state.segments;
+        // 三个参数：平移量、缩放比、铺满目标。都用整数档位（渲染器只吃 u32），
+        // 显示时换算回秒 / 百分比。
+        let shift_ms = self.retime_shift_ms;
+        let scale_pct = self.retime_scale_pct;
+        let target_secs = self.retime_target_secs;
+        let op = self.retime_op;
+
+        // 预览：按当前参数算一遍，把「会改几句 / 是否重叠」如实显示出来。
+        let preview = match op {
+            1 => Some(plan_retime(
+                segments,
+                TimeShift::ShiftAll {
+                    delta: shift_ms as f64 / 1000.0,
+                },
+            )),
+            2 => Some(plan_retime(
+                segments,
+                TimeShift::Scale {
+                    source_span: 1.0,
+                    target_span: scale_pct as f64 / 100.0,
+                },
+            )),
+            3 => Some(plan_retime(
+                segments,
+                TimeShift::FitToDuration {
+                    target_secs: target_secs as f64,
+                },
+            )),
+            _ => None,
+        };
+
+        let preview_text = match (&preview, op) {
+            (Some(plan), _) => {
+                let shift_desc = match op {
+                    1 => describe(TimeShift::ShiftAll {
+                        delta: shift_ms as f64 / 1000.0,
+                    }),
+                    2 => format!("缩放 {:+.0}%", scale_pct as f64 - 100.0),
+                    _ => format!("铺满 {target_secs} 秒"),
+                };
+                let mut t = format!("{shift_desc} · 将改 {} 句", plan.changed);
+                if plan.overlaps {
+                    // 重叠不是错误——应用时会自动压掉——但必须提前说，否则用户看到
+                    // 「应用后句数没变但时间变了」会以为是 bug。
+                    t.push_str(" · 检测到重叠，应用时自动压平");
+                }
+                if plan.degenerate {
+                    t.push_str(" · 含过短片段，应用时会自纠到最短时长");
+                }
+                t
+            }
+            (None, _) => "选择一种调整方式".to_string(),
+        };
+
+        // 目标时长的默认建议：整轨已有时长与视频总时长差得远时，界面直接提示
+        // （TXT 导入后必然命中）。
+        let fit_hint = suggest_fit(segments, self.state.total_duration);
+
+        let op_row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                primitives::segmented("整轨平移", op == 1, false)
+                    .id("retime-op-shift")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.retime_op = 1;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                primitives::segmented("整体缩放", op == 2, false)
+                    .id("retime-op-scale")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.retime_op = 2;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                primitives::segmented("铺满总时长", op == 3, false)
+                    .id("retime-op-fit")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.retime_op = 3;
+                        cx.notify();
+                    })),
+            );
+
+        // 参数行：按当前方式只显示相关的那一项，避免三个滑条堆在一起让人不知道
+        // 哪个在生效。
+        let param_row = match op {
+            1 => self
+                .render_slider(
+                    "retime-slider-shift",
+                    "平移量",
+                    // 档位 = (毫秒/1000 + 5) 取整，范围 0..60；负值也落在档位内。
+                    ((shift_ms / 1000) + 5).clamp(0, 60) as u32,
+                    0,
+                    60,
+                    format!("{:+.1} s", shift_ms as f64 / 1000.0),
+                    "正数往后、负数往前；起点会被钳在 0 且保持时长不变".to_string(),
+                    cx,
+                    move |this, v, cx| {
+                        // 滑条档位 0..60 秒 → -5.0..+55.0 秒，覆盖常见的修剪幅度。
+                        this.retime_shift_ms = (v as i64 - 5) * 1000;
+                        cx.notify();
+                    },
+                )
+                .into_any_element(),
+            2 => self
+                .render_slider(
+                    "retime-slider-scale",
+                    "缩放比例",
+                    scale_pct,
+                    50,
+                    150,
+                    format!("{:.0}%", scale_pct),
+                    "成片比字幕版本更长就把比例调大（时间轴等比拉伸）".to_string(),
+                    cx,
+                    move |this, v, cx| {
+                        this.retime_scale_pct = v;
+                        cx.notify();
+                    },
+                )
+                .into_any_element(),
+            3 => self
+                .render_slider(
+                    "retime-slider-target",
+                    "目标总时长",
+                    target_secs,
+                    10,
+                    3600,
+                    crate::utils::time::format_duration_short(target_secs as f64),
+                    fit_hint
+                        .map(|_| {
+                            format!(
+                                "当前整轨 {}，与视频时长不符——建议铺满到 {}",
+                                crate::utils::time::format_duration_short(
+                                    self.state.segments.last().map(|s| s.end).unwrap_or(0.0)
+                                ),
+                                crate::utils::time::format_duration_short(
+                                    self.state.total_duration
+                                )
+                            )
+                        })
+                        .unwrap_or_else(|| "按各句时长比例重新铺满整轨".to_string()),
+                    cx,
+                    move |this, v, cx| {
+                        this.retime_target_secs = v;
+                        cx.notify();
+                    },
+                )
+                .into_any_element(),
+            _ => div().into_any_element(),
+        };
+
+        let can_apply = op != 0 && !segments.is_empty();
+        let apply_label = match op {
+            1 => "应用平移",
+            2 => "应用缩放",
+            3 => "铺满时间轴",
+            _ => "应用",
+        };
+        let apply_row = div()
+            .flex()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_muted())
+                    .child(preview_text),
+            )
+            .child(
+                primitives::mini_btn(apply_label, can_apply)
+                    .id("retime-apply")
+                    .when(can_apply, |d| {
+                        d.on_click(cx.listener(move |this, _, _, cx| {
+                            this.apply_retime(cx);
+                        }))
+                    }),
+            );
+
+        primitives::card_sm()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(primitives::section_title("整轨时间轴调整"))
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child("先预览、后应用；应用前自动记撤销点"),
+                    ),
+            )
+            .child(op_row)
+            .child(param_row)
+            .child(apply_row)
+    }
+
+    /// 把当前参数对应的整轨变换真正写回字幕，并自纠重叠。
+    ///
+    /// 与 `render_retime_card` 的预览用**同一份** `plan_retime` 调用参数，避免
+    /// 「预览说改 190 句、应用却改了 189 句」这种自相矛盾。
+    fn apply_retime(&mut self, cx: &mut Context<Self>) {
+        use crate::subtitle::timing::{plan_retime, resolve_overlaps, TimeShift};
+        if self.state.segments.is_empty() {
+            return;
+        }
+        let shift = match self.retime_op {
+            1 => TimeShift::ShiftAll {
+                delta: self.retime_shift_ms as f64 / 1000.0,
+            },
+            2 => TimeShift::Scale {
+                source_span: 1.0,
+                target_span: self.retime_scale_pct as f64 / 100.0,
+            },
+            3 => TimeShift::FitToDuration {
+                target_secs: self.retime_target_secs as f64,
+            },
+            _ => return,
+        };
+        let plan = plan_retime(&self.state.segments, shift);
+        // 应用前记快照：整轨操作一改几百句，点错了必须有路可退。
+        self.state.snapshot_for_undo();
+        let resolved = resolve_overlaps(&plan.times);
+        for (seg, (start, end)) in self.state.segments.iter_mut().zip(resolved) {
+            seg.start = start;
+            seg.end = end;
+        }
+        let changed = plan.changed;
+        self.state.bump_segments_revision();
+        // 时间轴变了：波形/监视器的定位与质检缓存都要跟着重算。
+        self.subtitle_filter_key = None;
+        self.notice = Some(format!(
+            "已调整整轨时间轴（{changed} 句变动{}）",
+            if plan.overlaps {
+                "，重叠已压平"
+            } else {
+                ""
+            }
+        ));
+        cx.notify();
+    }
+
+    /// 字幕统计卡：整篇的时长 / 字数 / 语速 / 过长句。
+    ///
+    /// # 为什么这些数字值得单独一栏
+    ///
+    /// 「阅读速度（CPS）」与「单行过长」是字幕交付的两条硬指标——被平台或客户打回
+    /// 的常见原因就是「这句字幕一闪而过看不清」。此前用户只能一行行目测，现在给出
+    /// 整篇的极值与超标计数，并直接标出**是哪一句**（可点，跳过去改）。
+    ///
+    /// # 为什么按字符集分档
+    ///
+    /// CPS 对汉字与对英文字母不是一个量纲：一个汉字的信息量远大于一个字母。用同一个
+    /// 阈值会把中文全判成「过快」或把英文全判成「舒适」，两头都不准。分档逻辑在
+    /// `subtitle::stats::ReadingSpeed::classify`（纯函数、有单测），这里只负责展示。
+    fn render_subtitle_stats_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::subtitle::stats::{compute, ReadingSpeed};
+        let style = self.state.config.subtitle_style.clone();
+        // 媒体总时长：优先用工程里记录的（`total_duration`），没有则退回探测值。
+        // 两者都为 0 时 `spoken_ratio` 会返回 0，界面照常显示而不出 NaN。
+        let media_secs = if self.state.total_duration > 0.0 {
+            self.state.total_duration
+        } else {
+            self.state.transcribe_duration
+        };
+        // `max_chars_per_line` 是 u32（样式配置），stats 收 usize——显式转换，
+        // 不用 `as`（u32→usize 在 32 位平台也是无损的，但 `try_into` 更直白）。
+        let max_chars = usize::try_from(style.max_chars_per_line).unwrap_or(usize::MAX);
+        let stats = compute(&self.state.segments, media_secs, max_chars);
+        let max_cps_idx = stats.max_cps_index;
+        let longest_idx = stats.longest_index;
+        let too_fast = stats.too_fast_count;
+        let long_lines = stats.long_line_count;
+
+        // 统计行：标签 + 数值。`bad` 为真时用红色——只给需要用户动手的数字上色，
+        // 全绿或全红都等于没有信号。
+        let row = |label: &'static str, value: String, bad: bool| -> AnyElement {
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(Theme::SPACE_4))
+                .py(px(Theme::SPACE_1))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(Theme::TEXT_SMALL))
+                        .text_color(Theme::text_secondary())
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_SMALL))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if bad {
+                            Theme::accent_red()
+                        } else {
+                            Theme::text_primary()
+                        })
+                        .child(value),
+                )
+                .into_any_element()
+        };
+
+        let mut card = primitives::card_rows()
+            .child(primitives::setting_row(
+                "字幕统计",
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .child(format!("共 {} 句", stats.segment_count))
+                    .into_any_element(),
+            ))
+            .child(primitives::divider());
+
+        if stats.segment_count == 0 {
+            return card.child(
+                div()
+                    .py(px(Theme::SPACE_2))
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .child("还没有字幕，先在「智能转写」生成"),
+            );
+        }
+
+        card = card
+            .child(row(
+                "原文总字数",
+                format!("{} 字", stats.total_chars),
+                false,
+            ))
+            .child(row(
+                "已翻译",
+                format!("{} / {} 句", stats.translated_count, stats.segment_count),
+                false,
+            ))
+            .child(row(
+                "有语音时长",
+                format!(
+                    "{}（占全片 {:.0}%）",
+                    crate::utils::time::format_duration_short(stats.spoken_secs),
+                    stats.spoken_ratio() * 100.0
+                ),
+                false,
+            ))
+            .child(row(
+                "平均语速",
+                format!("{:.1} 字/秒", stats.average_cps()),
+                false,
+            ))
+            .child(row(
+                "最快一句",
+                format!("{:.1} 字/秒", stats.max_cps),
+                stats
+                    .max_cps_index
+                    .and_then(|i| self.state.segments.iter().find(|s| s.index == i))
+                    .and_then(|s| ReadingSpeed::classify(s.display_text(), s.duration()))
+                    == Some(ReadingSpeed::TooFast),
+            ));
+
+        // 两个「有问题」的数字做成可点的胶囊：点一下跳到那一句，用户才知道去改哪。
+        // 零项时保留计数但置灰——用户要看得出「这一项确实检查过、结果是 0」。
+        // 跳转目标取极值句（语速过快 → 最快那句；单行过长 → 最长那句）：stats 只给
+        // 极值，要精确到「第一句过长的」得再遍历一次，而极值句通常就是要改的那句。
+        let mut issues = div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(Theme::SPACE_2));
+
+        if too_fast == 0 {
+            issues = issues.child(primitives::tag_tinted(
+                "语速过快 0 句",
+                Theme::tint_neutral(),
+                Theme::tint_neutral_border(),
+                Theme::text_muted(),
+            ));
+        } else {
+            let el = primitives::tag_tinted(
+                format!("语速过快 {too_fast} 句"),
+                Theme::tint_red_soft(),
+                Theme::tint_red_border(),
+                Theme::accent_red(),
+            )
+            .id("stats-issue-too-fast");
+            issues = issues.child(match max_cps_idx {
+                Some(idx) => el
+                    .cursor_pointer()
+                    .hover(|s| s.opacity(0.85))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.jump_to_segment_for_stats(idx, cx);
+                    }))
+                    .into_any_element(),
+                None => el.into_any_element(),
+            });
+        }
+
+        if long_lines == 0 {
+            issues = issues.child(primitives::tag_tinted(
+                "单行过长 0 句",
+                Theme::tint_neutral(),
+                Theme::tint_neutral_border(),
+                Theme::text_muted(),
+            ));
+        } else {
+            let el = primitives::tag_tinted(
+                format!("单行过长 {long_lines} 句"),
+                Theme::tint_red_soft(),
+                Theme::tint_red_border(),
+                Theme::accent_red(),
+            )
+            .id("stats-issue-long-line");
+            issues = issues.child(match longest_idx {
+                Some(idx) => el
+                    .cursor_pointer()
+                    .hover(|s| s.opacity(0.85))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.jump_to_segment_for_stats(idx, cx);
+                    }))
+                    .into_any_element(),
+                None => el.into_any_element(),
+            });
+        }
+
+        if let Some(idx) = longest_idx {
+            issues = issues.child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_muted())
+                    .child(format!("最长句为第 {idx} 句（{} 字）", stats.max_chars)),
+            );
+        }
+
+        card.child(issues).child(
+            div()
+                .pt(px(Theme::SPACE_2))
+                .text_size(px(Theme::TEXT_CAPTION))
+                .text_color(Theme::text_muted())
+                .child(format!(
+                    "语速上限按字符集分档：中日韩约 9 字/秒、拉丁约 17 字/秒；单行超过 {} 字判为过长（按可折两行算）",
+                    style.max_chars_per_line.saturating_mul(2)
+                )),
+        )
+    }
+
+    /// 统计卡里的「跳到这一句」：选中目标句、强制字幕清单重新定位、刷新监视器帧。
+    ///
+    /// 与质检卡的 `jump_to_quality_issue` 同法但**不切页**——统计卡就在剪辑台里，
+    /// 用户点它是想看一眼那一句，不是想离开当前页面。
+    fn jump_to_segment_for_stats(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.state.select_segment(index);
+        // 置 `None` 强制清单重新滚动到选中行：只在列表内部改选中不会自动跟随。
+        self.subtitle_list_followed_sel = None;
+        // 监视器要显示这一句对应的画面，否则用户还得自己在时间轴上找。
+        self.trigger_extract_frame(cx);
+        cx.notify();
+    }
+
     /// 渲染剪辑工作台右侧底部的统一导出控制底栏
     pub(crate) fn render_editor_export_dock(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_open = self.is_export_dropdown_open;
@@ -1998,6 +2553,11 @@ impl MainWindow {
                                     .justify_between()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.editor_export_format = fmt;
+                                        // 落盘：导出格式是长期偏好，不存的话重启就
+                                        // 跳回默认，用户会以为选择没生效。
+                                        this.state.config.ui.export_format =
+                                            fmt.as_str().to_string();
+                                        let _ = this.state.config.save_to_file("config.toml");
                                         this.is_export_dropdown_open = false;
                                         cx.notify();
                                     }))
@@ -2065,6 +2625,76 @@ impl MainWindow {
                             }))
                     }),
             )
+            // 文件名模板：`{name}` / `{ext}` / `{date}`。同一部片子常要交付多份
+            // （给剪辑的、给外语同事的、按日期归档的），此前只能导出后手工改名。
+            // 默认 `{name}.{ext}` = 历史行为，不动这个输入框的用户完全无感。
+            // 放在导出栏而不是性能页：它只影响「导出」这一件事，就地可改最顺手。
+            .child({
+                let tpl = self.state.config.ui.export_name_template.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .flex_shrink_0()
+                            .child("文件名模板"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(self.render_export_name_template_input(cx)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .flex_shrink_0()
+                            .child(if tpl.trim() == "{name}.{ext}" {
+                                "占位符：{name} {ext} {date}"
+                            } else {
+                                "例：{name}.{date}.{ext}"
+                            }),
+                    )
+            })
+            // 编辑日志：与「导出字幕」同一排，因为它导出的是**这次编辑过程的记录**，
+            // 属于「交付/留档」这一类动作。
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .flex_shrink_0()
+                            .child("编辑日志"),
+                    )
+                    .child(
+                        primitives::chip_clickable("CSV", false, false)
+                            .id("export-log-csv")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_edit_log(crate::subtitle::qc::QcFormat::Csv, cx);
+                            })),
+                    )
+                    .child(
+                        primitives::chip_clickable("Markdown", false, false)
+                            .id("export-log-md")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_edit_log(crate::subtitle::qc::QcFormat::Markdown, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child(format!("本次会话 {} 条改动", self.state.edit_log.len())),
+                    ),
+            )
             .child(
                 div()
                     .flex()
@@ -2128,6 +2758,303 @@ impl MainWindow {
                         })
                     }),
             )
+    }
+
+    /// 查找替换面板（展开时才有内容；收起时返回空元素）。
+    ///
+    /// 真正的替换逻辑在 `subtitle::edit::replace_all`（纯函数、13 条单测）；这里只
+    /// 负责输入、选项、执行与结果反馈。**不在这里拼任何字符串替换逻辑**——那正是
+    /// 此前每个调用点各写一遍、大小写与译文保护各不相同的来源。
+    ///
+    /// 为什么替换前要记一次撤销快照：替换动辄改几十句，用户点错了必须有路可退。
+    /// 走 `state.push_undo_snapshot()`（与所有编辑入口同一套），不另造机制。
+    fn render_replace_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::subtitle::edit::{replace_all, ReplaceOptions};
+        if !self.replace_panel_open {
+            return None;
+        }
+        let find = self.replace_find.clone();
+        let with = self.replace_with.clone();
+        let case_sensitive = self.replace_case_sensitive;
+        let include_translation = self.replace_include_translation;
+        let status = self.replace_status.clone();
+        let can_apply = !find.is_empty() && !self.state.segments.is_empty();
+
+        // 两个自绘输入框：与 `render_api_input` 同一套最小可用编辑集合
+        // （可打印字符 + 退格/方向/Home/End + Ctrl+A/C/V，见 `apply_line_edit`）。
+        // 抽成闭包是因为两个框除了「绑哪个缓冲、哪个焦点」以外完全一样。
+        let input = |id: &'static str,
+                     field: crate::ui::ReplaceField,
+                     value: &str,
+                     placeholder: &str,
+                     cx: &mut Context<Self>|
+         -> AnyElement {
+            use crate::ui::ReplaceField;
+            let focus = match field {
+                ReplaceField::Find => self.replace_find_focus.clone(),
+                ReplaceField::With => self.replace_with_focus.clone(),
+            };
+            let is_focused = self.focused_replace_field == Some(field);
+            let char_count = value.chars().count();
+            let cursor = self.replace_cursor.min(char_count);
+            let before: String = value.chars().take(cursor).collect();
+            let after: String = value.chars().skip(cursor).collect();
+            primitives::text_input(is_focused, 120.0)
+                .id(id)
+                .track_focus(&focus)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        window.focus(&focus);
+                        this.focused_replace_field = Some(field);
+                        this.replace_cursor = match field {
+                            ReplaceField::Find => this.replace_find.chars().count(),
+                            ReplaceField::With => this.replace_with.chars().count(),
+                        };
+                        cx.notify();
+                    }),
+                )
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.replace_panel_open = false;
+                        this.replace_status = None;
+                        cx.notify();
+                        return;
+                    }
+                    let buffer = match field {
+                        ReplaceField::Find => &mut this.replace_find,
+                        ReplaceField::With => &mut this.replace_with,
+                    };
+                    let cursor = &mut this.replace_cursor;
+                    if apply_line_edit(buffer, cursor, event, cx) {
+                        cx.notify();
+                    }
+                }))
+                .child(if is_focused {
+                    div()
+                        .flex()
+                        .items_center()
+                        .text_size(px(Theme::TEXT_SMALL))
+                        .text_color(Theme::text_primary())
+                        .child(before)
+                        .child(div().text_color(Theme::accent_blue()).child("▌"))
+                        .child(after)
+                        .into_any_element()
+                } else if char_count == 0 {
+                    div()
+                        .text_size(px(Theme::TEXT_SMALL))
+                        .text_color(Theme::text_muted())
+                        .truncate()
+                        .child(placeholder.to_string())
+                        .into_any_element()
+                } else {
+                    div()
+                        .text_size(px(Theme::TEXT_SMALL))
+                        .text_color(Theme::text_primary())
+                        .truncate()
+                        .child(value.to_string())
+                        .into_any_element()
+                })
+                .into_any_element()
+        };
+
+        let mut row = div()
+            .w_full()
+            .px(px(Theme::SPACE_3))
+            .py(px(Theme::SPACE_2))
+            .bg(Theme::bg_sidebar())
+            .border_b_1()
+            .border_color(Theme::border())
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .child("查找"),
+            )
+            .child(div().flex_1().min_w(px(120.0)).child(input(
+                "replace-find-input",
+                crate::ui::ReplaceField::Find,
+                &find,
+                "要查找的文字",
+                cx,
+            )))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .child("替换为"),
+            )
+            .child(div().flex_1().min_w(px(120.0)).child(input(
+                "replace-with-input",
+                crate::ui::ReplaceField::With,
+                &with,
+                "替换成（可留空＝删除）",
+                cx,
+            )));
+
+        // 两个勾选：大小写、译文。用 mini_btn 的选中态表达，不引入新控件族。
+        row = row
+            .child(
+                primitives::mini_btn(
+                    if case_sensitive {
+                        "✓ 区分大小写"
+                    } else {
+                        "区分大小写"
+                    },
+                    true,
+                )
+                .id("replace-toggle-case")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.replace_case_sensitive = !this.replace_case_sensitive;
+                    cx.notify();
+                })),
+            )
+            .child(
+                primitives::mini_btn(
+                    if include_translation {
+                        "✓ 含译文"
+                    } else {
+                        "含译文"
+                    },
+                    true,
+                )
+                .id("replace-toggle-translation")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.replace_include_translation = !this.replace_include_translation;
+                    cx.notify();
+                })),
+            )
+            .child(
+                primitives::mini_btn("全部替换", can_apply)
+                    .id("replace-apply")
+                    .when(can_apply, |d| {
+                        d.on_click(cx.listener(move |this, _, _, cx| {
+                            // 先记快照：替换可能一次改几十句，点错必须有路可退。
+                            this.state.snapshot_for_undo();
+                            let options = ReplaceOptions {
+                                case_sensitive: this.replace_case_sensitive,
+                                include_translation: this.replace_include_translation,
+                            };
+                            let report = replace_all(
+                                &mut this.state.segments,
+                                &this.replace_find,
+                                &this.replace_with,
+                                &options,
+                            );
+                            this.replace_status = Some(if report.is_empty() {
+                                (false, "没有找到匹配的内容".to_string())
+                            } else {
+                                let mut msg = format!(
+                                    "已替换 {} 处，涉及 {} 句",
+                                    report.total_hits(),
+                                    report.changed.len()
+                                );
+                                if report.translation_hits > 0 {
+                                    msg.push_str(&format!(
+                                        "（其中译文 {} 处）",
+                                        report.translation_hits
+                                    ));
+                                }
+                                (true, msg)
+                            });
+                            // 内容变了：字幕清单的过滤结果与质检缓存都要跟着重算。
+                            this.state.bump_segments_revision();
+                            this.subtitle_filter_key = None;
+                            cx.notify();
+                        }))
+                    }),
+            )
+            .child(
+                primitives::mini_btn("关闭", true)
+                    .id("replace-close")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.replace_panel_open = false;
+                        this.replace_status = None;
+                        cx.notify();
+                    })),
+            );
+
+        if let Some((ok, msg)) = status {
+            row = row.child(
+                div()
+                    .flex_basis(relative(1.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(if ok {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::accent_orange()
+                    })
+                    .child(msg),
+            );
+        }
+        Some(row.into_any_element())
+    }
+
+    /// 导出文件名模板输入框（走与 API 输入框同一套最小编辑集合）。
+    ///
+    /// 校验**故意宽松**：模板是自由文本，任何「看起来不对」的值都仍能导出（最差
+    /// 只是名字不合心意），为此弹红字只会打扰。真正的兜底在
+    /// `writer::export_file_name`：空模板回落默认、无占位符时补扩展名。
+    fn render_export_name_template_input(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let focus = self.export_template_focus.clone();
+        let is_focused = self.export_template_focused;
+        let value = self.state.config.ui.export_name_template.clone();
+        let char_count = value.chars().count();
+        let cursor = self.export_template_cursor.min(char_count);
+        let before: String = value.chars().take(cursor).collect();
+        let after: String = value.chars().skip(cursor).collect();
+        primitives::text_input(is_focused, 120.0)
+            .id("export-name-template-input")
+            .track_focus(&focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    window.focus(&focus);
+                    this.export_template_cursor =
+                        this.state.config.ui.export_name_template.chars().count();
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let buffer = &mut this.state.config.ui.export_name_template;
+                let cursor = &mut this.export_template_cursor;
+                if apply_line_edit(buffer, cursor, event, cx) {
+                    let _ = this.state.config.save_to_file("config.toml");
+                    cx.notify();
+                }
+            }))
+            .child(if is_focused {
+                div()
+                    .flex()
+                    .items_center()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_primary())
+                    .child(before)
+                    .child(div().text_color(Theme::accent_blue()).child("▌"))
+                    .child(after)
+                    .into_any_element()
+            } else if char_count == 0 {
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .truncate()
+                    .child("{name}.{ext}")
+                    .into_any_element()
+            } else {
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_primary())
+                    .truncate()
+                    .child(value)
+                    .into_any_element()
+            })
+            .into_any_element()
     }
 
     /// 字幕清单的搜索输入框。
@@ -2318,10 +3245,15 @@ impl MainWindow {
                         // 离线链路需要两件东西：Qwen 模型与 llama.cpp 推理程序。
                         // 缺哪个就点名哪个，避免用户点「开始翻译」后才收到错误；
                         // 两者均缺时先提模型（体积大、下载慢，先知道更有心理预期）。
+                        // 模型路径可能是用户自备的（性能设置里可浏览 / 粘贴），
+                        // 因此文案不能只说「未下载」——自备路径填错时同样会命中这里，
+                        // 说「未就位」并给出两条出路（去模型页下载 / 去性能设置核对路径）
+                        // 才覆盖得住。
                         let miss_model = !self.state.model_is_present("qwen-llm");
                         let miss_cli = !self.state.model_is_present("llama-cpp");
                         if miss_model {
-                            "未下载 Qwen 模型，请在「性能设置 → 模型与组件」下载".to_string()
+                            "本地模型未就位，请在「性能设置」核对路径或到「模型与组件」下载"
+                                .to_string()
                         } else if miss_cli {
                             "未下载 llama.cpp 推理程序，请在「性能设置 → 模型与组件」下载"
                                 .to_string()

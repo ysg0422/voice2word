@@ -674,6 +674,194 @@ fn configured_path_for(item: &DownloadItem, cfg: &Option<AppConfig>) -> Option<P
     raw.map(AppConfig::resolve_path)
 }
 
+/// 按 id 查条目。
+///
+/// # 为什么需要它
+///
+/// 界面在「下载完成」「删除文件」这类回调里拿到的往往是**字符串 id**
+/// （跨线程消息、事件参数只能带 `'static` 的简单值），但真正干活时需要完整的
+/// `DownloadItem`——落地路径、是不是压缩包、有没有伴生文件都写在里面。
+/// 没有这个查表函数，每个调用点都得自己写一遍 `ITEMS.iter().find(...)`；
+/// 一旦某处写成按 `label` 之类的近似匹配，就会「找错条目」而且极难排查。
+///
+/// 条目只有十来个，线性扫描足够快；返回 `&'static` 也让调用方不必 clone。
+pub fn item_by_id(id: &str) -> Option<&'static DownloadItem> {
+    ITEMS.iter().find(|i| i.id == id)
+}
+
+/// 人类可读的体积：`512 B` / `123 KB` / `1.2 MB` / `0.9 GB`。
+///
+/// # 为什么这么定
+///
+/// - **1 KB = 1024 B**：与磁盘容量、任务管理器口径一致，用户对得上。
+/// - **保留一位小数，并抹掉末尾的 `.0`**：所以是 `123 KB` 而不是
+///   `123.0 KB`。界面上的体积是给用户扫一眼判断「要不要下」用的，
+///   多一个 `.0` 只是噪声，还显得像是没处理过。
+/// - **不足 1 KB 时按整数字节显示**（`512 B`）：字节级的小数没有意义。
+///
+/// # 单一实现
+///
+/// `src/ui/components/model_manager.rs` 里曾有一份私有同名副本
+/// （显示成 `141 MB` / `885 KB`）。两份一旦分叉——比如一处四舍五入、
+/// 一处截断——同一个文件在「下载进度」和「条目体积」两处会显示成不同的数，
+/// 用户会以为下载出错了。这里是**唯一实现**，那份私有副本应改为调用本函数。
+pub fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    let (value, unit) = if b >= GB {
+        (b / GB, "GB")
+    } else if b >= MB {
+        (b / MB, "MB")
+    } else if b >= KB {
+        (b / KB, "KB")
+    } else {
+        // 不足 1 KB：直接按整数字节，不显示小数。
+        return format!("{bytes} B");
+    };
+    // 先按一位小数格式化，再抹掉末尾的 `.0`（`123.0` → `123`）。
+    let text = format!("{value:.1}");
+    let text = text.strip_suffix(".0").unwrap_or(text.as_str());
+    format!("{text} {unit}")
+}
+
+/// 磁盘上某个路径的字节数；文件不存在或读不到元数据时返回 `None`。
+///
+/// # 为什么返回 `Option` 而不是 `0`
+///
+/// `0` 是**合法**的文件大小（空文件）。若用 `0` 兼表「读不到」，
+/// 界面就只能显示 `0 B`，用户无法区分「这文件是空的」和「这文件不见了」——
+/// 而这两种情况的处置完全不同（前者是坏文件、后者是路径配错）。
+/// 显式的 `None` 让调用方自己决定显示 `—` 还是别的。
+pub fn disk_size(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// 由磁盘上的**实际文件**反查它属于哪个条目；都不匹配则 `None`。
+///
+/// # 为什么需要「反查」而不是直接用档位的规范 id
+///
+/// 档位存在**档位内量化回退**：`TurboSpeed` 首选 q5，q5 不在时会实际加载 q8；
+/// `Balanced` 首选 small-q5_0，不在时实际加载 `ggml-small.bin`。界面上的「已就位」
+/// 若按规范 id（q5）判定，就会出现「明明 q8 在、跑得起来，却显示未下载」；
+/// 而删除按钮若仍按规范 id 找文件，又会变成「显示已就位、点删除却说没有文件」。
+///
+/// 用实际命中的文件反查条目 id，就同时解决了这两处错位：删除删的正是引擎在用的那个，
+/// 且 `ggml-small.bin` 这类**没有条目**的回退文件会得到 `None`——界面据此不渲染
+/// 删除按钮（它不在可下载清单里，本就不该由我们代删）。
+pub fn item_id_for_path(path: &Path) -> Option<&'static str> {
+    ITEMS
+        .iter()
+        .find(|i| AppConfig::resolve_path(i.dest) == path)
+        .map(|i| i.id)
+}
+
+/// 条目当前**生效**的落地路径（界面显示 / 资源管理器定位 / 统计占用用）。
+///
+/// 与存在性判定和 [`delete_item_file`] **同源**（都先问「配置指向哪」、再退到
+/// 默认 `dest`），但**不要求文件存在**——恰恰相反，它的价值就在文件不存在时：
+/// 「定位」按钮要能告诉用户「这个组件本该在哪个目录」，磁盘统计也要能对不存在的
+/// 文件返回 0 而不是漏掉一条。
+///
+/// 为什么不让调用方自己拼：界面里若各自写一遍「配置优先、默认兜底」，一旦与
+/// `configured_path_for` 的规则（尤其是 whisper 档位那条「只认配置指向的档位」）
+/// 分叉，就会出现「定位到 A、删除却删 B」的错位。
+pub fn item_effective_path(item: &DownloadItem, cfg: &AppConfig) -> PathBuf {
+    configured_path_for(item, &Some(cfg.clone()))
+        .unwrap_or_else(|| AppConfig::resolve_path(item.dest))
+}
+
+/// 删除某个组件已经下载的文件，成功时返回被删掉的路径。
+///
+/// # 安全契约（改动前务必逐条读完）
+///
+/// 这是本模块**唯一**会删用户磁盘文件的入口，所以边界收得极死：
+///
+/// - **只删一个普通文件**。解析出的路径若不是常规文件（例如是目录），
+///   直接报错返回——本函数**绝不**调用 `remove_dir_all`、**绝不**递归。
+/// - **压缩包类组件（`is_archive`）拒绝删除**。whisper-cli / llama-cpp 下载的
+///   是 zip，解压后入口 exe 只有几 KB，真正的代码在同目录 DLL 里；而 llama.cpp
+///   更是直接解压到 `tools/` **本身**。单独删「那个文件」要么留下一个残缺的
+///   半包（exe 在、DLL 没了），要么波及共享的 tools 目录。这类组件只能由用户
+///   手动整体移除，这里给出目录路径让他知道该删哪儿。
+/// - **拒绝删除用户自编译的构建**。命中 `looks_like_custom_build` 或
+///   `is_gpu_build` 的产物（例如手编的 Vulkan 版 whisper-cli）是用户的心血，
+///   误删后要重新编译，代价极高。
+/// - **路径解析与「是否已就位」判定完全同源**：两处都走
+///   `resolve_existing_path`，因此界面显示「已就位」的那个文件，正是这里
+///   会删的那个文件——不会出现「界面说有、却删到别处」或
+///   「删了但界面还标着已就位」的错位。
+///
+/// 返回 `Ok(None)` 表示「本来就没有可删的东西」：这是幂等的，
+/// 用户连点两次「删除」不会因为第二次找不到文件而报错。
+pub fn delete_item_file(item_id: &str, cfg: &AppConfig) -> Result<Option<PathBuf>> {
+    let item = item_by_id(item_id).ok_or_else(|| anyhow!("未知的组件 id: {item_id}"))?;
+
+    // 压缩包类：入口只是启动桩，删单文件必然留下坏包；llama.cpp 的解压目录
+    // 就是 tools/ 本身，更不能碰。让用户手动整体删除。
+    if item.is_archive {
+        let entry = AppConfig::resolve_path(item.dest);
+        let dir = entry.parent().unwrap_or(entry.as_path());
+        bail!(
+            "{}（{}）是自包含/压缩包组件：入口文件只是几 KB 的启动桩，\
+             真正的程序在同目录的 DLL 里，单独删一个文件会留下残缺的半包。\
+             请手动删除整个目录后再刷新：{}",
+            item.label,
+            item.id,
+            dir.display()
+        );
+    }
+
+    // 与「是否已就位」用同一套解析逻辑，保证删的就是界面报告存在的那个文件。
+    let cfg_opt = Some(cfg.clone());
+    let Some(path) = resolve_existing_path(item, &cfg_opt) else {
+        return Ok(None);
+    };
+
+    if !path.is_file() {
+        bail!(
+            "{} 的路径不是常规文件（可能是目录），已中止删除：{}",
+            item.label,
+            path.display()
+        );
+    }
+
+    // 用户自编译的构建不能删。先看 looks_like_custom_build（它已覆盖
+    // 「带伴生文件的条目 + GPU 后端 DLL」这一路），再看 is_gpu_build
+    // （覆盖没有伴生文件的条目）。
+    if looks_like_custom_build(item, &path) || is_gpu_build(&path) {
+        bail!(
+            "{} 看起来是你自己编译（自编译）的构建——自包含单文件或带 GPU 后端。\
+             为避免误删你手编的产物，这里不会删除它。若确实要删，请手动处理：{}",
+            item.label,
+            path.display()
+        );
+    }
+
+    fs::remove_file(&path).with_context(|| format!("删除文件失败: {}", path.display()))?;
+    info!(item = item.id, path = %path.display(), "已删除组件文件");
+    Ok(Some(path))
+}
+
+/// 该条目是否应该显示「删除」按钮。
+///
+/// # 为什么要有这个纯谓词
+///
+/// 界面用它做**显示层**的门禁：只有返回 `true` 的条目才渲染删除按钮。
+/// 这样就从根上保证了「按钮存在」与 `delete_item_file` 会成功不会分叉——
+/// 否则用户会点到一个必然报错的按钮（例如压缩包组件），
+/// 或者更糟：点到本该被保护、不该删的东西。
+///
+/// 未知 id 返回 `false`：界面拿到的可能是过期的 id（条目已改名/下线），
+/// 此时宁可不出按钮，也不要渲染一个点了就报错的按钮。
+pub fn item_is_deletable(id: &str) -> bool {
+    match item_by_id(id) {
+        Some(item) => !item.is_archive,
+        None => false,
+    }
+}
+
 /// 缺少的**必需**条目数（用于启动提示与界面告警）。
 pub fn missing_required_count() -> usize {
     let ctx = PresenceContext::load();
@@ -1473,6 +1661,205 @@ mod tests {
         assert!(
             is_present_with(item, &Some(cfg)),
             "配置指向自构建时，不应要求同目录必有伴生文件"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `human_size` 的边界：不足 1KB 按字节、1KB 起步、一位小数、抹掉末尾 `.0`。
+    ///
+    /// 锁这条规则是因为界面靠它给用户「值不值得下」的第一印象：
+    /// `123.0 KB` 这种尾部 `.0` 会让用户以为数字没处理干净。
+    ///
+    /// 注意示例值 `0.9 GB`：在「1 KB = 1024 B」且**按 1024^k 选档**的规则下，
+    /// 0.9 GB（966_367_641 B）严格小于 1 GB 门槛，因此必然显示为 `921.6 MB`
+    /// ——只有 ≥ 1 GB 才会进入 GB 档。这里把这个边界显式钉住，避免以后有人
+    /// 想当然地改成「0.9 GB」而对不上真实数值。
+    #[test]
+    fn human_size_boundaries() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        // 恰好 1 KB：抹掉 `.0` → `1 KB`
+        assert_eq!(human_size(1024), "1 KB");
+        // 123 KB（原始值 123.0）→ 同样抹掉 `.0`
+        assert_eq!(human_size(123 * 1024), "123 KB");
+        // 1.5 MB：保留一位小数
+        assert_eq!(human_size(1024 * 1024 * 3 / 2), "1.5 MB");
+        // 跨单位后仍是一位小数
+        assert_eq!(human_size(1024 * 1024 * 10 + 1024 * 512), "10.5 MB");
+        // 0.9 GB 示例值（966_367_641 B）低于 1 GB 门槛 → 按 1024 进制落在 MB 档
+        assert_eq!(human_size(966_367_641), "921.6 MB");
+        // GB 档：同样只保留一位小数，并按规则抹掉末尾 `.0`
+        assert_eq!(human_size(1024 * 1024 * 1024), "1 GB");
+        assert_eq!(human_size(1024 * 1024 * 1024 * 5 / 2), "2.5 GB");
+    }
+    /// `item_by_id` 能找到已知条目，且对未知 id 返回 `None`（不能 panic）。
+    #[test]
+    fn item_by_id_finds_known_and_rejects_bogus() {
+        let small = item_by_id("whisper-small").expect("应能找到 whisper-small");
+        assert_eq!(small.id, "whisper-small");
+        assert_eq!(small.dest, "models/whisper/ggml-small-q5_0.bin");
+
+        assert!(item_by_id("no-such-item").is_none());
+        assert!(item_by_id("").is_none());
+    }
+
+    /// `item_is_deletable` 是界面删除按钮的显示门禁：
+    /// 压缩包条目与未知 id 一律 `false`，其余普通文件条目 `true`。
+    /// `item_id_for_path` 必须把「默认落地路径」映射回它所属的条目 id，
+    /// 且对清单外的路径（例如 `ggml-small.bin` 这类没有条目的回退文件）返回 `None`。
+    ///
+    /// 这条锁住档位下拉里的删除接线：删除按**实际文件**反查条目，反查不到就不给
+    /// 删除按钮——若映射写错，会出现「显示已就位、点删除说没文件」或更糟的删错东西。
+    #[test]
+    fn item_id_for_path_maps_default_dests_and_rejects_others() {
+        for item in ITEMS {
+            let dest = AppConfig::resolve_path(item.dest);
+            assert_eq!(
+                item_id_for_path(&dest),
+                Some(item.id),
+                "{} 的默认落地路径应反查回自身",
+                item.id
+            );
+        }
+        // 清单外的文件（档位回退文件 / 用户自备模型）必须反查不到
+        let outside = AppConfig::resolve_path("models/whisper/ggml-small.bin");
+        assert_eq!(item_id_for_path(&outside), None);
+        let bogus = AppConfig::resolve_path("models/whisper/definitely-not-a-model.bin");
+        assert_eq!(item_id_for_path(&bogus), None);
+    }
+
+    #[test]
+    fn item_is_deletable_rules() {
+        // 压缩包组件（解压出来的半包/共享目录）不给删除按钮
+        assert!(!item_is_deletable("whisper-cli"));
+        assert!(!item_is_deletable("llama-cpp"));
+        // 未知 id（条目改名/下线后的过期值）也不给按钮
+        assert!(!item_is_deletable("no-such-id"));
+        // 普通文件条目可以删
+        assert!(item_is_deletable("whisper-small"));
+        assert!(item_is_deletable("qwen-llm"));
+        assert!(item_is_deletable("ffmpeg"));
+    }
+
+    /// 配置把组件指到临时目录里的真实文件时，删除应删掉**那个**文件并返回其路径。
+    #[test]
+    fn delete_item_file_removes_configured_file() {
+        let dir = std::env::temp_dir().join(format!("v2w_del_ok_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let file = dir.join("my-ffmpeg.exe");
+        fs::write(&file, vec![0u8; 4096]).unwrap();
+
+        let mut cfg = AppConfig::default();
+        // 绝对路径会被 `resolve_path` 原样保留，且 `resolve_existing_path`
+        // 优先取配置路径 —— 正好避免碰仓库树里的任何文件。
+        cfg.paths.ffmpeg = file.to_string_lossy().to_string();
+
+        let deleted = delete_item_file("ffmpeg", &cfg).expect("应能删除配置指向的文件");
+        assert_eq!(deleted.as_deref(), Some(file.as_path()));
+        assert!(!file.exists(), "配置指向的文件应已被删除");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 路径下什么都没有时删除是幂等的空操作：`Ok(None)`，不报错。
+    #[test]
+    fn delete_item_file_missing_returns_none() {
+        let dir = std::env::temp_dir().join(format!("v2w_del_missing_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut cfg = AppConfig::default();
+        // 指向一个不存在的文件；ffmpeg 的默认 dest（tools/ffmpeg.exe）在本仓库也不存在，
+        // 因此 `resolve_existing_path` 必然返回 None。
+        cfg.paths.ffmpeg = dir.join("not-there.exe").to_string_lossy().to_string();
+
+        let item = item_by_id("ffmpeg").unwrap();
+        assert!(
+            resolve_existing_path(item, &Some(cfg.clone())).is_none(),
+            "前置条件：配置与默认路径都不存在"
+        );
+        assert_eq!(delete_item_file("ffmpeg", &cfg).unwrap(), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 压缩包条目（llama-cpp / whisper-cli）必须拒绝删除，并提示手动移除整个目录。
+    ///
+    /// 它们解压后入口 exe 只有几 KB，真正代码在同目录 DLL 里；llama.cpp 更是
+    /// 直接解压到 `tools/` 本身。删单个文件只会留下坏掉的半包或波及共享目录。
+    #[test]
+    fn delete_item_file_refuses_archive() {
+        let cfg = AppConfig::default();
+        let err = delete_item_file("llama-cpp", &cfg).expect_err("压缩包条目必须拒绝删除");
+        let msg = err.to_string();
+        assert!(msg.contains("手动"), "错误信息应提示手动删除，实际: {msg}");
+        assert!(
+            msg.contains("tools"),
+            "错误信息应点出需要手动清理的目录，实际: {msg}"
+        );
+    }
+
+    /// 未知 id 必须报错，且错误里带上这个 id，方便定位是哪个界面键过期了。
+    #[test]
+    fn delete_item_file_rejects_unknown_id() {
+        let cfg = AppConfig::default();
+        let err = delete_item_file("definitely-not-an-item", &cfg).expect_err("未知 id 必须报错");
+        assert!(err.to_string().contains("definitely-not-an-item"));
+    }
+
+    /// 用户自编译的构建不能删。
+    ///
+    /// 走 `delete_item_file` 能到达「自编译保护」的新只有**非压缩包**条目，
+    /// 因此这里用 ffmpeg + 同目录 `ggml-vulkan.dll` 构造「用户手编的 GPU 构建」
+    /// 形态，命中 `is_gpu_build`。同时直接验证同源判据
+    /// `looks_like_custom_build`（带伴生文件的大单文件）——压缩包条目会更早被拒，
+    /// 所以用合成条目锁住这条谓词本身。
+    #[test]
+    fn delete_item_file_refuses_custom_build() {
+        let dir = std::env::temp_dir().join(format!("v2w_del_custom_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let exe = dir.join("ffmpeg.exe");
+        // >= 2 MB 的大单文件 + 官方 CPU 包从不提供的 GPU 后端 DLL。
+        fs::write(&exe, vec![0u8; 3_000_000]).unwrap();
+        fs::write(dir.join("ggml-vulkan.dll"), vec![0u8; 1024]).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.paths.ffmpeg = exe.to_string_lossy().to_string();
+
+        let err = delete_item_file("ffmpeg", &cfg).expect_err("自编译 GPU 构建必须拒绝删除");
+        assert!(
+            err.to_string().contains("编译"),
+            "错误信息应说明这是自编译构建: {err}"
+        );
+        assert!(exe.exists(), "自编译构建绝不能被删掉");
+        assert!(
+            dir.join("ggml-vulkan.dll").exists(),
+            "同目录的 GPU 后端 DLL 也不能被波及"
+        );
+
+        // 同源判据：带伴生文件 + >= 2 MB 单文件（同目录没有随附 DLL）
+        // 也必须判为自编译构建 —— delete_item_file 正是用它来做门禁。
+        let companion_item = DownloadItem {
+            id: "synthetic-companion",
+            label: "t",
+            note: "n",
+            dest: leak_str(exe.to_str().unwrap().to_string()),
+            urls: &["https://example.invalid/x"],
+            size: 4_000_000,
+            min_size: 0,
+            required: false,
+            group: ItemGroup::Binary,
+            is_archive: false,
+            companion: Some("whisper.dll"),
+        };
+        assert!(
+            looks_like_custom_build(&companion_item, &exe),
+            "带伴生文件的条目 + 大单文件应判为自编译构建"
         );
 
         let _ = fs::remove_dir_all(&dir);

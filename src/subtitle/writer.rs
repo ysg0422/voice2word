@@ -537,6 +537,45 @@ pub fn export_spec_for(fmt: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// 按命名模板拼导出文件名（不含目录）。
+///
+/// # 为什么要有模板
+///
+/// 导出的默认文件名一直是「工程名 + 扩展名」，而实际工作里同一部片子往往要同时交付
+/// 多份（`xx.srt` 给剪辑、`xx.en.srt` 给外语同事、`xx.20261009.srt` 归档）。此前只能
+/// 导出后手工改名，而且**六个导出入口各自拼了一遍 `format!("{stem}.{ext}")`**——
+/// 想加个日期后缀就得改六处，漏一处就出现「同一个按钮导出的名字规则不一样」。
+/// 收成一个纯函数 + 一个模板配置项后，规则只有一处。
+///
+/// # 占位符
+///
+/// - `{name}`：工程名（已剥掉原扩展名）
+/// - `{ext}`：目标扩展名（不含点）
+/// - `{date}`：当天日期 `YYYYMMDD`
+///
+/// 未识别的 `{...}` 原样保留（用户写错了看得见，而不是被悄悄吃掉）；
+/// 模板为空串时回落 `{name}.{ext}`。**模板里若一个占位符都没有**，则把结果当作
+/// 文件名主体再补 `.{ext}`——否则用户填「字幕」会导出没有扩展名的文件，
+/// 系统认不出格式、双击打不开。
+///
+/// 为什么 `{date}` 由调用方传入而不是这里取 `chrono::Local::now()`：纯函数才能单测
+/// （否则测出来的名字每天都不一样，测试只能写成「包含今天的日期」，等于没测）。
+pub fn export_file_name(template: &str, name: &str, ext: &str, date: &str) -> String {
+    let tpl = template.trim();
+    if tpl.is_empty() {
+        return format!("{name}.{ext}");
+    }
+    let has_placeholder = tpl.contains("{name}") || tpl.contains("{ext}") || tpl.contains("{date}");
+    let mut out = tpl
+        .replace("{name}", name)
+        .replace("{ext}", ext)
+        .replace("{date}", date);
+    if !has_placeholder {
+        out = format!("{out}.{ext}");
+    }
+    out
+}
+
 /// SRT 文本转义：`&` → `&amp;`、`<` → `&lt;`、`>` → `&gt;`。
 ///
 /// 为什么要转义：SRT 规范本身没有标记语法，但主流播放器（VLC / PotPlayer / mpv /
@@ -1641,5 +1680,45 @@ mod tests {
         assert!(leftovers.is_empty(), "不应残留临时文件: {leftovers:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 导出文件名模板：占位符替换、空模板回落、无占位符补扩展名、未知占位符原样保留。
+    ///
+    /// 这条锁住「六个导出入口共用同一套命名规则」：此前每个入口各写一遍
+    /// `format!("{stem}.{ext}")`，想加个日期后缀得改六处，漏一处就出现「同一个
+    /// 按钮导出的名字规则不一样」。
+    #[test]
+    fn export_file_name_renders_placeholders_and_falls_back() {
+        // 默认模板 = 历史行为，老用户感知不到新功能
+        assert_eq!(
+            super::export_file_name("{name}.{ext}", "课程01", "srt", "20261009"),
+            "课程01.srt"
+        );
+        // 三个占位符都能用，且可重复
+        assert_eq!(
+            super::export_file_name("{name}.{date}.{ext}", "课程01", "srt", "20261009"),
+            "课程01.20261009.srt"
+        );
+        assert_eq!(
+            super::export_file_name("{name}-{name}.{ext}", "a", "vtt", "20261009"),
+            "a-a.vtt"
+        );
+        // 空 / 全空白模板 → 回落默认
+        assert_eq!(super::export_file_name("", "n", "ass", "20261009"), "n.ass");
+        assert_eq!(
+            super::export_file_name("   ", "n", "ass", "20261009"),
+            "n.ass"
+        );
+        // 没有占位符：把模板当文件名主体，补上扩展名——否则导出无扩展名文件，
+        // 系统认不出格式、双击打不开
+        assert_eq!(
+            super::export_file_name("字幕", "n", "srt", "20261009"),
+            "字幕.srt"
+        );
+        // 未知占位符原样保留：用户写错了看得见，而不是被悄悄吃掉
+        assert_eq!(
+            super::export_file_name("{name}-{lang}.{ext}", "n", "srt", "20261009"),
+            "n-{lang}.srt"
+        );
     }
 }

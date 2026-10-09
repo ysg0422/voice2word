@@ -343,6 +343,86 @@ impl QualityReport {
     }
 }
 
+/// 质检问题的分类。与 `QualityReport` 的四个 `Vec<usize>` 一一对应。
+///
+/// 用枚举而不是让调用方自己挑 `report.low_confidence` / `report.glossary_violations`…：
+/// 界面上的「按类翻查」需要把「选中的是哪一类」存进 `MainWindow` 状态
+/// （闭包不能进状态，枚举可以），并且需要一个统一的「这一类有哪些句、下一句是谁」入口，
+/// 否则四种分类会在 UI 层各写一份导航逻辑，边界行为必然分叉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityCategory {
+    LowConfidence,
+    GlossaryViolation,
+    Untranslated,
+    EmptyOrShort,
+}
+
+impl QualityCategory {
+    /// 全部四类，顺序与界面上的展示顺序一致（低置信 → 术语 → 未翻译 → 碎片句）。
+    pub const ALL: [QualityCategory; 4] = [
+        QualityCategory::LowConfidence,
+        QualityCategory::GlossaryViolation,
+        QualityCategory::Untranslated,
+        QualityCategory::EmptyOrShort,
+    ];
+
+    /// 该类的句序号列表（升序；同一句在同一类里只出现一次）。
+    ///
+    /// 各 bucket 本身按 `segments` 的顺序 push，而 `segments` 本就按时间升序，
+    /// 所以这里**不重新排序**，只做去重保护——重排会让「列表顺序」与「字幕顺序」
+    /// 出现两个真相，用户按「下一处」跳的时候会觉得跳来跳去。
+    pub fn indices(self, report: &QualityReport) -> Vec<usize> {
+        let bucket: &[usize] = match self {
+            QualityCategory::LowConfidence => &report.low_confidence,
+            QualityCategory::GlossaryViolation => &report.glossary_violations,
+            QualityCategory::Untranslated => &report.untranslated,
+            QualityCategory::EmptyOrShort => &report.empty_or_short,
+        };
+        let mut out: Vec<usize> = Vec::with_capacity(bucket.len());
+        for &idx in bucket {
+            if !out.contains(&idx) {
+                out.push(idx);
+            }
+        }
+        out
+    }
+
+    /// 界面用的中文短名（与转写页质检卡片的胶囊文案同源，避免两处各写一份）
+    pub fn label(self) -> &'static str {
+        match self {
+            QualityCategory::LowConfidence => "低置信",
+            QualityCategory::GlossaryViolation => "术语违规",
+            QualityCategory::Untranslated => "未翻译",
+            QualityCategory::EmptyOrShort => "空/超短句",
+        }
+    }
+}
+
+/// 在某一类质检问题里找「当前句之后的下一处」；越过末尾则回卷到第一处。
+///
+/// - `current = None` → 返回该类第一处；
+/// - 该类为空 → `None`；
+/// - `current` 本身就是最后一处 → 回卷到第一处（与 `MainWindow` 的
+///   `quality_next_issue` 对「全部问题」的既有语义一致，用户可以循环翻查）。
+///
+/// 抽成纯函数是为了可单测：这几个边界（空类、无当前、越过末尾回卷）在界面里
+/// 各写一遍必然漏一两个，而它们恰恰是用户最容易碰到的（一路点到最后一处）。
+pub fn next_issue_in(current: Option<usize>, indices: &[usize]) -> Option<usize> {
+    // 列表约定升序，直接取第一个严格大于当前句的即可；current 为 None 时
+    // 视作「-∞」，于是返回第一处。current 本身也是问题时会被 `>` 跳过——
+    // 这正是「下一处」该有的行为，不能写 `>=` 否则会原地打转。
+    let probe = match current {
+        Some(i) => i,
+        // 没有当前句：从该类第一处起步；空类自然返回 None。
+        None => return indices.first().copied(),
+    };
+    if let Some(&next) = indices.iter().find(|&&i| i > probe) {
+        return Some(next);
+    }
+    // 越界（当前句在最后一处或之后）：回卷到第一处；空类自然返回 None。
+    indices.first().copied()
+}
+
 /// 对一批字幕跑一次质检，产出可单测的纯报告（不碰界面、不碰 IO、不做任何修改）。
 ///
 /// - `confidence_threshold`：`avg_logprob` 下限，**严格小于**才判低置信；
@@ -1621,5 +1701,109 @@ mod tests {
 
         let empty = quality_report(&segs, &[], DEFAULT_LOW_CONFIDENCE_THRESHOLD, false);
         assert!(empty.glossary_violations.is_empty(), "空术语表不产生违规");
+    }
+
+    // ==================== 按类翻查 (质检导航) ====================
+
+    /// 四类各自只认自己的 bucket：低置信 / 术语 / 未翻译 / 超短句互不串味。
+    #[test]
+    fn quality_category_indices_map_to_matching_bucket() {
+        // 1/2/4 都给上译文，好让「未翻译」只剩 3 号一句，四类各自独立可断言。
+        let mut low = Segment::new(1, 0.0, 1.0, "低置信的一句");
+        low.confidence = Some(-1.0);
+        low.translation = Some("低置信的译文".to_string());
+        let mut term = Segment::new(2, 1.0, 2.0, "GPT 是核心");
+        term.translation = Some("GPT is the core.".to_string());
+        let untranslated = Segment::new(3, 2.0, 3.0, "有原文没译文");
+        let mut short = Segment::new(4, 3.0, 4.0, "嗯");
+        short.translation = Some("嗯".to_string());
+        let entries = vec![("GPT".to_string(), "生成式预训练模型".to_string())];
+
+        let r = quality_report(
+            &[low, term, untranslated, short],
+            &entries,
+            DEFAULT_LOW_CONFIDENCE_THRESHOLD,
+            true,
+        );
+        assert_eq!(QualityCategory::LowConfidence.indices(&r), vec![1]);
+        assert_eq!(QualityCategory::GlossaryViolation.indices(&r), vec![2]);
+        assert_eq!(QualityCategory::Untranslated.indices(&r), vec![3]);
+        assert_eq!(QualityCategory::EmptyOrShort.indices(&r), vec![4]);
+    }
+
+    /// 同一类里多句时保持升序（与字幕顺序一致），并且同句重复只保留一次。
+    #[test]
+    fn quality_category_indices_are_ascending_and_deduped() {
+        let mut a = Segment::new(3, 0.0, 1.0, "低置信甲");
+        a.confidence = Some(-2.0);
+        let mut b = Segment::new(7, 1.0, 2.0, "低置信乙");
+        b.confidence = Some(-2.0);
+        let mut c = Segment::new(7, 2.0, 3.0, "低置信丙");
+        c.confidence = Some(-2.0);
+        let r = quality_report(&[a, b, c], &[], -0.35, false);
+        assert_eq!(r.low_confidence, vec![3, 7, 7], "bucket 原样保留重复");
+        assert_eq!(
+            QualityCategory::LowConfidence.indices(&r),
+            vec![3, 7],
+            "取句列表时去重，顺序不动"
+        );
+    }
+
+    /// 空报告：四类都取不到任何句，`indices` 全空。
+    #[test]
+    fn quality_category_indices_empty_for_empty_report() {
+        let r = quality_report(&[], &[], DEFAULT_LOW_CONFIDENCE_THRESHOLD, true);
+        for cat in QualityCategory::ALL {
+            assert!(cat.indices(&r).is_empty(), "{:?} 不该有句", cat);
+        }
+    }
+
+    /// 没有当前句时，「下一处」落在该类第一处。
+    #[test]
+    fn next_issue_in_none_returns_first() {
+        assert_eq!(next_issue_in(None, &[3, 7, 9]), Some(3));
+    }
+
+    /// 当前句本身就是问题句：要**跳过**它而不是再返回一次（否则按一下不动）。
+    #[test]
+    fn next_issue_in_skips_current_issue() {
+        assert_eq!(next_issue_in(Some(3), &[3, 7, 9]), Some(7));
+    }
+
+    /// 当前句落在两个问题句之间：取后面最近的一个。
+    #[test]
+    fn next_issue_in_between_issues_returns_next() {
+        assert_eq!(next_issue_in(Some(8), &[3, 7, 9]), Some(9));
+    }
+
+    /// 已经在最后一处：回卷到第一处，循环翻查。
+    #[test]
+    fn next_issue_in_wraps_at_end() {
+        assert_eq!(next_issue_in(Some(9), &[3, 7, 9]), Some(3));
+    }
+
+    /// 空分类：无论当前句是什么都没有「下一处」。
+    #[test]
+    fn next_issue_in_empty_slice_is_none() {
+        assert_eq!(next_issue_in(Some(5), &[]), None);
+        assert_eq!(next_issue_in(None, &[]), None);
+    }
+
+    /// 展示顺序与胶囊文案：顺序固定为 低置信 → 术语 → 未翻译 → 碎片句。
+    #[test]
+    fn quality_category_all_order_and_labels() {
+        assert_eq!(
+            QualityCategory::ALL,
+            [
+                QualityCategory::LowConfidence,
+                QualityCategory::GlossaryViolation,
+                QualityCategory::Untranslated,
+                QualityCategory::EmptyOrShort,
+            ]
+        );
+        assert_eq!(QualityCategory::LowConfidence.label(), "低置信");
+        assert_eq!(QualityCategory::GlossaryViolation.label(), "术语违规");
+        assert_eq!(QualityCategory::Untranslated.label(), "未翻译");
+        assert_eq!(QualityCategory::EmptyOrShort.label(), "空/超短句");
     }
 }

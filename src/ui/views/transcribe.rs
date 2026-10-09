@@ -9,7 +9,7 @@ use super::super::types::{ConfirmAction, ConfirmDialogInfo};
 use super::super::MainWindow;
 use crate::app::state::{ProcessStatus, QueueState, WorkspaceTab};
 // 质检报告是 `segment.rs` 里的纯逻辑：这里只把结果画出来，不在界面层重算判据。
-use crate::subtitle::segment::{quality_report, QualityReport};
+use crate::subtitle::segment::{quality_report, QualityCategory, QualityReport};
 use crate::subtitle::Segment;
 use crate::utils::time::format_duration_short;
 
@@ -750,6 +750,25 @@ impl MainWindow {
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.choose_batch_files(cx);
                                                 })),
+                                        )
+                                        .child(
+                                            // 目录递归导入：一门课的素材通常按文件夹组织，
+                                            // 让用户逐个文件选既费手又容易漏。
+                                            primitives::btn_clickable("导入整个文件夹", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
+                                                .id("idle-batch-folder-btn")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.choose_batch_folder(cx);
+                                                })),
+                                        )
+                                        .child(
+                                            // 已有字幕直接导入：跳过转写，接着编辑 / 导出。
+                                            // 排在这里是因为它的使用频率低于前三个，但
+                                            // 在「同事给了我一版字幕」这种场景里是唯一入口。
+                                            primitives::btn_clickable("导入已有字幕", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
+                                                .id("idle-import-subtitle-btn")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.import_subtitle_file(cx);
+                                                })),
                                         ),
                                 ),
                         )
@@ -786,14 +805,26 @@ impl MainWindow {
 
     /// 「下一处」的落点：当前选中句之后的第一处待复核；已是最后一处则回卷到第一处。
     /// 一处待复核都没有时返回 `None`（`jump_to_quality_issue` 会安全忽略）。
-    fn quality_next_issue(&mut self) -> Option<usize> {
+    ///
+    /// `category` 为 `None` 时跨全部四类翻查（原有的「下一处」语义）；
+    /// 为 `Some(cat)` 时**只在该类内**推进——用户往往只在意某一类问题
+    /// （例如只盯低置信句），跨类跳会把他引到不关心的行上。
+    ///
+    /// 边界（空类、当前句本身是问题、越过末尾回卷）全部交给纯函数
+    /// [`crate::subtitle::segment::next_issue_in`]，界面层不重复实现一遍。
+    fn quality_next_issue_in(&mut self, category: Option<QualityCategory>) -> Option<usize> {
         let report = self.quality_report_snapshot()?;
-        let all = report.all_issues();
-        let after_current = self
-            .state
-            .selected_segment_index
-            .and_then(|cur| all.iter().copied().find(|&idx| idx > cur));
-        after_current.or_else(|| all.first().copied())
+        let current = self.state.selected_segment_index;
+        match category {
+            Some(cat) => {
+                let indices = cat.indices(&report);
+                crate::subtitle::segment::next_issue_in(current, &indices)
+            }
+            None => {
+                let all = report.all_issues();
+                crate::subtitle::segment::next_issue_in(current, &all)
+            }
+        }
     }
 
     /// 一键定位：切回剪辑台 + 选中目标句 + 让字幕清单重新跟随滚动。
@@ -932,6 +963,30 @@ impl MainWindow {
             format!("置信度已评估 {scored} 句 · {missing} 句缺该项数据")
         };
 
+        // 按类翻查：用户往往只关心某一类问题（例如只盯低置信句）。给每一类一个
+        // 「只看这类」按钮，点一下就从当前句开始在这类内部往前推。空类不生成按钮——
+        // 点了也只会原地不动，不如藏掉。按钮文案用 `QualityCategory::label()`，
+        // 与上面的胶囊同源，不会出现「胶囊叫空/超短句、按钮叫碎片句」这种不一致。
+        let category_jump_buttons: Vec<AnyElement> = QualityCategory::ALL
+            .iter()
+            .filter(|cat| !cat.indices(&report).is_empty())
+            .map(|cat| {
+                let cat = *cat;
+                primitives::btn(
+                    format!("只看{}", cat.label()),
+                    primitives::BtnSize::Sm,
+                    primitives::BtnVariant::Secondary,
+                )
+                .id(("quality-jump-cat", cat as usize))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let next = this.quality_next_issue_in(Some(cat));
+                    this.jump_to_quality_issue(cx, next);
+                }))
+                .into_any_element()
+            })
+            .collect();
+
         let body: AnyElement = if total == 0 {
             // 零问题：给正向状态，而不是一排 0/0/0 的空壳。
             div()
@@ -983,10 +1038,41 @@ impl MainWindow {
                             .id("quality-review-next")
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| {
-                                let next = this.quality_next_issue();
+                                let next = this.quality_next_issue_in(None);
                                 this.jump_to_quality_issue(cx, next);
                             })),
                         )
+                        // 导出复核表：质检结论此前只活在界面里，没法交给别人复核。
+                        // 放在这一排而不是塞进导出栏，是因为它属于「质检」这个动作的
+                        // 收尾，用户在这里刚看完结论、顺手导出最自然。
+                        .child(
+                            primitives::btn(
+                                "导出复核表 CSV",
+                                primitives::BtnSize::Sm,
+                                primitives::BtnVariant::Secondary,
+                            )
+                            .id("quality-export-csv")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_review_sheet(crate::subtitle::qc::QcFormat::Csv, cx);
+                            })),
+                        )
+                        .child(
+                            primitives::btn(
+                                "Markdown",
+                                primitives::BtnSize::Sm,
+                                primitives::BtnVariant::Secondary,
+                            )
+                            .id("quality-export-md")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_review_sheet(
+                                    crate::subtitle::qc::QcFormat::Markdown,
+                                    cx,
+                                );
+                            })),
+                        )
+                        .children(category_jump_buttons)
                         .child(
                             div()
                                 .text_size(px(Theme::TEXT_SMALL))
@@ -1105,6 +1191,13 @@ impl MainWindow {
                                     .id("queue-add-files-btn")
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.choose_batch_files(cx)),
+                                    ),
+                            )
+                            .child(
+                                primitives::btn("导入文件夹", primitives::BtnSize::Sm, primitives::BtnVariant::Secondary)
+                                    .id("queue-add-folder-btn")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.choose_batch_folder(cx)),
                                     ),
                             )
                             .child(if is_processing {

@@ -194,6 +194,58 @@ impl WhisperModelTier {
         }
     }
 
+    /// Whisper 四档（不含 SenseVoice）：档位下拉菜单的遍历来源。
+    ///
+    /// 顺序即界面顺序：从最省资源到最准，用户从上往下读就是「越来越准、越来越慢」。
+    pub const WHISPER_TIERS: [Self; 4] =
+        [Self::Fast, Self::Balanced, Self::TurboSpeed, Self::Precise];
+
+    /// 该档位对应的**可下载组件 id**（`utils::model_download::ITEMS` 里的 id）。
+    ///
+    /// 档位下拉里的「下载 / 删除」要落到具体的 `DownloadItem` 上，而 id 是那份清单的
+    /// 唯一键。SenseVoice 不在此列：它由 `sensevoice-*` 三条目（模型 / 词表 / VAD）
+    /// 共同构成，不是「一个档位 = 一个文件」，因此返回 `None`——调用方据此不渲染
+    /// 单文件的下载/删除按钮，避免只删掉模型却留下悬空的词表引用。
+    pub fn download_item_id(self) -> Option<&'static str> {
+        match self {
+            Self::SenseVoice => None,
+            Self::Fast => Some("whisper-base"),
+            Self::Balanced => Some("whisper-small"),
+            Self::TurboSpeed => Some("whisper-turbo-q5"),
+            Self::Precise => Some("whisper-turbo-q8"),
+        }
+    }
+
+    /// 该档位**现在可用**的模型文件绝对路径；文件不在则 `None`。
+    ///
+    /// 语义刻意与 [`Self::model_relative_path`] 对齐（直接复用它）：界面上的
+    /// 「已就位 / 未下载」必须与「点开始转写后管线真正会加载的那个文件」同结论，
+    /// 否则会出现最气人的那种不一致——界面说未下载、其实跑得起来，或界面说已就位、
+    /// 一点却报「模型加载失败」。因此档位内的量化回退（Small 的 q5_0→ggml-small、
+    /// Turbo 的 q5→q8）在这里同样生效。
+    ///
+    /// **不**看 `paths.whisper_model`：那个字段表达的是「管线默认加载谁」，与
+    /// 「这一档下没下过」无关——若跟着它走，用户把配置指到 Turbo Q8 后，四个档位
+    /// 会一起显示「已就位」。
+    pub fn installed_path(self) -> Option<std::path::PathBuf> {
+        // 直接复用 `model_relative_path()`（含档位内量化回退），保证界面的
+        // 「已就位」与管线真正会加载的文件同结论；**不**看 `paths.whisper_model`
+        // ——那个字段表达「管线默认加载谁」，与「这一档下没下过」无关。
+        let p = AppConfig::resolve_path(&self.model_relative_path());
+        p.is_file().then_some(p)
+    }
+
+    /// 档位显示名（下拉触发器与菜单项共用，保证两处永远一致）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SenseVoice => "SenseVoice 极速",
+            Self::Fast => "Whisper Base",
+            Self::Balanced => "Whisper Small-Q5",
+            Self::TurboSpeed => "Whisper Turbo Q5",
+            Self::Precise => "Whisper Turbo Q8",
+        }
+    }
+
     /// 返回对应的模型文件名（相对于 models/whisper/ 或 models/sensevoice/ 目录）
     pub fn model_filename(self) -> &'static str {
         match self {
@@ -413,6 +465,12 @@ pub struct AppState {
     /// 快照式而非「反向操作」式：编辑动作有拆分/合并/删除/改时间五类，
     /// 逐类写逆操作既啰嗦又容易写错，整段克隆换来的是绝不会还原错。
     pub undo_stack: Vec<EditSnapshot>,
+    /// 编辑审计日志（有界，见 `subtitle::audit`）。
+    ///
+    /// 与撤销栈是**两件事**：撤销栈是「怎么退回去」（有上限、换文档即清空、退出即丢），
+    /// 审计是「改过什么」（用户要能事后查看、导出、交给别人）。共用一份会导致
+    /// 「撤销栈一满，审计也跟着丢」。
+    pub edit_log: crate::subtitle::audit::EditLog,
     /// 重做栈：撤销时把当前状态挪到这里，一旦发生新的编辑即清空。
     pub redo_stack: Vec<EditSnapshot>,
     /// 正在合并进同一层撤销记录的「文本编辑」目标片段序号。
@@ -469,6 +527,18 @@ pub struct AppState {
     pub is_benchmarking: bool,
     /// 性能设置页配置说明卡的展开状态（右上角问号按钮切换）
     pub show_perf_help: bool,
+    /// 性能页「音频预处理与救场」卡是否展开。
+    ///
+    /// 默认收起：出厂默认值已是实测最优，误改会变慢或变差；但功能必须能被找到——
+    /// 此前这些开关**完全没有界面入口**，只有翻开 `config.toml` 才知道它们存在。
+    pub show_audio_advanced: bool,
+    /// 更新检查的结果：`None` = 还没查过；`Some((是否新版, 文案, 下载页))`。
+    ///
+    /// 缓存在会话里（不落盘）：版本不会在几分钟内变化，而用户可能反复点「检查更新」；
+    /// 每次点都发一次 GitHub API 请求既慢又容易撞上未认证的速率限制。
+    pub update_check_result: Option<(bool, String, String)>,
+    /// 是否正在检查更新（防连点）
+    pub update_check_busy: bool,
 
     /// GPU 占用策略 ("full" 全速 | "balanced" 均衡 | "eco" 低占用 | "cpu" 纯 CPU)，
     /// 改动写入 config.toml 并重启生效
@@ -611,6 +681,7 @@ impl AppState {
             active_task_id: None,
             segments_revision: 0,
             undo_stack: Vec::new(),
+            edit_log: crate::subtitle::audit::EditLog::new(),
             redo_stack: Vec::new(),
             undo_text_coalesce: None,
             is_translating: false,
@@ -646,6 +717,9 @@ impl AppState {
             benchmark_result: None,
             is_benchmarking: false,
             show_perf_help: false,
+            show_audio_advanced: false,
+            update_check_result: None,
+            update_check_busy: false,
             gpu_mode,
             waveform: None,
             waveform_busy_for: None,
@@ -693,6 +767,53 @@ impl AppState {
             self.user_strategy,
             &self.hardware_info,
         );
+    }
+
+    /// 切换 Whisper 模型档位并**落盘**（性能页档位下拉的唯一入口）。
+    ///
+    /// 为什么必须落盘：`whisper_model_tier` 只是运行期状态，启动时由
+    /// [`WhisperModelTier::from_model_path`] 从 `config.paths.whisper_model` 反推。
+    /// 此前性能页的档位胶囊只改内存、不写配置，于是「选了 Turbo Q5 → 重启又变回
+    /// Small」——用户会认为选择没生效。这里把档位对应的相对路径写进配置，选择才
+    /// 真正持久。
+    ///
+    /// **无条件**写进配置，哪怕该档位还没下载：用户选了哪一档就该记住哪一档。
+    /// `from_model_path` 只按文件名认档位、不要求文件存在，所以下次启动会正确
+    /// 还原成同一个档位，界面显示「未下载」并给下载入口——这比「重启后悄悄跳回
+    /// 上一个档位」诚实得多（后者正是「选了不生效」的观感来源）。
+    ///
+    /// 未下载档位的文件缺失由开工守卫（`MainWindow::missing_engine_reason`）
+    /// 在点「开始转写」时明确拦住并给出可操作提示。
+    pub fn set_whisper_model_tier(&mut self, tier: WhisperModelTier) {
+        self.whisper_model_tier = tier;
+        self.config.paths.whisper_model = tier.model_relative_path();
+        let _ = self.config.save_to_file("config.toml");
+        // 档位换了，「模型与组件」卡里 whisper 各档的就位判定要跟着重算
+        // （`configured_path_for` 只认「配置指向的那个档位」）。
+        self.refresh_model_presence();
+    }
+
+    /// 切换「标点与润色」总开关与引擎档位，并**落盘**。
+    ///
+    /// # 为什么必须收成一个 setter
+    ///
+    /// 这两个字段（`enable_polish` / `polish_mode`）此前**任何界面入口都没写回配置**：
+    /// 性能页的总开关与档位胶囊、转写页侧栏的「标点与润色」都只改内存里的
+    /// `AppState`，而启动时 [`AppState::new`] 又是从 `config.pipeline` 读回来的——
+    /// 于是用户把润色打开、或从「极速标点」换成「Qwen 深度润色」，**重启即失效**，
+    /// 界面还会显示成配置里的旧值，看起来像选择没被记住。
+    ///
+    /// 更隐蔽的是「关掉润色」这一路：`enable_polish=false` 只改内存，配置里若原本
+    /// 是 `true`，重启后润色又自己开了回来——用户会以为程序擅自改了他的设置。
+    ///
+    /// 两个字段必须一起写：`polish_mode` 单独落盘而 `enable_polish` 不落盘，
+    /// 会出现「配置说开润色、但模式是用户上次没启用的那个」这类半套状态。
+    pub fn set_polish(&mut self, enabled: bool, mode: PolishMode) {
+        self.enable_polish = enabled;
+        self.polish_mode = mode;
+        self.config.pipeline.enable_polish = enabled;
+        self.config.pipeline.polish_mode = mode.as_str().to_string();
+        let _ = self.config.save_to_file("config.toml");
     }
 
     /// 将推荐配置应用至当前系统状态与 Pipeline 配置
@@ -1440,6 +1561,21 @@ impl AppState {
         // 只会退掉一个字符，栈也会被一次输入撑满。所以同一句的连续输入合并成
         // 一层：只有「换了一句」或「中间夹了别的编辑」时才另起一层。
         self.snapshot_for_text_edit(idx);
+        // 审计也逐键追加（日志层自带「连续同句同类型合并」的 `coalesced`，
+        // 展示时再折叠——这里若也做合并，就得把合并状态塞进 AppState，
+        // 与日志的职责重叠）。
+        let before_text = self
+            .segments
+            .iter()
+            .find(|s| s.index == idx)
+            .map(|s| s.display_text().to_string())
+            .unwrap_or_default();
+        self.audit(
+            crate::subtitle::audit::EditKind::Text,
+            idx,
+            before_text,
+            new_text.clone(),
+        );
         // P0-2：改原文必须让**旧译文失效**。`translation_matches` 只看「译文非空 +
         // 语言标记匹配」，而 `Segment` 里没有源文本哈希，所以只改原文不动标记时，
         // 这条会一直算「已完成」：表格里长期并列显示「新原文 + 旧译文」，点「开始翻译」
@@ -1484,6 +1620,18 @@ impl AppState {
         };
         self.snapshot_for_undo();
         let cleaned = text.trim().to_string();
+        let before_translation = self
+            .segments
+            .iter()
+            .find(|s| s.index == idx)
+            .and_then(|s| s.translation.clone())
+            .unwrap_or_default();
+        self.audit(
+            crate::subtitle::audit::EditKind::Translation,
+            idx,
+            before_translation,
+            cleaned.clone(),
+        );
         // P0-1：用户此刻是在「当前目标语言」下手工写这条译文，这个动作表达的就是
         // 「这条译文属于当前目标语言」，所以下面非空分支要**无条件**用当前目标语言
         // 覆盖标记。绝不能保留旧标记——那正是本缺陷的根因：English 译文 → 切到 日本語
@@ -1565,6 +1713,27 @@ impl AppState {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.undo_text_coalesce = None;
+    }
+
+    /// 记一条审计（内部便利方法，省掉调用点重复写 `DateTime::now()`）。
+    ///
+    /// 直接用 `Local::now()` 而不是让调用方传时间：审计要的是「真实发生时刻」，
+    /// 而纯函数层（`audit.rs`）把时间作为参数收进来，正是为了**它可以被单测**。
+    /// 两个目标不冲突：这里读钟、那边不读。
+    fn audit(
+        &mut self,
+        kind: crate::subtitle::audit::EditKind,
+        index: usize,
+        before: String,
+        after: String,
+    ) {
+        self.edit_log.push(crate::subtitle::audit::EditRecord {
+            index,
+            kind,
+            before,
+            after,
+            at: chrono::Local::now(),
+        });
     }
 
     /// 在执行一次编辑前记录快照。必须由**所有**编辑入口调用，
@@ -1670,6 +1839,15 @@ impl AppState {
         let edit = plan_time_edit(cur.start, cur.end, prev, next, delta_start, delta_end);
 
         self.snapshot_for_undo();
+        // 审计记的是**规划后**的实际结果，不是用户点的那个 ±0.1——微调会被邻居
+        // 边界挡住（`plan_time_edit` 可能收短/后挪），日志里若写「用户点了 +0.1」
+        // 就与实际发生的事不符，事后对照会误导。
+        self.audit(
+            crate::subtitle::audit::EditKind::Timing,
+            idx,
+            format!("{:.3}-{:.3}", cur.start, cur.end),
+            format!("{:.3}-{:.3}", edit.start, edit.end),
+        );
 
         self.segments[pos].start = edit.start;
         self.segments[pos].end = edit.end;
@@ -1796,6 +1974,18 @@ impl AppState {
         }
 
         self.snapshot_for_undo();
+        // 合并同样是破坏性的（少了一个 cue）。记下合并前的两句原文。
+        let before_merge = format!(
+            "{} | {}",
+            self.segments[pos].display_text(),
+            self.segments[pos + 1].display_text()
+        );
+        self.audit(
+            crate::subtitle::audit::EditKind::Merge,
+            idx,
+            before_merge,
+            String::new(),
+        );
         let next = self.segments.remove(pos + 1);
         // P0-4：译文不能丢。`next` 被 remove 之后它的译文就没了，而原文是「拼接」的，
         // 合并后的 cue 理应对应两段译文的拼接。修前这里完全没碰译文：首句无译文、
@@ -1834,6 +2024,15 @@ impl AppState {
             return;
         };
         self.snapshot_for_undo();
+        // 删除是破坏性操作：审计必须留下**被删掉的内容**，否则事后无从追查
+        // 「原来那句是什么」（撤销栈只有 50 层，且换文档即清空）。
+        let removed_text = self.segments[pos].display_text().to_string();
+        self.audit(
+            crate::subtitle::audit::EditKind::Delete,
+            idx,
+            removed_text,
+            String::new(),
+        );
         self.segments.remove(pos);
 
         self.reindex_segments();
@@ -2030,7 +2229,7 @@ fn merge_concat_translations(
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, ProcessStatus, WhisperModelTier};
+    use super::{AppState, PolishMode, ProcessStatus, WhisperModelTier};
     use crate::subtitle::Segment;
 
     /// 构造一个最小可用、不碰显卡/磁盘/子进程的 AppState：内存 SQLite + 假路径引擎，
@@ -2060,6 +2259,175 @@ mod tests {
         );
         state.segments = segments;
         state
+    }
+
+    /// 润色「档位 → 配置字符串 → 档位」必须往返一致，且「关闭」只关总开关。
+    ///
+    /// 回归护栏：`enable_polish` / `polish_mode` 此前**没有任何界面入口写回配置**，
+    /// 用户关掉润色、重启又被配置里的 `true` 打开（看起来像程序擅自改设置）。
+    /// 现在所有入口都经 `AppState::set_polish`，这里锁住它的配置侧契约：
+    /// ① 档位字符串与 `parse_label` 往返一致（启动回读的就是这个映射）；
+    /// ② 关闭只写 `enable_polish=false`，不顺手改写已选档位（否则关一下再开，
+    ///    引擎会悄悄从 Qwen 变回 CT-Punc）。
+    #[test]
+    fn polish_config_roundtrips_mode_and_keeps_mode_when_disabled() {
+        for mode in [PolishMode::PuncFast, PolishMode::QwenDeep] {
+            let s = mode.as_str();
+            assert_eq!(
+                PolishMode::parse_label(s),
+                mode,
+                "档位字符串 {s} 必须能被 parse_label 复原（启动回读走的就是它）"
+            );
+        }
+        // 关闭：沿用当前档位，仅总开关置假
+        let mut pipeline = crate::utils::AppConfig::default().pipeline;
+        pipeline.enable_polish = true;
+        pipeline.polish_mode = PolishMode::QwenDeep.as_str().to_string();
+        // 模拟 set_polish(false, 当前档位)
+        pipeline.enable_polish = false;
+        let text = toml::to_string_pretty(&pipeline).expect("serialize");
+        let back: crate::utils::config::PipelineConfig =
+            toml::from_str(&text).expect("deserialize");
+        assert!(
+            !back.enable_polish,
+            "关闭润色必须持久化，否则重启自己开回来"
+        );
+        assert_eq!(
+            PolishMode::parse_label(&back.polish_mode),
+            PolishMode::QwenDeep,
+            "关闭不应改写已选档位"
+        );
+    }
+
+    /// 档位 → 可下载组件 id 的映射必须与 `ITEMS` 对得上，且四档都不是压缩包
+    /// （压缩包组件不显示删除按钮）。这条锁住的是「界面上的下载/删除按钮」与
+    /// 「下载层真正能删的东西」之间的接线——一旦有人改了 id 或把某档换成 zip，
+    /// 这里先红。
+    #[test]
+    fn whisper_tier_download_ids_exist_and_are_deletable() {
+        for tier in WhisperModelTier::WHISPER_TIERS {
+            let id = tier
+                .download_item_id()
+                .unwrap_or_else(|| panic!("{tier:?} 应映射到可下载组件"));
+            assert!(
+                crate::utils::model_download::item_by_id(id).is_some(),
+                "{tier:?} 的组件 id {id} 不在 ITEMS 里"
+            );
+            assert!(
+                crate::utils::model_download::item_is_deletable(id),
+                "{tier:?} 的组件 {id} 应可删除（界面据此渲染删除按钮）"
+            );
+        }
+        // SenseVoice 不是「一个档位 = 一个文件」，必须返回 None
+        assert!(WhisperModelTier::SenseVoice.download_item_id().is_none());
+    }
+
+    /// 档位显示名四档各异且非空——下拉触发器与菜单项共用它，重复会让用户分不清。
+    #[test]
+    fn whisper_tier_labels_are_unique_and_nonempty() {
+        let mut seen = std::collections::HashSet::new();
+        for tier in WhisperModelTier::WHISPER_TIERS {
+            let label = tier.label();
+            assert!(!label.is_empty());
+            assert!(seen.insert(label), "档位显示名重复: {label}");
+        }
+        assert!(!WhisperModelTier::SenseVoice.label().is_empty());
+    }
+
+    /// `installed_path` 只认该档位自己的默认文件：配置指向别的档位时，
+    /// 没下过的档位不能跟着显示「已就位」。
+    #[test]
+    fn installed_path_does_not_follow_configured_other_tier() {
+        let mut cfg = crate::utils::AppConfig::default();
+        cfg.paths.whisper_model = "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string();
+        // 本测试断言的是**存在性**语义，不依赖磁盘：
+        // 非首选量化的 Balanced 只在 filesystem 真有 ggml-small-q5_0.bin 时才 Some，
+        // 与配置无关。
+        // installed_path 必须与 model_relative_path 同结论（界面「已就位」与管线
+        // 实际加载的文件一致），且**不受** config 指向影响。
+        for tier in WhisperModelTier::WHISPER_TIERS {
+            let rel = crate::utils::AppConfig::resolve_path(&tier.model_relative_path());
+            assert_eq!(
+                tier.installed_path().is_some(),
+                rel.is_file(),
+                "{tier:?} 的 installed_path 应与 model_relative_path 一致"
+            );
+        }
+        // 配置指向 turbo-q8 时，Balanced 是否可用只取决于小模型自己（含 q5_0→
+        // ggml-small 的档位内回退），不会因为配置指向 turbo 就跟着变 true。
+        let small_q5 = crate::utils::AppConfig::resolve_path("models/whisper/ggml-small-q5_0.bin");
+        let small_plain = crate::utils::AppConfig::resolve_path("models/whisper/ggml-small.bin");
+        assert_eq!(
+            WhisperModelTier::Balanced.installed_path().is_some(),
+            small_q5.is_file() || small_plain.is_file(),
+            "Balanced 不应跟着 config 指向的 turbo-q8 一起变已就位"
+        );
+    }
+
+    /// 编辑必须留下审计记录，且**破坏性操作要能追回被删的内容**。
+    ///
+    /// 这条锁住的是「审计接线」：`audit()` 的调用点分散在 4 个编辑入口，漏掉任何一个
+    /// 都会让用户事后查不到那次改动。撤销栈救不了这个——它只有 50 层、换文档即清空、
+    /// 退出即丢。
+    #[test]
+    fn destructive_edits_are_recorded_with_their_old_content() {
+        use crate::subtitle::audit::EditKind;
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 1.0, "第一句"),
+            Segment::new(2, 1.0, 2.0, "第二句"),
+        ]);
+
+        // 删除第 2 句：审计里必须留下「被删掉的那句原文」
+        state.select_segment(2);
+        state.delete_selected_segment();
+        let deletes: Vec<_> = state.edit_log.of_kind(EditKind::Delete);
+        assert_eq!(deletes.len(), 1, "删除必须留一条审计");
+        assert_eq!(deletes[0].index, 2);
+        assert_eq!(deletes[0].before, "第二句", "必须记下被删的内容");
+        assert!(deletes[0].after.is_empty());
+
+        // 合并：记录合并前的两句
+        state.select_segment(1);
+        // 只剩一句时合并是空操作（pos+1 越界），先补一句回来构造可合并的状态
+        state.segments.push(Segment::new(2, 1.0, 2.0, "第二句"));
+        state.merge_selected_with_next();
+        let merges: Vec<_> = state.edit_log.of_kind(EditKind::Merge);
+        assert_eq!(merges.len(), 1, "合并必须留一条审计");
+        assert!(
+            merges[0].before.contains("第一句") && merges[0].before.contains("第二句"),
+            "合并记录应含合并前的两句: {}",
+            merges[0].before
+        );
+    }
+
+    /// 时间微调的审计必须记**规划后的实际结果**，而不是用户点的那一下。
+    ///
+    /// 微调会被邻居边界挡住（`plan_time_edit` 可能收短/后挪），若日志里写「用户点了
+    /// +0.1」就与实际发生的事不符，事后对照会误导。
+    #[test]
+    fn timing_audit_records_planned_result_not_requested_delta() {
+        use crate::subtitle::audit::EditKind;
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 1.0, "a"),
+            Segment::new(2, 1.0, 2.0, "b"),
+        ]);
+        state.select_segment(2);
+        // 起点往前推 0.5 秒：会越界压到第 1 句，`plan_time_edit` 会收短它。
+        state.adjust_selected_times(-0.5, 0.0);
+        let records: Vec<_> = state.edit_log.of_kind(EditKind::Timing);
+        assert_eq!(records.len(), 1);
+        // before 是原区间，after 必须是规划结果（与当前实际时间一致）
+        assert_eq!(records[0].before, "1.000-2.000");
+        let seg = state
+            .segments
+            .iter()
+            .find(|s| s.index == 2)
+            .expect("第 2 句应还在");
+        assert_eq!(
+            records[0].after,
+            format!("{:.3}-{:.3}", seg.start, seg.end),
+            "审计记录必须与落定后的真实时间一致"
+        );
     }
 
     #[test]

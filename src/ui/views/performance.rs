@@ -23,6 +23,55 @@ pub(crate) fn effective_glossary_count(parsed: usize, limit: usize) -> usize {
     parsed.min(limit)
 }
 
+/// 离线模型路径行的状态提示：把「手动编辑的校验结果」与「`qwen-llm` 是否就位」
+/// 两路信号合成一条 `(是否中性色, 文案)`。
+///
+/// 抽成纯函数是为了单测——真正的三态耦合（校验红字 vs. 就位绿字）在界面里没法
+/// 用断言表达，而这段规则恰恰是最容易改错、也最容易自相矛盾的地方（例如
+/// 「绿字说路径有效、旁边却挂着下载按钮」）。规则：
+/// - `hint = Some((false, msg))`：手动编辑过且校验失败 → **最高优先级**透传红字原因。
+///   哪怕此刻正在下载也不能盖掉它：下载的是内置默认模型，而配置里的路径仍然是错的，
+///   下完照样用不了（`LLMEngine` 读的就是 `paths.llm_model`）。让红字与旁边的
+///   「恢复默认」按钮同时在场，才是这一情形真正的出路。
+/// - `hint = Some((true, msg))` 且模型已就位 → 透传中性确认；
+/// - 下载中 → 中性「正在下载模型…」（避免下载期间还挂着「未就位」误导成没反应）；
+/// - 其余 → 看就位与否给「未就位，怎么办」或「已就位，还能换」。
+pub(crate) fn local_model_status(
+    hint: Option<(bool, String)>,
+    model_present: bool,
+    downloading: bool,
+) -> (bool, String) {
+    match hint {
+        Some((false, msg)) => (false, msg),
+        Some((true, msg)) if model_present => (true, msg),
+        _ if downloading => (true, "正在下载模型…".to_string()),
+        _ if model_present => (true, "模型已就位；也可指向你自己下载的 .gguf".to_string()),
+        _ => (
+            false,
+            "模型未就位：填一个 .gguf 路径，或点「下载模型」用内置 Qwen".to_string(),
+        ),
+    }
+}
+
+/// Whisper 档位下拉里，每一档的**一句话说明**（纯函数，便于单测）。
+///
+/// 为什么要有它：档位菜单里塞的信息最多，而「档位名 → 该怎么选」这层判断如果散落在
+/// 渲染闭包里，就没法断言。抽成纯函数后，单测可以锁住「四档各有说明、不重复、
+/// 不落到空串」，避免以后加档位时漏写说明（表现是菜单里出现一行光秃秃的标题）。
+///
+/// 文案的取法是「定位 + 硬指标」：用户看这一行就是在决定选哪个，所以每档要能一句话
+/// 说清它适合谁（最快 / 均衡 / 较准 / 最准），并带上参数量或提速幅度这类可核对的数。
+pub(crate) fn tier_menu_desc(tier: crate::app::WhisperModelTier) -> &'static str {
+    use crate::app::WhisperModelTier as T;
+    match tier {
+        T::SenseVoice => "极速识别，SenseVoice 档下不参与选择",
+        T::Fast => "最快 · 39M 参数 · 低配机器首选",
+        T::Balanced => "均衡 · 244M 参数 · CPU 友好，出厂默认",
+        T::TurboSpeed => "较准 · 提速 25%~30% · 综合推荐",
+        T::Precise => "最准 · 抗口音吞音 · 旗舰精度，最慢",
+    }
+}
+
 /// ONNX 执行后端在性能页「引擎选择」卡上的一行状态：(文案, 是否警告色)。
 ///
 /// 抽成纯函数是为了单测：三种状态里的「实况」只有真跑一次 runner 才会出现
@@ -311,6 +360,8 @@ impl MainWindow {
             .child(self.render_parallelism_card(cx))
             // 6. 步骤 4: 标点恢复与 AI 文本润色
             .child(self.render_polish_selection_card(cx))
+            // 6.5 步骤 4.5: 音频前端预处理与救场解码
+            .child(self.render_audio_pipeline_card(cx))
             // 7. 步骤 5: 字幕翻译引擎（离线 Qwen / 在线 OpenAI 兼容 API）
             .child(self.render_translate_settings_card(cx))
             // 8. 步骤 6: 模型与外部组件（缺什么、一键补齐；全部走国内镜像）
@@ -533,8 +584,49 @@ impl MainWindow {
             }
         };
 
+        // 离线档的参数（本地模型文件）与在线档参数**调暗方向相反**：
+        // 在线档下本地模型路径整行调暗，明确「当前未生效」。
+        let dim_offline = move |el: AnyElement| -> AnyElement {
+            if is_online {
+                div().opacity(0.45).child(el).into_any_element()
+            } else {
+                el
+            }
+        };
+        let local_model_control = self.render_local_model_row(cx);
+
         primitives::card_rows()
             .child(Self::render_setting_row("翻译引擎", mode_control))
+            .child(Self::render_setting_divider())
+            .child(
+                // 自己写一行而不是走 render_setting_row：这一行是「输入框 + 按钮 +
+                // 下方提示」的纵向组合，塞进「左标签 + 右对齐控件」骨架会被折成窄条
+                // （写法参照同文件的 render_onnx_provider_row）。
+                div().w_full().py(px(Theme::SPACE_2)).child(dim_offline(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap(px(Theme::SPACE_1_5))
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap(px(Theme::SPACE_2))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(Theme::TEXT_BODY_LG))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(Theme::text_primary())
+                                        .child("本地模型"),
+                                )
+                                .child(local_model_control),
+                        )
+                        .into_any_element(),
+                )),
+            )
             .child(Self::render_setting_divider())
             .child(Self::render_setting_row("接口基址", dim(base_control)))
             .child(Self::render_setting_divider())
@@ -934,6 +1026,98 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// 离线链路（本地 Qwen）的模型文件路径行：输入框 + 「浏览…」按钮 + 即时校验提示。
+    ///
+    /// 需求来源：离线模型此前只能手改 `config.toml`，而「我自己下了一个 GGUF」
+    /// 是最自然的诉求。这里给出三条入口——直接在输入框里粘贴路径、点「浏览…」
+    /// 用系统对话框挑文件、点「恢复默认」回到内置 Qwen；三条路都汇到
+    /// `MainWindow::set_local_model_path`，不存在第二套落盘逻辑。
+    ///
+    /// 行尾三个可选按钮，都只在有意义时出现：模型缺失时给「下载模型」（下载中换成
+    /// 置灰占位），用户改过路径时给「恢复默认」，「浏览…」常驻。
+    ///
+    /// 状态提示把两路信号合成一条，避免自相矛盾（见函数内注释）：手动编辑的
+    /// 校验结果（`local_model_hint`，红字说明哪里不对）优先；没有失败校验时以
+    /// 「`qwen-llm` 是否就位」为准，因为「校验通过」只说明文件像个模型，
+    /// 不等于引擎真的能用它（例如体积没过 400MB 下限）。
+    fn render_local_model_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::ui::ApiField;
+        let input = self.render_api_input("local-model-path-input", ApiField::LocalModelPath, cx);
+        let browse = primitives::chip_clickable("浏览…", false, false)
+            .id("local-model-browse-btn")
+            .on_click(cx.listener(|this, _, _, cx| this.choose_llm_model_file(cx)));
+        // 「恢复默认」只在用户确实改过路径时出现：与内置默认路径逐字符比对
+        // （不做路径归一化——`resolve_path` 只认相对/绝对之分，比对原始字符串
+        // 足以判断「是不是用户自己填的」，也不会因为盘符大小写差异误判）。
+        // 让用户点一下就回到内置 Qwen，而不是逼他把整条长路径删干净。
+        let customized = self.state.config.paths.llm_model.trim()
+            != crate::utils::config::PathsConfig::default().llm_model;
+        let restore = customized.then(|| {
+            primitives::chip_clickable("恢复默认", false, false)
+                .id("local-model-restore-btn")
+                .on_click(
+                    cx.listener(|this, _, _, cx| this.set_local_model_path(String::new(), cx)),
+                )
+        });
+        // 模型没就位时，行尾给一个「下载」直达模型管理页那个条目（引导到「模型与
+        // 组件」卡要多滚一屏，这里放个等价按钮更省事）。注意：用户自备的路径若填错，
+        // `qwen-llm` 同样会判为未就位，此时点「下载」会按内置默认路径下载——
+        // 所以提示文案里同时点了「核对路径」这条出路（见 editor.rs 的翻译卡）。
+        let missing_model = !self.state.model_is_present("qwen-llm");
+        let downloading = self.state.is_downloading;
+        let download = if downloading {
+            // 下载中（可能是 qwen-llm 本身，也可能是「一键补齐」的其他条目）：
+            // 给一个置灰占位，别让按钮凭空消失、看起来像点错了。
+            Some(primitives::chip("下载中…", false, false).id("local-model-downloading"))
+        } else if missing_model {
+            Some(
+                primitives::chip_clickable("下载模型", false, false)
+                    .id("local-model-download-btn")
+                    .on_click(
+                        cx.listener(|this, _, _, cx| this.start_model_download("qwen-llm", cx)),
+                    ),
+            )
+        } else {
+            None
+        };
+
+        // 两路信号（校验红字 vs. 就位绿字）的合成规则抽在 `local_model_status`，
+        // 那里是唯一实现处，也有单测锁住——避免「绿字说路径有效、旁边却挂着
+        // 下载按钮」这类自相矛盾回归。
+        let (ok, msg) =
+            local_model_status(self.local_model_hint.clone(), !missing_model, downloading);
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_1_5))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(Theme::SPACE_2))
+                    .child(input)
+                    .child(browse)
+                    .children(download)
+                    .children(restore),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(if ok {
+                        Theme::text_muted()
+                    } else {
+                        Theme::accent_red()
+                    })
+                    .child(msg),
+            )
+            .into_any_element()
+    }
+
     /// 模型下拉所在行的「行尾」内容：拉取按钮 + 结果状态小字。
     fn render_model_fetch_row(&self, is_online: bool, cx: &mut Context<Self>) -> AnyElement {
         const MODEL_FETCH_MSG_MAX_W: f32 = 420.0;
@@ -1142,8 +1326,12 @@ impl MainWindow {
     }
 
     /// 步骤 2：识别引擎与模型架构选择 (每行一个配置项，右侧单行等级选择)
-    fn render_engine_selection_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_sv = self.state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
+    ///
+    /// `&mut self`（不是 `&self`）：档位下拉展开后，菜单项里的「下载 / 删除」要
+    /// 起下载任务、弹确认框，都是可变操作；菜单本身也依赖 `&mut` 才能构造。
+    fn render_engine_selection_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::app::WhisperModelTier;
+        let is_sv = self.state.whisper_model_tier == WhisperModelTier::SenseVoice;
 
         let engine_control = primitives::segmented_cluster()
             .child(self.seg_option(
@@ -1152,7 +1340,10 @@ impl MainWindow {
                 is_sv,
                 cx,
                 |this, cx| {
-                    this.state.whisper_model_tier = crate::app::WhisperModelTier::SenseVoice;
+                    // 走 setter 落盘（状态 + config.paths.whisper_model 双写）：
+                    // 直接赋值只改内存，重启后会被配置反推覆盖回去。
+                    this.state
+                        .set_whisper_model_tier(WhisperModelTier::SenseVoice);
                     cx.notify();
                 },
             ))
@@ -1162,48 +1353,29 @@ impl MainWindow {
                 !is_sv,
                 cx,
                 |this, cx| {
-                    if this.state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice {
-                        this.state.whisper_model_tier = crate::app::WhisperModelTier::TurboSpeed;
-                    }
+                    // 从 SenseVoice 切回 Whisper 时给一个默认档（Turbo Q5 综合最优）；
+                    // 已在 Whisper 档位系里则保持不变。落盘交给 setter。
+                    let tier = if this.state.whisper_model_tier == WhisperModelTier::SenseVoice {
+                        WhisperModelTier::TurboSpeed
+                    } else {
+                        this.state.whisper_model_tier
+                    };
+                    this.state.set_whisper_model_tier(tier);
                     cx.notify();
                 },
             ))
             .into_any_element();
 
-        let tiers: [(crate::app::WhisperModelTier, &'static str, &'static str); 4] = [
-            (
-                crate::app::WhisperModelTier::Fast,
-                "perf-tier-base",
-                "Base · 20x",
-            ),
-            (
-                crate::app::WhisperModelTier::Balanced,
-                "perf-tier-small",
-                "Small-Q5 · CPU",
-            ),
-            (
-                crate::app::WhisperModelTier::TurboSpeed,
-                "perf-tier-turboq5",
-                "Turbo Q5 · 6x",
-            ),
-            (
-                crate::app::WhisperModelTier::Precise,
-                "perf-tier-turboq8",
-                "Turbo Q8 · 4x",
-            ),
-        ];
-        let mut tier_row = primitives::segmented_cluster();
-        for (tier, id, label) in tiers {
-            let is_sel = self.state.whisper_model_tier == tier;
-            tier_row = tier_row.child(self.seg_option(id, label, is_sel, cx, move |this, cx| {
-                this.state.whisper_model_tier = tier;
-                cx.notify();
-            }));
-        }
+        // 档位选择改成**下拉**（原来是四个并排胶囊）：胶囊一行最多排四个，
+        // 每档只能塞进「名字 + 速率」六个字，放不下「多大体积 / 是否已下载」这类
+        // 决定用户该选哪个的关键信息；档位一旦再增加就会挤成两行。下拉的每一行
+        // 可以完整展示「名称 · 参数量 · 速度 · 体积 · 就位状态」，并在同一行直接给
+        // 下载 / 删除入口——模型管理从「另一个卡片里去对号入座」变成「就在这里管」。
         let tier_control = if is_sv {
-            tier_row.opacity(0.5).into_any_element()
+            // SenseVoice 档下 Whisper 档位不生效：给置灰的下拉触发器，不展开菜单
+            self.render_tier_trigger(true, cx).into_any_element()
         } else {
-            tier_row.into_any_element()
+            self.render_tier_trigger(false, cx).into_any_element()
         };
 
         div()
@@ -1215,10 +1387,574 @@ impl MainWindow {
                 primitives::card_rows()
                     .child(Self::render_setting_row("转写引擎", engine_control))
                     .child(Self::render_setting_divider())
-                    .child(Self::render_setting_row("Whisper 模型档位", tier_control))
+                    .child(
+                        // 下拉展开时菜单要占满整行：走 setting_row（左标签 + 右对齐控件）
+                        // 会把菜单挤成右侧一条窄缝，所以自己写一行（同上文 ONNX 行）。
+                        div()
+                            .w_full()
+                            .py(px(Theme::SPACE_2))
+                            .flex()
+                            .flex_col()
+                            .gap(px(Theme::SPACE_2))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(Theme::SPACE_4))
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(Theme::TEXT_BODY_LG))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::text_primary())
+                                            .child("Whisper 模型档位"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .justify_end()
+                                            .child(tier_control),
+                                    ),
+                            )
+                            .children(self.render_tier_menu(cx)),
+                    )
                     .child(Self::render_setting_divider())
                     .child(self.render_onnx_provider_row()),
             )
+    }
+
+    /// 档位下拉的触发器（收起态的按钮）。`disabled` 为真时置灰且不接交互。
+    ///
+    /// 触发器上直接带一个就位徽标（已就位 / 未下载）：用户收起菜单后仍能看到当前
+    /// 档位能不能用——否则他选完一档、菜单一收，界面又变回「只显示一个档位名」，
+    /// 没下过也看不出来，直到点「开始转写」才被告知。
+    fn render_tier_trigger(&self, disabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.whisper_dropdown_open && !disabled;
+        let ready = self.state.whisper_model_tier.installed_path().is_some();
+        div()
+            .id("perf-tier-dropdown-trigger")
+            .min_w(px(210.0))
+            .h(px(Theme::CTRL_H_MD))
+            .px(px(Theme::SPACE_4))
+            .rounded(px(Theme::RADIUS_MD))
+            .bg(Theme::bg_card())
+            .border_1()
+            .border_color(if open {
+                Theme::accent_mint()
+            } else {
+                Theme::border()
+            })
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(Theme::SPACE_3))
+            .when(!disabled, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.border_color(Theme::accent_mint()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.whisper_dropdown_open = !this.whisper_dropdown_open;
+                        cx.notify();
+                    }))
+            })
+            .when(disabled, |d| d.opacity(0.5))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(Theme::SPACE_2))
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_BODY))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(Theme::text_primary())
+                            .child(self.state.whisper_model_tier.label()),
+                    )
+                    // SenseVoice 档下 Whisper 档位不生效，不显示就位徽标（会误导）
+                    .when(!disabled, |d| {
+                        d.child(if ready {
+                            primitives::badge("已就位").into_any_element()
+                        } else {
+                            primitives::badge_danger("未下载").into_any_element()
+                        })
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_secondary())
+                    .child(if open { "▲" } else { "▼" }),
+            )
+    }
+
+    /// 档位下拉的展开菜单（未展开时返回 `None`，调用方 `children(..)` 直接跳过）。
+    ///
+    /// 菜单项 **不关闭菜单**：用户常常要在同一个菜单里「先看哪档已下 → 选它／没下就
+    /// 直接点下载」，点一下就关会逼他反复展开。选中态与下载态都即时刷新（`cx.notify`）。
+    fn render_tier_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::app::WhisperModelTier;
+        if !self.whisper_dropdown_open
+            || self.state.whisper_model_tier == WhisperModelTier::SenseVoice
+        {
+            return None;
+        }
+        let cur = self.state.whisper_model_tier;
+        let downloading = self.state.is_downloading;
+        let mut menu = div()
+            .id("perf-tier-menu")
+            .w_full()
+            .rounded(px(Theme::RADIUS_LG))
+            .bg(Theme::bg_card())
+            .border_1()
+            .border_color(Theme::border())
+            .p(px(Theme::SPACE_1))
+            .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_0_5));
+
+        for (ti, tier) in WhisperModelTier::WHISPER_TIERS.iter().copied().enumerate() {
+            let canonical_id: Option<&'static str> = tier.download_item_id();
+            let item = canonical_id.and_then(crate::utils::model_download::item_by_id);
+            // 「是否可用」一律取 `installed_path()`（= 引擎真正会加载的文件，
+            // 含档位内量化回退），而不是 `model_is_present(canonical_id)`——
+            // 后者按条目登记的精确文件名判定，会在「Turbo 用 q8 兜底 / Balanced
+            // 用 ggml-small 兜底」时判为未下载，与触发器上的徽标自相矛盾。
+            let loaded = tier.installed_path();
+            let present = loaded.is_some();
+            // 删除目标由**实际文件**反查条目：引擎在用的若是 `ggml-small.bin`
+            // 这类没有条目的回退文件，反查得 `None` → 不渲染删除按钮（它不在
+            // 可下载清单里，本就不该由我们代删）。
+            let deletable_id: Option<&'static str> = loaded
+                .as_deref()
+                .and_then(crate::utils::model_download::item_id_for_path)
+                .filter(|id| crate::utils::model_download::item_is_deletable(id));
+            let is_sel = tier == cur;
+
+            // 说明与体积都取「唯一实现处」：说明走 `tier_menu_desc`（纯函数，
+            // 有单测），体积走清单里的期望值（只读常量，不碰磁盘）——
+            // 实际磁盘占用在每一行按需 stat（见下），但那是有文件时才做的一次调用，
+            // 不是逐帧全量扫描。
+            let size_text = item
+                .map(|i| crate::utils::model_download::human_size(i.size))
+                .unwrap_or_default();
+            let note = tier_menu_desc(tier);
+            // 已下载时显示**实际**占用（与清单里的期望值可能不同：本机可能是
+            // q5_1 或用户自己的量化），用户才知道删这个能腾多少空间。
+            let actual = loaded
+                .as_deref()
+                .and_then(crate::utils::model_download::disk_size)
+                .map(crate::utils::model_download::human_size);
+
+            // 左列：名称 + 选中标记；右列：状态 + 下载/删除
+            let mut info = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(Theme::SPACE_1_5))
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(if is_sel {
+                            Theme::accent_mint()
+                        } else {
+                            Theme::text_muted()
+                        })
+                        .child(tier.label()),
+                );
+            if present {
+                if let Some(actual) = actual.clone() {
+                    info = info.child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child(format!("已占 {actual}")),
+                    );
+                }
+            } else if !size_text.is_empty() {
+                info = info.child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(Theme::text_muted())
+                        .child(format!("约 {size_text}")),
+                );
+            }
+            if is_sel {
+                info = info.child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(Theme::accent_mint())
+                        .child("[当前]"),
+                );
+            }
+
+            // 行尾：就位状态 + 下载 / 删除（管理动作内联在档位行，见文件头注释）。
+            let mut tail = div()
+                .flex()
+                .items_center()
+                .flex_shrink_0()
+                .gap(px(Theme::SPACE_1_5));
+            if present {
+                tail = tail.child(primitives::badge("已就位"));
+                if let Some(del_id) = deletable_id {
+                    let is_self_build = self.state.model_is_custom_build(del_id);
+                    let name_owned = tier.label().to_string();
+                    // 自编译构建在界面上仍显示按钮但置灰，文案换成「自编译」——
+                    // 比直接消失更能解释「为什么这档删不了」。
+                    let can_delete = !downloading && !is_self_build;
+                    tail = tail.child(
+                        primitives::mini_btn(if is_self_build { "自编译" } else { "删除" }, can_delete)
+                            .id(("perf-tier-del", ti))
+                            .when(can_delete, |d| {
+                                d.on_click(cx.listener(move |this, _, _, cx| {
+                                    // 阻止冒泡：否则点「删除」会顺带触发外层的
+                                    // 「选中该档位」——用户会发现自己只是要删文件，
+                                    // 却把正在用的档位顺手换成了一个没下载的档。
+                                    cx.stop_propagation();
+                                    this.confirm_dialog = Some(crate::ui::types::ConfirmDialogInfo {
+                                        title: format!("删除「{name_owned}」？"),
+                                        message: "将删除本地模型文件。删除后可随时重新下载，已完成的转写工程不受影响。".to_string(),
+                                        confirm_label: "删除".to_string(),
+                                        danger: true,
+                                        action: crate::ui::types::ConfirmAction::DeleteModelFile(
+                                            del_id.to_string(),
+                                        ),
+                                    });
+                                    cx.notify();
+                                }))
+                            }),
+                    );
+                }
+            } else if downloading {
+                tail = tail.child(primitives::badge_accent("下载中"));
+            } else {
+                // 未就位时按**规范 id** 下载（回退文件不是可下载项，不该出现在这里）。
+                let dl_id: &'static str = canonical_id.unwrap_or_default();
+                tail = tail.child(
+                    primitives::mini_btn("下载", true)
+                        .id(("perf-tier-dl", ti))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // 同上：下载按钮不应顺带改变当前档位。
+                            cx.stop_propagation();
+                            this.start_model_download(dl_id, cx);
+                        })),
+                );
+            }
+
+            // 行首：一个圆点，选中态实心薄荷色（复用与导出下拉一致的视觉语言）
+            let row = div()
+                .id(("perf-tier-row", ti))
+                .px(px(Theme::SPACE_2))
+                .py(px(Theme::SPACE_1_5))
+                .rounded(px(Theme::RADIUS_MD))
+                .cursor_pointer()
+                .bg(if is_sel {
+                    Theme::tint_mint_badge()
+                } else {
+                    Theme::transparent()
+                })
+                .hover(|s| s.bg(Theme::bg_hover()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.state.set_whisper_model_tier(tier);
+                    cx.notify();
+                }))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(Theme::SPACE_3))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w(px(0.0))
+                        .gap(px(Theme::SPACE_0_5))
+                        .child(info)
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(Theme::text_muted())
+                                .child(note),
+                        ),
+                )
+                .child(tail);
+            menu = menu.child(row);
+        }
+        Some(menu.into_any_element())
+    }
+
+    /// 步骤 4.5：音频前端预处理与救场解码。
+    ///
+    /// # 为什么这一卡必须存在
+    ///
+    /// 这些开关（降噪 / 归一 / 高通 / 停顿压实 / 音频加速 / VAD 阈值 / 低置信救场）
+    /// 全部**早已接线进管线**，`README` 也把它们写成卖点（「弱语音场景下提升识别率」），
+    /// 但此前没有任何界面入口——只有翻开 `config.toml` 才知道它们存在。功能做了却
+    /// 没人能开，等于没做；而弱语音素材正是这些开关唯一有价值的场景。
+    ///
+    /// # 为什么默认收起
+    ///
+    /// 默认值已是实测最优（增强全开、压实关闭、救场关闭），误改会**变慢或变差**。
+    /// 用「展开」把入口藏一层，既让需要的人找得到，又不让默认路径上的用户碰到。
+    fn render_audio_pipeline_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.state.show_audio_advanced;
+        let p = &self.state.config.pipeline;
+        let enabled = p.preprocess_enabled;
+        let denoise = p.preprocess_denoise;
+        let normalize = p.preprocess_normalize;
+        let compact = p.preprocess_compact;
+        let highpass = p.preprocess_highpass_hz;
+        let speed = p.whisper_audio_speed;
+        let vad = p.whisper_vad_threshold;
+        let rescue = p.whisper_rescue_logprob;
+
+        // 总开关：关掉即完全回到「原始音频直喂模型」的旧行为（便于 A/B 对比）。
+        let master = primitives::pill_btn_solid(
+            if enabled { "已开启" } else { "已关闭" },
+            if enabled {
+                Theme::accent_mint()
+            } else {
+                Theme::bg_card_hover()
+            },
+        )
+        .id("perf-audio-preprocess-toggle")
+        .text_color(if enabled {
+            Theme::text_on_accent()
+        } else {
+            Theme::text_muted()
+        })
+        .on_click(cx.listener(|this, _, _, cx| {
+            let next = !this.state.config.pipeline.preprocess_enabled;
+            this.state.config.pipeline.preprocess_enabled = next;
+            let _ = this.state.config.save_to_file("config.toml");
+            cx.notify();
+        }))
+        .into_any_element();
+
+        // 三个增强开关：走同一个小胶囊工厂，选中态用薄荷色（与全局导航一致）。
+        let toggle = |id: &'static str,
+                      label: &'static str,
+                      on: bool,
+                      cx: &mut Context<Self>,
+                      set: fn(&mut crate::utils::config::PipelineConfig, bool)|
+         -> Stateful<Div> {
+            primitives::segmented(label, on, false)
+                .id(id)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    set(&mut this.state.config.pipeline, !on);
+                    let _ = this.state.config.save_to_file("config.toml");
+                    cx.notify();
+                }))
+        };
+
+        let enhancements = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .child(toggle(
+                "perf-pre-denoise",
+                "谱减降噪",
+                denoise,
+                cx,
+                |c, v| c.preprocess_denoise = v,
+            ))
+            .child(toggle(
+                "perf-pre-normalize",
+                "电平归一",
+                normalize,
+                cx,
+                |c, v| c.preprocess_normalize = v,
+            ))
+            .child(toggle(
+                "perf-pre-compact",
+                "停顿压实",
+                compact,
+                cx,
+                |c, v| c.preprocess_compact = v,
+            ))
+            .into_any_element();
+
+        // 三个滑条用整数档位（渲染器只吃 u32），显示时再换算回物理量。
+        let hp_val = highpass.round().clamp(0.0, 200.0) as u32;
+        let hp_slider = self.render_slider(
+            "perf-slider-highpass",
+            "高通截止",
+            hp_val,
+            0,
+            200,
+            if hp_val == 0 {
+                "关闭".to_string()
+            } else {
+                format!("{hp_val} Hz")
+            },
+            "削掉 80 Hz 以下只贡献能量不贡献信息的低频（空调声、桌面震动）".to_string(),
+            cx,
+            move |this, v, cx| {
+                this.state.config.pipeline.preprocess_highpass_hz = v as f64;
+                let _ = this.state.config.save_to_file("config.toml");
+                cx.notify();
+            },
+        );
+
+        let speed_val = (speed * 100.0).round().clamp(100.0, 150.0) as u32;
+        let speed_slider = self.render_slider(
+            "perf-slider-audio-speed",
+            "输入音频加速",
+            speed_val,
+            100,
+            150,
+            format!("{:.2}×", speed_val as f64 / 100.0),
+            "只加速喂给模型的音频，字幕时间戳会映射回原时间轴；1.25× 约省两成时间".to_string(),
+            cx,
+            move |this, v, cx| {
+                this.state.config.pipeline.whisper_audio_speed = v as f64 / 100.0;
+                let _ = this.state.config.save_to_file("config.toml");
+                cx.notify();
+            },
+        );
+
+        let vad_val = (vad * 100.0).round().clamp(10.0, 90.0) as u32;
+        let vad_slider = self.render_slider(
+            "perf-slider-vad",
+            "静音检测阈值",
+            vad_val,
+            10,
+            90,
+            format!("{:.2}", vad_val as f64 / 100.0),
+            "越高越激进，轻声更可能被整段跳过；噪声大的素材可适当调高".to_string(),
+            cx,
+            move |this, v, cx| {
+                this.state.config.pipeline.whisper_vad_threshold = v as f64 / 100.0;
+                let _ = this.state.config.save_to_file("config.toml");
+                cx.notify();
+            },
+        );
+
+        let rescue_on = rescue < 0.0;
+        let rescue_control = div()
+            .flex()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .child(if rescue_on {
+                        format!("阈值 {rescue:.2}")
+                    } else {
+                        "关闭".to_string()
+                    }),
+            )
+            .child(
+                primitives::segmented("低置信二段重解码", rescue_on, false)
+                    .id("perf-rescue-toggle")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        // 关闭写回 0.0（与 `default_rescue_logprob` 同值）；
+                        // 开启给一个实测可用的保守值 -0.65。
+                        let cur = this.state.config.pipeline.whisper_rescue_logprob;
+                        this.state.config.pipeline.whisper_rescue_logprob =
+                            if cur < 0.0 { 0.0 } else { -0.65 };
+                        let _ = this.state.config.save_to_file("config.toml");
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_muted())
+                    .child("对低置信窗口重新解码一遍（更准但明显更慢，长片慎用）"),
+            )
+            .into_any_element();
+
+        let mut card = primitives::card_rows().child(
+            div()
+                .w_full()
+                .py(px(Theme::SPACE_2))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(Theme::SPACE_3))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(Theme::SPACE_0_5))
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_BODY_LG))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(Theme::text_primary())
+                                .child("音频预处理与救场"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(Theme::text_muted())
+                                .child("默认已是最优组合；弱语音 / 远场素材可在此微调"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(Theme::SPACE_2))
+                        .child(master)
+                        .child(
+                            primitives::mini_btn(if open { "收起" } else { "展开" }, true)
+                                .id("perf-audio-advanced-toggle")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.show_audio_advanced =
+                                        !this.state.show_audio_advanced;
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+        );
+
+        if !open {
+            return card;
+        }
+
+        // 总开关关闭时把增强项整块调暗：仍可见可改（便于提前配好），但明确未生效。
+        let dim = move |el: AnyElement| -> AnyElement {
+            if enabled {
+                el
+            } else {
+                div().opacity(0.45).child(el).into_any_element()
+            }
+        };
+
+        card = card
+            .child(Self::render_setting_divider())
+            .child(
+                div()
+                    .w_full()
+                    .py(px(Theme::SPACE_2))
+                    .child(dim(enhancements)),
+            )
+            .child(Self::render_setting_divider())
+            .child(hp_slider)
+            .child(Self::render_setting_divider())
+            .child(speed_slider)
+            .child(Self::render_setting_divider())
+            .child(vad_slider)
+            .child(Self::render_setting_divider())
+            .child(
+                div()
+                    .w_full()
+                    .py(px(Theme::SPACE_2))
+                    .flex()
+                    .flex_col()
+                    .gap(px(Theme::SPACE_1_5))
+                    .child(rescue_control),
+            );
+
+        // 返回 `card`：上面是赋值语句（值为 `()`），必须以表达式收尾才能满足
+        // `impl IntoElement` 的返回类型。
+        card
     }
 
     /// 步骤 3：并行度设置（转写线程数 / 并行进程数 / 润色线程数）
@@ -1328,7 +2064,7 @@ impl MainWindow {
     /// 各自在按下与按住移动时把本档取值回传。这样无需任何坐标换算，
     /// 也不依赖窗口尺寸，天然适配不同 DPI 与布局。
     #[allow(clippy::too_many_arguments)]
-    fn render_slider(
+    pub(crate) fn render_slider(
         &self,
         id: &'static str,
         label: &'static str,
@@ -1474,7 +2210,11 @@ impl MainWindow {
             Theme::text_muted()
         })
         .on_click(cx.listener(|this, _, _, cx| {
-            this.state.enable_polish = !this.state.enable_polish;
+            // 走 setter 落盘：只翻内存里的布尔量会让「关掉润色」在重启后失效
+            // （配置里仍是 true，启动又读回来）。模式沿用当前档位。
+            let next = !this.state.enable_polish;
+            let mode = this.state.polish_mode;
+            this.state.set_polish(next, mode);
             cx.notify();
         }))
         .into_any_element();
@@ -1486,9 +2226,9 @@ impl MainWindow {
                 is_punc && enable_polish,
                 cx,
                 |this, cx| {
-                    // 点选润色引擎 = 明确要润色，顺手打开总开关
-                    this.state.enable_polish = true;
-                    this.state.polish_mode = crate::app::PolishMode::PuncFast;
+                    // 点选润色引擎 = 明确要润色，顺手打开总开关（并落盘）
+                    this.state
+                        .set_polish(true, crate::app::PolishMode::PuncFast);
                     cx.notify();
                 },
             ))
@@ -1498,8 +2238,8 @@ impl MainWindow {
                 !is_punc && enable_polish,
                 cx,
                 |this, cx| {
-                    this.state.enable_polish = true;
-                    this.state.polish_mode = crate::app::PolishMode::QwenDeep;
+                    this.state
+                        .set_polish(true, crate::app::PolishMode::QwenDeep);
                     cx.notify();
                 },
             ))
@@ -1520,7 +2260,7 @@ impl MainWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::effective_glossary_count;
+    use super::{effective_glossary_count, local_model_status, tier_menu_desc};
     use crate::utils::config::TranslateConfig;
 
     /// 回归（P2）：术语表计数必须与**实际注入**一致——超过上限时显示生效数，
@@ -1618,5 +2358,78 @@ mod tests {
                 status.requested, status.actual
             )
         );
+    }
+
+    /// 回归：离线模型行「校验结果」与「是否就位」两路信号必须合成一条不矛盾的提示。
+    /// 最容易写错的两处：① 校验通过但模型其实没就位（例如自备 GGUF 体积没过
+    /// 400MB 下限）时不该显示成「放心了」；② 按过「恢复默认」后内置模型还没下，
+    /// 也不该给确认。两者都必须落到「未就位，下一步怎么办」。
+    #[test]
+    fn local_model_status_never_claims_ready_when_model_missing() {
+        // 编辑过且校验失败：红字原因原样透传，优先于就位判定
+        let (ok, msg) = local_model_status(
+            Some((
+                false,
+                "找不到模型文件：D:\\x.gguf（相对路径以项目根为基准）".to_string(),
+            )),
+            false,
+            false,
+        );
+        assert!(!ok);
+        assert!(msg.contains("找不到模型文件"), "应透传校验原因: {msg}");
+
+        // 编辑过、校验通过，但 qwen-llm 仍未就位（体积没过下限）：
+        // 不能报「路径有效」，要说未就位 + 下一步动作
+        let (ok, msg) = local_model_status(Some((true, "路径有效".to_string())), false, false);
+        assert!(!ok, "校验通过 ≠ 引擎可用，模型未就位时不得中性确认");
+        assert!(msg.contains("未就位"), "应提示未就位: {msg}");
+
+        // 编辑过、校验通过、模型确实就位：中性确认
+        let (ok, msg) = local_model_status(Some((true, "路径有效".to_string())), true, false);
+        assert!(ok);
+        assert_eq!(msg, "路径有效");
+
+        // 没编辑过、模型就位：中性说明（不报红）
+        let (ok, msg) = local_model_status(None, true, false);
+        assert!(ok);
+        assert!(msg.contains("已就位"), "{msg}");
+
+        // 没编辑过、模型未就位：红字 + 可操作指引
+        let (ok, msg) = local_model_status(None, false, false);
+        assert!(!ok);
+        assert!(msg.contains("下载模型"), "{msg}");
+
+        // 下载中：没有失败校验时给中性「正在下载…」（别让「未就位」看起来像没反应）
+        let (ok, msg) = local_model_status(None, false, true);
+        assert!(ok);
+        assert!(msg.contains("正在下载"), "{msg}");
+
+        // 但**失败校验优先级最高**，下载中也不盖掉：下载的是内置默认模型，
+        // 而配置里的路径仍是错的，下完照样用不了——红字与「恢复默认」必须同时在场。
+        let (ok, msg) =
+            local_model_status(Some((false, "找不到模型文件".to_string())), false, true);
+        assert!(!ok, "路径错误必须持续可见，下载遮不住它");
+        assert!(msg.contains("找不到模型文件"), "{msg}");
+    }
+
+    /// 档位下拉里每档的说明必须非空且互不相同。
+    ///
+    /// 说明文案是用户决定「选哪一档」的唯一依据；漏写会渲染出一行光秃秃的标题，
+    /// 两档写成同一句则等于没写。以后加档位时这条会先红。
+    #[test]
+    fn tier_menu_desc_is_present_and_unique_per_tier() {
+        use crate::app::WhisperModelTier as T;
+        let mut seen = std::collections::HashSet::new();
+        for tier in [
+            T::Fast,
+            T::Balanced,
+            T::TurboSpeed,
+            T::Precise,
+            T::SenseVoice,
+        ] {
+            let desc = tier_menu_desc(tier);
+            assert!(!desc.trim().is_empty(), "{tier:?} 缺少档位说明");
+            assert!(seen.insert(desc), "{tier:?} 的说明与别的档位重复: {desc}");
+        }
     }
 }
