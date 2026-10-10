@@ -62,7 +62,7 @@ api_key = "111111"
 api_model = "cn:deepseek-v4.1-flash"
 batch_size = 20
 timeout_secs = 120
-target_lang = "简体中文"
+target_lang = "日本語"
 glossary = ""
 max_glossary_entries = 80
 
