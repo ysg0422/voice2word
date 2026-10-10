@@ -7,15 +7,9 @@
 #     git push origin v0.1.0
 #
 # 触发后本工作流会：
-#   1. 在 windows-latest 上构建 release（产物为绿色版 exe）
+#   1. 在 windows-latest 上构建 release（产物为绿色便携版 exe）
 #   2. 跑一次 lib 单测做最低限度的发布前验证
-#   3. 组装「瘦包」（exe + config.toml + Python 胶水 + 首次使用说明）
-#   4. 创建 GitHub Release 并把 zip 挂上去（tag 带 - 的视为预发布）
-#
-# 关于「瘦包」：包内**不含**模型与外部工具（约 280MB），用户首次运行
-# 时通过界面「模型与组件 → 一键补齐」下载。这样发布物只有约 10MB，
-# 且用户拿到的一定是最新模型。组装逻辑与 scripts/package_release.ps1 一致，
-# 这里内联一份以便 CI 不依赖本地脚本的编码/路径假设。
+#   3. 创建 GitHub Release 并直接发布 voice2word.exe（tag 带 - 的视为预发布）
 #
 # 关于权限：创建 Release 需要 contents: write（本文件显式声明）。
 # 若推送 tag 时被拒并提示 workflow scope，说明所用 PAT 缺少 workflow 权限。
@@ -72,96 +66,7 @@ jobs:
         run: cargo build --release
 
       # ---------------------------------------------------------------
-      # 组装瘦包（与 scripts/package_release.ps1 同构）
-      # ---------------------------------------------------------------
-      - name: Assemble lite package
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          # 版本号优先取 tag（去掉前缀 v），保证与发布标签一致
-          $tag = '${{ github.ref_name }}'
-          $version = $tag -replace '^v', ''
-          if (-not $version) { throw "无法从 tag 解析版本号: $tag" }
-
-          $pkgName = "voice2word-v$version-win64-lite"
-          $stage = Join-Path $env:RUNNER_TEMP $pkgName
-          New-Item -ItemType Directory -Path $stage -Force | Out-Null
-
-          # 1) 主程序
-          Copy-Item -LiteralPath 'target/release/voice2word.exe' -Destination $stage -Force
-
-          # 2) 可移植默认配置（路径全是相对路径）
-          if (Test-Path -LiteralPath 'config.toml') {
-            Copy-Item -LiteralPath 'config.toml' -Destination $stage -Force
-          } else {
-            Write-Warning 'config.toml 不存在（程序首次运行会自动生成）'
-          }
-
-          # 3) Python 胶水（SenseVoice / CT-Punc 走它们）
-          $tools = Join-Path $stage 'tools'
-          New-Item -ItemType Directory -Path $tools -Force | Out-Null
-          foreach ($py in @('tools/punc_runner.py', 'tools/sensevoice_runner.py')) {
-            if (Test-Path -LiteralPath $py) {
-              Copy-Item -LiteralPath $py -Destination $tools -Force
-            } else {
-              Write-Warning "缺少 $py"
-            }
-          }
-
-          # 4) 首次使用说明
-          $readme = @"
-          Voice2Word v$version — 首次使用说明
-          ================================================
-
-          一、直接运行
-             双击 voice2word.exe 即可启动（绿色版，无需安装）。
-             配置、字幕库(voice2word.db)、日志都会写在 exe 所在目录。
-
-          二、首次运行需补齐「模型与组件」（约 280MB，只需一次）
-             本包是瘦包，不含模型与外部工具：
-               1. 打开「性能设置」页
-               2. 找到「模型与组件」卡片
-               3. 点击「一键补齐缺失的 N 项」
-               4. 等待下载完成（默认走免梯子镜像）
-
-          三、功能
-             语音转写 → 标点/润色 → 多语言翻译 → 剪辑校对 → 导出
-             导出：SRT / ASS / VTT / TXT / JSON / TTML / FCPXML / Premiere / 剪映
-
-          四、翻译
-             离线：本地 Qwen（免费，需下载翻译模型）
-             在线：在「性能设置 → 翻译」填接口基址 / API Key / 模型
-                   （模型 id 需与服务端 /v1/models 一致）
-          "@
-          # here-string 的缩进要剥掉，否则说明里带一堆前导空格
-          $readme = ($readme -split "`n" | ForEach-Object { $_.TrimStart(' ') }) -join "`n"
-          Set-Content -LiteralPath (Join-Path $stage 'README-首次使用.txt') -Value $readme -Encoding utf8NoBOM
-
-          # 5) 打 zip
-          $zip = Join-Path $env:RUNNER_TEMP "$pkgName.zip"
-          if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal
-
-          $size = (Get-Item -LiteralPath $zip).Length
-          Write-Host ("打包完成: {0} ({1:N1} MB)" -f $zip, ($size / 1MB))
-
-          # 供后续步骤引用
-          "PKG_ZIP=$zip" >> $env:GITHUB_ENV
-          "PKG_VERSION=$version" >> $env:GITHUB_ENV
-
-      - name: Upload package as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: voice2word-win64-lite
-          path: ${{ env.PKG_ZIP }}
-          if-no-files-found: error
-          retention-days: 30
-
-      # ---------------------------------------------------------------
-      # 创建 Release 并附上 zip。
-      # 纯 exe 也一并附上，方便只想换主程序的用户。
-      # tag 里带 '-'（如 v0.2.0-beta.1）自动标为预发布。
+      # 创建 Release 并发布纯净便携版 voice2word.exe
       # ---------------------------------------------------------------
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -170,22 +75,12 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
-          files: |
-            ${{ env.PKG_ZIP }}
-            target/release/voice2word.exe
+          files: target/release/voice2word.exe
           body: |
-            ## Voice2Word ${{ github.ref_name }}（Windows x64）
+            ## Voice2Word ${{ github.ref_name }} (Windows x64)
 
-            ### 下载哪个
-            | 文件 | 说明 |
-            | --- | --- |
-            | `voice2word-v${{ env.PKG_VERSION }}-win64-lite.zip` | **推荐**。绿色版，解压即用；首次运行在「模型与组件」一键补齐模型（约 280MB） |
-            | `voice2word.exe` | 只想换主程序时用（需自备 models/ 与 tools/） |
+            纯净便携单文件版，直接下载 `voice2word.exe` 即可运行（绿色免安装）。
 
-            ### 首次使用
-            1. 解压 zip，双击 `voice2word.exe`
-            2. 进「性能设置 → 模型与组件」→「一键补齐缺失的 N 项」
-            3. 回到「语音转写」页开始使用
-
-            ### 本版要点
-            见下方自动生成的变更说明。
+            ### 使用说明
+            1. 下载下方 `voice2word.exe` 双击即可运行。
+            2. 首次运行若缺少本地语音或标点模型，进入「性能设置 → 模型与组件」一键补齐即可。
