@@ -61,6 +61,7 @@ pub(crate) fn local_model_status(
 ///
 /// 文案的取法是「定位 + 硬指标」：用户看这一行就是在决定选哪个，所以每档要能一句话
 /// 说清它适合谁（最快 / 均衡 / 较准 / 最准），并带上参数量或提速幅度这类可核对的数。
+#[allow(dead_code)]
 pub(crate) fn tier_menu_desc(tier: crate::app::WhisperModelTier) -> &'static str {
     use crate::app::WhisperModelTier as T;
     match tier {
@@ -346,14 +347,14 @@ impl MainWindow {
         primitives::page_shell("performance-settings-page")
             // 1. 页头：标题 + 帮助按钮
             .child(self.render_page_header(cx))
-            // 2. 推荐配置：硬件评估档位 + 用户推理偏好 + 一键套用（真正落盘）
-            .child(self.render_recommend_card(cx))
-            // 3. 配置说明卡 (右上角问号按钮展开)
+            // 2. 配置说明卡 (右上角问号按钮展开)
             .children(if self.state.show_perf_help {
                 Some(self.render_perf_help_card(cx))
             } else {
                 None
             })
+            // 1.5 硬件加速模式选择（我有 GPU / 纯 CPU 模式）
+            .child(self.render_hardware_tier_card(cx))
             // 4. 步骤 2: 识别引擎与模型架构选择
             .child(self.render_engine_selection_card(cx))
             // 5. 步骤 3: 并行度（线程数 / 进程数滑条，量程按本机核心数推导）
@@ -366,6 +367,80 @@ impl MainWindow {
             .child(self.render_translate_settings_card(cx))
             // 8. 步骤 6: 模型与外部组件（缺什么、一键补齐；全部走国内镜像）
             .child(self.render_model_manager(false, cx))
+    }
+
+    /// 硬件加速模式选择卡（我有 GPU / 纯 CPU 模式自由无缝切换）
+    fn render_hardware_tier_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_gpu = self.state.config.gpu.is_gpu_tier();
+
+        let tier_control = primitives::segmented_cluster()
+            .child(self.seg_option(
+                "perf-tier-gpu",
+                "⚡ 我有独立显卡 (GPU 加速)",
+                is_gpu,
+                cx,
+                |this, cx| {
+                    this.state.set_hardware_tier(true);
+                    cx.notify();
+                },
+            ))
+            .child(self.seg_option(
+                "perf-tier-cpu",
+                "💻 无独立显卡 (纯 CPU 模式)",
+                !is_gpu,
+                cx,
+                |this, cx| {
+                    this.state.set_hardware_tier(false);
+                    cx.notify();
+                },
+            ))
+            .into_any_element();
+
+        primitives::card_rows()
+            .child(
+                div()
+                    .w_full()
+                    .py(px(Theme::SPACE_2))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(Theme::SPACE_3))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(Theme::SPACE_0_5))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(Theme::SPACE_2))
+                                    .child(
+                                        div()
+                                            .text_size(px(Theme::TEXT_BODY_LG))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::text_primary())
+                                            .child("硬件加速模式"),
+                                    )
+                                    .child(if is_gpu {
+                                        primitives::badge_accent("⚡ GPU 加速已启用")
+                                    } else {
+                                        primitives::badge("💻 纯 CPU 模式")
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_muted())
+                                    .child(if is_gpu {
+                                        "已开启显卡硬件加速推理与视频硬解，推荐搭配 Whisper Turbo Q5 / Q8 大模型"
+                                    } else {
+                                        "已优化多核 CPU 线程调度，不占用任何显卡资源，推荐搭配 SenseVoice 极速或 Small 模型"
+                                    }),
+                            ),
+                    )
+                    .child(tier_control),
+            )
     }
 
     /// 步骤 5：字幕翻译引擎设置。
@@ -539,7 +614,7 @@ impl MainWindow {
                             format!("已启用 {glossary_count} 条术语")
                         }
                     } else {
-                        "未设置（可留空）".to_string()
+                        "未设置".to_string()
                     }),
             )
             .child(
@@ -640,13 +715,6 @@ impl MainWindow {
                     .flex()
                     .flex_col()
                     .gap(px(Theme::SPACE_2))
-                    .child(
-                        div()
-                            .w_full()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_muted())
-                            .child(TranslateConfig::MODEL_ID_HELP),
-                    )
                     .child(model_fetch_row)
                     .children(model_choice_row)
                     .into_any_element())),
@@ -718,6 +786,7 @@ impl MainWindow {
     /// UI 侧一次都没调用过：用户既看不到自己属于哪一档，也没有按钮能让推荐参数
     /// 真正生效。这里把这条链路补全：选偏好 → 重算策略矩阵 → 写进 config.toml，
     /// 并把「当前档位 / 将要生效的参数 / 是否已偏离推荐」一并回显。
+    #[allow(dead_code)]
     fn render_recommend_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::core::UserStrategy;
 
@@ -1104,116 +1173,147 @@ impl MainWindow {
                     .children(download)
                     .children(restore),
             )
-            .child(
+            .children((!ok).then(|| {
                 div()
                     .w_full()
                     .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(if ok {
-                        Theme::text_muted()
-                    } else {
-                        Theme::accent_red()
-                    })
-                    .child(msg),
-            )
+                    .text_color(Theme::accent_red())
+                    .child(msg)
+            }))
             .into_any_element()
     }
 
-    /// 模型下拉所在行的「行尾」内容：拉取按钮 + 结果状态小字。
+    /// 模型下拉所在行的「行尾」内容：高亮绿色的 [获取模型列表] 按钮 + 结果状态。
     fn render_model_fetch_row(&self, is_online: bool, cx: &mut Context<Self>) -> AnyElement {
-        const MODEL_FETCH_MSG_MAX_W: f32 = 420.0;
+        const MODEL_FETCH_MSG_MAX_W: f32 = 520.0;
         let cfg = self.state.config.translate.clone();
-        let (loading, status, models) = model_cache_snapshot(&cfg);
-        let model_selected = self.state.config.translate.api_model.trim().to_string();
-        let has_selection = models.iter().any(|m| m.id == model_selected);
+        let (loading, status, _models) = model_cache_snapshot(&cfg);
 
-        let mut button = primitives::chip(
-            if loading {
-                "拉取中…"
+        // 1. 高亮绿色的 [获取模型列表] 按钮
+        let mut button = div()
+            .id("perf-translate-models-btn")
+            .px(px(Theme::SPACE_3))
+            .py(px(Theme::SPACE_1))
+            .rounded(px(Theme::RADIUS_MD))
+            .bg(if loading {
+                Theme::bg_disabled()
             } else {
-                "拉取模型列表"
-            },
-            false,
-            false,
-        )
-        .id("perf-translate-models-btn");
+                Theme::accent_mint()
+            })
+            .border_1()
+            .border_color(if loading {
+                Theme::border()
+            } else {
+                Theme::accent_mint_deep()
+            })
+            .text_size(px(Theme::TEXT_SMALL))
+            .font_weight(FontWeight::BOLD)
+            .text_color(if loading {
+                Theme::text_disabled()
+            } else {
+                Theme::text_on_accent()
+            });
+
         if !loading && is_online {
             button = button
                 .cursor_pointer()
-                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                .hover(|s| s.bg(Theme::accent_mint_deep()))
                 .on_click(cx.listener(|this, _, _, cx| this.fetch_translate_models(cx)));
         }
 
-        let mut row = div()
-            .flex()
-            .items_center()
-            .flex_wrap()
-            .gap(px(Theme::SPACE_2))
-            .child(button);
-        if let Some((ok, text)) = status {
-            row = row.children(text.lines().map(move |line| {
-                div()
-                    .max_w(px(MODEL_FETCH_MSG_MAX_W))
-                    .text_size(px(Theme::TEXT_SMALL))
-                    .text_color(if ok {
-                        Theme::accent_mint()
-                    } else {
-                        Theme::accent_red()
-                    })
-                    .child(line.to_string())
-            }));
-        }
-        // 列表拉到了、但当前模型名不在列表里：直接提示，免得用户拿着一个
-        // 会 400 的 id 去点「测试连接」
-        if !loading && !models.is_empty() && !has_selection {
-            row = row.child(
-                div()
-                    .max_w(px(MODEL_FETCH_MSG_MAX_W))
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(Theme::accent_orange())
-                    .child("当前模型名不在服务端列表内，点下方的 id 直接替换"),
-            );
-        }
-        row.into_any_element()
-    }
+        let button_el = button.child(if loading {
+            "获取中…"
+        } else {
+            "[获取模型列表]"
+        });
 
-    /// 服务端模型的下拉列表：点击即写入模型名（复用 `segmented` 范式，不自造样式）。
-    fn render_model_choice_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (loading, _, models) = model_cache_snapshot(&self.state.config.translate);
-        if loading || models.is_empty() {
-            return div().into_any_element();
-        }
-        let selected = self.state.config.translate.api_model.trim().to_string();
         let mut row = div()
             .w_full()
             .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(Theme::SPACE_2_5))
+                    .child(button_el),
+            );
+
+        if let Some((false, text)) = status {
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Theme::SPACE_1))
+                    .children(text.lines().map(move |line| {
+                        div()
+                            .max_w(px(MODEL_FETCH_MSG_MAX_W))
+                            .text_size(px(Theme::TEXT_SMALL))
+                            .text_color(Theme::accent_red())
+                            .child(line.to_string())
+                    })),
+            );
+        }
+
+        row.into_any_element()
+    }
+
+    /// 服务端模型的下拉列表/平铺选择区（直接获取到啥，列表池就有啥，点击即选入）。
+    fn render_model_choice_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (loading, _, models) = model_cache_snapshot(&self.state.config.translate);
+        let selected = self.state.config.translate.api_model.trim().to_string();
+
+        if models.is_empty() || loading {
+            return div().into_any_element();
+        }
+
+        let mut container = div()
+            .w_full()
+            .p(px(Theme::SPACE_2_5))
+            .rounded(px(Theme::RADIUS_MD))
+            .bg(Theme::bg_track())
+            .border_1()
+            .border_color(Theme::border())
+            .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_2));
+
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(Theme::text_secondary())
+                    .child(format!("服务端可用模型池（共 {} 个，点击直接填入）：", models.len())),
+            );
+        container = container.child(header);
+
+        let mut chips_row = div()
+            .w_full()
+            .flex()
             .flex_wrap()
-            .gap(px(Theme::SPACE_1_5))
-            .pb(px(Theme::SPACE_2));
+            .gap(px(Theme::SPACE_1_5));
+
         for model in models {
             let id = model.id.clone();
             let is_sel = id == selected;
-            let mut pill = primitives::segmented(model.display_label(), is_sel, false)
-                .id(SharedString::from(format!("perf-translate-model-{id}")))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.apply_translate_model(&id, cx);
-                }));
-            if let Some(tag) = model.reasoning_tag() {
-                // 推理模型标记：推理模型翻译更慢、更吃输出预算，正是用户踩过的坑
-                pill = pill.child(
-                    div()
-                        .ml(px(Theme::SPACE_1))
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .text_color(if is_sel {
-                            Theme::accent_blue()
-                        } else {
-                            Theme::accent_orange()
-                        })
-                        .child(tag),
-                );
-            }
-            row = row.child(pill);
+            chips_row = chips_row.child(
+                primitives::chip(model.display_label(), is_sel, false)
+                    .id(SharedString::from(format!("perf-fetched-model-{id}")))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.apply_translate_model(&id, cx);
+                    })),
+            );
         }
-        row.into_any_element()
+
+        container.child(chips_row).into_any_element()
     }
 
     /// 设置行通用布局：左侧名称，右侧单行等级选择器（简约，无描述小字）
@@ -1304,25 +1404,7 @@ impl MainWindow {
                     .into_any_element()
             });
 
-        if !fallback {
-            return row;
-        }
-
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .child(row)
-            .child(
-                // 日志里那条告警太长，这里只留可操作的那两句；用最小字号单独一行，
-                // 免得把卡片行高撑乱
-                div()
-                    .w_full()
-                    .pb(px(Theme::SPACE_2))
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(Theme::accent_orange())
-                    .child("按日志指引修复后重启生效：`pip install onnxruntime-directml` 并改用 DirectML 版 sherpa-onnx；不打算升级就把 provider 切回 `cpu`。"),
-            )
+        row
     }
 
     /// 步骤 2：识别引擎与模型架构选择 (每行一个配置项，右侧单行等级选择)
@@ -1539,7 +1621,6 @@ impl MainWindow {
             let size_text = item
                 .map(|i| crate::utils::model_download::human_size(i.size))
                 .unwrap_or_default();
-            let note = tier_menu_desc(tier);
             // 已下载时显示**实际**占用（与清单里的期望值可能不同：本机可能是
             // q5_1 或用户自己的量化），用户才知道删这个能腾多少空间。
             let actual = loaded
@@ -1665,20 +1746,7 @@ impl MainWindow {
                 .items_center()
                 .justify_between()
                 .gap(px(Theme::SPACE_3))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .min_w(px(0.0))
-                        .gap(px(Theme::SPACE_0_5))
-                        .child(info)
-                        .child(
-                            div()
-                                .text_size(px(Theme::TEXT_CAPTION))
-                                .text_color(Theme::text_muted())
-                                .child(note),
-                        ),
-                )
+                .child(info)
                 .child(tail);
             menu = menu.child(row);
         }
@@ -2072,7 +2140,7 @@ impl MainWindow {
         min: u32,
         max: u32,
         value_text: String,
-        hint: String,
+        _hint: String,
         cx: &mut Context<Self>,
         on_change: impl Fn(&mut Self, u32, &mut Context<Self>) + Copy + 'static,
     ) -> Stateful<Div> {
@@ -2176,13 +2244,6 @@ impl MainWindow {
                                     ))
                             })),
                     ),
-            )
-            // 提示
-            .child(
-                div()
-                    .text_size(px(Theme::TEXT_SMALL))
-                    .text_color(Theme::text_muted())
-                    .child(hint),
             )
     }
 

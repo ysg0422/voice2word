@@ -793,6 +793,22 @@ impl AppState {
         self.refresh_model_presence();
     }
 
+    /// 切换硬件加速层级（GPU / CPU），联动推理配置并持久化落盘
+    pub fn set_hardware_tier(&mut self, is_gpu: bool) {
+        self.config.apply_hardware_tier(is_gpu);
+        if is_gpu {
+            self.whisper_model_tier = WhisperModelTier::TurboSpeed;
+            self.gpu_mode = self.config.gpu.mode().to_string();
+        } else {
+            self.whisper_model_tier = WhisperModelTier::Balanced;
+            self.gpu_mode = "cpu".to_string();
+            let cores = Self::logical_cores();
+            self.whisper_threads = self.config.pipeline.whisper_threads.clamp(2, cores);
+        }
+        let _ = self.config.save_to_file("config.toml");
+        self.refresh_model_presence();
+    }
+
     /// 切换「标点与润色」总开关与引擎档位，并**落盘**。
     ///
     /// # 为什么必须收成一个 setter
@@ -835,16 +851,6 @@ impl AppState {
             self.config.paths.whisper_model = rel_path;
         }
 
-        let _ = self.config.save_to_file("config.toml");
-    }
-
-    /// 切换深浅主题并落盘。
-    ///
-    /// 颜色 token 是「渲染时读全局开关」的纯函数，所以这里只需翻转开关 + 写
-    /// config.toml，下一帧界面即整体换色，无需重建任何视图状态。
-    pub fn toggle_theme(&mut self) {
-        self.config.ui = self.config.ui.toggled();
-        crate::ui::theme::Theme::set_light(self.config.ui.is_light());
         let _ = self.config.save_to_file("config.toml");
     }
 

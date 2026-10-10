@@ -84,12 +84,8 @@ impl MainWindow {
             )
             // 检索栏：关键字 + 未翻译筛选 + 排序 + 命中摘要。只有空库时才隐藏。
             .children((total_count > 0).then(|| self.render_library_toolbar(cx)))
-            // 批量操作栏：有记录才出现。勾选卡片后可一次性导出，省去逐条点「导出字幕」。
-            .child(if total_count == 0 {
-                div().into_any_element()
-            } else {
-                self.render_library_batch_bar(cx)
-            })
+            // 批量操作栏：勾选后才展开，不选时不占面积
+            .children((!self.library_selected.is_empty()).then(|| self.render_library_batch_bar(cx)))
             // 视频卡片列表区域
             .child(if total_count == 0 {
                 self.render_library_empty(cx)
@@ -180,7 +176,7 @@ impl MainWindow {
                 div()
                     .text_size(px(Theme::TEXT_SMALL))
                     .text_color(Theme::text_muted())
-                    .child("按文件名或路径筛选，Esc 清空")
+                    .child("搜索视频...")
                     .into_any_element()
             } else {
                 div()
@@ -284,6 +280,22 @@ impl MainWindow {
             }))
             .child(sort_row)
             .child(
+                primitives::chip_clickable("全选", false, false)
+                    .id("lib-toolbar-select-all")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.library_selected =
+                            this.state.recent_tasks.iter().map(|t| t.id).collect();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                primitives::chip_clickable("查重", false, false)
+                    .id("lib-toolbar-find-dupes")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.report_library_duplicates(cx);
+                    })),
+            )
+            .child(
                 div()
                     .flex_shrink_0()
                     .font_family("Consolas")
@@ -298,11 +310,7 @@ impl MainWindow {
             .into_any_element()
     }
 
-    /// 视频库批量操作栏：选中计数 + 全选 / 清空 / 导出选中。
-    ///
-    /// 为什么需要它：历史库里一条条点「导出字幕」再逐次选路径，遇到「同一部片子
-    /// 重跑了几版想一次性导出来比对」时非常费手。勾选后集中导到同一个目录，
-    /// 文件名各自沿用工程名，一次点完。
+    /// 视频库批量操作栏：勾选后展开
     fn render_library_batch_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.library_selected.len();
         let total = self.state.recent_tasks.len();
@@ -317,11 +325,7 @@ impl MainWindow {
             .rounded_lg()
             .bg(Theme::bg_raised())
             .border_1()
-            .border_color(if selected > 0 {
-                Theme::tint_mint_border()
-            } else {
-                Theme::border_subtle()
-            })
+            .border_color(Theme::tint_mint_border())
             .flex()
             .items_center()
             .justify_between()
@@ -329,16 +333,9 @@ impl MainWindow {
                 div().flex().items_center().gap_2().child(
                     div()
                         .text_size(px(Theme::TEXT_BODY))
-                        .text_color(if selected > 0 {
-                            Theme::text_secondary()
-                        } else {
-                            Theme::text_muted()
-                        })
-                        .child(if selected == 0 {
-                            "勾选左侧方框，可批量导出字幕".to_string()
-                        } else {
-                            format!("已选 {selected} / {total} 项")
-                        }),
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(Theme::accent_mint())
+                        .child(format!("已选 {selected} / {total} 项")),
                 ),
             )
             .child(
@@ -347,16 +344,7 @@ impl MainWindow {
                     .items_center()
                     .gap_2()
                     .child(
-                        primitives::chip_clickable("全选", false, false)
-                            .id("lib-select-all-btn")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.library_selected =
-                                    this.state.recent_tasks.iter().map(|t| t.id).collect();
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        primitives::chip_clickable("清空", false, false)
+                        primitives::chip_clickable("取消选择", false, false)
                             .id("lib-clear-sel-btn")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.library_selected.clear();
@@ -364,19 +352,9 @@ impl MainWindow {
                             })),
                     )
                     .child(
-                        // 重复检测：库里的指纹（`content_hash`）能识别「改名 / 复制 /
-                        // 重下」的同一份媒体，但此前没有任何地方用它来提醒。重转一遍
-                        // 40 分钟的课是用户最容易犯、代价最高的错。
-                        primitives::chip_clickable("查重", false, false)
-                            .id("lib-find-dupes-btn")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.report_library_duplicates(cx);
-                            })),
-                    )
-                    .child(
                         primitives::btn_state(
                             if busy { "导出中…" } else { "导出选中" },
-                            primitives::BtnSize::Md,
+                            primitives::BtnSize::Sm,
                             primitives::BtnVariant::Primary,
                             can_export,
                         )
@@ -739,8 +717,8 @@ impl MainWindow {
             .child({
                 let thumb_box = div()
                     .flex_shrink_0()
-                    .w(px(Theme::LIB_THUMB_W))
-                    .h(px(Theme::LIB_THUMB_H))
+                    .w(px(144.0))
+                    .h(px(81.0))
                     .rounded_lg()
                     .overflow_hidden()
                     .bg(Theme::bg_sidebar())
@@ -843,44 +821,38 @@ impl MainWindow {
                                     // 已完成标记
                                     .child(primitives::stat_dot(Theme::accent_mint())),
                             )
-                            // 元数据标签行
+                            // 元数据标签行：极简点号分隔
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    // 时长标签
-                                    .child(Self::render_meta_pill("时长", &dur_str))
-                                    // 文件大小
-                                    .child(Self::render_meta_pill("大小", &file_size_str))
-                                    // 字幕段数
-                                    .child(Self::render_meta_pill(
-                                        "字幕",
-                                        &format!("{} 句", seg_len),
-                                    ))
-                                    // 处理耗时 (如果有 metrics)
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .text_color(Theme::text_muted())
+                                    .child(dur_str)
+                                    .child("·")
+                                    .child(file_size_str)
+                                    .child("·")
+                                    .child(format!("{} 句", seg_len))
                                     .children(task.metrics.as_ref().map(|m| {
-                                        Self::render_meta_pill(
-                                            "耗时",
-                                            &format!("{:.1}s", m.total_elapsed_sec),
-                                        )
-                                    })),
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child("·")
+                                            .child(format!("{:.1}s", m.total_elapsed_sec))
+                                    }))
+                                    .child("·")
+                                    .child(date_display),
                             ),
                     )
                     // 字幕预览文本
                     .child(
                         div()
-                            .text_size(px(Theme::TEXT_BODY_LG))
-                            .text_color(Theme::text_muted())
-                            .overflow_hidden()
-                            .child(sample_text),
-                    )
-                    // 日期
-                    .child(
-                        div()
                             .text_size(px(Theme::TEXT_BODY))
-                            .text_color(Theme::text_muted())
-                            .child(date_display),
+                            .text_color(Theme::text_secondary())
+                            .truncate()
+                            .child(sample_text),
                     ),
             )
             // ── 右侧：操作按钮组 ──
@@ -888,17 +860,13 @@ impl MainWindow {
                 div()
                     .flex_shrink_0()
                     .flex()
-                    .flex_col()
-                    .items_end()
-                    .justify_center()
+                    .items_center()
                     .gap_2()
                     // 耗时详情 (if metrics)
                     .children(task.metrics.clone().map(|m| {
                         let fname = task.file_name.clone();
-                        // 次级薄荷按钮：薄荷浅底 + 薄荷字，与主操作的实心薄荷区分开
-                        primitives::btn_mint_soft("耗时详情")
+                        primitives::btn_mint_soft("耗时")
                             .id(("lib-metrics-btn", task_id as usize))
-                            .w(px(Theme::LIB_ACTION_W))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.benchmark_dialog =
                                     Some(crate::ui::types::BenchmarkDialogInfo {
@@ -910,14 +878,12 @@ impl MainWindow {
                     }))
                     // 剪辑按钮 (主操作)
                     .child(
-                        // 主操作：实心薄荷方角按钮，与全站 CTA 同形
                         primitives::btn_clickable(
-                            "剪辑校对",
+                            "校对",
                             primitives::BtnSize::Md,
                             primitives::BtnVariant::Primary,
                         )
                         .id(("lib-edit-btn", task_id as usize))
-                        .w(px(Theme::LIB_ACTION_W))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             // 点击时才按 id 取出完整任务数据（渲染期不再克隆）
                             let Some(record) = this
@@ -944,7 +910,6 @@ impl MainWindow {
                             primitives::BtnVariant::Secondary,
                         )
                         .id(("lib-export-btn", task_id as usize))
-                        .w(px(Theme::LIB_ACTION_W))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             // 同上：仅在真正导出时才取出该任务的字幕数据
                             let Some(record) = this
@@ -1013,9 +978,8 @@ impl MainWindow {
                     // 删除按钮：危险操作按钮原语，卡片级尺寸（32px 圆角块）
                     .child({
                         let task_name = task.file_name.clone();
-                        primitives::btn_danger("删除", primitives::BtnSize::Lg)
+                        primitives::btn_danger("删除", primitives::BtnSize::Md)
                             .id(("lib-del-btn", task_id as usize))
-                            .w(px(Theme::LIB_ACTION_W))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 // 删除不可逆，且若删的是当前工程会静默换掉工作区，
                                 // 必须先确认。真正执行走 ConfirmAction。
@@ -1031,33 +995,6 @@ impl MainWindow {
                                 cx.notify();
                             }))
                     }),
-            )
-    }
-
-    /// 元数据标签 (圆角小药丸)：标签名 + 值
-    fn render_meta_pill(label: &str, value: &str) -> impl IntoElement {
-        div()
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .px_2p5()
-            .py_1()
-            .rounded_md()
-            .bg(Theme::bg_raised())
-            .border_1()
-            .border_color(Theme::border_subtle())
-            .child(
-                div()
-                    .text_size(px(Theme::TEXT_SMALL))
-                    .text_color(Theme::text_muted())
-                    .child(format!("{}:", label)),
-            )
-            .child(
-                div()
-                    .text_size(px(Theme::TEXT_BODY))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(Theme::text_secondary())
-                    .child(value.to_string()),
             )
     }
 }

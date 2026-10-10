@@ -235,22 +235,9 @@ impl MainWindow {
             )
             // ── 3. 识别引擎档位栅格 ──
             .child(self.render_engine_card(cx))
-            // ── 4. 转写参数（语言 / 格式 / 润色 / 线程）──
+            // ── 4. 转写核心参数（语言 / 格式 / 润色 / 线程 / GPU）──
             .child(self.render_params_card(cx))
-            // ── 4.5 字幕翻译（只读摘要 + 跳转性能设置；翻译参数不在这一栏调）──
-            .child(self.render_translate_summary_card(cx))
-            // ── 5. 硬件监控看板 ──
-            .child(self.render_hardware_monitor_card(cx))
-            // ── 5.5 模型缺失引导（仅在缺组件时出现，就绪后自动消失）──
-            .children({
-                let missing = self.state.missing_model_count();
-                if missing > 0 {
-                    Some(self.render_model_manager(true, cx))
-                } else {
-                    None
-                }
-            })
-            // ── 6. 底部主操作 CTA 按钮 (工程级突出呈现) ──
+            // ── 5. 底部主操作 CTA 按钮 (工程级突出呈现) ──
             .child(
                 primitives::btn(
                     if is_processing {
@@ -330,6 +317,7 @@ impl MainWindow {
     /// 一屏半。真正的配置都在性能设置页的翻译卡上（含「拉取模型列表」），
     /// 这里只解决用户实测的那个坑：**配置项在界面上根本没有入口**，
     /// 之前只能手改 `config.toml`。摘要 + 一次点击即到配置处。
+    #[allow(dead_code)]
     fn render_translate_summary_card(&mut self, cx: &mut Context<Self>) -> Div {
         let translate = &self.state.config.translate;
         let is_online = translate.is_online();
@@ -401,23 +389,22 @@ impl MainWindow {
 
     /// 「识别引擎」卡片：五档模型栅格（SenseVoice 独占整行）
     fn render_engine_card(&mut self, cx: &mut Context<Self>) -> Div {
-        let tiers: [(WhisperModelTier, &'static str, &'static str); 4] = [
-            (WhisperModelTier::Fast, "Base", "20x · 最省资源"),
-            (WhisperModelTier::Balanced, "Small-Q5", "8x · 纯 CPU 友好"),
-            (WhisperModelTier::TurboSpeed, "Turbo Q5", "6x · 推荐"),
-            (WhisperModelTier::Precise, "Turbo Q8", "4x · 最准"),
+        let tiers: [(WhisperModelTier, &'static str); 4] = [
+            (WhisperModelTier::Fast, "Base"),
+            (WhisperModelTier::Balanced, "Small-Q5"),
+            (WhisperModelTier::TurboSpeed, "Turbo Q5"),
+            (WhisperModelTier::Precise, "Turbo Q8"),
         ];
 
         let mut grid = div().flex().flex_wrap().gap(px(Theme::SPACE_1_5));
         grid = grid.child(self.tier_pill(
             WhisperModelTier::SenseVoice,
             "SenseVoice 极速",
-            "42x · 自带标点与数字规范",
             true,
             cx,
         ));
-        for (tier, name, speed) in tiers {
-            grid = grid.child(self.tier_pill(tier, name, speed, false, cx));
+        for (tier, name) in tiers {
+            grid = grid.child(self.tier_pill(tier, name, false, cx));
         }
 
         primitives::card_sm()
@@ -426,28 +413,22 @@ impl MainWindow {
             .child(grid)
     }
 
-    /// 模型档位选择胶囊：档位名 + 速度说明两行。
-    ///
-    /// 速度是选档位的唯一依据，去掉副标题后用户只能凭名字猜（「Turbo Q8 比 Q5 快还是慢？」），
-    /// 所以这一行必须留着；档位名用主字色、速度说明用弱化色，扫一眼就能比较。
+    /// 模型档位选择胶囊
     fn tier_pill(
         &mut self,
         tier: WhisperModelTier,
         name: &'static str,
-        speed: &'static str,
         full_width: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let is_sel = self.state.whisper_model_tier == tier;
         let pill = div()
             .id(name)
-            .h(px(Theme::TIER_PILL_H))
+            .h(px(Theme::CTRL_H_MD))
             .px(px(Theme::SPACE_2))
             .flex()
-            .flex_col()
             .items_center()
             .justify_center()
-            .gap(px(Theme::SPACE_1))
             .rounded(px(Theme::RADIUS_LG))
             .border_1()
             .border_color(if is_sel {
@@ -469,14 +450,12 @@ impl MainWindow {
                 }
             })
             .on_click(cx.listener(move |this, _, _, cx| {
-                // 走 setter 落盘：侧栏胶囊此前只改内存，重启后档位会被
-                // `config.paths.whisper_model` 反推覆盖回去。
                 this.state.set_whisper_model_tier(tier);
                 cx.notify();
             }))
             .child(
                 div()
-                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_size(px(Theme::TEXT_BODY))
                     .font_weight(if is_sel {
                         FontWeight::BOLD
                     } else {
@@ -488,16 +467,6 @@ impl MainWindow {
                         Theme::text_primary()
                     })
                     .child(name),
-            )
-            .child(
-                div()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(if is_sel {
-                        Theme::accent_blue()
-                    } else {
-                        Theme::text_muted()
-                    })
-                    .child(speed),
             );
         if full_width {
             pill.w_full()
@@ -556,8 +525,6 @@ impl MainWindow {
         };
         let gpu_sel = self.state.gpu_mode.clone();
         let gpu_limit_sel = self.state.config.gpu.effective_gpu_limit().to_string();
-        let audio_speed_sel = format!("{:.2}", self.state.config.pipeline.whisper_audio_speed);
-        let vad_threshold_sel = format!("{:.2}", self.state.config.pipeline.whisper_vad_threshold);
 
         primitives::card_sm()
             .gap(px(Theme::SPACE_2))
@@ -686,36 +653,6 @@ impl MainWindow {
                 },
                 cx,
             ))
-            .child(self.param_group(
-                "音频加速",
-                vec![
-                    ("1.00", "关闭"),
-                    ("1.15", "1.15x"),
-                    ("1.25", "1.25x"),
-                    ("1.35", "1.35x"),
-                    ("1.50", "1.50x"),
-                ],
-                &audio_speed_sel,
-                |this, sel, cx| {
-                    this.state.config.pipeline.whisper_audio_speed =
-                        sel.parse::<f64>().unwrap_or(1.0);
-                    let _ = this.state.config.save_to_file("config.toml");
-                    cx.notify();
-                },
-                cx,
-            ))
-            .child(self.param_group(
-                "Whisper VAD 阈值",
-                vec![("0.50", "标准"), ("0.55", "稍积极"), ("0.60", "积极")],
-                &vad_threshold_sel,
-                |this, sel, cx| {
-                    this.state.config.pipeline.whisper_vad_threshold =
-                        sel.parse::<f64>().unwrap_or(0.50);
-                    let _ = this.state.config.save_to_file("config.toml");
-                    cx.notify();
-                },
-                cx,
-            ))
     }
 
     /// 参数分组：小标题 + 分段选择器行
@@ -739,7 +676,7 @@ impl MainWindow {
             .child(self.pill_row(options, selected, on_select, cx))
     }
 
-    /// 通用分段选择器：一行等宽胶囊，单击切换
+    /// 通用分段选择器：一行等宽胶囊，单击切换（多于4项时自适应换行，避免溢出重叠）
     fn pill_row<K, L>(
         &mut self,
         options: Vec<(K, L)>,
@@ -751,14 +688,17 @@ impl MainWindow {
         K: Into<SharedString> + Clone + 'static,
         L: Into<SharedString>,
     {
-        let mut row = primitives::segmented_row();
+        let is_wrap = options.len() > 4;
+        let mut row = div().w_full().flex().gap(px(Theme::SPACE_1_5));
+        if is_wrap {
+            row = row.flex_wrap();
+        }
         for (key, label) in options {
             let key: SharedString = key.into();
             let is_sel = key.as_str() == selected;
-            // 元素 id 沿用选项值本身（与改动前逐字一致），避免影响既有交互命中
             let pill_id = key.clone();
             row = row.child(
-                primitives::segmented(label, is_sel, true)
+                primitives::segmented(label, is_sel, !is_wrap)
                     .id(pill_id)
                     .on_click(cx.listener(move |this, _, _, cx| on_select(this, key.as_str(), cx))),
             );
@@ -767,6 +707,7 @@ impl MainWindow {
     }
 
     /// 渲染硬件与模型资源监控对比卡片 (CPU / 内存实时对比)
+    #[allow(dead_code)]
     pub(crate) fn render_hardware_monitor_card(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let m = &self.state.metrics;
         let sys_cpu_pct = m.sys_cpu.clamp(0.0, 100.0);

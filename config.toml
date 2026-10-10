@@ -1,7 +1,7 @@
 [paths]
 ffmpeg = "tools/ffmpeg.exe"
 whisper_cli = "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"
-whisper_model = "models/whisper/ggml-small-q5_0.bin"
+whisper_model = "models/whisper/ggml-large-v3-turbo-q5_0.bin"
 vad_model = "models/whisper/ggml-silero-v6.2.0.bin"
 punc_model = "models/punc/model.int8.onnx"
 sensevoice_model = "models/sensevoice/model.int8.onnx"
@@ -17,10 +17,11 @@ output_format = "srt"
 enable_polish = false
 polish_mode = "punc"
 enable_vad = true
-whisper_threads = 10
+whisper_threads = 16
 whisper_processors = 1
 whisper_no_fallback = true
 whisper_rescue_logprob = 0.0
+whisper_low_confidence = -0.35
 whisper_max_context = 32
 whisper_audio_speed = 1.0
 whisper_vad_threshold = 0.5
@@ -37,27 +38,36 @@ enable_diarization = false
 speaker_count = 2
 
 [gpu]
-hwaccel_decode = false
+hardware_init_completed = true
+hardware_tier = "gpu"
+hwaccel_decode = true
 whisper_offload = true
-yield_to_desktop = true
+onnx_provider = "dml"
+yield_to_desktop = false
 gpu_limit_percent = 100
 
 [subtitle_style]
-font_size = 36
-letter_spacing = 4
-line_spacing = 1.399999976158142
-max_chars_per_line = 20
-bottom_margin = 80
-preset_name = "电影沉浸"
+font_size = 40
+letter_spacing = 1
+line_spacing = 1.2000000476837158
+max_chars_per_line = 16
+bottom_margin = 40
+preset_name = "白字黑影"
 preview_box_w = 374.13323974609375
 
 [translate]
-mode = "offline_qwen"
-api_base = "https://api.deepseek.com/v1"
-api_key = ""
-api_model = "deepseek-chat"
+mode = "online_api"
+api_base = "http://119.29.217.28:3021/"
+api_key = "111111"
+api_model = "cn:deepseek-v4.1-flash"
 batch_size = 20
 timeout_secs = 120
+target_lang = "简体中文"
+glossary = ""
+max_glossary_entries = 80
 
 [ui]
 theme = "dark"
+export_mode = "bilingual"
+export_format = "jianying"
+export_name_template = "{name}.{ext}"

@@ -679,13 +679,6 @@ impl MainWindow {
                         .into_any_element()
                 } else {
                     // 空闲就绪引导工作区 (Studio Dropzone)
-                    //
-                    // 「转写完成后的看板」实际就落在本分支：`actions.rs` 在 `Finished` 里
-                    // 会把 `transcribe_file` 清空并回到这里（随后弹出的完成弹窗盖在上面）。
-                    // 因此质检摘要挂在这里，用户一关弹窗就能看到「哪几句要复核」，
-                    // 而不是只剩一张「导入音视频文件」的空态卡。
-                    // 没有已载入字幕时 `render_quality_summary` 返回 None，布局与从前一致。
-                    let quality_card = self.render_quality_summary(cx);
                     div()
                         .id("lightweight-idle-dashboard")
                         .flex_1()
@@ -696,9 +689,7 @@ impl MainWindow {
                         .justify_center()
                         .gap(px(Theme::SPACE_4))
                         .p(px(Theme::PAGE_PAD))
-                        .children(quality_card)
                         .child(
-                            // 空态卡片外壳走 card()，内边距升一档让引导区更舒展
                             primitives::card_with_pad(Theme::SPACE_6)
                                 .w_full()
                                 .max_w(px(Theme::CONTENT_MAX_W))
@@ -715,7 +706,6 @@ impl MainWindow {
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        // 大号「+」比页面标题再大一档，作为空态主视觉
                                         .text_size(px(Theme::TEXT_DISPLAY))
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(Theme::accent_blue())
@@ -725,6 +715,7 @@ impl MainWindow {
                                 .child(
                                     div()
                                         .flex()
+                                        .flex_col()
                                         .items_center()
                                         .gap(px(Theme::SPACE_3))
                                         .mt(px(Theme::SPACE_2))
@@ -736,39 +727,40 @@ impl MainWindow {
                                                 })),
                                         )
                                         .child(
-                                            primitives::btn_clickable("从历史视频库选择", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
-                                                .id("idle-goto-library-btn")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.active_tab = WorkspaceTab::Library;
-                                                    this.state.refresh_recent_tasks();
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            primitives::btn_clickable("批量导入多个文件", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
-                                                .id("idle-batch-import-btn")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.choose_batch_files(cx);
-                                                })),
-                                        )
-                                        .child(
-                                            // 目录递归导入：一门课的素材通常按文件夹组织，
-                                            // 让用户逐个文件选既费手又容易漏。
-                                            primitives::btn_clickable("导入整个文件夹", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
-                                                .id("idle-batch-folder-btn")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.choose_batch_folder(cx);
-                                                })),
-                                        )
-                                        .child(
-                                            // 已有字幕直接导入：跳过转写，接着编辑 / 导出。
-                                            // 排在这里是因为它的使用频率低于前三个，但
-                                            // 在「同事给了我一版字幕」这种场景里是唯一入口。
-                                            primitives::btn_clickable("导入已有字幕", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
-                                                .id("idle-import-subtitle-btn")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.import_subtitle_file(cx);
-                                                })),
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(Theme::SPACE_2))
+                                                .child(
+                                                    primitives::chip_clickable("批量导入", false, false)
+                                                        .id("idle-batch-import-btn")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.choose_batch_files(cx);
+                                                        })),
+                                                )
+                                                .child(
+                                                    primitives::chip_clickable("导入文件夹", false, false)
+                                                        .id("idle-batch-folder-btn")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.choose_batch_folder(cx);
+                                                        })),
+                                                )
+                                                .child(
+                                                    primitives::chip_clickable("从视频库选择", false, false)
+                                                        .id("idle-goto-library-btn")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.state.active_tab = WorkspaceTab::Library;
+                                                            this.state.refresh_recent_tasks();
+                                                            cx.notify();
+                                                        })),
+                                                )
+                                                .child(
+                                                    primitives::chip_clickable("导入已有字幕", false, false)
+                                                        .id("idle-import-subtitle-btn")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.import_subtitle_file(cx);
+                                                        })),
+                                                ),
                                         ),
                                 ),
                         )
@@ -854,8 +846,6 @@ impl MainWindow {
         let report = self.quality_report_snapshot()?;
         let total = report.total_issues();
         let scored = report.confidence_scored;
-        let missing = report.confidence_missing;
-        let no_confidence = report.confidence_unavailable();
         // 「开始复核」的第一跳落点。必须在这里算好：下面给每个胶囊挂 `cx.listener`
         // 时要可变借用 `this`，闭包里再读 `report` 就与借用打架
         // （与 `render_batch_queue_panel` 先抽纯值是同一个处理）。
@@ -953,14 +943,10 @@ impl MainWindow {
                 },
             ));
 
-        // 置信度覆盖面：SenseVoice / 旧记录 / 流式预览片段都没有逐句置信度，
-        // 此时「低置信」一栏恒为空，必须说清是「判不了」而不是「没问题」。
-        let coverage = if missing == 0 {
+        let coverage = if scored > 0 {
             format!("置信度已评估 {scored} 句")
-        } else if no_confidence {
-            format!("当前引擎不提供逐句置信度（{missing} 句缺该项数据），低置信复核不可用")
         } else {
-            format!("置信度已评估 {scored} 句 · {missing} 句缺该项数据")
+            String::new()
         };
 
         // 按类翻查：用户往往只关心某一类问题（例如只盯低置信句）。给每一类一个
@@ -1000,7 +986,7 @@ impl MainWindow {
                         .text_size(px(Theme::TEXT_BODY))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(Theme::accent_mint())
-                        .child("质检通过：未发现低置信、术语违规或碎片句"),
+                        .child("质检通过"),
                 )
                 .into_any_element()
         } else {
@@ -1072,13 +1058,7 @@ impl MainWindow {
                                 );
                             })),
                         )
-                        .children(category_jump_buttons)
-                        .child(
-                            div()
-                                .text_size(px(Theme::TEXT_SMALL))
-                                .text_color(Theme::text_muted())
-                                .child("点某一类可定位该类第一处"),
-                        ),
+                        .children(category_jump_buttons),
                 )
                 .into_any_element()
         };
@@ -1090,12 +1070,12 @@ impl MainWindow {
                 .gap(px(Theme::SPACE_2))
                 .child(header)
                 .child(body)
-                .child(
+                .children((!coverage.is_empty()).then(|| {
                     div()
                         .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(Theme::text_muted())
-                        .child(coverage),
-                )
+                        .child(coverage)
+                }))
                 .into_any_element(),
         )
     }

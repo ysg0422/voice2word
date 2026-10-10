@@ -66,7 +66,7 @@ pub struct ShortcutSpec {
 }
 
 /// 默认键位表的唯一事实来源：启动时按此注册，速查表也按此校验。
-pub const SHORTCUT_SPECS: [ShortcutSpec; 15] = [
+pub const SHORTCUT_SPECS: [ShortcutSpec; 14] = [
     ShortcutSpec {
         key: "ctrl-space",
         hint_key: "Ctrl+Space",
@@ -106,11 +106,6 @@ pub const SHORTCUT_SPECS: [ShortcutSpec; 15] = [
         key: "ctrl-e",
         hint_key: "Ctrl+E",
         hint: "导出",
-    },
-    ShortcutSpec {
-        key: "ctrl-t",
-        hint_key: "Ctrl+T",
-        hint: "主题",
     },
     ShortcutSpec {
         key: "ctrl-f",
@@ -163,7 +158,6 @@ fn binding_for(key: &str) -> KeyBinding {
         "ctrl-enter" => KeyBinding::new(key, StartTranscription, None),
         "escape" => KeyBinding::new(key, CancelOrClose, None),
         "ctrl-e" => KeyBinding::new(key, ExportSubtitle, None),
-        "ctrl-t" => KeyBinding::new(key, ToggleTheme, None),
         "ctrl-f" => KeyBinding::new(key, FocusSubtitleSearch, None),
         "ctrl-k" => KeyBinding::new(key, OpenCommandPalette, None),
         "ctrl-z" => KeyBinding::new(key, Undo, None),
@@ -184,14 +178,13 @@ pub fn bind_default_keys(cx: &mut gpui::App) {
 /// 与 [`SHORTCUT_SPECS`]（真正的绑定表）同一份动作清单，逐条对齐由本文件末尾的
 /// 测试守着——补了绑定却忘了写速查表、或速查表里留着已经删掉的键位，都会先在这里
 /// 失败，而不是让用户对着界面上写错的键位按半天。
-pub const SHORTCUT_HINTS: [(&str, &str); 13] = [
+pub const SHORTCUT_HINTS: [(&str, &str); 12] = [
     ("Ctrl+Space", "播放/暂停"),
     ("Alt+↑↓", "上/下句"),
     ("Alt+←→", "±1 秒"),
     ("Ctrl+Enter", "开始转写"),
     ("Esc", "关闭/终止"),
     ("Ctrl+E", "导出"),
-    ("Ctrl+T", "主题"),
     ("Ctrl+F", "搜索"),
     ("Ctrl+K", "命令面板"),
     ("Ctrl+Z", "撤销"),

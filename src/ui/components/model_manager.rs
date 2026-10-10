@@ -18,7 +18,7 @@ use gpui::{div, px, AnyElement, FontWeight, IntoElement, ParentElement, Styled};
 use crate::ui::primitives;
 use crate::ui::theme::Theme;
 use crate::ui::MainWindow;
-use crate::utils::{ItemGroup, ITEMS};
+use crate::utils::ITEMS;
 
 // 体积格式化统一走 `utils::model_download::human_size`（单一实现处）：
 // 本文件曾有一份私有副本，与下载层各写各的规则，迟早出现「同一文件在模型卡与
@@ -63,18 +63,6 @@ impl MainWindow {
                     primitives::badge(format!("缺 {missing} 个可选"))
                 }),
         );
-
-        // ── 说明行：明确告知「不需要梯子」──
-        let note = div()
-            .text_size(px(Theme::TEXT_CAPTION))
-            .text_color(Theme::text_muted())
-            .child(if is_downloading {
-                "下载中… 可随时取消，已下载部分不会留下损坏文件"
-            } else if missing == 0 {
-                "全部组件就位，无需下载"
-            } else {
-                "下载源为国内镜像（hf-mirror），无需代理即可下载"
-            });
 
         // 占用统计：只 stat 各条目**已解析到的实际路径**（十来个文件，且卡片不是
         // 逐帧重绘的重灾区），让用户一眼看到「这些模型占了我多少盘」。放在按钮行
@@ -234,29 +222,86 @@ impl MainWindow {
             None
         };
 
-        // ── 条目列表 ──
-        let mut groups: Vec<(ItemGroup, Vec<&'static crate::utils::DownloadItem>)> = Vec::new();
-        for g in [ItemGroup::Asr, ItemGroup::Text, ItemGroup::Binary] {
-            let items: Vec<_> = ITEMS
-                .iter()
-                .filter(|i| i.group == g && (!compact || !self.state.model_is_present(i.id)))
-                .collect();
-            if !items.is_empty() {
-                groups.push((g, items));
-            }
+        // ── 分类别、分等级展示 (必需组件最前置) ──
+        struct ModelCategory {
+            title: &'static str,
+            is_required: bool,
+            item_ids: &'static [&'static str],
         }
 
-        let mut list = div().flex().flex_col().gap(px(Theme::SPACE_2));
-        for (group, items) in groups {
+        let categories = [
+            ModelCategory {
+                title: "核心必需组件",
+                is_required: true,
+                item_ids: &["ffmpeg", "whisper-cli", "whisper-small"],
+            },
+            ModelCategory {
+                title: "GPU 硬件加速推理程序 (NVIDIA / Vulkan)",
+                is_required: false,
+                item_ids: &["whisper-cublas"],
+            },
+            ModelCategory {
+                title: "Whisper 识别模型 (阶梯分级)",
+                is_required: false,
+                item_ids: &[
+                    "whisper-base",
+                    "whisper-turbo-q5",
+                    "whisper-turbo-q8",
+                ],
+            },
+            ModelCategory {
+                title: "端到端语音与辅助检测",
+                is_required: false,
+                item_ids: &[
+                    "sensevoice-model",
+                    "sensevoice-tokens",
+                    "sensevoice-vad",
+                    "silero-vad",
+                    "punc-model",
+                ],
+            },
+            ModelCategory {
+                title: "本地大语言模型与推理程序",
+                is_required: false,
+                item_ids: &["qwen-llm", "llama-cpp"],
+            },
+        ];
+
+        let mut list = div().flex().flex_col().gap(px(Theme::SPACE_3));
+        for cat in categories {
+            let cat_items: Vec<_> = cat
+                .item_ids
+                .iter()
+                .filter_map(|&id| ITEMS.iter().find(|i| i.id == id))
+                .filter(|i| !compact || !self.state.model_is_present(i.id))
+                .collect();
+
+            if cat_items.is_empty() {
+                continue;
+            }
+
             let mut col = div().flex().flex_col().gap(px(Theme::SPACE_1_5));
             col = col.child(
                 div()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(Theme::text_muted())
-                    .child(group.label()),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_BODY))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if cat.is_required {
+                                Theme::accent_mint()
+                            } else {
+                                Theme::text_secondary()
+                            })
+                            .child(cat.title),
+                    )
+                    .children(cat.is_required.then(|| {
+                        primitives::badge_accent("必需")
+                    })),
             );
-            for item in items {
+            for item in cat_items {
                 col = col.child(self.render_model_row(item, is_downloading, cx));
             }
             list = list.child(col);
@@ -265,8 +310,7 @@ impl MainWindow {
         // ── 组装 ──
         let mut card = primitives::card_sm()
             .gap(px(Theme::SPACE_2))
-            .child(header)
-            .child(note);
+            .child(header);
         if let Some(p) = progress {
             card = card.child(p);
         }
@@ -438,12 +482,6 @@ impl MainWindow {
                                     .child(human_size(item.size)),
                             )
                             .when(item.required, |d| d.child(primitives::badge_danger("必需"))),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_muted())
-                            .child(item.note),
                     ),
             )
             .child(

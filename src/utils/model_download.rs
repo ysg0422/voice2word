@@ -369,6 +369,22 @@ pub const ITEMS: &[DownloadItem] = &[
         is_archive: true,
         companion: Some("whisper.dll"),
     },
+    DownloadItem {
+        id: "whisper-cublas",
+        label: "whisper.cpp (NVIDIA CUDA 显卡极速版)",
+        note: "NVIDIA 显卡专用（含 CUDA 12.4 加速，免装 CUDA Toolkit）",
+        dest: "tools/whisper-cuda/whisper-cli.exe",
+        urls: &[
+            "https://gh-proxy.com/https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/whisper-cublas-12.4.0-bin-x64.zip",
+            "https://ghproxy.net/https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/whisper-cublas-12.4.0-bin-x64.zip",
+        ],
+        size: 457_024_596,
+        min_size: 100_000,
+        required: false,
+        group: ItemGroup::Binary,
+        is_archive: true,
+        companion: Some("cublas64_12.dll"),
+    },
 ];
 
 /// 一次扫描中复用的配置快照。
@@ -548,21 +564,42 @@ fn looks_like_custom_build(item: &DownloadItem, dest: &Path) -> bool {
     is_gpu_build(dest)
 }
 
-/// 该入口是否是**带 GPU 后端的构建**（本项目官方包是纯 CPU，从不含这些）。
+/// 该入口是否是**带 GPU 后端的构建**（本项目官方 CPU 包从不含这些）。
 ///
-/// 两条独立证据，命中其一即可：
-/// 1. 同目录存在 `ggml-vulkan.dll`（本项目官方 CPU 包不含此文件）；
-/// 2. 入口 exe 的 PE 导入表里出现 `vulkan-1.dll`（单文件静态链接的 Vulkan 版）。
+/// 多条独立证据，命中其一即可：
+/// 1. 同目录存在 Vulkan、CUDA 或 DirectML 后端 DLL（如 `ggml-vulkan.dll`、`ggml-cuda.dll`、`cublas64_12.dll` 等）；
+/// 2. 入口 exe 的 PE 导入表里出现 Vulkan / CUDA / DirectML 符号（静态或动态链接的 GPU 构建）。
 fn is_gpu_build(entry: &Path) -> bool {
     let Some(dir) = entry.parent() else {
         return false;
     };
-    if dir.join("ggml-vulkan.dll").exists() {
-        return true;
+    let gpu_dlls = [
+        "ggml-vulkan.dll",
+        "ggml-cuda.dll",
+        "ggml-dml.dll",
+        "nvcuda.dll",
+        "cublas64_12.dll",
+        "cublas64_11.dll",
+        "cudart64_12.dll",
+        "cudart64_110.dll",
+        "DirectML.dll",
+    ];
+    for dll in gpu_dlls {
+        if dir.join(dll).exists() {
+            return true;
+        }
     }
     match fs::read(entry) {
         Ok(bytes) => crate::utils::pe_imports::imported_dll_names(&bytes)
-            .map(|names| names.iter().any(|n| n == "vulkan-1.dll"))
+            .map(|names| {
+                names.iter().any(|n| {
+                    let lower = n.to_ascii_lowercase();
+                    lower.contains("vulkan")
+                        || lower.contains("cuda")
+                        || lower.contains("cublas")
+                        || lower.contains("directml")
+                })
+            })
             .unwrap_or(false),
         Err(_) => false,
     }
@@ -638,7 +675,20 @@ fn configured_path_for(item: &DownloadItem, cfg: &Option<AppConfig>) -> Option<P
         // llama.cpp 也走配置：用户可能把它装在别处（例如自编译产物）。
         // 若不接配置，即使用户已经能用，界面也会一直标「缺失」。
         "llama-cpp" => Some(cfg.paths.llama_cli.as_str()),
-        "whisper-cli" => Some(cfg.paths.whisper_cli.as_str()),
+        "whisper-cublas" => {
+            if cfg.paths.whisper_cli.contains("cuda") {
+                Some(cfg.paths.whisper_cli.as_str())
+            } else {
+                None
+            }
+        }
+        "whisper-cli" => {
+            if !cfg.paths.whisper_cli.contains("cuda") {
+                Some(cfg.paths.whisper_cli.as_str())
+            } else {
+                None
+            }
+        }
         _ => None,
     };
     // whisper 档位：只有「配置指向的那个档位」才算就位，否则会把用户没选的
@@ -1462,6 +1512,14 @@ mod tests {
         assert!(
             looks_like_custom_build(&item, &entry),
             "带 ggml-vulkan.dll 的构建应被判为自定义，避免被 CPU 包覆盖"
+        );
+
+        // 3) 测试 CUDA / cuBLAS DLL 同样能被正确识别为 GPU 构建
+        fs::remove_file(dir.join("ggml-vulkan.dll")).unwrap();
+        fs::write(dir.join("cublas64_12.dll"), vec![0u8; 1024]).unwrap();
+        assert!(
+            looks_like_custom_build(&item, &entry),
+            "带 cublas64_12.dll 的构建应被判为 GPU 自定义构建"
         );
 
         let _ = fs::remove_dir_all(&dir);

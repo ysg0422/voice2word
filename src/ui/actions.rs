@@ -2802,6 +2802,10 @@ impl MainWindow {
                             "下载完成"
                         };
                         this.state.download_status_msg = format!("{} {verb}", item.label);
+                        if item.id == "whisper-cublas" {
+                            this.state.config.paths.whisper_cli = item.dest.to_string();
+                            let _ = this.state.config.save_to_file("config.toml");
+                        }
                         // 重新扫描：新文件就位后界面上的「缺失」标记要立即消失
                         this.state.refresh_model_presence();
                         // 模型换了，硬件档案里的推荐配置与预览代理可能要重算

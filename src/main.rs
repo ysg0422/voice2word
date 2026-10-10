@@ -57,9 +57,12 @@ fn main() -> Result<()> {
     let config = AppConfig::load_from_file("config.toml")?;
     info!("配置加载成功: {:?}", config);
     startup.mark("config_load");
-    // 主题必须在任何界面构建之前设定：颜色 token 在渲染时才读取全局开关
-    ui::theme::Theme::set_light(config.ui.is_light());
-    info!("界面主题: {}", config.ui.label());
+    // 主题必须在任何界面构建之前设定：颜色 token 在渲染时才读取全局开关。
+    //
+    // 暂时固定为深色（只用黑色）：界面上已移除主题切换入口，
+    // 若还按 `config.ui.theme` 读，一旦旧配置里留着 `light`，用户会被困在浅色里无法回到深色。
+    ui::theme::Theme::set_light(false);
+    info!("界面主题: 深色");
     // 硬件档案预热（P1-A9）：`HardwareInfo` 的 CPU/内存采集由 sysinfo 负责，
     // 而 sysinfo 的刷新结果缓存在**进程级**静态状态里，首次调用约 850 ms
     // （实测 16 核机器），之后同一进程内再取只要 ~1 ms。

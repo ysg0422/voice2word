@@ -6537,6 +6537,7 @@ dependencies = [
  "pollster 0.3.0",
  "raw-window-handle",
  "rayon",
+ "regex",
  "rfd",
  "rusqlite",
  "serde",

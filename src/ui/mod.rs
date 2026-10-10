@@ -177,7 +177,6 @@ pub enum PaletteCommand {
     ExportCurrentFormat,
     StartTranslation,
     CancelTranslation,
-    ToggleTheme,
     SwitchToEditor,
     SwitchToGenerate,
     SwitchToLibrary,
@@ -210,7 +209,7 @@ pub struct PaletteCommandSpec {
 ///
 /// 每条命令都直接复用 `MainWindow` 上已有的方法（见 `run_palette_command`），
 /// 这里只做「名字 → 已有入口」的映射，不重写任何业务逻辑。
-pub const PALETTE_COMMANDS: [PaletteCommandSpec; 16] = [
+pub const PALETTE_COMMANDS: [PaletteCommandSpec; 15] = [
     PaletteCommandSpec {
         command: PaletteCommand::OpenFile,
         zh: "打开文件",
@@ -246,12 +245,6 @@ pub const PALETTE_COMMANDS: [PaletteCommandSpec; 16] = [
         zh: "取消翻译",
         en: "cancel translation",
         hint: "",
-    },
-    PaletteCommandSpec {
-        command: PaletteCommand::ToggleTheme,
-        zh: "切换主题",
-        en: "toggle theme",
-        hint: "Ctrl+T",
     },
     PaletteCommandSpec {
         command: PaletteCommand::SwitchToEditor,
@@ -400,6 +393,10 @@ pub struct MainWindow {
     /// 位移为正，左手柄往左拉位移为负。宽度变化要按手柄所在侧取符号，否则左手柄
     /// 往外拉会算成负增量，框反而变窄。
     pub(crate) preview_drag: Option<(f32, f32, bool)>,
+    /// 剪辑工作台右侧检查器宽度（自由拖拽调节，上限为窗口宽度的 50%）
+    pub(crate) editor_split_w: Option<f32>,
+    /// 检查器宽度拖拽会话：(起始宽度, 按下时的鼠标 x)
+    pub(crate) editor_split_drag: Option<(f32, f32)>,
     /// 右侧检查器当前显示哪张面板（样式 / 翻译），互斥切换
     pub(crate) subtitle_panel: EditorSubtitlePanel,
     pub(crate) text_cursor_pos: usize,
@@ -572,14 +569,32 @@ pub(crate) fn apply_line_edit(
     event: &KeyDownEvent,
     cx: &mut App,
 ) -> bool {
-    let key = event.keystroke.key.as_str();
+    let key_raw = event.keystroke.key.as_str();
+    let key_lower = key_raw.to_ascii_lowercase();
+    let key = key_lower.as_str();
     let total = buffer.chars().count();
     *cursor = (*cursor).min(total);
+
+    if key == "escape" {
+        buffer.clear();
+        *cursor = 0;
+        return true;
+    }
 
     if event.keystroke.modifiers.control {
         match key {
             "a" => {
                 *cursor = total;
+                return true;
+            }
+            "u" | "k" => {
+                buffer.clear();
+                *cursor = 0;
+                return true;
+            }
+            "backspace" | "back" | "\x08" | "delete" | "del" | "\x7f" => {
+                buffer.clear();
+                *cursor = 0;
                 return true;
             }
             "c" => {
@@ -589,8 +604,7 @@ pub(crate) fn apply_line_edit(
             "v" => {
                 if let Some(item) = cx.read_from_clipboard() {
                     if let Some(text) = item.text() {
-                        // 单行输入框：把换行折成空格，避免粘贴多行内容撑破布局
-                        let flat = text.replace(['\r', '\n'], " ");
+                        let flat = text.trim().replace(['\r', '\n'], "");
                         let mut chars: Vec<char> = buffer.chars().collect();
                         let insert: Vec<char> = flat.chars().collect();
                         let inserted = insert.len();
@@ -606,30 +620,32 @@ pub(crate) fn apply_line_edit(
     }
 
     match key {
-        "backspace" => {
+        "backspace" | "back" | "\x08" => {
             if *cursor > 0 && total > 0 {
                 let mut chars: Vec<char> = buffer.chars().collect();
                 chars.remove(*cursor - 1);
                 *buffer = chars.into_iter().collect();
                 *cursor -= 1;
+                return true;
             }
             true
         }
-        "delete" => {
+        "delete" | "del" | "\x7f" => {
             if *cursor < total {
                 let mut chars: Vec<char> = buffer.chars().collect();
                 chars.remove(*cursor);
                 *buffer = chars.into_iter().collect();
+                return true;
             }
             true
         }
-        "left" => {
+        "left" | "arrowleft" => {
             if *cursor > 0 {
                 *cursor -= 1;
             }
             true
         }
-        "right" => {
+        "right" | "arrowright" => {
             if *cursor < total {
                 *cursor += 1;
             }
@@ -644,8 +660,8 @@ pub(crate) fn apply_line_edit(
             true
         }
         _ => {
-            if key.chars().count() == 1 {
-                let ch = key.chars().next().unwrap();
+            if key_raw.chars().count() == 1 {
+                let ch = key_raw.chars().next().unwrap();
                 if !ch.is_control() {
                     let mut chars: Vec<char> = buffer.chars().collect();
                     chars.insert(*cursor, ch);
@@ -728,6 +744,8 @@ impl MainWindow {
             is_export_dropdown_open: false,
             preview_box_w: preview_box_w_initial,
             preview_drag: None,
+            editor_split_w: None,
+            editor_split_drag: None,
             subtitle_panel: EditorSubtitlePanel::default(),
             text_cursor_pos: 0,
             cached_live_image: None,
@@ -934,7 +952,12 @@ impl MainWindow {
                 return;
             }
         }
-        self.state.save_translate_config();
+        let cfg = self.state.config.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let _ = cfg.save_to_file("config.toml");
+            })
+            .detach();
     }
 
     /// 写入本地大模型（离线 Qwen 的 GGUF）路径：落盘 + 即时校验 + 刷新模型就位判定。
@@ -960,10 +983,8 @@ impl MainWindow {
         // 界面缓冲同步成规范化后的值：粘贴带首尾空格的路径时，输入框不该留着空格。
         self.local_model_input = path.clone();
         if path.is_empty() {
-            self.state.config.paths.llm_model =
-                crate::utils::config::PathsConfig::default().llm_model;
-            self.local_model_input = self.state.config.paths.llm_model.clone();
-            self.local_model_hint = Some((true, "已恢复为内置默认模型".to_string()));
+            self.state.config.paths.llm_model = String::new();
+            self.local_model_hint = Some((false, "未配置模型路径".to_string()));
         } else {
             self.state.config.paths.llm_model = path.clone();
             self.local_model_hint = crate::utils::config::validate_llm_model_path(&path)
@@ -1018,20 +1039,23 @@ impl MainWindow {
         let before: String = display.chars().take(cursor).collect();
         let after: String = display.chars().skip(cursor).collect();
 
-        primitives::text_input(is_focused, 200.0)
+        let has_content = char_count > 0;
+        let input_box = primitives::text_input(is_focused, 200.0)
             .id(id)
             .track_focus(&focus)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
                     window.focus(&focus);
-                    this.focused_api_field = Some(field);
-                    this.line_edit_cursor = match field {
-                        ApiField::Base => this.api_base_input.chars().count(),
-                        ApiField::Model => this.api_model_input.chars().count(),
-                        ApiField::Key => this.api_key_input.chars().count(),
-                        ApiField::LocalModelPath => this.local_model_input.chars().count(),
-                    };
+                    if this.focused_api_field != Some(field) {
+                        this.focused_api_field = Some(field);
+                        this.line_edit_cursor = match field {
+                            ApiField::Base => this.api_base_input.chars().count(),
+                            ApiField::Model => this.api_model_input.chars().count(),
+                            ApiField::Key => this.api_key_input.chars().count(),
+                            ApiField::LocalModelPath => this.local_model_input.chars().count(),
+                        };
+                    }
                     cx.notify();
                 }),
             )
@@ -1045,6 +1069,7 @@ impl MainWindow {
                 let cursor = &mut this.line_edit_cursor;
                 if apply_line_edit(buffer, cursor, event, cx) {
                     this.commit_api_field(field, cx);
+                    cx.notify();
                 }
             }))
             .child(if is_focused {
@@ -1068,7 +1093,54 @@ impl MainWindow {
                     .text_color(Theme::text_primary())
                     .truncate()
                     .child(display)
-            })
+            });
+
+        div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .w_full()
+            .child(div().flex_1().min_w(px(0.0)).child(input_box))
+            .children(has_content.then(|| {
+                primitives::chip_clickable("清空", false, false)
+                    .id(SharedString::from(format!("clear-{id}")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        match field {
+                            ApiField::Base => this.api_base_input.clear(),
+                            ApiField::Model => this.api_model_input.clear(),
+                            ApiField::Key => this.api_key_input.clear(),
+                            ApiField::LocalModelPath => this.local_model_input.clear(),
+                        };
+                        this.line_edit_cursor = 0;
+                        this.commit_api_field(field, cx);
+                        cx.notify();
+                    }))
+            }))
+            .child(
+                primitives::chip_clickable("粘贴", false, false)
+                    .id(SharedString::from(format!("paste-{id}")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(item) = cx.read_from_clipboard() {
+                            if let Some(text) = item.text() {
+                                let flat = text.trim().replace(['\r', '\n'], "");
+                                match field {
+                                    ApiField::Base => this.api_base_input = flat,
+                                    ApiField::Model => this.api_model_input = flat,
+                                    ApiField::Key => this.api_key_input = flat,
+                                    ApiField::LocalModelPath => this.local_model_input = flat,
+                                };
+                                this.line_edit_cursor = match field {
+                                    ApiField::Base => this.api_base_input.chars().count(),
+                                    ApiField::Model => this.api_model_input.chars().count(),
+                                    ApiField::Key => this.api_key_input.chars().count(),
+                                    ApiField::LocalModelPath => this.local_model_input.chars().count(),
+                                };
+                                this.commit_api_field(field, cx);
+                                cx.notify();
+                            }
+                        }
+                    }))
+            )
             .into_any_element()
     }
 }
@@ -1110,7 +1182,7 @@ impl MainWindow {
     fn palette_command_enabled(&self, command: PaletteCommand) -> bool {
         match command {
             // 打开文件与切主题没有任何前置条件
-            PaletteCommand::OpenFile | PaletteCommand::ToggleTheme => true,
+            PaletteCommand::OpenFile => true,
             // 与 `shortcuts::StartTranscription` 的挂载点同一套判断
             PaletteCommand::StartTranscription => {
                 !matches!(self.state.status, ProcessStatus::Processing { .. })
@@ -1168,7 +1240,6 @@ impl MainWindow {
             PaletteCommand::ExportCurrentFormat => self.perform_editor_export(cx),
             PaletteCommand::StartTranslation => self.trigger_llm_translation(cx),
             PaletteCommand::CancelTranslation => self.cancel_llm_translation(cx),
-            PaletteCommand::ToggleTheme => self.state.toggle_theme(),
             // 切页签与左侧导航栏走同一套副作用（剪辑台要补抽帧、视频库要刷新列表）
             PaletteCommand::SwitchToEditor => {
                 self.state.active_tab = WorkspaceTab::Editor;
@@ -1671,15 +1742,6 @@ impl Render for MainWindow {
                     this.perform_editor_export(cx);
                 }),
             )
-            .on_action(
-                cx.listener(|this, _: &shortcuts::ToggleTheme, _window, cx| {
-                    if this.command_palette.is_some() {
-                        return;
-                    }
-                    this.state.toggle_theme();
-                    cx.notify();
-                }),
-            )
             .on_action(cx.listener(|this, _: &shortcuts::Undo, _window, cx| {
                 if this.command_palette.is_some() {
                     return;
@@ -1710,6 +1772,7 @@ impl Render for MainWindow {
                     // 搜索框在剪辑台里，先切页再聚焦；若本帧尚未挂载，聚焦调用会静默失效，
                     // 用户再按一次即可，不会误伤其他状态。
                     this.state.active_tab = WorkspaceTab::Editor;
+                    this.subtitle_panel = EditorSubtitlePanel::Translate;
                     this.subtitle_search_focused = true;
                     this.subtitle_search_cursor = this.subtitle_search.chars().count();
                     window.focus(&this.subtitle_search_focus);
@@ -1751,7 +1814,8 @@ impl Render for MainWindow {
             // 但配色中性——操作成功不该被误读成出错。两者同时存在时错误条在上。
             .child(self.render_crash_banner(cx))
             .child(self.render_notice_banner(cx))
-            // 2. 左中右专业工作台架构
+            // 2. 工作区（导航已上移到顶部标题栏的横向标签条，这里不再占一列）。
+            // 省下的 180px 左栏宽度全部还给内容区。
             .child(
                 div()
                     .flex()
@@ -1759,31 +1823,18 @@ impl Render for MainWindow {
                     .flex_1()
                     .w_full()
                     .overflow_hidden()
-                    // 左侧主导航侧边栏 (左中右之「左」)
-                    .child(self.render_navigation_sidebar(cx))
-                    // 中间与右侧根据当前工作台呈现
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .flex_1()
-                            .h_full()
-                            .overflow_hidden()
-                            .child(match tab {
-                                WorkspaceTab::Editor => {
-                                    self.render_editor_layout(viewport_w, cx).into_any_element()
-                                }
-                                WorkspaceTab::Generate => {
-                                    self.render_generate_layout(cx).into_any_element()
-                                }
-                                WorkspaceTab::Library => {
-                                    self.render_library_layout(cx).into_any_element()
-                                }
-                                WorkspaceTab::Performance => {
-                                    self.render_performance_layout(cx).into_any_element()
-                                }
-                            }),
-                    ),
+                    .child(match tab {
+                        WorkspaceTab::Editor => {
+                            self.render_editor_layout(viewport_w, cx).into_any_element()
+                        }
+                        WorkspaceTab::Generate => {
+                            self.render_generate_layout(cx).into_any_element()
+                        }
+                        WorkspaceTab::Library => self.render_library_layout(cx).into_any_element(),
+                        WorkspaceTab::Performance => {
+                            self.render_performance_layout(cx).into_any_element()
+                        }
+                    }),
             );
 
         // 注意：每一层都必须 `let root = ...` 回写。GPUI 的 `.child()` 返回**新的**
@@ -1806,6 +1857,13 @@ impl Render for MainWindow {
         // 之前，两者万一并存时确认框仍然盖在最上层，与 Esc 的优先级顺序一致。
         let root = if self.command_palette.is_some() {
             root.child(self.render_command_palette(window, cx))
+        } else {
+            root
+        };
+
+        // 首次打开软件硬件配置向导（用户未完成初始选择时居中弹窗，提供「我有GPU」与「我没有GPU」选择）
+        let root = if !self.state.config.gpu.hardware_init_completed {
+            root.child(self.render_hardware_setup_modal(cx))
         } else {
             root
         };

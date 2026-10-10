@@ -389,42 +389,119 @@ impl ModelInfo {
 ///   只会得到一次 400）；
 /// - 响应体不是 JSON、或没有 `data` 数组 —— 返回错误，由调用方显示原文。
 pub fn parse_model_list(body: &str) -> Result<Vec<ModelInfo>> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).with_context(|| "模型列表响应不是合法 JSON")?;
-    let data = value
-        .get("data")
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| anyhow::anyhow!("模型列表响应缺少 data 数组"))?;
-    let mut out = Vec::with_capacity(data.len());
-    for item in data {
-        let Some(id) = item.get("id").and_then(|v| v.as_str()).map(str::trim) else {
-            continue;
-        };
-        if id.is_empty() {
-            continue;
+    // 1. 优先尝试 JSON 结构化解析
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        // 标准 OpenAI 风格 {"data": [...]}
+        if let Some(data) = value.get("data").and_then(|d| d.as_array()) {
+            let mut out = Vec::with_capacity(data.len());
+            for item in data {
+                let Some(id) = item.get("id").and_then(|v| v.as_str()).map(str::trim) else {
+                    continue;
+                };
+                if id.is_empty() {
+                    continue;
+                }
+                let name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(ToOwned::to_owned);
+                out.push(ModelInfo {
+                    id: id.to_string(),
+                    name,
+                    supports_reasoning: item
+                        .get("supports_reasoning")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    only_reasoning: item
+                        .get("only_reasoning")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    context_length: item.get("context_length").and_then(|v| v.as_u64()),
+                    max_output_tokens: item.get("max_output_tokens").and_then(|v| v.as_u64()),
+                });
+            }
+            return Ok(out);
         }
-        let name = item
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-            .map(ToOwned::to_owned);
-        out.push(ModelInfo {
-            id: id.to_string(),
-            name,
-            supports_reasoning: item
-                .get("supports_reasoning")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            only_reasoning: item
-                .get("only_reasoning")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            context_length: item.get("context_length").and_then(|v| v.as_u64()),
-            max_output_tokens: item.get("max_output_tokens").and_then(|v| v.as_u64()),
-        });
+
+        // 兼容 Gemini/Ollama 风格 {"models": [...]} 或顶层数组 [...]
+        let alt_array = value.get("models").and_then(|m| m.as_array()).or_else(|| value.as_array());
+        if let Some(data) = alt_array {
+            let mut out = Vec::with_capacity(data.len());
+            let mut seen = std::collections::HashSet::new();
+            for item in data {
+                let id = if let Some(s) = item.as_str() {
+                    Some(s.trim())
+                } else if let Some(id_val) = item.get("id").and_then(|v| v.as_str()) {
+                    Some(id_val.trim())
+                } else if let Some(name_val) = item.get("name").and_then(|v| v.as_str()) {
+                    Some(name_val.trim())
+                } else {
+                    None
+                };
+
+                let Some(id) = id else { continue };
+                if id.is_empty() || seen.contains(id) {
+                    continue;
+                }
+                seen.insert(id.to_string());
+
+                out.push(ModelInfo {
+                    id: id.to_string(),
+                    name: None,
+                    supports_reasoning: false,
+                    only_reasoning: false,
+                    context_length: None,
+                    max_output_tokens: None,
+                });
+            }
+            if !out.is_empty() {
+                return Ok(out);
+            }
+        }
     }
-    Ok(out)
+
+    // 2. 正则提取：若非标准 JSON 结构或格式异常，尝试使用正则识别模型 ID 模式
+    let mut regex_matches = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in body.lines() {
+        for key in &["\"id\":", "\"model\":", "\"name\":"] {
+            if let Some(pos) = line.find(key) {
+                let after = &line[pos + key.len()..];
+                if let Some(start) = after.find('"') {
+                    if let Some(end) = after[start + 1..].find('"') {
+                        let candidate = after[start + 1..start + 1 + end].trim();
+                        if !candidate.is_empty()
+                            && !seen.contains(candidate)
+                            && !["list", "model", "success", "error", "ok", "true", "false"].contains(&candidate)
+                            && candidate.contains(|c: char| c.is_alphanumeric())
+                        {
+                            seen.insert(candidate.to_string());
+                            regex_matches.push(ModelInfo {
+                                id: candidate.to_string(),
+                                name: None,
+                                supports_reasoning: false,
+                                only_reasoning: false,
+                                context_length: None,
+                                max_output_tokens: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !regex_matches.is_empty() {
+        return Ok(regex_matches);
+    }
+
+    if serde_json::from_str::<serde_json::Value>(body).is_err() {
+        anyhow::bail!("模型列表响应不是合法 JSON");
+    } else {
+        anyhow::bail!("模型列表响应缺少 data 数组");
+    }
 }
 
 /// 从网关错误响应体里取出**可操作**的信息：`error.message`（网关原文，里面往往
@@ -610,6 +687,12 @@ impl SubtitleStyleConfig {
 ///   给桌面合成器留出真正的 GPU 空窗。代价是总耗时约放大 100/N 倍。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuConfig {
+    /// 首次启动向导是否已完成（未完成时启动自动弹窗让用户选择「我有GPU」或「我没有GPU」）
+    #[serde(default)]
+    pub hardware_init_completed: bool,
+    /// 用户选定的硬件层级："gpu" (独立显卡加速) | "cpu" (纯 CPU 优化)
+    #[serde(default = "default_hardware_tier")]
+    pub hardware_tier: String,
     #[serde(default)]
     pub hwaccel_decode: bool,
     #[serde(default)]
@@ -620,6 +703,10 @@ pub struct GpuConfig {
     pub yield_to_desktop: bool,
     #[serde(default = "default_gpu_limit_percent")]
     pub gpu_limit_percent: u32,
+}
+
+fn default_hardware_tier() -> String {
+    "cpu".to_string()
 }
 
 fn default_gpu_limit_percent() -> u32 {
@@ -633,6 +720,8 @@ fn default_onnx_provider() -> String {
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
+            hardware_init_completed: false,
+            hardware_tier: default_hardware_tier(),
             hwaccel_decode: false,
             whisper_offload: false,
             onnx_provider: default_onnx_provider(),
@@ -660,30 +749,64 @@ impl GpuConfig {
         }
     }
 
+    pub fn is_gpu_tier(&self) -> bool {
+        self.hardware_tier.eq_ignore_ascii_case("gpu")
+    }
+
+    /// 一键套用独立显卡 GPU 硬件加速策略
+    pub fn apply_gpu_profile(&mut self) {
+        self.hardware_init_completed = true;
+        self.hardware_tier = "gpu".to_string();
+        self.hwaccel_decode = true;
+        self.whisper_offload = true;
+        self.onnx_provider = "dml".to_string();
+        self.yield_to_desktop = false;
+        self.gpu_limit_percent = 100;
+    }
+
+    /// 一键套用纯 CPU 节能与调度优化策略
+    pub fn apply_cpu_profile(&mut self) {
+        self.hardware_init_completed = true;
+        self.hardware_tier = "cpu".to_string();
+        self.hwaccel_decode = false;
+        self.whisper_offload = false;
+        self.onnx_provider = "cpu".to_string();
+        self.yield_to_desktop = true;
+        self.gpu_limit_percent = 100;
+    }
+
     pub fn from_mode(mode: &str) -> Self {
         match mode {
             "full" => Self {
+                hardware_init_completed: true,
+                hardware_tier: "gpu".to_string(),
                 hwaccel_decode: true,
                 whisper_offload: true,
-                onnx_provider: default_onnx_provider(),
+                onnx_provider: "dml".to_string(),
                 yield_to_desktop: false,
                 gpu_limit_percent: 100,
             },
             "balanced" => Self {
+                hardware_init_completed: true,
+                hardware_tier: "gpu".to_string(),
                 hwaccel_decode: false,
                 whisper_offload: true,
-                onnx_provider: default_onnx_provider(),
+                onnx_provider: "dml".to_string(),
                 yield_to_desktop: true,
                 gpu_limit_percent: 100,
             },
             "eco" => Self {
+                hardware_init_completed: true,
+                hardware_tier: "gpu".to_string(),
                 hwaccel_decode: false,
                 whisper_offload: true,
-                onnx_provider: default_onnx_provider(),
+                onnx_provider: "dml".to_string(),
                 yield_to_desktop: true,
                 gpu_limit_percent: 60,
             },
             "cpu" => Self {
+                hardware_init_completed: true,
+                hardware_tier: "cpu".to_string(),
                 hwaccel_decode: false,
                 whisper_offload: false,
                 onnx_provider: default_onnx_provider(),
@@ -1280,6 +1403,24 @@ impl AppConfig {
             return Err(err).with_context(|| format!("写回配置失败: {:?}", path));
         }
         Ok(())
+    }
+
+    /// 应用硬件选择（首次引导或设置页切换）：
+    /// - is_gpu 为 true 时：启用独显硬件加速、ONNX DirectML、视频硬解，推荐 Turbo Q5 档位
+    /// - is_gpu 为 false 时：关闭 GPU offload，优化 CPU 线程分配，视频软解，推荐 Small-Q5 档位
+    pub fn apply_hardware_tier(&mut self, is_gpu: bool) {
+        if is_gpu {
+            self.gpu.apply_gpu_profile();
+            self.paths.whisper_model = "models/whisper/ggml-large-v3-turbo-q5_0.bin".to_string();
+            self.pipeline.whisper_processors = 1;
+        } else {
+            self.gpu.apply_cpu_profile();
+            self.paths.whisper_model = "models/whisper/ggml-small-q5_0.bin".to_string();
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(8);
+            self.pipeline.whisper_threads = cores.clamp(2, 16);
+        }
     }
 
     /// 获取应用真实的根目录（多级回退）。

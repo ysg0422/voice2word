@@ -1144,15 +1144,82 @@ impl LLMEngine {
         expected: &std::collections::HashSet<usize>,
     ) -> std::collections::HashMap<usize, String> {
         let mut result = std::collections::HashMap::new();
-        for line in raw.lines() {
-            let Some((index, text)) = Self::parse_indexed_line(line) else {
+        // 1. 去除代码块包裹
+        let clean = raw.trim();
+        let clean = if let Some(stripped) = clean.strip_prefix("```markdown") {
+            stripped.trim_end_matches("```").trim()
+        } else if let Some(stripped) = clean.strip_prefix("```") {
+            stripped.trim_end_matches("```").trim()
+        } else {
+            clean
+        };
+
+        // 2. 逐行匹配与容错正则识取 (兼容 Markdown 列表、加粗、方括号、点号等)
+        let re_bracket = regex::Regex::new(r"(?m)^\s*(?:[-*•>#\s]*)\s*(?:\*\*)?\[\s*(\d+)\s*\](?:\*\*)?\s*[:：\-—]?\s*(.+?)\s*$").ok();
+        let re_numbered = regex::Regex::new(r"(?m)^\s*(?:[-*•>#\s]*)\s*(?:\*\*)?(\d+)(?:\*\*)?\s*[\.\)）\:：、\-—\|]\s*(.+?)\s*$").ok();
+
+        for line in clean.lines() {
+            let line_trim = line.trim();
+            if line_trim.is_empty() {
                 continue;
-            };
-            let text = Self::strip_stop_tags(&text);
-            if expected.contains(&index) && !text.is_empty() {
-                result.insert(index, text);
+            }
+            let mut matched = false;
+            if let Some(ref re) = re_bracket {
+                if let Some(caps) = re.captures(line_trim) {
+                    if let (Some(m_idx), Some(m_text)) = (caps.get(1), caps.get(2)) {
+                        if let Ok(idx) = m_idx.as_str().parse::<usize>() {
+                            let text = Self::strip_stop_tags(m_text.as_str().trim());
+                            if expected.contains(&idx) && !text.is_empty() {
+                                result.insert(idx, text);
+                                matched = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !matched {
+                if let Some(ref re) = re_numbered {
+                    if let Some(caps) = re.captures(line_trim) {
+                        if let (Some(m_idx), Some(m_text)) = (caps.get(1), caps.get(2)) {
+                            if let Ok(idx) = m_idx.as_str().parse::<usize>() {
+                                let text = Self::strip_stop_tags(m_text.as_str().trim());
+                                if expected.contains(&idx) && !text.is_empty() {
+                                    result.insert(idx, text);
+                                    matched = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !matched {
+                if let Some((index, text)) = Self::parse_indexed_line(line_trim) {
+                    let text = Self::strip_stop_tags(&text);
+                    if expected.contains(&index) && !text.is_empty() {
+                        result.insert(index, text);
+                    }
+                }
             }
         }
+
+        // 3. 全局正则容错扫描：如果行级解析仍有缺失，扫描全文中的 `[序号] 译文` 结构
+        if result.len() < expected.len() {
+            if let Ok(re_global) = regex::Regex::new(r"\[\s*(\d+)\s*\]\s*[:：\-—]?\s*([^\n\r\[]+)") {
+                for caps in re_global.captures_iter(clean) {
+                    if let (Some(m_idx), Some(m_text)) = (caps.get(1), caps.get(2)) {
+                        if let Ok(idx) = m_idx.as_str().parse::<usize>() {
+                            if expected.contains(&idx) && !result.contains_key(&idx) {
+                                let text = Self::strip_stop_tags(m_text.as_str().trim());
+                                if !text.is_empty() {
+                                    result.insert(idx, text);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         result
     }
 

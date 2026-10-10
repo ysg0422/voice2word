@@ -38,6 +38,7 @@ raw-window-handle = "0.6"
 ureq = { version = "2.10", default-features = false, features = ["json", "tls"] }
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 sha2 = "0.10"
+regex = "1.10"
 
 [profile.dev]
 # Keep debug symbols and fast incremental builds, while giving the UI,
