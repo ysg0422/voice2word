@@ -1,7 +1,7 @@
 [paths]
 ffmpeg = "tools/ffmpeg.exe"
 whisper_cli = "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"
-whisper_model = "models/whisper/ggml-large-v3-turbo-q5_0.bin"
+whisper_model = "models/whisper/ggml-small-q5_0.bin"
 vad_model = "models/whisper/ggml-silero-v6.2.0.bin"
 punc_model = "models/punc/model.int8.onnx"
 sensevoice_model = "models/sensevoice/model.int8.onnx"
@@ -39,11 +39,11 @@ speaker_count = 2
 
 [gpu]
 hardware_init_completed = true
-hardware_tier = "gpu"
-hwaccel_decode = true
-whisper_offload = true
-onnx_provider = "dml"
-yield_to_desktop = false
+hardware_tier = "cpu"
+hwaccel_decode = false
+whisper_offload = false
+onnx_provider = "cpu"
+yield_to_desktop = true
 gpu_limit_percent = 100
 
 [subtitle_style]
@@ -57,9 +57,9 @@ preview_box_w = 374.13323974609375
 
 [translate]
 mode = "online_api"
-api_base = "http://119.29.217.28:3021/"
+api_base = "http://119.29.217.28:3021/v1"
 api_key = "111111"
-api_model = "cn:deepseek-v4.1-flash"
+api_model = "global:fast-model"
 batch_size = 20
 timeout_secs = 120
 target_lang = "日本語"

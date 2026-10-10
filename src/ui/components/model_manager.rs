@@ -21,9 +21,53 @@ use crate::ui::MainWindow;
 use crate::utils::ITEMS;
 
 // 体积格式化统一走 `utils::model_download::human_size`（单一实现处）：
-// 本文件曾有一份私有副本，与下载层各写各的规则，迟早出现「同一文件在模型卡与
-// 下载进度里显示成两个数」。这里只做引入，不再重复实现。
 use crate::utils::model_download::human_size;
+
+/// 判断某个组件在用户当前的硬件配置和引擎模式下，是否属于「当前模式所需」的组件。
+pub fn is_item_needed_by_current_config(item_id: &str, state: &crate::app::AppState) -> bool {
+    let is_gpu = state.config.gpu.is_gpu_tier();
+    let is_sv = state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
+
+    match item_id {
+        // 音视频抽音解码：任何模式都需要
+        "ffmpeg" => true,
+
+        // GPU 专用的 CUDA 推理程序：只有在 GPU 加速模式下才需要！纯 CPU 模式绝不需要
+        "whisper-cublas" => is_gpu,
+
+        // CPU 版本的 Whisper CLI：在纯 CPU 模式下需要
+        "whisper-cli" => !is_gpu,
+
+        // SenseVoice 引擎套件：选择 SenseVoice 极速模式时需要
+        "sensevoice-model" | "sensevoice-tokens" | "sensevoice-vad" => is_sv,
+
+        // Whisper 模型档位与 Silero VAD：选择 Whisper 全能模式时需要
+        "whisper-small" | "whisper-base" | "whisper-turbo-q5" | "whisper-turbo-q8" | "silero-vad" => {
+            if is_sv {
+                false
+            } else {
+                if item_id == "silero-vad" || item_id == "whisper-small" {
+                    true
+                } else if let Some(current_id) = state.whisper_model_tier.download_item_id() {
+                    item_id == current_id
+                } else {
+                    false
+                }
+            }
+        }
+
+        // 标点模型：开启标点恢复时需要
+        "punc-model" => state.enable_polish,
+
+        // 本地大模型：只有在本地离线 Qwen 翻译或 Qwen 深度润色模式下需要
+        "qwen-llm" | "llama-cpp" => {
+            state.config.translate.mode == "offline_qwen"
+                || (state.enable_polish && state.polish_mode == crate::app::PolishMode::QwenDeep)
+        }
+
+        _ => true,
+    }
+}
 
 impl MainWindow {
     /// 模型管理卡片。`compact` 为真时只显示缺失项与一个「一键补齐」按钮
@@ -38,8 +82,8 @@ impl MainWindow {
         let total = self.state.download_total_bytes;
         let status = self.state.download_status_msg.clone();
         let current = self.state.download_current.clone();
-        let missing = self.state.missing_model_count();
-        let missing_required = self.state.missing_required_models();
+        let show_all = self.model_manager_show_all;
+        let is_gpu = self.state.config.gpu.is_gpu_tier();
 
         // 进度比例：服务端没给 Content-Length 时退化为「不确定」态（用 0 表示）
         let ratio = if total > 0 {
@@ -48,21 +92,71 @@ impl MainWindow {
             0.0
         };
 
-        // ── 顶部：标题 + 缺失计数 ──
-        let header = div().flex().items_center().justify_between().child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(Theme::SPACE_2))
-                .child(primitives::section_title("模型与组件"))
-                .child(if missing == 0 {
-                    primitives::badge("已就绪")
-                } else if missing_required > 0 {
-                    primitives::badge_danger(format!("缺 {missing_required} 个必需"))
-                } else {
-                    primitives::badge(format!("缺 {missing} 个可选"))
-                }),
-        );
+        // ── 顶部：基于当前配置的精准缺失判定（纯 CPU 模式绝不把 GPU CUDA 组件算缺失） ──
+        let active_missing_items: Vec<&crate::utils::DownloadItem> = ITEMS
+            .iter()
+            .filter(|i| !self.state.model_is_present(i.id))
+            .filter(|i| is_item_needed_by_current_config(i.id, &self.state))
+            .collect();
+        let missing = active_missing_items.len();
+        let missing_required = active_missing_items.iter().filter(|i| i.required).count();
+
+        let missing_badge = if missing == 0 {
+            primitives::badge_accent(if is_gpu {
+                "当前模式组件已齐备 (GPU加速)"
+            } else {
+                "当前模式组件已齐备 (纯CPU模式)"
+            })
+        } else if missing == 1 {
+            let item = active_missing_items[0];
+            let tag = if item.required { "缺必需组件" } else { "缺可选组件" };
+            primitives::badge_danger(format!("{tag}: {}", item.label))
+        } else if missing <= 3 {
+            let names = active_missing_items
+                .iter()
+                .map(|i| i.label)
+                .collect::<Vec<_>>()
+                .join("、");
+            primitives::badge_danger(format!("缺 {missing} 项: {names}"))
+        } else if missing_required > 0 {
+            primitives::badge_danger(format!("缺 {missing} 项 (含 {missing_required} 个必需)"))
+        } else {
+            primitives::badge_danger(format!("缺 {missing} 个可选"))
+        };
+
+        // 视图切换胶囊：用啥显示啥 vs 全部组件库
+        let view_toggle = primitives::segmented_cluster()
+            .child(
+                primitives::segmented("当前配置所需", !show_all, false)
+                    .id("model-view-needed")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.model_manager_show_all = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                primitives::segmented("全部组件库", show_all, false)
+                    .id("model-view-all")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.model_manager_show_all = true;
+                        cx.notify();
+                    })),
+            );
+
+        let header = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(Theme::SPACE_2))
+                    .child(primitives::section_title("模型与组件"))
+                    .child(missing_badge),
+            )
+            .child(view_toggle);
 
         // 占用统计：只 stat 各条目**已解析到的实际路径**（十来个文件，且卡片不是
         // 逐帧重绘的重灾区），让用户一眼看到「这些模型占了我多少盘」。放在按钮行
@@ -267,40 +361,58 @@ impl MainWindow {
             },
         ];
 
-        let mut list = div().flex().flex_col().gap(px(Theme::SPACE_3));
+        let mut list = div().w_full().flex().flex_col().gap(px(Theme::SPACE_3));
         for cat in categories {
             let cat_items: Vec<_> = cat
                 .item_ids
                 .iter()
                 .filter_map(|&id| ITEMS.iter().find(|i| i.id == id))
-                .filter(|i| !compact || !self.state.model_is_present(i.id))
+                .filter(|i| {
+                    if !show_all {
+                        // 「当前配置所需」模式：用啥显示啥，CPU 模式下绝不展示未开启的 GPU 组件
+                        is_item_needed_by_current_config(i.id, &self.state)
+                    } else {
+                        // 「全部组件库」模式：展示全部项
+                        !compact || !self.state.model_is_present(i.id)
+                    }
+                })
                 .collect();
 
             if cat_items.is_empty() {
                 continue;
             }
 
-            let mut col = div().flex().flex_col().gap(px(Theme::SPACE_1_5));
-            col = col.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_BODY))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(if cat.is_required {
-                                Theme::accent_mint()
-                            } else {
-                                Theme::text_secondary()
-                            })
-                            .child(cat.title),
-                    )
-                    .children(cat.is_required.then(|| {
-                        primitives::badge_accent("必需")
-                    })),
-            );
+            // 当前分类下真正缺失的条目（当前不需要的不计入缺失警示）
+            let cat_missing = cat_items
+                .iter()
+                .filter(|i| !self.state.model_is_present(i.id) && is_item_needed_by_current_config(i.id, &self.state))
+                .count();
+
+            let mut col = div().w_full().flex().flex_col().gap(px(Theme::SPACE_1_5));
+            let mut title_row = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_BODY))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(if cat_missing > 0 {
+                            Theme::accent_red()
+                        } else if cat.is_required {
+                            Theme::accent_mint()
+                        } else {
+                            Theme::text_secondary()
+                        })
+                        .child(cat.title),
+                );
+            if cat.is_required {
+                title_row = title_row.child(primitives::badge_accent("必需"));
+            }
+            if cat_missing > 0 {
+                title_row = title_row.child(primitives::badge_danger(format!("缺 {cat_missing} 项")));
+            }
+            col = col.child(title_row);
             for item in cat_items {
                 col = col.child(self.render_model_row(item, is_downloading, cx));
             }
@@ -359,7 +471,7 @@ impl MainWindow {
         card.into_any_element()
     }
 
-    /// 单个条目行：名称 + 说明 + 体积 + 状态徽标 / 下载按钮。
+    /// 单个条目行：名称 + 体积 + 明确状态徽标（已就位/未下载） + 操作区。
     fn render_model_row(
         &mut self,
         item: &'static crate::utils::DownloadItem,
@@ -367,9 +479,6 @@ impl MainWindow {
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
         let present = self.state.model_is_present(item.id);
-        // 用户自编译的自包含构建（如手编 Vulkan whisper-cli）：单独打标，
-        // 且不给「下载」按钮——下载会被 download_one 拒绝（保护用户构建），
-        // 与其点一下弹错，不如直接说明这是你自己的版本、无需下载。
         let custom = present && self.state.model_is_custom_build(item.id);
         let is_current = self
             .state
@@ -378,91 +487,125 @@ impl MainWindow {
             .map(|c| c == item.id)
             .unwrap_or(false);
         let row_id = item.id;
-        // ElementId 只实现了 (&'static str, usize/u32/u64/EntityId) 等组合，
-        // `(&str, &str)` 不在其中；用条目在 ITEMS 里的下标做唯一键（id 本就唯一，
-        // 下标同样唯一且是 Copy 的 usize，可直接进 move 闭包）。
         let row_idx = ITEMS.iter().position(|i| i.id == item.id).unwrap_or(0);
 
-        let status_el: AnyElement = if custom {
-            primitives::badge_accent("已就位 · 自编译").into_any_element()
+        let is_needed = is_item_needed_by_current_config(item.id, &self.state);
+
+        // 状态徽标：直接紧跟在名称和体积右侧，任何分辨率下都一眼可见
+        let status_badge = if is_current && is_downloading {
+            primitives::badge_accent("下载中")
+        } else if custom {
+            primitives::badge_accent("已就位 · 自编译")
         } else if present {
-            primitives::badge("已就位").into_any_element()
-        } else if is_current && is_downloading {
-            primitives::badge_accent("下载中").into_any_element()
+            primitives::badge_accent("已就位")
+        } else if !is_needed {
+            primitives::badge("未下载 · 当前模式无需此项")
+        } else if item.required {
+            primitives::badge_danger("未下载 · 必需")
         } else {
-            primitives::btn_clickable(
-                "下载",
-                primitives::BtnSize::Sm,
-                primitives::BtnVariant::Secondary,
-            )
-            .id(row_id)
-            .when(!is_downloading, |s| {
-                s.on_click(cx.listener(move |this, _, _, cx| {
-                    this.start_model_download(row_id, cx);
-                }))
-            })
-            .into_any_element()
+            primitives::badge_danger("未下载")
         };
 
-        // 管理动作：定位（常驻）+ 删除（仅已就位且可安全删除时）。
-        // 删除按钮**只对 `item_is_deletable` 为真的条目渲染**——该判定与
-        // `delete_item_file` 共用同一条规则，不会出现「按钮点了却告诉你删不了」。
-        // 压缩包类组件（llama.cpp / whisper-cli 这类「小 exe + 一堆 DLL」）不渲染
-        // 删除按钮：它们解压到 `tools/` 共享目录，删单个文件只会留下坏掉的半成品。
-        //
-        // 为什么删除要二次确认：模型动辄几百 MB、重下要走网络，误触代价高，
-        // 且它与视频库删除一样「一点即不可逆」，沿用同一个确认弹窗范式。
-        let mut actions = div()
-            .flex()
-            .items_center()
-            .flex_shrink_0()
-            .gap(px(Theme::SPACE_1_5));
-        actions = actions.child(
-            primitives::mini_btn("定位", true)
-                .id(("model-reveal", row_idx))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.reveal_model_file(row_id, cx);
-                })),
-        );
-        if present && crate::utils::model_download::item_is_deletable(item.id) {
-            let is_self_build = self.state.model_is_custom_build(item.id);
-            let can_delete = !is_downloading && !is_self_build;
-            let label = if is_self_build { "自编译" } else { "删除" };
-            actions = actions.child(
-                primitives::mini_btn(label, can_delete)
-                    .id(("model-delete", row_idx))
-                    .when(can_delete, |d| {
-                        d.on_click(cx.listener(move |this, _, _, cx| {
-                            let name = item.label.to_string();
-                            this.confirm_dialog = Some(crate::ui::types::ConfirmDialogInfo {
-                                title: format!("删除「{name}」？"),
-                                message: format!(
-                                    "将删除本地文件：{}。删除后可随时重新下载，已完成的转写工程不受影响。",
-                                    crate::utils::AppConfig::resolve_path(item.dest).display()
-                                ),
-                                confirm_label: "删除".to_string(),
-                                danger: true,
-                                action: crate::ui::types::ConfirmAction::DeleteModelFile(
-                                    item.id.to_string(),
-                                ),
-                            });
-                            cx.notify();
+        // 操作区：未就位显示下载按钮；已就位显示「定位」与「删除」
+        let right_actions = if !present {
+            let downloading_this = is_current && is_downloading;
+            div()
+                .flex()
+                .items_center()
+                .flex_shrink_0()
+                .gap(px(Theme::SPACE_1_5))
+                .child(
+                    primitives::btn_clickable(
+                        if downloading_this {
+                            "正在下载…"
+                        } else if is_needed {
+                            "立即下载"
+                        } else {
+                            "下载 (备用)"
+                        },
+                        primitives::BtnSize::Sm,
+                        if is_needed {
+                            primitives::BtnVariant::Primary
+                        } else {
+                            primitives::BtnVariant::Secondary
+                        },
+                    )
+                    .id(row_id)
+                    .when(!is_downloading, |s| {
+                        s.on_click(cx.listener(move |this, _, _, cx| {
+                            this.start_model_download(row_id, cx);
                         }))
                     }),
+                )
+        } else {
+            let mut actions = div()
+                .flex()
+                .items_center()
+                .flex_shrink_0()
+                .gap(px(Theme::SPACE_1_5));
+            actions = actions.child(
+                primitives::mini_btn("定位", true)
+                    .id(("model-reveal", row_idx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.reveal_model_file(row_id, cx);
+                    })),
             );
-        }
+            if crate::utils::model_download::item_is_deletable(item.id) {
+                let is_self_build = self.state.model_is_custom_build(item.id);
+                let can_delete = !is_downloading && !is_self_build;
+                let label = if is_self_build { "自编译" } else { "删除" };
+                actions = actions.child(
+                    primitives::mini_btn(label, can_delete)
+                        .id(("model-delete", row_idx))
+                        .when(can_delete, |d| {
+                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                let name = item.label.to_string();
+                                this.confirm_dialog = Some(crate::ui::types::ConfirmDialogInfo {
+                                    title: format!("删除「{name}」？"),
+                                    message: format!(
+                                        "将删除本地文件：{}。删除后可随时重新下载，已完成的转写工程不受影响。",
+                                        crate::utils::AppConfig::resolve_path(item.dest).display()
+                                    ),
+                                    confirm_label: "删除".to_string(),
+                                    danger: true,
+                                    action: crate::ui::types::ConfirmAction::DeleteModelFile(
+                                        item.id.to_string(),
+                                    ),
+                                });
+                                cx.notify();
+                            }))
+                        }),
+                );
+            }
+            actions
+        };
 
-        div()
+        let mut row_container = div()
+            .w_full()
             .flex()
             .items_center()
             .justify_between()
             .gap(px(Theme::SPACE_2))
+            .px(px(Theme::SPACE_2))
+            .py(px(Theme::SPACE_1_5))
+            .rounded(px(Theme::RADIUS_SM));
+
+        if !present && !is_downloading && is_needed {
+            row_container = row_container
+                .bg(Theme::tint_red_soft())
+                .border_1()
+                .border_color(Theme::tint_red_border());
+        } else {
+            row_container = row_container.hover(|s| s.bg(Theme::bg_hover()));
+        }
+
+        row_container
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(Theme::SPACE_0_5))
-                    .flex_1()
+                    .min_w(px(0.0))
                     .child(
                         div()
                             .flex()
@@ -472,7 +615,11 @@ impl MainWindow {
                                 div()
                                     .text_size(px(Theme::TEXT_SMALL))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(Theme::text_primary())
+                                    .text_color(if !present {
+                                        Theme::accent_red()
+                                    } else {
+                                        Theme::text_primary()
+                                    })
                                     .child(item.label),
                             )
                             .child(
@@ -481,18 +628,10 @@ impl MainWindow {
                                     .text_color(Theme::text_muted())
                                     .child(human_size(item.size)),
                             )
-                            .when(item.required, |d| d.child(primitives::badge_danger("必需"))),
+                            .child(status_badge),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_shrink_0()
-                    .gap(px(Theme::SPACE_2))
-                    .child(status_el)
-                    .child(actions),
-            )
+            .child(right_actions)
             .into_any_element()
     }
 }

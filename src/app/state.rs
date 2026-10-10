@@ -958,21 +958,18 @@ impl AppState {
         self.save_translate_config();
     }
 
-    /// 把术语表写到临时文件并返回路径，供外部编辑器（记事本）打开。
-    ///
-    /// 用临时文件而非「对话框逐行输入」：术语表天然是多行文本，自绘单行输入框
-    /// 既装不下也没法用输入法舒服地编辑；写文件让用户用顺手的编辑器改，回来再读。
+    /// 把术语表写到软件根目录下的 `glossary.txt` 并返回路径，供外部编辑器（记事本）打开。
     pub fn write_glossary_temp_file(&self) -> std::io::Result<std::path::PathBuf> {
-        let path = std::env::temp_dir().join("voice2word_glossary.txt");
+        let path = crate::utils::AppConfig::resolve_path("glossary.txt");
         let header = "# Voice2Word 术语表：每行一条「原文=译文」（也支持 -> / → / : 分隔）\n\
                      # 以 # 开头的是注释。保存后回到程序点「应用术语表」。\n\n";
         std::fs::write(&path, format!("{header}{}", self.config.translate.glossary))?;
         Ok(path)
     }
 
-    /// 从临时文件读回术语表（跳过自动写入的注释头），落盘并返回生效条数。
+    /// 从 `glossary.txt` 读回术语表（跳过自动写入的注释头），落盘并返回生效条数。
     pub fn reload_glossary_from_temp_file(&mut self) -> std::io::Result<usize> {
-        let path = std::env::temp_dir().join("voice2word_glossary.txt");
+        let path = crate::utils::AppConfig::resolve_path("glossary.txt");
         let text = std::fs::read_to_string(&path)?;
         self.config.translate.glossary = text;
         self.save_translate_config();

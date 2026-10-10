@@ -1117,8 +1117,13 @@ impl MainWindow {
                                                 .border_color(Theme::border_mid())
                                                 .cursor_pointer()
                                                 .hover(|s| s.bg(Theme::bg_hover()))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.prompt_edit_translation(cx);
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    if let Some(idx) = this.state.selected_segment_index {
+                                                        let trans = this.state.segments.iter().find(|s| s.index == idx)
+                                                            .and_then(|s| s.translation.clone())
+                                                            .unwrap_or_default();
+                                                        this.start_inline_edit(idx, true, &trans, window, cx);
+                                                    }
                                                 }))
                                                 .child(
                                                     div()
@@ -1602,6 +1607,13 @@ impl MainWindow {
                             // 列表信息子标头
                             .child({
                                 let has_any_trans = self.state.segments.iter().any(|s| s.has_translation());
+                                let has_distinct_trans = self.state.segments.iter().any(|s| {
+                                    if let Some(t) = &s.translation {
+                                        !t.trim().is_empty() && t.trim() != s.display_text().trim()
+                                    } else {
+                                        false
+                                    }
+                                });
                                 div()
                                     .w_full()
                                     .h(px(26.0))
@@ -1617,18 +1629,24 @@ impl MainWindow {
                                             .text_size(px(Theme::TEXT_SMALL))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(Theme::text_muted())
-                                            .child("字幕清单 (上下并列显示)"),
+                                            .child(if has_distinct_trans {
+                                                "字幕清单 (上下并列显示)"
+                                            } else {
+                                                "字幕清单"
+                                            }),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(Theme::TEXT_SMALL))
-                                            .text_color(if has_any_trans {
+                                            .text_color(if has_distinct_trans {
                                                 Theme::accent_mint()
                                             } else {
                                                 Theme::text_muted()
                                             })
-                                            .child(if has_any_trans {
+                                            .child(if has_distinct_trans {
                                                 "双语显示"
+                                            } else if has_any_trans {
+                                                "单语显示 (译文同原文)"
                                             } else {
                                                 "单语显示"
                                             }),
@@ -1652,8 +1670,14 @@ impl MainWindow {
                                 }
 
                                 let row_count = self.subtitle_filter.len();
-                                let has_any_trans = self.state.segments.iter().any(|s| s.has_translation());
-                                let row_h = if has_any_trans {
+                                let has_distinct_trans = self.state.segments.iter().any(|s| {
+                                    if let Some(t) = &s.translation {
+                                        !t.trim().is_empty() && t.trim() != s.display_text().trim()
+                                    } else {
+                                        false
+                                    }
+                                });
+                                let row_h = if has_distinct_trans {
                                     SUBTITLE_ROW_H_BILINGUAL
                                 } else {
                                     SUBTITLE_ROW_H_MONO
@@ -1677,6 +1701,9 @@ impl MainWindow {
                                         let cur_time = this.state.current_time;
                                         let glossary_bad = glossary_bad.clone();
                                         let low_conf = low_conf.clone();
+                                        let inline_target = this.inline_edit_target;
+                                        let inline_buf = this.inline_edit_buffer.clone();
+                                        let inline_focus = this.inline_edit_focus.clone();
                                         visible_range
                                             .map(|i| {
                                                 let pos = this.subtitle_filter.get(i).copied().unwrap_or(i);
@@ -1826,43 +1853,197 @@ impl MainWindow {
                                                                     })),
                                                             ),
                                                     )
-                                                    // 第二行：字幕内容 (原文)
-                                                    .child(
-                                                        div()
-                                                            .w_full()
-                                                            .text_size(px(Theme::TEXT_BODY))
-                                                            .font_weight(if is_selected {
-                                                                FontWeight::SEMIBOLD
-                                                            } else {
-                                                                FontWeight::NORMAL
-                                                            })
-                                                            .text_color(Theme::text_primary())
-                                                            .truncate()
-                                                            .child(raw_text),
-                                                    )
-                                                    // 第三行：翻译字幕 (在原文下方直接显示；无翻译时不显示)
-                                                    .children(if has_trans && !trans_text.trim().is_empty() {
-                                                        Some(
+                                                    // 第二行：字幕内容 (原文，点击直接就地编辑)
+                                                    .child({
+                                                        let is_editing_raw = inline_target == Some((seg_idx, false));
+                                                        if is_editing_raw {
                                                             div()
-                                                                .id(("table-row-trans", seg_idx))
+                                                                .id(("inline-edit-raw", seg_idx))
                                                                 .w_full()
-                                                                .text_size(px(Theme::TEXT_SMALL))
-                                                                .text_color(if is_selected {
-                                                                    Theme::accent_mint()
-                                                                } else {
-                                                                    Theme::text_secondary()
-                                                                })
-                                                                .truncate()
-                                                                .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    this.state.select_segment(seg_idx);
-                                                                    this.prompt_edit_translation(cx);
+                                                                .track_focus(&inline_focus)
+                                                                .px_1p5()
+                                                                .py_0p5()
+                                                                .rounded_sm()
+                                                                .bg(Theme::bg_sidebar())
+                                                                .border_1()
+                                                                .border_color(Theme::accent_mint())
+                                                                .cursor_text()
+                                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                                    window.focus(&this.inline_edit_focus);
                                                                     cx.notify();
                                                                 }))
-                                                                .child(trans_text),
-                                                        )
-                                                    } else {
-                                                        None
+                                                                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                                                    this.handle_inline_edit_keydown(event, cx);
+                                                                }))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_between()
+                                                                .child(
+                                                                    div()
+                                                                        .flex_1()
+                                                                        .text_size(px(Theme::TEXT_BODY))
+                                                                        .text_color(Theme::accent_mint())
+                                                                        .truncate()
+                                                                        .child(format!("{}▌", inline_buf)),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .gap_1()
+                                                                        .flex_shrink_0()
+                                                                        .child(
+                                                                            div()
+                                                                                .id(("inline-save-raw", seg_idx))
+                                                                                .px_1()
+                                                                                .py_0p5()
+                                                                                .rounded_sm()
+                                                                                .bg(Theme::accent_mint())
+                                                                                .text_size(px(10.0))
+                                                                                .text_color(Theme::text_on_accent())
+                                                                                .cursor_pointer()
+                                                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                                                    this.commit_inline_edit(cx);
+                                                                                }))
+                                                                                .child("保存"),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .id(("inline-cancel-raw", seg_idx))
+                                                                                .px_1()
+                                                                                .py_0p5()
+                                                                                .rounded_sm()
+                                                                                .bg(Theme::bg_hover())
+                                                                                .text_size(px(10.0))
+                                                                                .text_color(Theme::text_muted())
+                                                                                .cursor_pointer()
+                                                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                                                    this.cancel_inline_edit(cx);
+                                                                                }))
+                                                                                .child("取消"),
+                                                                        ),
+                                                                )
+                                                        } else {
+                                                            div()
+                                                                .id(("table-row-raw", seg_idx))
+                                                                .w_full()
+                                                                .text_size(px(Theme::TEXT_BODY))
+                                                                .font_weight(if is_selected {
+                                                                    FontWeight::SEMIBOLD
+                                                                } else {
+                                                                    FontWeight::NORMAL
+                                                                })
+                                                                .text_color(Theme::text_primary())
+                                                                .truncate()
+                                                                .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                .cursor_text()
+                                                                .on_click(cx.listener({
+                                                                    let raw_for_click = raw_text.clone();
+                                                                    move |this, _, window, cx| {
+                                                                        this.state.select_segment(seg_idx);
+                                                                        this.start_inline_edit(seg_idx, false, &raw_for_click, window, cx);
+                                                                    }
+                                                                }))
+                                                                .child(raw_text.clone())
+                                                        }
+                                                    })
+                                                    // 第三行：翻译字幕 (点击直接就地编辑；无翻译且非编辑态时不显示)
+                                                    .children({
+                                                        let is_editing_trans = inline_target == Some((seg_idx, true));
+                                                        let show_trans = is_editing_trans || (has_trans && !trans_text.trim().is_empty() && trans_text.trim() != raw_text.trim());
+                                                        if show_trans {
+                                                            Some(if is_editing_trans {
+                                                                div()
+                                                                    .id(("inline-edit-trans", seg_idx))
+                                                                    .w_full()
+                                                                    .track_focus(&inline_focus)
+                                                                    .px_1p5()
+                                                                    .py_0p5()
+                                                                    .rounded_sm()
+                                                                    .bg(Theme::bg_sidebar())
+                                                                    .border_1()
+                                                                    .border_color(Theme::accent_mint())
+                                                                    .cursor_text()
+                                                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                                        window.focus(&this.inline_edit_focus);
+                                                                        cx.notify();
+                                                                    }))
+                                                                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                                                        this.handle_inline_edit_keydown(event, cx);
+                                                                    }))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_between()
+                                                                    .child(
+                                                                        div()
+                                                                            .flex_1()
+                                                                            .text_size(px(Theme::TEXT_SMALL))
+                                                                            .text_color(Theme::accent_mint())
+                                                                            .truncate()
+                                                                            .child(format!("{}▌", inline_buf)),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .gap_1()
+                                                                            .flex_shrink_0()
+                                                                            .child(
+                                                                                div()
+                                                                                    .id(("inline-save-trans", seg_idx))
+                                                                                    .px_1()
+                                                                                    .py_0p5()
+                                                                                    .rounded_sm()
+                                                                                    .bg(Theme::accent_mint())
+                                                                                    .text_size(px(10.0))
+                                                                                    .text_color(Theme::text_on_accent())
+                                                                                    .cursor_pointer()
+                                                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                                                        this.commit_inline_edit(cx);
+                                                                                    }))
+                                                                                    .child("保存"),
+                                                                            )
+                                                                            .child(
+                                                                                div()
+                                                                                    .id(("inline-cancel-trans", seg_idx))
+                                                                                    .px_1()
+                                                                                    .py_0p5()
+                                                                                    .rounded_sm()
+                                                                                    .bg(Theme::bg_hover())
+                                                                                    .text_size(px(10.0))
+                                                                                    .text_color(Theme::text_muted())
+                                                                                    .cursor_pointer()
+                                                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                                                        this.cancel_inline_edit(cx);
+                                                                                    }))
+                                                                                    .child("取消"),
+                                                                            ),
+                                                                    )
+                                                            } else {
+                                                                div()
+                                                                    .id(("table-row-trans", seg_idx))
+                                                                    .w_full()
+                                                                    .text_size(px(Theme::TEXT_SMALL))
+                                                                    .text_color(if is_selected {
+                                                                        Theme::accent_mint()
+                                                                    } else {
+                                                                        Theme::text_secondary()
+                                                                    })
+                                                                    .truncate()
+                                                                    .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                    .cursor_text()
+                                                                    .on_click(cx.listener({
+                                                                        let trans_for_click = trans_text.clone();
+                                                                        move |this, _, window, cx| {
+                                                                            this.state.select_segment(seg_idx);
+                                                                            this.start_inline_edit(seg_idx, true, &trans_for_click, window, cx);
+                                                                        }
+                                                                    }))
+                                                                    .child(trans_text)
+                                                            })
+                                                        } else {
+                                                            None
+                                                        }
                                                     })
                                                     .into_any_element()
                                             })
@@ -3244,6 +3425,14 @@ impl MainWindow {
             .iter()
             .filter(|s| s.has_translation() && !s.translation_matches(&target))
             .count();
+        let has_any_trans_overall = self.state.segments.iter().any(|s| s.has_translation());
+        let has_distinct_trans = self.state.segments.iter().any(|s| {
+            if let Some(t) = &s.translation {
+                !t.trim().is_empty() && t.trim() != s.display_text().trim()
+            } else {
+                false
+            }
+        });
 
         // 引擎档位：本地 Qwen 免费离线，在线 API 更快更好但需要密钥
         let mode_row = div()
@@ -3367,8 +3556,13 @@ impl MainWindow {
                     primitives::BtnVariant::Secondary,
                 )
                 .id("btn-translate-edit-selected")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.prompt_edit_translation(cx);
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if let Some(idx) = this.state.selected_segment_index {
+                        let trans = this.state.segments.iter().find(|s| s.index == idx)
+                            .and_then(|s| s.translation.clone())
+                            .unwrap_or_default();
+                        this.start_inline_edit(idx, true, &trans, window, cx);
+                    }
                 }))
                 .into_any_element()
             } else {
@@ -3436,6 +3630,21 @@ impl MainWindow {
             } else {
                 div().into_any_element()
             })
+            // 存在译文且未在翻译中时，提供一键清空译文入口，方便恢复纯净单语状态
+            .child(if has_any_trans_overall && !is_translating {
+                primitives::btn_clickable(
+                    "清空译文",
+                    primitives::BtnSize::Sm,
+                    primitives::BtnVariant::Secondary,
+                )
+                .id("btn-translate-clear-all")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.clear_all_translations(cx);
+                }))
+                .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(
                 div()
                     .flex_1()
@@ -3452,7 +3661,11 @@ impl MainWindow {
                         } else if expected > 0 && done == expected {
                             // 同上：`done` 只认实际译出，空/纯空白译文不会被
                             // 当成「已全部翻译为{target}」。
-                            format!("已全部翻译为{target}")
+                            if !has_distinct_trans && has_any_trans_overall {
+                                format!("已处理完毕（译文同原文，画面与列表已自动单行显示；若无需译文可点「清空译文」）")
+                            } else {
+                                format!("已全部翻译为{target}")
+                            }
                         } else if expected == 0 {
                             // 有字幕但没有任何非空源文：没有可翻译的内容
                             "所有字幕行都为空，没有可翻译的文本".to_string()
@@ -4280,10 +4493,151 @@ impl MainWindow {
         }).detach();
     }
 
-    /// 弹出原生 Windows 输入对话框直接订正**译文**（机翻有出入时手工改）。
-    ///
-    /// 与 `prompt_edit_text` 同一套实现：自绘输入框拿不到系统 IME 组合态，
-    /// 中文/日文输入法下会错字，所以译文编辑也走系统 InputBox。
+    /// 开始就地原地编辑字幕（原文或译文）。
+    pub(crate) fn start_inline_edit(
+        &mut self,
+        seg_idx: usize,
+        is_trans: bool,
+        initial_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inline_edit_target.is_some() {
+            self.commit_inline_edit(cx);
+        }
+        self.inline_edit_target = Some((seg_idx, is_trans));
+        self.inline_edit_buffer = initial_text.to_string();
+        self.inline_edit_cursor = initial_text.chars().count();
+        window.focus(&self.inline_edit_focus);
+        cx.notify();
+    }
+
+    /// 提交保存当前的就地原地编辑。
+    pub(crate) fn commit_inline_edit(&mut self, cx: &mut Context<Self>) {
+        let Some((seg_idx, is_trans)) = self.inline_edit_target.take() else {
+            return;
+        };
+        let new_text = self.inline_edit_buffer.trim().to_string();
+        if is_trans {
+            if let Some(seg) = self.state.segments.iter_mut().find(|s| s.index == seg_idx) {
+                if new_text.is_empty() {
+                    seg.translation = None;
+                    seg.translation_lang = None;
+                } else {
+                    seg.translation = Some(new_text);
+                    seg.translation_lang = Some(self.state.translate_target_lang.clone());
+                }
+            }
+        } else {
+            if !new_text.is_empty() {
+                if let Some(seg) = self.state.segments.iter_mut().find(|s| s.index == seg_idx) {
+                    seg.text = new_text.clone();
+                    if !seg.polished.is_empty() {
+                        seg.polished = new_text.clone();
+                    }
+                }
+                if self.state.selected_segment_index == Some(seg_idx) {
+                    self.state.editing_text = new_text;
+                }
+            }
+        }
+        self.inline_edit_buffer.clear();
+        self.inline_edit_cursor = 0;
+        self.state.segments_dirty = true;
+        self.state.flush_segments_if_dirty();
+        cx.notify();
+    }
+
+    /// 取消当前的就地原地编辑。
+    pub(crate) fn cancel_inline_edit(&mut self, cx: &mut Context<Self>) {
+        self.inline_edit_target = None;
+        self.inline_edit_buffer.clear();
+        self.inline_edit_cursor = 0;
+        cx.notify();
+    }
+
+    /// 处理就地原地编辑时的按键输入
+    pub(crate) fn handle_inline_edit_keydown(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let key = &event.keystroke.key;
+        let total_chars = self.inline_edit_buffer.chars().count();
+        let cursor = self.inline_edit_cursor.min(total_chars);
+
+        if event.keystroke.modifiers.control {
+            if key == "v" {
+                if let Some(item) = cx.read_from_clipboard() {
+                    if let Some(text) = item.text() {
+                        let clean = text.trim().replace(['\r', '\n'], "");
+                        let mut chars: Vec<char> = self.inline_edit_buffer.chars().collect();
+                        let insert_chars: Vec<char> = clean.chars().collect();
+                        let ins_len = insert_chars.len();
+                        chars.splice(cursor..cursor, insert_chars);
+                        self.inline_edit_buffer = chars.into_iter().collect();
+                        self.inline_edit_cursor = cursor + ins_len;
+                        cx.notify();
+                    }
+                }
+            } else if key == "c" {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(self.inline_edit_buffer.clone()));
+            } else if key == "a" {
+                self.inline_edit_cursor = total_chars;
+                cx.notify();
+            }
+            return;
+        }
+
+        if key == "enter" {
+            self.commit_inline_edit(cx);
+        } else if key == "escape" {
+            self.cancel_inline_edit(cx);
+        } else if key == "backspace" {
+            if cursor > 0 && total_chars > 0 {
+                let mut chars: Vec<char> = self.inline_edit_buffer.chars().collect();
+                chars.remove(cursor - 1);
+                self.inline_edit_buffer = chars.into_iter().collect();
+                self.inline_edit_cursor = cursor - 1;
+                cx.notify();
+            }
+        } else if key == "delete" {
+            if cursor < total_chars {
+                let mut chars: Vec<char> = self.inline_edit_buffer.chars().collect();
+                chars.remove(cursor);
+                self.inline_edit_buffer = chars.into_iter().collect();
+                cx.notify();
+            }
+        } else if key == "left" {
+            if cursor > 0 {
+                self.inline_edit_cursor = cursor - 1;
+                cx.notify();
+            }
+        } else if key == "right" {
+            if cursor < total_chars {
+                self.inline_edit_cursor = cursor + 1;
+                cx.notify();
+            }
+        } else if key == "home" {
+            self.inline_edit_cursor = 0;
+            cx.notify();
+        } else if key == "end" {
+            self.inline_edit_cursor = total_chars;
+            cx.notify();
+        } else if key.chars().count() == 1 {
+            let ch = key.chars().next().unwrap();
+            if !ch.is_control() {
+                let mut chars: Vec<char> = self.inline_edit_buffer.chars().collect();
+                chars.insert(cursor, ch);
+                self.inline_edit_buffer = chars.into_iter().collect();
+                self.inline_edit_cursor = cursor + 1;
+                cx.notify();
+            }
+        }
+    }
+
+    /// 弹出原生 Windows 输入对话框直接订正**译文**（旧版备用入口，已被就地编辑替代）。
+    #[allow(dead_code)]
     pub(crate) fn prompt_edit_translation(&mut self, cx: &mut Context<Self>) {
         // 与 `prompt_edit_text` 同样的会话守卫：InputBox 弹出期间工作区可能被换掉、
         // 选中项也可能被播放联动改掉，收尾时必须定位回原来那一句

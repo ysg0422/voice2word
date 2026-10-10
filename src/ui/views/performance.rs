@@ -125,6 +125,7 @@ pub(crate) fn provider_status_line(
 /// 渲染时按 `(api_base, api_key)` 指纹比对，配置一改旧列表立即作废，不会拿过期结果
 /// 去覆盖用户新填的基址。
 static MODEL_LIST: Mutex<Option<ModelListCache>> = Mutex::new(None);
+static MODEL_CATEGORY: Mutex<String> = Mutex::new(String::new());
 
 struct ModelListCache {
     /// 拉取时的配置指纹（基址 + 生效密钥），用于判断列表是否已过期
@@ -1049,7 +1050,18 @@ impl MainWindow {
                 .background_executor()
                 .spawn(async move { fetch_model_list(&cfg, &key) })
                 .await;
-            let _ = this.update(cx, |_this, cx| {
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(ref outcome) = result {
+                    if outcome.url.contains("/v1/models")
+                        && !this.state.config.translate.api_base.contains("/v1")
+                    {
+                        let trimmed = this.state.config.translate.api_base.trim().trim_end_matches('/');
+                        let auto_v1 = format!("{trimmed}/v1");
+                        this.state.config.translate.api_base = auto_v1.clone();
+                        this.api_base_input = auto_v1;
+                        this.state.save_translate_config();
+                    }
+                }
                 with_model_cache(|slot| {
                     *slot = Some(match result {
                         Ok(outcome) => ModelListCache {
@@ -1261,7 +1273,7 @@ impl MainWindow {
         row.into_any_element()
     }
 
-    /// 服务端模型的下拉列表/平铺选择区（直接获取到啥，列表池就有啥，点击即选入）。
+    /// 服务端模型的规整选择区（支持分类Tab过滤、滚动容器防撑屏、纯净ID展示）。
     fn render_model_choice_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let (loading, _, models) = model_cache_snapshot(&self.state.config.translate);
         let selected = self.state.config.translate.api_model.trim().to_string();
@@ -1269,6 +1281,19 @@ impl MainWindow {
         if models.is_empty() || loading {
             return div().into_any_element();
         }
+
+        let cat = MODEL_CATEGORY.lock().map(|g| g.clone()).unwrap_or_default();
+        let cn_count = models.iter().filter(|m| m.id.starts_with("cn:")).count();
+        let global_count = models.iter().filter(|m| m.id.starts_with("global:")).count();
+
+        let filtered_models: Vec<&ModelInfo> = models
+            .iter()
+            .filter(|m| match cat.as_str() {
+                "cn" => m.id.starts_with("cn:"),
+                "global" => m.id.starts_with("global:"),
+                _ => true,
+            })
+            .collect();
 
         let mut container = div()
             .w_full()
@@ -1281,30 +1306,99 @@ impl MainWindow {
             .flex_col()
             .gap(px(Theme::SPACE_2));
 
+        // 顶部操作栏：标题 + 当前选定提示 + 分类过滤 Tabs
         let header = div()
             .flex()
             .items_center()
             .justify_between()
             .child(
                 div()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(Theme::text_secondary())
-                    .child(format!("服务端可用模型池（共 {} 个，点击直接填入）：", models.len())),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(Theme::text_primary())
+                            .child(format!("可用模型池 ({} 个)", models.len())),
+                    )
+                    .child(if !selected.is_empty() {
+                        div()
+                            .px(px(Theme::SPACE_1_5))
+                            .py(px(2.0))
+                            .rounded(px(Theme::RADIUS_SM))
+                            .bg(Theme::tint_mint_soft())
+                            .border_1()
+                            .border_color(Theme::tint_mint_border())
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::accent_mint())
+                            .child(format!("当前: {selected}"))
+                    } else {
+                        div()
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(Theme::SPACE_1))
+                    .child(
+                        primitives::chip(format!("全部 ({})", models.len()), cat.is_empty(), false)
+                            .id("model-cat-all")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                if let Ok(mut g) = MODEL_CATEGORY.lock() {
+                                    *g = String::new();
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .when(cn_count > 0, |d| {
+                        d.child(
+                            primitives::chip(format!("国内 ({cn_count})"), cat == "cn", false)
+                                .id("model-cat-cn")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    if let Ok(mut g) = MODEL_CATEGORY.lock() {
+                                        *g = "cn".to_string();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when(global_count > 0, |d| {
+                        d.child(
+                            primitives::chip(format!("国际 ({global_count})"), cat == "global", false)
+                                .id("model-cat-global")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    if let Ok(mut g) = MODEL_CATEGORY.lock() {
+                                        *g = "global".to_string();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             );
         container = container.child(header);
 
-        let mut chips_row = div()
+        // 核心滚动网格：限制高度 max-h 140px，带平滑滚动，绝不霸占整个屏幕
+        let mut scroll_box = div()
+            .id("perf-model-scroll-box")
             .w_full()
+            .max_h(px(140.0))
+            .overflow_y_scroll()
             .flex()
             .flex_wrap()
-            .gap(px(Theme::SPACE_1_5));
+            .gap(px(Theme::SPACE_1_5))
+            .p(px(Theme::SPACE_1));
 
-        for model in models {
+        for model in filtered_models {
             let id = model.id.clone();
             let is_sel = id == selected;
-            chips_row = chips_row.child(
-                primitives::chip(model.display_label(), is_sel, false)
+            scroll_box = scroll_box.child(
+                primitives::chip(id.clone(), is_sel, false)
                     .id(SharedString::from(format!("perf-fetched-model-{id}")))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1313,7 +1407,7 @@ impl MainWindow {
             );
         }
 
-        container.child(chips_row).into_any_element()
+        container.child(scroll_box).into_any_element()
     }
 
     /// 设置行通用布局：左侧名称，右侧单行等级选择器（简约，无描述小字）

@@ -478,6 +478,14 @@ pub struct MainWindow {
     /// 与 `subtitle_filter` 同理——播放时每 40ms 重绘一次，逐帧对上千句 × 术语条数
     /// 跑子串匹配会白白掉帧。
     pub(crate) glossary_bad_cache: Option<((String, u64), Vec<usize>)>,
+    /// 就地编辑状态：`Some((段落index, 是否为译文))`
+    pub(crate) inline_edit_target: Option<(usize, bool)>,
+    /// 就地编辑缓冲区文本
+    pub(crate) inline_edit_buffer: String,
+    /// 就地编辑光标位置（字符偏移）
+    pub(crate) inline_edit_cursor: usize,
+    /// 就地编辑焦点句柄
+    pub(crate) inline_edit_focus: FocusHandle,
     /// 在线翻译 API 配置卡片的编辑缓冲（改完即写 config.toml）
     pub(crate) api_base_input: String,
     pub(crate) api_model_input: String,
@@ -533,6 +541,8 @@ pub struct MainWindow {
     /// 面板是「非阻塞式冒泡」的轻量浮层而非确认框那种阻塞模态，因此与
     /// `confirm_dialog` 等并存时由渲染顺序决定盖在谁上面（见 `Render::render`）。
     pub(crate) command_palette: Option<CommandPaletteState>,
+    /// 模型与组件管理视图：false = 仅显示当前配置所需（默认，用啥显示啥）；true = 显示全部组件库
+    pub(crate) model_manager_show_all: bool,
 }
 
 /// 剪辑台行首「低置信」标记的判据（纯函数，便于单测）。
@@ -702,6 +712,7 @@ impl MainWindow {
         let api_model_focus = cx.focus_handle();
         let api_key_focus = cx.focus_handle();
         let local_model_focus = cx.focus_handle();
+        let inline_edit_focus = cx.focus_handle();
         let api_base_input = state.config.translate.api_base.clone();
         let api_model_input = state.config.translate.api_model.clone();
         let api_key_input = state.config.translate.api_key.clone();
@@ -780,6 +791,10 @@ impl MainWindow {
             subtitle_filter_key: None,
             glossary_bad_cache: None,
             low_confidence_cache: None,
+            inline_edit_target: None,
+            inline_edit_buffer: String::new(),
+            inline_edit_cursor: 0,
+            inline_edit_focus,
             api_base_input,
             api_model_input,
             api_key_input,
@@ -804,6 +819,7 @@ impl MainWindow {
             library_selected: HashSet::new(),
             library_export_busy: false,
             command_palette: None,
+            model_manager_show_all: false,
         };
 
         // 恢复上次的批量队列：队列原本只在内存里，关窗 / 崩溃就全丢，用户排好的

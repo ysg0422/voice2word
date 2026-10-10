@@ -139,9 +139,14 @@ impl Segment {
                 _ => self.display_text().to_string(),
             },
             ExportMode::Bilingual => match self.translation.as_deref() {
-                // 同上：只有**非空**译文才拼出第二行，否则整段回落为纯原文
+                // 只有非空译文才拼出第二行；若译文与原文内容一致（如中翻中无变化），自动去重单行显示
                 Some(t) if !t.trim().is_empty() => {
-                    format!("{}\n{}", t, self.display_text())
+                    let raw = self.display_text();
+                    if t.trim() == raw.trim() {
+                        raw.to_string()
+                    } else {
+                        format!("{}\n{}", t, raw)
+                    }
                 }
                 _ => self.display_text().to_string(),
             },
@@ -161,10 +166,7 @@ impl Segment {
     /// 换格式导出后上下行颠倒：
     /// - [`ExportMode::RawOnly`] → 原文；
     /// - [`ExportMode::TranslationOnly`] → 仅译文（译文为空时退回原文，避免空条）；
-    /// - [`ExportMode::Bilingual`] → `译文  原文`（无译文时退回原文）。
-    ///
-    /// 为什么必须提供它：此前三个工程导出器都只写 `display_text()`，用户辛苦译好的
-    /// 字幕在剪映 / 达芬奇 / Premiere 里**凭空消失**，而界面里明明看得见。
+    /// - [`ExportMode::Bilingual`] → `译文  原文`（无译文或译文与原文相同时退回单份原文）。
     pub fn project_export_text(&self, mode: ExportMode) -> String {
         let raw = self.display_text().replace(['\r', '\n'], " ");
         let trans = self
@@ -177,7 +179,13 @@ impl Segment {
             ExportMode::RawOnly => raw,
             ExportMode::TranslationOnly if has_trans => trans,
             ExportMode::TranslationOnly => raw,
-            ExportMode::Bilingual if has_trans => format!("{trans}  {raw}"),
+            ExportMode::Bilingual if has_trans => {
+                if trans.trim() == raw.trim() {
+                    raw
+                } else {
+                    format!("{trans}  {raw}")
+                }
+            }
             ExportMode::Bilingual => raw,
         }
     }
@@ -1020,6 +1028,16 @@ mod tests {
             "translated\n润色后的文本。"
         );
         assert_eq!(seg.export_text(ExportMode::TranslationOnly), "translated");
+
+        // 译文与原文完全相同时（如中翻中无变化），双语模式应自动去重为单行
+        seg.translation = Some("润色后的文本。".to_string());
+        assert_eq!(
+            seg.export_text(ExportMode::Bilingual),
+            "润色后的文本。",
+            "译文与原文一致时应单行去重，避免叠两行相同文字"
+        );
+        let proj = seg.project_export_text(ExportMode::Bilingual);
+        assert_eq!(proj, "润色后的文本。", "项目导出也应去重为单语单行");
     }
 
     #[test]

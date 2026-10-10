@@ -2629,6 +2629,29 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// 清空当前字幕列表中的全部译文，恢复单语状态。
+    pub(crate) fn clear_all_translations(&mut self, cx: &mut Context<Self>) {
+        if self.state.is_translating {
+            self.notice = Some("翻译正在进行中，请先取消翻译再清空译文".to_string());
+            cx.notify();
+            return;
+        }
+        let had_trans = self.state.segments.iter().any(|s| s.translation.is_some());
+        if !had_trans {
+            self.notice = Some("当前没有译文可清空".to_string());
+            cx.notify();
+            return;
+        }
+        for seg in &mut self.state.segments {
+            seg.translation = None;
+            seg.translation_lang = None;
+        }
+        self.state.segments_dirty = true;
+        self.state.flush_segments_if_dirty();
+        self.notice = Some("已清空全部译文，已恢复为单语显示".to_string());
+        cx.notify();
+    }
+
     /// 打开（或创建）术语表临时文件，供用户用记事本等编辑器编辑。
     ///
     /// 术语表是多行文本，自绘单行输入框既装不下也没法用输入法舒服编辑；改为写文件 +
@@ -2643,10 +2666,9 @@ impl MainWindow {
                     .arg("")
                     .arg(&path)
                     .spawn();
-                self.glossary_status = Some(format!(
-                    "已打开术语表文件（{}）。改完保存后回来点「应用术语表」。",
-                    path.display()
-                ));
+                self.glossary_status = Some(
+                    "已打开软件目录下的术语表（glossary.txt）。改完保存后点「应用术语表」。".to_string(),
+                );
             }
             Err(e) => {
                 self.glossary_status = Some(format!("无法创建术语表文件: {e}"));
@@ -2832,15 +2854,21 @@ impl MainWindow {
         if self.state.is_downloading {
             return;
         }
+        let show_all = self.model_manager_show_all;
         let mut pending: Vec<&'static crate::utils::DownloadItem> = crate::utils::ITEMS
             .iter()
             .filter(|i| !self.state.model_is_present(i.id))
+            .filter(|i| show_all || crate::ui::components::model_manager::is_item_needed_by_current_config(i.id, &self.state))
             .collect();
         // 小文件先下：几十 MB 的 VAD/tokens 几秒就完，用户立刻看到进展；
         // ffmpeg(50MB) 与主模型(180MB+) 排在后面。
         pending.sort_by_key(|i| i.size);
         if pending.is_empty() {
-            self.state.download_status_msg = "所有组件都已就位".to_string();
+            self.state.download_status_msg = if show_all {
+                "全部组件库均已就位".to_string()
+            } else {
+                "当前模式所需组件均已就位，无需下载".to_string()
+            };
             cx.notify();
             return;
         }
