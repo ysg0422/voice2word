@@ -2667,7 +2667,8 @@ impl MainWindow {
                     .arg(&path)
                     .spawn();
                 self.glossary_status = Some(
-                    "已打开软件目录下的术语表（glossary.txt）。改完保存后点「应用术语表」。".to_string(),
+                    "已打开软件目录下的术语表（glossary.txt）。改完保存后点「应用术语表」。"
+                        .to_string(),
                 );
             }
             Err(e) => {
@@ -2858,7 +2859,13 @@ impl MainWindow {
         let mut pending: Vec<&'static crate::utils::DownloadItem> = crate::utils::ITEMS
             .iter()
             .filter(|i| !self.state.model_is_present(i.id))
-            .filter(|i| show_all || crate::ui::components::model_manager::is_item_needed_by_current_config(i.id, &self.state))
+            .filter(|i| {
+                show_all
+                    || crate::ui::components::model_manager::is_item_needed_by_current_config(
+                        i.id,
+                        &self.state,
+                    )
+            })
             .collect();
         // 小文件先下：几十 MB 的 VAD/tokens 几秒就完，用户立刻看到进展；
         // ffmpeg(50MB) 与主模型(180MB+) 排在后面。

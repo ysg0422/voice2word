@@ -9,7 +9,10 @@ use crate::ui::MainWindow;
 
 impl MainWindow {
     /// 首次启动硬件选择对话框：让用户一键选择「我有 GPU」或「我没有 GPU」
-    pub(crate) fn render_hardware_setup_modal(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_hardware_setup_modal(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let is_gpu = self.state.config.gpu.is_gpu_tier();
 
         primitives::modal_scrim()

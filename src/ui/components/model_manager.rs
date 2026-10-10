@@ -42,7 +42,8 @@ pub fn is_item_needed_by_current_config(item_id: &str, state: &crate::app::AppSt
         "sensevoice-model" | "sensevoice-tokens" | "sensevoice-vad" => is_sv,
 
         // Whisper 模型档位与 Silero VAD：选择 Whisper 全能模式时需要
-        "whisper-small" | "whisper-base" | "whisper-turbo-q5" | "whisper-turbo-q8" | "silero-vad" => {
+        "whisper-small" | "whisper-base" | "whisper-turbo-q5" | "whisper-turbo-q8"
+        | "silero-vad" => {
             if is_sv {
                 false
             } else {
@@ -109,7 +110,11 @@ impl MainWindow {
             })
         } else if missing == 1 {
             let item = active_missing_items[0];
-            let tag = if item.required { "缺必需组件" } else { "缺可选组件" };
+            let tag = if item.required {
+                "缺必需组件"
+            } else {
+                "缺可选组件"
+            };
             primitives::badge_danger(format!("{tag}: {}", item.label))
         } else if missing <= 3 {
             let names = active_missing_items
@@ -337,11 +342,7 @@ impl MainWindow {
             ModelCategory {
                 title: "Whisper 识别模型 (阶梯分级)",
                 is_required: false,
-                item_ids: &[
-                    "whisper-base",
-                    "whisper-turbo-q5",
-                    "whisper-turbo-q8",
-                ],
+                item_ids: &["whisper-base", "whisper-turbo-q5", "whisper-turbo-q8"],
             },
             ModelCategory {
                 title: "端到端语音与辅助检测",
@@ -385,32 +386,32 @@ impl MainWindow {
             // 当前分类下真正缺失的条目（当前不需要的不计入缺失警示）
             let cat_missing = cat_items
                 .iter()
-                .filter(|i| !self.state.model_is_present(i.id) && is_item_needed_by_current_config(i.id, &self.state))
+                .filter(|i| {
+                    !self.state.model_is_present(i.id)
+                        && is_item_needed_by_current_config(i.id, &self.state)
+                })
                 .count();
 
             let mut col = div().w_full().flex().flex_col().gap(px(Theme::SPACE_1_5));
-            let mut title_row = div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(if cat_missing > 0 {
-                            Theme::accent_red()
-                        } else if cat.is_required {
-                            Theme::accent_mint()
-                        } else {
-                            Theme::text_secondary()
-                        })
-                        .child(cat.title),
-                );
+            let mut title_row = div().flex().items_center().gap_2().child(
+                div()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(if cat_missing > 0 {
+                        Theme::accent_red()
+                    } else if cat.is_required {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::text_secondary()
+                    })
+                    .child(cat.title),
+            );
             if cat.is_required {
                 title_row = title_row.child(primitives::badge_accent("必需"));
             }
             if cat_missing > 0 {
-                title_row = title_row.child(primitives::badge_danger(format!("缺 {cat_missing} 项")));
+                title_row =
+                    title_row.child(primitives::badge_danger(format!("缺 {cat_missing} 项")));
             }
             col = col.child(title_row);
             for item in cat_items {
@@ -420,9 +421,7 @@ impl MainWindow {
         }
 
         // ── 组装 ──
-        let mut card = primitives::card_sm()
-            .gap(px(Theme::SPACE_2))
-            .child(header);
+        let mut card = primitives::card_sm().gap(px(Theme::SPACE_2)).child(header);
         if let Some(p) = progress {
             card = card.child(p);
         }

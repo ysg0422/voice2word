@@ -85,7 +85,9 @@ impl MainWindow {
             // 检索栏：关键字 + 未翻译筛选 + 排序 + 命中摘要。只有空库时才隐藏。
             .children((total_count > 0).then(|| self.render_library_toolbar(cx)))
             // 批量操作栏：勾选后才展开，不选时不占面积
-            .children((!self.library_selected.is_empty()).then(|| self.render_library_batch_bar(cx)))
+            .children(
+                (!self.library_selected.is_empty()).then(|| self.render_library_batch_bar(cx)),
+            )
             // 视频卡片列表区域
             .child(if total_count == 0 {
                 self.render_library_empty(cx)

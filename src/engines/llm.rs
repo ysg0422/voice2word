@@ -1155,8 +1155,14 @@ impl LLMEngine {
         };
 
         // 2. 逐行匹配与容错正则识取 (兼容 Markdown 列表、加粗、方括号、点号等)
-        let re_bracket = regex::Regex::new(r"(?m)^\s*(?:[-*•>#\s]*)\s*(?:\*\*)?\[\s*(\d+)\s*\](?:\*\*)?\s*[:：\-—]?\s*(.+?)\s*$").ok();
-        let re_numbered = regex::Regex::new(r"(?m)^\s*(?:[-*•>#\s]*)\s*(?:\*\*)?(\d+)(?:\*\*)?\s*[\.\)）\:：、\-—\|]\s*(.+?)\s*$").ok();
+        let re_bracket = regex::Regex::new(
+            r"(?m)^\s*(?:[-*•>#\s]*)\s*(?:\*\*)?\[\s*(\d+)\s*\](?:\*\*)?\s*[:：\-—]?\s*(.+?)\s*$",
+        )
+        .ok();
+        let re_numbered = regex::Regex::new(
+            r"(?m)^\s*(?:[-*•>#\s]*)\s*(?:\*\*)?(\d+)(?:\*\*)?\s*[\.\)）\:：、\-—\|]\s*(.+?)\s*$",
+        )
+        .ok();
 
         for line in clean.lines() {
             let line_trim = line.trim();
@@ -1204,7 +1210,8 @@ impl LLMEngine {
 
         // 3. 全局正则容错扫描：如果行级解析仍有缺失，扫描全文中的 `[序号] 译文` 结构
         if result.len() < expected.len() {
-            if let Ok(re_global) = regex::Regex::new(r"\[\s*(\d+)\s*\]\s*[:：\-—]?\s*([^\n\r\[]+)") {
+            if let Ok(re_global) = regex::Regex::new(r"\[\s*(\d+)\s*\]\s*[:：\-—]?\s*([^\n\r\[]+)")
+            {
                 for caps in re_global.captures_iter(clean) {
                     if let (Some(m_idx), Some(m_text)) = (caps.get(1), caps.get(2)) {
                         if let Ok(idx) = m_idx.as_str().parse::<usize>() {

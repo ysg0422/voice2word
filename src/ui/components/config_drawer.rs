@@ -397,12 +397,8 @@ impl MainWindow {
         ];
 
         let mut grid = div().flex().flex_wrap().gap(px(Theme::SPACE_1_5));
-        grid = grid.child(self.tier_pill(
-            WhisperModelTier::SenseVoice,
-            "SenseVoice 极速",
-            true,
-            cx,
-        ));
+        grid =
+            grid.child(self.tier_pill(WhisperModelTier::SenseVoice, "SenseVoice 极速", true, cx));
         for (tier, name) in tiers {
             grid = grid.child(self.tier_pill(tier, name, false, cx));
         }

@@ -426,7 +426,10 @@ pub fn parse_model_list(body: &str) -> Result<Vec<ModelInfo>> {
         }
 
         // 兼容 Gemini/Ollama 风格 {"models": [...]} 或顶层数组 [...]
-        let alt_array = value.get("models").and_then(|m| m.as_array()).or_else(|| value.as_array());
+        let alt_array = value
+            .get("models")
+            .and_then(|m| m.as_array())
+            .or_else(|| value.as_array());
         if let Some(data) = alt_array {
             let mut out = Vec::with_capacity(data.len());
             let mut seen = std::collections::HashSet::new();
@@ -435,10 +438,10 @@ pub fn parse_model_list(body: &str) -> Result<Vec<ModelInfo>> {
                     Some(s.trim())
                 } else if let Some(id_val) = item.get("id").and_then(|v| v.as_str()) {
                     Some(id_val.trim())
-                } else if let Some(name_val) = item.get("name").and_then(|v| v.as_str()) {
-                    Some(name_val.trim())
                 } else {
-                    None
+                    item.get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|name_val| name_val.trim())
                 };
 
                 let Some(id) = id else { continue };
@@ -474,7 +477,8 @@ pub fn parse_model_list(body: &str) -> Result<Vec<ModelInfo>> {
                         let candidate = after[start + 1..start + 1 + end].trim();
                         if !candidate.is_empty()
                             && !seen.contains(candidate)
-                            && !["list", "model", "success", "error", "ok", "true", "false"].contains(&candidate)
+                            && !["list", "model", "success", "error", "ok", "true", "false"]
+                                .contains(&candidate)
                             && candidate.contains(|c: char| c.is_alphanumeric())
                         {
                             seen.insert(candidate.to_string());

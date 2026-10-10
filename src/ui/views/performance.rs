@@ -1055,7 +1055,13 @@ impl MainWindow {
                     if outcome.url.contains("/v1/models")
                         && !this.state.config.translate.api_base.contains("/v1")
                     {
-                        let trimmed = this.state.config.translate.api_base.trim().trim_end_matches('/');
+                        let trimmed = this
+                            .state
+                            .config
+                            .translate
+                            .api_base
+                            .trim()
+                            .trim_end_matches('/');
                         let auto_v1 = format!("{trimmed}/v1");
                         this.state.config.translate.api_base = auto_v1.clone();
                         this.api_base_input = auto_v1;
@@ -1255,19 +1261,15 @@ impl MainWindow {
             );
 
         if let Some((false, text)) = status {
-            row = row.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(Theme::SPACE_1))
-                    .children(text.lines().map(move |line| {
-                        div()
-                            .max_w(px(MODEL_FETCH_MSG_MAX_W))
-                            .text_size(px(Theme::TEXT_SMALL))
-                            .text_color(Theme::accent_red())
-                            .child(line.to_string())
-                    })),
-            );
+            row = row.child(div().flex().flex_col().gap(px(Theme::SPACE_1)).children(
+                text.lines().map(move |line| {
+                    div()
+                        .max_w(px(MODEL_FETCH_MSG_MAX_W))
+                        .text_size(px(Theme::TEXT_SMALL))
+                        .text_color(Theme::accent_red())
+                        .child(line.to_string())
+                }),
+            ));
         }
 
         row.into_any_element()
@@ -1284,7 +1286,10 @@ impl MainWindow {
 
         let cat = MODEL_CATEGORY.lock().map(|g| g.clone()).unwrap_or_default();
         let cn_count = models.iter().filter(|m| m.id.starts_with("cn:")).count();
-        let global_count = models.iter().filter(|m| m.id.starts_with("global:")).count();
+        let global_count = models
+            .iter()
+            .filter(|m| m.id.starts_with("global:"))
+            .count();
 
         let filtered_models: Vec<&ModelInfo> = models
             .iter()
@@ -1369,15 +1374,19 @@ impl MainWindow {
                     })
                     .when(global_count > 0, |d| {
                         d.child(
-                            primitives::chip(format!("国际 ({global_count})"), cat == "global", false)
-                                .id("model-cat-global")
-                                .cursor_pointer()
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    if let Ok(mut g) = MODEL_CATEGORY.lock() {
-                                        *g = "global".to_string();
-                                    }
-                                    cx.notify();
-                                })),
+                            primitives::chip(
+                                format!("国际 ({global_count})"),
+                                cat == "global",
+                                false,
+                            )
+                            .id("model-cat-global")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                if let Ok(mut g) = MODEL_CATEGORY.lock() {
+                                    *g = "global".to_string();
+                                }
+                                cx.notify();
+                            })),
                         )
                     }),
             );
@@ -1464,7 +1473,7 @@ impl MainWindow {
                 || self.state.model_is_present("punc-model"),
         );
 
-        let row = div()
+        div()
             .w_full()
             .flex()
             .items_center()
@@ -1496,9 +1505,7 @@ impl MainWindow {
                     .text_color(Theme::text_muted())
                     .child(value)
                     .into_any_element()
-            });
-
-        row
+            })
     }
 
     /// 步骤 2：识别引擎与模型架构选择 (每行一个配置项，右侧单行等级选择)

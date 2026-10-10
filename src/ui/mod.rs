@@ -1149,13 +1149,15 @@ impl MainWindow {
                                     ApiField::Base => this.api_base_input.chars().count(),
                                     ApiField::Model => this.api_model_input.chars().count(),
                                     ApiField::Key => this.api_key_input.chars().count(),
-                                    ApiField::LocalModelPath => this.local_model_input.chars().count(),
+                                    ApiField::LocalModelPath => {
+                                        this.local_model_input.chars().count()
+                                    }
                                 };
                                 this.commit_api_field(field, cx);
                                 cx.notify();
                             }
                         }
-                    }))
+                    })),
             )
             .into_any_element()
     }

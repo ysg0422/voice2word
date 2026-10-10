@@ -3662,7 +3662,7 @@ impl MainWindow {
                             // 同上：`done` 只认实际译出，空/纯空白译文不会被
                             // 当成「已全部翻译为{target}」。
                             if !has_distinct_trans && has_any_trans_overall {
-                                format!("已处理完毕（译文同原文，画面与列表已自动单行显示；若无需译文可点「清空译文」）")
+                                "已处理完毕（译文同原文，画面与列表已自动单行显示；若无需译文可点「清空译文」）".to_string()
                             } else {
                                 format!("已全部翻译为{target}")
                             }
@@ -4581,7 +4581,9 @@ impl MainWindow {
                     }
                 }
             } else if key == "c" {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(self.inline_edit_buffer.clone()));
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                    self.inline_edit_buffer.clone(),
+                ));
             } else if key == "a" {
                 self.inline_edit_cursor = total_chars;
                 cx.notify();
