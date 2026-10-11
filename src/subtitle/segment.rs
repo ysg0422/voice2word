@@ -260,10 +260,10 @@ pub fn glossary_violations(segments: &[Segment], entries: &[(String, String)]) -
 /// 4. 与 `pipeline.rs` 里的 `0.35` 数值相同**纯属巧合**：那是「低置信片段的**时长占比**
 ///    超过 35% 就放弃救场」的上限，与 `avg_logprob` 无关，别当成同一个阈值。
 ///
-/// TODO(接入配置)：位于 `src/utils/config.rs` 的 `PipelineConfig` 才是它该待的地方。
-/// 建议落在 `whisper_rescue_logprob` 旁边（`config.rs:544-547` 附近），字段形如
-/// `pub whisper_low_confidence: f64`（`#[serde(default = "default_low_confidence")]`，
-/// 默认 -0.35），由界面暴露滑杆；本线程无权改 `config.rs`，故先固化成具名常量。
+/// 该阈值现已接入配置：`PipelineConfig::whisper_low_confidence`
+/// （`src/utils/config.rs`，默认 -0.35、用户可调），转写页质检卡、剪辑台高亮与
+/// 一键复核都从配置读。此常量保留为「产品默认值」的单一事实来源——
+/// `default_low_confidence()` 与它同值，并有单测锁死两者相等。
 pub const DEFAULT_LOW_CONFIDENCE_THRESHOLD: f64 = -0.35;
 
 /// 空/超短句判据：`display_text()` 去空白后字符数**少于**该值即视为 ASR 碎片噪声。
@@ -746,7 +746,7 @@ fn split_index_at_ratio(text: &str, ratio: f64) -> Option<usize> {
 /// 原文，整句译文全挂在左行，双语行错位）或「没有润色」（展示/导出回落成未标点、
 /// 未清理的原始识别文本，左右两半风格不一致）。
 /// 文本长度不足 2 无法切分时返回 `None`，由调用方按「不切」处理。
-fn split_following(text: &str, ratio: f64) -> (String, Option<String>) {
+pub(crate) fn split_following(text: &str, ratio: f64) -> (String, Option<String>) {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     if n <= 1 {

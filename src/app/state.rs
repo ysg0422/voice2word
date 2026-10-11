@@ -2152,12 +2152,12 @@ impl AppState {
         // P0-3：译文必须**按同一个 ratio 切开**，左右各拿一半，绝不能整条复制给两半
         // （修前是 `translation: orig.translation.clone()`）：复制会让双语导出出现两个
         // cue 显示同一条完整译文（原文却已正确切开），而且本函数收尾立刻 flush 落库，
-        // 重复译文会被持久化。切分策略与自动拆分（`subtitle::segment` 里的
-        // `split_following`，目前是私有函数、无法直接复用）逐条一致：先按标点就近切、
+        // 重复译文会被持久化。切分策略直接复用自动拆分的
+        // `subtitle::segment::split_following`，两边同一份实现：先按标点就近切、
         // 找不到标点再按比例硬切，**绝不让后半段落空**。
         let (trans_left, trans_right) = match orig.translation.as_deref() {
             Some(t) if !t.trim().is_empty() => {
-                let (l, r) = split_text_by_ratio(t, ratio);
+                let (l, r) = crate::subtitle::segment::split_following(t, ratio);
                 (Some(l), r)
             }
             // 没有译文（或只有空白）时两半都不带译文：不能凭空造出 `Some("")`，
@@ -2373,68 +2373,6 @@ impl AppState {
             .filter(|i| !self.model_is_present(i.id))
             .count()
     }
-}
-
-/// 按 `ratio` 把文本切成前后两半，供手工拆分时译文跟随切点。
-///
-/// 必须与 `crate::subtitle::segment` 里自动拆分用的 `split_following` **保持同一套
-/// 策略**：优先在标点处切（切点标点归前段），找不到可用标点再按比例硬切，
-/// **绝不让后半段落空**——否则右半段会退化成「没有译文」，双语导出时整句译文
-/// 全挂在左行，右行只剩原文。两份实现分家会重新长出「同一句话自动拆和手工拆得到
-/// 不同的译文切点」这类不一致；`split_following` 目前是 `subtitle` 模块的私有函数，
-/// 无法直接复用（建议把它提升为 `pub` 供这里调用，见任务报告）。
-///
-/// 文本长度不足 2 无法切分时返回 `(原文, None)`，由调用方按「不切」处理。
-fn split_text_by_ratio(text: &str, ratio: f64) -> (String, Option<String>) {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    if n <= 1 {
-        return (text.to_string(), None);
-    }
-    let cut = split_index_at_ratio(text, ratio).unwrap_or_else(|| {
-        let c = (n as f64 * ratio.clamp(0.0, 1.0)).round() as usize;
-        c.clamp(1, n - 1)
-    });
-    let left: String = chars[..cut].iter().collect();
-    let right: String = chars[cut..].iter().collect();
-    (left, Some(right))
-}
-
-/// 可作为切分点的中英文标点（与 `subtitle::segment::is_split_punct` 同集合）
-fn is_split_punct(c: char) -> bool {
-    matches!(
-        c,
-        '，' | '。' | '！' | '？' | '；' | '、' | '：' | '…' | ',' | '.' | '!' | '?' | ';' | ':'
-    )
-}
-
-/// 在 `text` 中寻找最接近 `ratio` 位置的标点切点（切点标点归前段）。
-/// 与 `subtitle::segment::split_index_at_ratio` 逐条同规则：切点强制落在 25%~75%
-/// 区间、两侧各留至少 2 字符；无合理切点返回 `None`。
-fn split_index_at_ratio(text: &str, ratio: f64) -> Option<usize> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    if n < 4 {
-        return None;
-    }
-    let target = (n as f64 * ratio.clamp(0.0, 1.0)) as usize;
-    let lo = ((n as f64) * 0.25) as usize;
-    let hi = ((n as f64) * 0.75).ceil() as usize;
-    let mut best: Option<(usize, i64)> = None;
-    for (i, &c) in chars.iter().enumerate() {
-        if !is_split_punct(c) {
-            continue;
-        }
-        let left_len = i + 1;
-        if left_len < 2 || n - left_len < 2 || left_len < lo || left_len > hi {
-            continue;
-        }
-        let dist = (left_len as i64 - target as i64).abs();
-        if best.is_none_or(|(_, best_dist)| dist < best_dist) {
-            best = Some((left_len, dist));
-        }
-    }
-    best.map(|(cut, _)| cut)
 }
 
 /// 「合并下句」时把首句与次句的译文拼成一条。
