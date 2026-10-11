@@ -108,6 +108,8 @@ fn create_shortcut(
 
 fn run_installer() {
     let install_dir = get_install_dir();
+    // 记录非致命步骤的失败原因，最终在完成提示里如实反馈，避免假装成功。
+    let mut warnings: Vec<String> = Vec::new();
     let welcome_msg = format!(
         "欢迎使用 {app} v{ver} 安装向导！\n\n\
         本程序将把 {app} 安装至您的电脑：\n\
@@ -170,20 +172,32 @@ fn run_installer() {
     let src_config = current_dir.join("config.toml");
     let dst_config = install_dir.join("config.toml");
     if src_config.exists() && !dst_config.exists() {
-        let _ = fs::copy(&src_config, &dst_config);
+        if let Err(e) = fs::copy(&src_config, &dst_config) {
+            warnings.push(format!("配置文件 config.toml 复制失败：{e}"));
+        }
     }
 
     let src_tools = current_dir.join("tools");
     let dst_tools = install_dir.join("tools");
     if src_tools.exists() {
-        let _ = fs::create_dir_all(&dst_tools);
-        if let Ok(entries) = fs::read_dir(&src_tools) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_file() {
-                    let _ = fs::copy(&p, dst_tools.join(entry.file_name()));
+        if let Err(e) = fs::create_dir_all(&dst_tools) {
+            warnings.push(format!("创建 tools 目录失败：{e}"));
+        }
+        match fs::read_dir(&src_tools) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_file() {
+                        if let Err(e) = fs::copy(&p, dst_tools.join(entry.file_name())) {
+                            warnings.push(format!(
+                                "复制 {} 失败：{e}",
+                                entry.file_name().to_string_lossy()
+                            ));
+                        }
+                    }
                 }
             }
+            Err(e) => warnings.push(format!("读取 tools 目录失败：{e}")),
         }
     }
 
@@ -204,18 +218,29 @@ fn run_installer() {
         exe = APP_EXE_NAME,
         dir = install_dir.display(),
     );
-    let _ = fs::write(&uninstall_bat, bat_content);
+    if let Err(e) = fs::write(&uninstall_bat, bat_content) {
+        warnings.push(format!("卸载脚本 uninstall.bat 写入失败：{e}"));
+    }
 
     // 5. 创建桌面快捷方式
+    let mut desktop_ok = false;
     if let Ok(user_profile) = std::env::var("USERPROFILE") {
         let desktop = PathBuf::from(user_profile).join("Desktop");
         if desktop.exists() {
             let desktop_shortcut = desktop.join(format!("{}.lnk", APP_NAME));
-            let _ = create_shortcut(&target_exe, &desktop_shortcut, &install_dir);
+            match create_shortcut(&target_exe, &desktop_shortcut, &install_dir) {
+                Ok(()) => desktop_ok = true,
+                Err(e) => warnings.push(format!("桌面快捷方式创建失败：{e}")),
+            }
+        } else {
+            warnings.push("未找到桌面目录，已跳过桌面快捷方式".to_string());
         }
+    } else {
+        warnings.push("未读取到 USERPROFILE，已跳过桌面快捷方式".to_string());
     }
 
     // 6. 创建开始菜单快捷方式
+    let mut start_menu_ok = false;
     if let Ok(app_data) = std::env::var("APPDATA") {
         let start_menu = PathBuf::from(app_data)
             .join("Microsoft")
@@ -224,8 +249,15 @@ fn run_installer() {
             .join("Programs");
         if start_menu.exists() {
             let start_shortcut = start_menu.join(format!("{}.lnk", APP_NAME));
-            let _ = create_shortcut(&target_exe, &start_shortcut, &install_dir);
+            match create_shortcut(&target_exe, &start_shortcut, &install_dir) {
+                Ok(()) => start_menu_ok = true,
+                Err(e) => warnings.push(format!("开始菜单快捷方式创建失败：{e}")),
+            }
+        } else {
+            warnings.push("未找到开始菜单目录，已跳过开始菜单快捷方式".to_string());
         }
+    } else {
+        warnings.push("未读取到 APPDATA，已跳过开始菜单快捷方式".to_string());
     }
 
     // 7. 注册 Windows 控制面板卸载项 (当前用户)
@@ -240,19 +272,37 @@ fn run_installer() {
         dir = install_dir.display(),
         uninst = uninstall_bat.display(),
     );
-    let _ = Command::new("cmd").args(["/c", &reg_cmd]).status();
+    match Command::new("cmd").args(["/c", &reg_cmd]).status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => warnings.push(format!("注册控制面板卸载项返回非零退出码：{status}")),
+        Err(e) => warnings.push(format!("注册控制面板卸载项失败：{e}")),
+    }
 
     // 8. 询问是否立即启动
-    let finish_msg = format!(
-        "{app} v{ver} 已成功安装到您的电脑！\n\n\
-        • 安装位置: {dir}\n\
-        • 桌面快捷方式已创建\n\
-        • 开始菜单项已创建\n\n\
-        是否立即启动 {app}？",
-        app = APP_NAME,
-        ver = APP_VERSION,
-        dir = install_dir.display()
-    );
+    let mut finish_lines = vec![
+        format!("{APP_NAME} v{APP_VERSION} 已成功安装到您的电脑！"),
+        String::new(),
+        format!("• 安装位置: {}", install_dir.display()),
+    ];
+    if desktop_ok {
+        finish_lines.push("• 桌面快捷方式已创建".to_string());
+    }
+    if start_menu_ok {
+        finish_lines.push("• 开始菜单项已创建".to_string());
+    }
+    if !warnings.is_empty() {
+        finish_lines.push(String::new());
+        finish_lines.push("以下步骤未完全成功，请留意：".to_string());
+        for w in warnings.iter().take(5) {
+            finish_lines.push(format!("· {w}"));
+        }
+        if warnings.len() > 5 {
+            finish_lines.push(format!("· 另有 {} 项提示已省略", warnings.len() - 5));
+        }
+    }
+    finish_lines.push(String::new());
+    finish_lines.push(format!("是否立即启动 {APP_NAME}？"));
+    let finish_msg = finish_lines.join("\n");
 
     let run_now = message_box(
         &format!("{app} 安装成功", app = APP_NAME),
@@ -261,7 +311,13 @@ fn run_installer() {
     );
 
     if run_now == IDYES {
-        let _ = Command::new(&target_exe).current_dir(&install_dir).spawn();
+        if let Err(e) = Command::new(&target_exe).current_dir(&install_dir).spawn() {
+            message_box(
+                "启动失败",
+                &format!("启动 {APP_NAME} 失败：\n{e}\n\n您可以稍后从桌面快捷方式手动启动。"),
+                MB_OK | MB_ICONERROR,
+            );
+        }
     }
 }
 
