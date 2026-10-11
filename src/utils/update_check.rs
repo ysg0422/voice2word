@@ -356,6 +356,16 @@ pub fn describe(current: &str, latest: &str, newer: bool) -> String {
     }
 }
 
+/// 判断一次下载是否算「完整」。
+///
+/// 服务器给了 `Content-Length` 时，收到的字节数不能少于它：镜像/代理中途断流
+/// 时 `read` 会以 `Ok(0)` 正常收尾，若只看「有没有读到过数据」，一个残缺的 exe
+/// 会被当成成功落盘，用户点更新后拿到的是打不开的文件。未给长度（chunked 传输）
+/// 时无从校验，只能放行。
+fn download_is_complete(written: u64, total_size: u64) -> bool {
+    total_size == 0 || written >= total_size
+}
+
 /// 下载更新文件到 updates/ 目录，支持镜像加速与断点/临时文件保护。
 pub fn download_update_file(
     download_url: &str,
@@ -466,6 +476,14 @@ pub fn download_update_file(
         }
 
         drop(file);
+
+        // 截断校验：见 `download_is_complete`。失败则当成该镜像不可用，换下一个。
+        if download_ok && !download_is_complete(written, total_size) {
+            last_err = Some(anyhow!(
+                "下载不完整：收到 {written} 字节，Content-Length 声明 {total_size} 字节"
+            ));
+            download_ok = false;
+        }
 
         if download_ok && written > 1024 {
             if let Err(e) = fs::rename(&part, &dest) {
@@ -677,5 +695,20 @@ mod tests {
             "https://github.com/ysg0422/voice2word/releases/download/v0.3.0/voice2word.exe"
         );
         assert_eq!(r.asset_size, 27000000);
+    }
+
+    /// 截断的下载必须被判为不完整：镜像/代理中途断流时 `read` 会以 `Ok(0)`
+    /// 正常收尾，只看「读到过数据」会把残缺 exe 当成成功落盘。
+    #[test]
+    fn download_is_complete_detects_truncation() {
+        // 未给 Content-Length（chunked）：无从校验，放行。
+        assert!(download_is_complete(0, 0));
+        assert!(download_is_complete(123, 0));
+        // 给足或超出：算完整。
+        assert!(download_is_complete(1000, 1000));
+        assert!(download_is_complete(1001, 1000));
+        // 少一个字节都不算完整。
+        assert!(!download_is_complete(999, 1000));
+        assert!(!download_is_complete(0, 1000));
     }
 }
