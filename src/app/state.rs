@@ -602,6 +602,14 @@ pub struct AppState {
     /// 渲染成可见提示条，让「没保存上」这件事至少是可被发现的。
     pub db_write_error: Option<String>,
 
+    /// 最近一次配置落盘失败的原因（`None` = 一切正常）。
+    ///
+    /// 与 [`Self::db_write_error`] 同型：设置页 / 性能页 / 字幕样式滑条的每一次
+    /// 改动都会写 `config.toml`，而此前这些写盘一律 `let _ = ...` 吞错。保存失败
+    /// （磁盘满、目录只读、`config.toml` 被别的程序占用）完全静默——用户改完设置、
+    /// 重启、发现设置又变回去了，却没有任何线索。这里把失败挂到可见提示条上。
+    pub config_write_error: Option<String>,
+
     /// 「0 秒智能缓存命中」的查询结果缓存：(文件路径, 命中记录)。
     ///
     /// 渲染路径要读它（转写页卡片显示「已命中缓存 N 句」），而底层查询会把
@@ -775,6 +783,7 @@ impl AppState {
             // 首次扫描放在 `with_hardware` 收尾处（那里能拿到 &mut self）
             cached_transcription: Arc::new(std::sync::Mutex::new(None)),
             db_write_error: None,
+            config_write_error: None,
             model_present: std::collections::HashMap::new(),
             model_custom_build: std::collections::HashMap::new(),
         };
@@ -810,6 +819,31 @@ impl AppState {
         );
     }
 
+    /// 把当前配置落盘，并把失败原因记进 [`Self::config_write_error`]。
+    ///
+    /// # 为什么收成一个方法而不是到处 `let _ = self.config.save_to_file(...)`
+    ///
+    /// 设置页 / 性能页 / 字幕样式滑条 / 翻译设置等入口都会在改动后落盘，此前一律
+    /// `let _ = ...` 吞掉错误。写盘失败（磁盘满、目录只读、`config.toml` 被别的
+    /// 程序占用）于是完全静默：用户改完设置、重启、发现设置又变回去了，却没有任何
+    /// 线索。这与字幕写库失败是同一类「用户以为保存了」的缺陷，处理方式也一致——
+    /// 挂到跨页常驻的提示条上，**不重试**（失败通常是持久性原因，重试只会再失败）。
+    fn persist_config(&mut self) {
+        self.persist_config_to("config.toml");
+    }
+
+    /// [`Self::persist_config`] 的可注入路径版本：便于单测用临时目录复现写盘失败，
+    /// 而不必去动真正的 `config.toml`（跑测试时写它会覆盖用户配置）。
+    fn persist_config_to<P: AsRef<std::path::Path>>(&mut self, path: P) {
+        match self.config.save_to_file(path) {
+            Ok(()) => self.config_write_error = None,
+            Err(err) => {
+                tracing::warn!(error = %err, "配置落盘失败，改动尚未持久化");
+                self.config_write_error = Some(format!("设置保存失败：{err}"));
+            }
+        }
+    }
+
     /// 切换 Whisper 模型档位并**落盘**（性能页档位下拉的唯一入口）。
     ///
     /// 为什么必须落盘：`whisper_model_tier` 只是运行期状态，启动时由
@@ -828,7 +862,7 @@ impl AppState {
     pub fn set_whisper_model_tier(&mut self, tier: WhisperModelTier) {
         self.whisper_model_tier = tier;
         self.config.paths.whisper_model = tier.model_relative_path();
-        let _ = self.config.save_to_file("config.toml");
+        self.persist_config();
         // 档位换了，「模型与组件」卡里 whisper 各档的就位判定要跟着重算
         // （`configured_path_for` 只认「配置指向的那个档位」）。
         self.refresh_model_presence();
@@ -847,7 +881,7 @@ impl AppState {
             self.whisper_threads =
                 Self::clamp_threads_to_cores(self.config.pipeline.whisper_threads, cores);
         }
-        let _ = self.config.save_to_file("config.toml");
+        self.persist_config();
         self.refresh_model_presence();
     }
 
@@ -871,7 +905,7 @@ impl AppState {
         self.polish_mode = mode;
         self.config.pipeline.enable_polish = enabled;
         self.config.pipeline.polish_mode = mode.as_str().to_string();
-        let _ = self.config.save_to_file("config.toml");
+        self.persist_config();
     }
 
     /// 将推荐配置应用至当前系统状态与 Pipeline 配置
@@ -893,7 +927,7 @@ impl AppState {
             self.config.paths.whisper_model = rel_path;
         }
 
-        let _ = self.config.save_to_file("config.toml");
+        self.persist_config();
     }
 
     /// SenseVoice 原生自带高精度标点与数字规范化（ITN），管线会整段跳过 CT-Punc
@@ -909,12 +943,12 @@ impl AppState {
     }
 
     /// 设置页 / 主界面调整字幕样式后落盘，避免重启丢失
-    pub fn save_subtitle_style(&self) {
+    pub fn save_subtitle_style(&mut self) {
         // 同步一份给管线：转写收尾的自动导出没有别的途径拿到样式，
         // 而这里正是「样式刚被改过」的唯一收口（滑条 / 预设 / 预览框宽都走它）。
         self.pipeline
             .set_subtitle_style(self.config.subtitle_style.clone());
-        let _ = self.config.save_to_file("config.toml");
+        self.persist_config();
     }
 
     /// 导出内容模式（原文 / 仅译文 / 双语）的落盘字符串 ↔ 枚举转换。
@@ -947,7 +981,7 @@ impl AppState {
         };
         if self.config.ui.export_mode != s {
             self.config.ui.export_mode = s.to_string();
-            let _ = self.config.save_to_file("config.toml");
+            self.persist_config();
         }
     }
 
@@ -966,8 +1000,8 @@ impl AppState {
     }
 
     /// 翻译相关配置（模式 / 接口 / 密钥 / 模型）落盘
-    pub fn save_translate_config(&self) {
-        let _ = self.config.save_to_file("config.toml");
+    pub fn save_translate_config(&mut self) {
+        self.persist_config();
     }
 
     /// 组装在线翻译引擎所需的连接参数（密钥回退环境变量、地址容错拼接）
@@ -1196,10 +1230,14 @@ impl AppState {
         self.load_task_with(task, true);
     }
 
-    /// 删除历史任务记录（若当前工作区正显示该工程，则静默补位至下一条或彻底清空，不切换页面）
-    pub fn delete_task_record(&mut self, id: i64) {
+    /// 删除历史任务记录（若当前工作区正显示该工程，则静默补位至下一条或彻底清空，不切换页面）。
+    ///
+    /// 返回删除是否成功。此前这里是 `let _ = self.db.delete_task(id)`，删库失败被
+    /// 完全静默：界面照样刷新、照样提示「已删除该记录」，而记录其实还在库里，下次
+    /// 刷新列表它又冒出来。失败时**不**做补位/清空——工程仍在，不该被切走。
+    pub fn delete_task_record(&mut self, id: i64) -> anyhow::Result<()> {
         let deleted_task = self.recent_tasks.iter().find(|t| t.id == id).cloned();
-        let _ = self.db.delete_task(id);
+        self.db.delete_task(id)?;
         self.refresh_recent_tasks();
 
         if let Some(task) = deleted_task {
@@ -1222,6 +1260,7 @@ impl AppState {
                 }
             }
         }
+        Ok(())
     }
 
     /// 彻底清空当前工作区工程状态（重置为空闲初始状态）
@@ -3932,5 +3971,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 配置落盘失败必须被记成可见提示，成功则清掉旧错误。
+    ///
+    /// 这是「设置保存失败」横幅的唯二状态来源：此前 7 处 `let _ = save_to_file`
+    /// 把失败完全吞掉，用户改完设置、重启发现设置又变回去了，却毫无线索。
+    #[test]
+    fn persist_config_records_failure_and_clears_on_success() {
+        let mut state = test_state(Vec::new());
+        // 造一个「父路径是文件」的非法目标：`save_to_file` 第一步 create_dir_all
+        // 就会失败，稳定复现写盘失败，不依赖磁盘满/只读这类环境条件。
+        let base = std::env::temp_dir().join(format!(
+            "v2w_persist_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let blocker = base.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bad = blocker.join("config.toml");
+
+        state.config_write_error = None;
+        state.persist_config_to(&bad);
+        assert!(
+            state.config_write_error.is_some(),
+            "写盘失败必须被记录成可见提示"
+        );
+
+        // 换成合法目标：成功落盘后旧错误应被清掉，否则提示条会一直挂着。
+        let good = base.join("config.toml");
+        state.persist_config_to(&good);
+        assert!(good.exists(), "合法目标应真的写出 config.toml");
+        assert!(
+            state.config_write_error.is_none(),
+            "成功落盘后必须清除上一次的失败提示"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -1288,21 +1288,32 @@ impl MainWindow {
             })
             .unwrap_or(false);
 
-        self.state.delete_task_record(id);
-
-        self.notice = Some(if was_current {
-            match self
-                .state
-                .selected_file
-                .as_ref()
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-            {
-                Some(name) => format!("已删除当前工程，工作区已切换到「{name}」"),
-                None => "已删除当前工程，工作区已清空".to_string(),
+        match self.state.delete_task_record(id) {
+            Ok(()) => {
+                self.notice = Some(if was_current {
+                    match self
+                        .state
+                        .selected_file
+                        .as_ref()
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    {
+                        Some(name) => format!("已删除当前工程，工作区已切换到「{name}」"),
+                        None => "已删除当前工程，工作区已清空".to_string(),
+                    }
+                } else {
+                    "已删除该记录".to_string()
+                });
             }
-        } else {
-            "已删除该记录".to_string()
-        });
+            Err(err) => {
+                // 删库失败：记录其实还在库里，不能提示「已删除」，也不能让工作区跟着
+                // 切走。走跨页可见的失败横幅，别让用户以为删掉了。
+                tracing::warn!(error = %err, "删除历史记录失败");
+                self.notice = None;
+                self.state.status = ProcessStatus::Failed(format!(
+                    "删除记录失败：{err}（记录仍在视频库中，请检查磁盘空间或数据库是否被占用）"
+                ));
+            }
+        }
 
         if self.state.selected_file.is_some() {
             self.trigger_extract_frame(cx);

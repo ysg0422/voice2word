@@ -1954,6 +1954,8 @@ impl Render for MainWindow {
             .child(self.render_error_banner(cx))
             // 字幕写库失败：与转写错误分开显示，因为它要常驻到用户处理为止
             .child(self.render_db_error_banner(cx))
+            // 设置落盘失败：与字幕写库失败同型，常驻到用户处理为止
+            .child(self.render_config_error_banner(cx))
             // 1.6 一次性中性提示条：成功类反馈（如「已删除该记录」）与错误条同处一列，
             // 但配色中性——操作成功不该被误读成出错。两者同时存在时错误条在上。
             .child(self.render_crash_banner(cx))

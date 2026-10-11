@@ -74,6 +74,61 @@ impl MainWindow {
             .into_any_element()
     }
 
+    /// 设置落盘失败横幅。
+    ///
+    /// 与 [`Self::render_db_error_banner`] 并列的另一种「没保存上」：这里指
+    /// `config.toml` 写失败（磁盘满、目录只读、文件被占用），后果是**用户改的
+    /// 设置重启后失效**。单列一条而不是并进 db 横幅，是因为两者可以同时发生，
+    /// 且处置提示不同（一个写历史库、一个写配置文件）。
+    pub(crate) fn render_config_error_banner(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(msg) = self.state.config_write_error.clone() else {
+            return div().into_any_element();
+        };
+
+        div()
+            .id("config-error-banner")
+            .w_full()
+            .flex_shrink_0()
+            .px(px(Theme::PAGE_PAD))
+            .py(px(Theme::SPACE_2))
+            .bg(Theme::tint_red_soft())
+            .border_b_1()
+            .border_color(Theme::tint_red_border())
+            .flex()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .child(primitives::stat_dot_sm(Theme::accent_red()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(Theme::TEXT_BODY))
+                    .text_color(Theme::accent_red())
+                    // 说明后果：用户需要知道「重启后这次改动会丢」
+                    .child(format!(
+                        "{msg}（设置尚未写入 config.toml，重启后可能失效，请检查磁盘空间或文件权限）"
+                    )),
+            )
+            .child(
+                div()
+                    .id("config-error-banner-dismiss")
+                    .flex_shrink_0()
+                    .px(px(Theme::SPACE_2))
+                    .py_0p5()
+                    .rounded(px(Theme::RADIUS_SM))
+                    .cursor_pointer()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::accent_red())
+                    .hover(|s| s.bg(Theme::tint_red_border()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.state.config_write_error = None;
+                        cx.notify();
+                    }))
+                    .child("知道了"),
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn render_error_banner(&self, cx: &mut Context<Self>) -> AnyElement {
         let ProcessStatus::Failed(msg) = &self.state.status else {
             return div().into_any_element();
