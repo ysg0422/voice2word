@@ -47,13 +47,20 @@ yield_to_desktop = true
 gpu_limit_percent = 100
 
 [subtitle_style]
-font_size = 40
+font_size = 32
 letter_spacing = 1
 line_spacing = 1.2000000476837158
-max_chars_per_line = 16
+max_chars_per_line = 14
 bottom_margin = 40
 preset_name = "白字黑影"
-preview_box_w = 374.13323974609375
+preview_box_w = 560.0
+primary_color = "#FFFFFF"
+outline_width = 1.5
+outline_color = "#000000"
+bg_style = "shadow"
+bg_opacity = 0.6000000238418579
+is_bold = true
+alignment = "center"
 
 [translate]
 mode = "online_api"

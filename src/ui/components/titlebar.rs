@@ -312,6 +312,7 @@ impl MainWindow {
         let is_downloading = self.state.update_download_busy;
         let downloaded = self.state.update_downloaded_path.is_some();
         let has_new_version = matches!(self.state.update_check_result, Some((true, _, _)));
+        let is_latest = matches!(self.state.update_check_result, Some((false, _, _)));
 
         div()
             .flex()
@@ -319,7 +320,7 @@ impl MainWindow {
             .gap_1()
             .pr_2()
             .child(if downloaded {
-                primitives::chip_clickable("新版本就绪", true, false)
+                primitives::chip_clickable("新版本就绪(打开)", true, false)
                     .id("titlebar-update-open-btn")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.open_downloaded_update(cx);
@@ -330,10 +331,38 @@ impl MainWindow {
                     .id("titlebar-update-downloading-btn")
                     .into_any_element()
             } else if has_new_version {
-                primitives::chip_clickable("发现新版(点击下载)", true, false)
+                div()
                     .id("titlebar-update-direct-btn")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(Theme::accent_mint())
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(Theme::text_on_accent())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(Theme::accent_mint_deep()))
+                    .child("发现新版本(点击更新)")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.download_app_update(cx);
+                    }))
+                    .into_any_element()
+            } else if is_latest {
+                div()
+                    .id("titlebar-latest-btn")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(Theme::bg_inset())
+                    .border_1()
+                    .border_color(Theme::accent_mint())
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::accent_mint())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(Theme::bg_hover()))
+                    .child(format!("当前已是最新版(v{}) ✓", crate::utils::update_check::current_version()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.check_for_update(cx);
                     }))
                     .into_any_element()
             } else {

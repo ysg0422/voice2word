@@ -72,6 +72,32 @@ fn preview_backdrop(bg: gpui::Rgba) -> gpui::Rgba {
     }
 }
 
+/// HSV(0..360, 0..1, 0..1) 转 RGB(0..255)
+pub(crate) fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let c = v * s;
+    let h_prime = ((h % 360.0) + 360.0) % 360.0 / 60.0;
+    let x = c * (1.0 - (h_prime % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r1, g1, b1) = if (0.0..1.0).contains(&h_prime) {
+        (c, x, 0.0)
+    } else if (1.0..2.0).contains(&h_prime) {
+        (x, c, 0.0)
+    } else if (2.0..3.0).contains(&h_prime) {
+        (0.0, c, x)
+    } else if (3.0..4.0).contains(&h_prime) {
+        (0.0, x, c)
+    } else if (4.0..5.0).contains(&h_prime) {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    (
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
+}
+
 /// 字幕样式可选值（字号 / 底边距以 1080p 为基准，与 `SubtitleStyleConfig` 语义一致）
 const STYLE_FONT_SIZES: [u32; 5] = [28, 36, 44, 52, 60];
 const STYLE_LETTER_SPACINGS: [u32; 5] = [0, 1, 2, 4, 6];
@@ -772,55 +798,109 @@ impl MainWindow {
                                                 .child("恢复默认"),
                                         ),
                                 )
-                                // 1) 文字颜色池（纯色圆点无文字描述）
-                                .child(
+                                // 1) 文字颜色池（纯色圆点 + 最后一个调色板色轮）
+                                .child({
+                                    let is_custom_color = !crate::utils::SUBTITLE_COLOR_PALETTE
+                                        .iter()
+                                        .any(|(_, hex)| cur_style.primary_color.eq_ignore_ascii_case(hex));
+                                    let is_picker_open = self.custom_color_picker_open;
+
                                     div()
                                         .flex()
-                                        .items_center()
-                                        .gap_1p5()
-                                        .child(
-                                            div()
-                                                .w(px(58.0))
-                                                .flex_shrink_0()
-                                                .text_size(px(Theme::TEXT_SMALL))
-                                                .text_color(Theme::text_secondary())
-                                                .child("文字颜色"),
-                                        )
+                                        .flex_col()
+                                        .gap_2()
                                         .child(
                                             div()
                                                 .flex()
                                                 .items_center()
-                                                .flex_wrap()
-                                                .gap_2()
-                                                .children(crate::utils::SUBTITLE_COLOR_PALETTE.into_iter().enumerate().map(|(idx, (_name, hex))| {
-                                                    let is_sel = cur_style.primary_color.eq_ignore_ascii_case(hex);
-                                                    let (r, g, b) = crate::utils::SubtitleStyleConfig::hex_to_rgb(hex);
-                                                    let swatch_color = rgb((r as u32) << 16 | (g as u32) << 8 | (b as u32));
+                                                .gap_1p5()
+                                                .child(
                                                     div()
-                                                        .id(("color-opt", idx))
-                                                        .w(px(22.0))
-                                                        .h(px(22.0))
-                                                        .rounded_full()
-                                                        .cursor_pointer()
-                                                        .bg(swatch_color)
-                                                        .border_2()
-                                                        .border_color(if is_sel {
-                                                            Theme::accent_mint()
-                                                        } else {
-                                                            rgba(0x80808044)
-                                                        })
-                                                        .hover(|s| if !is_sel { s.border_color(Theme::text_secondary()) } else { s })
-                                                        .on_click(cx.listener({
-                                                            let hex_str = hex.to_string();
-                                                            move |this, _, _, cx| {
-                                                                this.state.config.subtitle_style.primary_color = hex_str.clone();
-                                                                this.state.save_subtitle_style();
-                                                                cx.notify();
-                                                            }
+                                                        .w(px(58.0))
+                                                        .flex_shrink_0()
+                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                        .text_color(Theme::text_secondary())
+                                                        .child("文字颜色"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .flex_wrap()
+                                                        .gap_2()
+                                                        // 7 个预设纯色小圆点
+                                                        .children(crate::utils::SUBTITLE_COLOR_PALETTE.into_iter().enumerate().map(|(idx, (_name, hex))| {
+                                                            let is_sel = cur_style.primary_color.eq_ignore_ascii_case(hex);
+                                                            let (r, g, b) = crate::utils::SubtitleStyleConfig::hex_to_rgb(hex);
+                                                            let swatch_color = rgb((r as u32) << 16 | (g as u32) << 8 | (b as u32));
+                                                            div()
+                                                                .id(("color-opt", idx))
+                                                                .w(px(22.0))
+                                                                .h(px(22.0))
+                                                                .rounded_full()
+                                                                .cursor_pointer()
+                                                                .bg(swatch_color)
+                                                                .border_2()
+                                                                .border_color(if is_sel {
+                                                                    Theme::accent_mint()
+                                                                } else {
+                                                                    rgba(0x80808044)
+                                                                })
+                                                                .hover(|s| if !is_sel { s.border_color(Theme::text_secondary()) } else { s })
+                                                                .on_click(cx.listener({
+                                                                    let hex_str = hex.to_string();
+                                                                    move |this, _, _, cx| {
+                                                                        this.state.config.subtitle_style.primary_color = hex_str.clone();
+                                                                        this.state.save_subtitle_style();
+                                                                        cx.notify();
+                                                                    }
+                                                                }))
                                                         }))
-                                                }))
+                                                        // 最后一个：调色板色轮圆点（可滑动自定义调色）
+                                                        .child({
+                                                            let is_wheel_active = is_custom_color || is_picker_open;
+                                                            let (r, g, b) = crate::utils::SubtitleStyleConfig::hex_to_rgb(&cur_style.primary_color);
+                                                            let cur_swatch = rgb((r as u32) << 16 | (g as u32) << 8 | (b as u32));
+                                                            div()
+                                                                .id("color-wheel-toggle-btn")
+                                                                .w(px(22.0))
+                                                                .h(px(22.0))
+                                                                .rounded_full()
+                                                                .cursor_pointer()
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .bg(if is_custom_color { cur_swatch } else { Theme::bg_inset() })
+                                                                .border_2()
+                                                                .border_color(if is_wheel_active {
+                                                                    Theme::accent_mint()
+                                                                } else {
+                                                                    rgba(0x80808044)
+                                                                })
+                                                                .hover(|s| s.border_color(Theme::accent_mint()))
+                                                                .child(
+                                                                    if is_custom_color {
+                                                                        div()
+                                                                    } else {
+                                                                        div()
+                                                                            .text_size(px(10.0))
+                                                                            .child("🎨")
+                                                                    }
+                                                                )
+                                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                                    this.custom_color_picker_open = !this.custom_color_picker_open;
+                                                                    cx.notify();
+                                                                }))
+                                                        })
+                                                )
                                         )
-                                )
+                                        // 若调色板展开：显示环形色轮与自由滑动调色卡片
+                                        .child(if is_picker_open {
+                                            self.render_color_wheel_picker(&cur_style.primary_color, cx)
+                                        } else {
+                                            div().into_any_element()
+                                        })
+                                })
                                 // 2) 字重与水平对齐
                                 .child(
                                     div()
@@ -1136,30 +1216,93 @@ impl MainWindow {
                                                         .flex_1()
                                                         .max_w(px(STYLE_ROW_BTN_MAX_W))
                                                         .flex()
-                                                        .gap_1()
-                                                        .children(STYLE_LETTER_SPACINGS.into_iter().map(|val| {
-                                                            let is_sel = cur_style.letter_spacing == val;
+                                                        .gap_1p5()
+                                                        .items_center()
+                                                        // 步进调节 [-] [当前值] [+]
+                                                        .child(
                                                             div()
-                                                                .id(("letter-sp", val))
-                                                                .flex_1()
-                                                                .py_0p5()
-                                                                .rounded_md()
-                                                                .cursor_pointer()
-                                                                .text_size(px(Theme::TEXT_SMALL))
                                                                 .flex()
                                                                 .items_center()
-                                                                .justify_center()
-                                                                .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
+                                                                .gap_0p5()
+                                                                .bg(Theme::bg_inset())
                                                                 .border_1()
-                                                                .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
-                                                                .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    this.state.config.subtitle_style.letter_spacing = val;
-                                                                    this.state.save_subtitle_style();
-                                                                    cx.notify();
+                                                                .border_color(Theme::bg_hover_strong())
+                                                                .rounded_md()
+                                                                .px_1()
+                                                                .py_0p5()
+                                                                .child(
+                                                                    div()
+                                                                        .id("letter-sp-dec")
+                                                                        .px_1p5()
+                                                                        .cursor_pointer()
+                                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(Theme::text_secondary())
+                                                                        .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                        .child("-1")
+                                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                                            let cur = this.state.config.subtitle_style.letter_spacing;
+                                                                            this.state.config.subtitle_style.letter_spacing = cur.saturating_sub(1);
+                                                                            this.state.save_subtitle_style();
+                                                                            cx.notify();
+                                                                        }))
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .px_1()
+                                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(Theme::accent_mint())
+                                                                        .child(format!("{}px", cur_style.letter_spacing))
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .id("letter-sp-inc")
+                                                                        .px_1p5()
+                                                                        .cursor_pointer()
+                                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(Theme::text_secondary())
+                                                                        .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                        .child("+1")
+                                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                                            let cur = this.state.config.subtitle_style.letter_spacing;
+                                                                            this.state.config.subtitle_style.letter_spacing = (cur + 1).min(20);
+                                                                            this.state.save_subtitle_style();
+                                                                            cx.notify();
+                                                                        }))
+                                                                )
+                                                        )
+                                                        // 快捷预设
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .flex()
+                                                                .gap_1()
+                                                                .children(STYLE_LETTER_SPACINGS.into_iter().map(|val| {
+                                                                    let is_sel = cur_style.letter_spacing == val;
+                                                                    div()
+                                                                        .id(("letter-sp", val))
+                                                                        .flex_1()
+                                                                        .py_0p5()
+                                                                        .rounded_md()
+                                                                        .cursor_pointer()
+                                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .justify_center()
+                                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
+                                                                        .border_1()
+                                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
+                                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                                            this.state.config.subtitle_style.letter_spacing = val;
+                                                                            this.state.save_subtitle_style();
+                                                                            cx.notify();
+                                                                        }))
+                                                                        .child(format!("{}", val))
                                                                 }))
-                                                                .child(format!("{}px", val))
-                                                        }))
+                                                        )
                                                 )
                                         )
                                         // 底边距
@@ -1175,30 +1318,93 @@ impl MainWindow {
                                                         .flex_1()
                                                         .max_w(px(STYLE_ROW_BTN_MAX_W))
                                                         .flex()
-                                                        .gap_1()
-                                                        .children(STYLE_BOTTOM_MARGINS.into_iter().map(|val| {
-                                                            let is_sel = cur_style.bottom_margin == val;
+                                                        .gap_1p5()
+                                                        .items_center()
+                                                        // 步进调节 [-] [当前值] [+]
+                                                        .child(
                                                             div()
-                                                                .id(("bot-mg", val))
+                                                                 .flex()
+                                                                 .items_center()
+                                                                 .gap_0p5()
+                                                                 .bg(Theme::bg_inset())
+                                                                 .border_1()
+                                                                 .border_color(Theme::bg_hover_strong())
+                                                                 .rounded_md()
+                                                                 .px_1()
+                                                                 .py_0p5()
+                                                                 .child(
+                                                                     div()
+                                                                         .id("bot-mg-dec")
+                                                                         .px_1p5()
+                                                                         .cursor_pointer()
+                                                                         .text_size(px(Theme::TEXT_SMALL))
+                                                                         .font_weight(FontWeight::BOLD)
+                                                                         .text_color(Theme::text_secondary())
+                                                                         .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                         .child("-5")
+                                                                         .on_click(cx.listener(|this, _, _, cx| {
+                                                                             let cur = this.state.config.subtitle_style.bottom_margin;
+                                                                             this.state.config.subtitle_style.bottom_margin = cur.saturating_sub(5);
+                                                                             this.state.save_subtitle_style();
+                                                                             cx.notify();
+                                                                         }))
+                                                                 )
+                                                                 .child(
+                                                                     div()
+                                                                         .px_1()
+                                                                         .text_size(px(Theme::TEXT_SMALL))
+                                                                         .font_weight(FontWeight::BOLD)
+                                                                         .text_color(Theme::accent_mint())
+                                                                         .child(format!("{}px", cur_style.bottom_margin))
+                                                                 )
+                                                                 .child(
+                                                                     div()
+                                                                         .id("bot-mg-inc")
+                                                                         .px_1p5()
+                                                                         .cursor_pointer()
+                                                                         .text_size(px(Theme::TEXT_SMALL))
+                                                                         .font_weight(FontWeight::BOLD)
+                                                                         .text_color(Theme::text_secondary())
+                                                                         .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                         .child("+5")
+                                                                         .on_click(cx.listener(|this, _, _, cx| {
+                                                                             let cur = this.state.config.subtitle_style.bottom_margin;
+                                                                             this.state.config.subtitle_style.bottom_margin = (cur + 5).min(300);
+                                                                             this.state.save_subtitle_style();
+                                                                             cx.notify();
+                                                                         }))
+                                                                 )
+                                                        )
+                                                        // 快捷预设
+                                                        .child(
+                                                            div()
                                                                 .flex_1()
-                                                                .py_0p5()
-                                                                .rounded_md()
-                                                                .cursor_pointer()
-                                                                .text_size(px(Theme::TEXT_SMALL))
                                                                 .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                                .border_1()
-                                                                .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
-                                                                .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    this.state.config.subtitle_style.bottom_margin = val;
-                                                                    this.state.save_subtitle_style();
-                                                                    cx.notify();
+                                                                .gap_1()
+                                                                .children(STYLE_BOTTOM_MARGINS.into_iter().map(|val| {
+                                                                    let is_sel = cur_style.bottom_margin == val;
+                                                                    div()
+                                                                        .id(("bot-mg", val))
+                                                                        .flex_1()
+                                                                        .py_0p5()
+                                                                        .rounded_md()
+                                                                        .cursor_pointer()
+                                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .justify_center()
+                                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
+                                                                        .border_1()
+                                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
+                                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                                            this.state.config.subtitle_style.bottom_margin = val;
+                                                                            this.state.save_subtitle_style();
+                                                                            cx.notify();
+                                                                        }))
+                                                                        .child(format!("{}", val))
                                                                 }))
-                                                                .child(format!("{}", val))
-                                                        }))
+                                                        )
                                                 )
                                         )
                                         // 行间距
@@ -1213,30 +1419,93 @@ impl MainWindow {
                                                         .flex_1()
                                                         .max_w(px(STYLE_ROW_BTN_MAX_W))
                                                         .flex()
-                                                        .gap_1()
-                                                        .children(STYLE_LINE_SPACINGS.into_iter().map(|val| {
-                                                            let is_sel = cur_style.line_spacing == val;
+                                                        .gap_1p5()
+                                                        .items_center()
+                                                        // 步进调节 [-] [当前值] [+]
+                                                        .child(
                                                             div()
-                                                                .id(("line-sp", (val * 10.0) as u32))
+                                                                 .flex()
+                                                                 .items_center()
+                                                                 .gap_0p5()
+                                                                 .bg(Theme::bg_inset())
+                                                                 .border_1()
+                                                                 .border_color(Theme::bg_hover_strong())
+                                                                 .rounded_md()
+                                                                 .px_1()
+                                                                 .py_0p5()
+                                                                 .child(
+                                                                     div()
+                                                                         .id("line-sp-dec")
+                                                                         .px_1p5()
+                                                                         .cursor_pointer()
+                                                                         .text_size(px(Theme::TEXT_SMALL))
+                                                                         .font_weight(FontWeight::BOLD)
+                                                                         .text_color(Theme::text_secondary())
+                                                                         .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                         .child("-0.1")
+                                                                         .on_click(cx.listener(|this, _, _, cx| {
+                                                                             let cur = this.state.config.subtitle_style.line_spacing;
+                                                                             this.state.config.subtitle_style.line_spacing = (cur - 0.1).max(1.0);
+                                                                             this.state.save_subtitle_style();
+                                                                             cx.notify();
+                                                                         }))
+                                                                 )
+                                                                 .child(
+                                                                     div()
+                                                                         .px_1()
+                                                                         .text_size(px(Theme::TEXT_SMALL))
+                                                                         .font_weight(FontWeight::BOLD)
+                                                                         .text_color(Theme::accent_mint())
+                                                                         .child(format!("{:.1}x", cur_style.line_spacing))
+                                                                 )
+                                                                 .child(
+                                                                     div()
+                                                                         .id("line-sp-inc")
+                                                                         .px_1p5()
+                                                                         .cursor_pointer()
+                                                                         .text_size(px(Theme::TEXT_SMALL))
+                                                                         .font_weight(FontWeight::BOLD)
+                                                                         .text_color(Theme::text_secondary())
+                                                                         .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                         .child("+0.1")
+                                                                         .on_click(cx.listener(|this, _, _, cx| {
+                                                                             let cur = this.state.config.subtitle_style.line_spacing;
+                                                                             this.state.config.subtitle_style.line_spacing = (cur + 0.1).min(3.0);
+                                                                             this.state.save_subtitle_style();
+                                                                             cx.notify();
+                                                                         }))
+                                                                 )
+                                                        )
+                                                        // 快捷预设
+                                                        .child(
+                                                            div()
                                                                 .flex_1()
-                                                                .py_0p5()
-                                                                .rounded_md()
-                                                                .cursor_pointer()
-                                                                .text_size(px(Theme::TEXT_SMALL))
                                                                 .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                                .border_1()
-                                                                .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
-                                                                .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    this.state.config.subtitle_style.line_spacing = val;
-                                                                    this.state.save_subtitle_style();
-                                                                    cx.notify();
+                                                                .gap_1()
+                                                                .children(STYLE_LINE_SPACINGS.into_iter().map(|val| {
+                                                                    let is_sel = (cur_style.line_spacing - val).abs() < 0.05;
+                                                                    div()
+                                                                        .id(("line-sp", (val * 10.0) as u32))
+                                                                        .flex_1()
+                                                                        .py_0p5()
+                                                                        .rounded_md()
+                                                                        .cursor_pointer()
+                                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .justify_center()
+                                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
+                                                                        .border_1()
+                                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
+                                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                                            this.state.config.subtitle_style.line_spacing = val;
+                                                                            this.state.save_subtitle_style();
+                                                                            cx.notify();
+                                                                        }))
+                                                                        .child(format!("{:.1}", val))
                                                                 }))
-                                                                .child(format!("{:.1}", val))
-                                                        }))
+                                                        )
                                                 )
                                         )
                                         // 单行字数
@@ -1251,30 +1520,93 @@ impl MainWindow {
                                                         .flex_1()
                                                         .max_w(px(STYLE_ROW_BTN_MAX_W))
                                                         .flex()
-                                                        .gap_1()
-                                                        .children(STYLE_MAX_CHARS.into_iter().map(|val| {
-                                                            let is_sel = cur_style.max_chars_per_line == val;
+                                                        .gap_1p5()
+                                                        .items_center()
+                                                        // 步进调节 [-] [当前值] [+]
+                                                        .child(
                                                             div()
-                                                                .id(("max-chars", val))
+                                                                 .flex()
+                                                                 .items_center()
+                                                                 .gap_0p5()
+                                                                 .bg(Theme::bg_inset())
+                                                                 .border_1()
+                                                                 .border_color(Theme::bg_hover_strong())
+                                                                 .rounded_md()
+                                                                 .px_1()
+                                                                 .py_0p5()
+                                                                 .child(
+                                                                     div()
+                                                                         .id("max-chars-dec")
+                                                                         .px_1p5()
+                                                                         .cursor_pointer()
+                                                                         .text_size(px(Theme::TEXT_SMALL))
+                                                                         .font_weight(FontWeight::BOLD)
+                                                                         .text_color(Theme::text_secondary())
+                                                                         .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                         .child("-1")
+                                                                         .on_click(cx.listener(|this, _, _, cx| {
+                                                                             let cur = this.state.config.subtitle_style.max_chars_per_line;
+                                                                             this.state.config.subtitle_style.max_chars_per_line = cur.saturating_sub(1).max(6);
+                                                                             this.state.save_subtitle_style();
+                                                                             cx.notify();
+                                                                         }))
+                                                                 )
+                                                                 .child(
+                                                                     div()
+                                                                         .px_1()
+                                                                         .text_size(px(Theme::TEXT_SMALL))
+                                                                         .font_weight(FontWeight::BOLD)
+                                                                         .text_color(Theme::accent_mint())
+                                                                         .child(format!("{}字", cur_style.max_chars_per_line))
+                                                                 )
+                                                                 .child(
+                                                                     div()
+                                                                         .id("max-chars-inc")
+                                                                         .px_1p5()
+                                                                         .cursor_pointer()
+                                                                         .text_size(px(Theme::TEXT_SMALL))
+                                                                         .font_weight(FontWeight::BOLD)
+                                                                         .text_color(Theme::text_secondary())
+                                                                         .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                         .child("+1")
+                                                                         .on_click(cx.listener(|this, _, _, cx| {
+                                                                             let cur = this.state.config.subtitle_style.max_chars_per_line;
+                                                                             this.state.config.subtitle_style.max_chars_per_line = (cur + 1).min(50);
+                                                                             this.state.save_subtitle_style();
+                                                                             cx.notify();
+                                                                         }))
+                                                                 )
+                                                        )
+                                                        // 快捷预设
+                                                        .child(
+                                                            div()
                                                                 .flex_1()
-                                                                .py_0p5()
-                                                                .rounded_md()
-                                                                .cursor_pointer()
-                                                                .text_size(px(Theme::TEXT_SMALL))
                                                                 .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                                .border_1()
-                                                                .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
-                                                                .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    this.state.config.subtitle_style.max_chars_per_line = val;
-                                                                    this.state.save_subtitle_style();
-                                                                    cx.notify();
+                                                                .gap_1()
+                                                                .children(STYLE_MAX_CHARS.into_iter().map(|val| {
+                                                                    let is_sel = cur_style.max_chars_per_line == val;
+                                                                    div()
+                                                                        .id(("max-chars", val))
+                                                                        .flex_1()
+                                                                        .py_0p5()
+                                                                        .rounded_md()
+                                                                        .cursor_pointer()
+                                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .justify_center()
+                                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
+                                                                        .border_1()
+                                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
+                                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                                            this.state.config.subtitle_style.max_chars_per_line = val;
+                                                                            this.state.save_subtitle_style();
+                                                                            cx.notify();
+                                                                        }))
+                                                                        .child(format!("{}", val))
                                                                 }))
-                                                                .child(format!("{}", val))
-                                                        }))
+                                                        )
                                                 )
                                         )
                                 )
@@ -5114,6 +5446,173 @@ impl MainWindow {
                 });
             }
         }).detach();
+    }
+
+    /// 渲染色彩圆盘调色板（24色相环绕成圈，鼠标滑动调色）
+    pub(crate) fn render_color_wheel_picker(
+        &self,
+        current_hex: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (r, g, b) = crate::utils::SubtitleStyleConfig::hex_to_rgb(current_hex);
+        let cur_rgb = rgb((r as u32) << 16 | (g as u32) << 8 | (b as u32));
+        let hex_display = current_hex.to_uppercase();
+
+        div()
+            .id("custom-color-wheel-panel")
+            .w_full()
+            .p_2()
+            .rounded_md()
+            .bg(Theme::bg_inset())
+            .border_1()
+            .border_color(Theme::border())
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            // 左侧：24色相圆环色轮，鼠标滑过即可顺滑调色
+            .child(
+                div()
+                    .w(px(76.0))
+                    .h(px(76.0))
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    // 24 个色块环绕成一个圈
+                    .children((0..24usize).map(|i| {
+                        let angle_deg = i as f32 * (360.0 / 24.0);
+                        let (pr, pg, pb) = hsv_to_rgb(angle_deg, 1.0, self.color_picker_brightness);
+                        let hex_str = format!("#{:02X}{:02X}{:02X}", pr, pg, pb);
+                        let dot_color = rgb((pr as u32) << 16 | (pg as u32) << 8 | (pb as u32));
+                        let rad = angle_deg.to_radians();
+                        let cx_pos = 38.0 + 26.0 * rad.cos() - 4.5;
+                        let cy_pos = 38.0 + 26.0 * rad.sin() - 4.5;
+
+                        div()
+                            .id(("wheel-dot", i))
+                            .absolute()
+                            .left(px(cx_pos))
+                            .top(px(cy_pos))
+                            .w(px(9.0))
+                            .h(px(9.0))
+                            .rounded_full()
+                            .cursor_pointer()
+                            .bg(dot_color)
+                            .hover(|s| s.border_1().border_color(Theme::text_primary()))
+                            .on_mouse_move(cx.listener({
+                                let h = hex_str.clone();
+                                move |this, event: &MouseMoveEvent, _, cx| {
+                                    if event.pressed_button == Some(MouseButton::Left) {
+                                        this.state.config.subtitle_style.primary_color = h.clone();
+                                        this.state.save_subtitle_style();
+                                        cx.notify();
+                                    }
+                                }
+                            }))
+                            .on_click(cx.listener({
+                                let h = hex_str.clone();
+                                move |this, _, _, cx| {
+                                    this.state.config.subtitle_style.primary_color = h.clone();
+                                    this.state.save_subtitle_style();
+                                    cx.notify();
+                                }
+                            }))
+                    }))
+                    // 圆环正中心：当前拾取的大色块
+                    .child(
+                        div()
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded_full()
+                            .bg(cur_rgb)
+                            .border_2()
+                            .border_color(Theme::border())
+                    )
+            )
+            // 右侧：当前十六进制数值与快速纯度调节
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .font_family("Consolas")
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(Theme::accent_mint())
+                                    .child(hex_display)
+                            )
+                            .child(
+                                div()
+                                    .id("wheel-close-btn")
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .bg(Theme::bg_hover())
+                                    .cursor_pointer()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_secondary())
+                                    .hover(|s| s.text_color(Theme::text_primary()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.custom_color_picker_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child("收起 ✕")
+                            )
+                    )
+                    // 明暗度 / 纯度微调
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .children([
+                                ("纯黑", "#000000"),
+                                ("深暗", "#1E293B"),
+                                ("明亮", "#F8FAFC"),
+                                ("金色", "#F59E0B"),
+                                ("青翠", "#10B981"),
+                            ].into_iter().enumerate().map(|(idx, (name, hex))| {
+                                div()
+                                    .id(("preset-light", idx))
+                                    .flex_1()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(Theme::bg_hover())
+                                    .text_color(Theme::text_secondary())
+                                    .hover(|s| s.text_color(Theme::text_primary()).bg(Theme::bg_hover_strong()))
+                                    .on_click(cx.listener({
+                                        let h = hex.to_string();
+                                        move |this, _, _, cx| {
+                                            this.state.config.subtitle_style.primary_color = h.clone();
+                                            this.state.save_subtitle_style();
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .child(name)
+                            }))
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child("按住鼠标在圆环上滑动可自由调色")
+                    )
+            )
+            .into_any_element()
     }
 }
 

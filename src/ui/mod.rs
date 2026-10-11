@@ -488,6 +488,13 @@ pub struct MainWindow {
     pub(crate) inline_edit_cursor: usize,
     /// 就地编辑焦点句柄
     pub(crate) inline_edit_focus: FocusHandle,
+    /// 自定义调色板展开状态
+    pub(crate) custom_color_picker_open: bool,
+    /// 缓存的色相圆环图像
+    #[allow(dead_code)]
+    pub(crate) cached_color_wheel: Option<Arc<RenderImage>>,
+    /// 调色板当前亮度乘数 (0.2 ~ 1.0)
+    pub(crate) color_picker_brightness: f32,
     /// 上次点击字幕清单项的时间记录 (seg_idx, is_trans, click_instant)，用于双击判定
     pub(crate) last_subtitle_click: Option<(usize, bool, std::time::Instant)>,
     /// 在线翻译 API 配置卡片的编辑缓冲（改完即写 config.toml）
@@ -834,6 +841,9 @@ impl MainWindow {
             library_export_busy: false,
             command_palette: None,
             model_manager_tab: ModelManagerTab::SenseVoice,
+            custom_color_picker_open: false,
+            cached_color_wheel: None,
+            color_picker_brightness: 1.0,
         };
 
         // 恢复上次的批量队列：队列原本只在内存里，关窗 / 崩溃就全丢，用户排好的
