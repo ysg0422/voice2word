@@ -632,6 +632,16 @@ impl AppState {
             .unwrap_or(8) as u32
     }
 
+    /// 把「转写线程数」收敛到 `[2, cores]`：设置页滑条量程与引擎都以这个区间为准，
+    /// 收敛口径必须只此一处，避免界面与实际生效值打架。
+    ///
+    /// 用 `cores.max(2)` 兜底：单核机器/容器上 `available_parallelism()` 会返回 1，
+    /// 若直接写 `requested.clamp(2, cores)` 就是 `clamp(2, 1)`——`min <= max` 断言
+    /// 立即 panic（CPU 档切换曾因此崩在这一行）。
+    pub fn clamp_threads_to_cores(requested: u32, cores: u32) -> u32 {
+        requested.clamp(2, cores.max(2))
+    }
+
     pub fn new(config: AppConfig, db: Database, pipeline: Arc<TaskPipeline>) -> Self {
         Self::with_hardware(config, db, pipeline, HardwareProfile::detect())
     }
@@ -650,10 +660,8 @@ impl AppState {
         let translate_mode = TranslateMode::parse_mode(&config.translate.mode);
         // 线程数按本机逻辑核心数收敛：既保证与设置页滑条量程一致，
         // 也避免把小于 8 的用户设置强行抬到 8 导致滑条取值无法持久化。
-        let threads = config
-            .pipeline
-            .whisper_threads
-            .clamp(2, Self::logical_cores().max(2));
+        let threads =
+            Self::clamp_threads_to_cores(config.pipeline.whisper_threads, Self::logical_cores());
         let whisper_model_tier =
             WhisperModelTier::from_model_path(&config.paths.whisper_model).unwrap_or_default();
         // 并行进程数交给管线（0 = 自动，按核数推导）
@@ -836,7 +844,8 @@ impl AppState {
             self.whisper_model_tier = WhisperModelTier::Balanced;
             self.gpu_mode = "cpu".to_string();
             let cores = Self::logical_cores();
-            self.whisper_threads = self.config.pipeline.whisper_threads.clamp(2, cores);
+            self.whisper_threads =
+                Self::clamp_threads_to_cores(self.config.pipeline.whisper_threads, cores);
         }
         let _ = self.config.save_to_file("config.toml");
         self.refresh_model_presence();
@@ -3896,5 +3905,32 @@ mod tests {
         state.seek_to(2.0);
         assert_eq!(state.selected_segment_index, Some(2));
         assert_eq!(state.editing_text, "第二句");
+    }
+
+    /// 回归：线程数收敛到 `[2, cores]` 时，单核机器（cores == 1）不得 panic。
+    /// 旧代码 `whisper_threads.clamp(2, cores)` 在 cores < 2 时是 `clamp(2, 1)`，
+    /// `min <= max` 断言直接崩；CPU 档切换走的正是这条路径。
+    #[test]
+    fn clamp_threads_to_cores_handles_single_core() {
+        // cores = 1：下界与上界都落到 2，绝不 panic
+        assert_eq!(AppState::clamp_threads_to_cores(16, 1), 2);
+        assert_eq!(AppState::clamp_threads_to_cores(2, 1), 2);
+        // cores = 0（异常硬件档案）同样兜底到 2
+        assert_eq!(AppState::clamp_threads_to_cores(8, 0), 2);
+        // 常规核数：夹到 [2, cores]
+        assert_eq!(AppState::clamp_threads_to_cores(1, 16), 2);
+        assert_eq!(AppState::clamp_threads_to_cores(64, 16), 16);
+        assert_eq!(AppState::clamp_threads_to_cores(8, 16), 8);
+        // 不变量：结果恒在 [2, max(cores, 2)] 内，且永远 >= 2
+        for cores in 0u32..=32 {
+            for req in [1u32, 2, 4, 8, 16, 32, 64] {
+                let v = AppState::clamp_threads_to_cores(req, cores);
+                assert!(v >= 2, "线程数不得低于 2: req={req} cores={cores} -> {v}");
+                assert!(
+                    v <= cores.max(2),
+                    "线程数不得超过核数: req={req} cores={cores} -> {v}"
+                );
+            }
+        }
     }
 }
