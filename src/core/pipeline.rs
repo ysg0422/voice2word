@@ -441,7 +441,12 @@ impl TaskPipeline {
             && cores >= 4;
         // SenseVoice 单会话在 8 线程附近已饱和，继续加线程反而更慢
         // （实测 16 线程 41.6s vs 8 线程 32.6s），故对单会话线程数设上限。
-        let sv_threads = threads.unwrap_or(8).clamp(2, 8);
+        let sv_threads = threads
+            .unwrap_or(crate::engines::sensevoice::MAX_THREADS)
+            .clamp(
+                crate::engines::sensevoice::MIN_THREADS,
+                crate::engines::sensevoice::MAX_THREADS,
+            );
         // 并行进程数：0 = 自动（沿用引擎内按核数推导的调优默认值）
         let workers_override = match self.parallel_workers.load(Ordering::Relaxed) {
             0 => None,

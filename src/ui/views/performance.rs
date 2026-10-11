@@ -358,6 +358,31 @@ fn parallel_process_max(is_sensevoice: bool) -> u32 {
     (hard_max as u32).max(1)
 }
 
+/// 转写线程数滑条的量程下限：SenseVoice 与 Whisper 最左档都取 2（与引擎线程下限一致）。
+fn thread_slider_min(is_sensevoice: bool) -> u32 {
+    if is_sensevoice {
+        crate::engines::sensevoice::MIN_THREADS
+    } else {
+        2
+    }
+}
+
+/// 转写线程数滑条的量程上限：按当前识别引擎区分。
+///
+/// Whisper 侧没有单会话线程上限（引擎原样接受任意线程数），滑条给到逻辑核数即可；
+/// SenseVoice 的单会话线程数在引擎里夹到 `sensevoice::MAX_THREADS`(8)。此前滑条量程
+/// 一律取逻辑核数：16 核机器上用户能选到 9~16，界面与 config.toml 都记着 16，引擎却
+/// 按 8 跑——与并行进程数、VAD 阈值同型的「改了没效果」。这条函数把「滑条上限 ==
+/// 引擎实际会夹到的上限」钉成单测可断言的不等式。
+fn thread_slider_max(is_sensevoice: bool, cores: u32) -> u32 {
+    let hard_max = if is_sensevoice {
+        crate::engines::sensevoice::MAX_THREADS
+    } else {
+        u32::MAX
+    };
+    cores.max(2).min(hard_max)
+}
+
 impl MainWindow {
     /// 渲染性能与推理设置工作台
     pub(crate) fn render_performance_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2140,11 +2165,22 @@ impl MainWindow {
     /// 改动即时写入 config.toml 并作用于下一次任务。
     fn render_parallelism_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let cores = crate::app::AppState::logical_cores();
-        let thread_max = cores.max(2);
-        let thread_val = self.state.whisper_threads.clamp(2, thread_max);
 
-        // 量程按当前所选识别引擎取（见 `parallel_process_max`）。
+        // 量程按当前所选识别引擎取（见 `parallel_process_max` / `thread_slider_max`）。
         let is_sv = self.state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
+        let thread_min = thread_slider_min(is_sv);
+        let thread_max = thread_slider_max(is_sv, cores);
+        let thread_val = self.state.whisper_threads.clamp(thread_min, thread_max);
+        // SenseVoice 单会话线程封顶 8：在数值旁显式标注，避免「选到 16 却没变快」的困惑。
+        let thread_text = if is_sv {
+            format!(
+                "{thread_val} 线程（SenseVoice 上限 {}）",
+                crate::engines::sensevoice::MAX_THREADS
+            )
+        } else {
+            format!("{thread_val} 线程")
+        };
+
         let auto_procs = crate::engines::sensevoice_worker_count(cores) as u32;
         let proc_max = parallel_process_max(is_sv);
         let proc_val = self.state.config.pipeline.parallel_workers.min(proc_max);
@@ -2162,9 +2198,9 @@ impl MainWindow {
             "perf-slider-threads",
             "转写线程数",
             thread_val,
-            2,
+            thread_min,
             thread_max,
-            format!("{thread_val} 线程"),
+            thread_text,
             String::new(),
             cx,
             move |this, v, cx| {
@@ -2570,6 +2606,64 @@ mod tests {
             WhisperModelTier::SenseVoice.model_relative_path().to_ascii_lowercase(),
             ref m if m.ends_with(".onnx")
         ));
+    }
+    /// 回归：转写线程数滑条量程必须与**该引擎实际夹取的线程上限**一致。
+    ///
+    /// SenseVoice 单会话线程在引擎里夹到 `MAX_THREADS`(8)，此前滑条量程一律取逻辑
+    /// 核数（16 核 → 16）：用户选 9~16 时界面与 config.toml 都记着 16，引擎却按 8
+    /// 跑。Whisper 侧无此上限，量程应保持在逻辑核数。
+    #[test]
+    fn thread_slider_max_matches_engine_clamp() {
+        use super::{thread_slider_max, thread_slider_min};
+        use crate::engines::sensevoice::{MAX_THREADS, MIN_THREADS};
+
+        // 常量不等式放进 `const` 块，规避 clippy 的 `assertions_on_constants`。
+        const { assert!(MIN_THREADS <= MAX_THREADS) };
+
+        assert_eq!(
+            thread_slider_min(true),
+            MIN_THREADS,
+            "SenseVoice 最左档取引擎下限"
+        );
+        assert_eq!(thread_slider_min(false), 2, "Whisper 最左档保持 2");
+
+        for cores in [1u32, 2, 4, 8, 16, 32, 64] {
+            let sv_max = thread_slider_max(true, cores);
+            assert!(
+                (MIN_THREADS..=MAX_THREADS).contains(&sv_max),
+                "SenseVoice 量程 {sv_max}（{cores} 核）越出 [{MIN_THREADS}, {MAX_THREADS}]"
+            );
+            // 滑条每一档都必须被引擎原样接受（不被静默夹小）
+            for v in thread_slider_min(true)..=sv_max {
+                assert_eq!(
+                    v.clamp(MIN_THREADS, MAX_THREADS),
+                    v,
+                    "SenseVoice 滑条档位 {v}（{cores} 核）会被引擎悄悄改成更小的值"
+                );
+            }
+            // Whisper 侧无单会话上限：量程 == 逻辑核数（至少 2），且引擎原样接受
+            assert_eq!(
+                thread_slider_max(false, cores),
+                cores.max(2),
+                "Whisper 线程量程应保持为逻辑核数"
+            );
+        }
+
+        // 16 核是「滑条给到 16、引擎夹回 8」的原发场景
+        assert_eq!(thread_slider_max(true, 16), MAX_THREADS);
+        assert_eq!(thread_slider_max(true, 4), 4);
+        assert_eq!(thread_slider_max(false, 16), 16);
+
+        // 设置页实际显示的线程值必须落在引擎有效区间内
+        let cores = crate::app::AppState::logical_cores();
+        let shown = crate::utils::config::AppConfig::default()
+            .pipeline
+            .whisper_threads
+            .clamp(thread_slider_min(true), thread_slider_max(true, cores));
+        assert!(
+            (MIN_THREADS..=MAX_THREADS).contains(&shown),
+            "SenseVoice 页面显示线程数 {shown} 落在有效区间外"
+        );
     }
     /// 回归（P3）：ONNX provider 回落的界面文案必须与日志层的判定完全同源——
     /// 「请求 dml、实际 cpu」是唯一需要警告色的情形；请求本来就是 cpu 时不该报警。

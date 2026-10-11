@@ -356,7 +356,10 @@ pub fn transcribe_chunked_sensevoice(
         return sensevoice.transcribe(
             wav_path,
             language,
-            Some(threads_hint.clamp(2, 8)),
+            Some(threads_hint.clamp(
+                super::sensevoice::MIN_THREADS,
+                super::sensevoice::MAX_THREADS,
+            )),
             Some(total_duration),
             progress_cb,
         );
@@ -376,7 +379,10 @@ pub fn transcribe_chunked_sensevoice(
         return sensevoice.transcribe(
             wav_path,
             language,
-            Some(threads_hint.clamp(2, 8)),
+            Some(threads_hint.clamp(
+                super::sensevoice::MIN_THREADS,
+                super::sensevoice::MAX_THREADS,
+            )),
             Some(total_duration),
             progress_cb,
         );

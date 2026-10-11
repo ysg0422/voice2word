@@ -13,6 +13,17 @@ use crate::subtitle::Segment;
 
 use super::whisper::{take_live_pids, ChildEntry, ChildPidGuard};
 
+/// SenseVoice 单会话线程数上限。
+///
+/// 依据：16 核机器实测单会话在 8 线程附近已饱和（8 线程 32.6s vs 16 线程 41.6s，
+/// 线程越多反而越慢），故单会话与切块回退路径都夹到 8。公开给设置页推导滑条量程：
+/// 滑条若能选到 9~16 而引擎静默夹回 8，就是「改了没效果」的观感来源——与 VAD 阈值、
+/// 并行进程数滑条同型。
+pub const MAX_THREADS: u32 = 8;
+
+/// SenseVoice 单会话线程数下限（与设置页滑条最左档一致）。
+pub const MIN_THREADS: u32 = 2;
+
 /// 跨平台强杀指定进程及其子进程树（用于用户「终止转写」即时生效）
 fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
