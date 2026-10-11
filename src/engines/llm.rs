@@ -117,7 +117,7 @@ impl CopyRate {
     /// 收尾时给用户的提示文案（同时用于日志与进度回调）。
     pub(crate) fn warning_message(self) -> String {
         format!(
-            "⚠ 检出 {}/{} 句未真正译出（模型疑似复制原文），可再次点击「开始翻译」补译",
+            "检出 {}/{} 句未真正译出（模型疑似复制原文），可再次点击「开始翻译」补译",
             self.rejected, self.checked
         )
     }

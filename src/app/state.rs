@@ -539,6 +539,16 @@ pub struct AppState {
     pub update_check_result: Option<(bool, String, String)>,
     /// 是否正在检查更新（防连点）
     pub update_check_busy: bool,
+    /// 更新包直接下载目标：(download_url, asset_name, size)
+    pub update_download_target: Option<(String, String, u64)>,
+    /// 是否正在下载更新安装包
+    pub update_download_busy: bool,
+    /// 更新下载进度 0.0 ~ 1.0
+    pub update_download_progress: f32,
+    /// 更新下载状态文案或提示
+    pub update_download_status: Option<String>,
+    /// 已下载的新版本文件路径
+    pub update_downloaded_path: Option<PathBuf>,
 
     /// GPU 占用策略 ("full" 全速 | "balanced" 均衡 | "eco" 低占用 | "cpu" 纯 CPU)，
     /// 改动写入 config.toml 并重启生效
@@ -720,6 +730,11 @@ impl AppState {
             show_audio_advanced: false,
             update_check_result: None,
             update_check_busy: false,
+            update_download_target: None,
+            update_download_busy: false,
+            update_download_progress: 0.0,
+            update_download_status: None,
+            update_downloaded_path: None,
             gpu_mode,
             waveform: None,
             waveform_busy_for: None,

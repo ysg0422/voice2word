@@ -89,7 +89,7 @@ impl MainWindow {
                                                             .text_size(px(Theme::TEXT_BODY_LG))
                                                             .font_weight(FontWeight::BOLD)
                                                             .text_color(Theme::accent_mint())
-                                                            .child("⚡ 我有独立显卡"),
+                                                            .child("我有独立显卡"),
                                                     )
                                                     .child(primitives::badge_accent("GPU 全速加速")),
                                             )
@@ -167,7 +167,7 @@ impl MainWindow {
                                                             .text_size(px(Theme::TEXT_BODY_LG))
                                                             .font_weight(FontWeight::BOLD)
                                                             .text_color(Theme::text_primary())
-                                                            .child("💻 我没有 GPU"),
+                                                            .child("无独立显卡 (纯 CPU)"),
                                                     )
                                                     .child(primitives::badge("纯 CPU 优化")),
                                             )

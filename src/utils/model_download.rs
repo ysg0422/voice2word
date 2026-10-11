@@ -48,6 +48,10 @@ use super::AppConfig;
 /// 镜像站根地址。下载 URL 基于它拼接（HuggingFace 国内镜像）。
 pub const MIRROR_BASE: &str = "https://hf-mirror.com";
 
+/// 阿里云魔搭社区根地址（国内极速直连 CDN，实测 10MB/s+）。
+pub const MODELSCOPE_BASE: &str = "https://www.modelscope.cn/";
+pub const MODELSCOPE_BASE_ALT: &str = "https://modelscope.cn/";
+
 /// GitHub Release 代理站根地址。
 ///
 /// 部分组件（如 whisper.cpp 官方 Windows 构建）只发在 GitHub
@@ -65,9 +69,15 @@ pub const PROXY_BASE_ALT: &str = "https://ghproxy.net/";
 /// 新增条目时若手滑贴了直连 github 的地址，在测试里就会被拦住。
 #[cfg(test)]
 fn is_allowed_source(url: &str) -> bool {
-    [MIRROR_BASE, PROXY_BASE, PROXY_BASE_ALT]
-        .iter()
-        .any(|b| url.starts_with(b))
+    [
+        MIRROR_BASE,
+        MODELSCOPE_BASE,
+        MODELSCOPE_BASE_ALT,
+        PROXY_BASE,
+        PROXY_BASE_ALT,
+    ]
+    .iter()
+    .any(|b| url.starts_with(b))
 }
 
 /// 单个可下载项。
@@ -151,6 +161,7 @@ pub const ITEMS: &[DownloadItem] = &[
         note: "极速识别（非自回归，自带标点与数字规范）",
         dest: "models/sensevoice/model.int8.onnx",
         urls: &[
+            "https://www.modelscope.cn/models/poloniumrock/SenseVoiceSmallOnnx/resolve/master/model.int8.onnx",
             "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/model.int8.onnx",
         ],
         size: 239_233_841,
@@ -166,6 +177,7 @@ pub const ITEMS: &[DownloadItem] = &[
         note: "上面那个模型的分词表，缺它无法启动",
         dest: "models/sensevoice/tokens.txt",
         urls: &[
+            "https://www.modelscope.cn/models/poloniumrock/SenseVoiceSmallOnnx/resolve/master/tokens.txt",
             "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/tokens.txt",
         ],
         size: 315_894,
@@ -198,6 +210,8 @@ pub const ITEMS: &[DownloadItem] = &[
         note: "默认档位；中文精度与速度平衡",
         dest: "models/whisper/ggml-small-q5_0.bin",
         urls: &[
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-small-q5_1.bin",
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-small.bin",
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin",
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
         ],
@@ -214,6 +228,7 @@ pub const ITEMS: &[DownloadItem] = &[
         note: "低配机器可选，速度最快",
         dest: "models/whisper/ggml-base.bin",
         urls: &[
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-base.bin",
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
         ],
         size: 147_951_465,
@@ -229,6 +244,7 @@ pub const ITEMS: &[DownloadItem] = &[
         note: "大模型量化版，速度与精度兼得",
         dest: "models/whisper/ggml-large-v3-turbo-q5_0.bin",
         urls: &[
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3-q5_0.bin",
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
         ],
         size: 574_041_195,
@@ -244,6 +260,7 @@ pub const ITEMS: &[DownloadItem] = &[
         note: "旗舰精度，抗口音与吞音",
         dest: "models/whisper/ggml-large-v3-turbo-q8_0.bin",
         urls: &[
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3.bin",
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin",
         ],
         size: 874_188_075,
@@ -1118,11 +1135,16 @@ fn fetch_to_file(
         // 这里的 timeout 是**整个请求**的上限，不是空闲超时，
         // 因此给足 2 小时，避免 800 MB 在 100 KB/s 的线路上被掐断。
         .timeout(Duration::from_secs(2 * 60 * 60))
+        // 自动探测并继承环境中的 HTTP_PROXY / HTTPS_PROXY（梯子加速）
+        .try_proxy_from_env(true)
         .build();
 
     let resp = agent
         .get(url)
-        .set("User-Agent", "Mozilla/5.0 (Voice2Word)")
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
+        )
         .call()
         .map_err(|e| anyhow!("请求失败: {e}"))?;
 

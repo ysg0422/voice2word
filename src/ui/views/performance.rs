@@ -377,7 +377,7 @@ impl MainWindow {
         let tier_control = primitives::segmented_cluster()
             .child(self.seg_option(
                 "perf-tier-gpu",
-                "⚡ 我有独立显卡 (GPU 加速)",
+                "独立显卡 (GPU 加速)",
                 is_gpu,
                 cx,
                 |this, cx| {
@@ -387,7 +387,7 @@ impl MainWindow {
             ))
             .child(self.seg_option(
                 "perf-tier-cpu",
-                "💻 无独立显卡 (纯 CPU 模式)",
+                "无独立显卡 (纯 CPU 模式)",
                 !is_gpu,
                 cx,
                 |this, cx| {
@@ -397,51 +397,34 @@ impl MainWindow {
             ))
             .into_any_element();
 
-        primitives::card_rows()
-            .child(
-                div()
-                    .w_full()
-                    .py(px(Theme::SPACE_2))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(Theme::SPACE_3))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(Theme::SPACE_0_5))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(Theme::SPACE_2))
-                                    .child(
-                                        div()
-                                            .text_size(px(Theme::TEXT_BODY_LG))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(Theme::text_primary())
-                                            .child("硬件加速模式"),
-                                    )
-                                    .child(if is_gpu {
-                                        primitives::badge_accent("⚡ GPU 加速已启用")
-                                    } else {
-                                        primitives::badge("💻 纯 CPU 模式")
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(Theme::TEXT_CAPTION))
-                                    .text_color(Theme::text_muted())
-                                    .child(if is_gpu {
-                                        "已开启显卡硬件加速推理与视频硬解，推荐搭配 Whisper Turbo Q5 / Q8 大模型"
-                                    } else {
-                                        "已优化多核 CPU 线程调度，不占用任何显卡资源，推荐搭配 SenseVoice 极速或 Small 模型"
-                                    }),
-                            ),
-                    )
-                    .child(tier_control),
-            )
+        primitives::card_rows().child(
+            div()
+                .w_full()
+                .py(px(Theme::SPACE_2))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(Theme::SPACE_3))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(Theme::SPACE_2))
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_BODY_LG))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(Theme::text_primary())
+                                .child("硬件加速模式"),
+                        )
+                        .child(if is_gpu {
+                            primitives::badge_accent("GPU 加速已启用")
+                        } else {
+                            primitives::badge("纯 CPU 模式")
+                        }),
+                )
+                .child(tier_control),
+        )
     }
 
     /// 步骤 5：字幕翻译引擎设置。
@@ -1959,7 +1942,7 @@ impl MainWindow {
             } else {
                 format!("{hp_val} Hz")
             },
-            "削掉 80 Hz 以下只贡献能量不贡献信息的低频（空调声、桌面震动）".to_string(),
+            String::new(),
             cx,
             move |this, v, cx| {
                 this.state.config.pipeline.preprocess_highpass_hz = v as f64;
@@ -1976,7 +1959,7 @@ impl MainWindow {
             100,
             150,
             format!("{:.2}×", speed_val as f64 / 100.0),
-            "只加速喂给模型的音频，字幕时间戳会映射回原时间轴；1.25× 约省两成时间".to_string(),
+            String::new(),
             cx,
             move |this, v, cx| {
                 this.state.config.pipeline.whisper_audio_speed = v as f64 / 100.0;
@@ -1993,7 +1976,7 @@ impl MainWindow {
             10,
             90,
             format!("{:.2}", vad_val as f64 / 100.0),
-            "越高越激进，轻声更可能被整段跳过；噪声大的素材可适当调高".to_string(),
+            String::new(),
             cx,
             move |this, v, cx| {
                 this.state.config.pipeline.whisper_vad_threshold = v as f64 / 100.0;
@@ -2140,17 +2123,6 @@ impl MainWindow {
         let proc_max = auto_procs.max(1);
         let proc_val = self.state.config.pipeline.parallel_workers.min(proc_max);
 
-        let thread_hint = format!(
-            "本机 {cores} 逻辑核心 · SenseVoice 单会话超过 8 线程后收益递减，Whisper 建议设为物理核心数"
-        );
-        let proc_hint = if proc_val == 0 {
-            format!("自动：按本机 {cores} 核推导为 {auto_procs} 进程（实测最优）")
-        } else {
-            format!(
-                "本机 {cores} 核，自动值为 {auto_procs} 进程 · 仅长音频（≥3 分钟）多进程切块时生效"
-            )
-        };
-
         let thread_slider = self.render_slider(
             "perf-slider-threads",
             "转写线程数",
@@ -2158,7 +2130,7 @@ impl MainWindow {
             2,
             thread_max,
             format!("{thread_val} 线程"),
-            thread_hint,
+            String::new(),
             cx,
             move |this, v, cx| {
                 if this.state.whisper_threads != v {
@@ -2181,7 +2153,7 @@ impl MainWindow {
             } else {
                 format!("{proc_val} 进程")
             },
-            proc_hint,
+            String::new(),
             cx,
             move |this, v, cx| {
                 if this.state.config.pipeline.parallel_workers != v {
@@ -2206,7 +2178,7 @@ impl MainWindow {
             1,
             cores.max(1),
             format!("{llm_val} 线程"),
-            format!("本机 {cores} 逻辑核心 · 供 Qwen 深度润色使用，选「极速标点」时不受影响"),
+            String::new(),
             cx,
             move |this, v, cx| {
                 if this.state.config.pipeline.llm_threads != v {
@@ -2241,7 +2213,7 @@ impl MainWindow {
         min: u32,
         max: u32,
         value_text: String,
-        _hint: String,
+        hint: String,
         cx: &mut Context<Self>,
         on_change: impl Fn(&mut Self, u32, &mut Context<Self>) + Copy + 'static,
     ) -> Stateful<Div> {
@@ -2253,16 +2225,17 @@ impl MainWindow {
             .id(id)
             .w_full()
             .flex()
-            .flex_col()
-            .gap(px(Theme::SPACE_2))
-            .py(px(Theme::SPACE_2))
-            // 上行：标签 + 当前值胶囊
+            .items_center()
+            .justify_between()
+            .gap(px(Theme::SPACE_4))
+            .py(px(Theme::SPACE_2_5))
+            // 左侧：标签 + 提示说明
             .child(
                 div()
-                    .w_full()
+                    .flex_1()
                     .flex()
-                    .items_center()
-                    .justify_between()
+                    .flex_col()
+                    .gap(px(Theme::SPACE_1))
                     .child(
                         div()
                             .text_size(px(Theme::TEXT_BODY_LG))
@@ -2270,80 +2243,131 @@ impl MainWindow {
                             .text_color(Theme::text_primary())
                             .child(label),
                     )
-                    .child(primitives::badge_accent(value_text)),
+                    .when(!hint.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(px(Theme::TEXT_SMALL))
+                                .text_color(Theme::text_muted())
+                                .child(hint),
+                        )
+                    }),
             )
-            // 轨道
+            // 右侧：紧凑高级步进控制组 (定宽 220px，拒绝通栏傻长大滑轨)
             .child(
                 div()
-                    .relative()
-                    .w_full()
-                    .h(px(Theme::SPACE_6))
+                    .flex_shrink_0()
+                    .w(px(220.0))
                     .flex()
-                    .items_center()
-                    // 1) 底轨 + 已选填充
+                    .flex_col()
+                    .gap(px(Theme::SPACE_2))
+                    .items_end()
+                    // 1) 步进微调：[-] [ 当前值徽章 ] [+]
                     .child(
                         div()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .h(px(Theme::PROGRESS_H))
-                            .rounded_full()
-                            .bg(Theme::bg_track())
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(relative(ratio))
-                                    .rounded_full()
-                                    .bg(Theme::accent_mint()),
-                            ),
-                    )
-                    // 2) 手柄：外圈用卡片底色形成描边，内圈实心薄荷色
-                    .child(
-                        div()
-                            .absolute()
-                            .left(relative(ratio))
-                            .ml(px(-8.0))
-                            .w(px(Theme::SPACE_4))
-                            .h(px(Theme::SPACE_4))
-                            .rounded_full()
-                            .bg(Theme::bg_card())
                             .flex()
                             .items_center()
-                            .justify_center()
+                            .gap(px(Theme::SPACE_2))
                             .child(
-                                div()
-                                    .w(px(Theme::SPACE_2))
-                                    .h(px(Theme::SPACE_2))
-                                    .rounded_full()
-                                    .bg(Theme::accent_mint()),
+                                primitives::chip_clickable("－", false, value <= min)
+                                    .id(SharedString::from(format!("{id}-dec")))
+                                    .when(value > min, |d| {
+                                        let next = value.saturating_sub(1).max(min);
+                                        d.on_click(cx.listener(move |this, _, _, cx| {
+                                            on_change(this, next, cx)
+                                        }))
+                                    }),
+                            )
+                            .child(primitives::badge_accent(value_text))
+                            .child(
+                                primitives::chip_clickable("＋", false, value >= max)
+                                    .id(SharedString::from(format!("{id}-inc")))
+                                    .when(value < max, |d| {
+                                        let next = value.saturating_add(1).min(max);
+                                        d.on_click(cx.listener(move |this, _, _, cx| {
+                                            on_change(this, next, cx)
+                                        }))
+                                    }),
                             ),
                     )
-                    // 3) 命中层：每档一个隐形格子，支持单击与按住拖动
+                    // 2) 定长精致微滑轨 (高 6px，薄荷绿胶囊指示)
                     .child(
                         div()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .top_0()
-                            .bottom_0()
+                            .relative()
+                            .w_full()
+                            .h(px(Theme::SPACE_4))
                             .flex()
-                            .cursor_pointer()
-                            .children((min..=max).map(|v| {
+                            .items_center()
+                            // 底轨 + 已选填充
+                            .child(
                                 div()
-                                    .flex_1()
-                                    .h_full()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| on_change(this, v, cx)),
-                                    )
-                                    .on_mouse_move(cx.listener(
-                                        move |this, event: &MouseMoveEvent, _, cx| {
-                                            if event.pressed_button == Some(MouseButton::Left) {
-                                                on_change(this, v, cx);
-                                            }
-                                        },
-                                    ))
-                            })),
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(Theme::PROGRESS_H))
+                                    .rounded_full()
+                                    .bg(Theme::bg_track())
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative(ratio))
+                                            .rounded_full()
+                                            .bg(Theme::accent_mint()),
+                                    ),
+                            )
+                            // 手柄：外圈描边，内圈薄荷色
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(relative(ratio))
+                                    .ml(px(-7.0))
+                                    .w(px(14.0))
+                                    .h(px(14.0))
+                                    .rounded_full()
+                                    .bg(Theme::bg_card())
+                                    .border_1()
+                                    .border_color(Theme::border())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .w(px(6.0))
+                                            .h(px(6.0))
+                                            .rounded_full()
+                                            .bg(Theme::accent_mint()),
+                                    ),
+                            )
+                            // 命中层：每档一个隐形格子，支持单击与按住拖动
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .top_0()
+                                    .bottom_0()
+                                    .flex()
+                                    .cursor_pointer()
+                                    .children((min..=max).map(|v| {
+                                        div()
+                                            .flex_1()
+                                            .h_full()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    on_change(this, v, cx)
+                                                }),
+                                            )
+                                            .on_mouse_move(cx.listener(
+                                                move |this, event: &MouseMoveEvent, _, cx| {
+                                                    if event.pressed_button
+                                                        == Some(MouseButton::Left)
+                                                    {
+                                                        on_change(this, v, cx);
+                                                    }
+                                                },
+                                            ))
+                                    })),
+                            ),
                     ),
             )
     }

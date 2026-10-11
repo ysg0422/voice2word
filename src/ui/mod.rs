@@ -378,6 +378,8 @@ pub struct MainWindow {
     /// 模型下载的取消标志（与 `translate_cancel` 同一套模式）。
     /// 下载最大 833 MB，慢网下要几十分钟，必须有办法中断。
     pub(crate) model_download_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// 应用更新包下载取消标志
+    pub(crate) update_download_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) editor_export_format: EditorExportFormat,
     /// 导出内容模式：原文 / 仅译文 / 双语。对字幕文件与剪辑工程文件统一生效。
     pub(crate) editor_export_mode: ExportMode,
@@ -486,6 +488,8 @@ pub struct MainWindow {
     pub(crate) inline_edit_cursor: usize,
     /// 就地编辑焦点句柄
     pub(crate) inline_edit_focus: FocusHandle,
+    /// 上次点击字幕清单项的时间记录 (seg_idx, is_trans, click_instant)，用于双击判定
+    pub(crate) last_subtitle_click: Option<(usize, bool, std::time::Instant)>,
     /// 在线翻译 API 配置卡片的编辑缓冲（改完即写 config.toml）
     pub(crate) api_base_input: String,
     pub(crate) api_model_input: String,
@@ -541,8 +545,16 @@ pub struct MainWindow {
     /// 面板是「非阻塞式冒泡」的轻量浮层而非确认框那种阻塞模态，因此与
     /// `confirm_dialog` 等并存时由渲染顺序决定盖在谁上面（见 `Render::render`）。
     pub(crate) command_palette: Option<CommandPaletteState>,
-    /// 模型与组件管理视图：false = 仅显示当前配置所需（默认，用啥显示啥）；true = 显示全部组件库
-    pub(crate) model_manager_show_all: bool,
+    /// 模型与组件管理视图分类：SenseVoice 专区 / Whisper 模型库 / 全部组件
+    pub(crate) model_manager_tab: ModelManagerTab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ModelManagerTab {
+    #[default]
+    SenseVoice,
+    Whisper,
+    Common,
 }
 
 /// 剪辑台行首「低置信」标记的判据（纯函数，便于单测）。
@@ -746,6 +758,7 @@ impl MainWindow {
             notice: None,
             translate_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             whisper_dropdown_open: false,
             // 导出格式也是长期偏好（与 `editor_export_mode` 同理）：从配置恢复，
             // 否则每次启动都跳回「剪映草稿」，用户得重选一遍。
@@ -795,6 +808,7 @@ impl MainWindow {
             inline_edit_buffer: String::new(),
             inline_edit_cursor: 0,
             inline_edit_focus,
+            last_subtitle_click: None,
             api_base_input,
             api_model_input,
             api_key_input,
@@ -819,7 +833,7 @@ impl MainWindow {
             library_selected: HashSet::new(),
             library_export_busy: false,
             command_palette: None,
-            model_manager_show_all: false,
+            model_manager_tab: ModelManagerTab::SenseVoice,
         };
 
         // 恢复上次的批量队列：队列原本只在内存里，关窗 / 崩溃就全丢，用户排好的

@@ -1,27 +1,59 @@
-//! 模型与外部组件管理面板（首次使用引导）。
+//! 模型与外部组件管理面板（首次使用引导与模型库）。
 //!
-//! # 为什么要有它
+//! # 架构设计
 //!
-//! 模型与可执行文件合计约 2.9 GB，不进版本库。此前用户 clone 下来只拿到源码，
-//! 启动后各引擎报「未就绪」，却没有任何界面告诉他缺什么、去哪拿。
-//!
-//! # 下载源
-//!
-//! 全部走 `hf-mirror.com`（HuggingFace 国内镜像），**不需要梯子**。
-//! 2026-10-05 在本机（无代理）实测：`github.com` 的 release 附件超时不可达，
-//! 而 hf-mirror 上全部条目均可下（实测下载 141 MB 用时 19.7 秒）。
-//! 详见 `src/utils/model_download.rs` 的模块文档。
+//! 1. **零冗余依赖**：SenseVoice 默认模式为纯自包含 ONNX 架构，无需任何 whisper.cpp / llama.cpp；
+//!    在线 API 翻译模式无需本地 Qwen / llama.cpp。
+//! 2. **镜像加速**：优先直连阿里云魔搭社区（ModelScope CDN，实测 10MB/s+），自动回落 HuggingFace 镜像。
+//! 3. **视觉层次优化**：核心模型与底层执行程序分流展示，系统维护工具独立沉底。
 
 use gpui::prelude::*;
 use gpui::{div, px, AnyElement, FontWeight, IntoElement, ParentElement, Styled};
 
 use crate::ui::primitives;
 use crate::ui::theme::Theme;
-use crate::ui::MainWindow;
+use crate::ui::{MainWindow, ModelManagerTab};
+use crate::utils::model_download::human_size;
 use crate::utils::ITEMS;
 
-// 体积格式化统一走 `utils::model_download::human_size`（单一实现处）：
-use crate::utils::model_download::human_size;
+/// 判断某个组件在用户选择的分类专区下是否需要展示或下载。
+pub(crate) fn is_item_needed_for_tab(
+    item_id: &str,
+    tab: ModelManagerTab,
+    state: &crate::app::AppState,
+) -> bool {
+    let is_gpu = state.config.gpu.is_gpu_tier();
+    match tab {
+        ModelManagerTab::SenseVoice => {
+            // SenseVoice 专区：核心识别模型、分词表、VAD 专属项
+            matches!(
+                item_id,
+                "sensevoice-model" | "sensevoice-tokens" | "sensevoice-vad"
+            )
+        }
+        ModelManagerTab::Whisper => {
+            // Whisper 专区：Whisper 模型档位、VAD、标点、推理程序
+            if item_id == "whisper-cublas" {
+                is_gpu
+            } else if item_id == "whisper-cli" {
+                !is_gpu
+            } else if item_id == "silero-vad" || item_id == "punc-model" {
+                true
+            } else if let Some(current_id) = state.whisper_model_tier.download_item_id() {
+                item_id == current_id
+            } else {
+                item_id == "whisper-turbo-q5" || item_id == "whisper-small"
+            }
+        }
+        ModelManagerTab::Common => {
+            // 公用组件：FFmpeg 媒体流提取、yt-dlp、本地翻译大模型及 llama.cpp
+            matches!(
+                item_id,
+                "ffmpeg" | "yt-dlp" | "llama-cpp" | "qwen-llm"
+            )
+        }
+    }
+}
 
 /// 判断某个组件在用户当前的硬件配置和引擎模式下，是否属于「当前模式所需」的组件。
 pub fn is_item_needed_by_current_config(item_id: &str, state: &crate::app::AppState) -> bool {
@@ -32,41 +64,39 @@ pub fn is_item_needed_by_current_config(item_id: &str, state: &crate::app::AppSt
         // 音视频抽音解码：任何模式都需要
         "ffmpeg" => true,
 
-        // GPU 专用的 CUDA 推理程序：只有在 GPU 加速模式下才需要！纯 CPU 模式绝不需要
-        "whisper-cublas" => is_gpu,
+        // GPU 专用的 CUDA 推理程序：只有在选择 Whisper 且开启 GPU 加速模式下才需要！
+        "whisper-cublas" => is_gpu && !is_sv,
 
-        // CPU 版本的 Whisper CLI：在纯 CPU 模式下需要
-        "whisper-cli" => !is_gpu,
+        // CPU 版本的 Whisper CLI：只有在选择 Whisper 且纯 CPU 模式下才需要！
+        "whisper-cli" => !is_gpu && !is_sv,
 
-        // SenseVoice 引擎套件：选择 SenseVoice 极速模式时需要
+        // SenseVoice 引擎套件：选择 SenseVoice 极速模式时需要（自包含 ONNX 架构，无需任何 cpp）
         "sensevoice-model" | "sensevoice-tokens" | "sensevoice-vad" => is_sv,
 
-        // Whisper 模型档位与 Silero VAD：选择 Whisper 全能模式时需要
+        // Whisper 模型档位与 Silero VAD：选择 Whisper 模式时需要
         "whisper-small" | "whisper-base" | "whisper-turbo-q5" | "whisper-turbo-q8"
         | "silero-vad" => {
             if is_sv {
                 false
+            } else if item_id == "silero-vad" {
+                true
+            } else if let Some(current_id) = state.whisper_model_tier.download_item_id() {
+                item_id == current_id
             } else {
-                if item_id == "silero-vad" || item_id == "whisper-small" {
-                    true
-                } else if let Some(current_id) = state.whisper_model_tier.download_item_id() {
-                    item_id == current_id
-                } else {
-                    false
-                }
+                item_id == "whisper-small"
             }
         }
 
         // 标点模型：开启标点恢复时需要
         "punc-model" => state.enable_polish,
 
-        // 本地大模型：只有在本地离线 Qwen 翻译或 Qwen 深度润色模式下需要
+        // 本地离线大模型：只有在本地离线 Qwen 翻译或 Qwen 深度润色模式下需要
         "qwen-llm" | "llama-cpp" => {
             state.config.translate.mode == "offline_qwen"
                 || (state.enable_polish && state.polish_mode == crate::app::PolishMode::QwenDeep)
         }
 
-        _ => true,
+        _ => false,
     }
 }
 
@@ -75,7 +105,7 @@ impl MainWindow {
     /// （用于侧栏），否则显示完整清单（用于独立页面）。
     pub(crate) fn render_model_manager(
         &mut self,
-        compact: bool,
+        _compact: bool,
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
         let is_downloading = self.state.is_downloading;
@@ -83,7 +113,7 @@ impl MainWindow {
         let total = self.state.download_total_bytes;
         let status = self.state.download_status_msg.clone();
         let current = self.state.download_current.clone();
-        let show_all = self.model_manager_show_all;
+        let current_tab = self.model_manager_tab;
         let is_gpu = self.state.config.gpu.is_gpu_tier();
 
         // 进度比例：服务端没给 Content-Length 时退化为「不确定」态（用 0 表示）
@@ -93,29 +123,23 @@ impl MainWindow {
             0.0
         };
 
-        // ── 顶部：基于当前配置的精准缺失判定（纯 CPU 模式绝不把 GPU CUDA 组件算缺失） ──
+        // ── 顶部：基于当前选定专区计算缺失项 ──
         let active_missing_items: Vec<&crate::utils::DownloadItem> = ITEMS
             .iter()
             .filter(|i| !self.state.model_is_present(i.id))
-            .filter(|i| is_item_needed_by_current_config(i.id, &self.state))
+            .filter(|i| is_item_needed_for_tab(i.id, current_tab, &self.state))
             .collect();
         let missing = active_missing_items.len();
-        let missing_required = active_missing_items.iter().filter(|i| i.required).count();
 
         let missing_badge = if missing == 0 {
-            primitives::badge_accent(if is_gpu {
-                "当前模式组件已齐备 (GPU加速)"
-            } else {
-                "当前模式组件已齐备 (纯CPU模式)"
+            primitives::badge_accent(match current_tab {
+                ModelManagerTab::SenseVoice => "SenseVoice 组件已就绪 (推荐引擎)",
+                ModelManagerTab::Whisper => "Whisper 所需组件已就绪",
+                ModelManagerTab::Common => "公用支撑组件已就绪",
             })
         } else if missing == 1 {
             let item = active_missing_items[0];
-            let tag = if item.required {
-                "缺必需组件"
-            } else {
-                "缺可选组件"
-            };
-            primitives::badge_danger(format!("{tag}: {}", item.label))
+            primitives::badge_danger(format!("缺组件: {}", item.label))
         } else if missing <= 3 {
             let names = active_missing_items
                 .iter()
@@ -123,132 +147,95 @@ impl MainWindow {
                 .collect::<Vec<_>>()
                 .join("、");
             primitives::badge_danger(format!("缺 {missing} 项: {names}"))
-        } else if missing_required > 0 {
-            primitives::badge_danger(format!("缺 {missing} 项 (含 {missing_required} 个必需)"))
         } else {
-            primitives::badge_danger(format!("缺 {missing} 个可选"))
+            primitives::badge_danger(format!("缺 {missing} 项"))
         };
 
-        // 视图切换胶囊：用啥显示啥 vs 全部组件库
+        // 视图切换胶囊：SenseVoice (推荐) vs Whisper 模型库 vs 公用组件
         let view_toggle = primitives::segmented_cluster()
             .child(
-                primitives::segmented("当前配置所需", !show_all, false)
-                    .id("model-view-needed")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.model_manager_show_all = false;
-                        cx.notify();
-                    })),
+                primitives::segmented(
+                    "SenseVoice (推荐)",
+                    current_tab == ModelManagerTab::SenseVoice,
+                    false,
+                )
+                .id("model-tab-sv")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.model_manager_tab = ModelManagerTab::SenseVoice;
+                    cx.notify();
+                })),
             )
             .child(
-                primitives::segmented("全部组件库", show_all, false)
-                    .id("model-view-all")
+                primitives::segmented(
+                    "Whisper 模型库",
+                    current_tab == ModelManagerTab::Whisper,
+                    false,
+                )
+                .id("model-tab-whisper")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.model_manager_tab = ModelManagerTab::Whisper;
+                    cx.notify();
+                })),
+            )
+            .child(
+                primitives::segmented("公用组件", current_tab == ModelManagerTab::Common, false)
+                    .id("model-tab-common")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.model_manager_show_all = true;
+                        this.model_manager_tab = ModelManagerTab::Common;
                         cx.notify();
                     })),
             );
+
+        // 占用统计
+        let presence = crate::utils::model_download::PresenceContextRef::new(&self.state.config);
+        let (used_bytes, used_count) = ITEMS
+            .iter()
+            .filter(|i| presence.is_present(i))
+            .filter_map(|i| {
+                let p = crate::utils::model_download::item_effective_path(i, &self.state.config);
+                crate::utils::model_download::disk_size(&p)
+            })
+            .fold((0u64, 0usize), |(bytes, n), sz| (bytes + sz, n + 1));
 
         let header = div()
             .w_full()
             .flex()
             .items_center()
             .justify_between()
+            .gap(px(Theme::SPACE_2))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(Theme::SPACE_2))
-                    .child(primitives::section_title("模型与组件"))
-                    .child(missing_badge),
+                    .gap(px(Theme::SPACE_2_5))
+                    .child(primitives::section_title("模型与执行组件"))
+                    .child(missing_badge)
+                    .when(used_count > 0, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(Theme::text_muted())
+                                .child(format!(
+                                    "已就位 {used_count} 项 · 占 {}",
+                                    human_size(used_bytes)
+                                )),
+                        )
+                    }),
             )
             .child(view_toggle);
 
-        // 占用统计：只 stat 各条目**已解析到的实际路径**（十来个文件，且卡片不是
-        // 逐帧重绘的重灾区），让用户一眼看到「这些模型占了我多少盘」。放在按钮行
-        // 左边，与「删除」一起构成磁盘管理的最小闭环：看到占用 → 决定删哪个。
-        let presence = crate::utils::model_download::PresenceContextRef::new(&self.state.config);
-        let (used_bytes, used_count) = ITEMS
-            .iter()
-            .filter(|i| presence.is_present(i))
-            .filter_map(|i| {
-                // 路径解析与存在性判定同源（`item_effective_path`），不在这里
-                // 自己拼「配置优先 / 默认兜底」——那份规则一旦分叉就会出现
-                // 「显示已就位、统计却算到另一个文件」。
-                let p = crate::utils::model_download::item_effective_path(i, &self.state.config);
-                crate::utils::model_download::disk_size(&p)
-            })
-            .fold((0u64, 0usize), |(bytes, n), sz| (bytes + sz, n + 1));
-
-        // ── 一键补齐 / 取消 ──
-        let bulk_row = {
-            let mut row = div().flex().items_center().gap(px(Theme::SPACE_2));
-            if used_count > 0 {
-                row = row.child(
-                    div()
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .text_color(Theme::text_muted())
-                        .child(format!(
-                            "已就位 {used_count} 项 · 共占 {}",
-                            human_size(used_bytes)
-                        )),
-                );
-            }
-            row = row.child(
-                primitives::chip_clickable("打开目录", false, false)
-                    .id("model-open-dir")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_models_dir(cx);
-                    })),
-            );
-            // 数据备份 / 恢复：与「模型与组件」同卡，因为两者都是「我机器上的本地
-            // 状态」。备份走 `utils::backup`（连 WAL 一起打包），恢复带二次确认且
-            // 底层拒绝覆盖现有文件——见 `actions.rs::backup_data` 的说明。
-            row = row.child(
-                primitives::chip_clickable("备份数据", false, false)
-                    .id("data-backup-btn")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.backup_data(cx);
-                    })),
-            );
-            row = row.child(
-                primitives::chip_clickable("恢复备份", false, false)
-                    .id("data-restore-btn")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.choose_backup_to_restore(cx);
-                    })),
-            );
-            // 诊断报告：放在这一排的末尾，因为它回答的是同一类问题——「我机器上
-            // 到底解析到了什么」。用户遇到「说缺 X 但我明明有 X」时第一件事就是导它。
-            row = row.child(
-                primitives::chip_clickable("导出诊断", false, false)
-                    .id("data-diagnostics-btn")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.export_diagnostics(cx);
-                    })),
-            );
-            // 检查更新：只在用户点击时发一次出站请求（不轮询——这个项目的卖点之一
-            // 就是完全本地运行，而且 GitHub 未认证 API 有速率限制）。
-            let checking = self.state.update_check_busy;
-            row = row.child(
-                primitives::chip_clickable(
-                    if checking {
-                        "检查中…"
-                    } else {
-                        "检查更新"
-                    },
-                    false,
-                    false,
-                )
-                .id("update-check-btn")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.check_for_update(cx);
-                })),
-            );
-            if is_downloading {
-                row = row.child(
+        // ── 主操作动作条（补齐所需 / 取消下载） ──
+        let action_bar = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(Theme::SPACE_2))
+            .children(if is_downloading {
+                Some(
                     primitives::btn_clickable(
                         "取消下载",
-                        primitives::BtnSize::Md,
+                        primitives::BtnSize::Sm,
                         primitives::BtnVariant::Secondary,
                     )
                     .id("model-dl-cancel")
@@ -258,22 +245,32 @@ impl MainWindow {
                         this.state.download_status_msg = "正在取消下载…".to_string();
                         cx.notify();
                     })),
-                );
+                )
             } else if missing > 0 {
-                row = row.child(
+                Some(
                     primitives::btn_clickable(
-                        format!("一键补齐缺失的 {missing} 个组件"),
-                        primitives::BtnSize::Md,
+                        match current_tab {
+                            ModelManagerTab::SenseVoice => {
+                                format!("补齐 SenseVoice 所需 ({missing} 项)")
+                            }
+                            ModelManagerTab::Whisper => {
+                                format!("补齐 Whisper 所需 ({missing} 项)")
+                            }
+                            ModelManagerTab::Common => {
+                                format!("补齐公用组件 ({missing} 项)")
+                            }
+                        },
+                        primitives::BtnSize::Sm,
                         primitives::BtnVariant::Primary,
                     )
                     .id("model-dl-all")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.download_all_missing(cx);
                     })),
-                );
-            }
-            row
-        };
+                )
+            } else {
+                None
+            });
 
         // ── 进度条（仅下载中出现）──
         let progress = if is_downloading {
@@ -296,18 +293,32 @@ impl MainWindow {
                     .w_full()
                     .flex()
                     .flex_col()
-                    .gap(px(Theme::SPACE_1))
+                    .gap(px(Theme::SPACE_1_5))
+                    .py(px(Theme::SPACE_1))
                     .child(
                         div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_secondary())
-                            .child(label),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(Theme::accent_mint())
+                                    .child(label),
+                            )
+                            .when(total > 0, |d| {
+                                d.child(
+                                    div()
+                                        .text_size(px(Theme::TEXT_CAPTION))
+                                        .text_color(Theme::text_muted())
+                                        .child(format!("{:.1}%", ratio * 100.0)),
+                                )
+                            }),
                     )
                     .child(if total > 0 {
                         primitives::progress_bar(ratio)
                     } else {
-                        // 服务端未给长度：画一条不确定态的满宽细线，
-                        // 而不是留空（留空看起来像卡死了）
                         div()
                             .w_full()
                             .h(px(Theme::PROGRESS_H))
@@ -321,46 +332,53 @@ impl MainWindow {
             None
         };
 
-        // ── 分类别、分等级展示 (必需组件最前置) ──
+        // ── 分类结构 ──
         struct ModelCategory {
             title: &'static str,
-            is_required: bool,
             item_ids: &'static [&'static str],
         }
 
-        let categories = [
-            ModelCategory {
-                title: "核心必需组件",
-                is_required: true,
-                item_ids: &["ffmpeg", "whisper-cli", "whisper-small"],
-            },
-            ModelCategory {
-                title: "GPU 硬件加速推理程序 (NVIDIA / Vulkan)",
-                is_required: false,
-                item_ids: &["whisper-cublas"],
-            },
-            ModelCategory {
-                title: "Whisper 识别模型 (阶梯分级)",
-                is_required: false,
-                item_ids: &["whisper-base", "whisper-turbo-q5", "whisper-turbo-q8"],
-            },
-            ModelCategory {
-                title: "端到端语音与辅助检测",
-                is_required: false,
+        let categories = match current_tab {
+            ModelManagerTab::SenseVoice => vec![ModelCategory {
+                title: "SenseVoice 极速语音识别 (推荐)",
                 item_ids: &[
                     "sensevoice-model",
                     "sensevoice-tokens",
                     "sensevoice-vad",
-                    "silero-vad",
-                    "punc-model",
                 ],
-            },
-            ModelCategory {
-                title: "本地大语言模型与推理程序",
-                is_required: false,
-                item_ids: &["qwen-llm", "llama-cpp"],
-            },
-        ];
+            }],
+            ModelManagerTab::Whisper => vec![
+                ModelCategory {
+                    title: "Whisper 识别模型库",
+                    item_ids: &[
+                        "whisper-turbo-q5",
+                        "whisper-turbo-q8",
+                        "whisper-small",
+                        "whisper-base",
+                        "silero-vad",
+                        "punc-model",
+                    ],
+                },
+                ModelCategory {
+                    title: "Whisper 推理程序",
+                    item_ids: if is_gpu {
+                        &["whisper-cublas"]
+                    } else {
+                        &["whisper-cli"]
+                    },
+                },
+            ],
+            ModelManagerTab::Common => vec![
+                ModelCategory {
+                    title: "音视频解码与流媒体解析",
+                    item_ids: &["ffmpeg", "yt-dlp"],
+                },
+                ModelCategory {
+                    title: "本地大模型翻译与润色引擎",
+                    item_ids: &["llama-cpp", "qwen-llm"],
+                },
+            ],
+        };
 
         let mut list = div().w_full().flex().flex_col().gap(px(Theme::SPACE_3));
         for cat in categories {
@@ -369,13 +387,7 @@ impl MainWindow {
                 .iter()
                 .filter_map(|&id| ITEMS.iter().find(|i| i.id == id))
                 .filter(|i| {
-                    if !show_all {
-                        // 「当前配置所需」模式：用啥显示啥，CPU 模式下绝不展示未开启的 GPU 组件
-                        is_item_needed_by_current_config(i.id, &self.state)
-                    } else {
-                        // 「全部组件库」模式：展示全部项
-                        !compact || !self.state.model_is_present(i.id)
-                    }
+                    is_item_needed_for_tab(i.id, current_tab, &self.state)
                 })
                 .collect();
 
@@ -383,36 +395,34 @@ impl MainWindow {
                 continue;
             }
 
-            // 当前分类下真正缺失的条目（当前不需要的不计入缺失警示）
             let cat_missing = cat_items
                 .iter()
                 .filter(|i| {
                     !self.state.model_is_present(i.id)
-                        && is_item_needed_by_current_config(i.id, &self.state)
+                        && is_item_needed_for_tab(i.id, current_tab, &self.state)
                 })
                 .count();
 
             let mut col = div().w_full().flex().flex_col().gap(px(Theme::SPACE_1_5));
-            let mut title_row = div().flex().items_center().gap_2().child(
-                div()
-                    .text_size(px(Theme::TEXT_BODY))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(if cat_missing > 0 {
-                        Theme::accent_red()
-                    } else if cat.is_required {
-                        Theme::accent_mint()
-                    } else {
-                        Theme::text_secondary()
-                    })
-                    .child(cat.title),
-            );
-            if cat.is_required {
-                title_row = title_row.child(primitives::badge_accent("必需"));
-            }
-            if cat_missing > 0 {
-                title_row =
-                    title_row.child(primitives::badge_danger(format!("缺 {cat_missing} 项")));
-            }
+            let title_row = div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_BODY))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(if cat_missing > 0 {
+                            Theme::accent_red()
+                        } else {
+                            Theme::text_primary()
+                        })
+                        .child(cat.title),
+                )
+                .when(cat_missing > 0, |d| {
+                    d.child(primitives::badge_danger(format!("缺 {cat_missing} 项")))
+                });
+
             col = col.child(title_row);
             for item in cat_items {
                 col = col.child(self.render_model_row(item, is_downloading, cx));
@@ -420,39 +430,135 @@ impl MainWindow {
             list = list.child(col);
         }
 
-        // ── 组装 ──
-        let mut card = primitives::card_sm().gap(px(Theme::SPACE_2)).child(header);
+        // ── 底部维护工具栏 ──
+        let checking = self.state.update_check_busy;
+        let footer_tools = div()
+            .w_full()
+            .pt(px(Theme::SPACE_2))
+            .border_t_1()
+            .border_color(Theme::border())
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(Theme::SPACE_1_5))
+            .child(
+                primitives::chip_clickable("打开目录", false, false)
+                    .id("model-open-dir")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_models_dir(cx);
+                    })),
+            )
+            .child(
+                primitives::chip_clickable("备份数据", false, false)
+                    .id("data-backup-btn")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.backup_data(cx);
+                    })),
+            )
+            .child(
+                primitives::chip_clickable("恢复备份", false, false)
+                    .id("data-restore-btn")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.choose_backup_to_restore(cx);
+                    })),
+            )
+            .child(
+                primitives::chip_clickable("导出诊断", false, false)
+                    .id("data-diagnostics-btn")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.export_diagnostics(cx);
+                    })),
+            )
+            .child(
+                primitives::chip_clickable(
+                    if checking {
+                        "检查中…"
+                    } else {
+                        "检查更新"
+                    },
+                    false,
+                    false,
+                )
+                .id("update-check-btn")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.check_for_update(cx);
+                })),
+            );
+
+        // ── 组装整张卡片 ──
+        let mut card = primitives::card_sm()
+            .gap(px(Theme::SPACE_2_5))
+            .child(header)
+            .child(action_bar);
+
         if let Some(p) = progress {
             card = card.child(p);
         }
-        card = card.child(bulk_row);
-        // 有新版本时给一个直达下载页的入口。只报告、不自动下载替换 exe——
-        // 静默替换正在运行的可执行文件是能把安装搞死的操作。
-        if let Some((true, text, url)) = self.state.update_check_result.clone() {
-            let has_url = !url.trim().is_empty();
+
+        // 版本更新横幅（如果有）
+        if let Some((true, text, _url)) = self.state.update_check_result.clone() {
+            let is_downloading = self.state.update_download_busy;
+            let downloaded = self.state.update_downloaded_path.is_some();
+            let has_target = self.state.update_download_target.is_some();
             card = card.child(
                 div()
                     .w_full()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .gap(px(Theme::SPACE_2))
                     .child(
                         div()
                             .text_size(px(Theme::TEXT_SMALL))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(Theme::accent_mint())
-                            .child(text),
+                            .child(if let Some(status) = &self.state.update_download_status {
+                                status.clone()
+                            } else {
+                                text
+                            }),
                     )
-                    .children(has_url.then(|| {
-                        primitives::chip_clickable("前往下载", false, false)
-                            .id("update-open-page-btn")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_release_page(cx);
-                            }))
-                    })),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .children(if downloaded {
+                                Some(
+                                    primitives::chip_clickable("打开新版本", true, false)
+                                        .id("update-open-file-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_downloaded_update(cx);
+                                        })),
+                                )
+                            } else if is_downloading {
+                                Some(
+                                    primitives::chip_clickable("正在下载…", false, false)
+                                        .id("update-downloading-btn"),
+                                )
+                            } else if has_target {
+                                Some(
+                                    primitives::chip_clickable("直接下载更新", true, false)
+                                        .id("update-direct-download-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.download_app_update(cx);
+                                        })),
+                                )
+                            } else {
+                                Some(
+                                    primitives::chip_clickable("前往下载", false, false)
+                                        .id("update-open-page-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_release_page(cx);
+                                        })),
+                                )
+                            }),
+                    ),
             );
         }
+
         card = card.child(list);
+
         if !status.is_empty() {
             card = card.child(
                 div()
@@ -467,10 +573,12 @@ impl MainWindow {
                     .child(status),
             );
         }
+
+        card = card.child(footer_tools);
         card.into_any_element()
     }
 
-    /// 单个条目行：名称 + 体积 + 明确状态徽标（已就位/未下载） + 操作区。
+    /// 单个条目行：名称 + 用途说明 + 体积 + 状态徽标 + 操作区。
     fn render_model_row(
         &mut self,
         item: &'static crate::utils::DownloadItem,
@@ -490,19 +598,19 @@ impl MainWindow {
 
         let is_needed = is_item_needed_by_current_config(item.id, &self.state);
 
-        // 状态徽标：直接紧跟在名称和体积右侧，任何分辨率下都一眼可见
+        // 状态徽标：已就位 / 必需 / 可选
         let status_badge = if is_current && is_downloading {
             primitives::badge_accent("下载中")
         } else if custom {
-            primitives::badge_accent("已就位 · 自编译")
+            primitives::badge_accent("已就位 (自编译)")
         } else if present {
             primitives::badge_accent("已就位")
         } else if !is_needed {
-            primitives::badge("未下载 · 当前模式无需此项")
+            primitives::badge("未下载 (当前模式无需)")
         } else if item.required {
-            primitives::badge_danger("未下载 · 必需")
+            primitives::badge_danger("核心依赖 · 待补齐")
         } else {
-            primitives::badge_danger("未下载")
+            primitives::badge_danger("待下载")
         };
 
         // 操作区：未就位显示下载按钮；已就位显示「定位」与「删除」
@@ -520,7 +628,7 @@ impl MainWindow {
                         } else if is_needed {
                             "立即下载"
                         } else {
-                            "下载 (备用)"
+                            "下载备用"
                         },
                         primitives::BtnSize::Sm,
                         if is_needed {
@@ -584,9 +692,9 @@ impl MainWindow {
             .flex()
             .items_center()
             .justify_between()
-            .gap(px(Theme::SPACE_2))
-            .px(px(Theme::SPACE_2))
-            .py(px(Theme::SPACE_1_5))
+            .gap(px(Theme::SPACE_3))
+            .px(px(Theme::SPACE_3))
+            .py(px(Theme::SPACE_2))
             .rounded(px(Theme::RADIUS_SM));
 
         if !present && !is_downloading && is_needed {
@@ -601,20 +709,22 @@ impl MainWindow {
         row_container
             .child(
                 div()
+                    .flex_1()
                     .flex()
                     .flex_col()
                     .gap(px(Theme::SPACE_0_5))
                     .min_w(px(0.0))
+                    // 上行：标题 + 体积 + 徽章
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(Theme::SPACE_1_5))
+                            .gap(px(Theme::SPACE_2))
                             .child(
                                 div()
-                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .text_size(px(Theme::TEXT_BODY))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(if !present {
+                                    .text_color(if !present && is_needed {
                                         Theme::accent_red()
                                     } else {
                                         Theme::text_primary()

@@ -119,12 +119,13 @@ impl MainWindow {
                     })
                     .child(self.render_top_search(cx)),
             )
-            // 右侧：原生窗口控制按钮组 (最小化 / 最大化 / 关闭)
+            // 右侧：原生窗口控制按钮组 (最小化 / 最大化 / 关闭) 与检查更新按钮
             .child(
                 div()
                     .flex()
                     .items_center()
                     .h_full()
+                    .child(self.render_titlebar_update_widget(cx))
                     // 最小化
                     .child(
                         primitives::titlebar_btn("—", false)
@@ -225,7 +226,7 @@ impl MainWindow {
                     } else {
                         Theme::text_muted()
                     })
-                    .child("🔍"),
+                    .child("搜索"),
             )
             .child(
                 div()
@@ -301,6 +302,46 @@ impl MainWindow {
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(Theme::text_muted())
                     .child("Ctrl+F")
+                    .into_any_element()
+            })
+    }
+
+    /// 标题栏右上角更新组件（检测新版、一键直连下载、打开新版）
+    pub(crate) fn render_titlebar_update_widget(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_checking = self.state.update_check_busy;
+        let is_downloading = self.state.update_download_busy;
+        let downloaded = self.state.update_downloaded_path.is_some();
+        let has_new_version = matches!(self.state.update_check_result, Some((true, _, _)));
+
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .pr_2()
+            .child(if downloaded {
+                primitives::chip_clickable("新版本就绪", true, false)
+                    .id("titlebar-update-open-btn")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_downloaded_update(cx);
+                    }))
+                    .into_any_element()
+            } else if is_downloading {
+                primitives::chip_clickable("下载更新中…", false, false)
+                    .id("titlebar-update-downloading-btn")
+                    .into_any_element()
+            } else if has_new_version {
+                primitives::chip_clickable("发现新版(点击下载)", true, false)
+                    .id("titlebar-update-direct-btn")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.download_app_update(cx);
+                    }))
+                    .into_any_element()
+            } else {
+                primitives::chip_clickable(if is_checking { "检查中…" } else { "检查更新" }, false, false)
+                    .id("titlebar-check-update-btn")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.check_for_update(cx);
+                    }))
                     .into_any_element()
             })
     }

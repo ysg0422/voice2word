@@ -568,6 +568,7 @@ impl MainWindow {
         }
         self.state.update_check_busy = true;
         self.state.download_status_msg = "正在检查更新…".to_string();
+        self.state.update_download_status = Some("正在检查更新…".to_string());
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -583,18 +584,95 @@ impl MainWindow {
                         let newer = is_newer(&latest.version, current);
                         let text = describe(current, &latest.version, newer);
                         this.state.download_status_msg = text.clone();
-                        this.state.update_check_result = Some((newer, text, latest.page_url));
+                        this.state.update_check_result = Some((newer, text.clone(), latest.page_url));
+                        this.state.update_download_target = Some((
+                            latest.download_url,
+                            latest.asset_name,
+                            latest.asset_size,
+                        ));
+                        this.state.update_download_status = Some(text);
                     }
                     Err(e) => {
-                        // 网络失败不是程序故障：说清「检查不了」而不是让用户以为坏了。
-                        this.state.download_status_msg = format!("检查更新失败：{e}");
+                        let err_msg = format!("检查更新失败：{e}");
+                        this.state.download_status_msg = err_msg.clone();
+                        this.state.update_download_status = Some(err_msg);
                         this.state.update_check_result = None;
+                        this.state.update_download_target = None;
                     }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// 应用内直接下载最新版本（支持国内加速镜像，不跳转网页）
+    pub(crate) fn download_app_update(&mut self, cx: &mut Context<Self>) {
+        if self.state.update_download_busy {
+            return;
+        }
+        let Some((url, name, _)) = self.state.update_download_target.clone() else {
+            return;
+        };
+        if url.trim().is_empty() {
+            return;
+        }
+
+        self.state.update_download_busy = true;
+        self.state.update_download_progress = 0.0;
+        self.state.update_download_status = Some("正在连接更新镜像…".to_string());
+        self.update_download_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        let cancel = self.update_download_cancel.clone();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::utils::update_check::download_update_file(
+                        &url,
+                        &name,
+                        &cancel,
+                        |_frac, _written, _total| {},
+                    )
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                this.state.update_download_busy = false;
+                match res {
+                    Ok(path) => {
+                        this.state.update_download_progress = 1.0;
+                        let msg = format!("新版本已下载就绪：{}", path.display());
+                        this.state.update_download_status = Some(msg);
+                        this.state.update_downloaded_path = Some(path);
+                    }
+                    Err(e) => {
+                        this.state.update_download_status = Some(format!("下载失败：{e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 打开已下载的新版文件所在文件夹
+    pub(crate) fn open_downloaded_update(&mut self, _cx: &mut Context<Self>) {
+        if let Some(path) = &self.state.update_downloaded_path {
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("explorer")
+                    .arg(format!("/select,{}", path.display()))
+                    .spawn();
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                if let Some(p) = path.parent() {
+                    let _ = open::that(p);
+                }
+            }
+        }
     }
 
     /// 在浏览器里打开最新版本的下载页（`update_check_result` 里有 URL）。
@@ -605,8 +683,6 @@ impl MainWindow {
         if url.trim().is_empty() {
             return;
         }
-        // 用系统默认浏览器打开：不在应用内嵌 WebView（那会引入一个巨大的依赖面，
-        // 只为显示一个下载页）。
         let _ = open::that(&url);
         cx.notify();
     }
@@ -2855,26 +2931,26 @@ impl MainWindow {
         if self.state.is_downloading {
             return;
         }
-        let show_all = self.model_manager_show_all;
+        let current_tab = self.model_manager_tab;
         let mut pending: Vec<&'static crate::utils::DownloadItem> = crate::utils::ITEMS
             .iter()
             .filter(|i| !self.state.model_is_present(i.id))
             .filter(|i| {
-                show_all
-                    || crate::ui::components::model_manager::is_item_needed_by_current_config(
-                        i.id,
-                        &self.state,
-                    )
+                crate::ui::components::model_manager::is_item_needed_for_tab(
+                    i.id,
+                    current_tab,
+                    &self.state,
+                )
             })
             .collect();
         // 小文件先下：几十 MB 的 VAD/tokens 几秒就完，用户立刻看到进展；
         // ffmpeg(50MB) 与主模型(180MB+) 排在后面。
         pending.sort_by_key(|i| i.size);
         if pending.is_empty() {
-            self.state.download_status_msg = if show_all {
-                "全部组件库均已就位".to_string()
-            } else {
-                "当前模式所需组件均已就位，无需下载".to_string()
+            self.state.download_status_msg = match current_tab {
+                crate::ui::ModelManagerTab::SenseVoice => "SenseVoice 所需组件均已就位".to_string(),
+                crate::ui::ModelManagerTab::Whisper => "Whisper 所需组件均已就位".to_string(),
+                crate::ui::ModelManagerTab::Common => "公用支撑组件均已就位".to_string(),
             };
             cx.notify();
             return;

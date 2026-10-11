@@ -387,20 +387,43 @@ impl MainWindow {
         )
     }
 
-    /// 「识别引擎」卡片：五档模型栅格（SenseVoice 独占整行）
+    /// 「识别引擎」卡片：只显示已下载就位的模型，未下载不显示
     fn render_engine_card(&mut self, cx: &mut Context<Self>) -> Div {
-        let tiers: [(WhisperModelTier, &'static str); 4] = [
-            (WhisperModelTier::Fast, "Base"),
-            (WhisperModelTier::Balanced, "Small-Q5"),
-            (WhisperModelTier::TurboSpeed, "Turbo Q5"),
-            (WhisperModelTier::Precise, "Turbo Q8"),
+        let tiers: [(WhisperModelTier, &'static str, &'static str); 4] = [
+            (WhisperModelTier::Fast, "Base", "whisper-base"),
+            (WhisperModelTier::Balanced, "Small-Q5", "whisper-small"),
+            (WhisperModelTier::TurboSpeed, "Turbo Q5", "whisper-turbo-q5"),
+            (WhisperModelTier::Precise, "Turbo Q8", "whisper-turbo-q8"),
         ];
 
+        let mut available: Vec<(WhisperModelTier, &'static str, bool)> = Vec::new();
+        // 检查 SenseVoice 模型是否已就位
+        if self.state.model_is_present("sensevoice-model") {
+            available.push((WhisperModelTier::SenseVoice, "SenseVoice 极速", true));
+        }
+
+        // Whisper 各模型档位：只保留已就位的
+        for (tier, name, item_id) in tiers {
+            if self.state.model_is_present(item_id) {
+                available.push((tier, name, false));
+            }
+        }
+
+        // 兜底：若全未下载，保留推荐的 SenseVoice
+        if available.is_empty() {
+            available.push((WhisperModelTier::SenseVoice, "SenseVoice 极速", true));
+        } else {
+            // 当前选中的档位若未下载，自动平滑切至首个已就位模型
+            let cur = self.state.whisper_model_tier;
+            if !available.iter().any(|(t, _, _)| *t == cur) {
+                let fallback = available[0].0;
+                self.state.set_whisper_model_tier(fallback);
+            }
+        }
+
         let mut grid = div().flex().flex_wrap().gap(px(Theme::SPACE_1_5));
-        grid =
-            grid.child(self.tier_pill(WhisperModelTier::SenseVoice, "SenseVoice 极速", true, cx));
-        for (tier, name) in tiers {
-            grid = grid.child(self.tier_pill(tier, name, false, cx));
+        for (tier, name, full_width) in available {
+            grid = grid.child(self.tier_pill(tier, name, full_width, cx));
         }
 
         primitives::card_sm()
@@ -475,7 +498,10 @@ impl MainWindow {
     fn render_params_card(&mut self, cx: &mut Context<Self>) -> Div {
         let lang_sel = match self.state.language.as_str() {
             "zh" => "zh",
+            "ja" => "ja",
             "en" => "en",
+            "ko" => "ko",
+            "yue" => "yue",
             _ => "auto",
         };
         // 兜底回落到 "srt" 之前，必须把新增的专业格式也列出来——否则 output_format
@@ -563,7 +589,14 @@ impl MainWindow {
             })
             .child(self.param_group(
                 "识别语言",
-                vec![("auto", "自动"), ("zh", "中文"), ("en", "English")],
+                vec![
+                    ("auto", "自动"),
+                    ("zh", "中文"),
+                    ("ja", "日语"),
+                    ("en", "英语"),
+                    ("ko", "韩语"),
+                    ("yue", "粤语"),
+                ],
                 lang_sel,
                 |this, sel, cx| {
                     this.state.language = sel.to_string();

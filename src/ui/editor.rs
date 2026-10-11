@@ -87,9 +87,9 @@ const EDITOR_STACK_BELOW_W: f32 = 820.0;
 const EDITOR_STACK_MONITOR_H: f32 = 320.0;
 
 /// 上下并列字幕行高度（双语模式：时间 + 原文 + 译文）
-const SUBTITLE_ROW_H_BILINGUAL: f32 = 68.0;
+const SUBTITLE_ROW_H_BILINGUAL: f32 = 82.0;
 /// 上下并列字幕行高度（单语模式：时间 + 原文）
-const SUBTITLE_ROW_H_MONO: f32 = 50.0;
+const SUBTITLE_ROW_H_MONO: f32 = 56.0;
 
 /// 说话人标签的配色：4 个说话人各占一色，超过则回落到第一色循环。
 /// 只在标签本身着色（不染整行），避免与「选中行」的高亮底色互相干扰。
@@ -1188,10 +1188,26 @@ impl MainWindow {
                                             },
                                         )),
                                 )
-                                // 第二行：全宽行内交互输入框 (宽敞易读，不拥挤)
+                                // 第二行：原文输入框（带清晰标题）
                                 .child(
                                     div()
                                         .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(Theme::text_muted())
+                                                        .child("原文编辑"),
+                                                ),
+                                        )
                                         .child({
                                             let is_focused = self.is_text_focused;
                                             let total_chars = cur_text.chars().count();
@@ -1329,9 +1345,9 @@ impl MainWindow {
                                                                                 .child("▌"),
                                                                         )
                                                                         .child(ch_str)
-                                                                } else {
-                                                                    div().child(ch_str)
-                                                                })
+                                                                    } else {
+                                                                        div().child(ch_str)
+                                                                    })
                                                         }))
                                                         .child(if is_focused && cursor_pos == total_chars {
                                                             div()
@@ -1349,15 +1365,87 @@ impl MainWindow {
                                                             div()
                                                         })
                                                 })
-                                        })
+                                        }),
                                 )
-                                // 第二行半：实时预览条——显示的就是上一行正在编辑的那句文本。
-                                // 排版参数（字号 / 行间距 / 底边距 / 单行字数）改一下立刻在这里
-                                // 看到效果，不必载入视频、也不必去别的面板找。
-                                //
-                                // 两侧各挂一个「拖拽调宽」把手（`subtitle_preview_box`）：
-                                // 字幕框以中线为中心左右对称收放，把手贴在框的两条边上。
-                                .child(self.render_subtitle_preview_box(&cur_text, cx))
+                                // 第二行半：译文内容展示（若已翻译）
+                                .children(seg.translation.as_ref().filter(|t| !t.trim().is_empty()).map(|trans_str| {
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(Theme::accent_mint())
+                                                        .child("译文内容"),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("subtitle-trans-editor-box")
+                                                .w_full()
+                                                .min_h(px(Theme::TABLE_HEADER_H))
+                                                .px(px(Theme::SPACE_3))
+                                                .py(px(Theme::SPACE_1))
+                                                .rounded(px(Theme::RADIUS_LG))
+                                                .bg(Theme::bg_sidebar())
+                                                .border_1()
+                                                .border_color(Theme::border())
+                                                .cursor_pointer()
+                                                .hover(|s| s.border_color(Theme::accent_mint()))
+                                                .text_size(px(Theme::TEXT_BODY_LG))
+                                                .text_color(Theme::accent_mint())
+                                                .on_click(cx.listener({
+                                                    let trans_clone = trans_str.clone();
+                                                    let idx = seg.index;
+                                                    move |this, _, window, cx| {
+                                                        this.start_inline_edit(idx, true, &trans_clone, window, cx);
+                                                    }
+                                                }))
+                                                .child(trans_str.clone()),
+                                        )
+                                }))
+                                // 第二行四分之三：实时排版效果预览（带明确标题与双语联动）
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .pt_1()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(Theme::text_muted())
+                                                        .child("画面效果预览"),
+                                                ),
+                                        )
+                                        .child({
+                                            let preview_str = if let Some(t) = &seg.translation {
+                                                if !t.trim().is_empty() && t.trim() != cur_text.trim() {
+                                                    format!("{}\n{}", t.trim(), cur_text.trim())
+                                                } else {
+                                                    cur_text.clone()
+                                                }
+                                            } else {
+                                                cur_text.clone()
+                                            };
+                                            self.render_subtitle_preview_box(&preview_str, cx)
+                                        }),
+                                )
                                 // 第三行：时间微调与快捷标点注入 (规整两行，干净不拥挤)
                                 .child(
                                     div()
@@ -1756,7 +1844,8 @@ impl MainWindow {
                                                     }))
                                                     .flex()
                                                     .flex_col()
-                                                    .justify_between()
+                                                    .justify_start()
+                                                    .gap(px(3.0))
                                                     // 选中指示线（左缘 3px 竖条）
                                                     .child(if is_selected {
                                                         div()
@@ -1860,6 +1949,7 @@ impl MainWindow {
                                                             div()
                                                                 .id(("inline-edit-raw", seg_idx))
                                                                 .w_full()
+                                                                .h(px(24.0))
                                                                 .track_focus(&inline_focus)
                                                                 .px_1p5()
                                                                 .py_0p5()
@@ -1936,12 +2026,28 @@ impl MainWindow {
                                                                 .text_color(Theme::text_primary())
                                                                 .truncate()
                                                                 .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                .cursor_text()
+                                                                .cursor_pointer()
                                                                 .on_click(cx.listener({
                                                                     let raw_for_click = raw_text.clone();
                                                                     move |this, _, window, cx| {
                                                                         this.state.select_segment(seg_idx);
-                                                                        this.start_inline_edit(seg_idx, false, &raw_for_click, window, cx);
+                                                                        this.trigger_extract_frame(cx);
+                                                                        let now = std::time::Instant::now();
+                                                                        let is_double = match this.last_subtitle_click {
+                                                                            Some((last_idx, false, last_t))
+                                                                                if last_idx == seg_idx && now.duration_since(last_t).as_millis() < 350 =>
+                                                                            {
+                                                                                true
+                                                                            }
+                                                                            _ => false,
+                                                                        };
+                                                                        if is_double {
+                                                                            this.last_subtitle_click = None;
+                                                                            this.start_inline_edit(seg_idx, false, &raw_for_click, window, cx);
+                                                                        } else {
+                                                                            this.last_subtitle_click = Some((seg_idx, false, now));
+                                                                            cx.notify();
+                                                                        }
                                                                     }
                                                                 }))
                                                                 .child(raw_text.clone())
@@ -1956,6 +2062,7 @@ impl MainWindow {
                                                                 div()
                                                                     .id(("inline-edit-trans", seg_idx))
                                                                     .w_full()
+                                                                    .h(px(24.0))
                                                                     .track_focus(&inline_focus)
                                                                     .px_1p5()
                                                                     .py_0p5()
@@ -2031,12 +2138,28 @@ impl MainWindow {
                                                                     })
                                                                     .truncate()
                                                                     .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                    .cursor_text()
+                                                                    .cursor_pointer()
                                                                     .on_click(cx.listener({
                                                                         let trans_for_click = trans_text.clone();
                                                                         move |this, _, window, cx| {
                                                                             this.state.select_segment(seg_idx);
-                                                                            this.start_inline_edit(seg_idx, true, &trans_for_click, window, cx);
+                                                                            this.trigger_extract_frame(cx);
+                                                                            let now = std::time::Instant::now();
+                                                                            let is_double = match this.last_subtitle_click {
+                                                                                Some((last_idx, true, last_t))
+                                                                                    if last_idx == seg_idx && now.duration_since(last_t).as_millis() < 350 =>
+                                                                                {
+                                                                                    true
+                                                                                }
+                                                                                _ => false,
+                                                                            };
+                                                                            if is_double {
+                                                                                this.last_subtitle_click = None;
+                                                                                this.start_inline_edit(seg_idx, true, &trans_for_click, window, cx);
+                                                                            } else {
+                                                                                this.last_subtitle_click = Some((seg_idx, true, now));
+                                                                                cx.notify();
+                                                                            }
                                                                         }
                                                                     }))
                                                                     .child(trans_text)

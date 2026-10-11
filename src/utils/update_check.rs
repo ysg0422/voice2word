@@ -70,6 +70,12 @@ pub struct LatestRelease {
     pub page_url: String,
     /// 发行说明（已截断，见 `MAX_NOTES_CHARS`）
     pub notes: String,
+    /// 直接下载链接（提取 .exe 或 .zip 资产，无需去网页点击）
+    pub download_url: String,
+    /// 附件名称（如 voice2word.exe）
+    pub asset_name: String,
+    /// 附件大小（字节，0 表示未知）
+    pub asset_size: u64,
 }
 
 /// 当前编译进二进制的版本（`CARGO_PKG_VERSION`）。
@@ -117,11 +123,52 @@ pub fn parse_latest_release(body: &str) -> Result<LatestRelease> {
         .take(MAX_NOTES_CHARS)
         .collect();
 
+    // 从 assets 列表中提取可执行文件或安装包附件直链
+    let mut download_url = String::new();
+    let mut asset_name = String::new();
+    let mut asset_size: u64 = 0;
+
+    if let Some(assets) = value.get("assets").and_then(|a| a.as_array()) {
+        for asset in assets {
+            if let Some(name) = asset.get("name").and_then(|n| n.as_str()) {
+                let lower = name.to_ascii_lowercase();
+                if lower.ends_with(".exe") || lower.ends_with(".zip") {
+                    let url = asset
+                        .get("browser_download_url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let size = asset.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+                    // 优先选择 .exe
+                    if lower.ends_with(".exe") || download_url.is_empty() {
+                        download_url = url;
+                        asset_name = name.to_string();
+                        asset_size = size;
+                        if lower.ends_with(".exe") {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if download_url.is_empty() {
+        asset_name = "voice2word.exe".to_string();
+        download_url = format!(
+            "https://github.com/ysg0422/voice2word/releases/download/{}/voice2word.exe",
+            tag
+        );
+    }
+
     Ok(LatestRelease {
         version,
         published_at: text_field("published_at"),
         page_url: text_field("html_url"),
         notes,
+        download_url,
+        asset_name,
+        asset_size,
     })
 }
 
@@ -250,6 +297,7 @@ pub fn fetch_latest_release(timeout_secs: u64) -> Result<LatestRelease> {
         .timeout(Duration::from_secs(
             timeout_secs.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS),
         ))
+        .try_proxy_from_env(true)
         .build();
 
     let response = match agent
@@ -306,6 +354,136 @@ pub fn describe(current: &str, latest: &str, newer: bool) -> String {
     } else {
         format!("已是最新版本 {current}")
     }
+}
+
+/// 下载更新文件到 updates/ 目录，支持镜像加速与断点/临时文件保护。
+pub fn download_update_file(
+    download_url: &str,
+    asset_name: &str,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    progress: impl Fn(f32, u64, u64) + Send + 'static,
+) -> Result<std::path::PathBuf> {
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+
+    let updates_dir = crate::utils::AppConfig::resolve_path("updates");
+    fs::create_dir_all(&updates_dir)
+        .map_err(|e| anyhow!("创建 updates 目录失败：{e}"))?;
+
+    let final_name = if asset_name.trim().is_empty() {
+        "voice2word.exe"
+    } else {
+        asset_name.trim()
+    };
+    let dest = updates_dir.join(final_name);
+    let part = updates_dir.join(format!("{final_name}.part"));
+
+    // 候选下载镜像（国内加速镜像优先，最后兜底 GitHub 直链）
+    let mut candidate_urls = Vec::new();
+    if download_url.starts_with("https://github.com/") {
+        candidate_urls.push(format!("https://ghproxy.net/{download_url}"));
+        candidate_urls.push(format!("https://gh-proxy.com/{download_url}"));
+        candidate_urls.push(format!("https://mirror.ghproxy.com/{download_url}"));
+    }
+    candidate_urls.push(download_url.to_string());
+
+    let mut last_err = None;
+    for url in candidate_urls {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = fs::remove_file(&part);
+            return Err(anyhow!("用户已取消下载"));
+        }
+
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(30 * 60))
+            .try_proxy_from_env(true)
+            .build();
+
+        let resp = match agent
+            .get(&url)
+            .set(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            )
+            .call()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(anyhow!("连接下载源失败：{e}"));
+                continue;
+            }
+        };
+
+        if resp.status() < 200 || resp.status() >= 300 {
+            last_err = Some(anyhow!("下载源返回 HTTP {}", resp.status()));
+            continue;
+        }
+
+        let total_size = resp
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let mut reader = resp.into_reader();
+        let mut file = match fs::File::create(&part) {
+            Ok(f) => f,
+            Err(e) => return Err(anyhow!("创建临时文件失败：{e}")),
+        };
+
+        let mut buf = vec![0u8; 128 * 1024];
+        let mut written: u64 = 0;
+        let mut download_ok = true;
+
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                drop(file);
+                let _ = fs::remove_file(&part);
+                return Err(anyhow!("用户已取消下载"));
+            }
+
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Err(e) = file.write_all(&buf[..n]) {
+                        last_err = Some(anyhow!("写入磁盘失败：{e}"));
+                        download_ok = false;
+                        break;
+                    }
+                    written += n as u64;
+                    let frac = if total_size > 0 {
+                        (written as f32 / total_size as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    progress(frac, written, total_size);
+                }
+                Err(e) => {
+                    last_err = Some(anyhow!("网络读取中断：{e}"));
+                    download_ok = false;
+                    break;
+                }
+            }
+        }
+
+        drop(file);
+
+        if download_ok && written > 1024 {
+            if let Err(e) = fs::rename(&part, &dest) {
+                let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
+                let alt_dest = updates_dir.join(format!("voice2word_{timestamp}.exe"));
+                if let Err(e2) = fs::rename(&part, &alt_dest) {
+                    return Err(anyhow!("落盘失败：{e} / {e2}"));
+                }
+                return Ok(alt_dest);
+            }
+            return Ok(dest);
+        } else {
+            let _ = fs::remove_file(&part);
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("所有下载镜像均不可用，请稍后重试")))
 }
 #[cfg(test)]
 mod tests {
@@ -474,9 +652,31 @@ mod tests {
         assert!(RELEASES_API_URL.ends_with("/releases/latest"));
     }
 
-    // 注意：这里**故意不给 `fetch_latest_release` 写测试**。
-    // 任何测试只要真的发请求，整套单测就会依赖 GitHub 的可用性与限流额度：
-    // CI 里一次 403/超时就会把和本模块无关的提交判红，而且离线环境（含
-    // `cargo test --offline`）根本无法通过。IO 与解析的边界已经被
-    // `parse_latest_release` 的用例覆盖，网络那一层交给手工验证。
+    /// 校验从 assets 中正确提取 exe 附件直链与大小
+    #[test]
+    fn parse_latest_release_extracts_asset_download_url() {
+        let body = r#"{
+            "tag_name": "v0.3.0",
+            "assets": [
+                {
+                    "name": "voice2word-windows-x64.zip",
+                    "browser_download_url": "https://github.com/ysg0422/voice2word/releases/download/v0.3.0/voice2word-windows-x64.zip",
+                    "size": 25000000
+                },
+                {
+                    "name": "voice2word.exe",
+                    "browser_download_url": "https://github.com/ysg0422/voice2word/releases/download/v0.3.0/voice2word.exe",
+                    "size": 27000000
+                }
+            ]
+        }"#;
+        let r = parse_latest_release(body).expect("带 assets 附件的 payload 必须解析成功");
+        assert_eq!(r.version, "0.3.0");
+        assert_eq!(r.asset_name, "voice2word.exe");
+        assert_eq!(
+            r.download_url,
+            "https://github.com/ysg0422/voice2word/releases/download/v0.3.0/voice2word.exe"
+        );
+        assert_eq!(r.asset_size, 27000000);
+    }
 }
