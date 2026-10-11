@@ -615,51 +615,78 @@ impl JianYingExporter {
         let mut meta_file = File::create(&meta_path)?;
         meta_file.write_all(serde_json::to_string_pretty(&meta_json)?.as_bytes())?;
 
-        // 注册到剪映的 root_meta_info.json 中
-        if let Some(root_meta_file) = Self::get_root_meta_path() {
-            if let Ok(content) = fs::read_to_string(&root_meta_file) {
-                if let Ok(mut root_val) = serde_json::from_str::<Value>(&content) {
-                    let new_store_entry = json!({
-                        "draft_cloud_last_action_download": false,
-                        "draft_cloud_purchase_info": "",
-                        "draft_cloud_template_id": "",
-                        "draft_cloud_tutorial_info": "",
-                        "draft_cloud_videocut_purchase_info": "",
-                        "draft_cover": "",
-                        "draft_fold_path": norm_project_dir,
-                        "draft_id": draft_id,
-                        "draft_is_ai_shorts": false,
-                        "draft_is_invisible": false,
-                        "draft_json_file": norm_content_file,
-                        "draft_name": project_name,
-                        "draft_new_version": "",
-                        "draft_root_path": norm_draft_root,
-                        "draft_timeline_materials_size": 0,
-                        "draft_type": "",
-                        "tm_draft_cloud_completed": "",
-                        "tm_draft_cloud_modified": 0,
-                        "tm_draft_create": now_us,
-                        "tm_draft_modified": now_us,
-                        "tm_draft_removed": 0,
-                        "tm_duration": duration_us
-                    });
-
-                    if let Some(store) = root_val
-                        .get_mut("all_draft_store")
-                        .and_then(|s| s.as_array_mut())
-                    {
-                        store.insert(0, new_store_entry);
-                    }
-                    if let Some(ids) = root_val.get_mut("draft_ids").and_then(|i| i.as_u64()) {
-                        root_val["draft_ids"] = json!(ids + 1);
-                    }
-
-                    let _ = fs::write(&root_meta_file, serde_json::to_string_pretty(&root_val)?);
-                }
+        // 注册到剪映的 root_meta_info.json 中。
+        //
+        // 注册失败必须让调用方知道：草稿文件夹虽然已经生成，但没登记进
+        // root_meta_info.json 就不会出现在剪映首页。此前这里用 `let _ = fs::write`
+        // 把写失败吞掉，UI 仍提示「已注入剪映草稿，打开剪映即可在首页看到」，
+        // 用户打开剪映却找不到工程，且没有任何线索。
+        match Self::get_root_meta_path() {
+            Some(root_meta_file) => {
+                let new_store_entry = json!({
+                    "draft_cloud_last_action_download": false,
+                    "draft_cloud_purchase_info": "",
+                    "draft_cloud_template_id": "",
+                    "draft_cloud_tutorial_info": "",
+                    "draft_cloud_videocut_purchase_info": "",
+                    "draft_cover": "",
+                    "draft_fold_path": norm_project_dir,
+                    "draft_id": draft_id,
+                    "draft_is_ai_shorts": false,
+                    "draft_is_invisible": false,
+                    "draft_json_file": norm_content_file,
+                    "draft_name": project_name,
+                    "draft_new_version": "",
+                    "draft_root_path": norm_draft_root,
+                    "draft_timeline_materials_size": 0,
+                    "draft_type": "",
+                    "tm_draft_cloud_completed": "",
+                    "tm_draft_cloud_modified": 0,
+                    "tm_draft_create": now_us,
+                    "tm_draft_modified": now_us,
+                    "tm_draft_removed": 0,
+                    "tm_duration": duration_us
+                });
+                Self::register_into_root_meta(&root_meta_file, new_store_entry)?;
+            }
+            None => {
+                // 未找到 root_meta_info.json（例如仅靠兜底路径探测到草稿根目录）：
+                // 草稿文件夹已落在剪映草稿根下，剪映下次启动会自行扫描收录，
+                // 因此不算失败，但留一条日志便于排查。
+                tracing::warn!(
+                    draft = %project_dir.display(),
+                    "未找到剪映 root_meta_info.json，草稿未登记到首页索引，改由剪映自行扫描"
+                );
             }
         }
 
         Ok(project_dir)
+    }
+
+    /// 把一条草稿条目登记进剪映的 `root_meta_info.json`（读 → 头插 → 写回）。
+    ///
+    /// 拆成独立函数是为了可测试：注册失败（文件缺失/损坏、缺少 `all_draft_store`、
+    /// 写盘失败）都必须冒泡成 `Err`，调用方才能如实告诉用户「没登记进首页」，
+    /// 而不是像以前那样 `let _ = fs::write` 吞掉、UI 却报成功。
+    fn register_into_root_meta(root_meta_file: &Path, entry: Value) -> Result<()> {
+        let content = fs::read_to_string(root_meta_file)
+            .with_context(|| format!("读取剪映索引 {} 失败", root_meta_file.display()))?;
+        let mut root_val: Value = serde_json::from_str(&content)
+            .with_context(|| format!("解析剪映索引 {} 失败", root_meta_file.display()))?;
+
+        let store = root_val
+            .get_mut("all_draft_store")
+            .and_then(|s| s.as_array_mut())
+            .context("剪映索引缺少 all_draft_store 数组，无法登记草稿")?;
+        store.insert(0, entry);
+
+        if let Some(ids) = root_val.get_mut("draft_ids").and_then(|i| i.as_u64()) {
+            root_val["draft_ids"] = json!(ids + 1);
+        }
+
+        fs::write(root_meta_file, serde_json::to_string_pretty(&root_val)?)
+            .with_context(|| format!("写入剪映索引 {} 失败", root_meta_file.display()))?;
+        Ok(())
     }
 }
 
@@ -744,5 +771,66 @@ mod tests {
             !content_raw.contains("Hello world"),
             "关闭双语时不应出现译文"
         );
+    }
+
+    /// 注册：新草稿条目头插到 `all_draft_store` 最前（剪映首页按此顺序展示），
+    /// 并把 `draft_ids` 计数 +1。
+    #[test]
+    fn register_into_root_meta_prepends_and_bumps_ids() {
+        let dir = std::env::temp_dir().join(format!("v2w_jy_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let meta = dir.join("root_meta_info.json");
+        fs::write(
+            &meta,
+            r#"{"draft_ids": 3, "all_draft_store": [{"draft_name": "old"}]}"#,
+        )
+        .unwrap();
+
+        JianYingExporter::register_into_root_meta(&meta, json!({"draft_name": "new"})).unwrap();
+
+        let val: Value = serde_json::from_str(&fs::read_to_string(&meta).unwrap()).unwrap();
+        let store = val["all_draft_store"].as_array().unwrap();
+        assert_eq!(store.len(), 2);
+        assert_eq!(store[0]["draft_name"], "new");
+        assert_eq!(store[1]["draft_name"], "old");
+        assert_eq!(val["draft_ids"], 4);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 索引里没有 `all_draft_store` 数组时必须报错（否则会「写回原文件、草稿却没登记」，
+    /// 调用方还会以为成功）；且失败时原文件不能被改写。
+    #[test]
+    fn register_into_root_meta_errors_without_store() {
+        let dir = std::env::temp_dir().join(format!("v2w_jy_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let meta = dir.join("root_meta_info.json");
+        let original = r#"{"draft_ids": 1}"#;
+        fs::write(&meta, original).unwrap();
+
+        let err = JianYingExporter::register_into_root_meta(&meta, json!({})).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("all_draft_store"),
+            "错误信息应说明缺少 all_draft_store: {err:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&meta).unwrap(),
+            original,
+            "失败不应改写原文件"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 索引文件不存在（例如用户从没启动过剪映）时必须报错，而不是静默放过。
+    #[test]
+    fn register_into_root_meta_errors_on_missing_file() {
+        let dir = std::env::temp_dir().join(format!("v2w_jy_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let meta = dir.join("does_not_exist.json");
+
+        assert!(JianYingExporter::register_into_root_meta(&meta, json!({})).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
