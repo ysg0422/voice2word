@@ -8,7 +8,7 @@
 use super::actions::translated_out_count;
 use super::primitives;
 use super::theme::Theme;
-use super::{apply_line_edit, EditorExportFormat, EditorSubtitlePanel, MainWindow};
+use super::{apply_line_edit, EditorExportFormat, EditorSubtitlePanel, MainWindow, StyleField};
 use crate::app::state::{ProcessStatus, WorkspaceTab};
 use crate::subtitle::ExportMode;
 use crate::utils::time::{format_duration_short, seconds_to_hms, seconds_to_timestamp_short};
@@ -99,14 +99,20 @@ pub(crate) fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
 }
 
 /// 字幕样式可选值（字号 / 底边距以 1080p 为基准，与 `SubtitleStyleConfig` 语义一致）
+#[allow(dead_code)]
 const STYLE_FONT_SIZES: [u32; 5] = [28, 36, 44, 52, 60];
+#[allow(dead_code)]
 const STYLE_LETTER_SPACINGS: [u32; 5] = [0, 1, 2, 4, 6];
+#[allow(dead_code)]
 const STYLE_LINE_SPACINGS: [f32; 5] = [1.0, 1.2, 1.4, 1.6, 1.8];
+#[allow(dead_code)]
 const STYLE_MAX_CHARS: [u32; 5] = [10, 14, 18, 22, 26];
+#[allow(dead_code)]
 const STYLE_BOTTOM_MARGINS: [u32; 5] = [20, 40, 60, 80, 120];
 /// 分段按钮组的宽度上界：4 个短标签等分后每个约 117px，够放下 2~4 个字，
 /// 又不会像铺满整行那样被拉伸成 200px 的空条。用 max_w 而非固定宽，
 /// 是为了窄面板下仍能随容器收缩，避免「标签 + 按钮组」溢出卡片。
+#[allow(dead_code)]
 const STYLE_ROW_BTN_MAX_W: f32 = 480.0;
 
 /// 左右二分布局下左侧视频监视器的最小宽度（逻辑 px）
@@ -1101,7 +1107,7 @@ impl MainWindow {
                                         .flex()
                                         .flex_col()
                                         .gap_1p5()
-                                        // 字体大小（微调 + 快捷档位）
+                                        // 字体大小
                                         .child(
                                             div()
                                                 .flex_1()
@@ -1109,99 +1115,25 @@ impl MainWindow {
                                                 .items_center()
                                                 .gap_1p5()
                                                 .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("字体大小"))
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .max_w(px(STYLE_ROW_BTN_MAX_W))
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap_1p5()
-                                                        // 步进微调器
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap_0p5()
-                                                                .bg(Theme::bg_inset())
-                                                                .border_1()
-                                                                .border_color(Theme::bg_hover_strong())
-                                                                .rounded_md()
-                                                                .px_1()
-                                                                .py_0p5()
-                                                                .child(
-                                                                    div()
-                                                                        .id("font-size-dec")
-                                                                        .px_1p5()
-                                                                        .cursor_pointer()
-                                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                                        .font_weight(FontWeight::BOLD)
-                                                                        .text_color(Theme::text_secondary())
-                                                                        .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                        .child("-2")
-                                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                                            let cur = this.state.config.subtitle_style.font_size;
-                                                                            this.state.config.subtitle_style.font_size = cur.saturating_sub(2).max(20);
-                                                                            this.state.save_subtitle_style();
-                                                                            cx.notify();
-                                                                        }))
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .px_1()
-                                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                                        .font_weight(FontWeight::BOLD)
-                                                                        .text_color(Theme::accent_mint())
-                                                                        .child(format!("{}px", cur_style.font_size))
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .id("font-size-inc")
-                                                                        .px_1p5()
-                                                                        .cursor_pointer()
-                                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                                        .font_weight(FontWeight::BOLD)
-                                                                        .text_color(Theme::text_secondary())
-                                                                        .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                        .child("+2")
-                                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                                            let cur = this.state.config.subtitle_style.font_size;
-                                                                            this.state.config.subtitle_style.font_size = (cur + 2).min(80);
-                                                                            this.state.save_subtitle_style();
-                                                                            cx.notify();
-                                                                        }))
-                                                                )
-                                                        )
-                                                        // 快捷档位
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .flex()
-                                                                .gap_1()
-                                                                .children(STYLE_FONT_SIZES.into_iter().map(|val| {
-                                                                    let is_sel = cur_style.font_size == val;
-                                                                    div()
-                                                                        .id(("font-sz", val))
-                                                                        .flex_1()
-                                                                        .py_0p5()
-                                                                        .rounded_md()
-                                                                        .cursor_pointer()
-                                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .justify_center()
-                                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                                        .border_1()
-                                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
-                                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                                            this.state.config.subtitle_style.font_size = val;
-                                                                            this.state.save_subtitle_style();
-                                                                            cx.notify();
-                                                                        }))
-                                                                        .child(format!("{}", val))
-                                                                }))
-                                                        )
-                                                )
+                                                .child(self.render_style_stepper_input(
+                                                    StyleField::FontSize,
+                                                    "-2",
+                                                    "+2",
+                                                    |this, cx| {
+                                                        let cur = this.state.config.subtitle_style.font_size;
+                                                        this.state.config.subtitle_style.font_size = cur.saturating_sub(2).max(10);
+                                                        this.state.save_subtitle_style();
+                                                        cx.notify();
+                                                    },
+                                                    |this, cx| {
+                                                        let cur = this.state.config.subtitle_style.font_size;
+                                                        this.state.config.subtitle_style.font_size = (cur + 2).min(120);
+                                                        this.state.save_subtitle_style();
+                                                        cx.notify();
+                                                    },
+                                                    format!("{}px", cur_style.font_size),
+                                                    cx,
+                                                ))
                                         )
                                         // 字间距
                                         .child(
@@ -1211,99 +1143,25 @@ impl MainWindow {
                                                 .items_center()
                                                 .gap_1p5()
                                                 .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("字间距"))
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .max_w(px(STYLE_ROW_BTN_MAX_W))
-                                                        .flex()
-                                                        .gap_1p5()
-                                                        .items_center()
-                                                        // 步进调节 [-] [当前值] [+]
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap_0p5()
-                                                                .bg(Theme::bg_inset())
-                                                                .border_1()
-                                                                .border_color(Theme::bg_hover_strong())
-                                                                .rounded_md()
-                                                                .px_1()
-                                                                .py_0p5()
-                                                                .child(
-                                                                    div()
-                                                                        .id("letter-sp-dec")
-                                                                        .px_1p5()
-                                                                        .cursor_pointer()
-                                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                                        .font_weight(FontWeight::BOLD)
-                                                                        .text_color(Theme::text_secondary())
-                                                                        .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                        .child("-1")
-                                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                                            let cur = this.state.config.subtitle_style.letter_spacing;
-                                                                            this.state.config.subtitle_style.letter_spacing = cur.saturating_sub(1);
-                                                                            this.state.save_subtitle_style();
-                                                                            cx.notify();
-                                                                        }))
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .px_1()
-                                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                                        .font_weight(FontWeight::BOLD)
-                                                                        .text_color(Theme::accent_mint())
-                                                                        .child(format!("{}px", cur_style.letter_spacing))
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .id("letter-sp-inc")
-                                                                        .px_1p5()
-                                                                        .cursor_pointer()
-                                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                                        .font_weight(FontWeight::BOLD)
-                                                                        .text_color(Theme::text_secondary())
-                                                                        .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                        .child("+1")
-                                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                                            let cur = this.state.config.subtitle_style.letter_spacing;
-                                                                            this.state.config.subtitle_style.letter_spacing = (cur + 1).min(20);
-                                                                            this.state.save_subtitle_style();
-                                                                            cx.notify();
-                                                                        }))
-                                                                )
-                                                        )
-                                                        // 快捷预设
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .flex()
-                                                                .gap_1()
-                                                                .children(STYLE_LETTER_SPACINGS.into_iter().map(|val| {
-                                                                    let is_sel = cur_style.letter_spacing == val;
-                                                                    div()
-                                                                        .id(("letter-sp", val))
-                                                                        .flex_1()
-                                                                        .py_0p5()
-                                                                        .rounded_md()
-                                                                        .cursor_pointer()
-                                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .justify_center()
-                                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                                        .border_1()
-                                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
-                                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                                            this.state.config.subtitle_style.letter_spacing = val;
-                                                                            this.state.save_subtitle_style();
-                                                                            cx.notify();
-                                                                        }))
-                                                                        .child(format!("{}", val))
-                                                                }))
-                                                        )
-                                                )
+                                                .child(self.render_style_stepper_input(
+                                                    StyleField::LetterSpacing,
+                                                    "-1",
+                                                    "+1",
+                                                    |this, cx| {
+                                                        let cur = this.state.config.subtitle_style.letter_spacing;
+                                                        this.state.config.subtitle_style.letter_spacing = cur.saturating_sub(1);
+                                                        this.state.save_subtitle_style();
+                                                        cx.notify();
+                                                    },
+                                                    |this, cx| {
+                                                        let cur = this.state.config.subtitle_style.letter_spacing;
+                                                        this.state.config.subtitle_style.letter_spacing = (cur + 1).min(50);
+                                                        this.state.save_subtitle_style();
+                                                        cx.notify();
+                                                    },
+                                                    format!("{}px", cur_style.letter_spacing),
+                                                    cx,
+                                                ))
                                         )
                                         // 底边距
                                         .child(
@@ -1313,301 +1171,83 @@ impl MainWindow {
                                                 .items_center()
                                                 .gap_1p5()
                                                 .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("底边距"))
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .max_w(px(STYLE_ROW_BTN_MAX_W))
-                                                        .flex()
-                                                        .gap_1p5()
-                                                        .items_center()
-                                                        // 步进调节 [-] [当前值] [+]
-                                                        .child(
-                                                            div()
-                                                                 .flex()
-                                                                 .items_center()
-                                                                 .gap_0p5()
-                                                                 .bg(Theme::bg_inset())
-                                                                 .border_1()
-                                                                 .border_color(Theme::bg_hover_strong())
-                                                                 .rounded_md()
-                                                                 .px_1()
-                                                                 .py_0p5()
-                                                                 .child(
-                                                                     div()
-                                                                         .id("bot-mg-dec")
-                                                                         .px_1p5()
-                                                                         .cursor_pointer()
-                                                                         .text_size(px(Theme::TEXT_SMALL))
-                                                                         .font_weight(FontWeight::BOLD)
-                                                                         .text_color(Theme::text_secondary())
-                                                                         .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                         .child("-5")
-                                                                         .on_click(cx.listener(|this, _, _, cx| {
-                                                                             let cur = this.state.config.subtitle_style.bottom_margin;
-                                                                             this.state.config.subtitle_style.bottom_margin = cur.saturating_sub(5);
-                                                                             this.state.save_subtitle_style();
-                                                                             cx.notify();
-                                                                         }))
-                                                                 )
-                                                                 .child(
-                                                                     div()
-                                                                         .px_1()
-                                                                         .text_size(px(Theme::TEXT_SMALL))
-                                                                         .font_weight(FontWeight::BOLD)
-                                                                         .text_color(Theme::accent_mint())
-                                                                         .child(format!("{}px", cur_style.bottom_margin))
-                                                                 )
-                                                                 .child(
-                                                                     div()
-                                                                         .id("bot-mg-inc")
-                                                                         .px_1p5()
-                                                                         .cursor_pointer()
-                                                                         .text_size(px(Theme::TEXT_SMALL))
-                                                                         .font_weight(FontWeight::BOLD)
-                                                                         .text_color(Theme::text_secondary())
-                                                                         .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                         .child("+5")
-                                                                         .on_click(cx.listener(|this, _, _, cx| {
-                                                                             let cur = this.state.config.subtitle_style.bottom_margin;
-                                                                             this.state.config.subtitle_style.bottom_margin = (cur + 5).min(300);
-                                                                             this.state.save_subtitle_style();
-                                                                             cx.notify();
-                                                                         }))
-                                                                 )
-                                                        )
-                                                        // 快捷预设
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .flex()
-                                                                .gap_1()
-                                                                .children(STYLE_BOTTOM_MARGINS.into_iter().map(|val| {
-                                                                    let is_sel = cur_style.bottom_margin == val;
-                                                                    div()
-                                                                        .id(("bot-mg", val))
-                                                                        .flex_1()
-                                                                        .py_0p5()
-                                                                        .rounded_md()
-                                                                        .cursor_pointer()
-                                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .justify_center()
-                                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                                        .border_1()
-                                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
-                                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                                            this.state.config.subtitle_style.bottom_margin = val;
-                                                                            this.state.save_subtitle_style();
-                                                                            cx.notify();
-                                                                        }))
-                                                                        .child(format!("{}", val))
-                                                                }))
-                                                        )
-                                                )
+                                                .child(self.render_style_stepper_input(
+                                                    StyleField::BottomMargin,
+                                                    "-5",
+                                                    "+5",
+                                                    |this, cx| {
+                                                        let cur = this.state.config.subtitle_style.bottom_margin;
+                                                        this.state.config.subtitle_style.bottom_margin = cur.saturating_sub(5);
+                                                        this.state.save_subtitle_style();
+                                                        cx.notify();
+                                                    },
+                                                    |this, cx| {
+                                                        let cur = this.state.config.subtitle_style.bottom_margin;
+                                                        this.state.config.subtitle_style.bottom_margin = (cur + 5).min(500);
+                                                        this.state.save_subtitle_style();
+                                                        cx.notify();
+                                                    },
+                                                    format!("{}px", cur_style.bottom_margin),
+                                                    cx,
+                                                ))
                                         )
                                         // 行间距
                                         .child(
                                             div()
+                                                .flex_1()
                                                 .flex()
                                                 .items_center()
                                                 .gap_1p5()
                                                 .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("行间距"))
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .max_w(px(STYLE_ROW_BTN_MAX_W))
-                                                        .flex()
-                                                        .gap_1p5()
-                                                        .items_center()
-                                                        // 步进调节 [-] [当前值] [+]
-                                                        .child(
-                                                            div()
-                                                                 .flex()
-                                                                 .items_center()
-                                                                 .gap_0p5()
-                                                                 .bg(Theme::bg_inset())
-                                                                 .border_1()
-                                                                 .border_color(Theme::bg_hover_strong())
-                                                                 .rounded_md()
-                                                                 .px_1()
-                                                                 .py_0p5()
-                                                                 .child(
-                                                                     div()
-                                                                         .id("line-sp-dec")
-                                                                         .px_1p5()
-                                                                         .cursor_pointer()
-                                                                         .text_size(px(Theme::TEXT_SMALL))
-                                                                         .font_weight(FontWeight::BOLD)
-                                                                         .text_color(Theme::text_secondary())
-                                                                         .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                         .child("-0.1")
-                                                                         .on_click(cx.listener(|this, _, _, cx| {
-                                                                             let cur = this.state.config.subtitle_style.line_spacing;
-                                                                             this.state.config.subtitle_style.line_spacing = (cur - 0.1).max(1.0);
-                                                                             this.state.save_subtitle_style();
-                                                                             cx.notify();
-                                                                         }))
-                                                                 )
-                                                                 .child(
-                                                                     div()
-                                                                         .px_1()
-                                                                         .text_size(px(Theme::TEXT_SMALL))
-                                                                         .font_weight(FontWeight::BOLD)
-                                                                         .text_color(Theme::accent_mint())
-                                                                         .child(format!("{:.1}x", cur_style.line_spacing))
-                                                                 )
-                                                                 .child(
-                                                                     div()
-                                                                         .id("line-sp-inc")
-                                                                         .px_1p5()
-                                                                         .cursor_pointer()
-                                                                         .text_size(px(Theme::TEXT_SMALL))
-                                                                         .font_weight(FontWeight::BOLD)
-                                                                         .text_color(Theme::text_secondary())
-                                                                         .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                         .child("+0.1")
-                                                                         .on_click(cx.listener(|this, _, _, cx| {
-                                                                             let cur = this.state.config.subtitle_style.line_spacing;
-                                                                             this.state.config.subtitle_style.line_spacing = (cur + 0.1).min(3.0);
-                                                                             this.state.save_subtitle_style();
-                                                                             cx.notify();
-                                                                         }))
-                                                                 )
-                                                        )
-                                                        // 快捷预设
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .flex()
-                                                                .gap_1()
-                                                                .children(STYLE_LINE_SPACINGS.into_iter().map(|val| {
-                                                                    let is_sel = (cur_style.line_spacing - val).abs() < 0.05;
-                                                                    div()
-                                                                        .id(("line-sp", (val * 10.0) as u32))
-                                                                        .flex_1()
-                                                                        .py_0p5()
-                                                                        .rounded_md()
-                                                                        .cursor_pointer()
-                                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .justify_center()
-                                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                                        .border_1()
-                                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
-                                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                                            this.state.config.subtitle_style.line_spacing = val;
-                                                                            this.state.save_subtitle_style();
-                                                                            cx.notify();
-                                                                        }))
-                                                                        .child(format!("{:.1}", val))
-                                                                }))
-                                                        )
-                                                )
+                                                .child(self.render_style_stepper_input(
+                                                    StyleField::LineSpacing,
+                                                    "-0.1",
+                                                    "+0.1",
+                                                    |this, cx| {
+                                                        let cur = this.state.config.subtitle_style.line_spacing;
+                                                        let next = ((cur - 0.1) * 10.0).round() / 10.0;
+                                                        this.state.config.subtitle_style.line_spacing = next.max(0.5);
+                                                        this.state.save_subtitle_style();
+                                                        cx.notify();
+                                                    },
+                                                    |this, cx| {
+                                                        let cur = this.state.config.subtitle_style.line_spacing;
+                                                        let next = ((cur + 0.1) * 10.0).round() / 10.0;
+                                                        this.state.config.subtitle_style.line_spacing = next.min(5.0);
+                                                        this.state.save_subtitle_style();
+                                                        cx.notify();
+                                                    },
+                                                    format!("{:.1}x", cur_style.line_spacing),
+                                                    cx,
+                                                ))
                                         )
                                         // 单行字数
                                         .child(
                                             div()
+                                                .flex_1()
                                                 .flex()
                                                 .items_center()
                                                 .gap_1p5()
                                                 .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("单行字数"))
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .max_w(px(STYLE_ROW_BTN_MAX_W))
-                                                        .flex()
-                                                        .gap_1p5()
-                                                        .items_center()
-                                                        // 步进调节 [-] [当前值] [+]
-                                                        .child(
-                                                            div()
-                                                                 .flex()
-                                                                 .items_center()
-                                                                 .gap_0p5()
-                                                                 .bg(Theme::bg_inset())
-                                                                 .border_1()
-                                                                 .border_color(Theme::bg_hover_strong())
-                                                                 .rounded_md()
-                                                                 .px_1()
-                                                                 .py_0p5()
-                                                                 .child(
-                                                                     div()
-                                                                         .id("max-chars-dec")
-                                                                         .px_1p5()
-                                                                         .cursor_pointer()
-                                                                         .text_size(px(Theme::TEXT_SMALL))
-                                                                         .font_weight(FontWeight::BOLD)
-                                                                         .text_color(Theme::text_secondary())
-                                                                         .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                         .child("-1")
-                                                                         .on_click(cx.listener(|this, _, _, cx| {
-                                                                             let cur = this.state.config.subtitle_style.max_chars_per_line;
-                                                                             this.state.config.subtitle_style.max_chars_per_line = cur.saturating_sub(1).max(6);
-                                                                             this.state.save_subtitle_style();
-                                                                             cx.notify();
-                                                                         }))
-                                                                 )
-                                                                 .child(
-                                                                     div()
-                                                                         .px_1()
-                                                                         .text_size(px(Theme::TEXT_SMALL))
-                                                                         .font_weight(FontWeight::BOLD)
-                                                                         .text_color(Theme::accent_mint())
-                                                                         .child(format!("{}字", cur_style.max_chars_per_line))
-                                                                 )
-                                                                 .child(
-                                                                     div()
-                                                                         .id("max-chars-inc")
-                                                                         .px_1p5()
-                                                                         .cursor_pointer()
-                                                                         .text_size(px(Theme::TEXT_SMALL))
-                                                                         .font_weight(FontWeight::BOLD)
-                                                                         .text_color(Theme::text_secondary())
-                                                                         .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                         .child("+1")
-                                                                         .on_click(cx.listener(|this, _, _, cx| {
-                                                                             let cur = this.state.config.subtitle_style.max_chars_per_line;
-                                                                             this.state.config.subtitle_style.max_chars_per_line = (cur + 1).min(50);
-                                                                             this.state.save_subtitle_style();
-                                                                             cx.notify();
-                                                                         }))
-                                                                 )
-                                                        )
-                                                        // 快捷预设
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .flex()
-                                                                .gap_1()
-                                                                .children(STYLE_MAX_CHARS.into_iter().map(|val| {
-                                                                    let is_sel = cur_style.max_chars_per_line == val;
-                                                                    div()
-                                                                        .id(("max-chars", val))
-                                                                        .flex_1()
-                                                                        .py_0p5()
-                                                                        .rounded_md()
-                                                                        .cursor_pointer()
-                                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .justify_center()
-                                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                                        .border_1()
-                                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
-                                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                                            this.state.config.subtitle_style.max_chars_per_line = val;
-                                                                            this.state.save_subtitle_style();
-                                                                            cx.notify();
-                                                                        }))
-                                                                        .child(format!("{}", val))
-                                                                }))
-                                                        )
-                                                )
+                                                .child(self.render_style_stepper_input(
+                                                    StyleField::MaxChars,
+                                                    "-1",
+                                                    "+1",
+                                                    |this, cx| {
+                                                        let cur = this.state.config.subtitle_style.max_chars_per_line;
+                                                        this.state.config.subtitle_style.max_chars_per_line = cur.saturating_sub(1).max(4);
+                                                        this.state.save_subtitle_style();
+                                                        cx.notify();
+                                                    },
+                                                    |this, cx| {
+                                                        let cur = this.state.config.subtitle_style.max_chars_per_line;
+                                                        this.state.config.subtitle_style.max_chars_per_line = (cur + 1).min(100);
+                                                        this.state.save_subtitle_style();
+                                                        cx.notify();
+                                                    },
+                                                    format!("{}字", cur_style.max_chars_per_line),
+                                                    cx,
+                                                ))
                                         )
                                 )
                                 .into_any_element()
@@ -5605,12 +5245,152 @@ impl MainWindow {
                                     .child(name)
                             }))
                     )
+            )
+            .into_any_element()
+    }
+
+    /// 渲染 Word 风格的数值步进微调输入组件（带加减按钮，中间数值框支持单击/双击就地编辑数字）
+    pub(crate) fn render_style_stepper_input<FDown, FUp>(
+        &self,
+        field: StyleField,
+        step_down_label: &str,
+        step_up_label: &str,
+        step_down_fn: FDown,
+        step_up_fn: FUp,
+        display_val: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement
+    where
+        FDown: Fn(&mut MainWindow, &mut Context<MainWindow>) + 'static + Clone,
+        FUp: Fn(&mut MainWindow, &mut Context<MainWindow>) + 'static + Clone,
+    {
+        let is_editing = self.focused_style_field == Some(field);
+        let id_prefix = match field {
+            StyleField::FontSize => "font-size",
+            StyleField::LetterSpacing => "letter-sp",
+            StyleField::BottomMargin => "bot-mg",
+            StyleField::LineSpacing => "line-sp",
+            StyleField::MaxChars => "max-chars",
+        };
+
+        let dec_id = format!("{}-dec", id_prefix);
+        let inc_id = format!("{}-inc", id_prefix);
+        let val_id = format!("{}-val-box", id_prefix);
+
+        let down_fn = step_down_fn.clone();
+        let up_fn = step_up_fn.clone();
+
+        let focus_handle = self.style_field_focus.clone();
+
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .bg(Theme::bg_inset())
+            .border_1()
+            .border_color(if is_editing { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+            .rounded_md()
+            .p_0p5()
+            // 减号步进按钮
+            .child(
+                div()
+                    .id(SharedString::from(dec_id))
+                    .px_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .rounded_sm()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(Theme::text_secondary())
+                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::accent_mint()))
+                    .child(step_down_label.to_string())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.focused_style_field.is_some() {
+                            this.commit_style_field_edit(cx);
+                        }
+                        down_fn(this, cx);
+                    }))
+            )
+            // 中间输入框 / 显示框（支持单击与双击直接输入数字）
+            .child(if is_editing {
+                let cursor = self.line_edit_cursor.min(self.style_field_input.chars().count());
+                let before: String = self.style_field_input.chars().take(cursor).collect();
+                let after: String = self.style_field_input.chars().skip(cursor).collect();
+
+                div()
+                    .id(SharedString::from(val_id))
+                    .track_focus(&focus_handle)
+                    .w(px(76.0))
+                    .px_1p5()
+                    .py_0p5()
+                    .bg(Theme::bg_app())
+                    .border_1()
+                    .border_color(Theme::accent_mint())
+                    .rounded_sm()
+                    .cursor_text()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        let key = &event.keystroke.key;
+                        if key == "enter" {
+                            this.commit_style_field_edit(cx);
+                        } else if key == "escape" {
+                            this.cancel_style_field_edit(cx);
+                        } else if apply_line_edit(&mut this.style_field_input, &mut this.line_edit_cursor, event, cx) {
+                            cx.notify();
+                        }
+                    }))
                     .child(
                         div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_muted())
-                            .child("按住鼠标在圆环上滑动可自由调色")
+                            .flex()
+                            .items_center()
+                            .text_size(px(Theme::TEXT_SMALL))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(Theme::text_primary())
+                            .child(before)
+                            .child(div().text_color(Theme::accent_mint()).child("▌"))
+                            .child(after)
                     )
+            } else {
+                div()
+                    .id(SharedString::from(val_id))
+                    .w(px(76.0))
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_text()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(Theme::accent_mint())
+                    .hover(|s| s.bg(Theme::bg_hover()).border_1().border_color(Theme::accent_mint()))
+                    .child(display_val)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.start_style_field_edit(field, window, cx);
+                    }))
+            })
+            // 加号步进按钮
+            .child(
+                div()
+                    .id(SharedString::from(inc_id))
+                    .px_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .rounded_sm()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(Theme::text_secondary())
+                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::accent_mint()))
+                    .child(step_up_label.to_string())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.focused_style_field.is_some() {
+                            this.commit_style_field_edit(cx);
+                        }
+                        up_fn(this, cx);
+                    }))
             )
             .into_any_element()
     }

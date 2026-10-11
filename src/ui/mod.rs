@@ -147,6 +147,16 @@ pub enum ApiField {
     LocalModelPath,
 }
 
+/// 样式排版参数微调字段，支持点击/双击直接就地输入数值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StyleField {
+    FontSize,
+    LetterSpacing,
+    BottomMargin,
+    LineSpacing,
+    MaxChars,
+}
+
 /// 视频库查询缓存的键：`(关键字, 只看译文, 只看原文, 排序, 记录数, 首条 id)`。
 ///
 /// 抽成别名有两个理由：clippy 会拒绝对裸元组当场写两层泛型（`type_complexity`），
@@ -513,6 +523,12 @@ pub struct MainWindow {
     pub(crate) focused_api_field: Option<ApiField>,
     /// 单行输入共用的光标位置（同一时刻只有一个框聚焦，无需每框一个）
     pub(crate) line_edit_cursor: usize,
+    /// 样式排版参数当前聚焦编辑的字段
+    pub(crate) focused_style_field: Option<StyleField>,
+    /// 样式排版参数正在编辑输入的文本缓冲
+    pub(crate) style_field_input: String,
+    /// 样式排版参数输入框焦点句柄
+    pub(crate) style_field_focus: FocusHandle,
     /// API Key 是否明文显示（默认掩码，避免录屏/截图泄露）
     pub(crate) api_key_visible: bool,
     /// 在线翻译接口连通性自检状态
@@ -827,6 +843,9 @@ impl MainWindow {
             local_model_hint: None,
             focused_api_field: None,
             line_edit_cursor: 0,
+            focused_style_field: None,
+            style_field_input: String::new(),
+            style_field_focus: cx.focus_handle(),
             api_key_visible: false,
             is_probing_translate: false,
             translate_probe_msg: None,
@@ -998,6 +1017,76 @@ impl MainWindow {
                 let _ = cfg.save_to_file("config.toml");
             })
             .detach();
+    }
+
+    /// 开始排版参数就地输入（点击或双击触发）
+    pub(crate) fn start_style_field_edit(
+        &mut self,
+        field: StyleField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cur_val_str = match field {
+            StyleField::FontSize => self.state.config.subtitle_style.font_size.to_string(),
+            StyleField::LetterSpacing => self.state.config.subtitle_style.letter_spacing.to_string(),
+            StyleField::BottomMargin => self.state.config.subtitle_style.bottom_margin.to_string(),
+            StyleField::LineSpacing => format!("{:.1}", self.state.config.subtitle_style.line_spacing),
+            StyleField::MaxChars => self.state.config.subtitle_style.max_chars_per_line.to_string(),
+        };
+        self.focused_style_field = Some(field);
+        self.style_field_input = cur_val_str.clone();
+        self.line_edit_cursor = cur_val_str.chars().count();
+        window.focus(&self.style_field_focus);
+        cx.notify();
+    }
+
+    /// 确认排版参数输入并落盘保存
+    pub(crate) fn commit_style_field_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(field) = self.focused_style_field.take() {
+            let s = self.style_field_input.trim();
+            match field {
+                StyleField::FontSize => {
+                    if let Ok(v) = s.parse::<u32>() {
+                        self.state.config.subtitle_style.font_size = v.clamp(10, 120);
+                        self.state.save_subtitle_style();
+                    }
+                }
+                StyleField::LetterSpacing => {
+                    if let Ok(v) = s.parse::<u32>() {
+                        self.state.config.subtitle_style.letter_spacing = v.clamp(0, 50);
+                        self.state.save_subtitle_style();
+                    }
+                }
+                StyleField::BottomMargin => {
+                    if let Ok(v) = s.parse::<u32>() {
+                        self.state.config.subtitle_style.bottom_margin = v.clamp(0, 500);
+                        self.state.save_subtitle_style();
+                    }
+                }
+                StyleField::LineSpacing => {
+                    if let Ok(v) = s.parse::<f32>() {
+                        let clamped = ((v * 10.0).round() / 10.0).clamp(0.5, 5.0);
+                        self.state.config.subtitle_style.line_spacing = clamped;
+                        self.state.save_subtitle_style();
+                    }
+                }
+                StyleField::MaxChars => {
+                    if let Ok(v) = s.parse::<u32>() {
+                        self.state.config.subtitle_style.max_chars_per_line = v.clamp(4, 100);
+                        self.state.save_subtitle_style();
+                    }
+                }
+            }
+            self.style_field_input.clear();
+            cx.notify();
+        }
+    }
+
+    /// 取消排版参数输入
+    pub(crate) fn cancel_style_field_edit(&mut self, cx: &mut Context<Self>) {
+        self.focused_style_field = None;
+        self.style_field_input.clear();
+        cx.notify();
     }
 
     /// 写入本地大模型（离线 Qwen 的 GGUF）路径：落盘 + 即时校验 + 刷新模型就位判定。
