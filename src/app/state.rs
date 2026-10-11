@@ -1925,10 +1925,23 @@ impl AppState {
                 Ok(()) => self.db_write_error = None,
                 Err(err) => {
                     tracing::warn!(error = %err, "字幕写库失败，改动尚未持久化");
-                    self.db_write_error = Some(format!("字幕保存失败：{err}"));
+                    self.record_db_write_error(format!("字幕保存失败：{err}"));
                 }
             }
         }
+    }
+
+    /// 追加一条写库失败提示（`db_write_error`）。
+    ///
+    /// 已有提示时用「；」拼接而非覆盖：一次操作里可能先后失败两次（例如「上一个
+    /// 工程的 flush 失败」+「当前转写结果入库失败」），只留最后一条会让用户以为
+    /// 只有一处出了问题，去排查时漏掉另一条。成功落库时调用方仍会把它清成 `None`。
+    pub fn record_db_write_error(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.db_write_error = Some(match self.db_write_error.take() {
+            Some(prev) => format!("{prev}；{msg}"),
+            None => msg,
+        });
     }
 
     /// 标记字幕内容已变化（驱动清单搜索缓存失效）
@@ -4090,5 +4103,71 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `record_db_write_error` 追加而非覆盖：同一次操作里可能先后失败两处，
+    /// 两条都要留下（只显示最后一条会让用户排查时漏掉另一处）。
+    #[test]
+    fn record_db_write_error_appends_and_keeps_order() {
+        let mut state = test_state(Vec::new());
+        assert!(state.db_write_error.is_none());
+
+        state.record_db_write_error("历史记录保存失败：库被锁");
+        assert_eq!(
+            state.db_write_error.as_deref(),
+            Some("历史记录保存失败：库被锁")
+        );
+
+        // 第二条来自另一个环节：两条都在，且先发生的排在前
+        state.record_db_write_error("字幕保存失败：磁盘已满");
+        assert_eq!(
+            state.db_write_error.as_deref(),
+            Some("历史记录保存失败：库被锁；字幕保存失败：磁盘已满")
+        );
+
+        // 成功落库由调用方显式清空，不会被追加逻辑复活
+        state.db_write_error = None;
+        assert!(state.db_write_error.is_none());
+    }
+
+    /// 空串也要如实记录：调用方传进来的就是「发生了什么」，helper 不该
+    /// 擅自把空消息当成「没有错误」而吞掉。
+    #[test]
+    fn record_db_write_error_keeps_empty_message() {
+        let mut state = test_state(Vec::new());
+        state.record_db_write_error("");
+        assert_eq!(state.db_write_error.as_deref(), Some(""));
+    }
+
+    /// 真实链路的顺序契约：转写结果入库失败时，错误要在第 2 步 flush 之后才挂到
+    /// `db_write_error` 上。这里锁住两个事实——(1) flush 在无脏数据时不会误清已有
+    /// 提示；(2) 之后补挂的入库失败会追加在已有提示后面，而不是被吞掉。
+    #[test]
+    fn db_insert_error_survives_successful_flush() {
+        let mut state = test_state(Vec::new());
+        // flush 成功（无脏数据，等同 no-op）会把 db_write_error 清空，
+        // 若把 insert 错误在 flush 之前挂上就会被吞掉——这正是修复点。
+        state.db_write_error = Some("旧错误".to_string());
+        state.segments_dirty = false;
+        state.flush_segments_if_dirty();
+        assert_eq!(state.db_write_error.as_deref(), Some("旧错误"));
+
+        // 模拟第 1 步入库失败：错误在 flush 之后补挂，必须留下
+        state.record_db_write_error("历史记录保存失败：库被锁");
+        assert_eq!(
+            state.db_write_error.as_deref(),
+            Some("旧错误；历史记录保存失败：库被锁")
+        );
+    }
+
+    /// 与之相对：flush 自身成功时会把陈旧提示清空（成功即代表不再有未落库改动）。
+    #[test]
+    fn successful_flush_clears_stale_db_error() {
+        let mut state = test_state(Vec::new());
+        state.db_write_error = Some("上一次的失败".to_string());
+        state.segments_dirty = true;
+        state.active_task_id = None; // 无主键 → sync 直接 Ok
+        state.flush_segments_if_dirty();
+        assert!(state.db_write_error.is_none(), "成功落库后应清空提示");
     }
 }

@@ -1729,20 +1729,27 @@ impl MainWindow {
                                     let in_batch = this.state.batch_running;
 
                                     // 1. 存入数据库历史记录 (包含 5 阶段性能统计指标)
+                                    //    写库失败不能静默：否则这条转写结果不会出现在历史库里，
+                                    //    后续「保存字幕」也会因 active_task_id 为空而无处可写。
+                                    //    先把错误收在局部，等第 2 步的 flush 走完再挂到提示条上——
+                                    //    flush 成功时会把 db_write_error 清空，顺序反过来会把这里的错误吞掉。
                                     let mut new_task_id: Option<i64> = None;
+                                    let mut db_insert_error: Option<String> = None;
                                     if let Some(ref path) = file_path {
-                                        new_task_id = this
-                                            .state
-                                            .db
-                                            .insert_task(
-                                                &path.to_string_lossy(),
-                                                &filename,
-                                                total_dur,
-                                                "completed",
-                                                &segments,
-                                                Some(&metrics),
-                                            )
-                                            .ok();
+                                        match this.state.db.insert_task(
+                                            &path.to_string_lossy(),
+                                            &filename,
+                                            total_dur,
+                                            "completed",
+                                            &segments,
+                                            Some(&metrics),
+                                        ) {
+                                            Ok(id) => new_task_id = Some(id),
+                                            Err(err) => {
+                                                tracing::warn!(error = %err, "转写结果写入历史库失败");
+                                                db_insert_error = Some(format!("历史记录保存失败：{err}"));
+                                            }
+                                        }
                                         this.state.refresh_recent_tasks();
                                         // 刚写入了新记录 → 让「0 秒命中」缓存失效，
                                         // 否则再次选中同一文件会显示旧的命中状态
@@ -1755,6 +1762,12 @@ impl MainWindow {
                                     // 注意顺序：这一步必须用**旧**的 active_task_id 写回，
                                     // 所以新 id 要等 segments 换完之后才登记。
                                     this.state.flush_segments_if_dirty();
+                                    // 第 1 步写历史库若失败，这里才补挂提示条：放在 flush 之后，
+                                    // 避免 flush 成功时把 db_write_error 清空、把这条错误顺手吞掉。
+                                    if let Some(msg) = db_insert_error {
+                                        // 与 flush 的错误并存时两条都留（flush 报的是上一个工程，本条报的是当前转写结果）。
+                                        this.state.record_db_write_error(msg);
+                                    }
                                     if let Some(path) = file_path {
                                         this.state.selected_file = Some(path.clone());
                                         this.state.preview_source = Some(path);
