@@ -33,7 +33,8 @@ pub(crate) fn is_item_needed_for_tab(
         }
         ModelManagerTab::Whisper => {
             // Whisper 专区：Whisper 模型档位、VAD、标点、推理程序
-            let has_cli = state.model_is_present("whisper-cli") || state.model_is_present("whisper-cublas");
+            let has_cli =
+                state.model_is_present("whisper-cli") || state.model_is_present("whisper-cublas");
             if item_id == "whisper-cli" {
                 // 若本地尚未就位任何可用 CLI，4.1MB 的基础 whisper-cli 为绝对必需
                 !has_cli
@@ -50,10 +51,7 @@ pub(crate) fn is_item_needed_for_tab(
         }
         ModelManagerTab::Common => {
             // 公用组件：FFmpeg 媒体流提取、yt-dlp、本地翻译大模型及 llama.cpp
-            matches!(
-                item_id,
-                "ffmpeg" | "yt-dlp" | "llama-cpp" | "qwen-llm"
-            )
+            matches!(item_id, "ffmpeg" | "yt-dlp" | "llama-cpp" | "qwen-llm")
         }
     }
 }
@@ -72,7 +70,8 @@ pub fn is_item_needed_by_current_config(item_id: &str, state: &crate::app::AppSt
 
         // 基础版本的 Whisper CLI（4.1MB）：选择 Whisper 且本地尚无任何 CLI 时必须下载！
         "whisper-cli" => {
-            let has_cli = state.model_is_present("whisper-cli") || state.model_is_present("whisper-cublas");
+            let has_cli =
+                state.model_is_present("whisper-cli") || state.model_is_present("whisper-cublas");
             !is_sv && !has_cli
         }
 
@@ -347,11 +346,7 @@ impl MainWindow {
         let categories = match current_tab {
             ModelManagerTab::SenseVoice => vec![ModelCategory {
                 title: "SenseVoice 极速语音识别 (推荐)",
-                item_ids: &[
-                    "sensevoice-model",
-                    "sensevoice-tokens",
-                    "sensevoice-vad",
-                ],
+                item_ids: &["sensevoice-model", "sensevoice-tokens", "sensevoice-vad"],
             }],
             ModelManagerTab::Whisper => vec![
                 ModelCategory {
@@ -367,10 +362,7 @@ impl MainWindow {
                 },
                 ModelCategory {
                     title: "Whisper 推理程序",
-                    item_ids: &[
-                        "whisper-cli",
-                        "whisper-cublas",
-                    ],
+                    item_ids: &["whisper-cli", "whisper-cublas"],
                 },
             ],
             ModelManagerTab::Common => vec![
@@ -391,9 +383,7 @@ impl MainWindow {
                 .item_ids
                 .iter()
                 .filter_map(|&id| ITEMS.iter().find(|i| i.id == id))
-                .filter(|i| {
-                    is_item_needed_for_tab(i.id, current_tab, &self.state)
-                })
+                .filter(|i| is_item_needed_for_tab(i.id, current_tab, &self.state))
                 .collect();
 
             if cat_items.is_empty() {
@@ -523,42 +513,36 @@ impl MainWindow {
                                 text
                             }),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .children(if downloaded {
-                                Some(
-                                    primitives::chip_clickable("打开新版本", true, false)
-                                        .id("update-open-file-btn")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.open_downloaded_update(cx);
-                                        })),
-                                )
-                            } else if is_downloading {
-                                Some(
-                                    primitives::chip_clickable("正在下载…", false, false)
-                                        .id("update-downloading-btn"),
-                                )
-                            } else if has_target {
-                                Some(
-                                    primitives::chip_clickable("直接下载更新", true, false)
-                                        .id("update-direct-download-btn")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.download_app_update(cx);
-                                        })),
-                                )
-                            } else {
-                                Some(
-                                    primitives::chip_clickable("前往下载", false, false)
-                                        .id("update-open-page-btn")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.open_release_page(cx);
-                                        })),
-                                )
-                            }),
-                    ),
+                    .child(div().flex().items_center().gap_2().children(if downloaded {
+                        Some(
+                            primitives::chip_clickable("打开新版本", true, false)
+                                .id("update-open-file-btn")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_downloaded_update(cx);
+                                })),
+                        )
+                    } else if is_downloading {
+                        Some(
+                            primitives::chip_clickable("正在下载…", false, false)
+                                .id("update-downloading-btn"),
+                        )
+                    } else if has_target {
+                        Some(
+                            primitives::chip_clickable("直接下载更新", true, false)
+                                .id("update-direct-download-btn")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.download_app_update(cx);
+                                })),
+                        )
+                    } else {
+                        Some(
+                            primitives::chip_clickable("前往下载", false, false)
+                                .id("update-open-page-btn")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_release_page(cx);
+                                })),
+                        )
+                    })),
             );
         }
 

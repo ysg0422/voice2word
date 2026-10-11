@@ -368,8 +368,7 @@ pub fn download_update_file(
     use std::sync::atomic::Ordering;
 
     let updates_dir = crate::utils::AppConfig::resolve_path("updates");
-    fs::create_dir_all(&updates_dir)
-        .map_err(|e| anyhow!("创建 updates 目录失败：{e}"))?;
+    fs::create_dir_all(&updates_dir).map_err(|e| anyhow!("创建 updates 目录失败：{e}"))?;
 
     let final_name = if asset_name.trim().is_empty() {
         "voice2word.exe"

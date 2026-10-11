@@ -1032,10 +1032,19 @@ impl MainWindow {
     ) {
         let cur_val_str = match field {
             StyleField::FontSize => self.state.config.subtitle_style.font_size.to_string(),
-            StyleField::LetterSpacing => self.state.config.subtitle_style.letter_spacing.to_string(),
+            StyleField::LetterSpacing => {
+                self.state.config.subtitle_style.letter_spacing.to_string()
+            }
             StyleField::BottomMargin => self.state.config.subtitle_style.bottom_margin.to_string(),
-            StyleField::LineSpacing => format!("{:.1}", self.state.config.subtitle_style.line_spacing),
-            StyleField::MaxChars => self.state.config.subtitle_style.max_chars_per_line.to_string(),
+            StyleField::LineSpacing => {
+                format!("{:.1}", self.state.config.subtitle_style.line_spacing)
+            }
+            StyleField::MaxChars => self
+                .state
+                .config
+                .subtitle_style
+                .max_chars_per_line
+                .to_string(),
         };
         self.focused_style_field = Some(field);
         self.style_field_input = cur_val_str.clone();

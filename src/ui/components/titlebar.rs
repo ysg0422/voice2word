@@ -360,18 +360,29 @@ impl MainWindow {
                     .text_color(Theme::accent_mint())
                     .cursor_pointer()
                     .hover(|s| s.bg(Theme::bg_hover()))
-                    .child(format!("当前已是最新版(v{}) ✓", crate::utils::update_check::current_version()))
+                    .child(format!(
+                        "当前已是最新版(v{}) ✓",
+                        crate::utils::update_check::current_version()
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.check_for_update(cx);
                     }))
                     .into_any_element()
             } else {
-                primitives::chip_clickable(if is_checking { "检查中…" } else { "检查更新" }, false, false)
-                    .id("titlebar-check-update-btn")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.check_for_update(cx);
-                    }))
-                    .into_any_element()
+                primitives::chip_clickable(
+                    if is_checking {
+                        "检查中…"
+                    } else {
+                        "检查更新"
+                    },
+                    false,
+                    false,
+                )
+                .id("titlebar-check-update-btn")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.check_for_update(cx);
+                }))
+                .into_any_element()
             })
     }
 }

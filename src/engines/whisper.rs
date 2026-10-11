@@ -542,7 +542,9 @@ impl WhisperEngine {
         } else if is_default_layout {
             let candidates = [
                 crate::utils::AppConfig::resolve_path("tools/whisper-cuda/whisper-cli.exe"),
-                crate::utils::AppConfig::resolve_path("tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"),
+                crate::utils::AppConfig::resolve_path(
+                    "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe",
+                ),
             ];
             candidates
                 .into_iter()
@@ -555,7 +557,8 @@ impl WhisperEngine {
         if !self.cli_path.exists() && effective_cli.exists() {
             tracing::info!(
                 "配置的 Whisper CLI 路径 {:?} 不存在，已自动智能匹配到有效推理程序: {:?}",
-                self.cli_path, effective_cli
+                self.cli_path,
+                effective_cli
             );
         }
 

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const APP_NAME: &str = "Voice2Word";
-const APP_VERSION: &str = "0.1.3";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_EXE_NAME: &str = "voice2word.exe";
 
 // 内置由 cargo build --release 生成的主程序二进制
@@ -52,15 +52,25 @@ fn message_box(title: &str, text: &str, flags: u32) -> i32 {
 
 fn get_install_dir() -> PathBuf {
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        PathBuf::from(local_app_data).join("Programs").join(APP_NAME)
+        PathBuf::from(local_app_data)
+            .join("Programs")
+            .join(APP_NAME)
     } else if let Ok(user_profile) = std::env::var("USERPROFILE") {
-        PathBuf::from(user_profile).join("AppData").join("Local").join("Programs").join(APP_NAME)
+        PathBuf::from(user_profile)
+            .join("AppData")
+            .join("Local")
+            .join("Programs")
+            .join(APP_NAME)
     } else {
         PathBuf::from("C:\\Voice2Word")
     }
 }
 
-fn create_shortcut(target_exe: &Path, shortcut_path: &Path, working_dir: &Path) -> Result<(), String> {
+fn create_shortcut(
+    target_exe: &Path,
+    shortcut_path: &Path,
+    working_dir: &Path,
+) -> Result<(), String> {
     let target = target_exe.to_string_lossy().replace('\'', "''");
     let shortcut = shortcut_path.to_string_lossy().replace('\'', "''");
     let work = working_dir.to_string_lossy().replace('\'', "''");
@@ -78,7 +88,14 @@ fn create_shortcut(target_exe: &Path, shortcut_path: &Path, working_dir: &Path) 
     );
 
     let status = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
         .status()
         .map_err(|e| format!("快捷方式创建失败: {}", e))?;
 
@@ -119,7 +136,11 @@ fn run_installer() {
     if let Err(e) = fs::create_dir_all(&install_dir) {
         message_box(
             "安装失败",
-            &format!("无法创建安装目录:\n{}\n\n错误: {}", install_dir.display(), e),
+            &format!(
+                "无法创建安装目录:\n{}\n\n错误: {}",
+                install_dir.display(),
+                e
+            ),
             MB_OK | MB_ICONERROR,
         );
         return;

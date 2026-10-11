@@ -584,12 +584,10 @@ impl MainWindow {
                         let newer = is_newer(&latest.version, current);
                         let text = describe(current, &latest.version, newer);
                         this.state.download_status_msg = text.clone();
-                        this.state.update_check_result = Some((newer, text.clone(), latest.page_url));
-                        this.state.update_download_target = Some((
-                            latest.download_url,
-                            latest.asset_name,
-                            latest.asset_size,
-                        ));
+                        this.state.update_check_result =
+                            Some((newer, text.clone(), latest.page_url));
+                        this.state.update_download_target =
+                            Some((latest.download_url, latest.asset_name, latest.asset_size));
                         this.state.update_download_status = Some(text);
                     }
                     Err(e) => {
@@ -621,7 +619,8 @@ impl MainWindow {
         self.state.update_download_busy = true;
         self.state.update_download_progress = 0.0;
         self.state.update_download_status = Some("正在连接更新镜像…".to_string());
-        self.update_download_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.update_download_cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let cancel = self.update_download_cancel.clone();
         cx.notify();
 
@@ -1474,10 +1473,15 @@ impl MainWindow {
             ));
         }
 
-        let configured_cli = crate::utils::AppConfig::resolve_path(&self.state.config.paths.whisper_cli);
+        let configured_cli =
+            crate::utils::AppConfig::resolve_path(&self.state.config.paths.whisper_cli);
         let has_cli = configured_cli.is_file()
-            || crate::utils::AppConfig::resolve_path("tools/whisper-cuda/whisper-cli.exe").is_file()
-            || crate::utils::AppConfig::resolve_path("tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe").is_file();
+            || crate::utils::AppConfig::resolve_path("tools/whisper-cuda/whisper-cli.exe")
+                .is_file()
+            || crate::utils::AppConfig::resolve_path(
+                "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe",
+            )
+            .is_file();
 
         if !has_cli {
             let sv_ready = self.state.model_is_present("sensevoice-model");

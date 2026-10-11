@@ -21,7 +21,9 @@ use std::sync::Arc;
 /// 字幕配置 → 预览配色 `(文字色, 底色, 描边色)`。
 ///
 /// 完全由 `SubtitleStyleConfig` 驱动，支持自定义文字颜色、描边粗细与底框不透明度。
-fn subtitle_computed_colors(style: &crate::utils::SubtitleStyleConfig) -> (gpui::Rgba, gpui::Rgba, gpui::Rgba) {
+fn subtitle_computed_colors(
+    style: &crate::utils::SubtitleStyleConfig,
+) -> (gpui::Rgba, gpui::Rgba, gpui::Rgba) {
     let (r, g, b) = crate::utils::SubtitleStyleConfig::hex_to_rgb(&style.primary_color);
     let fg = rgb((r as u32) << 16 | (g as u32) << 8 | (b as u32));
 
@@ -451,7 +453,11 @@ impl MainWindow {
                                             .border_1()
                                             .border_color(border)
                                             .text_size(px(font_px))
-                                            .font_weight(if style.is_bold { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                            .font_weight(if style.is_bold {
+                                                FontWeight::BOLD
+                                            } else {
+                                                FontWeight::NORMAL
+                                            })
                                             .text_color(fg)
                                             .text_align(match style.alignment.as_str() {
                                                 "left" => TextAlign::Left,
@@ -2295,14 +2301,11 @@ impl MainWindow {
                                                                         this.state.select_segment(seg_idx);
                                                                         this.trigger_extract_frame(cx);
                                                                         let now = std::time::Instant::now();
-                                                                        let is_double = match this.last_subtitle_click {
+                                                                        let is_double = matches!(
+                                                                            this.last_subtitle_click,
                                                                             Some((last_idx, false, last_t))
-                                                                                if last_idx == seg_idx && now.duration_since(last_t).as_millis() < 350 =>
-                                                                            {
-                                                                                true
-                                                                            }
-                                                                            _ => false,
-                                                                        };
+                                                                                if last_idx == seg_idx && now.duration_since(last_t).as_millis() < 350
+                                                                        );
                                                                         if is_double {
                                                                             this.last_subtitle_click = None;
                                                                             this.start_inline_edit(seg_idx, false, &raw_for_click, window, cx);
@@ -2407,14 +2410,11 @@ impl MainWindow {
                                                                             this.state.select_segment(seg_idx);
                                                                             this.trigger_extract_frame(cx);
                                                                             let now = std::time::Instant::now();
-                                                                            let is_double = match this.last_subtitle_click {
+                                                                            let is_double = matches!(
+                                                                                this.last_subtitle_click,
                                                                                 Some((last_idx, true, last_t))
-                                                                                    if last_idx == seg_idx && now.duration_since(last_t).as_millis() < 350 =>
-                                                                                {
-                                                                                    true
-                                                                                }
-                                                                                _ => false,
-                                                                            };
+                                                                                    if last_idx == seg_idx && now.duration_since(last_t).as_millis() < 350
+                                                                            );
                                                                             if is_double {
                                                                                 this.last_subtitle_click = None;
                                                                                 this.start_inline_edit(seg_idx, true, &trans_for_click, window, cx);
@@ -2555,7 +2555,11 @@ impl MainWindow {
                             .border_1()
                             .border_color(border)
                             .text_size(px(font_px))
-                            .font_weight(if style.is_bold { FontWeight::BOLD } else { FontWeight::NORMAL })
+                            .font_weight(if style.is_bold {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
                             .text_color(fg)
                             .text_align(match style.alignment.as_str() {
                                 "left" => TextAlign::Left,
@@ -5167,8 +5171,8 @@ impl MainWindow {
                             .rounded_full()
                             .bg(cur_rgb)
                             .border_2()
-                            .border_color(Theme::border())
-                    )
+                            .border_color(Theme::border()),
+                    ),
             )
             // 右侧：当前十六进制数值与快速纯度调节
             .child(
@@ -5188,7 +5192,7 @@ impl MainWindow {
                                     .text_size(px(Theme::TEXT_BODY))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(Theme::accent_mint())
-                                    .child(hex_display)
+                                    .child(hex_display),
                             )
                             .child(
                                 div()
@@ -5205,22 +5209,22 @@ impl MainWindow {
                                         this.custom_color_picker_open = false;
                                         cx.notify();
                                     }))
-                                    .child("收起 ✕")
-                            )
+                                    .child("收起 ✕"),
+                            ),
                     )
                     // 明暗度 / 纯度微调
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .children([
+                        div().flex().items_center().gap_1().children(
+                            [
                                 ("纯黑", "#000000"),
                                 ("深暗", "#1E293B"),
                                 ("明亮", "#F8FAFC"),
                                 ("金色", "#F59E0B"),
                                 ("青翠", "#10B981"),
-                            ].into_iter().enumerate().map(|(idx, (name, hex))| {
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, (name, hex))| {
                                 div()
                                     .id(("preset-light", idx))
                                     .flex_1()
@@ -5233,23 +5237,29 @@ impl MainWindow {
                                     .justify_center()
                                     .bg(Theme::bg_hover())
                                     .text_color(Theme::text_secondary())
-                                    .hover(|s| s.text_color(Theme::text_primary()).bg(Theme::bg_hover_strong()))
+                                    .hover(|s| {
+                                        s.text_color(Theme::text_primary())
+                                            .bg(Theme::bg_hover_strong())
+                                    })
                                     .on_click(cx.listener({
                                         let h = hex.to_string();
                                         move |this, _, _, cx| {
-                                            this.state.config.subtitle_style.primary_color = h.clone();
+                                            this.state.config.subtitle_style.primary_color =
+                                                h.clone();
                                             this.state.save_subtitle_style();
                                             cx.notify();
                                         }
                                     }))
                                     .child(name)
-                            }))
-                    )
+                            }),
+                        ),
+                    ),
             )
             .into_any_element()
     }
 
     /// 渲染 Word 风格的数值步进微调输入组件（带加减按钮，中间数值框支持单击/双击就地编辑数字）
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_style_stepper_input<FDown, FUp>(
         &self,
         field: StyleField,
@@ -5288,7 +5298,11 @@ impl MainWindow {
             .gap_1()
             .bg(Theme::bg_inset())
             .border_1()
-            .border_color(if is_editing { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+            .border_color(if is_editing {
+                Theme::accent_mint()
+            } else {
+                Theme::bg_hover_strong()
+            })
             .rounded_md()
             .p_0p5()
             // 减号步进按钮
@@ -5309,11 +5323,13 @@ impl MainWindow {
                             this.commit_style_field_edit(cx);
                         }
                         down_fn(this, cx);
-                    }))
+                    })),
             )
             // 中间输入框 / 显示框（支持单击与双击直接输入数字）
             .child(if is_editing {
-                let cursor = self.line_edit_cursor.min(self.style_field_input.chars().count());
+                let cursor = self
+                    .line_edit_cursor
+                    .min(self.style_field_input.chars().count());
                 let before: String = self.style_field_input.chars().take(cursor).collect();
                 let after: String = self.style_field_input.chars().skip(cursor).collect();
 
@@ -5337,7 +5353,12 @@ impl MainWindow {
                             this.commit_style_field_edit(cx);
                         } else if key == "escape" {
                             this.cancel_style_field_edit(cx);
-                        } else if apply_line_edit(&mut this.style_field_input, &mut this.line_edit_cursor, event, cx) {
+                        } else if apply_line_edit(
+                            &mut this.style_field_input,
+                            &mut this.line_edit_cursor,
+                            event,
+                            cx,
+                        ) {
                             cx.notify();
                         }
                     }))
@@ -5350,7 +5371,7 @@ impl MainWindow {
                             .text_color(Theme::text_primary())
                             .child(before)
                             .child(div().text_color(Theme::accent_mint()).child("▌"))
-                            .child(after)
+                            .child(after),
                     )
             } else {
                 div()
@@ -5366,7 +5387,11 @@ impl MainWindow {
                     .text_size(px(Theme::TEXT_SMALL))
                     .font_weight(FontWeight::BOLD)
                     .text_color(Theme::accent_mint())
-                    .hover(|s| s.bg(Theme::bg_hover()).border_1().border_color(Theme::accent_mint()))
+                    .hover(|s| {
+                        s.bg(Theme::bg_hover())
+                            .border_1()
+                            .border_color(Theme::accent_mint())
+                    })
                     .child(display_val)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.start_style_field_edit(field, window, cx);
@@ -5390,7 +5415,7 @@ impl MainWindow {
                             this.commit_style_field_edit(cx);
                         }
                         up_fn(this, cx);
-                    }))
+                    })),
             )
             .into_any_element()
     }

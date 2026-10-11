@@ -631,13 +631,27 @@ pub struct SubtitleStyleConfig {
     pub alignment: String,
 }
 
-fn default_primary_color() -> String { "#FFFFFF".to_string() }
-fn default_outline_width() -> f32 { 2.0 }
-fn default_outline_color() -> String { "#000000".to_string() }
-fn default_bg_style() -> String { "shadow".to_string() }
-fn default_bg_opacity() -> f32 { 0.6 }
-fn default_is_bold() -> bool { true }
-fn default_alignment() -> String { "center".to_string() }
+fn default_primary_color() -> String {
+    "#FFFFFF".to_string()
+}
+fn default_outline_width() -> f32 {
+    2.0
+}
+fn default_outline_color() -> String {
+    "#000000".to_string()
+}
+fn default_bg_style() -> String {
+    "shadow".to_string()
+}
+fn default_bg_opacity() -> f32 {
+    0.6
+}
+fn default_is_bold() -> bool {
+    true
+}
+fn default_alignment() -> String {
+    "center".to_string()
+}
 
 impl Default for SubtitleStyleConfig {
     fn default() -> Self {

@@ -365,32 +365,45 @@ impl SubtitleWriter {
         wrap: usize,
     ) -> Result<()> {
         let mut file = File::create(path).with_context(|| "创建 ASS 文件失败")?;
-        let (preset_primary, preset_outline, preset_back, preset_border_style, preset_outline_w, preset_shadow) =
-            ass_preset_colors(&style.preset_name);
+        let (
+            preset_primary,
+            preset_outline,
+            preset_back,
+            preset_border_style,
+            preset_outline_w,
+            preset_shadow,
+        ) = ass_preset_colors(&style.preset_name);
         let default_cfg = SubtitleStyleConfig::default();
-        let primary = if style.preset_name != "白字黑影" && style.primary_color == default_cfg.primary_color {
+        let primary = if style.preset_name != "白字黑影"
+            && style.primary_color == default_cfg.primary_color
+        {
             preset_primary.to_string()
         } else {
             style.ass_primary_colour()
         };
-        let outline = if style.preset_name != "白字黑影" && style.outline_color == default_cfg.outline_color {
+        let outline = if style.preset_name != "白字黑影"
+            && style.outline_color == default_cfg.outline_color
+        {
             preset_outline.to_string()
         } else {
             style.ass_outline_colour()
         };
-        let outline_w = if style.preset_name != "白字黑影" && (style.outline_width - default_cfg.outline_width).abs() < 0.01 {
+        let outline_w = if style.preset_name != "白字黑影"
+            && (style.outline_width - default_cfg.outline_width).abs() < 0.01
+        {
             preset_outline_w
         } else {
             style.outline_width
         };
-        let border_style = if style.preset_name != "白字黑影" && style.bg_style == default_cfg.bg_style {
-            preset_border_style
-        } else {
-            match style.bg_style.as_str() {
-                "box" | "pill" => 3,
-                _ => 1,
-            }
-        };
+        let border_style =
+            if style.preset_name != "白字黑影" && style.bg_style == default_cfg.bg_style {
+                preset_border_style
+            } else {
+                match style.bg_style.as_str() {
+                    "box" | "pill" => 3,
+                    _ => 1,
+                }
+            };
         let bold_flag = if style.is_bold { 1 } else { 0 };
         let back = preset_back;
         let shadow = preset_shadow;
