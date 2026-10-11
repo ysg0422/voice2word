@@ -29,7 +29,8 @@ pub use audio_prep::{
     TimePiece, SAMPLE_RATE as ASR_SAMPLE_RATE,
 };
 pub use chunked_whisper::{
-    sensevoice_worker_count, transcribe_chunked, transcribe_chunked_sensevoice,
+    chunk_threshold_secs, sensevoice_worker_count, transcribe_chunked,
+    transcribe_chunked_sensevoice,
 };
 pub use diarization::{detect_speakers, MAX_SPEAKERS};
 pub use ffmpeg::FFmpegEngine;

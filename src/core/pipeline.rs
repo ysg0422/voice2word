@@ -456,7 +456,10 @@ impl TaskPipeline {
         // 判断是否启用纯内存管道推流 (In-Memory PCM Streaming Pipe):
         // 当使用 SenseVoice、启用 GPU 推理，或音频时长无需多进程切块时，直接以 0 磁盘 I/O 管道推流
         let mut can_stream = !sv_parallel
-            && (is_sensevoice || use_gpu || duration_for_chunks <= 405.0 || audio_speed > 1.0);
+            && (is_sensevoice
+                || use_gpu
+                || duration_for_chunks <= crate::engines::chunk_threshold_secs()
+                || audio_speed > 1.0);
 
         let mut ffmpeg_audio_sec = 0.0;
         // 临时 WAV 用守卫持有：本函数后续有多个 `?` / 取消提前返回点，

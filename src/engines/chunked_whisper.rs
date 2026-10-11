@@ -34,6 +34,17 @@ pub const MAX_WORKERS: usize = 4;
 /// 8 进程反而回落到 17.3s —— 并发模型加载的磁盘争用与内存带宽成为新瓶颈。
 pub const MAX_SV_WORKERS: usize = 6;
 
+/// 切块并行的最短音频门限（秒）：短于它整轨单进程转写，不做多进程切块。
+///
+/// `CHUNK_SEC + MIN_CHUNK_SEC` = 360 + 45 = 405s。这是「切块是否划算」的统一判据：
+/// 切块路径内部（[`transcribe_chunked`]）与管线侧决定是否走 0 磁盘内存推流
+/// （`can_stream`）都读这一个函数。此前管线里直接写死 `405.0`，与这里的常量是同一
+/// 门限的两份写法，改动任一处都会让两条路径悄悄分叉——收敛到一处消除该风险。
+/// 该值同时等价于 [`plan_chunks`] 从单块切到多块的边界。
+pub fn chunk_threshold_secs() -> f64 {
+    CHUNK_SEC + MIN_CHUNK_SEC
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct AudioChunk {
     pub index: usize,
@@ -435,7 +446,7 @@ pub fn transcribe_chunked(
     progress_cb: Option<crate::engines::SegmentProgressCb>,
 ) -> Result<(Vec<Segment>, f64)> {
     // GPU 单进程切块只会反复加载模型并丢掉跨块上下文，又慢又不准。
-    if use_gpu || total_duration <= CHUNK_SEC + MIN_CHUNK_SEC {
+    if use_gpu || total_duration <= chunk_threshold_secs() {
         return whisper.transcribe_with_model(
             wav_path,
             language,
@@ -524,6 +535,16 @@ mod tests {
         let c = plan_chunks(120.0);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].start, 0.0);
+    }
+
+    /// 门限是「单块 vs 多块」的统一判据：等于门限时仍是单块，略过即切成多块。
+    /// 管线侧 `can_stream` 与切块路径都读 `chunk_threshold_secs()`，此处锁住它与
+    /// `plan_chunks` 的边界一致，防止两处再次各写一个数字后悄悄分叉。
+    #[test]
+    fn chunk_threshold_matches_plan_chunks_boundary() {
+        assert_eq!(chunk_threshold_secs(), 405.0);
+        assert_eq!(plan_chunks(chunk_threshold_secs()).len(), 1);
+        assert!(plan_chunks(chunk_threshold_secs() + 1.0).len() >= 2);
     }
 
     #[test]
