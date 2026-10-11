@@ -24,11 +24,15 @@ const MIN_CHUNK_SEC: f64 = 45.0;
 /// （不取 `MIN_CHUNK_SEC`=45s：那等于允许单条字幕被拉到接近一个整块，正是要挡的场景。）
 const TAIL_EXTEND_MAX_SEC: f64 = 12.0;
 const DEFAULT_WORKERS: usize = 2;
-const MAX_WORKERS: usize = 4;
+/// Whisper 多进程并行的 worker 上限。
+///
+/// 公开给性能页推导滑条量程：用户显式指定的并行进程数在这里被夹住，滑条就不能
+/// 给出超出它的档位，否则「选 6 实际跑 4」与 VAD 阈值那类静默失效同型。
+pub const MAX_WORKERS: usize = 4;
 /// SenseVoice 多进程并行的 worker 上限。
 /// 16 核机器实测：6 进程 × 2 线程（12 线程）最快（6 分钟样本 14.5s）；
 /// 8 进程反而回落到 17.3s —— 并发模型加载的磁盘争用与内存带宽成为新瓶颈。
-const MAX_SV_WORKERS: usize = 6;
+pub const MAX_SV_WORKERS: usize = 6;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AudioChunk {
@@ -438,8 +442,12 @@ pub fn transcribe_chunked(
         );
     }
 
+    // 显式值同样要过 `MAX_WORKERS`：这个上限的存在理由是「每个 whisper-cli 至少
+    // 8 线程，进程过多会互抢内存带宽」，与用户怎么选无关。此前只夹到 `chunks.len()`，
+    // 而 SenseVoice 路径已正确夹到 `MAX_SV_WORKERS`——于是 16 核机器上滑条能给到
+    // 6，Whisper 就真的起 6 个进程，把自动推导路径永远不会触到的上限冲破。
     let workers = match workers_override {
-        Some(w) if w >= 1 => w.min(chunks.len()),
+        Some(w) if w >= 1 => w.clamp(1, MAX_WORKERS).min(chunks.len()),
         _ => worker_count(chunks.len(), threads.unwrap_or(8), use_gpu),
     };
     // 单进程时切块只会反复冷启动加载模型，比整段识别更慢，直接走整段路径
@@ -583,6 +591,87 @@ mod tests {
         assert!(out[1].start > out[0].end, "新句应落在上一句之后: {out:?}");
     }
 
+    /// 回归：用户显式指定的并行进程数不得冲破 `MAX_WORKERS`。
+    ///
+    /// 此前 `transcribe_chunked` 里的显式分支只夹到 `chunks.len()`，漏了
+    /// `MAX_WORKERS`；SenseVoice 分支（`transcribe_chunked_sensevoice`）却正确夹了
+    /// `MAX_SV_WORKERS`。于是 16 核机器上滑条能给到 6，Whisper 就真起 6 个
+    /// whisper-cli——而自动推导路径永远算不出超过 4 的值。上限的存在理由（每进程
+    /// 至少 8 线程、进程过多互抢内存带宽）与用户怎么选无关，显式值同样要过。
+    #[test]
+    fn explicit_worker_override_respects_max_workers() {
+        // 与 `transcribe_chunked` 中显式分支完全同一行表达式。
+        let resolve = |w: usize, chunk_n: usize| -> usize {
+            match Some(w) {
+                Some(w) if w >= 1 => w.clamp(1, MAX_WORKERS).min(chunk_n),
+                _ => worker_count(chunk_n, 8, false),
+            }
+        };
+        // 块数足够多时，任何显式值都不得超过上限
+        for w in 1..=16 {
+            assert!(
+                resolve(w, 32) <= MAX_WORKERS,
+                "显式指定 {w} 个进程越过了上限 {MAX_WORKERS}"
+            );
+        }
+        assert_eq!(resolve(6, 32), MAX_WORKERS, "6 应被夹到上限");
+        assert_eq!(resolve(16, 32), MAX_WORKERS);
+        // 块数更少时仍以块数为准，不凭空造出多于块数的进程
+        assert_eq!(resolve(6, 3), 3);
+        assert_eq!(resolve(1, 8), 1, "显式 1 应保留（走整段路径）");
+        // 自动推导路径也永远不超过上限
+        for threads in [2u32, 8, 16, 32, 64] {
+            assert!(worker_count(64, threads, false) <= MAX_WORKERS);
+        }
+    }
+
+    /// 回归：SenseVoice 与 Whisper 两条路径的进程上限是**不同**的两个常量，
+    /// 且 SenseVoice 更宽（6 > 4）。设置页滑条量程按引擎取，正是靠这个不等式；
+    /// 若哪天两个上限被改成相等或反向（SenseVoice 更窄），滑条就会把本可跑满的
+    /// 档位砍掉、或给出超过引擎上限的档位——两者都是界面与实际不符。
+    #[test]
+    fn sv_and_whisper_worker_limits_are_ordered() {
+        // 常量不等式放进 `const` 块，避免 clippy 的 `assertions_on_constants`。
+        const { assert!(MAX_SV_WORKERS > MAX_WORKERS) };
+        for cores in [1u32, 2, 4, 8, 16, 32, 64] {
+            let n = sensevoice_worker_count(cores);
+            assert!(
+                (2..=MAX_SV_WORKERS).contains(&n),
+                "自动进程数 {n}（{cores} 核）越出 [2, {MAX_SV_WORKERS}]"
+            );
+        }
+        for threads in [2u32, 8, 16, 32, 64] {
+            assert!(
+                worker_count(64, threads, false) <= MAX_WORKERS,
+                "自动进程数越出 Whisper 上限"
+            );
+        }
+    }
+
+    /// 回归：SenseVoice 路径的显式进程数必须夹到 `MAX_SV_WORKERS`(6)，
+    /// 而不是 Whisper 的 `MAX_WORKERS`(4)。设置页在 SenseVoice 下量程给到 6，
+    /// 若这里误夹到 4，用户选 5/6 就是静默降级。
+    #[test]
+    fn explicit_sv_worker_override_respects_max_sv_workers() {
+        // 与 `transcribe_chunked_sensevoice` 中显式分支同一行表达式。
+        let resolve = |w: usize| -> usize {
+            match Some(w) {
+                Some(w) if w >= 1 => w.clamp(1, MAX_SV_WORKERS),
+                _ => sensevoice_worker_count(16),
+            }
+        };
+        for w in 1..=16 {
+            assert!(
+                resolve(w) <= MAX_SV_WORKERS,
+                "显式 {w} 个进程越过了 SenseVoice 上限 {MAX_SV_WORKERS}"
+            );
+        }
+        // 5/6 档必须真的可用（Whisper 的上限 4 会砍掉这两档）
+        assert_eq!(resolve(5), 5, "SenseVoice 下 5 进程应当可选");
+        assert_eq!(resolve(6), MAX_SV_WORKERS);
+        assert_eq!(resolve(8), MAX_SV_WORKERS, "8 应被夹到上限");
+        assert_eq!(resolve(1), 1, "显式 1 应保留（走整段路径）");
+    }
     #[test]
     fn cpu_workers_keep_eight_threads_per_process() {
         assert_eq!(worker_count(6, 8, false), 2);

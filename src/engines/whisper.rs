@@ -4,12 +4,21 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 
 use crate::subtitle::Segment;
 use crate::utils::TempPathGuard;
+
+/// Silero VAD 语音阈值的**有效区间**（含端点）。
+///
+/// 这里是唯一权威来源：引擎的 `set_vad_threshold` 用它与 whisper-cli 的 `-vt`
+/// 对齐，性能页的滑条量程也由它推导。此前滑条写死 `(10, 90)`（0.10~0.90）而引擎
+/// 夹到 `(0.3, 0.8)`，用户拖到 0.15 时界面显示 0.15、配置也存了 0.15，
+/// 引擎却按 0.30 跑——「改了没效果」且无从察觉。量程与夹取必须同源。
+pub const VAD_THRESHOLD_MIN: f64 = 0.30;
+pub const VAD_THRESHOLD_MAX: f64 = 0.80;
 
 pub struct WhisperEngine {
     cli_path: PathBuf,
@@ -20,7 +29,12 @@ pub struct WhisperEngine {
     use_gpu: bool,
     /// GPU 占用上限（百分比，100 = 不限速）。小于 100 时子进程按占空比被挂起/恢复，
     /// 给桌面合成器留出真正的 GPU 空窗；让路模式只降优先级，压不住 GPU 队列。
-    gpu_limit_percent: u32,
+    ///
+    /// 用原子量而不是普通字段：它必须能在进程运行中途被改写。此前是构造时定死的
+    /// `u32`，用户在性能页把「低占用 GPU」的上限从 40% 改到 80%，config.toml 存了
+    /// 新值，本进程的 whisper-cli 却仍按旧的 40% 被挂起——与
+    /// `vad_threshold_bits` 当初的坑完全同型。
+    gpu_limit_percent: AtomicU32,
     /// 禁用温度回退 (-nf)： turbo 等大模型同样跳过回退重解码以提速，
     /// 由此损失的少数低置信片段由管线的置信度二段重解码救回
     no_fallback: bool,
@@ -240,7 +254,7 @@ impl WhisperEngine {
             threads,
             processors,
             use_gpu,
-            gpu_limit_percent,
+            gpu_limit_percent: AtomicU32::new(gpu_limit_percent),
             no_fallback,
             max_context: max_context.clamp(0, 448),
             need_token_probs: AtomicBool::new(false),
@@ -277,12 +291,21 @@ impl WhisperEngine {
 
     pub fn set_vad_threshold(&self, threshold: f64) {
         let valid = if threshold.is_finite() {
-            threshold.clamp(0.3, 0.8)
+            threshold.clamp(VAD_THRESHOLD_MIN, VAD_THRESHOLD_MAX)
         } else {
             0.5
         };
         self.vad_threshold_bits
             .store(valid.to_bits(), Ordering::SeqCst);
+    }
+
+    /// 运行期改写 GPU 占用上限（百分比，100 = 不限速）。
+    ///
+    /// 性能页「低占用 GPU」档切换上限时调用：该值在构造时已从配置写入，但用户
+    /// 中途改档位必须立刻对**下一个** whisper-cli 子进程生效，否则「改了要重启」。
+    /// 与 [`Self::set_vad_threshold`] 同一套写法（原子量 + 下一次 spawn 生效）。
+    pub fn set_gpu_limit_percent(&self, percent: u32) {
+        self.gpu_limit_percent.store(percent, Ordering::Relaxed);
     }
 
     pub fn uses_gpu(&self) -> bool {
@@ -732,7 +755,10 @@ impl WhisperEngine {
         // GPU 占空比限速：仅在走显卡推理且用户设了上限时生效。
         // 必须与 child.wait() 配对 stop()，保证句柄关闭前限速线程已退出。
         let gpu_throttle = if self.use_gpu {
-            super::media_pipeline::GpuThrottle::for_child(&child, self.gpu_limit_percent)
+            super::media_pipeline::GpuThrottle::for_child(
+                &child,
+                self.gpu_limit_percent.load(Ordering::Relaxed),
+            )
         } else {
             super::media_pipeline::GpuThrottle::off()
         };
@@ -1074,6 +1100,11 @@ impl WhisperEngine {
             .take_while(|c| c.is_ascii_digit() || *c == '.')
             .collect();
         num.parse::<f64>().ok()
+    }
+
+    /// 当前生效的 GPU 占用上限（供单测与外部观测；引擎内部 spawn 时读同一份）。
+    pub fn gpu_limit_percent(&self) -> u32 {
+        self.gpu_limit_percent.load(Ordering::Relaxed)
     }
 
     /// 从完整 stderr 文本中提取 Silero VAD 总耗时 (秒)
@@ -1758,4 +1789,29 @@ mod tests {
             "错误应来自 spawn 失败这条路径，实际: {msg}"
         );
     }
+}
+
+/// 回归：GPU 占用上限必须能**运行期**改写。
+///
+/// 此前它是构造时定死的 `u32` 字段，用户在性能页把上限从 40% 调到 80% 后，
+/// config.toml 存了新值、界面也显示新值，本进程的 whisper-cli 却仍按 40% 被
+/// 挂起——「改了要重启才生效」。改成原子量后这条断言把「可改写」钉住。
+#[test]
+fn gpu_limit_percent_is_settable_at_runtime() {
+    let eng = WhisperEngine::with_device(
+        std::path::PathBuf::from("whisper-cli"),
+        std::path::PathBuf::from("model"),
+        None,
+        4,
+        1,
+        false,
+        true,
+        32,
+        100,
+    );
+    assert_eq!(eng.gpu_limit_percent(), 100, "构造值应原样生效");
+    eng.set_gpu_limit_percent(40);
+    assert_eq!(eng.gpu_limit_percent(), 40, "运行期改写必须立即生效");
+    eng.set_gpu_limit_percent(80);
+    assert_eq!(eng.gpu_limit_percent(), 80);
 }

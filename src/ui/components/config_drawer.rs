@@ -573,6 +573,11 @@ impl MainWindow {
                     crate::engines::media_pipeline::set_yield_to_desktop(
                         this.state.config.gpu.yield_to_desktop,
                     );
+                    // `from_mode` 会整段重写 gpu_limit_percent（如 eco 档给 60），
+                    // 因此切档位也要重下发一次，否则上限沿用上一个档位残留的值。
+                    this.state
+                        .pipeline
+                        .set_gpu_limit_percent(this.state.config.gpu.effective_gpu_limit());
                     let _ = this.state.config.save_to_file("config.toml");
                     cx.notify();
                 },
@@ -585,6 +590,11 @@ impl MainWindow {
                     &gpu_limit_sel,
                     |this, sel, cx| {
                         this.state.config.gpu.gpu_limit_percent = sel.parse::<u32>().unwrap_or(60);
+                        // 立即下发给引擎：GPU 限速是「子进程按占空比挂起/恢复」，
+                        // 只存配置的话本进程仍按旧档位跑，用户要重启才看到效果。
+                        this.state
+                            .pipeline
+                            .set_gpu_limit_percent(this.state.config.gpu.effective_gpu_limit());
                         let _ = this.state.config.save_to_file("config.toml");
                         cx.notify();
                     },
@@ -637,7 +647,20 @@ impl MainWindow {
             ))
             .child(self.param_group(
                 "标点与润色",
-                vec![("off", "关闭"), ("punc", "极速标点"), ("qwen", "Qwen 润色")],
+                {
+                    // SenseVoice 原生自带标点与 ITN，管线会跳过 CT-Punc 阶段。此时
+                    // 「极速标点」是一个**无操作**档位，必须就地写明，否则用户选了
+                    // 它却什么都没发生，还以为程序没记住自己的选择。
+                    if self.state.punc_polish_is_noop() {
+                        vec![
+                            ("off", "关闭"),
+                            ("punc", "极速标点（SenseVoice 原生自带）"),
+                            ("qwen", "Qwen 润色"),
+                        ]
+                    } else {
+                        vec![("off", "关闭"), ("punc", "极速标点"), ("qwen", "Qwen 润色")]
+                    }
+                },
                 polish_sel,
                 |this, sel, cx| {
                     // 统一走 `AppState::set_polish`：状态 + config.toml 双写。

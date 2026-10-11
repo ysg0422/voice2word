@@ -249,6 +249,15 @@ impl TaskPipeline {
         self.llm.set_threads(n);
     }
 
+    /// 运行期改写 GPU 占用上限（百分比，100 = 不限速），转发给 whisper 引擎。
+    ///
+    /// 与 [`Self::set_llm_threads`] 同一层：引擎实例被管线私有持有，UI 拿不到，
+    /// 凡「改完要对下一次转写立即生效」的引擎参数都在这里开一个转发口。
+    /// 不转发的话，用户在性能页调整「低占用 GPU」上限后必须重启程序才生效。
+    pub fn set_gpu_limit_percent(&self, percent: u32) {
+        self.whisper.set_gpu_limit_percent(percent);
+    }
+
     /// ONNX 执行后端实况：SenseVoice 优先，回退 CT-Punc；两者都没回报过则是 `None`。
     ///
     /// 供性能页把「配置了 dml 却回落 cpu」显示到界面上（引擎不感知 UI）。

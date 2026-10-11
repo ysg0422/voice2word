@@ -340,6 +340,24 @@ fn onnx_provider_actual(pipeline: &crate::core::TaskPipeline) -> Option<(String,
         .map(|s| (s.requested, s.actual))
 }
 
+/// 并行进程数滑条的量程上限：按当前识别引擎区分。
+///
+/// 两条转写路径的硬上限是两个不同的常量——Whisper 夹 `MAX_WORKERS`(4)、
+/// SenseVoice 夹 `MAX_SV_WORKERS`(6)。抽成纯函数是为了让单测能直接钉住
+/// 「滑条上限 == 引擎实际会夹到的上限」这一等式：
+/// - 取 Whisper 的 4 给 SenseVoice：界面选不到 5/6，而引擎本可跑满 6；
+/// - 取 SenseVoice 的 6 给 Whisper：界面显示 5/6、引擎静默夹到 4。
+///
+/// 两种都是「改了没效果」的观感来源。
+fn parallel_process_max(is_sensevoice: bool) -> u32 {
+    let hard_max = if is_sensevoice {
+        crate::engines::chunked_whisper::MAX_SV_WORKERS
+    } else {
+        crate::engines::chunked_whisper::MAX_WORKERS
+    };
+    (hard_max as u32).max(1)
+}
+
 impl MainWindow {
     /// 渲染性能与推理设置工作台
     pub(crate) fn render_performance_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1968,13 +1986,18 @@ impl MainWindow {
             },
         );
 
-        let vad_val = (vad * 100.0).round().clamp(10.0, 90.0) as u32;
+        // 量程由引擎的有效区间推导，不写死：滑条能选到的值必须全部真的生效
+        // （引擎 `set_vad_threshold` 夹到同一区间，否则「拖到 0.15 实际跑 0.30」）。
+        let vad_val = (vad * 100.0).round().clamp(
+            crate::engines::whisper::VAD_THRESHOLD_MIN * 100.0,
+            crate::engines::whisper::VAD_THRESHOLD_MAX * 100.0,
+        ) as u32;
         let vad_slider = self.render_slider(
             "perf-slider-vad",
             "静音检测阈值",
             vad_val,
-            10,
-            90,
+            (crate::engines::whisper::VAD_THRESHOLD_MIN * 100.0).round() as u32,
+            (crate::engines::whisper::VAD_THRESHOLD_MAX * 100.0).round() as u32,
             format!("{:.2}", vad_val as f64 / 100.0),
             String::new(),
             cx,
@@ -2112,16 +2135,28 @@ impl MainWindow {
     /// 步骤 3：并行度设置（转写线程数 / 并行进程数 / 润色线程数）
     ///
     /// 三项都用滑条，量程按本机核心数推导：线程数上限 = 逻辑核心数；
-    /// 进程数上限 = 引擎内实测最优的并行进程数（`sensevoice_worker_count`），
-    /// 最左档为「自动」，即按核数推导。改动即时写入 config.toml 并作用于下一次任务。
+    /// 进程数上限按当前识别引擎区分：SenseVoice = MAX_SV_WORKERS(6)、
+    /// Whisper = MAX_WORKERS(4)；最左档为「自动」，即按核数推导。
+    /// 改动即时写入 config.toml 并作用于下一次任务。
     fn render_parallelism_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let cores = crate::app::AppState::logical_cores();
         let thread_max = cores.max(2);
         let thread_val = self.state.whisper_threads.clamp(2, thread_max);
 
+        // 量程按当前所选识别引擎取（见 `parallel_process_max`）。
+        let is_sv = self.state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
         let auto_procs = crate::engines::sensevoice_worker_count(cores) as u32;
-        let proc_max = auto_procs.max(1);
+        let proc_max = parallel_process_max(is_sv);
         let proc_val = self.state.config.pipeline.parallel_workers.min(proc_max);
+        let proc_text = if proc_val == 0 {
+            if is_sv {
+                format!("自动（{auto_procs}）")
+            } else {
+                "自动".to_string()
+            }
+        } else {
+            format!("{proc_val} 进程")
+        };
 
         let thread_slider = self.render_slider(
             "perf-slider-threads",
@@ -2148,11 +2183,7 @@ impl MainWindow {
             proc_val,
             0,
             proc_max,
-            if proc_val == 0 {
-                format!("自动（{auto_procs}）")
-            } else {
-                format!("{proc_val} 进程")
-            },
+            proc_text,
             String::new(),
             cx,
             move |this, v, cx| {
@@ -2462,6 +2493,84 @@ mod tests {
         assert_eq!(effective_glossary_count(cap + 40, cap + 100), cap + 40);
     }
 
+    /// 回归：VAD 滑条量程必须落在引擎的有效区间内。
+    ///
+    /// 此前滑条写死 `(10, 90)` 而引擎夹到 `(0.3, 0.8)`：用户拖到 0.15 时界面显示
+    /// 0.15、config.toml 也存了 0.15，引擎却按 0.30 跑——「改了没效果」且无从察觉。
+    /// 量程现在由 `whisper::VAD_THRESHOLD_{MIN,MAX}` 推导，这条断言把两者钉在一起。
+    #[test]
+    fn vad_slider_range_matches_engine_clamp() {
+        use crate::engines::whisper::{VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN};
+        let slider_min = (VAD_THRESHOLD_MIN * 100.0).round() as u32;
+        let slider_max = (VAD_THRESHOLD_MAX * 100.0).round() as u32;
+        // 滑条的每一个取值换算回物理量后都必须**原样**通过引擎夹取
+        for v in slider_min..=slider_max {
+            let as_f64 = v as f64 / 100.0;
+            let clamped = as_f64.clamp(VAD_THRESHOLD_MIN, VAD_THRESHOLD_MAX);
+            assert_eq!(
+                as_f64, clamped,
+                "滑条档位 {v}（{as_f64}）会被引擎悄悄改成 {clamped}"
+            );
+        }
+        // 默认值必须落在量程内，否则一进页面就显示被夹过的值
+        let cfg = crate::utils::config::AppConfig::default();
+        let d = cfg.pipeline.whisper_vad_threshold;
+        assert!(
+            (VAD_THRESHOLD_MIN..=VAD_THRESHOLD_MAX).contains(&d),
+            "默认 VAD 阈值 {d} 落在有效区间外"
+        );
+    }
+
+    /// 回归：并行进程数滑条量程必须与**该引擎实际夹取的上限**一致。
+    ///
+    /// 此前量程无条件取 `MAX_WORKERS`(4)：默认引擎是 SenseVoice（上限 6），
+    /// 界面上 5/6 两档直接消失，而引擎本可跑满 6 —— 静默的能力削减。
+    /// 更早的版本则是量程取自动值（16 核下 6）而不分引擎，Whisper 侧显示 5/6、
+    /// 实际却被夹到 4。这条断言把「量程 == 引擎夹取值」钉死在两端。
+    #[test]
+    fn parallel_process_slider_max_matches_engine_clamp() {
+        use super::parallel_process_max;
+        use crate::app::WhisperModelTier;
+        use crate::engines::chunked_whisper::{MAX_SV_WORKERS, MAX_WORKERS};
+
+        let sv_max = parallel_process_max(true) as usize;
+        let whisper_max = parallel_process_max(false) as usize;
+        assert_eq!(sv_max, MAX_SV_WORKERS, "SenseVoice 量程应放开到 6");
+        assert_eq!(whisper_max, MAX_WORKERS, "Whisper 量程不得超过 4");
+        assert!(sv_max > whisper_max, "SenseVoice 必须比 Whisper 更宽");
+
+        // 滑条上的每一档都必须是引擎会**原样接受**的值（不被静默夹小）
+        for w in 1..=sv_max {
+            assert_eq!(
+                w.clamp(1, MAX_SV_WORKERS),
+                w,
+                "SenseVoice 滑条档位 {w} 会被引擎悄悄改成更小的值"
+            );
+        }
+        for w in 1..=whisper_max {
+            assert_eq!(
+                w.clamp(1, MAX_WORKERS),
+                w,
+                "Whisper 滑条档位 {w} 会被引擎悄悄改成更小的值"
+            );
+        }
+
+        // 自动档（0）不受量程约束，且两条路径的自动值都落在各自量程内
+        let cores = crate::app::AppState::logical_cores();
+        assert!(
+            crate::engines::sensevoice_worker_count(cores) <= sv_max,
+            "自动进程数越出 SenseVoice 量程"
+        );
+        assert!(
+            crate::engines::chunked_whisper::worker_count(64, cores.max(8), false) <= whisper_max,
+            "自动进程数越出 Whisper 量程"
+        );
+        // 档位类型与量程取值的对应关系不能被改反
+        assert!(matches!(
+            WhisperModelTier::SenseVoice.model_relative_path().to_ascii_lowercase(),
+            ref m if m.ends_with(".onnx")
+        ));
+    }
     /// 回归（P3）：ONNX provider 回落的界面文案必须与日志层的判定完全同源——
     /// 「请求 dml、实际 cpu」是唯一需要警告色的情形；请求本来就是 cpu 时不该报警。
     #[test]

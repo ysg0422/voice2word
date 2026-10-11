@@ -350,13 +350,30 @@ impl WhisperModelTier {
         }
     }
 
-    /// 预估转写秒数。GPU 上线程收益更弱；润色额外加固定开销。
+    /// 预估的 Qwen 深度润色附加开销（秒/分钟素材）。
+    ///
+    /// 与 CT-Punc（毫秒级，可忽略）不同，Qwen 是逐批 LLM 解码，耗时与素材量成正比，
+    /// 必须计入预估，否则「预计 2 分钟」实际要等十几分钟。
+    const QWEN_POLISH_SEC_PER_MIN: f64 = 2.4;
+
+    /// 预估转写秒数。GPU 上线程收益更弱；润色按**档位**计附加开销。
+    ///
+    /// # 为什么必须区分润色档位
+    ///
+    /// 旧签名只有一个 `enable_polish: bool`，于是无法表达三档截然不同的代价：
+    /// - SenseVoice + `punc`：管线**整段跳过**标点（模型原生自带 ITN），开销 0；
+    /// - 其它引擎 + `punc`：CT-Punc 毫秒级，开销可忽略；
+    /// - 任意引擎 + `qwen`：逐批 LLM 解码，32 分钟素材实测约 +1.3 分钟。
+    ///
+    /// 而 SenseVoice 恰是出厂默认引擎、`punc` 又是默认档位——不区分就只能二选一：
+    /// 要么把 Qwen 的开销算给误开了它的 SenseVoice 用户（虚高），要么一律不算
+    /// （选 Qwen 的人被严重低估）。按档位分别计，两种误导同时消掉。
     pub fn estimate_seconds(
         self,
         duration_sec: f64,
         threads: u32,
         use_gpu: bool,
-        enable_polish: bool,
+        polish: Option<PolishMode>,
     ) -> f64 {
         let media = duration_sec.max(1.0);
         let mut secs = media * self.cpu_realtime_factor();
@@ -370,8 +387,9 @@ impl WhisperModelTier {
         } else {
             secs *= thread_f;
         }
-        if enable_polish && self != Self::SenseVoice {
-            secs += (media / 60.0) * 2.4;
+        // 只有 Qwen 档才计附加开销：CT-Punc 毫秒级，SenseVoice 的 `punc` 更是整段跳过。
+        if matches!(polish, Some(PolishMode::QwenDeep)) {
+            secs += (media / 60.0) * Self::QWEN_POLISH_SEC_PER_MIN;
         }
         secs.max(1.0)
     }
@@ -867,6 +885,18 @@ impl AppState {
         }
 
         let _ = self.config.save_to_file("config.toml");
+    }
+
+    /// SenseVoice 原生自带高精度标点与数字规范化（ITN），管线会整段跳过 CT-Punc
+    /// 阶段（`pipeline.rs` 里 `is_sensevoice && mode == "punc"` 分支直接进
+    /// 「原生标点」瞬时完成）。此时界面上那个「极速标点」档位是**无操作**的：
+    /// 用户以为自己选了一个处理步骤，实际什么都没发生。
+    ///
+    /// 返回 `false` 时界面应把该档位标注为「原生自带 / 不适用」，而不是让它看起来
+    /// 和其它档位一样是个生效的选项。
+    pub fn punc_polish_is_noop(&self) -> bool {
+        self.whisper_model_tier == WhisperModelTier::SenseVoice
+            && self.polish_mode == PolishMode::PuncFast
     }
 
     /// 设置页 / 主界面调整字幕样式后落盘，避免重启丢失
@@ -1590,7 +1620,7 @@ impl AppState {
             dur,
             self.whisper_threads,
             self.hardware.use_gpu_pipeline(),
-            self.enable_polish,
+            self.enable_polish.then_some(self.polish_mode),
         );
         WhisperModelTier::format_eta(secs)
     }
@@ -2614,12 +2644,50 @@ mod tests {
         );
     }
 
+    /// 回归：润色附加开销必须**按档位**计，而不是一个 bool 了事。
+    ///
+    /// SenseVoice 是出厂默认引擎、`punc` 是默认档位，而管线对
+    /// 「SenseVoice + punc」整段跳过标点——若沿用旧的 `enable_polish: bool`，
+    /// 就只能在「给误开它的 SenseVoice 用户虚高 +1.3 分钟」与「让选了 Qwen 的人
+    /// 被严重低估」之间二选一。按档位计，两种误导同时消掉。
+    #[test]
+    fn polish_overhead_depends_on_mode_not_just_switch() {
+        use crate::app::PolishMode;
+        let d = 1920.0; // 32 分钟样片
+        let sv = WhisperModelTier::SenseVoice;
+        let base = sv.estimate_seconds(d, 8, false, None);
+        let punc = sv.estimate_seconds(d, 8, false, Some(PolishMode::PuncFast));
+        let qwen = sv.estimate_seconds(d, 8, false, Some(PolishMode::QwenDeep));
+
+        assert_eq!(base, punc, "SenseVoice 的极速标点被跳过，不该加时间");
+        assert!(
+            qwen > punc,
+            "Qwen 深度润色必须计入附加开销：punc={punc} qwen={qwen}"
+        );
+        let delta = qwen - punc;
+        assert!(
+            (delta - 76.8).abs() < 1.0,
+            "Qwen 附加开销应按 2.4 s/分钟 计，实际 {delta}"
+        );
+
+        let w = WhisperModelTier::Balanced;
+        assert_eq!(
+            w.estimate_seconds(d, 8, false, Some(PolishMode::PuncFast)),
+            w.estimate_seconds(d, 8, false, None),
+            "CT-Punc 毫秒级，不该计入预估"
+        );
+        assert!(
+            w.estimate_seconds(d, 8, false, Some(PolishMode::QwenDeep))
+                > w.estimate_seconds(d, 8, false, None)
+        );
+    }
+
     #[test]
     fn more_threads_shortens_cpu_eta() {
         let d = 32.0 * 60.0;
-        let t4 = WhisperModelTier::Balanced.estimate_seconds(d, 4, false, false);
-        let t8 = WhisperModelTier::Balanced.estimate_seconds(d, 8, false, false);
-        let t16 = WhisperModelTier::Balanced.estimate_seconds(d, 16, false, false);
+        let t4 = WhisperModelTier::Balanced.estimate_seconds(d, 4, false, None);
+        let t8 = WhisperModelTier::Balanced.estimate_seconds(d, 8, false, None);
+        let t16 = WhisperModelTier::Balanced.estimate_seconds(d, 16, false, None);
         assert!(t4 > t8, "4 threads ({t4}) should be slower than 8 ({t8})");
         assert!(
             t8 > t16,
@@ -2634,8 +2702,8 @@ mod tests {
     #[test]
     fn gpu_eta_is_faster_than_cpu() {
         let d = 32.0 * 60.0;
-        let cpu = WhisperModelTier::Precise.estimate_seconds(d, 8, false, false);
-        let gpu = WhisperModelTier::Precise.estimate_seconds(d, 8, true, false);
+        let cpu = WhisperModelTier::Precise.estimate_seconds(d, 8, false, None);
+        let gpu = WhisperModelTier::Precise.estimate_seconds(d, 8, true, None);
         assert!(gpu < cpu * 0.5);
     }
 
@@ -2645,8 +2713,8 @@ mod tests {
     fn gpu_speedup_is_tier_dependent() {
         let d = 32.0 * 60.0;
         let ratio = |tier: WhisperModelTier| {
-            let cpu = tier.estimate_seconds(d, 8, false, false);
-            let gpu = tier.estimate_seconds(d, 8, true, false);
+            let cpu = tier.estimate_seconds(d, 8, false, None);
+            let gpu = tier.estimate_seconds(d, 8, true, None);
             gpu / cpu
         };
         let fast = ratio(WhisperModelTier::Fast);

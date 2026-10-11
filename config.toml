@@ -1,7 +1,7 @@
 [paths]
 ffmpeg = "tools/ffmpeg.exe"
 whisper_cli = "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"
-whisper_model = "models/whisper/ggml-small-q5_0.bin"
+whisper_model = "models/sensevoice/model.int8.onnx"
 vad_model = "models/whisper/ggml-silero-v6.2.0.bin"
 punc_model = "models/punc/model.int8.onnx"
 sensevoice_model = "models/sensevoice/model.int8.onnx"
@@ -47,14 +47,14 @@ yield_to_desktop = true
 gpu_limit_percent = 100
 
 [subtitle_style]
-font_size = 32
+font_size = 42
 letter_spacing = 9
 line_spacing = 2.1999998092651367
 max_chars_per_line = 25
 bottom_margin = 65
 preset_name = "白字黑影"
 preview_box_w = 560.0
-primary_color = "#FF4000"
+primary_color = "#FF0080"
 outline_width = 1.5
 outline_color = "#000000"
 bg_style = "shadow"

@@ -268,6 +268,8 @@ fn parse_timestamp(raw: &str) -> Option<f64> {
     let parts: Vec<&str> = clock.split(':').collect();
     let (hours, minutes, seconds) = match parts.as_slice() {
         [s] => (0u32, 0u32, parse_uint(s)?),
+        // `MM:SS`：省略小时段。只有**秒**段必须 <60——分/时是累加单位，
+        // WebVTT 允许 `90:00.000`（90 分）这类写法，浏览器原样接受。
         [m, s] => {
             let s = parse_uint(s)?;
             if s >= 60 {
@@ -398,6 +400,21 @@ mod tests {
         assert_eq!(a[0].end, 2.5);
         assert_eq!(b[0].start, a[0].start);
         assert_eq!(b[0].end, a[0].end);
+    }
+
+    /// 无小时段时**只有秒**受 60 限制：WebVTT 允许 `90:00.000`（90 分）这类写法，
+    /// 分钟段是累加单位本就可以溢出。这条把这个口径钉住——若哪天有人把 `[m,s]`
+    /// 分支改成照抄 `[h,m,s]` 的 `m >= 60`，1 小时以上的 WebVTT 会被静默丢块。
+    #[test]
+    fn mm_ss_allows_minutes_over_59_but_not_seconds() {
+        let vtt = "WEBVTT\n\n90:00.000 --> 90:02.500\n长片\n";
+        let segs = parse_vtt(vtt).unwrap();
+        assert_eq!(segs.len(), 1, "MM 超过 59 仍需解析");
+        assert_eq!(segs[0].start, 5400.0);
+        assert_eq!(segs[0].end, 5402.5);
+        // 秒段 >=60 依然是坏时间戳（MM:SS 里的 SS 不能溢出）
+        let bad = "WEBVTT\n\n01:90.000 --> 01:95.000\n越界\n";
+        assert!(parse_vtt(bad).is_err(), "秒段 >=60 必须判坏");
     }
 
     /// 短格式 `MM:SS.mmm`（无小时）也要收：很多工具在时长不足一小时时省掉小时段。
