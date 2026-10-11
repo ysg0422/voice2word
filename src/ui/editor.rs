@@ -2643,18 +2643,6 @@ impl MainWindow {
         }
     }
 
-    /// 松手：结束调色轮拖动会话，并把颜色落盘（下次启动仍是这个颜色）。
-    ///
-    /// 拖动中只改内存、不写 config.toml：圆环上 24 个色块的 `on_mouse_move` 在拖动时会
-    /// 连续触发，若每次落盘会在一瞬间反复写几十次配置文件，既卡顿又刷盘。真正写盘只在
-    /// 这里（松手，含指针移出面板后松手）发生一次。
-    fn end_color_wheel_drag(&mut self) {
-        if self.color_wheel_dragging {
-            self.color_wheel_dragging = false;
-            self.state.save_subtitle_style();
-        }
-    }
-
     /// 整轨时间轴调整卡：平移 / 缩放 / 铺满目标时长。
     ///
     /// # 为什么需要它
@@ -5122,14 +5110,14 @@ impl MainWindow {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.end_color_wheel_drag();
+                    this.state.end_config_drag();
                     cx.notify();
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.end_color_wheel_drag();
+                    this.state.end_config_drag();
                     cx.notify();
                 }),
             )
@@ -5176,9 +5164,10 @@ impl MainWindow {
                                 move |this, event: &MouseMoveEvent, _, cx| {
                                     if event.pressed_button == Some(MouseButton::Left) {
                                         this.state.config.subtitle_style.primary_color = h.clone();
-                                        // 只标记拖动中、更新内存色值；真正的落盘留到松手
-                                        // （`end_color_wheel_drag`），避免拖动中反复写盘。
-                                        this.color_wheel_dragging = true;
+                                        // 打开统一落盘闸门：拖动中只更新内存并同步管线
+                                        // （实时预览），真正的写盘留到松手 `end_config_drag`。
+                                        this.state.begin_config_drag();
+                                        this.state.save_subtitle_style();
                                         cx.notify();
                                     }
                                 }

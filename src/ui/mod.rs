@@ -505,9 +505,6 @@ pub struct MainWindow {
     pub(crate) cached_color_wheel: Option<Arc<RenderImage>>,
     /// 调色板当前亮度乘数 (0.2 ~ 1.0)
     pub(crate) color_picker_brightness: f32,
-    /// 是否正在拖动调色轮取色。拖动中只改内存、不写盘，松手才落盘一次，
-    /// 避免 24 个色块的连续 `on_mouse_move` 在一瞬间反复写 config.toml。
-    pub(crate) color_wheel_dragging: bool,
     /// 上次点击字幕清单项的时间记录 (seg_idx, is_trans, click_instant)，用于双击判定
     pub(crate) last_subtitle_click: Option<(usize, bool, std::time::Instant)>,
     /// 在线翻译 API 配置卡片的编辑缓冲（改完即写 config.toml）
@@ -870,7 +867,6 @@ impl MainWindow {
             custom_color_picker_open: false,
             cached_color_wheel: None,
             color_picker_brightness: 1.0,
-            color_wheel_dragging: false,
         };
 
         // 恢复上次的批量队列：队列原本只在内存里，关窗 / 崩溃就全丢，用户排好的

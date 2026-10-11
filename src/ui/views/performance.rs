@@ -2296,6 +2296,23 @@ impl MainWindow {
             .justify_between()
             .gap(px(Theme::SPACE_4))
             .py(px(Theme::SPACE_2_5))
+            // 拖动落盘闸门：轨道上的按下/移动只更新内存（实时预览照常），松手
+            // ——含把指针拖出行外才松手——在这里统一落盘一次。否则一次拖动会在
+            // UI 线程上打出几十上百次同步写，既卡顿又刷盘。
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.state.end_config_drag();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.state.end_config_drag();
+                    cx.notify();
+                }),
+            )
             // 左侧：标签 + 提示说明
             .child(
                 div()
@@ -2421,6 +2438,7 @@ impl MainWindow {
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, _, _, cx| {
+                                                    this.state.begin_config_drag();
                                                     on_change(this, v, cx)
                                                 }),
                                             )
@@ -2429,6 +2447,7 @@ impl MainWindow {
                                                     if event.pressed_button
                                                         == Some(MouseButton::Left)
                                                     {
+                                                        this.state.begin_config_drag();
                                                         on_change(this, v, cx);
                                                     }
                                                 },

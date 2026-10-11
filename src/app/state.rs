@@ -610,6 +610,17 @@ pub struct AppState {
     /// 重启、发现设置又变回去了，却没有任何线索。这里把失败挂到可见提示条上。
     pub config_write_error: Option<String>,
 
+    /// 拖动类控件（滑条轨道 / 调色轮）的落盘闸门。
+    ///
+    /// 这类控件的 `on_mouse_move` 会在拖动时连续回调，若每次都走 [`Self::persist_config`]
+    /// 就是一次同步磁盘写——一次拖动能在 UI 线程上打出几十上百次写，既卡顿又刷盘，
+    /// 而中间值用户根本用不到。约定：按下/开始拖动 [`Self::begin_config_drag`] 打开闸门，
+    /// 拖动中 `persist_config` 只把改动留在内存，松手 [`Self::end_config_drag`] 一次性落盘。
+    ///
+    /// 注意闸门**只**影响 `persist_config`，不影响各方法对内存 / 管线的即时更新
+    /// （拖动中的实时预览照常）。
+    config_drag_active: bool,
+
     /// 「0 秒智能缓存命中」的查询结果缓存：(文件路径, 命中记录)。
     ///
     /// 渲染路径要读它（转写页卡片显示「已命中缓存 N 句」），而底层查询会把
@@ -784,6 +795,7 @@ impl AppState {
             cached_transcription: Arc::new(std::sync::Mutex::new(None)),
             db_write_error: None,
             config_write_error: None,
+            config_drag_active: false,
             model_present: std::collections::HashMap::new(),
             model_custom_build: std::collections::HashMap::new(),
         };
@@ -832,9 +844,40 @@ impl AppState {
         self.persist_config_to("config.toml");
     }
 
+    /// 打开「拖动中」落盘闸门：此后到 [`Self::end_config_drag`] 之前，
+    /// [`Self::persist_config`] 只把改动留在内存、不写盘。
+    ///
+    /// 幂等：已在拖动中时重复调用无副作用。
+    pub(crate) fn begin_config_drag(&mut self) {
+        self.config_drag_active = true;
+    }
+
+    /// 关闭闸门并补一次落盘：把整段拖动期间的改动一次性写进 `config.toml`。
+    ///
+    /// 幂等：没在拖动时是空操作，重复调用只会在第一次真正写盘（之后
+    /// `save_to_file` 见内容未变也不再重写）。
+    pub(crate) fn end_config_drag(&mut self) {
+        self.end_config_drag_to("config.toml");
+    }
+
+    /// [`Self::end_config_drag`] 的可注入路径版本（单测用）。
+    fn end_config_drag_to<P: AsRef<std::path::Path>>(&mut self, path: P) {
+        if !self.config_drag_active {
+            return;
+        }
+        self.config_drag_active = false;
+        self.persist_config_to(path);
+    }
+
     /// [`Self::persist_config`] 的可注入路径版本：便于单测用临时目录复现写盘失败，
     /// 而不必去动真正的 `config.toml`（跑测试时写它会覆盖用户配置）。
+    ///
+    /// 拖动闸门在这里生效：`config_drag_active` 为真时只把改动留在内存
+    /// （见字段说明），松手由 [`Self::end_config_drag`] 统一补写。
     fn persist_config_to<P: AsRef<std::path::Path>>(&mut self, path: P) {
+        if self.config_drag_active {
+            return;
+        }
         match self.config.save_to_file(path) {
             Ok(()) => self.config_write_error = None,
             Err(err) => {
@@ -4009,6 +4052,103 @@ mod tests {
         assert!(
             state.config_write_error.is_none(),
             "成功落盘后必须清除上一次的失败提示"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    /// 造一个进程内唯一的临时目录，供落盘相关单测隔离使用。
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 造一个「父路径是文件」的非法落盘目标：`save_to_file` 第一步
+    /// `create_dir_all` 就会失败，稳定复现写盘失败，不依赖磁盘满 / 只读。
+    fn make_bad_target(base: &std::path::Path) -> std::path::PathBuf {
+        let blocker = base.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        blocker.join("config.toml")
+    }
+
+    /// 拖动闸门：拖动期间 `persist_config_to` 不写盘、不改错误状态；
+    /// 松手补写一次，文件真的落盘、闸门复位。
+    #[test]
+    fn config_drag_gate_defers_persist_until_release() {
+        let mut state = test_state(Vec::new());
+        let base = unique_temp_dir("v2w_drag_gate");
+        let good = base.join("config.toml");
+
+        state.config_write_error = None;
+        state.begin_config_drag();
+        assert!(state.config_drag_active, "按下后闸门应打开");
+
+        // 闸门开着：拖动中反复调用都只留内存，不写盘、不产生错误。
+        state.persist_config_to(&good);
+        state.persist_config_to(&good);
+        assert!(
+            !good.exists(),
+            "拖动中不得写盘，否则一次拖动会打出几十上百次同步写"
+        );
+        assert!(
+            state.config_write_error.is_none(),
+            "拖动中不写盘，自然也不该冒出保存失败提示"
+        );
+
+        // 松手：补写一次，文件真的出现、闸门复位。
+        state.end_config_drag_to(&good);
+        assert!(good.exists(), "松手后应真的写出 config.toml");
+        assert!(!state.config_drag_active, "松手后闸门应关闭");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 未开闸门时 `end_config_drag_to` 是空操作：既不写盘也不误报错误
+    /// （否则一次普通点击松手会把「其实没保存」的错误提示挂上去）。
+    #[test]
+    fn end_config_drag_without_begin_is_noop() {
+        let mut state = test_state(Vec::new());
+        let base = unique_temp_dir("v2w_drag_noop");
+        let bad = make_bad_target(&base);
+
+        state.config_write_error = None;
+        state.end_config_drag_to(&bad);
+        assert!(
+            state.config_write_error.is_none(),
+            "没在拖动时松手不该触发落盘、更不该报错"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 拖到非法路径：闸门照常打开、不 panic；松手才把失败记成可见提示。
+    #[test]
+    fn config_drag_gate_records_failure_on_release() {
+        let mut state = test_state(Vec::new());
+        let base = unique_temp_dir("v2w_drag_fail");
+        let bad = make_bad_target(&base);
+
+        state.config_write_error = None;
+        state.begin_config_drag();
+        state.persist_config_to(&bad);
+        assert!(
+            state.config_write_error.is_none(),
+            "拖动中不写盘，失败也要等松手才记账"
+        );
+
+        state.end_config_drag_to(&bad);
+        assert!(!state.config_drag_active, "松手后闸门应关闭");
+        assert!(
+            state.config_write_error.is_some(),
+            "松手补写失败必须被记成可见提示"
         );
 
         let _ = std::fs::remove_dir_all(&base);
