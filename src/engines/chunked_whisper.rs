@@ -109,6 +109,16 @@ pub fn worker_count(chunk_n: usize, requested_threads: u32, use_gpu: bool) -> us
         .max(DEFAULT_WORKERS.min(chunk_n))
 }
 
+/// 把用户设定的「转写线程数」摊到各并行进程：每进程 `threads / workers`，最少 1。
+///
+/// 此前这里对商做 `.max(4)`：用户设 4 线程、切块路径按核数起 2 个进程时，每进程被
+/// 抬到 4 线程 → 实跑 8 线程，设置「静默翻倍」且无从察觉。进程数由核数推导、与线程
+/// 设置无关，硬抬下限只会让低线程设置失效。商 ≥ 4 时（线程 ≥ 8 且进程数不多，即默认
+/// 与常规档）结果与修复前逐档一致，只影响 2~7 线程的低配设置与显式多进程覆盖。
+fn per_process_threads(threads: u32, workers: usize) -> u32 {
+    (threads / workers.max(1) as u32).max(1)
+}
+
 /// 去掉切块重叠区里的重复句：后一块落在上一块尾部的字幕丢弃。
 pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment> {
     parts.sort_by_key(|(idx, _, _)| *idx);
@@ -470,7 +480,7 @@ pub fn transcribe_chunked(
     let per_proc_threads = if use_gpu {
         threads.unwrap_or(8).max(4)
     } else {
-        (threads.unwrap_or(8) / workers as u32).max(4)
+        per_process_threads(threads.unwrap_or(8), workers)
     };
     let lang = language.map(|s| s.to_string());
     let model = model_override.map(|p| p.to_path_buf());
@@ -629,6 +639,45 @@ mod tests {
         for threads in [2u32, 8, 16, 32, 64] {
             assert!(worker_count(64, threads, false) <= MAX_WORKERS);
         }
+    }
+
+    /// 回归：切块并行把「转写线程数」摊到各进程时，用户设的低线程数不该被硬抬
+    /// 下限放大。旧实现每进程 `.max(4)`：设 4 线程 + 2 进程 → 实跑 8 线程，
+    /// 设置被静默翻倍且无从察觉。
+    #[test]
+    fn per_process_threads_does_not_inflate_low_thread_settings() {
+        // 修复前的旧值（`.max(4)`）作对照：以下正是被放大的档位。
+        assert_eq!(
+            per_process_threads(4, 2),
+            2,
+            "4 线程分 2 进程应为 2，而非旧值 4"
+        );
+        assert_eq!(
+            per_process_threads(2, 2),
+            1,
+            "2 线程分 2 进程应为 1，而非旧值 4"
+        );
+        assert_eq!(
+            per_process_threads(8, 4),
+            2,
+            "8 线程分 4 进程应为 2，而非旧值 4"
+        );
+        // 商 >= 4 的常规档与修复前逐档一致，证明无回归。
+        assert_eq!(per_process_threads(8, 2), 4);
+        assert_eq!(per_process_threads(16, 4), 4);
+        // 不变量：进程数 x 每进程线程数不再系统性超过用户设定（每进程至少 1 线程）。
+        for threads in 1u32..=64 {
+            for workers in 1usize..=MAX_WORKERS {
+                let per = per_process_threads(threads, workers);
+                assert!(per >= 1, "每进程至少 1 线程");
+                assert!(
+                    per * workers as u32 <= threads.max(workers as u32),
+                    "线程被放大：{threads} 线程 x {workers} 进程 -> 每进程 {per}"
+                );
+            }
+        }
+        // workers = 0 不得 panic（`.max(1)` 兜底），也不凭空放大。
+        assert_eq!(per_process_threads(8, 0), 8);
     }
 
     /// 回归：SenseVoice 与 Whisper 两条路径的进程上限是**不同**的两个常量，
