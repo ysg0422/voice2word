@@ -828,7 +828,7 @@ impl AppState {
     /// 程序占用）于是完全静默：用户改完设置、重启、发现设置又变回去了，却没有任何
     /// 线索。这与字幕写库失败是同一类「用户以为保存了」的缺陷，处理方式也一致——
     /// 挂到跨页常驻的提示条上，**不重试**（失败通常是持久性原因，重试只会再失败）。
-    fn persist_config(&mut self) {
+    pub(crate) fn persist_config(&mut self) {
         self.persist_config_to("config.toml");
     }
 

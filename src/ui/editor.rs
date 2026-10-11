@@ -3370,7 +3370,7 @@ impl MainWindow {
                                         // 跳回默认，用户会以为选择没生效。
                                         this.state.config.ui.export_format =
                                             fmt.as_str().to_string();
-                                        let _ = this.state.config.save_to_file("config.toml");
+                                        this.state.persist_config();
                                         this.is_export_dropdown_open = false;
                                         cx.notify();
                                     }))
@@ -3670,7 +3670,7 @@ impl MainWindow {
                 let buffer = &mut this.state.config.ui.export_name_template;
                 let cursor = &mut this.export_template_cursor;
                 if apply_line_edit(buffer, cursor, event, cx) {
-                    let _ = this.state.config.save_to_file("config.toml");
+                    this.state.persist_config();
                     cx.notify();
                 }
             }))

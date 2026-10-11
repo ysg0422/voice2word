@@ -1019,12 +1019,11 @@ impl MainWindow {
                 return;
             }
         }
-        let cfg = self.state.config.clone();
-        cx.background_executor()
-            .spawn(async move {
-                let _ = cfg.save_to_file("config.toml");
-            })
-            .detach();
+        // 落盘统一走 [`AppState::persist_config`]：此前这里 clone 一份配置丢到后台
+        // 线程 `let _ = save_to_file(...)`，写盘失败彻底静默——用户逐键改完 API
+        // 地址/密钥，重启发现又变回去却没有任何线索。同步写几百字节的 TOML 成本
+        // 可忽略（与本文件其它落盘点同口径），失败会挂到常驻提示条。
+        self.state.persist_config();
     }
 
     /// 开始排版参数就地输入（点击或双击触发）

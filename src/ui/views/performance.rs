@@ -1923,7 +1923,7 @@ impl MainWindow {
         .on_click(cx.listener(|this, _, _, cx| {
             let next = !this.state.config.pipeline.preprocess_enabled;
             this.state.config.pipeline.preprocess_enabled = next;
-            let _ = this.state.config.save_to_file("config.toml");
+            this.state.persist_config();
             cx.notify();
         }))
         .into_any_element();
@@ -1939,7 +1939,7 @@ impl MainWindow {
                 .id(id)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     set(&mut this.state.config.pipeline, !on);
-                    let _ = this.state.config.save_to_file("config.toml");
+                    this.state.persist_config();
                     cx.notify();
                 }))
         };
@@ -1989,7 +1989,7 @@ impl MainWindow {
             cx,
             move |this, v, cx| {
                 this.state.config.pipeline.preprocess_highpass_hz = v as f64;
-                let _ = this.state.config.save_to_file("config.toml");
+                this.state.persist_config();
                 cx.notify();
             },
         );
@@ -2006,7 +2006,7 @@ impl MainWindow {
             cx,
             move |this, v, cx| {
                 this.state.config.pipeline.whisper_audio_speed = v as f64 / 100.0;
-                let _ = this.state.config.save_to_file("config.toml");
+                this.state.persist_config();
                 cx.notify();
             },
         );
@@ -2028,7 +2028,7 @@ impl MainWindow {
             cx,
             move |this, v, cx| {
                 this.state.config.pipeline.whisper_vad_threshold = v as f64 / 100.0;
-                let _ = this.state.config.save_to_file("config.toml");
+                this.state.persist_config();
                 cx.notify();
             },
         );
@@ -2057,7 +2057,7 @@ impl MainWindow {
                         let cur = this.state.config.pipeline.whisper_rescue_logprob;
                         this.state.config.pipeline.whisper_rescue_logprob =
                             if cur < 0.0 { 0.0 } else { -0.65 };
-                        let _ = this.state.config.save_to_file("config.toml");
+                        this.state.persist_config();
                         cx.notify();
                     })),
             )
@@ -2207,7 +2207,7 @@ impl MainWindow {
                 if this.state.whisper_threads != v {
                     this.state.whisper_threads = v;
                     this.state.config.pipeline.whisper_threads = v;
-                    let _ = this.state.config.save_to_file("config.toml");
+                    this.state.persist_config();
                     cx.notify();
                 }
             },
@@ -2226,7 +2226,7 @@ impl MainWindow {
                 if this.state.config.pipeline.parallel_workers != v {
                     this.state.config.pipeline.parallel_workers = v;
                     this.state.pipeline.set_parallel_workers(v as usize);
-                    let _ = this.state.config.save_to_file("config.toml");
+                    this.state.persist_config();
                     cx.notify();
                 }
             },
@@ -2251,7 +2251,7 @@ impl MainWindow {
                 if this.state.config.pipeline.llm_threads != v {
                     this.state.config.pipeline.llm_threads = v;
                     this.state.pipeline.set_llm_threads(v);
-                    let _ = this.state.config.save_to_file("config.toml");
+                    this.state.persist_config();
                     cx.notify();
                 }
             },

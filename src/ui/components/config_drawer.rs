@@ -578,7 +578,7 @@ impl MainWindow {
                     this.state
                         .pipeline
                         .set_gpu_limit_percent(this.state.config.gpu.effective_gpu_limit());
-                    let _ = this.state.config.save_to_file("config.toml");
+                    this.state.persist_config();
                     cx.notify();
                 },
                 cx,
@@ -595,7 +595,7 @@ impl MainWindow {
                         this.state
                             .pipeline
                             .set_gpu_limit_percent(this.state.config.gpu.effective_gpu_limit());
-                        let _ = this.state.config.save_to_file("config.toml");
+                        this.state.persist_config();
                         cx.notify();
                     },
                     cx,
@@ -619,7 +619,7 @@ impl MainWindow {
                     // 与同卡片其它项一致：状态 + config.toml 双写。此前只改 state，
                     // 重启后 `AppState::with_hardware` 从配置读回的仍是旧语言。
                     this.state.config.pipeline.language = sel.to_string();
-                    let _ = this.state.config.save_to_file("config.toml");
+                    this.state.persist_config();
                     cx.notify();
                 },
                 cx,
@@ -640,7 +640,7 @@ impl MainWindow {
                     this.state.output_format = sel.to_string();
                     // 同上：不落盘的话，重启后配置里的旧格式会把这次选择覆盖掉
                     this.state.config.pipeline.output_format = sel.to_string();
-                    let _ = this.state.config.save_to_file("config.toml");
+                    this.state.persist_config();
                     cx.notify();
                 },
                 cx,
@@ -690,7 +690,7 @@ impl MainWindow {
                                 n.parse::<u32>().unwrap_or(2);
                         }
                     }
-                    let _ = this.state.config.save_to_file("config.toml");
+                    this.state.persist_config();
                     cx.notify();
                 },
                 cx,
@@ -705,7 +705,7 @@ impl MainWindow {
                         this.state.whisper_threads = v;
                         // 与性能页滑条同一落盘口径（见 views/performance.rs）
                         this.state.config.pipeline.whisper_threads = v;
-                        let _ = this.state.config.save_to_file("config.toml");
+                        this.state.persist_config();
                         cx.notify();
                     }
                 },
