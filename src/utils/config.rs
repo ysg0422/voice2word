@@ -813,29 +813,69 @@ impl SubtitleStyleConfig {
         Self::hex_to_ass_bgr(&self.outline_color)
     }
 
+    /// 颜色串净化：只接受 `#RRGGBB` / `RRGGBB` 形式的纯 ASCII 十六进制。
+    ///
+    /// 返回 `Some(无 # 的六位串，大小写原样保留)` 表示合法，`None` 表示非法。
+    ///
+    /// 这里刻意**只做 ASCII 判断**，绝不按字节下标切片：旧实现用
+    /// `clean.len() >= 6` 判长度再 `&clean[0..2]` 切片，用户把颜色手写成
+    /// 中文（如 "蓝色" 恰好 6 字节）时，切片会落在多字节字符中间直接 panic。
+    fn sanitize_hex(hex: &str) -> Option<String> {
+        let clean = hex.trim().trim_start_matches('#');
+        if clean.len() == 6 && clean.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Some(clean.to_string())
+        } else {
+            None
+        }
+    }
+
     /// 十六进制 (#RRGGBB) 转 ASS 格式 (&H00BBGGRR)
     pub fn hex_to_ass_bgr(hex: &str) -> String {
-        let clean = hex.trim().trim_start_matches('#');
-        if clean.len() >= 6 {
-            let r = &clean[0..2];
-            let g = &clean[2..4];
-            let b = &clean[4..6];
-            format!("&H00{b}{g}{r}")
-        } else {
-            "&H00FFFFFF".to_string()
+        match Self::sanitize_hex(hex) {
+            Some(clean) => {
+                let r = &clean[0..2];
+                let g = &clean[2..4];
+                let b = &clean[4..6];
+                format!("&H00{b}{g}{r}")
+            }
+            None => "&H00FFFFFF".to_string(),
         }
     }
 
     /// 十六进制 (#RRGGBB) 转 RGB (r, g, b)
     pub fn hex_to_rgb(hex: &str) -> (u8, u8, u8) {
-        let clean = hex.trim().trim_start_matches('#');
-        if clean.len() >= 6 {
-            let r = u8::from_str_radix(&clean[0..2], 16).unwrap_or(255);
-            let g = u8::from_str_radix(&clean[2..4], 16).unwrap_or(255);
-            let b = u8::from_str_radix(&clean[4..6], 16).unwrap_or(255);
-            (r, g, b)
-        } else {
-            (255, 255, 255)
+        match Self::sanitize_hex(hex) {
+            Some(clean) => (
+                u8::from_str_radix(&clean[0..2], 16).unwrap_or(255),
+                u8::from_str_radix(&clean[2..4], 16).unwrap_or(255),
+                u8::from_str_radix(&clean[4..6], 16).unwrap_or(255),
+            ),
+            None => (255, 255, 255),
+        }
+    }
+
+    /// 启动时净化颜色字段：非法值回落默认色并记一条 warn，避免坏值静默传播。
+    ///
+    /// `#[serde(default)]` 只覆盖「字段缺失」，不覆盖「字段值非法」，
+    /// 所以用户手写 `primary_color = "蓝色"` 时必须在解析后显式纠正。
+    pub(crate) fn sanitize_colors(&mut self) {
+        if Self::sanitize_hex(&self.primary_color).is_none() {
+            tracing::warn!(
+                field = "subtitle_style.primary_color",
+                value = %self.primary_color,
+                fallback = %default_primary_color(),
+                "字幕主色不是合法 #RRGGBB，已回落默认色"
+            );
+            self.primary_color = default_primary_color();
+        }
+        if Self::sanitize_hex(&self.outline_color).is_none() {
+            tracing::warn!(
+                field = "subtitle_style.outline_color",
+                value = %self.outline_color,
+                fallback = %default_outline_color(),
+                "字幕描边色不是合法 #RRGGBB，已回落默认色"
+            );
+            self.outline_color = default_outline_color();
         }
     }
 }
@@ -1451,6 +1491,10 @@ impl AppConfig {
                 }
             }
         }
+        // 颜色字段兜底净化：手写坏值（如中文色名）会让 ASS 输出/预览出错，
+        // 在这里统一纠正一次，UI 与导出都拿到合法值。
+        cfg.subtitle_style.sanitize_colors();
+
         Ok(cfg)
     }
 
@@ -1820,7 +1864,7 @@ fn human_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TranslateConfig, UiConfig};
+    use super::{SubtitleStyleConfig, TranslateConfig, UiConfig};
     use std::fs;
 
     /// 切换主题不能顺手把导出内容偏好重置回默认「双语」。
@@ -2975,6 +3019,81 @@ mod tests {
         let err = super::validate_llm_model_path(&p).expect_err("小于 1MB 应被拒绝");
         assert!(err.contains("体积过小"), "{err}");
         assert!(err.contains("512 KB"), "体积应格式化为人话: {err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 合法 #RRGGBB 必须逐字节转换正确（净化不能改变合法输入的行为）。
+    #[test]
+    fn hex_to_rgb_parses_valid_colors() {
+        assert_eq!(SubtitleStyleConfig::hex_to_rgb("#FF0080"), (255, 0, 128));
+        assert_eq!(SubtitleStyleConfig::hex_to_rgb("FF0080"), (255, 0, 128));
+        assert_eq!(SubtitleStyleConfig::hex_to_rgb("  #000000  "), (0, 0, 0));
+    }
+
+    /// 非法颜色串回落白色且**绝不 panic**：旧实现按字节下标切片，
+    /// 中文色名（如 "蓝色" 恰好 6 字节）会切在多字节字符中间直接崩。
+    #[test]
+    fn hex_to_rgb_rejects_invalid_without_panic() {
+        assert_eq!(SubtitleStyleConfig::hex_to_rgb("蓝色"), (255, 255, 255));
+        assert_eq!(SubtitleStyleConfig::hex_to_rgb("zzzzzz"), (255, 255, 255));
+        assert_eq!(SubtitleStyleConfig::hex_to_rgb("#12"), (255, 255, 255));
+        assert_eq!(SubtitleStyleConfig::hex_to_rgb(""), (255, 255, 255));
+        assert_eq!(SubtitleStyleConfig::hex_to_rgb("#1234567"), (255, 255, 255));
+    }
+
+    /// ASS 颜色必须是 BGR 顺序，非法值回落白。
+    #[test]
+    fn hex_to_ass_bgr_matches_expected() {
+        assert_eq!(SubtitleStyleConfig::hex_to_ass_bgr("#FF0080"), "&H008000FF");
+        assert_eq!(SubtitleStyleConfig::hex_to_ass_bgr("#000000"), "&H00000000");
+        assert_eq!(SubtitleStyleConfig::hex_to_ass_bgr("蓝色"), "&H00FFFFFF");
+        assert_eq!(SubtitleStyleConfig::hex_to_ass_bgr("zzzzzz"), "&H00FFFFFF");
+    }
+
+    /// 启动净化：坏色值被纠正为默认色，合法值原样保留。
+    #[test]
+    fn sanitize_colors_fixes_invalid_values() {
+        let mut style = SubtitleStyleConfig {
+            primary_color: "蓝色".to_string(),
+            outline_color: "#zzzzzz".to_string(),
+            ..SubtitleStyleConfig::default()
+        };
+        style.sanitize_colors();
+        assert_eq!(style.primary_color, "#FFFFFF");
+        assert_eq!(style.outline_color, "#000000");
+
+        let mut good = SubtitleStyleConfig {
+            primary_color: "#FF0080".to_string(),
+            outline_color: "#0F172A".to_string(),
+            ..SubtitleStyleConfig::default()
+        };
+        good.sanitize_colors();
+        assert_eq!(good.primary_color, "#FF0080");
+        assert_eq!(good.outline_color, "#0F172A");
+    }
+
+    /// 从磁盘加载时坏色值必须被净化：`#[serde(default)]` 救不了「字段值非法」。
+    #[test]
+    fn load_from_file_sanitizes_invalid_colors() {
+        let dir = std::env::temp_dir().join(format!("v2w_cfg_color_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let main_path = dir.join("config.toml");
+
+        super::AppConfig::default()
+            .save_to_file(&main_path)
+            .expect("save");
+        let text = fs::read_to_string(&main_path).expect("read");
+        let bad = text
+            .replace("primary_color = \"#FFFFFF\"", "primary_color = \"蓝色\"")
+            .replace("outline_color = \"#000000\"", "outline_color = \"zzzzzz\"");
+        assert!(bad.contains("蓝色"), "测试前提：坏色值应已写入文件");
+        fs::write(&main_path, &bad).expect("write bad");
+
+        let back = super::AppConfig::load_from_file(&main_path).expect("load");
+        assert_eq!(back.subtitle_style.primary_color, "#FFFFFF");
+        assert_eq!(back.subtitle_style.outline_color, "#000000");
 
         let _ = fs::remove_dir_all(&dir);
     }
