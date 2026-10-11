@@ -148,6 +148,14 @@ fn run_installer() {
 
     // 2. 释放主执行程序
     let target_exe = install_dir.join(APP_EXE_NAME);
+    if MAIN_EXE_BYTES.len() < 1024 * 1024 {
+        message_box(
+            "安装失败",
+            "安装程序数据不完整，请重新下载官方正式发布的安装包！",
+            MB_OK | MB_ICONERROR,
+        );
+        return;
+    }
     if let Err(e) = fs::write(&target_exe, MAIN_EXE_BYTES) {
         message_box(
             "安装失败",

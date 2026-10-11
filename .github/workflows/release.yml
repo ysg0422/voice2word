@@ -60,9 +60,11 @@ jobs:
       - name: cargo test --lib
         run: cargo test --lib -- --test-threads=1
 
-      - name: cargo build --release
-        # 一次性构建主程序 voice2word.exe 与内置向导安装包 voice2word-setup.exe
-        run: cargo build --release
+      - name: cargo build --release (voice2word)
+        run: cargo build --release --bin voice2word
+
+      - name: cargo build --release (voice2word-setup)
+        run: cargo build --release --bin voice2word-setup
 
       # ---------------------------------------------------------------
       # 组装发布物（安装包向导版 + 绿色便携版）
