@@ -532,7 +532,34 @@ impl WhisperEngine {
             cb(0.0, "Whisper 正在加载模型并开始逐句识别...", None);
         }
 
-        let mut cmd = Command::new(&self.cli_path);
+        // 动态自适应探测可用推理程序：仅在默认 tools 布局路径下，智能回退至其他有效安装目录
+        let is_default_layout = {
+            let s = self.cli_path.to_string_lossy();
+            s.contains("tools") || s.contains("whisper-vulkan") || s.contains("whisper-cuda")
+        };
+        let effective_cli = if self.cli_path.exists() {
+            self.cli_path.clone()
+        } else if is_default_layout {
+            let candidates = [
+                crate::utils::AppConfig::resolve_path("tools/whisper-cuda/whisper-cli.exe"),
+                crate::utils::AppConfig::resolve_path("tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"),
+            ];
+            candidates
+                .into_iter()
+                .find(|p| p.exists())
+                .unwrap_or_else(|| self.cli_path.clone())
+        } else {
+            self.cli_path.clone()
+        };
+
+        if !self.cli_path.exists() && effective_cli.exists() {
+            tracing::info!(
+                "配置的 Whisper CLI 路径 {:?} 不存在，已自动智能匹配到有效推理程序: {:?}",
+                self.cli_path, effective_cli
+            );
+        }
+
+        let mut cmd = Command::new(&effective_cli);
         cmd.arg("-m").arg(&effective_model);
 
         match &audio_input {
@@ -673,16 +700,16 @@ impl WhisperEngine {
         // 推理程序缺失时提前给出可操作的中文提示：否则 `cmd.spawn()` 只会抛一句
         // 原始的「调用 whisper-cli 失败」，新用户看不出是「程序没下」还是「路径写错」。
         // 放在取消早退之后：取消语义优先，不应被缺失检查打断。
-        if !self.cli_path.exists() {
+        if !effective_cli.exists() {
             anyhow::bail!(
-                "Whisper 推理程序未就位：{:?}。请到「性能设置 → 模型与组件」下载「whisper.cpp 识别程序」（会自动解压）；若你自行编译了 Vulkan 版，也可在 config.toml 的 paths.whisper_cli 指向它。",
-                self.cli_path
+                "Whisper 推理程序未就位：{:?}。请到「性能设置 → 模型与组件」下载「whisper.cpp 识别程序」（约4MB）；若已下载 SenseVoice，也可在右侧引擎直接切换为「SenseVoice 极速」进行转写。",
+                effective_cli
             );
         }
 
         let mut child = cmd
             .spawn()
-            .with_context(|| format!("调用 whisper-cli 失败: {:?}", self.cli_path))?;
+            .with_context(|| format!("调用 whisper-cli 失败: {:?}", effective_cli))?;
         crate::utils::child_registry::adopt(&child);
 
         // 登记子进程 PID，供用户「终止转写」时强杀。

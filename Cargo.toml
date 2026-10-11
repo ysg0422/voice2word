@@ -1,6 +1,6 @@
 [package]
 name = "voice2word"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Voice2Word - 音视频智能字幕生成器 (Rust + GPUI)"
 

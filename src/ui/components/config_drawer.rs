@@ -470,6 +470,10 @@ impl MainWindow {
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.state.set_whisper_model_tier(tier);
+                this.model_manager_tab = match tier {
+                    crate::app::WhisperModelTier::SenseVoice => crate::ui::ModelManagerTab::SenseVoice,
+                    _ => crate::ui::ModelManagerTab::Whisper,
+                };
                 cx.notify();
             }))
             .child(

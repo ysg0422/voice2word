@@ -766,6 +766,10 @@ impl MainWindow {
         // 清掉整棵进程树。这是唯一能覆盖「父进程被强杀」的兜底 —— 单靠退出路径里的
         // kill 逻辑在强杀场景下根本没有机会执行。非 Windows 平台为空实现。
         crate::utils::child_registry::ensure_job_object();
+        let default_model_tab = match state.whisper_model_tier {
+            crate::app::WhisperModelTier::SenseVoice => ModelManagerTab::SenseVoice,
+            _ => ModelManagerTab::Whisper,
+        };
         let mut window = Self {
             state,
             metrics_rx,
@@ -859,7 +863,7 @@ impl MainWindow {
             library_selected: HashSet::new(),
             library_export_busy: false,
             command_palette: None,
-            model_manager_tab: ModelManagerTab::SenseVoice,
+            model_manager_tab: default_model_tab,
             custom_color_picker_open: false,
             cached_color_wheel: None,
             color_picker_brightness: 1.0,

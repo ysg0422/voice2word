@@ -22,7 +22,7 @@ pub(crate) fn is_item_needed_for_tab(
     tab: ModelManagerTab,
     state: &crate::app::AppState,
 ) -> bool {
-    let is_gpu = state.config.gpu.is_gpu_tier();
+    let _is_gpu = state.config.gpu.is_gpu_tier();
     match tab {
         ModelManagerTab::SenseVoice => {
             // SenseVoice 专区：核心识别模型、分词表、VAD 专属项
@@ -33,10 +33,13 @@ pub(crate) fn is_item_needed_for_tab(
         }
         ModelManagerTab::Whisper => {
             // Whisper 专区：Whisper 模型档位、VAD、标点、推理程序
-            if item_id == "whisper-cublas" {
-                is_gpu
-            } else if item_id == "whisper-cli" {
-                !is_gpu
+            let has_cli = state.model_is_present("whisper-cli") || state.model_is_present("whisper-cublas");
+            if item_id == "whisper-cli" {
+                // 若本地尚未就位任何可用 CLI，4.1MB 的基础 whisper-cli 为绝对必需
+                !has_cli
+            } else if item_id == "whisper-cublas" {
+                // whisper-cublas 为 435MB 可选 CUDA 极速扩展包，不作为强制阻断项
+                false
             } else if item_id == "silero-vad" || item_id == "punc-model" {
                 true
             } else if let Some(current_id) = state.whisper_model_tier.download_item_id() {
@@ -57,18 +60,21 @@ pub(crate) fn is_item_needed_for_tab(
 
 /// 判断某个组件在用户当前的硬件配置和引擎模式下，是否属于「当前模式所需」的组件。
 pub fn is_item_needed_by_current_config(item_id: &str, state: &crate::app::AppState) -> bool {
-    let is_gpu = state.config.gpu.is_gpu_tier();
+    let _is_gpu = state.config.gpu.is_gpu_tier();
     let is_sv = state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
 
     match item_id {
         // 音视频抽音解码：任何模式都需要
         "ffmpeg" => true,
 
-        // GPU 专用的 CUDA 推理程序：只有在选择 Whisper 且开启 GPU 加速模式下才需要！
-        "whisper-cublas" => is_gpu && !is_sv,
+        // GPU 专用的 CUDA 推理程序：435MB 可选深度加速包，不绑架一键补齐
+        "whisper-cublas" => false,
 
-        // CPU 版本的 Whisper CLI：只有在选择 Whisper 且纯 CPU 模式下才需要！
-        "whisper-cli" => !is_gpu && !is_sv,
+        // 基础版本的 Whisper CLI（4.1MB）：选择 Whisper 且本地尚无任何 CLI 时必须下载！
+        "whisper-cli" => {
+            let has_cli = state.model_is_present("whisper-cli") || state.model_is_present("whisper-cublas");
+            !is_sv && !has_cli
+        }
 
         // SenseVoice 引擎套件：选择 SenseVoice 极速模式时需要（自包含 ONNX 架构，无需任何 cpp）
         "sensevoice-model" | "sensevoice-tokens" | "sensevoice-vad" => is_sv,
@@ -114,7 +120,7 @@ impl MainWindow {
         let status = self.state.download_status_msg.clone();
         let current = self.state.download_current.clone();
         let current_tab = self.model_manager_tab;
-        let is_gpu = self.state.config.gpu.is_gpu_tier();
+        let _is_gpu = self.state.config.gpu.is_gpu_tier();
 
         // 进度比例：服务端没给 Content-Length 时退化为「不确定」态（用 0 表示）
         let ratio = if total > 0 {
@@ -361,11 +367,10 @@ impl MainWindow {
                 },
                 ModelCategory {
                     title: "Whisper 推理程序",
-                    item_ids: if is_gpu {
-                        &["whisper-cublas"]
-                    } else {
-                        &["whisper-cli"]
-                    },
+                    item_ids: &[
+                        "whisper-cli",
+                        "whisper-cublas",
+                    ],
                 },
             ],
             ModelManagerTab::Common => vec![

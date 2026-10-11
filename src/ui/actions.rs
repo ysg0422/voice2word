@@ -1467,12 +1467,28 @@ impl MainWindow {
         // 命名**的自备模型时，`model_is_present` 会因「名字对不上任何档位」判为缺失，
         // 而管线其实跑得起来——用实际路径判定就不会误拦。
         let will_load = crate::utils::AppConfig::resolve_path(&tier.model_relative_path());
-        (!will_load.is_file()).then(|| {
-            format!(
+        if !will_load.is_file() {
+            return Some(format!(
                 "{} 模型未就位：请在「性能设置 → Whisper 模型档位」点「下载」，或改选已就位的档位",
                 tier.label()
-            )
-        })
+            ));
+        }
+
+        let configured_cli = crate::utils::AppConfig::resolve_path(&self.state.config.paths.whisper_cli);
+        let has_cli = configured_cli.is_file()
+            || crate::utils::AppConfig::resolve_path("tools/whisper-cuda/whisper-cli.exe").is_file()
+            || crate::utils::AppConfig::resolve_path("tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe").is_file();
+
+        if !has_cli {
+            let sv_ready = self.state.model_is_present("sensevoice-model");
+            return Some(if sv_ready {
+                "Whisper 推理程序未就位：请到「模型与组件」下载「whisper.cpp 识别程序」（约4MB），或在右侧切换为已就绪的「SenseVoice 极速」引擎".to_string()
+            } else {
+                "Whisper 推理程序未就位：请到「性能设置 → 模型与组件」下载「whisper.cpp 识别程序」（约4MB）".to_string()
+            });
+        }
+
+        None
     }
 
     /// 启动一次转写，显式指定输入文件。
@@ -2901,7 +2917,7 @@ impl MainWindow {
                             "下载完成"
                         };
                         this.state.download_status_msg = format!("{} {verb}", item.label);
-                        if item.id == "whisper-cublas" {
+                        if item.id == "whisper-cublas" || item.id == "whisper-cli" {
                             this.state.config.paths.whisper_cli = item.dest.to_string();
                             let _ = this.state.config.save_to_file("config.toml");
                         }
