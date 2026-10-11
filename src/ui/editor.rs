@@ -18,36 +18,45 @@ use image::{Frame, ImageBuffer, Rgba};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-/// 预设 → 预览配色 `(文字色, 底色, 描边色)`。
+/// 字幕配置 → 预览配色 `(文字色, 底色, 描边色)`。
 ///
-/// GPUI 不支持文字描边与投影，所以这里用「底色透明度 + 描边」近似表达各预设的观感；
-/// 导出 ASS 时同一预设会写入真正的描边 / 阴影 / 底框参数（见 `subtitle::writer::ass_preset_colors`）。
-/// 注意：本文件同时引入了 `image::Rgba`，故返回类型须写全限定名 `gpui::Rgba`。
+/// 完全由 `SubtitleStyleConfig` 驱动，支持自定义文字颜色、描边粗细与底框不透明度。
+fn subtitle_computed_colors(style: &crate::utils::SubtitleStyleConfig) -> (gpui::Rgba, gpui::Rgba, gpui::Rgba) {
+    let (r, g, b) = crate::utils::SubtitleStyleConfig::hex_to_rgb(&style.primary_color);
+    let fg = rgb((r as u32) << 16 | (g as u32) << 8 | (b as u32));
+
+    let (or, og, ob) = crate::utils::SubtitleStyleConfig::hex_to_rgb(&style.outline_color);
+    let border = if style.outline_width > 0.0 {
+        rgb((or as u32) << 16 | (og as u32) << 8 | (ob as u32))
+    } else {
+        Theme::transparent()
+    };
+
+    let bg = match style.bg_style.as_str() {
+        "none" => Theme::transparent(),
+        "box" => {
+            let a = ((style.bg_opacity.clamp(0.0, 1.0) * 255.0) as u32).clamp(0, 255);
+            rgba(a)
+        }
+        "pill" => {
+            let a = ((style.bg_opacity.clamp(0.0, 1.0) * 230.0) as u32).clamp(0, 255);
+            rgba(0x18181b00 | a)
+        }
+        _ => {
+            // "shadow" 默认投影底色
+            let a = ((style.bg_opacity.clamp(0.0, 1.0) * 160.0) as u32).clamp(0, 255);
+            rgba(a)
+        }
+    };
+
+    (fg, bg, border)
+}
+
+#[allow(dead_code)]
 fn subtitle_preset_colors(preset: &str) -> (gpui::Rgba, gpui::Rgba, gpui::Rgba) {
-    match preset {
-        // 黄字 + 黑边：用较重的底色近似黑边带来的高对比
-        "黄字黑边" => (rgb(0xffd60a), rgba(0x000000d9), rgba(0x000000ff)),
-        // 半透明黑框：白字 + 明显的半透明底框
-        "半透明黑框" => (
-            // 字幕字形画在视频画面 / 媒体底色上，恒用恒白 token，
-            // 不能跟主题翻转（浅色主题下 text_white 会变近黑，直接糊成一片）
-            Theme::text_subtitle(),
-            rgba(0x000000b3),
-            Theme::tint_neutral_border(),
-        ),
-        // 电影沉浸：无底框悬浮白字
-        "电影沉浸" => (
-            Theme::text_subtitle(),
-            Theme::transparent(),
-            Theme::transparent(),
-        ),
-        // 白字黑影（默认）：白字 + 浅底色近似投影
-        _ => (
-            Theme::text_subtitle(),
-            rgba(0x00000080),
-            Theme::transparent(),
-        ),
-    }
+    let mut cfg = crate::utils::SubtitleStyleConfig::default();
+    cfg.apply_preset(preset);
+    subtitle_computed_colors(&cfg)
 }
 
 /// 样式预览条的底色修正。
@@ -64,11 +73,11 @@ fn preview_backdrop(bg: gpui::Rgba) -> gpui::Rgba {
 }
 
 /// 字幕样式可选值（字号 / 底边距以 1080p 为基准，与 `SubtitleStyleConfig` 语义一致）
-const STYLE_FONT_SIZES: [u32; 4] = [32, 40, 48, 56];
-const STYLE_LETTER_SPACINGS: [u32; 4] = [0, 1, 2, 4];
-const STYLE_LINE_SPACINGS: [f32; 4] = [1.0, 1.2, 1.4, 1.6];
-const STYLE_MAX_CHARS: [u32; 4] = [12, 16, 20, 24];
-const STYLE_BOTTOM_MARGINS: [u32; 4] = [20, 40, 60, 80];
+const STYLE_FONT_SIZES: [u32; 5] = [28, 36, 44, 52, 60];
+const STYLE_LETTER_SPACINGS: [u32; 5] = [0, 1, 2, 4, 6];
+const STYLE_LINE_SPACINGS: [f32; 5] = [1.0, 1.2, 1.4, 1.6, 1.8];
+const STYLE_MAX_CHARS: [u32; 5] = [10, 14, 18, 22, 26];
+const STYLE_BOTTOM_MARGINS: [u32; 5] = [20, 40, 60, 80, 120];
 /// 分段按钮组的宽度上界：4 个短标签等分后每个约 117px，够放下 2~4 个字，
 /// 又不会像铺满整行那样被拉伸成 200px 的空条。用 max_w 而非固定宽，
 /// 是为了窄面板下仍能随容器收缩，避免「标签 + 按钮组」溢出卡片。
@@ -382,7 +391,7 @@ impl MainWindow {
                             .child({
                                 let style = self.state.config.subtitle_style.clone();
                                 let font_px = style.preview_font_px();
-                                let (fg, bg, border) = subtitle_preset_colors(&style.preset_name);
+                                let (fg, bg, border) = subtitle_computed_colors(&style);
                                 // 宽度与编辑卡里的预览框同源：拖把手时两者在同一帧一起变，
                                 // 不存在「预览改了、画面上没跟上」的延迟
                                 let box_w = self.subtitle_box_w();
@@ -410,9 +419,13 @@ impl MainWindow {
                                             .border_1()
                                             .border_color(border)
                                             .text_size(px(font_px))
-                                            .font_weight(FontWeight::BOLD)
+                                            .font_weight(if style.is_bold { FontWeight::BOLD } else { FontWeight::NORMAL })
                                             .text_color(fg)
-                                            .text_align(TextAlign::Center)
+                                            .text_align(match style.alignment.as_str() {
+                                                "left" => TextAlign::Left,
+                                                "right" => TextAlign::Right,
+                                                _ => TextAlign::Center,
+                                            })
                                             .line_height(px(font_px * style.line_spacing))
                                             // 预览与导出同源：按当前导出内容模式渲染，
                                             // 译好之后在监视器里就能直接看到译文/双语。
@@ -725,7 +738,7 @@ impl MainWindow {
                             primitives::card_sm()
                                 .flex_none()
                                 .gap(px(Theme::SPACE_2))
-                                // 卡片标题
+                                // 卡片标题与恢复默认
                                 .child(
                                     div()
                                         .flex()
@@ -740,47 +753,208 @@ impl MainWindow {
                                         )
                                         .child(
                                             div()
+                                                .id("btn-reset-subtitle-style")
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded_md()
+                                                .bg(Theme::bg_inset())
+                                                .border_1()
+                                                .border_color(Theme::border())
+                                                .cursor_pointer()
                                                 .text_size(px(Theme::TEXT_SMALL))
-                                                .text_color(Theme::accent_mint())
-                                                .child(format!("当前: {}", cur_style.preset_name)),
+                                                .text_color(Theme::text_secondary())
+                                                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.state.config.subtitle_style = crate::utils::SubtitleStyleConfig::default();
+                                                    this.state.save_subtitle_style();
+                                                    cx.notify();
+                                                }))
+                                                .child("恢复默认"),
                                         ),
                                 )
-                                // 1) 风格预设切牌
+                                // 1) 文字颜色池（纯色圆点无文字描述）
                                 .child(
                                     div()
                                         .flex()
                                         .items_center()
-                                        .gap_2()
+                                        .gap_1p5()
                                         .child(
                                             div()
+                                                .w(px(58.0))
+                                                .flex_shrink_0()
                                                 .text_size(px(Theme::TEXT_SMALL))
                                                 .text_color(Theme::text_secondary())
-                                                .child("视觉预设:"),
+                                                .child("文字颜色"),
                                         )
                                         .child(
                                             div()
                                                 .flex()
+                                                .items_center()
                                                 .flex_wrap()
-                                                .flex_1()
-                                                .gap_1p5()
-                                                // 预设清单与 `SubtitleStyleConfig::apply_preset` 共用同一份常量，
-                                                // 避免两处各写一遍名字后悄悄漂移
-                                                .children(crate::utils::SUBTITLE_PRESETS.into_iter().enumerate().map(|(idx, label)| {
-                                                    let is_sel = cur_style.preset_name == label;
+                                                .gap_2()
+                                                .children(crate::utils::SUBTITLE_COLOR_PALETTE.into_iter().enumerate().map(|(idx, (_name, hex))| {
+                                                    let is_sel = cur_style.primary_color.eq_ignore_ascii_case(hex);
+                                                    let (r, g, b) = crate::utils::SubtitleStyleConfig::hex_to_rgb(hex);
+                                                    let swatch_color = rgb((r as u32) << 16 | (g as u32) << 8 | (b as u32));
                                                     div()
-                                                        .id(("preset-btn", idx))
+                                                        .id(("color-opt", idx))
+                                                        .w(px(22.0))
+                                                        .h(px(22.0))
+                                                        .rounded_full()
+                                                        .cursor_pointer()
+                                                        .bg(swatch_color)
+                                                        .border_2()
+                                                        .border_color(if is_sel {
+                                                            Theme::accent_mint()
+                                                        } else {
+                                                            rgba(0x80808044)
+                                                        })
+                                                        .hover(|s| if !is_sel { s.border_color(Theme::text_secondary()) } else { s })
+                                                        .on_click(cx.listener({
+                                                            let hex_str = hex.to_string();
+                                                            move |this, _, _, cx| {
+                                                                this.state.config.subtitle_style.primary_color = hex_str.clone();
+                                                                this.state.save_subtitle_style();
+                                                                cx.notify();
+                                                            }
+                                                        }))
+                                                }))
+                                        )
+                                )
+                                // 2) 字重与水平对齐
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(
+                                            div()
+                                                .w(px(58.0))
+                                                .flex_shrink_0()
+                                                .text_size(px(Theme::TEXT_SMALL))
+                                                .text_color(Theme::text_secondary())
+                                                .child("字重对齐"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                // 粗细开关
+                                                .child(
+                                                    div()
+                                                        .w(px(96.0))
+                                                        .flex()
+                                                        .gap_1()
+                                                        .child({
+                                                            let is_bold = cur_style.is_bold;
+                                                            div()
+                                                                .id("btn-bold-on")
+                                                                .flex_1()
+                                                                .py_0p5()
+                                                                .rounded_md()
+                                                                .cursor_pointer()
+                                                                .text_size(px(Theme::TEXT_SMALL))
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .bg(if is_bold { Theme::accent_mint() } else { Theme::bg_inset() })
+                                                                .border_1()
+                                                                .border_color(if is_bold { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                                .text_color(if is_bold { Theme::text_on_accent() } else { Theme::text_secondary() })
+                                                                .child("加粗")
+                                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                                    this.state.config.subtitle_style.is_bold = true;
+                                                                    this.state.save_subtitle_style();
+                                                                    cx.notify();
+                                                                }))
+                                                        })
+                                                        .child({
+                                                            let is_bold = cur_style.is_bold;
+                                                            div()
+                                                                .id("btn-bold-off")
+                                                                .flex_1()
+                                                                .py_0p5()
+                                                                .rounded_md()
+                                                                .cursor_pointer()
+                                                                .text_size(px(Theme::TEXT_SMALL))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .bg(if !is_bold { Theme::accent_mint() } else { Theme::bg_inset() })
+                                                                .border_1()
+                                                                .border_color(if !is_bold { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                                .text_color(if !is_bold { Theme::text_on_accent() } else { Theme::text_secondary() })
+                                                                .child("常规")
+                                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                                    this.state.config.subtitle_style.is_bold = false;
+                                                                    this.state.save_subtitle_style();
+                                                                    cx.notify();
+                                                                }))
+                                                        })
+                                                )
+                                                // 对齐方式 (居左/居中/居右)
+                                                .child(
+                                                    div()
                                                         .flex_1()
-                                                        .min_w(px(70.0))
-                                                        .py_1()
+                                                        .flex()
+                                                        .gap_1()
+                                                        .children([("靠左", "left"), ("居中", "center"), ("靠右", "right")].into_iter().enumerate().map(|(idx, (label, align))| {
+                                                            let is_sel = cur_style.alignment == align;
+                                                            div()
+                                                                .id(("align-btn", idx))
+                                                                .flex_1()
+                                                                .py_0p5()
+                                                                .rounded_md()
+                                                                .cursor_pointer()
+                                                                .text_size(px(Theme::TEXT_SMALL))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
+                                                                .border_1()
+                                                                .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                                .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
+                                                                .child(label)
+                                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                                    this.state.config.subtitle_style.alignment = align.to_string();
+                                                                    this.state.save_subtitle_style();
+                                                                    cx.notify();
+                                                                }))
+                                                        }))
+                                                )
+                                        )
+                                )
+                                // 3) 文字描边
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(
+                                            div()
+                                                .w(px(58.0))
+                                                .flex_shrink_0()
+                                                .text_size(px(Theme::TEXT_SMALL))
+                                                .text_color(Theme::text_secondary())
+                                                .child("文字描边"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .flex()
+                                                .gap_1()
+                                                .children(crate::utils::SUBTITLE_OUTLINE_OPTIONS.into_iter().enumerate().map(|(idx, (label, width))| {
+                                                    let is_sel = (cur_style.outline_width - width).abs() < 0.1;
+                                                    div()
+                                                        .id(("outline-w", idx))
+                                                        .flex_1()
+                                                        .py_0p5()
                                                         .rounded_md()
                                                         .cursor_pointer()
                                                         .text_size(px(Theme::TEXT_SMALL))
-                                                        // 用布局居中（flex + justify_center），不用 `text_center()`：
-                                                        // GPUI 0.2.2 的 `.hover()` 走 `Style::refine`，而 `Style::text`
-                                                        // 没有 `#[refineable]`，悬停时整块 `TextStyleRefinement` 会被
-                                                        // hover 闭包里那份（只设了 text_color）**整体替换**，没显式设过的
-                                                        // `text_align` 于是回落到默认值 Left —— 鼠标一移上去文字就跳到左边。
-                                                        // 居中交给 flex 后，悬停只碰底色/前景色，不再牵动对齐。
                                                         .flex()
                                                         .items_center()
                                                         .justify_center()
@@ -788,13 +962,56 @@ impl MainWindow {
                                                         .border_1()
                                                         .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
                                                         .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                        .hover(|s| if !is_sel { s.bg(Theme::bg_hover()).text_color(Theme::text_primary()) } else { s })
+                                                        .child(label)
                                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                                            // 预设同时套用整组排版参数，而非只改名字
-                                                            this.state.apply_subtitle_preset(label);
+                                                            this.state.config.subtitle_style.outline_width = width;
+                                                            this.state.save_subtitle_style();
                                                             cx.notify();
                                                         }))
+                                                }))
+                                        )
+                                )
+                                // 4) 背景底框
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(
+                                            div()
+                                                .w(px(58.0))
+                                                .flex_shrink_0()
+                                                .text_size(px(Theme::TEXT_SMALL))
+                                                .text_color(Theme::text_secondary())
+                                                .child("背景底框"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .flex()
+                                                .gap_1()
+                                                .children([("投影", "shadow"), ("黑框", "box"), ("胶囊", "pill"), ("纯净", "none")].into_iter().enumerate().map(|(idx, (label, mode))| {
+                                                    let is_sel = cur_style.bg_style == mode;
+                                                    div()
+                                                        .id(("bg-mode", idx))
+                                                        .flex_1()
+                                                        .py_0p5()
+                                                        .rounded_md()
+                                                        .cursor_pointer()
+                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
+                                                        .border_1()
+                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
                                                         .child(label)
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.state.config.subtitle_style.bg_style = mode.to_string();
+                                                            this.state.save_subtitle_style();
+                                                            cx.notify();
+                                                        }))
                                                 }))
                                         )
                                 )
@@ -804,41 +1021,106 @@ impl MainWindow {
                                         .flex()
                                         .flex_col()
                                         .gap_1p5()
-                                        // 字号
+                                        // 字体大小（微调 + 快捷档位）
                                         .child(
                                             div()
                                                 .flex_1()
                                                 .flex()
                                                 .items_center()
                                                 .gap_1p5()
-                                                .child(div().w(px(Theme::FORM_LABEL_W)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("字号"))
+                                                .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("字体大小"))
                                                 .child(
                                                     div()
                                                         .flex_1()
                                                         .max_w(px(STYLE_ROW_BTN_MAX_W))
                                                         .flex()
-                                                        .gap_1()
-                                                        .children(STYLE_FONT_SIZES.into_iter().map(|val| {
-                                                            let is_sel = cur_style.font_size == val;
+                                                        .items_center()
+                                                        .gap_1p5()
+                                                        // 步进微调器
+                                                        .child(
                                                             div()
-                                                                .id(("font-sz", val))
-                                                                .flex_1()
-                                                                .py_0p5()
-                                                                .rounded_md()
-                                                                .cursor_pointer()
-                                                                .text_size(px(Theme::TEXT_SMALL))
-                                                                .text_center()
-                                                                .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap_0p5()
+                                                                .bg(Theme::bg_inset())
                                                                 .border_1()
-                                                                .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
-                                                                .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    this.state.config.subtitle_style.font_size = val;
-                                                                    this.state.save_subtitle_style();
-                                                                    cx.notify();
+                                                                .border_color(Theme::bg_hover_strong())
+                                                                .rounded_md()
+                                                                .px_1()
+                                                                .py_0p5()
+                                                                .child(
+                                                                    div()
+                                                                        .id("font-size-dec")
+                                                                        .px_1p5()
+                                                                        .cursor_pointer()
+                                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(Theme::text_secondary())
+                                                                        .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                        .child("-2")
+                                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                                            let cur = this.state.config.subtitle_style.font_size;
+                                                                            this.state.config.subtitle_style.font_size = cur.saturating_sub(2).max(20);
+                                                                            this.state.save_subtitle_style();
+                                                                            cx.notify();
+                                                                        }))
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .px_1()
+                                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(Theme::accent_mint())
+                                                                        .child(format!("{}px", cur_style.font_size))
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .id("font-size-inc")
+                                                                        .px_1p5()
+                                                                        .cursor_pointer()
+                                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(Theme::text_secondary())
+                                                                        .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                        .child("+2")
+                                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                                            let cur = this.state.config.subtitle_style.font_size;
+                                                                            this.state.config.subtitle_style.font_size = (cur + 2).min(80);
+                                                                            this.state.save_subtitle_style();
+                                                                            cx.notify();
+                                                                        }))
+                                                                )
+                                                        )
+                                                        // 快捷档位
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .flex()
+                                                                .gap_1()
+                                                                .children(STYLE_FONT_SIZES.into_iter().map(|val| {
+                                                                    let is_sel = cur_style.font_size == val;
+                                                                    div()
+                                                                        .id(("font-sz", val))
+                                                                        .flex_1()
+                                                                        .py_0p5()
+                                                                        .rounded_md()
+                                                                        .cursor_pointer()
+                                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .justify_center()
+                                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
+                                                                        .border_1()
+                                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
+                                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                                            this.state.config.subtitle_style.font_size = val;
+                                                                            this.state.save_subtitle_style();
+                                                                            cx.notify();
+                                                                        }))
+                                                                        .child(format!("{}", val))
                                                                 }))
-                                                                .child(format!("{}", val))
-                                                        }))
+                                                        )
                                                 )
                                         )
                                         // 字间距
@@ -848,7 +1130,7 @@ impl MainWindow {
                                                 .flex()
                                                 .items_center()
                                                 .gap_1p5()
-                                                .child(div().w(px(Theme::FORM_LABEL_W)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("字间距"))
+                                                .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("字间距"))
                                                 .child(
                                                     div()
                                                         .flex_1()
@@ -864,7 +1146,9 @@ impl MainWindow {
                                                                 .rounded_md()
                                                                 .cursor_pointer()
                                                                 .text_size(px(Theme::TEXT_SMALL))
-                                                                .text_center()
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
                                                                 .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
                                                                 .border_1()
                                                                 .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
@@ -885,7 +1169,7 @@ impl MainWindow {
                                                 .flex()
                                                 .items_center()
                                                 .gap_1p5()
-                                                .child(div().w(px(Theme::FORM_LABEL_W)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("底边距"))
+                                                .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("底边距"))
                                                 .child(
                                                     div()
                                                         .flex_1()
@@ -901,7 +1185,9 @@ impl MainWindow {
                                                                 .rounded_md()
                                                                 .cursor_pointer()
                                                                 .text_size(px(Theme::TEXT_SMALL))
-                                                                .text_center()
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
                                                                 .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
                                                                 .border_1()
                                                                 .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
@@ -921,7 +1207,7 @@ impl MainWindow {
                                                 .flex()
                                                 .items_center()
                                                 .gap_1p5()
-                                                .child(div().w(px(Theme::FORM_LABEL_W)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("行间距"))
+                                                .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("行间距"))
                                                 .child(
                                                     div()
                                                         .flex_1()
@@ -937,7 +1223,9 @@ impl MainWindow {
                                                                 .rounded_md()
                                                                 .cursor_pointer()
                                                                 .text_size(px(Theme::TEXT_SMALL))
-                                                                .text_center()
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
                                                                 .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
                                                                 .border_1()
                                                                 .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
@@ -957,7 +1245,7 @@ impl MainWindow {
                                                 .flex()
                                                 .items_center()
                                                 .gap_1p5()
-                                                .child(div().w(px(Theme::FORM_LABEL_W)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("单行字数"))
+                                                .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("单行字数"))
                                                 .child(
                                                     div()
                                                         .flex_1()
@@ -973,7 +1261,9 @@ impl MainWindow {
                                                                 .rounded_md()
                                                                 .cursor_pointer()
                                                                 .text_size(px(Theme::TEXT_SMALL))
-                                                                .text_center()
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
                                                                 .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
                                                                 .border_1()
                                                                 .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
@@ -2217,7 +2507,7 @@ impl MainWindow {
         // 样式取自全局配置（面板里改哪个参数都立即写回这里）
         let style = self.state.config.subtitle_style.clone();
         let font_px = style.preview_font_px();
-        let (fg, bg, border) = subtitle_preset_colors(&style.preset_name);
+        let (fg, bg, border) = subtitle_computed_colors(&style);
         let bg = preview_backdrop(bg);
         // 空行会被 GPUI 折成 0 高，给个占位符保证预览条始终有形
         let preview_text = if cur_text.trim().is_empty() {
@@ -2293,9 +2583,13 @@ impl MainWindow {
                             .border_1()
                             .border_color(border)
                             .text_size(px(font_px))
-                            .font_weight(FontWeight::BOLD)
+                            .font_weight(if style.is_bold { FontWeight::BOLD } else { FontWeight::NORMAL })
                             .text_color(fg)
-                            .text_align(TextAlign::Center)
+                            .text_align(match style.alignment.as_str() {
+                                "left" => TextAlign::Left,
+                                "right" => TextAlign::Right,
+                                _ => TextAlign::Center,
+                            })
                             .line_height(px(font_px * style.line_spacing))
                             .child(preview_text),
                     )

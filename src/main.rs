@@ -2,6 +2,7 @@
 //! 遵循 Codex / Zed 极简现代设计风格
 
 #![recursion_limit = "512"]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 // ── 单入口：模块只经 lib crate 引用（voice2word::…），本文件不再 mod 一遍 ──
 //

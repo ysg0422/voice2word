@@ -365,8 +365,41 @@ impl SubtitleWriter {
         wrap: usize,
     ) -> Result<()> {
         let mut file = File::create(path).with_context(|| "创建 ASS 文件失败")?;
-        let (primary, outline, back, border_style, outline_w, shadow) =
+        let (preset_primary, preset_outline, preset_back, preset_border_style, preset_outline_w, preset_shadow) =
             ass_preset_colors(&style.preset_name);
+        let default_cfg = SubtitleStyleConfig::default();
+        let primary = if style.preset_name != "白字黑影" && style.primary_color == default_cfg.primary_color {
+            preset_primary.to_string()
+        } else {
+            style.ass_primary_colour()
+        };
+        let outline = if style.preset_name != "白字黑影" && style.outline_color == default_cfg.outline_color {
+            preset_outline.to_string()
+        } else {
+            style.ass_outline_colour()
+        };
+        let outline_w = if style.preset_name != "白字黑影" && (style.outline_width - default_cfg.outline_width).abs() < 0.01 {
+            preset_outline_w
+        } else {
+            style.outline_width
+        };
+        let border_style = if style.preset_name != "白字黑影" && style.bg_style == default_cfg.bg_style {
+            preset_border_style
+        } else {
+            match style.bg_style.as_str() {
+                "box" | "pill" => 3,
+                _ => 1,
+            }
+        };
+        let bold_flag = if style.is_bold { 1 } else { 0 };
+        let back = preset_back;
+        let shadow = preset_shadow;
+        let alignment = match style.alignment.as_str() {
+            "left" => 1,
+            "right" => 3,
+            _ => 2,
+        };
+
         let header = format!(
             r#"[Script Info]
 Title: Voice2Word Subtitle
@@ -377,10 +410,7 @@ Timer: 100.0000
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},0,0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow},2,20,20,{margin_v},1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bold_flag},0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow},{alignment},20,20,{margin_v},1
 "#,
             size = style.font_size,
             spacing = style.letter_spacing,
@@ -406,13 +436,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 let color = speaker_ass_color(idx);
                 writeln!(
                     file,
-                    "Style: {name},Microsoft YaHei,{size},{color},&H000000FF,{outline},{back},0,0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow},2,20,20,{margin_v},1",
+                    "Style: {name},Microsoft YaHei,{size},{color},&H000000FF,{outline},{back},{bold_flag},0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow},{alignment},20,20,{margin_v},1",
                     size = style.font_size,
                     spacing = style.letter_spacing,
                     margin_v = style.bottom_margin,
                 )?;
             }
         }
+
+        writeln!(
+            file,
+            "\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+        )?;
 
         let with_speaker = super::segment::has_speaker_labels(segments);
         for seg in segments {
@@ -769,6 +804,10 @@ fn ass_preset_colors(preset: &str) -> (&'static str, &'static str, &'static str,
         "半透明黑框" => ("&H00FFFFFF", "&H00000000", "&H80000000", 3, 1.0, 0.0),
         // 无边框无阴影，纯悬浮白字
         "电影沉浸" => ("&H00FFFFFF", "&H00000000", "&H00000000", 1, 0.0, 0.0),
+        // 霓虹极光：青字 + 深蓝描边 + 底框
+        "霓虹极光" => ("&H00BFD42D", "&H002A170F", "&H4018181A", 1, 2.5, 1.0),
+        // 活力暖橙：暖橙 + 黑边 + 阴影
+        "活力暖橙" => ("&H003C92FB", "&H00000000", "&H80000000", 1, 2.5, 1.0),
         // 白字黑影（默认）：白字 + 细黑边 + 投影
         _ => ("&H00FFFFFF", "&H00000000", "&H80000000", 1, 2.0, 1.0),
     }

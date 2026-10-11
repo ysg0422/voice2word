@@ -602,16 +602,42 @@ pub struct SubtitleStyleConfig {
     pub max_chars_per_line: u32,
     /// 画面底边距 px @1080p
     pub bottom_margin: u32,
-    /// 预设名称："白字黑影" / "黄字黑边" / "半透明黑框" / "电影沉浸"
+    /// 预设名称："白字黑影" / "黄字黑边" / "半透明黑框" / "电影沉浸" / "霓虹极光" / "活力暖橙"
     pub preset_name: String,
     /// 预览框的手动宽度（px）。
-    ///
-    /// `None`（旧配置 / 从未拖过）= 按「单行最大字数 × 预览字号」自动推算；
-    /// `Some(w)` = 用户在预览条两侧拖过把手，以手动值为准。
-    /// 用 `#[serde(default)]` 保证老 `config.toml` 缺这一项时能正常反序列化。
     #[serde(default)]
     pub preview_box_w: Option<f32>,
+
+    /// 主文字颜色（十六进制，如 "#FFFFFF"、"#FFD60A"）
+    #[serde(default = "default_primary_color")]
+    pub primary_color: String,
+    /// 描边粗细（0.0 表示无描边，典型 1.5 ~ 4.0）
+    #[serde(default = "default_outline_width")]
+    pub outline_width: f32,
+    /// 描边颜色（如 "#000000"）
+    #[serde(default = "default_outline_color")]
+    pub outline_color: String,
+    /// 底框风格："shadow" (投影) | "box" (半透明底框) | "none" (纯悬浮) | "pill" (圆角胶囊)
+    #[serde(default = "default_bg_style")]
+    pub bg_style: String,
+    /// 底框不透明度 0.0 ~ 1.0 (默认 0.6)
+    #[serde(default = "default_bg_opacity")]
+    pub bg_opacity: f32,
+    /// 是否粗体
+    #[serde(default = "default_is_bold")]
+    pub is_bold: bool,
+    /// 水平对齐方式："left" | "center" | "right"
+    #[serde(default = "default_alignment")]
+    pub alignment: String,
 }
+
+fn default_primary_color() -> String { "#FFFFFF".to_string() }
+fn default_outline_width() -> f32 { 2.0 }
+fn default_outline_color() -> String { "#000000".to_string() }
+fn default_bg_style() -> String { "shadow".to_string() }
+fn default_bg_opacity() -> f32 { 0.6 }
+fn default_is_bold() -> bool { true }
+fn default_alignment() -> String { "center".to_string() }
 
 impl Default for SubtitleStyleConfig {
     fn default() -> Self {
@@ -623,34 +649,134 @@ impl Default for SubtitleStyleConfig {
             bottom_margin: 40,
             preset_name: "白字黑影".to_string(),
             preview_box_w: None,
+            primary_color: default_primary_color(),
+            outline_width: default_outline_width(),
+            outline_color: default_outline_color(),
+            bg_style: default_bg_style(),
+            bg_opacity: default_bg_opacity(),
+            is_bold: default_is_bold(),
+            alignment: default_alignment(),
         }
     }
 }
 
 /// 可选预设列表（UI 与 `apply_preset` 共用同一份清单）
-pub const SUBTITLE_PRESETS: [&str; 4] = ["白字黑影", "黄字黑边", "半透明黑框", "电影沉浸"];
+pub const SUBTITLE_PRESETS: [&str; 6] = [
+    "白字黑影",
+    "黄字黑边",
+    "半透明黑框",
+    "电影沉浸",
+    "霓虹极光",
+    "活力暖橙",
+];
+
+/// 经典字幕调色板：(展示标签, 十六进制色值)
+pub const SUBTITLE_COLOR_PALETTE: [(&str, &str); 7] = [
+    ("纯白", "#FFFFFF"),
+    ("明黄", "#FFD60A"),
+    ("天蓝", "#38BDF8"),
+    ("薄荷", "#2DD4BF"),
+    ("樱粉", "#F472B6"),
+    ("暖橙", "#FB923C"),
+    ("浅紫", "#C084FC"),
+];
+
+/// 常用描边预设：(展示标签, 粗细px, 色值hex)
+pub const SUBTITLE_OUTLINE_OPTIONS: [(&str, f32); 4] = [
+    ("无描边", 0.0),
+    ("细边 1.5", 1.5),
+    ("中边 2.5", 2.5),
+    ("粗边 4.0", 4.0),
+];
 
 impl SubtitleStyleConfig {
-    /// 应用预设：预设不只是改个名字，而是同时套用一组排版参数，
-    /// 否则「切换预设」对画面毫无影响，形同虚设。
+    /// 应用预设：预设同时套用一组完整排版与色彩参数
     pub fn apply_preset(&mut self, preset: &str) {
         self.preset_name = preset.to_string();
-        let (font_size, letter_spacing, line_spacing, max_chars, bottom_margin) = match preset {
-            "黄字黑边" => (44, 1, 1.2, 16, 40),
-            "半透明黑框" => (36, 1, 1.2, 16, 40),
-            "电影沉浸" => (36, 4, 1.4, 20, 80),
+        match preset {
+            "黄字黑边" => {
+                self.font_size = 44;
+                self.letter_spacing = 1;
+                self.line_spacing = 1.2;
+                self.max_chars_per_line = 16;
+                self.bottom_margin = 40;
+                self.primary_color = "#FFD60A".to_string();
+                self.outline_color = "#000000".to_string();
+                self.outline_width = 3.0;
+                self.bg_style = "shadow".to_string();
+                self.bg_opacity = 0.8;
+                self.is_bold = true;
+            }
+            "半透明黑框" => {
+                self.font_size = 38;
+                self.letter_spacing = 1;
+                self.line_spacing = 1.2;
+                self.max_chars_per_line = 16;
+                self.bottom_margin = 40;
+                self.primary_color = "#FFFFFF".to_string();
+                self.outline_color = "#000000".to_string();
+                self.outline_width = 1.0;
+                self.bg_style = "box".to_string();
+                self.bg_opacity = 0.7;
+                self.is_bold = true;
+            }
+            "电影沉浸" => {
+                self.font_size = 36;
+                self.letter_spacing = 4;
+                self.line_spacing = 1.4;
+                self.max_chars_per_line = 20;
+                self.bottom_margin = 80;
+                self.primary_color = "#FFFFFF".to_string();
+                self.outline_color = "#000000".to_string();
+                self.outline_width = 0.0;
+                self.bg_style = "none".to_string();
+                self.bg_opacity = 0.0;
+                self.is_bold = false;
+            }
+            "霓虹极光" => {
+                self.font_size = 42;
+                self.letter_spacing = 2;
+                self.line_spacing = 1.3;
+                self.max_chars_per_line = 16;
+                self.bottom_margin = 40;
+                self.primary_color = "#2DD4BF".to_string();
+                self.outline_color = "#0F172A".to_string();
+                self.outline_width = 2.5;
+                self.bg_style = "box".to_string();
+                self.bg_opacity = 0.75;
+                self.is_bold = true;
+            }
+            "活力暖橙" => {
+                self.font_size = 42;
+                self.letter_spacing = 1;
+                self.line_spacing = 1.2;
+                self.max_chars_per_line = 16;
+                self.bottom_margin = 40;
+                self.primary_color = "#FB923C".to_string();
+                self.outline_color = "#000000".to_string();
+                self.outline_width = 2.5;
+                self.bg_style = "shadow".to_string();
+                self.bg_opacity = 0.8;
+                self.is_bold = true;
+            }
             // 白字黑影（默认）
-            _ => (40, 1, 1.2, 16, 40),
-        };
-        self.font_size = font_size;
-        self.letter_spacing = letter_spacing;
-        self.line_spacing = line_spacing;
-        self.max_chars_per_line = max_chars;
-        self.bottom_margin = bottom_margin;
+            _ => {
+                self.font_size = 40;
+                self.letter_spacing = 1;
+                self.line_spacing = 1.2;
+                self.max_chars_per_line = 16;
+                self.bottom_margin = 40;
+                self.primary_color = "#FFFFFF".to_string();
+                self.outline_color = "#000000".to_string();
+                self.outline_width = 2.0;
+                self.bg_style = "shadow".to_string();
+                self.bg_opacity = 0.5;
+                self.is_bold = true;
+            }
+        }
     }
 
-    /// 预览缩放系数：监视器画面高度约为 1080p 的 1/3，
-    /// 把 1080p 基准字号换算成监视器上的可读字号（纯近似，导出仍按 1080p 原值）。
+    /// 预览缩放系数：监视器画面高度约为 1080p 的 1/3
     pub const PREVIEW_SCALE: f32 = 0.32;
 
     /// 预览用字号（px）
@@ -661,6 +787,42 @@ impl SubtitleStyleConfig {
     /// 预览用底边距（画面高度比例）
     pub fn preview_bottom_ratio(&self) -> f32 {
         (self.bottom_margin as f32 / 1080.0).clamp(0.0, 0.25)
+    }
+
+    /// 将主颜色 hex 转为 ASS 格式颜色（&H00BBGGRR）
+    pub fn ass_primary_colour(&self) -> String {
+        Self::hex_to_ass_bgr(&self.primary_color)
+    }
+
+    /// 将描边颜色 hex 转为 ASS 格式颜色（&H00BBGGRR）
+    pub fn ass_outline_colour(&self) -> String {
+        Self::hex_to_ass_bgr(&self.outline_color)
+    }
+
+    /// 十六进制 (#RRGGBB) 转 ASS 格式 (&H00BBGGRR)
+    pub fn hex_to_ass_bgr(hex: &str) -> String {
+        let clean = hex.trim().trim_start_matches('#');
+        if clean.len() >= 6 {
+            let r = &clean[0..2];
+            let g = &clean[2..4];
+            let b = &clean[4..6];
+            format!("&H00{b}{g}{r}")
+        } else {
+            "&H00FFFFFF".to_string()
+        }
+    }
+
+    /// 十六进制 (#RRGGBB) 转 RGB (r, g, b)
+    pub fn hex_to_rgb(hex: &str) -> (u8, u8, u8) {
+        let clean = hex.trim().trim_start_matches('#');
+        if clean.len() >= 6 {
+            let r = u8::from_str_radix(&clean[0..2], 16).unwrap_or(255);
+            let g = u8::from_str_radix(&clean[2..4], 16).unwrap_or(255);
+            let b = u8::from_str_radix(&clean[4..6], 16).unwrap_or(255);
+            (r, g, b)
+        } else {
+            (255, 255, 255)
+        }
     }
 }
 

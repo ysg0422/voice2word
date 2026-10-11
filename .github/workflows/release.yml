@@ -61,12 +61,24 @@ jobs:
         run: cargo test --lib -- --test-threads=1
 
       - name: cargo build --release
-        # release 会让 gpui 的 build script 去找 fxc.exe 编译着色器；
-        # windows-latest 自带 Windows SDK，where.exe 能命中（仓库不写死路径）。
+        # 一次性构建主程序 voice2word.exe 与内置向导安装包 voice2word-setup.exe
         run: cargo build --release
 
       # ---------------------------------------------------------------
-      # 创建 Release 并发布纯净便携版 voice2word.exe
+      # 组装发布物（安装包向导版 + 绿色便携版）
+      # ---------------------------------------------------------------
+      - name: Assemble Release Assets
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $version = $tag -replace '^v', ''
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item target/release/voice2word.exe dist/voice2word.exe -Force
+          Copy-Item target/release/voice2word-setup.exe "dist/Voice2Word-v$version-Setup.exe" -Force
+          Get-ChildItem dist
+
+      # ---------------------------------------------------------------
+      # 创建 GitHub Release 并发布安装包与便携版
       # ---------------------------------------------------------------
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -75,12 +87,18 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
-          files: target/release/voice2word.exe
+          files: |
+            dist/Voice2Word-*-Setup.exe
+            dist/voice2word.exe
           body: |
             ## Voice2Word ${{ github.ref_name }} (Windows x64)
 
-            纯净便携单文件版，直接下载 `voice2word.exe` 即可运行（绿色免安装）。
+            ### 下载说明
+            | 文件 | 类型 | 适用场景与说明 |
+            | :--- | :--- | :--- |
+            | **`Voice2Word-v${{ github.ref_name }}-Setup.exe`** | **安装包向导版（推荐）** | 自动向导安装，自动生成桌面快捷方式、开始菜单图标与卸载项，无控制台黑框 |
+            | `voice2word.exe` | 绿色便携版 | 单文件即开即用（无控制台黑框），免安装 |
 
-            ### 使用说明
-            1. 下载下方 `voice2word.exe` 双击即可运行。
+            ### 首次使用
+            1. 下载安装包或便携版直接运行即可。
             2. 首次运行若缺少本地语音或标点模型，进入「性能设置 → 模型与组件」一键补齐即可。

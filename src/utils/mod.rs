@@ -19,7 +19,10 @@ pub mod time;
 pub mod update_check;
 pub mod zip_extract;
 
-pub use config::{AppConfig, SubtitleStyleConfig, SUBTITLE_PRESETS};
+pub use config::{
+    AppConfig, SubtitleStyleConfig, SUBTITLE_COLOR_PALETTE, SUBTITLE_OUTLINE_OPTIONS,
+    SUBTITLE_PRESETS,
+};
 pub use frame_cache::FrameCache;
 pub use logger::init_logger;
 pub use model_download::{DownloadItem, ItemGroup, ITEMS};
