@@ -123,6 +123,12 @@ impl FrameCache {
         }
     }
 
+    /// 取缓存锁；即便持锁线程此前 panic 导致 Mutex 中毒，也取回内部值继续用。
+    /// 帧缓存只是可随时重建的旁路数据，不值得因一次中毒打断整条预览抽帧链路。
+    fn lock_cache(&self) -> std::sync::MutexGuard<'_, FrameCacheInner> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 记一次新增帧，攒够阈值就裁剪一次磁盘目录。
     fn note_disk_write(&self, disk_dir: &Path) {
         if self.since_prune.fetch_add(1, Ordering::Relaxed) + 1 >= PRUNE_EVERY {
@@ -162,7 +168,7 @@ impl FrameCache {
         let key = Self::cache_key(video_path, time_sec);
 
         // 尝试从内存缓存获取
-        if let Some(path) = self.cache.lock().unwrap().map.get(&key).cloned() {
+        if let Some(path) = self.lock_cache().map.get(&key).cloned() {
             if path.exists() {
                 return Ok(path);
             }
@@ -176,9 +182,7 @@ impl FrameCache {
 
         // 检查磁盘是否已存在抽取过的帧，存在则直接复用
         if out_jpg.exists() {
-            self.cache
-                .lock()
-                .unwrap()
+            self.lock_cache()
                 .insert(key.clone(), out_jpg.clone(), self.max_size);
             return Ok(out_jpg);
         }
@@ -205,9 +209,7 @@ impl FrameCache {
         }
 
         // 限制缓存大小，FIFO 淘汰
-        self.cache
-            .lock()
-            .unwrap()
+        self.lock_cache()
             .insert(key, out_jpg.clone(), self.max_size);
         // 磁盘目录也要有上限，否则长期使用后 v2w_frames 会只增不减
         self.note_disk_write(&temp_dir);
@@ -218,7 +220,7 @@ impl FrameCache {
     /// 清理所有缓存（含磁盘帧目录）
     pub fn clear(&self) {
         {
-            let mut inner = self.cache.lock().unwrap();
+            let mut inner = self.lock_cache();
             inner.map.clear();
             inner.order.clear();
         }
@@ -227,7 +229,7 @@ impl FrameCache {
 
     /// 获取当前缓存大小
     pub fn size(&self) -> usize {
-        self.cache.lock().unwrap().map.len()
+        self.lock_cache().map.len()
     }
 }
 
@@ -264,7 +266,7 @@ mod tests {
         let cache = FrameCache::new(2);
         let inner_path = |s: &str| PathBuf::from(s);
         {
-            let mut inner = cache.cache.lock().unwrap();
+            let mut inner = cache.lock_cache();
             inner.insert("k1".into(), inner_path("p1"), cache.max_size);
             inner.insert("k2".into(), inner_path("p2"), cache.max_size);
             // k1 重复插入移至队尾：下次淘汰的应是 k2

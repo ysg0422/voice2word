@@ -2279,7 +2279,10 @@ impl MainWindow {
 
         // 记录最新期望的时间戳
         {
-            let mut pending = self.pending_extract_time.lock().unwrap();
+            let mut pending = self
+                .pending_extract_time
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *pending = Some(target_time);
         }
 
@@ -2307,7 +2310,7 @@ impl MainWindow {
             loop {
                 // 取出当前最新的目标时间
                 let next_time = {
-                    let mut lock = pending_time.lock().unwrap();
+                    let mut lock = pending_time.lock().unwrap_or_else(|e| e.into_inner());
                     lock.take()
                 };
 
@@ -2317,7 +2320,10 @@ impl MainWindow {
                         // 无待处理请求，释放锁并退出
                         is_extracting.store(false, std::sync::atomic::Ordering::SeqCst);
                         // 双重检查避免竞态退出
-                        let has_more = pending_time.lock().unwrap().is_some();
+                        let has_more = pending_time
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some();
                         if has_more
                             && is_extracting
                                 .compare_exchange(
@@ -2346,7 +2352,7 @@ impl MainWindow {
                         .await;
 
                 let is_latest = {
-                    let lock = pending_time.lock().unwrap();
+                    let lock = pending_time.lock().unwrap_or_else(|e| e.into_inner());
                     lock.is_none()
                 };
 

@@ -652,11 +652,15 @@ impl MainWindow {
         };
 
         // 格式化日期（取日期部分）
-        let date_display = if task.created_at.len() >= 10 {
-            task.created_at[..10].to_string()
-        } else {
-            task.created_at.clone()
-        };
+        // 取日期部分（前 10 字节 = "YYYY-MM-DD"）。这里用 `get(..10)` 而不是直接
+        // `[..10]` 切片：`created_at` 正常由数据库写入固定为 ASCII 时间戳，但万一
+        // 混入多字节字符、且第 10 字节恰好落在字符中间，直接切片会 panic，`get` 则
+        // 安全返回 None 并退化为显示整串。
+        let date_display = task
+            .created_at
+            .get(..10)
+            .map(str::to_string)
+            .unwrap_or_else(|| task.created_at.clone());
 
         let selected = self.library_selected.contains(&task_id);
         div()

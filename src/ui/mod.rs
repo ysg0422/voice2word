@@ -362,6 +362,8 @@ pub struct MainWindow {
     pub(crate) text_focus: FocusHandle,
     pub(crate) is_text_focused: bool,
     pub(crate) is_extracting_frame: Arc<std::sync::atomic::AtomicBool>,
+    /// 最新一次期望抽帧时间戳（单飞队列用）。读取时用 `unwrap_or_else(|e| e.into_inner())`
+    /// 容忍 Mutex 中毒：这只是可覆盖的旁路状态，一次中毒不该打断整条预览抽帧链路。
     pub(crate) pending_extract_time: Arc<std::sync::Mutex<Option<f64>>>,
     pub(crate) last_drag_extract: std::time::Instant,
     pub(crate) play_tick_generation: u64,
