@@ -2,6 +2,7 @@
 
 use gpui::prelude::*;
 use gpui::*;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -446,10 +447,9 @@ impl MainWindow {
                 )
                 .into_any_element();
         }
-        let ordered: Vec<_> = ids
-            .iter()
-            .filter_map(|id| self.state.recent_tasks.iter().find(|t| t.id == *id))
-            .collect();
+        // 逐卡片线性 find 是「卡片数 × 记录数」——50 × 50 = 每帧 2500 次比较。
+        // 改成每帧建一次「id → 下标」索引再查表，见 `library_ordered_tasks`。
+        let ordered = library_ordered_tasks(&self.state.recent_tasks, &ids);
         let cards: Vec<AnyElement> = ordered
             .into_iter()
             .map(|task| self.render_library_card(task, cx).into_any_element())
@@ -1004,6 +1004,34 @@ impl MainWindow {
     }
 }
 
+/// 每帧构建一次的「任务 id → 下标」索引。
+///
+/// 卡片列表没有虚拟化：50 张卡片各自 `recent_tasks.iter().find(...)` 就是每帧
+/// 2500 次比较，纯属白跑。重复 id 保留**首次**出现的下标，与旧线性 `find` 的
+/// 语义逐字一致（真实数据受 DB 主键约束不会重复，这里只是不让重构引入差异）。
+fn library_task_index(tasks: &[crate::storage::TaskRecord]) -> HashMap<i64, usize> {
+    let mut index: HashMap<i64, usize> = HashMap::with_capacity(tasks.len());
+    for (i, task) in tasks.iter().enumerate() {
+        index.entry(task.id).or_insert(i);
+    }
+    index
+}
+
+/// 按可见 id 的顺序取出任务引用。
+///
+/// 查不到的 id **跳过**（与旧 `filter_map` 一致：那张卡片不渲染，而不是显示占位），
+/// 输出顺序严格跟随 `visible_ids`。
+fn library_ordered_tasks<'a>(
+    tasks: &'a [crate::storage::TaskRecord],
+    visible_ids: &[i64],
+) -> Vec<&'a crate::storage::TaskRecord> {
+    let index = library_task_index(tasks);
+    visible_ids
+        .iter()
+        .filter_map(|id| index.get(id).map(|i| &tasks[*i]))
+        .collect()
+}
+
 /// 把字节数格式化成界面用的体积文本。
 ///
 /// 抽成独立函数是因为它现在跑在后台线程里（见 `ensure_library_sizes`），
@@ -1036,7 +1064,11 @@ fn library_ext_label(file_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{export_spec_for, format_file_size, library_ext_label};
+    use super::{
+        export_spec_for, format_file_size, library_ext_label, library_ordered_tasks,
+        library_task_index,
+    };
+    use crate::storage::TaskRecord;
 
     #[test]
     fn file_size_formatting_matches_previous_rendering() {
@@ -1083,5 +1115,71 @@ mod tests {
         assert_eq!(library_ext_label("noext"), "NOEXT");
         assert_eq!(library_ext_label(""), "MP4");
         assert_eq!(library_ext_label("..."), "MP4");
+    }
+    /// 测试用的最小任务记录（视频库列表返回的就是这种「空壳」记录）。
+    fn task_record(id: i64, file_name: &str) -> TaskRecord {
+        TaskRecord {
+            id,
+            file_path: format!("D:/videos/{file_name}"),
+            file_name: file_name.to_string(),
+            duration: 1.0,
+            status: "completed".to_string(),
+            segments: Vec::new(),
+            segment_count: 0,
+            sample_text: String::new(),
+            segments_loaded: false,
+            has_translation: false,
+            created_at: "2026-01-01 00:00:00".to_string(),
+            content_hash: None,
+            metrics: None,
+        }
+    }
+
+    /// 回归（P3）：卡片列表从「每张卡片各自线性 `find`」换成每帧一次的
+    /// HashMap 索引后，结果必须与旧的 `filter_map(|id| tasks.iter().find(...))`
+    /// 逐项相同——顺序跟随可见 id、查不到的 id **跳过**（那张卡片不渲染，
+    /// 而不是显示占位）、重复 id 取**首次**出现的记录。
+    #[test]
+    fn library_index_lookup_matches_linear_find() {
+        let tasks = vec![
+            task_record(7, "a.mp4"),
+            task_record(5, "b.mp4"),
+            task_record(3, "c.mp4"),
+            // 真实数据受 DB 主键约束 id 唯一；这里故意造一条重复，
+            // 钉住「首个取胜」这条旧语义
+            task_record(5, "b-dup.mp4"),
+        ];
+        let visible = vec![3, 7, 99, 5];
+
+        let got: Vec<(i64, String)> = library_ordered_tasks(&tasks, &visible)
+            .iter()
+            .map(|t| (t.id, t.file_name.clone()))
+            .collect();
+        let expected: Vec<(i64, String)> = visible
+            .iter()
+            .filter_map(|id| tasks.iter().find(|t| t.id == *id))
+            .map(|t| (t.id, t.file_name.clone()))
+            .collect();
+
+        assert_eq!(got, expected, "索引查表必须与旧的逐条线性 find 等价");
+        assert_eq!(
+            got,
+            vec![
+                (3, "c.mp4".to_string()),
+                (7, "a.mp4".to_string()),
+                (5, "b.mp4".to_string())
+            ],
+            "顺序跟随可见 id；查不到的跳过；重复 id 取首次出现"
+        );
+        assert_eq!(
+            library_task_index(&tasks).get(&5).copied(),
+            Some(1),
+            "重复 id 必须保留首次出现的下标"
+        );
+        assert!(library_ordered_tasks(&tasks, &[]).is_empty());
+        assert!(
+            library_ordered_tasks(&tasks, &[123]).is_empty(),
+            "全部查不到时不应渲染任何卡片"
+        );
     }
 }

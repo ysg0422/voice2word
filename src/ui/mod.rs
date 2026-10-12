@@ -516,7 +516,10 @@ pub struct MainWindow {
     /// 术语表疑似未命中句下标的缓存：键为 `(术语表文本, segments_revision)`。
     /// 与 `subtitle_filter` 同理——播放时每 40ms 重绘一次，逐帧对上千句 × 术语条数
     /// 跑子串匹配会白白掉帧。
-    pub(crate) glossary_bad_cache: Option<((String, u64), Vec<usize>)>,
+    ///
+    /// 值存 `Arc<[usize]>`：命中路径只克隆引用计数。原来的 `Vec<usize>` 每次命中
+    /// 都要深拷贝一遍，等于把省下的遍历又按元素逐个拷了回来。
+    pub(crate) glossary_bad_cache: GlossaryBadCache,
     /// 剪辑台渲染用的「派生统计快照」缓存：键为 [`DerivedSnapshotKey`]。
     ///
     /// 与上面三个缓存同一范式（`segments_revision` + 会改动结果的配置项），
@@ -1002,6 +1005,42 @@ pub(crate) fn cached_derived_snapshot(
     snapshot
 }
 
+/// 术语表违规下标缓存的键：`(术语表原文, segments_revision)`。
+///
+/// 键用**原文**而不是解析后的条目：用户改术语表的行为都会改这串文本，
+/// 而解析结果一旦因为上限截断等原因与原文不同步，就会出现「改了术语表、高亮不动」。
+pub(crate) type GlossaryBadKey = (String, u64);
+
+/// 术语表违规下标缓存：值存 `Arc<[usize]>`，命中时只克隆引用计数。
+pub(crate) type GlossaryBadCache = Option<(GlossaryBadKey, Arc<[usize]>)>;
+
+/// 术语表违规下标的缓存取数：键一致直接复用上次那个 `Arc`，否则现算并换入。
+///
+/// 抽成自由函数（不吃 `AppState`）是为了能在无 GUI 上下文的单测里钉死两条性质：
+/// 「同键命中不重算、复用同一个 `Arc`」与「术语表文本或 `segments_revision` 变了必重算」。
+/// 命中路径**不 clone 术语表文本**——原实现每帧都 `glossary.clone()` 去拼键，
+/// 等于每帧白拷一份可能上 KB 的字符串，只为了立刻做一次字符串比较。
+pub(crate) fn glossary_violations_cached(
+    cache: &mut GlossaryBadCache,
+    glossary: &str,
+    segments_revision: u64,
+    compute: impl FnOnce() -> Vec<usize>,
+) -> Arc<[usize]> {
+    if let Some((cached_key, cached)) = cache.as_ref() {
+        // 键判定与改造前逐字等价：术语表原文 + `segments_revision` 都相同才命中。
+        if cached_key.1 == segments_revision && cached_key.0 == glossary {
+            return Arc::clone(cached);
+        }
+    }
+    let result: Arc<[usize]> = compute().into();
+    // 只有真的失效才把术语表原文拷进新键（每帧最多一次，而不是每次调用）。
+    *cache = Some((
+        (glossary.to_string(), segments_revision),
+        Arc::clone(&result),
+    ));
+    result
+}
+
 impl MainWindow {
     pub fn new(state: AppState, cx: &mut Context<Self>) -> Self {
         let metrics_rx = crate::utils::SystemMonitor::spawn_background_monitor();
@@ -1226,19 +1265,26 @@ impl MainWindow {
     ///
     /// 术语表为空时直接返回空（零开销）；否则每帧最多重算一次，而不是在虚拟列表的
     /// 逐行闭包里现算——那会对「可视行 × 术语条数」重复匹配，纯属浪费。
+    ///
+    /// 返回 `Arc<[usize]>`：命中只克隆引用计数，术语表原文也只参与**按引用**比较
+    /// （原实现每次调用都 `glossary.clone()` 拼键 + `Vec::clone()` 深拷贝结果）。
+    pub(crate) fn cached_glossary_violations_arc(&mut self) -> Arc<[usize]> {
+        let state = &self.state;
+        let glossary = state.config.translate.glossary.as_str();
+        let revision = state.segments_revision;
+        glossary_violations_cached(&mut self.glossary_bad_cache, glossary, revision, || {
+            state.glossary_violations()
+        })
+    }
+
+    /// 兼容入口：仍返回 owned `Vec`。
+    ///
+    /// `actions.rs`（质检表的 `glossary_violations: Vec<usize>` 字段）与 `editor.rs`
+    /// （逐帧转 `HashSet`）都按 `Vec` 消费，而这两个文件不在本次改动范围内；
+    /// 这里保留原名与返回类型，内部走同一个 Arc 缓存——省掉的是「每帧 clone 术语表
+    /// 文本」这条固定开销，最后一次 `to_vec()` 仍在（内容与顺序完全不变）。
     pub(crate) fn cached_glossary_violations(&mut self) -> Vec<usize> {
-        let key = (
-            self.state.config.translate.glossary.clone(),
-            self.state.segments_revision,
-        );
-        if let Some((cached_key, cached)) = self.glossary_bad_cache.as_ref() {
-            if cached_key == &key {
-                return cached.clone();
-            }
-        }
-        let result = self.state.glossary_violations();
-        self.glossary_bad_cache = Some((key, result.clone()));
-        result
+        self.cached_glossary_violations_arc().to_vec()
     }
 
     /// 低置信句下标（按 `(阈值, segments_revision)` 缓存）。
@@ -2586,9 +2632,10 @@ fn should_ignore_delete_in_status(status: &ProcessStatus) -> bool {
 mod tests {
     use super::{
         build_derived_snapshot, cached_derived_snapshot, filter_cache_usable, filter_commands,
-        has_any_translation, has_distinct_translation, insert_printable_key,
-        move_palette_selection_row, should_ignore_delete_in_status, translated_other_lang_count,
-        DerivedSnapshot, DerivedSnapshotKey, PALETTE_COMMANDS,
+        glossary_violations_cached, has_any_translation, has_distinct_translation,
+        insert_printable_key, move_palette_selection_row, should_ignore_delete_in_status,
+        translated_other_lang_count, DerivedSnapshot, DerivedSnapshotKey, GlossaryBadCache,
+        PALETTE_COMMANDS,
     };
     use crate::subtitle::Segment;
     use std::cell::Cell;
@@ -3157,5 +3204,62 @@ mod tests {
         seg.translation = Some("另一句话".to_string());
         assert!(has_distinct_translation(std::slice::from_ref(&seg)));
         assert!(has_any_translation(std::slice::from_ref(&seg)));
+    }
+    /// 回归（P3）：术语表违规下标缓存命中时必须复用同一个 `Arc`，不得重算、
+    /// 更不得像原来那样 `Vec::clone()` 深拷贝（编辑台每帧都取一次这批下标）。
+    #[test]
+    fn glossary_violation_cache_hit_reuses_arc_without_recompute() {
+        let mut cache: GlossaryBadCache = None;
+        let mut computes = 0usize;
+        let first = glossary_violations_cached(&mut cache, "生成器=engine", 7, || {
+            computes += 1;
+            vec![1, 4]
+        });
+        let second = glossary_violations_cached(&mut cache, "生成器=engine", 7, || {
+            computes += 1;
+            // 命中时这个闭包根本不该被执行：故意给一个完全不同的结果
+            vec![99]
+        });
+        assert_eq!(computes, 1, "同一键必须命中缓存、不得重算");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "命中必须复用同一个 Arc（零深拷贝）"
+        );
+        assert_eq!(&*second, &[1usize, 4][..], "命中返回的仍是缓存内容");
+        assert_eq!(second.to_vec(), vec![1, 4], "兼容入口（to_vec）内容不变");
+    }
+
+    /// 键的失效条件必须与改造前**等价**：术语表**内容**变了、或 `segments_revision`
+    /// 推进了，都必须重算；否则会出现「改了术语表、琥珀色高亮不动」。
+    #[test]
+    fn glossary_violation_cache_invalidates_on_glossary_or_revision_change() {
+        let mut cache: GlossaryBadCache = None;
+        let base = glossary_violations_cached(&mut cache, "甲=乙", 1, || vec![2]);
+        assert_eq!(&*base, &[2usize][..]);
+        // 术语表文本变了（这里变成空表）→ 必须重算
+        let emptied = glossary_violations_cached(&mut cache, "", 1, || vec![7]);
+        assert_eq!(&*emptied, &[7usize][..], "术语表文本变化必须失效重算");
+        assert!(!Arc::ptr_eq(&base, &emptied));
+        // revision 推进 → 必须重算
+        let bumped = glossary_violations_cached(&mut cache, "", 2, || vec![5]);
+        assert_eq!(
+            &*bumped,
+            &[5usize][..],
+            "segments_revision 推进必须失效重算"
+        );
+        assert!(!Arc::ptr_eq(&emptied, &bumped));
+        // 同键再来一次 → 命中同一个 Arc（键是「原文 + revision」，两者都要一致）
+        let again = glossary_violations_cached(&mut cache, "", 2, || vec![123]);
+        assert!(
+            Arc::ptr_eq(&bumped, &again),
+            "同键（空术语表 + rev2）应命中"
+        );
+        // 文本回到旧值、但 revision 已是 2 → 仍然不得复用 rev1 的结果
+        let reverted = glossary_violations_cached(&mut cache, "甲=乙", 2, || vec![6]);
+        assert_eq!(
+            &*reverted,
+            &[6usize][..],
+            "文本相同但 revision 变过，必须重算"
+        );
     }
 }

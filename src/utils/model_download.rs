@@ -467,7 +467,7 @@ impl PresenceContext {
     }
 
     pub fn is_present(&self, item: &DownloadItem) -> bool {
-        is_present_with(item, &self.cfg)
+        is_present_with_opt(item, self.cfg.as_ref())
     }
 }
 
@@ -476,7 +476,9 @@ impl PresenceContext {
 /// `AppState` 自己就持有 `config`，判定时再 `load_from_file` 一次纯属浪费
 /// （启动路径上因此白读一遍 TOML）。调用方有配置就直接用这个。
 pub fn is_present_with_config(item: &DownloadItem, cfg: &AppConfig) -> bool {
-    is_present_with(item, &Some(cfg.clone()))
+    // 判定只读 `cfg.paths` 查表，没必要把整份 `AppConfig` 深拷贝一份再取引用；
+    // 这里直接借用，与 `is_present_with` 共用同一份实现，语义不变。
+    is_present_with_opt(item, Some(cfg))
 }
 
 /// 一次扫描、复用同一份内存配置。
@@ -490,12 +492,16 @@ impl<'a> PresenceContextRef<'a> {
     }
 
     pub fn is_present(&self, item: &DownloadItem) -> bool {
-        is_present_with(item, &Some(self.cfg.clone()))
+        // 原实现是 `&Some(self.cfg.clone())`：每调一次就深拷贝整份 `AppConfig`
+        // （paths / pipeline / 术语表等），而模型管理面板是**每个条目每帧**调一次，
+        // 这份拷贝纯属白跑。判定只读 `cfg.paths`，直接借用传下去即可。
+        is_present_with_opt(item, Some(self.cfg))
     }
 
     /// 是否命中了用户自编译的自包含构建（同一次扫描内复用配置，不额外读盘）。
     pub fn is_custom_build(&self, item: &DownloadItem) -> bool {
-        is_custom_build_with(item, &Some(self.cfg.clone()))
+        // 同上：借用配置，避免每个条目每帧白拷贝一份 `AppConfig`。
+        is_custom_build_with_opt(item, Some(self.cfg))
     }
 }
 
@@ -521,6 +527,14 @@ pub fn is_present(item: &DownloadItem) -> bool {
 }
 
 fn is_present_with(item: &DownloadItem, cfg: &Option<AppConfig>) -> bool {
+    is_present_with_opt(item, cfg.as_ref())
+}
+
+/// [`is_present_with`] 的**借用版**：一路借 `&AppConfig`，零拷贝。
+///
+/// 保留上面那个「按值 Option」签名只为不动既有调用点与单测；两者共用这一份
+/// 实现，因此判定逐字同源——`PresenceContextRef` 走的也是这里。
+fn is_present_with_opt(item: &DownloadItem, cfg: Option<&AppConfig>) -> bool {
     let Some(path) = resolve_existing_path(item, cfg) else {
         return false;
     };
@@ -711,6 +725,11 @@ fn is_gpu_build(entry: &Path) -> bool {
 /// （用户可能把 `whisper_cli` 指到别处），再判断形态。界面据此区分
 /// 「本项目下载展开的官方包」与「用户自己编的版本」，避免用户误以为自己的构建被覆盖。
 pub fn is_custom_build_with(item: &DownloadItem, cfg: &Option<AppConfig>) -> bool {
+    is_custom_build_with_opt(item, cfg.as_ref())
+}
+
+/// [`is_custom_build_with`] 的借用版（与 [`is_present_with_opt`] 同一套理由）。
+pub fn is_custom_build_with_opt(item: &DownloadItem, cfg: Option<&AppConfig>) -> bool {
     let Some(path) = resolve_existing_path(item, cfg) else {
         return false;
     };
@@ -742,7 +761,9 @@ fn min_acceptable_size(item: &DownloadItem) -> u64 {
 ///
 /// 这一步很关键：只认默认路径的话，一个「已经配好且能用」的组件
 /// 会被界面一直标成「缺失」。
-fn resolve_existing_path(item: &DownloadItem, cfg: &Option<AppConfig>) -> Option<PathBuf> {
+/// 只接受 `Option<&AppConfig>`（借用）：判定只在 `cfg.paths` 上查表，
+/// 不需要也不该把整份 `AppConfig` 拷一份再取引用（`PresenceContextRef` 每帧都走这里）。
+fn resolve_existing_path(item: &DownloadItem, cfg: Option<&AppConfig>) -> Option<PathBuf> {
     // 配置里为同类组件指定的路径（按 dest 反查该配哪个字段）
     let configured: Option<PathBuf> = configured_path_for(item, cfg);
     if let Some(p) = configured {
@@ -758,9 +779,10 @@ fn resolve_existing_path(item: &DownloadItem, cfg: &Option<AppConfig>) -> Option
 }
 
 /// 按条目 id 反查 `config.toml` 中对应的路径字段（已解析为绝对路径）。
-fn configured_path_for(item: &DownloadItem, cfg: &Option<AppConfig>) -> Option<PathBuf> {
+/// 借用 `&AppConfig`：只在 `cfg.paths` 上查表，不需要所有权。
+fn configured_path_for(item: &DownloadItem, cfg: Option<&AppConfig>) -> Option<PathBuf> {
     // 配置由调用方读一次并传入；这里只做查表，不再碰磁盘。
-    let cfg = cfg.as_ref()?;
+    let cfg = cfg?;
     let raw: Option<&str> = match item.id {
         "ffmpeg" => Some(cfg.paths.ffmpeg.as_str()),
         "whisper-small" | "whisper-base" | "whisper-turbo-q5" | "whisper-turbo-q8" => {
@@ -918,8 +940,7 @@ pub fn item_id_for_path(path: &Path) -> Option<&'static str> {
 /// `configured_path_for` 的规则（尤其是 whisper 档位那条「只认配置指向的档位」）
 /// 分叉，就会出现「定位到 A、删除却删 B」的错位。
 pub fn item_effective_path(item: &DownloadItem, cfg: &AppConfig) -> PathBuf {
-    configured_path_for(item, &Some(cfg.clone()))
-        .unwrap_or_else(|| AppConfig::resolve_path(item.dest))
+    configured_path_for(item, Some(cfg)).unwrap_or_else(|| AppConfig::resolve_path(item.dest))
 }
 
 /// 删除某个组件已经下载的文件，成功时返回被删掉的路径。
@@ -964,8 +985,8 @@ pub fn delete_item_file(item_id: &str, cfg: &AppConfig) -> Result<Option<PathBuf
     }
 
     // 与「是否已就位」用同一套解析逻辑，保证删的就是界面报告存在的那个文件。
-    let cfg_opt = Some(cfg.clone());
-    let Some(path) = resolve_existing_path(item, &cfg_opt) else {
+    // 同一套解析逻辑；这里借用 `cfg`，避免为了取引用再拷一份配置。
+    let Some(path) = resolve_existing_path(item, Some(cfg)) else {
         return Ok(None);
     };
 
@@ -2049,7 +2070,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         // 只有一个 exe，没有 llama-server.exe / DLL（模拟静态构建）
         let custom = dir.join("llama-completion.exe");
-        fs::write(&custom, vec![0u8; 2_000_000]).unwrap();
+        // 3 MB >= `SELF_CONTAINED_ENTRY_FLOOR`（2 MB）：这才算「静态自包含单文件」形态
+        fs::write(&custom, vec![0u8; 3_000_000]).unwrap();
 
         let mut cfg = AppConfig::default();
         cfg.paths.llama_cli = custom.to_string_lossy().to_string();
@@ -2178,7 +2200,7 @@ mod tests {
 
         let item = item_by_id("ffmpeg").unwrap();
         assert!(
-            resolve_existing_path(item, &Some(cfg.clone())).is_none(),
+            resolve_existing_path(item, Some(&cfg)).is_none(),
             "前置条件：配置与默认路径都不存在"
         );
         assert_eq!(delete_item_file("ffmpeg", &cfg).unwrap(), None);
@@ -2561,5 +2583,94 @@ mod tests {
         assert_eq!(range_header(0), "bytes=0-");
         assert_eq!(range_header(500), "bytes=500-");
         assert_eq!(range_header(4_078_768), "bytes=4078768-");
+    }
+    /// 借用版入口必须与既有「按值 Option」入口给出**逐条一致**的结论。
+    ///
+    /// 背景：`PresenceContextRef::is_present` / `is_custom_build` 原实现每次调用都
+    /// `self.cfg.clone()`——深拷贝整份 `AppConfig`（paths / pipeline / 术语表等），
+    /// 而 `model_manager` 是**每个条目每帧**各调一次。改成借用省掉的只是拷贝，
+    /// **绝不能**改变判定：一旦分叉，界面、启动日志与删除入口就会互相矛盾。
+    #[test]
+    fn borrowed_presence_entries_agree_with_owned_config() {
+        let dir = std::env::temp_dir().join(format!("v2w_borrow_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 造一个「够大」的假 ffmpeg（`is_present` 对它有条体积下限）
+        let fake_ffmpeg = dir.join("my-ffmpeg.exe");
+        fs::write(&fake_ffmpeg, vec![0u8; 300_000]).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.paths.ffmpeg = fake_ffmpeg.to_string_lossy().to_string();
+
+        let item = item_by_id("ffmpeg").expect("有 ffmpeg 条目");
+        // 按值入口需要一份 clone 才能与借用版同时持有同一配置
+        let owned = is_present_with(item, &(Some(cfg.clone())));
+        let ctx = PresenceContextRef::new(&cfg);
+        assert!(owned, "前置条件：配置指向的文件存在且够大，应判为已就位");
+        assert_eq!(
+            ctx.is_present(item),
+            owned,
+            "借用上下文与按值入口结论必须一致"
+        );
+        assert_eq!(
+            is_present_with_opt(item, Some(&cfg)),
+            owned,
+            "借用 Option 入口与按值入口结论必须一致"
+        );
+        assert_eq!(
+            is_present_with_config(item, &cfg),
+            owned,
+            "`is_present_with_config` 与按值入口结论必须一致"
+        );
+        assert_eq!(
+            ctx.is_custom_build(item),
+            is_custom_build_with(item, &(Some(cfg.clone()))),
+            "自编译判定的借用/按值入口结论必须一致"
+        );
+
+        // 反例：配置指向不存在的文件时两条路径都要判缺失——借用不得退化成
+        // 「读默认路径」或「忽略配置」。
+        cfg.paths.ffmpeg = dir.join("not-there.exe").to_string_lossy().to_string();
+        let missing = is_present_with(item, &(Some(cfg.clone())));
+        let ctx = PresenceContextRef::new(&cfg);
+        assert!(!missing, "前置条件：配置与默认路径都不存在");
+        assert_eq!(ctx.is_present(item), missing, "缺失结论也必须一致");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `is_custom_build` 的借用入口同样只看配置指向的**实际**路径。
+    ///
+    /// 素材与 `configured_custom_llama_build_without_companion_is_present` 同源：
+    /// 配置指向一个 2 MB 的单文件构建（同目录没有伴生 DLL），借用版也必须认出
+    /// 「用户自编译」，否则界面会把用户的构建误报成「官方包未下载」。
+    #[test]
+    fn borrowed_custom_build_detection_matches_owned_entry() {
+        let dir = std::env::temp_dir().join(format!("v2w_borrow_custom_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let custom = dir.join("llama-completion.exe");
+        // 3 MB >= `SELF_CONTAINED_ENTRY_FLOOR`（2 MB）：这才算「静态自包含单文件」形态
+        fs::write(&custom, vec![0u8; 3_000_000]).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.paths.llama_cli = custom.to_string_lossy().to_string();
+
+        let item = item_by_id("llama-cpp").expect("有 llama-cpp 条目");
+        let owned = is_custom_build_with(item, &(Some(cfg.clone())));
+        let ctx = PresenceContextRef::new(&cfg);
+        assert!(owned, "3 MB 单文件且无伴生文件，应判为自编译构建");
+        assert_eq!(
+            ctx.is_custom_build(item),
+            owned,
+            "借用版必须认出同一个自编译构建"
+        );
+        assert_eq!(
+            ctx.is_present(item),
+            is_present_with(item, &(Some(cfg.clone()))),
+            "就位判定同样必须一致"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
