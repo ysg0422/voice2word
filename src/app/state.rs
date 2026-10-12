@@ -428,6 +428,19 @@ pub struct EditSnapshot {
 /// 暴露出的形状与语义和原字段完全一致。
 pub type CachedTranscription = Arc<std::sync::Mutex<Option<(String, Option<Arc<TaskRecord>>)>>>;
 
+/// 脏字幕的落库去抖窗口：用户停手这么久之后，才把整份工程写回历史库。
+///
+/// # 为什么要去抖
+///
+/// 落库 = 把整份 `segments` 序列化成 JSON + 一条 sqlite UPDATE。5000 句的工程大约
+/// 10~30ms。而拖时间轴的定位请求每 40ms 就来一次（见 `seek_by_mouse_x` 的节流），
+/// 切句 / 暂停播放同样是高频动作——逐次写库等于让磁盘写把交互本身拖慢，
+/// 用户看到的就是「拖一下卡一下」。
+///
+/// 停手 1.2s 后写一次：连续操作自动合成一次写盘。真崩了最多丢这 1.2s 内的编辑，
+/// 而换工程 / 导出 / 关窗守卫走的都是**立刻写入**的那条路，不会丢。
+pub const SEGMENTS_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(1200);
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
@@ -465,6 +478,11 @@ pub struct AppState {
 
     /// 字幕编辑产生的未落库脏标记（去抖：切句/跳转/播放/导出时统一写回）
     pub segments_dirty: bool,
+
+    /// 「待落库」登记：高频交互节点（跳转 / 切句 / 暂停播放 / 就地改一句）不再立刻
+    /// 写库，而是把时刻记在这里，由界面侧的定时器在停手满 [`SEGMENTS_FLUSH_IDLE`]
+    /// 后统一 flush（见 [`AppState::flush_segments_if_due`]）。
+    pub segments_flush_due: Option<std::time::Instant>,
 
     /// 当前编辑的工程对应的数据库主键（`tasks.id`）。
     ///
@@ -748,6 +766,7 @@ impl AppState {
             whisper_model_tier,
             cancel_requested: false,
             segments_dirty: false,
+            segments_flush_due: None,
             active_task_id: None,
             segments_revision: 0,
             undo_stack: Vec::new(),
@@ -1777,8 +1796,10 @@ impl AppState {
 
     /// 选中指定索引的字幕片段
     pub fn select_segment(&mut self, index: usize) {
-        // 切句前先把上一句的编辑落库（去抖收口点）
-        self.flush_segments_if_dirty();
+        // 切句前把上一句的编辑登记为「稍后落库」：逐句跳转时每跳一次都序列化整份工程
+        // 太贵（5000 句约 10~30ms），写库交给停手 1.2s 后的定时器
+        // （见 `SEGMENTS_FLUSH_IDLE`）。关窗 / 换工程仍会立刻写，不会丢。
+        self.defer_segments_flush();
         // 换了一句就是另一段编辑会话，之前那句的文本合并到此为止
         self.undo_text_coalesce = None;
         self.selected_segment_index = Some(index);
@@ -1831,7 +1852,9 @@ impl AppState {
 
     /// 跳转播放指针时间
     pub fn seek_to(&mut self, time_sec: f64) {
-        self.flush_segments_if_dirty();
+        // 拖动时间轴时本函数每 40ms 就被调一次（`seek_by_mouse_x` 的节流），
+        // 这里绝不能同步写库：登记完就走，写库留给停手后的定时器。
+        self.defer_segments_flush();
         let max_dur = if self.total_duration > 0.0 {
             self.total_duration
         } else {
@@ -1961,7 +1984,12 @@ impl AppState {
     }
 
     /// 将编辑产生的脏字幕落库（幂等，未脏时零开销）
+    ///
+    /// 换工程 / 导出 / 关窗守卫 / 结构性编辑（拆分合并删除）都走这条**立刻写入**的路；
+    /// 高频交互走 [`AppState::defer_segments_flush`]。这里顺带作废待落库登记：登记留着
+    /// 的话，定时器稍后还会把同一份（或更旧的）内容再写一遍。
     pub fn flush_segments_if_dirty(&mut self) {
+        self.segments_flush_due = None;
         if self.segments_dirty {
             self.segments_dirty = false;
             // 写库失败不能静默：用户以为改动已保存，重启后却发现全丢了。
@@ -1979,6 +2007,44 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// 登记「稍后落库」：高频交互节点用它代替立刻写库（见 [`SEGMENTS_FLUSH_IDLE`]）。
+    ///
+    /// 不脏就不登记：空登记只会让定时器白白醒来查一次。
+    pub fn defer_segments_flush(&mut self) {
+        if self.segments_dirty {
+            self.segments_flush_due = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 停手满 [`SEGMENTS_FLUSH_IDLE`] 就把待落库的改动写回；返回「这次真的走了写库」。
+    ///
+    /// 写失败时 [`AppState::flush_segments_if_dirty`] 会把脏标记放回，这里再登记一次，
+    /// 于是定时器下一个窗口会重试——写库失败有提示条（`db_write_error`），
+    /// 但不该要求用户再点一下才重试。
+    pub fn flush_segments_if_due(&mut self) -> bool {
+        self.flush_segments_if_due_at(std::time::Instant::now())
+    }
+
+    /// [`Self::flush_segments_if_due`] 的可注入时钟版本（单测直接给时刻，不睡真实时间）。
+    pub fn flush_segments_if_due_at(&mut self, now: std::time::Instant) -> bool {
+        let Some(due) = self.segments_flush_due else {
+            return false;
+        };
+        if now.saturating_duration_since(due) < SEGMENTS_FLUSH_IDLE {
+            return false;
+        }
+        if !self.segments_dirty {
+            // 期间已经被别的路（换工程 / 关窗 / 导出）写过：登记作废，别一直挂着。
+            self.segments_flush_due = None;
+            return false;
+        }
+        self.flush_segments_if_dirty();
+        if self.segments_dirty {
+            self.segments_flush_due = Some(std::time::Instant::now());
+        }
+        true
     }
 
     /// 追加一条写库失败提示（`db_write_error`）。
@@ -2479,7 +2545,7 @@ fn merge_concat_translations(
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, PolishMode, ProcessStatus, WhisperModelTier};
+    use super::{AppState, PolishMode, ProcessStatus, WhisperModelTier, SEGMENTS_FLUSH_IDLE};
     use crate::subtitle::Segment;
 
     /// 构造一个最小可用、不碰显卡/磁盘/子进程的 AppState：内存 SQLite + 假路径引擎，
@@ -4420,5 +4486,49 @@ mod tests {
         state.active_task_id = None; // 无主键 → sync 直接 Ok
         state.flush_segments_if_dirty();
         assert!(state.db_write_error.is_none(), "成功落库后应清空提示");
+    }
+
+    /// 去抖落库：登记之后不许立刻写；停手满窗口才写一次；立刻写入的入口要作废登记。
+    ///
+    /// 回归护栏：`seek_to` 在拖动时间轴时每 40ms 被调一次。一旦回到「每次都同步写库」，
+    /// 5000 句的工程每拖一下就要多付 10~30ms 的序列化 + UPDATE，手感直接变差。
+    #[test]
+    fn deferred_flush_waits_for_idle_window() {
+        let mut state = test_state(Vec::new());
+        state.active_task_id = None; // 无主键 → 写库路径直接 Ok，本测试只验时序
+
+        // 没有改动就不登记：空登记只会让定时器白醒一次
+        state.segments_dirty = false;
+        state.defer_segments_flush();
+        assert!(state.segments_flush_due.is_none(), "没改动不该登记待落库");
+
+        state.segments_dirty = true;
+        state.defer_segments_flush();
+        let due = state.segments_flush_due.expect("有改动必须登记待落库");
+
+        // 窗口没到：不写，也不清脏标记，登记继续留着
+        assert!(!state.flush_segments_if_due_at(due + std::time::Duration::from_millis(300)));
+        assert!(state.segments_dirty, "没到点就不该清脏标记");
+        assert!(state.segments_flush_due.is_some(), "没到点登记要留着");
+
+        // 停手满窗口：写一次，脏标记与登记一起清掉
+        assert!(state.flush_segments_if_due_at(due + SEGMENTS_FLUSH_IDLE));
+        assert!(!state.segments_dirty, "写过之后脏标记必须清掉");
+        assert!(state.segments_flush_due.is_none(), "写过之后登记必须清掉");
+
+        // 立刻写入的入口（换工程 / 导出 / 关窗）要作废登记：
+        // 不作废的话定时器稍后还会把同一份内容再写一遍。
+        state.segments_dirty = true;
+        state.defer_segments_flush();
+        assert!(state.segments_flush_due.is_some());
+        state.flush_segments_if_dirty();
+        assert!(state.segments_flush_due.is_none(), "立刻写入后登记必须作废");
+
+        // 期间被别的路写过（脏标记已清）：到点也不写，登记顺手作废
+        state.segments_dirty = true;
+        state.defer_segments_flush();
+        state.segments_dirty = false;
+        assert!(!state.flush_segments_if_due_at(due + SEGMENTS_FLUSH_IDLE * 2));
+        assert!(state.segments_flush_due.is_none(), "空登记不能一直挂着");
     }
 }

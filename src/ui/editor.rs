@@ -5337,7 +5337,9 @@ impl MainWindow {
         // 递增它」，见 `AppState::bump_segments_revision` 的文档）。
         self.state.bump_segments_revision();
         self.state.segments_dirty = true;
-        self.state.flush_segments_if_dirty();
+        // 连续改错别字时这是「一句一次写库」（整份 JSON + sqlite UPDATE），
+        // 登记成「稍后落库」后由定时器合并成一次（见 SEGMENTS_FLUSH_IDLE）。
+        self.state.defer_segments_flush();
         cx.notify();
     }
 

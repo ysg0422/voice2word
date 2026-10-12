@@ -431,6 +431,9 @@ pub struct MainWindow {
     /// 就等于每帧常驻一张 GPU 纹理（拖动时间轴每 40ms 换一帧）。换帧时用这里的
     /// 旧引用把上一张交还，显存占用恒定在「一帧」。见 `render_monitor_picture`。
     pub(crate) cached_static_image: Option<Arc<RenderImage>>,
+    /// 脏字幕的延迟落库定时器是否已经起过（进程内只起一次，见
+    /// [`MainWindow::ensure_segments_flush_ticker`]）。
+    pub(crate) segments_flush_ticker: bool,
     /// 监视器「静态帧解码失败」兜底路径的已试结果：`(帧路径, 解码结果)`。
     ///
     /// `Some((path, None))` 表示这条路径已经试过、解不出来——渲染层据此显示同步
@@ -1062,6 +1065,7 @@ impl MainWindow {
             text_cursor_pos: 0,
             cached_live_image: None,
             cached_static_image: None,
+            segments_flush_ticker: false,
             cached_fallback_frame: None,
             subtitle_list_scroll: UniformListScrollHandle::new(),
             batch_queue_scroll: ScrollHandle::new(),
@@ -2077,10 +2081,50 @@ impl MainWindow {
             // Delete 会被裸键动作（播放/暂停、删当前句）吃掉，既打不出空格又误触发操作。
             || self.library_search_focus.contains_focused(window, cx)
     }
+
+    /// 启动「脏字幕延迟落库」定时器（进程内只起一次）。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 跳转 / 切句 / 暂停播放 / 就地改一句这些高频交互现在只登记 `segments_flush_due`
+    /// （见 `AppState::defer_segments_flush`），真正写库得有人来触发。拖时间轴时
+    /// `seek_to` 每 40ms 一次，而一次写库要序列化整份字幕（5000 句约 10~30ms）——
+    /// 逐次写就是「拖一下卡一下」。这里每 500ms 查一次「停手够久了吗」。
+    ///
+    /// # 为什么常驻而不是按需起停
+    ///
+    /// 登记点在 `AppState` 里，那里拿不到 `cx`；要按需起就得让每个调用点都带上上下文。
+    /// 常驻的代价是每 500ms 一次空转检查：未登记时只是一次 `Option::is_none`，
+    /// 与已经在跑的 40ms 播放 tick 相比可以忽略。
+    fn ensure_segments_flush_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.segments_flush_ticker {
+            return;
+        }
+        self.segments_flush_ticker = true;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            let alive = this
+                .update(cx, |this, cx| {
+                    if this.state.flush_segments_if_due() {
+                        // 真的写了库：界面上的「已保存 / 未保存」类提示要跟着刷新。
+                        cx.notify();
+                    }
+                })
+                .is_ok();
+            if !alive {
+                break;
+            }
+        })
+        .detach();
+    }
 }
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 脏字幕的延迟落库定时器：首次渲染时起一次，之后常驻。
+        self.ensure_segments_flush_ticker(cx);
         if self.metrics_rx.has_changed().unwrap_or(false) {
             self.state.metrics = self.metrics_rx.borrow_and_update().clone();
         }

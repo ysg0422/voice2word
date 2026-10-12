@@ -2835,7 +2835,9 @@ impl MainWindow {
             self.state.current_time = self.state.video_player.current_play_time();
             self.state.is_playing = false;
         }
-        self.state.flush_segments_if_dirty();
+        // 暂停/停止/跳转都会经过这里，属于高频交互：登记「稍后落库」，
+        // 别在这里序列化整份工程（见 SEGMENTS_FLUSH_IDLE）。
+        self.state.defer_segments_flush();
         self.state.video_player.stop();
         self.play_tick_generation = self.state.video_player.generation();
     }
@@ -2886,7 +2888,8 @@ impl MainWindow {
             let Some(video_file) = self.state.preview_media().cloned() else {
                 return;
             };
-            self.state.flush_segments_if_dirty();
+            // 开播同样是高频入口（用户会反复暂停/继续对字幕），登记即可。
+            self.state.defer_segments_flush();
             self.state.is_playing = true;
             let start_sec = self.state.current_time;
             self.state.video_player.play(video_file, start_sec);
