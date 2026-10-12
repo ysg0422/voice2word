@@ -32,7 +32,8 @@ pub enum PipelineEvent {
 
 /// 转写引擎能力描述：把原先散落在 `run_with_options` 里的
 /// `is_sensevoice / can_stream / sv_parallel` 分支样板收敛为一次结构化查询。
-/// 新增引擎时只需扩展 [`EngineCapabilities::plan`]，管线其余部分只读字段。
+/// 新增引擎时只需扩展 [`EngineCapabilities::plan`]，管线其余部分统一经
+/// [`EngineProfile`] 读取能力，不再各自复算布尔量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineCapabilities {
     /// 本次任务选用 SenseVoice 引擎
@@ -82,6 +83,31 @@ impl EngineCapabilities {
             parallel_chunks,
             sensevoice_threads,
         }
+    }
+}
+
+/// 引擎能力查询的收敛点：管线只经此 trait 询问能力，
+/// 避免 `sensevoice / can_stream / parallel` 三处判断散落在各分支里。
+trait EngineProfile {
+    /// 本次任务选用 SenseVoice 引擎
+    fn sensevoice(&self) -> bool;
+    /// 走纯内存 PCM 管道推流
+    fn can_stream(&self) -> bool;
+    /// SenseVoice 切块并行（多进程）
+    fn parallel(&self) -> bool;
+}
+
+impl EngineProfile for EngineCapabilities {
+    fn sensevoice(&self) -> bool {
+        self.sensevoice
+    }
+
+    fn can_stream(&self) -> bool {
+        self.stream
+    }
+
+    fn parallel(&self) -> bool {
+        self.parallel_chunks
     }
 }
 
@@ -328,7 +354,7 @@ impl TimelineRestorer {
         seg.end = end;
         // 词级时间戳与段同属一条时间轴：段边界映射回真实媒体时间后，词时间必须
         // 做同一映射。否则「段在真实时间、词在模型时间」两套坐标混用，逐词高亮 /
-        // 卡拉OK 滚动会整体错位。	o_original 单调不减，因此映射后仍落在段区间内。
+        // 卡拉OK 滚动会整体错位。to_original 单调不减，因此映射后仍落在段区间内。
         for w in seg.words.iter_mut() {
             let ws = self.to_original(w.start);
             let we = self.to_original(w.end).max(ws);
@@ -683,7 +709,9 @@ impl TaskPipeline {
         let ffmpeg = self.ffmpeg.clone();
         let use_gpu = whisper.uses_gpu();
 
-        let is_sensevoice = model_override
+        // 引擎档位是否选中 SenseVoice：仅作为能力求解的输入，最终能力统一走
+        // [`EngineProfile`]，避免同一判断在求解前后各算一遍。
+        let sensevoice_selected = model_override
             .as_ref()
             .map(|p| p.to_string_lossy().to_lowercase().contains("sensevoice"))
             .unwrap_or(false);
@@ -697,7 +725,7 @@ impl TaskPipeline {
         // 引擎能力一次性求解：并行切块 / 纯内存推流 / 单会话线程数的判定公式
         // 集中在 [`EngineCapabilities::plan`]，此处只读结果，下游局部变量名保持不变。
         let caps = EngineCapabilities::plan(
-            is_sensevoice,
+            sensevoice_selected,
             self.sensevoice.is_some(),
             use_gpu,
             audio_speed,
@@ -706,8 +734,8 @@ impl TaskPipeline {
             threads,
             crate::engines::chunk_threshold_secs(),
         );
-        let is_sensevoice = caps.sensevoice;
-        let sv_parallel = caps.parallel_chunks;
+        let is_sensevoice = caps.sensevoice();
+        let sv_parallel = caps.parallel();
         // SenseVoice 单会话在 8 线程附近已饱和，继续加线程反而更慢
         // （实测 16 线程 41.6s vs 8 线程 32.6s），故对单会话线程数设上限。
         let sv_threads = caps.sensevoice_threads;
@@ -719,7 +747,7 @@ impl TaskPipeline {
 
         // 判断是否启用纯内存管道推流 (In-Memory PCM Streaming Pipe):
         // 当使用 SenseVoice、启用 GPU 推理，或音频时长无需多进程切块时，直接以 0 磁盘 I/O 管道推流
-        let mut can_stream = caps.stream;
+        let mut can_stream = caps.can_stream();
 
         let mut ffmpeg_audio_sec = 0.0;
         // 临时 WAV 用守卫持有：本函数后续有多个 `?` / 取消提前返回点，
@@ -1344,6 +1372,21 @@ impl TaskPipeline {
         }
         let rescue_sec = rescue_started.elapsed().as_secs_f64();
 
+        // 断点续跑：命中已落盘的救场结果则直接读回，跳过二次解码。
+        // 仅在「不跳过后续阶段」时读回——跳过后续阶段时 `segments` 已是最终产物，
+        // 覆盖它会把说话人标签等下游信息一并抹掉。
+        let resumed_rescue = if !skip_post {
+            artifacts
+                .as_ref()
+                .and_then(|a| a.read_segments(Stage::Rescue).ok().flatten())
+        } else {
+            None
+        };
+        if let Some(segs) = resumed_rescue {
+            info!("断点续跑：复用已落盘的救场结果（{} 段）", segs.len());
+            segments = segs;
+        }
+
         // best-effort 落盘救场后的片段快照（进入标点/润色阶段前；写失败只告警）。
         if !skip_post {
             if let Some(a) = artifacts.as_ref() {
@@ -1356,7 +1399,31 @@ impl TaskPipeline {
         // ── 阶段 3: 标点与语法润色（可跳过）──
         let mut qwen_sec = 0.0;
         let mut polish_engine_name = None;
-        if enable_polish && !segments.is_empty() && !skip_post {
+        // 断点续跑：命中已落盘的标点 / 润色结果则直接读回，跳过二次推理。
+        // 同样只在「不跳过后续阶段」时读回，避免覆盖已完成的全流程产物。
+        let mut polish_resumed = false;
+        if !skip_post {
+            if let Some(segs) = artifacts
+                .as_ref()
+                .and_then(|a| a.read_segments(Stage::Polish).ok().flatten())
+                .or_else(|| {
+                    artifacts
+                        .as_ref()
+                        .and_then(|a| a.read_segments(Stage::Punctuate).ok().flatten())
+                })
+            {
+                info!("断点续跑：复用已落盘的标点/润色结果（{} 段）", segs.len());
+                segments = segs;
+                polish_engine_name = Some("断点续跑：复用已落盘的标点/润色结果".to_string());
+                let _ = tx.send(PipelineEvent::Progress {
+                    stage: "生成字幕".into(),
+                    progress: 0.96,
+                    detail: "断点续跑：复用已落盘的标点/润色结果".into(),
+                });
+                polish_resumed = true;
+            }
+        }
+        if !polish_resumed && enable_polish && !segments.is_empty() && !skip_post {
             let mode = polish_mode.unwrap_or_else(|| "punc".to_string());
             let use_punc = (mode == "punc")
                 && self
@@ -1471,7 +1538,7 @@ impl TaskPipeline {
             } else {
                 info!("润色模式为关闭或未知: {}", mode);
             }
-        } else {
+        } else if !polish_resumed {
             let _ = tx.send(PipelineEvent::StageChanged(Stage::Write.label().into()));
             let _ = tx.send(PipelineEvent::Progress {
                 stage: "生成字幕".into(),
@@ -1738,6 +1805,18 @@ fn scale_segment_to_original_time(segment: &mut Segment, speed: f64, original_du
     }
     segment.start *= speed;
     segment.end *= speed;
+    // 词级时间戳与段共用同一时间轴：段被还原后词必须同步缩放并钳到同一区间，
+    // 否则加速音频的流式预览里「段在真实时间、词在模型时间」两套坐标混用，
+    // 逐词高亮 / 卡拉OK 滚动会整体错位。
+    for w in segment.words.iter_mut() {
+        w.start *= speed;
+        w.end *= speed;
+        w.end = w.end.max(w.start);
+        if original_duration > 0.0 {
+            w.start = w.start.clamp(0.0, original_duration);
+            w.end = w.end.clamp(w.start, original_duration);
+        }
+    }
     if original_duration > 0.0 {
         segment.start = segment.start.clamp(0.0, original_duration);
         segment.end = segment.end.clamp(segment.start, original_duration);
@@ -1875,6 +1954,36 @@ mod tests {
         scale_segment_to_original_time(&mut seg, 1.25, 600.0);
         assert!((seg.start - 12.5).abs() < 1e-9);
         assert!((seg.end - 15.0).abs() < 1e-9);
+    }
+
+    /// 加速音频的流式预览同样要还原词级时间戳：段被缩放、词不缩放 = 逐词高亮错位。
+    #[test]
+    fn accelerated_preview_scales_word_timings_with_segment() {
+        let mut seg = Segment::new(1, 10.0, 12.0, "测试");
+        seg.words = vec![
+            WordTiming {
+                word: "测".to_string(),
+                start: 10.0,
+                end: 11.0,
+            },
+            WordTiming {
+                word: "试".to_string(),
+                start: 11.0,
+                end: 12.0,
+            },
+        ];
+        scale_segment_to_original_time(&mut seg, 1.25, 600.0);
+        assert!((seg.start - 12.5).abs() < 1e-9, "实得 {}", seg.start);
+        assert!((seg.end - 15.0).abs() < 1e-9, "实得 {}", seg.end);
+        assert_eq!(seg.words.len(), 2, "词不得在还原时丢失");
+        assert!((seg.words[0].start - 12.5).abs() < 1e-9);
+        assert!((seg.words[0].end - 13.75).abs() < 1e-9);
+        assert!((seg.words[1].start - 13.75).abs() < 1e-9);
+        assert!((seg.words[1].end - 15.0).abs() < 1e-9);
+        for w in &seg.words {
+            assert!(w.start <= w.end);
+            assert!(w.start >= seg.start - 1e-9 && w.end <= seg.end + 1e-9);
+        }
     }
 
     #[test]
