@@ -165,6 +165,16 @@ pub(crate) fn click_seek_target(segments: &[Segment], index: usize) -> Option<f6
     segments.iter().find(|s| s.index == index).map(|s| s.start)
 }
 
+/// 播放联动高亮判据：`current_time` 是否落在某句播放区间的**半开区间** `[start, end)` 内。
+///
+/// 必须与 [`crate::app::state::AppState::get_active_segment`] 同源：边界时间
+/// `t == end == 下一句 start` 属于**下一句**（见该方法文档）。若误用闭区间 `<=`，
+/// 相邻两句会在共享边界同时亮起「正在播放」底色，而监视器/预览只显示后一句，
+/// 造成列表高亮与画面不一致。
+pub(crate) fn is_playing_at(start: f64, end: f64, t: f64) -> bool {
+    t >= start && t < end
+}
+
 /// 监视器「视口内屏」（画面可用的那块黑底区域）的像素尺寸估算。
 ///
 /// 由窗口视口尺寸、布局模式（左右二分 / 上下堆叠）与右侧面板宽度推出，用于把画面按
@@ -2167,7 +2177,7 @@ impl MainWindow {
                                                 };
                                                 let seg_idx = seg.index;
                                                 let is_selected = sel == Some(seg_idx);
-                                                let is_playing_here = cur_time >= seg.start && cur_time <= seg.end;
+                                                let is_playing_here = is_playing_at(seg.start, seg.end, cur_time);
                                                 let start_ts = seconds_to_timestamp_short(seg.start);
                                                 let end_ts = seconds_to_timestamp_short(seg.end);
                                                 let dur = seg.duration();
@@ -5557,8 +5567,8 @@ impl MainWindow {
 mod tests {
     use super::translated_out_count;
     use super::{
-        click_seek_target, fit_video_size, monitor_screen_size, EDITOR_STACK_MONITOR_H,
-        MONITOR_VIDEO_FIT_FRAC,
+        click_seek_target, fit_video_size, is_playing_at, monitor_screen_size,
+        EDITOR_STACK_MONITOR_H, MONITOR_VIDEO_FIT_FRAC,
     };
     use crate::subtitle::Segment;
     use crate::ui::primitives::should_consume_scroll;
@@ -5725,5 +5735,23 @@ mod tests {
         );
         assert!(w > 0.0 && h > 0.0);
         assert!(w < screen.0 && h < screen.1, "四周必须留白，避免画面顶满");
+    }
+
+    /// 回归（P2）：「正在播放」行高亮必须用半开区间 `[start, end)`，与
+    /// `AppState::get_active_segment()` 同源——共享边界时间属于**下一句**。
+    /// 修前列表用的是闭区间 `<= seg.end`，相邻两句在边界处会同时高亮，
+    /// 而监视器/预览只显示后一句，列表与画面不一致。
+    #[test]
+    fn playing_highlight_uses_half_open_interval() {
+        // 相邻两句共享边界 t = 5.0：前句 end == 后句 start
+        assert!(is_playing_at(0.0, 5.0, 0.0), "起点（左闭）应高亮");
+        assert!(is_playing_at(0.0, 5.0, 3.0), "句中应高亮");
+        assert!(
+            !is_playing_at(0.0, 5.0, 5.0),
+            "共享边界属于下一句，前句不得高亮（右开）"
+        );
+        assert!(is_playing_at(5.0, 9.0, 5.0), "共享边界处由后句高亮");
+        assert!(!is_playing_at(5.0, 9.0, 9.0), "末句结束后不再高亮");
+        assert!(!is_playing_at(0.0, 5.0, -0.1), "区间之外不得高亮");
     }
 }
