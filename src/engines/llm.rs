@@ -645,6 +645,31 @@ impl LLMEngine {
             warn!("Qwen 常驻服务不可用，回退到命令行批量润色");
         }
 
+        // 取数与写回分离：批次循环收敛到 `polish_apply`，取数函数可替换。
+        // 生产链路走 `polish_batch`（常驻服务失败自动回退命令行）；回归测试
+        // 注入构造结果，复现「第二遍只返回部分段落」的场景。
+        self.polish_apply(&mut segments, progress_cb, |batch| {
+            self.polish_batch(batch, server.as_mut())
+        });
+
+        info!("LLM 全部片段润色完成");
+        Ok(segments)
+    }
+
+    /// 润色批次循环：切批取数并写回 `segments`。
+    ///
+    /// `fetch` 是「一批字幕 → 序号→润色文本」的取数回调，生产链路由
+    /// [`Self::polish_batch`] 承担。把这层抽出来，是为了让测试能在不启动模型的
+    /// 前提下，用假结果驱动**与生产完全一致**的切批与写回逻辑。
+    fn polish_apply<F>(
+        &self,
+        segments: &mut [Segment],
+        progress_cb: Option<crate::engines::TextProgressCb>,
+        mut fetch: F,
+    ) where
+        F: FnMut(&[Segment]) -> std::collections::HashMap<usize, String>,
+    {
+        let total = segments.len();
         let mut completed = 0usize;
         for group in segments.chunks_mut(MAX_SEGMENTS_PER_BATCH) {
             if self.is_cancelled() {
@@ -672,13 +697,8 @@ impl LLMEngine {
                     chars += cost;
                     end += 1;
                 }
-                let results = self.polish_batch(&group[start..end], server.as_mut());
-                for seg in group[start..end].iter_mut() {
-                    seg.polished = results
-                        .get(&seg.index)
-                        .cloned()
-                        .unwrap_or_else(|| seg.text.clone());
-                }
+                let results = fetch(&group[start..end]);
+                Self::apply_polish_results(&mut group[start..end], &results);
                 start = end;
             }
 
@@ -691,9 +711,29 @@ impl LLMEngine {
                 );
             }
         }
+    }
 
-        info!("LLM 全部片段润色完成");
-        Ok(segments)
+    /// 把一批润色结果写回对应片段。
+    ///
+    /// 唯一硬约束：**拿不到新结果或新结果为空时，保留原有 `seg.polished`，
+    /// 绝不清空、绝不降级为原文**。此前写回是
+    /// `results.get(..).cloned().unwrap_or_else(|| seg.text.clone())`：第二遍
+    /// 润色（再次点击「润色」，或某批只解析出部分条目）时，没拿到结果的段落
+    /// 会被无标点原文覆盖——上一遍的润色成果被静默丢掉，`display_text` 随之
+    /// 回退，界面与导出一起退化。
+    fn apply_polish_results(
+        segments: &mut [Segment],
+        results: &std::collections::HashMap<usize, String>,
+    ) {
+        for seg in segments.iter_mut() {
+            match results.get(&seg.index) {
+                Some(pol) if !pol.trim().is_empty() => seg.polished = pol.clone(),
+                _ => warn!(
+                    index = seg.index,
+                    "Qwen 未返回该段润色结果（或结果为空），保留原有润色文本，不降级为原文"
+                ),
+            }
+        }
     }
 
     /// 批量翻译字幕片段（从外语/多语言翻译为目标语言，例如简体中文）
@@ -1066,7 +1106,7 @@ impl LLMEngine {
         let source_chars: usize = source_segments.iter().map(|s| s.text.chars().count()).sum();
         let max_tokens =
             output_token_budget(source_chars, self.ctx_size, POLISH_FIXED_PROMPT_TOKENS);
-        let output = server
+        let outcome = server
             .and_then(|server| server.complete(&prompt, max_tokens))
             .or_else(|| {
                 self.run_prompt(&prompt, max_tokens)
@@ -1075,19 +1115,56 @@ impl LLMEngine {
                         stopped_by_limit: false,
                     })
             });
-        let Some(output) = output else {
+        // P1：必须解构出 `stopped_by_limit`。此前这里是
+        // `let output = output.content;`，把截断信号直接丢了——模型撞上
+        // `n_predict` 上限时返回的是**被切一半的半截文本**，而末行
+        // `[3] 半句…` 仍能通过 `parse_batch_response`，于是被当成完整润色
+        // 结果写回。
+        let Some(CompletionOutcome {
+            content: output,
+            stopped_by_limit,
+        }) = outcome
+        else {
             return Default::default();
         };
-        let output = output.content;
 
+        Self::polish_batch_finalize(&source_segments, &output, stopped_by_limit)
+    }
+
+    /// `polish_batch` 的纯解析半段：解析模型输出，并按截断信号丢弃末条。
+    ///
+    /// 与 `translate_batch` 的截断处理对齐：信号为真就丢弃**最后一条已解析
+    /// 结果**，由上层「保留原文」兜底。但**不复用** `retry_missing`——它用
+    /// `is_untranslated_copy` 判断成功，而润色后与原文相同完全正常（只加标点
+    /// 或本就无需改动），会被误判成「没润色」而反复重试 / 丢结果。
+    fn polish_batch_finalize(
+        source_segments: &[&Segment],
+        output: &str,
+        stopped_by_limit: bool,
+    ) -> std::collections::HashMap<usize, String> {
         let expected = source_segments
             .iter()
             .map(|seg| seg.index)
             .collect::<std::collections::HashSet<_>>();
-        let result = Self::parse_batch_response(&output, &expected);
+        let mut result = Self::parse_batch_response(output, &expected);
+        if stopped_by_limit {
+            let last_matched = source_segments
+                .iter()
+                .rev()
+                .map(|seg| seg.index)
+                .find(|idx| result.contains_key(idx));
+            if let Some(idx) = last_matched {
+                result.remove(&idx);
+                warn!(
+                    index = idx,
+                    batch = source_segments.len(),
+                    "Qwen 润色输出被长度上限截断，丢弃末条结果并保留原文"
+                );
+            }
+        }
         if result.len() != source_segments.len() {
             warn!(
-                "Qwen 批量输出不完整 ({}/{} 条)，未匹配条目将保留原文",
+                "Qwen 润色批量输出不完整 ({}/{} 条)，未匹配条目保留原文",
                 result.len(),
                 source_segments.len()
             );
@@ -1301,7 +1378,7 @@ mod tests {
         MAX_SEGMENTS_PER_BATCH, OUTPUT_TOKENS_PER_CHAR, PROMPT_TOKENS_PER_CHAR,
     };
     use crate::subtitle::Segment;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn parses_indexed_batch_response() {
@@ -1689,5 +1766,109 @@ mod tests {
         assert_eq!(last, Some(3));
         parsed.remove(&3);
         assert_eq!(parsed.len(), 2, "末条应被丢弃以触发折半重试");
+    }
+    // ─────────── P1：润色链路的截断丢弃与结果保留 ───────────
+
+    /// 撞上 `n_predict` 上限时，被截断的末条润色结果必须被丢弃（半截文本不得
+    /// 写回），其余段落照常写回；没有截断信号时同样的输出必须全部保留。
+    #[test]
+    fn 润色截断时丢弃末条结果且其余段落仍写回() {
+        let engine = LLMEngine::new(
+            "definitely-not-a-real-cli-path.exe",
+            "definitely-not-a-real-model.gguf",
+            4096,
+            4,
+        );
+        let segs = [
+            seg_at(1, "今天讲概率不等式"),
+            seg_at(2, "下一节讲条件概率"),
+            seg_at(3, "最后讲贝叶斯公式"),
+        ];
+        // 末行 `[3] 最后` 是被 `n_predict` 切一半的半截文本：解析器认得出它，
+        // 但绝不能当成完整润色结果。
+        let raw = "[1] 今天讲概率不等式。\n[2] 下一节讲条件概率。\n[3] 最后";
+        // 无截断信号：三条都保留，不能误丢
+        let refs: Vec<&Segment> = segs.iter().collect();
+        let complete = LLMEngine::polish_batch_finalize(&refs, raw, false);
+        assert_eq!(complete.len(), 3, "无截断时不得丢弃任何条目");
+        assert_eq!(complete.get(&3).map(String::as_str), Some("最后"));
+
+        // 有截断信号：末条被丢弃，其余两条保留
+        let truncated = LLMEngine::polish_batch_finalize(&refs, raw, true);
+        assert_eq!(truncated.len(), 2, "截断时必须丢弃末条: {truncated:?}");
+        assert!(!truncated.contains_key(&3), "被截断的末条不得写回");
+        assert_eq!(
+            truncated.get(&1).map(String::as_str),
+            Some("今天讲概率不等式。")
+        );
+        assert_eq!(
+            truncated.get(&2).map(String::as_str),
+            Some("下一节讲条件概率。")
+        );
+
+        // 写回：被丢弃的那条保留原文（不得写半截文本），其余两条写回润色结果
+        let mut target = vec![
+            seg_at(1, "今天讲概率不等式"),
+            seg_at(2, "下一节讲条件概率"),
+            seg_at(3, "最后讲贝叶斯公式"),
+        ];
+        engine.polish_apply(&mut target, None, |_| truncated.clone());
+        assert_eq!(target[0].polished, "今天讲概率不等式。");
+        assert_eq!(target[1].polished, "下一节讲条件概率。");
+        assert!(
+            target[2].polished.trim().is_empty(),
+            "被截断的段落不得写回半截文本"
+        );
+        assert_eq!(
+            target[2].display_text(),
+            "最后讲贝叶斯公式",
+            "截断段落应回退原文"
+        );
+    }
+
+    /// 第二遍润色没拿到结果（或结果为空）时，第一遍的润色结果必须原样保留，
+    /// 不得被无标点原文覆盖降级（此前 `unwrap_or_else(|| seg.text.clone())`
+    /// 会把上一遍成果直接抹掉）。
+    #[test]
+    fn 润色未返回结果时保留上一遍润色() {
+        let engine = LLMEngine::new(
+            "definitely-not-a-real-cli-path.exe",
+            "definitely-not-a-real-model.gguf",
+            4096,
+            4,
+        );
+        let mut segs = vec![seg_at(1, "今天讲概率不等式"), seg_at(2, "下一节讲条件概率")];
+
+        // 第一遍：两段都拿到润色结果
+        let first = HashMap::from([
+            (1usize, "今天讲概率不等式。".to_string()),
+            (2usize, "下一节讲条件概率。".to_string()),
+        ]);
+        engine.polish_apply(&mut segs, None, |_| first.clone());
+        assert_eq!(segs[0].polished, "今天讲概率不等式。");
+        assert_eq!(segs[1].polished, "下一节讲条件概率。");
+
+        // 第二遍：只返回第 1 段；第 2 段拿到的是空白串（模拟模型漏段 / 空结果）
+        let second = HashMap::from([
+            (1usize, "今天讲概率不等式，是重点。".to_string()),
+            (2usize, "   ".to_string()),
+        ]);
+        engine.polish_apply(&mut segs, None, |_| second.clone());
+        assert_eq!(segs[0].polished, "今天讲概率不等式，是重点。");
+        assert_eq!(
+            segs[1].polished, "下一节讲条件概率。",
+            "空白结果不得清空上一遍的润色"
+        );
+
+        // 第三遍：整批都没拿到（空映射）——上一遍结果仍须完整保留
+        engine.polish_apply(&mut segs, None, |_| HashMap::new());
+        assert_eq!(segs[0].polished, "今天讲概率不等式，是重点。");
+        assert_eq!(segs[1].polished, "下一节讲条件概率。");
+        assert_eq!(segs[0].display_text(), "今天讲概率不等式，是重点。");
+        assert_eq!(
+            segs[1].display_text(),
+            "下一节讲条件概率。",
+            "display_text 不得回退成原文"
+        );
     }
 }
