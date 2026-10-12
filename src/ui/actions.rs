@@ -1996,6 +1996,10 @@ impl MainWindow {
                                 progress,
                                 detail,
                             } => {
+                                // 先把本条队列进度落进当前活动条目，再更新全局状态：
+                                // 两者用的是同一个事件，但队列卡片要的是「这一条的
+                                // 百分比」，而全局状态只服务单文件进度条/抽屉。
+                                this.state.record_batch_progress(&stage, progress);
                                 this.state.status = ProcessStatus::Processing {
                                     stage,
                                     progress,

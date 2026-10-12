@@ -7,7 +7,7 @@ use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::types::{ConfirmAction, ConfirmDialogInfo};
 use super::super::MainWindow;
-use crate::app::state::{ProcessStatus, QueueState, WorkspaceTab};
+use crate::app::state::{ProcessStatus, QueueItem, QueueState, WorkspaceTab};
 use crate::ui::format_mm_ss;
 // 质检报告是 `segment.rs` 里的纯逻辑：这里只把结果画出来，不在界面层重算判据。
 use crate::subtitle::segment::{QualityCategory, QualityReport};
@@ -1094,7 +1094,7 @@ impl MainWindow {
         // 先把要渲染的数据抽成纯值。下面给「移除」按钮挂 cx.listener 需要可变借用
         // 上下文，如果行内容还借着 self.state，两个借用会打架。
         // kind: 0 等待 / 1 转写中 / 2 已完成 / 3 失败
-        let rows: Vec<(usize, String, String, f64, u8)> = self
+        let rows: Vec<QueueRow> = self
             .state
             .batch_queue
             .iter()
@@ -1106,13 +1106,15 @@ impl MainWindow {
                     QueueState::Done { .. } => 2,
                     QueueState::Failed(_) => 3,
                 };
-                (
+                QueueRow {
                     idx,
-                    item.name.clone(),
-                    item.state.label(),
-                    item.duration,
+                    name: item.name.clone(),
+                    label: item.state.label(),
+                    duration: item.duration,
                     kind,
-                )
+                    progress: queue_progress_view(item),
+                    stage: item.stage.clone(),
+                }
             })
             .collect();
 
@@ -1271,7 +1273,16 @@ impl MainWindow {
                     .flex()
                     .flex_col()
                     .gap(px(Theme::SPACE_1))
-                    .children(rows.into_iter().map(|(idx, name, label, dur, kind)| {
+                    .children(rows.into_iter().map(|row| {
+                        let QueueRow {
+                            idx,
+                            name,
+                            label,
+                            duration: dur,
+                            kind,
+                            progress,
+                            stage,
+                        } = row;
                         let dot = match kind {
                             1 => Theme::accent_orange(),
                             2 => Theme::accent_mint(),
@@ -1284,6 +1295,12 @@ impl MainWindow {
                             _ => Theme::text_muted(),
                         };
                         let is_active = active == Some(idx);
+                        // 有进度就多挂一行（进度条 + 百分比 + 阶段名），没有就保持
+                        // 原来的单行卡片：排序、间距、圆角、描边一律走同一套值，
+                        // 只是外层从「一行」变成「一列」，不改既有布局体系。
+                        let progress_line = progress
+                            .map(|p| render_queue_progress(p, stage.as_deref()));
+                        let has_progress = progress_line.is_some();
                         div()
                             .id(("batch-queue-row", idx))
                             .w_full()
@@ -1302,12 +1319,29 @@ impl MainWindow {
                             } else {
                                 Theme::border_subtle()
                             })
-                            .flex()
-                            .items_center()
-                            .gap(px(Theme::SPACE_2))
-                            .child(
-                                primitives::stat_dot_sm(dot),
-                            )
+                            // 进度条**整行宽**，所以它必须待在文件名行之外：
+                            // 塞进那一行里会被右侧的时长 / 状态 / 移除按钮挤成
+                            // 短短一截，而卡片底下又要空出大片留白。
+                            .when_some(progress_line, |s, line| {
+                                s.flex()
+                                    .flex_col()
+                                    .gap(px(Theme::SPACE_1))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(Theme::SPACE_2))
+                                            .child(primitives::stat_dot_sm(dot)),
+                                    )
+                                    .child(line)
+                            })
+                            .when(!has_progress, |s| {
+                                s.flex()
+                                    .items_center()
+                                    .gap(px(Theme::SPACE_2))
+                                    .child(primitives::stat_dot_sm(dot))
+                            })
                             .child(
                                 div()
                                     .flex_1()
@@ -1379,6 +1413,103 @@ impl MainWindow {
     }
 }
 
+/// 一条队列行的渲染数据（纯值）。
+///
+/// 为什么先抽出来：行内容若还借着 `self.state`，下面给「移除」按钮挂
+/// `cx.listener` 要的可变借用就会和它打架。
+#[derive(Debug)]
+struct QueueRow {
+    idx: usize,
+    name: String,
+    label: String,
+    duration: f64,
+    /// 0 等待 / 1 转写中 / 2 已完成 / 3 失败
+    kind: u8,
+    /// 本条进度（`None` = 还没开始跑，不画进度）
+    progress: Option<QueueProgressView>,
+    /// 管线给的阶段名，仅「转写中」时非空
+    stage: Option<String>,
+}
+
+/// 「本条进度」在队列卡片上的呈现取值（**纯数据**，便于单测）。
+#[derive(Debug, Clone, PartialEq)]
+struct QueueProgressView {
+    /// 进度条填充比例（0.0 ~ 1.0）。由百分比换算而来，因为 `progress_bar`
+    /// 吃的是比率，而队列里存的是百分比。
+    ratio: f32,
+    /// 百分比整数。用整数是刻意的：`{:.1}%` 会在同一帧里反复改宽度，
+    /// 卡片右侧整列状态文字会跟着左右抖动。
+    percent: u8,
+    /// 是否画出进度条（只有「没满格」才会走到构造点，因此恒为 `true`；
+    /// 保留这个字段是为了让渲染侧不必自己再判一次满格）
+    show_bar: bool,
+}
+
+/// 一条队列项在卡片上要画的进度：`None` = 既不画条也不显示百分比。
+///
+/// **满格（100%）也返回 `None`**：成功条目的状态文案「已完成 12 句」已经把结果
+/// 说清了，再挂一根满条 + 100% 只是噪声。失败条目不受此限——它停在部分进度上，
+/// 那个数字恰恰说明「跑到哪儿才炸的」。`AppState::finish_active_queue_item`
+/// 成功时把进度定格成 100 而不是 1.0，就是为了和这里的判据共用「百分比」这套单位。
+fn queue_progress_view(item: &QueueItem) -> Option<QueueProgressView> {
+    match item.state {
+        QueueState::Pending => return None,
+        // 转写中 / 已完成 / 失败三种都走同一条判定：失败停在出事的百分比上，
+        // 「跑到 62% 才炸」和「一开始就炸」对用户是两条完全不同的信息。
+        QueueState::Running | QueueState::Done { .. } | QueueState::Failed(_) => {}
+    }
+    // 队列里存的就是 0~100 的百分比，这里只夹一次、换算一次
+    let pct = item.progress.clamp(0.0, 100.0);
+    let ratio = (pct / 100.0) as f32;
+    // 满格 = 没有任何新信息可报：结果文案已经说了「已完成 12 句」，再画一根
+    // 满条 + 100% 只是噪声。**失败不在此列**——失败停在部分进度上，那个数字
+    // 恰恰说明「跑到哪儿才炸的」。
+    if pct >= 100.0 || !pct.is_finite() {
+        return None;
+    }
+    Some(QueueProgressView {
+        ratio,
+        percent: if pct > 0.0 { pct.ceil() as u8 } else { 0 },
+        show_bar: true,
+    })
+}
+
+/// 队列卡片第二行：本条进度条 + 百分比 + 阶段名。
+///
+/// 复用 `primitives::progress_bar`（轨道色 / 填充色 / 高度与其它进度条同源），
+/// 只补一行文字与间距，不改现有布局体系。
+fn render_queue_progress(p: QueueProgressView, stage: Option<&str>) -> Div {
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(Theme::SPACE_2))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(primitives::progress_bar(p.ratio)),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(Theme::TEXT_SMALL))
+                .text_color(Theme::text_muted())
+                .child(format!("{}%", p.percent)),
+        )
+        .when_some(stage.map(str::to_string), |s, stage| {
+            s.child(
+                div()
+                    .flex_shrink_0()
+                    .max_w(px(Theme::QUEUE_LABEL_MAX_W))
+                    .truncate()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .child(stage),
+            )
+        })
+}
+
 /// 流式看板里「当前行是不是最后一行」的判据（`i` 从 0 起，纯函数便于单测）。
 ///
 /// 为什么要单独判空：看板外层用 `seg_count`（数据源计数）决定显示占位文案还是
@@ -1391,8 +1522,10 @@ fn is_last_stream_row(i: usize, total: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_last_stream_row;
+    use super::{is_last_stream_row, queue_progress_view, QueueProgressView};
+    use crate::app::state::{QueueItem, QueueState};
     use crate::ui::split_mm_ss;
+    use std::path::PathBuf;
 
     /// 回归（P1）：数据计数与实际渲染行数口径不一致时，流式看板不得 panic。
     /// 空窗口下「没有最后一行」是显式语义，而不是靠回绕后的比较侥幸恒假。
@@ -1421,5 +1554,79 @@ mod tests {
         assert_eq!(split_mm_ss(60.0), (1, 0));
         assert_eq!(split_mm_ss(61.0), (1, 1));
         assert_eq!(split_mm_ss(3661.0), (61, 1));
+    }
+
+    // ── 批量队列「本条进度」 ────────────────────────────────────────────
+
+    /// 造一条队列项：直接落状态与进度，不碰磁盘。
+    fn queue_item(state: QueueState, progress: f64) -> QueueItem {
+        let mut item = QueueItem::new(PathBuf::from("a.mp4"));
+        item.state = state;
+        item.progress = progress;
+        item
+    }
+
+    /// 「等待中」的条目不许显示进度：它还没开跑，一根 0% 的条只会让人以为
+    /// 这一条卡住了。
+    #[test]
+    fn pending_item_shows_no_progress() {
+        assert!(queue_progress_view(&queue_item(QueueState::Pending, 0.0)).is_none());
+        assert!(
+            queue_progress_view(&queue_item(QueueState::Pending, 0.5)).is_none(),
+            "等待中的条目即便残留了进度值也不该显示"
+        );
+    }
+
+    /// 转写中：条 + 百分比都要有；上一帧的残留值也不能画出越界的条。
+    #[test]
+    fn running_item_shows_matching_bar_and_percentage() {
+        let view = queue_progress_view(&queue_item(QueueState::Running, 37.5)).expect("要画进度");
+
+        // `ratio` 走布局引擎的 0.0~1.0，`percent` 是给用户看的 0~100，两者同源
+        assert!((f64::from(view.ratio) - 0.375).abs() < 1e-6);
+        assert_eq!(view.percent, 38, "37.5% 向上取整成 38，宁可显得多一点");
+        assert!(view.show_bar, "没满格就必须画条");
+
+        // 极端值：越界的百分比被夹回 [0,100]；满格（100）走另一条分支（见下）
+        assert!(queue_progress_view(&queue_item(QueueState::Running, 500.0)).is_none());
+        assert_eq!(
+            queue_progress_view(&queue_item(QueueState::Running, -1.0))
+                .unwrap()
+                .percent,
+            0
+        );
+    }
+
+    /// 收尾规则：成功 = 满格，**不再画任何进度**；失败 = 停在出事那一刻，
+    /// 百分比与进度条都留着（「跑到 62% 才炸」本身就是有用的信息）。
+    #[test]
+    fn settled_items_hide_full_progress_and_keep_failure_percent() {
+        let done = queue_progress_view(&queue_item(QueueState::Done { segments: 3 }, 100.0));
+        assert!(done.is_none(), "满格不再画条，连百分比也不必显示");
+
+        let failed =
+            queue_progress_view(&queue_item(QueueState::Failed("坏文件".to_string()), 62.0))
+                .expect("失败条目要保留停在的百分比");
+        assert_eq!(failed.percent, 62);
+        assert!(failed.show_bar);
+    }
+
+    /// 渲染函数不许 panic，也不能自己造阶段名：阶段名一律原样透传。
+    #[test]
+    fn progress_row_renders_with_and_without_stage() {
+        let view = QueueProgressView {
+            ratio: 0.5,
+            percent: 50,
+            show_bar: true,
+        };
+        let _ = super::render_queue_progress(view, Some("语音识别"));
+        let _ = super::render_queue_progress(
+            QueueProgressView {
+                ratio: 0.0,
+                percent: 0,
+                show_bar: true,
+            },
+            None,
+        );
     }
 }

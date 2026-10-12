@@ -85,6 +85,23 @@ pub struct QueueItem {
     /// 时长（秒）。入队时先置 0，由后台探测补齐；0 表示尚未探测到
     pub duration: f64,
     pub state: QueueState,
+    /// 本条自己的转写进度，单位是**百分比**（0.0 ~ 100.0）。
+    ///
+    /// 与 `ProcessStatus::Processing::progress`（0.0 ~ 1.0 的比率）刻意不同单位：
+    /// 面板要显示的是整数百分比，直接用比率就得在每个渲染点乘 100 并处理四舍五入；
+    /// 收尾判定（「满格 = 不再画进度」）也就跟着散在多处。这里存百分比，
+    /// 卡片侧只做取整。
+    ///
+    /// 为什么不并进 [`QueueState`]：批量面板要按「运行中 / 已完成 / 失败」三套配色
+    /// 渲染卡片，状态每多一个进度字段，`match item.state` 就得在四五个调用点同时
+    /// 跟着改；而进度是**瞬态数据**，每条重跑都要清零，跟状态的生命周期不是一回事。
+    /// 分开存还让「失败」保住出事那一刻的进度——把进度塞进状态枚举就做不到这点
+    /// （失败分支持的是 `String` 原因）。
+    pub progress: f64,
+    /// 本条正在跑的阶段名（沿用管线 `PipelineEvent::Progress` 给的字符串，
+    /// 只改标点不改措辞）。条目未开跑 / 已结算后为 `None`，否则收尾时会留下
+    /// 上一阶段的残影，用户以为还卡在那个阶段。
+    pub stage: Option<String>,
 }
 
 impl QueueItem {
@@ -99,6 +116,8 @@ impl QueueItem {
             name,
             duration: 0.0,
             state: QueueState::Pending,
+            progress: 0.0,
+            stage: None,
         }
     }
 }
@@ -1642,10 +1661,16 @@ impl AppState {
             .position(|i| i.path.to_string_lossy().to_lowercase() == key)
     }
 
-    /// 把某条队列项标记为「转写中」，让队列卡片立刻有反馈
+    /// 把某条队列项标记为「转写中」，让队列卡片立刻有反馈。
+    ///
+    /// 顺带把本条进度清零：条目重跑（失败重排、或用户再点一次「开始全部」）时，
+    /// 不清就会带着上一轮残留的百分比进新任务——第一批进度事件到达前它一直挂在
+    /// 卡片上，看起来就像「刚开始就已经跑到 80%」。
     pub fn mark_queue_running(&mut self, idx: usize) {
         if let Some(item) = self.batch_queue.get_mut(idx) {
             item.state = QueueState::Running;
+            item.progress = 0.0;
+            item.stage = None;
         }
     }
 
@@ -1692,6 +1717,16 @@ impl AppState {
     pub fn finish_active_queue_item(&mut self, outcome: Result<usize, String>) {
         if let Some(idx) = self.batch_active.take() {
             if let Some(item) = self.batch_queue.get_mut(idx) {
+                // 进度条定格：成功收到满格，失败保留出事那一刻的值不动
+                // （失败信息本身走 `QueueState::Failed`，这里只负责不让进度条
+                // 看起来还活着）。阶段名一律清掉：任务已经结束，再挂一个
+                // 「语音识别」只会让人以为它还在跑。
+                if outcome.is_ok() {
+                    // 沿用「百分比」这套单位（面板也按 0~100 判满格），
+                    // 不写 1.0：两处口径不一致时进度条会比文字状态早一帧消失。
+                    item.progress = 100.0;
+                }
+                item.stage = None;
                 item.state = match outcome {
                     Ok(segments) => QueueState::Done { segments },
                     Err(reason) => QueueState::Failed(reason),
@@ -1708,6 +1743,29 @@ impl AppState {
         if matches!(self.status, ProcessStatus::Processing { .. }) {
             self.status = ProcessStatus::Idle;
         }
+    }
+
+    /// 把一次管线进度事件记到**当前正在跑的那一条**队列项上。
+    ///
+    /// 判据只用 `batch_active`：它就是「这一条」的唯一权威来源，进度事件里
+    /// 不带文件名。`batch_active == None` 有两种情形都要**直接忽略**：
+    /// 单文件转写、以及批量已收尾（`finish_batch_queue` 清掉指针之后）。
+    /// 少了这层判断，单文件转写的百分比就会写进队列里某个「等待中」的条目，
+    /// 批量模式连开都没开，卡片上却冒出进度。
+    ///
+    /// 阶段名沿用管线给的字符串（`PipelineEvent::Progress` 里的 `stage`），
+    /// 这里不改写措辞：UI 换词就得跟着管线的阶段表改两处，迟早不同步。
+    pub fn record_batch_progress(&mut self, stage: &str, progress: f64) {
+        let Some(idx) = self.batch_active else {
+            return;
+        };
+        let Some(item) = self.batch_queue.get_mut(idx) else {
+            return;
+        };
+        // `abs()` 兜住上游万一发来的负值（管线目前只发 0.0~1.0 的比率），
+        // 再换算成 0~100 的百分比。
+        item.progress = (progress.abs() * 100.0).clamp(0.0, 100.0);
+        item.stage = Some(stage.to_string());
     }
 
     /// 队列汇总：`(已完成数, 失败数, 累计字幕句数)`
@@ -2952,8 +3010,149 @@ mod tests {
         assert_eq!(next_pending_index(&queue), Some(1));
     }
 
-    /// 失败项在「待处理」计数里要算数（用户点「开始全部」时它们会被重试），
-    /// 但不等于「可续跑」——两者用不同判定，别混。
+    /// 进度只落在当前活动项上，别的条目一个字节都不许动——它们还没开始跑。
+    #[test]
+    fn progress_lands_on_active_item_only() {
+        use super::QueueItem;
+        use std::path::PathBuf;
+
+        let mut state = test_state(Vec::new());
+        state.batch_queue = vec![
+            QueueItem::new(PathBuf::from("a.mp4")),
+            QueueItem::new(PathBuf::from("b.mp4")),
+            QueueItem::new(PathBuf::from("c.mp4")),
+        ];
+        state.batch_active = Some(1);
+
+        state.record_batch_progress("语音识别", 0.37);
+
+        assert_eq!(state.batch_queue[1].progress, 37.0);
+        assert_eq!(state.batch_queue[1].stage.as_deref(), Some("语音识别"));
+        assert_eq!(state.batch_queue[0].progress, 0.0, "还没跑的那条不许有进度");
+        assert!(state.batch_queue[0].stage.is_none());
+        assert_eq!(state.batch_queue[2].progress, 0.0, "还没跑的那条不许有进度");
+        assert!(state.batch_queue[2].stage.is_none());
+
+        // 越界（活动下标指向已被删掉的条目）必须静默忽略，不许 panic
+        state.batch_active = Some(99);
+        state.record_batch_progress("语音识别", 0.9);
+
+        // 指针被清空之后（批量收尾 / 单文件模式）再来的事件同样无处可落
+        state.batch_active = None;
+        state.record_batch_progress("语音识别", 0.9);
+    }
+
+    /// 切到下一条：上一条的进度必须**定格**，不能跟着新事件继续爬。
+    ///
+    /// 定格规则取的是「上一条被自己结算时的状态」——成功是 1.0、失败保留当时值；
+    /// 这条用例走的是「上一条报错退出、下一条接管」的路径，失败那条约 0.5 定格，
+    /// 之后所有进度事件都只许落在下一条身上。
+    #[test]
+    fn progress_stops_at_previous_item_when_batch_advances() {
+        use super::QueueItem;
+        use std::path::PathBuf;
+
+        let mut state = test_state(Vec::new());
+        state.batch_queue = vec![
+            QueueItem::new(PathBuf::from("a.mp4")),
+            QueueItem::new(PathBuf::from("b.mp4")),
+            QueueItem::new(PathBuf::from("c.mp4")),
+        ];
+        state.batch_active = Some(0);
+        state.mark_queue_running(0);
+        state.record_batch_progress("语音识别", 0.5);
+
+        state.finish_active_queue_item(Err("坏文件".to_string()));
+        assert_eq!(
+            state.batch_queue[0].progress, 50.0,
+            "失败条目的进度定格在出事那一刻，交给续跑逻辑去开始下一条"
+        );
+
+        state.batch_active = Some(1);
+        state.mark_queue_running(1);
+        state.record_batch_progress("提取音频", 0.1);
+
+        assert_eq!(state.batch_queue[1].progress, 10.0, "进度必须跟着新条目走");
+        assert_eq!(state.batch_queue[1].stage.as_deref(), Some("提取音频"));
+        assert_eq!(state.batch_queue[0].progress, 50.0, "上一条的进度不许再变");
+        assert!(state.batch_queue[0].stage.is_none());
+        assert_eq!(state.batch_queue[2].progress, 0.0, "还没跑的那条不许有进度");
+        assert!(state.batch_queue[2].stage.is_none());
+    }
+
+    /// 单文件模式（`batch_active == None`）绝不往队列里写：队列卡片上的条目
+    /// 应当是干净的，否则单跑一支片子，队列里某个「等待中」的条目会凭空
+    /// 冒出百分比，用户以为它已经在转写。
+    #[test]
+    fn batch_progress_is_ignored_outside_batch_mode() {
+        use super::QueueItem;
+        use std::path::PathBuf;
+
+        let mut state = test_state(Vec::new());
+        state.batch_queue = vec![QueueItem::new(PathBuf::from("a.mp4"))];
+        assert!(state.batch_active.is_none());
+
+        state.record_batch_progress("语音识别", 0.88);
+
+        assert_eq!(state.batch_queue[0].progress, 0.0);
+        assert!(state.batch_queue[0].stage.is_none());
+    }
+
+    #[test]
+    fn queue_item_progress_defaults_to_zero_and_clears_stale_stage() {
+        use super::{QueueItem, QueueState};
+        use std::path::PathBuf;
+
+        // 新条目：没进度、没阶段。阶段留着 `Some` 会让「等待中」的卡片显示
+        // 一个不存在的阶段名——面板上就是一条假信息。
+        let fresh = QueueItem::new(PathBuf::from("a.mp4"));
+        assert_eq!(fresh.progress, 0.0);
+        assert!(fresh.stage.is_none());
+
+        // 重跑同一条：残留进度和阶段都必须被清掉
+        let mut state = test_state(Vec::new());
+        state.batch_queue = vec![QueueItem::new(PathBuf::from("a.mp4"))];
+        state.batch_queue[0].progress = 87.0;
+        state.batch_queue[0].stage = Some("智能润色".to_string());
+        state.mark_queue_running(0);
+        assert_eq!(state.batch_queue[0].progress, 0.0, "重跑必须从 0 开始");
+        assert!(state.batch_queue[0].stage.is_none());
+        assert_eq!(state.batch_queue[0].state, QueueState::Running);
+    }
+
+    /// 结算时的定格规则：**成功收到 100%，失败保留当下值**。
+    ///
+    /// 失败若也强行收到 0%，用户看到的就是「这一条根本没跑过」；若强行跳到 100%，
+    /// 又像是在骗：「都满格了怎么还失败」。保留当下值才说得通，而失败原因由
+    /// `QueueState::Failed` 负责解释。
+    #[test]
+    fn finishing_freezes_progress_at_full_on_success_and_keeps_it_on_failure() {
+        use super::QueueItem;
+        use std::path::PathBuf;
+
+        let mut state = test_state(Vec::new());
+        state.batch_queue = vec![QueueItem::new(PathBuf::from("a.mp4"))];
+        state.batch_active = Some(0);
+        state.batch_queue[0].progress = 42.0;
+        state.batch_queue[0].stage = Some("语音识别".to_string());
+
+        state.finish_active_queue_item(Ok(9));
+        assert_eq!(state.batch_queue[0].progress, 100.0, "成功后必须满格");
+        assert!(
+            state.batch_queue[0].stage.is_none(),
+            "结算后不能留下阶段残影"
+        );
+
+        state.batch_active = Some(0);
+        state.batch_queue[0].progress = 55.0;
+        state.batch_queue[0].stage = Some("生成字幕".to_string());
+        state.finish_active_queue_item(Err("坏文件".to_string()));
+        assert_eq!(
+            state.batch_queue[0].progress, 55.0,
+            "失败要保留出事那一刻的进度，别清零也别骗成满格"
+        );
+    }
+
     #[test]
     fn failed_items_count_as_pending_but_are_not_runnable() {
         use super::QueueState;
