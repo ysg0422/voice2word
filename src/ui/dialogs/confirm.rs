@@ -70,7 +70,13 @@ impl MainWindow {
             .child(
                 primitives::modal_card(Theme::DIALOG_W, Theme::PAGE_PAD)
                     .id("confirm-dialog-card")
-                    // 面板自身吞掉点击，否则点正文也会被遮罩当作「取消」
+                    // 面板自身吞掉点击，否则点正文也会被遮罩当作「取消」。
+                    //
+                    // 光挂一个空的 on_click 是不够的：GPUI 的点击沿命中链冒泡，
+                    // 遮罩与卡片都命中时两者都会收到 click，空回调并不会中断冒泡，
+                    // 遮罩的「点空白 = 取消」照样触发。必须让卡片 `occlude()`，把
+                    // 遮罩从命中集合里挡掉，点正文/按钮才不会误判成取消。
+                    .occlude()
                     .on_click(cx.listener(|_, _, _, _cx| {}))
                     .gap(px(Theme::SPACE_3))
                     .child(primitives::page_title(info.title.clone()))
