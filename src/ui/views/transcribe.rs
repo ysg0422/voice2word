@@ -53,7 +53,8 @@ impl MainWindow {
         // 撑满剩余宽度的职责。
         primitives::page_shell("transcribe-main-workspace")
             .flex_1()
-            // ── 顶部步骤流式导航栏 (借鉴 SmartSub / VideoCaptioner 黄金布局) ──
+            // ── 顶部步骤流式导航栏：转写是一条「导入 → 识别 → 翻译 → 导出」的直线，
+// 步骤常驻在顶部，用户随时知道自己在第几步、下一步该干什么 ──
             .child(
                 div()
                     .w_full()
