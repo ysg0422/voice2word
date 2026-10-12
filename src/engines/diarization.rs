@@ -111,23 +111,26 @@ pub fn detect_speakers(
 
     // 只有「能量够 + 有稳定基频」的段才参与聚类：纯噪声/音乐段能量可能很高，
     // 但没有说话人特征，硬拉进聚类会凭空造出一个「说话人」。
-    let candidates: Vec<usize> = (0..segments.len())
-        .filter(|&i| {
-            stats[i]
-                .as_ref()
-                .map(|s| s.rms > gate && s.features.is_some())
-                .unwrap_or(false)
-        })
-        .collect();
+    // 一次性同时收集候选段索引与其特征向量：索引与向量在同一个循环里成对压入，
+    // 二者天然一一对应。这样就不必依赖「先按谓词过滤、再按同一谓词解包」这种脆弱
+    // 的不变量——一旦两处谓词漂移，旧写法里的 `.unwrap()` 会直接 panic。
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut vectors: Vec<FeatureVec> = Vec::new();
+    for (i, slot) in stats.iter().enumerate() {
+        if let Some(s) = slot {
+            if s.rms > gate {
+                if let Some(f) = s.features {
+                    candidates.push(i);
+                    vectors.push(f);
+                }
+            }
+        }
+    }
     if candidates.len() < k {
         // 有效段太少（例如只有一两句话），聚类没有统计意义，全部留空
         return vec![None; segments.len()];
     }
-
-    let vectors: Vec<FeatureVec> = candidates
-        .iter()
-        .map(|&i| stats[i].as_ref().and_then(|s| s.features).unwrap())
-        .collect();
+    debug_assert_eq!(candidates.len(), vectors.len());
     let normalized = zscore_normalize(&vectors);
     let assignments = kmeans(&normalized, k);
 
