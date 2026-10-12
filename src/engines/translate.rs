@@ -290,6 +290,9 @@ fn translate_via_online_api(
     let mut completed = 0usize;
     // 失败但**不需要中止整片**的批次数（重试用尽、或本批解析不完整）
     let mut soft_failed_batches = 0usize;
+    // 最近一次软失败的原因：全部批次都失败时并进最终错误信息，
+    // 免得把真正的根因（如推理模型的思考吃光输出预算）只留在日志里。
+    let mut last_batch_error: Option<String> = None;
     // P0-B：整批的「译文 == 原文」复制率统计
     let mut copy = CopyRate::default();
 
@@ -333,14 +336,19 @@ fn translate_via_online_api(
                     info!("在线翻译被取消，保留已完成的部分（{completed}/{pending_total}）");
                     break;
                 }
-                // 参数类错误（401/403/404：密钥、地址、模型名）不是暂时性的，
+                // 配置类错误（401/403/404：密钥、地址、模型名）不是暂时性的，
                 // 后面的批会以完全相同的原因再失败一遍。继续「逐批跳过」只会把
                 // 一个配置错误伪装成「翻译完成 0 句」。立刻带着真实原因中止。
-                if !is_retryable(&err) {
+                //
+                // 其余一律按「本批软失败」处理并继续后面的句子：重试用尽（429/网络）
+                // 与确定性的单批失败（推理模型的思考吃光输出预算）都只坏这一批，
+                // 没有理由把前面已经译好的句子一起丢掉。
+                if classify_batch_error(&err) == BatchErrorAction::Fatal {
                     return Err(err).map_err(|e| {
                         anyhow!("在线翻译中止：{e}。请检查「性能设置 → 在线翻译 API」的地址、密钥与模型名。")
                     });
                 }
+                last_batch_error = Some(err.to_string());
                 soft_failed_batches += 1;
                 warn!(
                     error = %err,
@@ -455,8 +463,12 @@ fn translate_via_online_api(
             ));
         }
         if ok == 0 {
+            let reason = last_batch_error
+                .as_deref()
+                .map(|e| format!("最后一批的失败原因：{e}。"))
+                .unwrap_or_default();
             return Err(anyhow!(
-                "在线翻译未能译出任何一句（共 {pending_total} 句待译）。请用「性能设置 → 在线翻译 API → 测试连接」检查地址、密钥与模型名。"
+                "在线翻译未能译出任何一句（共 {pending_total} 句待译）。{reason}请用「性能设置 → 在线翻译 API → 测试连接」检查地址、密钥与模型名。"
             ));
         }
         if copy.rejected > 0 {
@@ -576,16 +588,54 @@ fn request_batch_with_retry(
     Err(last_err.unwrap_or_else(|| anyhow!("在线翻译请求失败")))
 }
 
-/// 错误是否值得重试：网络层错误与 429 / 5xx 属于暂时性，其余（401/403/404 等）不是。
-fn is_retryable(err: &anyhow::Error) -> bool {
+/// 单批失败的**处置类别**：决定上层的下一步动作。
+///
+/// 此前只有「可重试 / 不可重试」二分，而「不可重试」在上层
+/// （[`translate_via_online_api`]）被当成**中止整片**——这对三类错误过于粗暴：
+/// 配置类错误（401/403/404）确实该立刻中止，但「推理模型的思考吃光输出预算」
+/// 只坏在这一批，没有理由把前面已经译好的几百句一起丢掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchErrorAction {
+    /// 暂时性（限流 / 5xx / 网络抖动 / 空响应）：原样重发就有机会成功。
+    Retry,
+    /// 只坏这一批、且重发必然同样（推理模型的输出预算被思考吃光）：
+    /// 跳过本批继续后面的句子，保住已完成的部分。
+    SkipBatch,
+    /// 配置/参数类（401/403/404、非法 JSON、取消）：后面的批会以同样的原因失败，
+    /// 立刻带着真实原因中止，免得把配置错误伪装成「翻译完成 0 句」。
+    Fatal,
+}
+
+/// 单批失败该怎么处置：重试、跳过本批，还是中止整片。
+fn classify_batch_error(err: &anyhow::Error) -> BatchErrorAction {
     let msg = err.to_string();
     // 优先按真实状态码判断。不能直接 `contains("HTTP 5")`：因为错误文案里还拼了服务端的
     // 响应体（snippet），一个 4xx 的响应体若恰好提到了「HTTP 5xx」，就会被误判为可重试而白等退避。
     if let Some(code) = http_status_code(&msg) {
-        return code == 429 || (500..=599).contains(&code);
+        return if code == 429 || (500..=599).contains(&code) {
+            BatchErrorAction::Retry
+        } else {
+            BatchErrorAction::Fatal
+        };
     }
-    // 无状态码：ureq 的网络类错误，文案里带「无法连接」或底层 io 错误
-    msg.contains("无法连接") || msg.contains("timed out") || msg.contains("timeout")
+    // 无状态码：ureq 的网络类错误，文案里带「无法连接」或底层 io 超时
+    if msg.contains("无法连接") || msg.contains("timed out") || msg.contains("timeout") {
+        return BatchErrorAction::Retry;
+    }
+    // 空响应（网关抖动、上游 200 空体、偶发只回思考）是**暂时性**的：重发一次往往就好。
+    // 必须与下面「思考吃光预算」分开判——那条是确定性的，同一条 payload 重发只会再空一次。
+    if msg.contains("在线接口返回了空内容") {
+        return BatchErrorAction::Retry;
+    }
+    if msg.contains("思考过程耗尽输出预算") {
+        return BatchErrorAction::SkipBatch;
+    }
+    BatchErrorAction::Fatal
+}
+
+/// 错误是否值得**原样重试**（[`BatchErrorAction::Retry`]）。
+fn is_retryable(err: &anyhow::Error) -> bool {
+    classify_batch_error(err) == BatchErrorAction::Retry
 }
 
 /// 从错误文案里取出「HTTP <状态码>」的状态码。取不到返回 `None`。
@@ -879,6 +929,8 @@ fn request_batch_translation(
     }
 
     let mut content = extract_message_content(&value).unwrap_or_default();
+    // 本批响应里到底有没有思考文本：首次响应为准，加大预算重试后按重试响应更新。
+    let mut saw_thinking = observed > 0;
     // 没有 `content`、却明明有思考文本：几乎必然是 `max_tokens` 被思考吃光后截断。
     // 此时**不**把思考当译文，而是用「思考量 + 译文预算」的更大预算重试一次。
     if content.trim().is_empty() && observed > 0 && !known_reasoning {
@@ -898,10 +950,20 @@ fn request_batch_translation(
             if retry_observed > 0 {
                 profile.mark_reasoning(retry_observed);
             }
+            saw_thinking = retry_observed > 0;
             content = extract_message_content(&value).unwrap_or_default();
         }
     }
     if content.trim().is_empty() {
+        // 已知对面是推理模型、它却仍然只回了思考：输出预算已被思考吃光。这类空响应
+        // 是**确定性**的——同一条 payload 再发一次只会再空一次，所以显式抛「预算耗尽」
+        // （[`BatchErrorAction::SkipBatch`]：跳过本批、保住已译部分），
+        // 而不是「空内容」（那条会被当成暂时性错误白白重试 3 轮）。
+        if saw_thinking && profile.is_reasoning() {
+            return Err(anyhow!(
+                "推理模型思考过程耗尽输出预算，本批未产出译文（thinking 约占 {REASONING_THINKING_TOKENS} token，可降低每批条数后重试）"
+            ));
+        }
         return Err(anyhow!(
             "在线接口返回了空内容。若使用的是推理模型（如 deepseek-reasoner），请改用非推理模型"
         ));
@@ -1257,6 +1319,49 @@ mod tests {
         assert!(is_retryable(&anyhow!(
             "在线接口返回 HTTP 503: service unavailable"
         )));
+        // 空响应（网关抖动 / 上游 200 空体 / 偶发只回思考）同样是暂时性的：重发往往就好。
+        // 回归：此前它不属于任何分支 → 判「不可重试」→ 上层直接中止整片。
+        assert!(is_retryable(&anyhow!(
+            "在线接口返回了空内容。若使用的是推理模型（如 deepseek-reasoner），请改用非推理模型"
+        )));
+    }
+
+    /// 单批失败的处置类别：暂时性重试、确定性的单批失败跳过、配置类中止整片。
+    ///
+    /// 回归：此前只有「可重试 / 不可重试」二分，而「不可重试」在上层被当成**中止整片**
+    /// ——推理模型把输出预算全花在思考上时，几百句已译好的字幕会被一起丢掉。
+    #[test]
+    fn batch_error_action_classification() {
+        use BatchErrorAction::{Fatal, Retry, SkipBatch};
+        assert_eq!(
+            classify_batch_error(&anyhow!(
+                "在线接口返回 HTTP 429（触发限流，请降低批量条数或稍后重试）"
+            )),
+            Retry
+        );
+        assert_eq!(
+            classify_batch_error(&anyhow!(
+                "在线接口返回了空内容。若使用的是推理模型（如 deepseek-reasoner），请改用非推理模型"
+            )),
+            Retry
+        );
+        // 确定性但只坏这一批：跳过本批继续后面的句子，绝不中止整片
+        assert_eq!(
+            classify_batch_error(&anyhow!(
+                "推理模型思考过程耗尽输出预算，本批未产出译文（thinking 约占 2048 token，可降低每批条数后重试）"
+            )),
+            SkipBatch
+        );
+        // 配置类：后面的批会以同样的原因失败，立刻中止
+        for msg in [
+            "在线接口返回 HTTP 401（API Key 无效或无权限）: unauthorized",
+            "在线接口返回 HTTP 403（API Key 无效或无权限）",
+            "在线接口返回 HTTP 404（接口地址或模型名不存在）",
+            "在线接口响应不是合法 JSON: expected value",
+            "在线接口返回 HTTP 400: upstream said HTTP 500, bad request",
+        ] {
+            assert_eq!(classify_batch_error(&anyhow!("{msg}")), Fatal, "{msg}");
+        }
     }
 
     /// 增量翻译：已有目标语言译文的句子不该再发请求（在线接口按 token 计费）。
@@ -2255,8 +2360,12 @@ mod tests {
 
         let msg = err.to_string();
         assert!(
-            msg.contains("空内容"),
-            "应报「空内容」而不是静默成功: {msg}"
+            msg.contains("耗尽输出预算"),
+            "应报「思考吃光输出预算」而不是静默成功: {msg}"
+        );
+        assert!(
+            msg.contains("未能译出任何一句"),
+            "本批失败应记为软失败，并在最终错误里带上根因: {msg}"
         );
         assert!(
             !msg.contains("候选一"),
@@ -2406,6 +2515,54 @@ mod tests {
         assert!(
             later.iter().all(|i| *i >= 9),
             "已译的第 1~8 句不得重发: {later:?}"
+        );
+    }
+
+    /// P0-C 端到端回归：网关**持续**返回空内容时，只该跳过这一批，
+    /// 绝不能把前面已经译好的批次一起丢掉。
+    ///
+    /// 修前：空内容错误不在 `is_retryable` 的任一分支里 → 判「不可重试」→
+    /// 上层直接 `return Err` 中止整片，用户拿到的是「一句都没译出」。
+    #[test]
+    fn empty_content_skips_batch_and_keeps_earlier_translations() {
+        let ok = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] Hello." } }]
+        })
+        .to_string();
+        let empty = serde_json::json!({
+            "choices": [{ "message": { "content": "" } }]
+        })
+        .to_string();
+        // 第 1 批成功；第 2 批连回 MAX_BATCH_RETRIES 次空内容（重发仍空 → 跳过该批）
+        let mut replies = vec![ok];
+        replies.extend(std::iter::repeat_n(empty, MAX_BATCH_RETRIES));
+        let (addr, seen) = spawn_mock_server(replies);
+        let mut cfg = online_cfg_for(&addr);
+        cfg.batch_size = 1; // 每条一批，强制产生两批
+
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "你好"),
+            Segment::new(2, 1.0, 2.0, "世界"),
+        ];
+        let out = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("只有一批失败时不该整片失败");
+
+        assert_eq!(
+            out[0].translation.as_deref(),
+            Some("Hello."),
+            "已译好的批次必须保住"
+        );
+        assert!(out[1].translation.is_none(), "空内容批次不该凭空产生译文");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1 + MAX_BATCH_RETRIES,
+            "空响应应重试到上限再跳过该批"
         );
     }
 
