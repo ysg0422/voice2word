@@ -27,11 +27,13 @@ extern "system" {
 const MB_OK: u32 = 0x00000000;
 const MB_OKCANCEL: u32 = 0x00000001;
 const MB_YESNO: u32 = 0x00000004;
+const MB_YESNOCANCEL: u32 = 0x00000003;
 const MB_ICONINFORMATION: u32 = 0x00000040;
 const MB_ICONQUESTION: u32 = 0x00000020;
 const MB_ICONERROR: u32 = 0x00000010;
 const IDOK: i32 = 1;
 const IDYES: i32 = 6;
+const IDNO: i32 = 7;
 
 fn to_wide_chars(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -63,6 +65,85 @@ fn get_install_dir() -> PathBuf {
             .join(APP_NAME)
     } else {
         PathBuf::from("C:\\Voice2Word")
+    }
+}
+
+fn select_install_dir(default_dir: &Path) -> Option<PathBuf> {
+    // 用户选择的是"安装位置"（父目录），最终会在其中创建 Voice2Word 子目录，
+    // 以保证卸载时只删除专属目录，不波及其他文件。
+    let default_parent = default_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_dir.to_path_buf());
+    let title = format!("{APP_NAME} v{APP_VERSION} 安装程序");
+    let choice = message_box(
+        &title,
+        &format!(
+            "欢迎使用 {app} v{ver} 安装向导！\n\n默认安装位置：\n{dir}\n\n点击【是】使用默认位置安装；\n点击【否】自定义安装位置（可选择任意磁盘/目录）；\n点击【取消】退出向导。",
+            app = APP_NAME,
+            ver = APP_VERSION,
+            dir = default_dir.display()
+        ),
+        MB_YESNOCANCEL | MB_ICONQUESTION,
+    );
+
+    let parent = match choice {
+        IDYES => default_parent,
+        IDNO => pick_directory(&default_parent)?,
+        _ => return None,
+    };
+    let install_dir = resolve_install_dir(&parent);
+
+    let confirm = message_box(
+        &title,
+        &format!(
+            "即将把 {app} v{ver} 安装到：\n{dir}\n\n安装完成后将创建桌面快捷方式、开始菜单快捷方式与卸载项。\n注意：卸载时会删除上述安装目录（含其中的用户数据）。\n\n点击【确定】开始安装，点击【取消】退出向导。",
+            app = APP_NAME,
+            ver = APP_VERSION,
+            dir = install_dir.display()
+        ),
+        MB_OKCANCEL | MB_ICONQUESTION,
+    );
+
+    if confirm == IDOK {
+        Some(install_dir)
+    } else {
+        None
+    }
+}
+
+fn resolve_install_dir(parent: &Path) -> PathBuf {
+    // 若所选目录本身就叫 Voice2Word，则直接使用，避免出现 ...\Voice2Word\Voice2Word。
+    match parent.file_name() {
+        Some(name) if name.to_string_lossy().eq_ignore_ascii_case(APP_NAME) => parent.to_path_buf(),
+        _ => parent.join(APP_NAME),
+    }
+}
+
+fn pick_directory(initial: &Path) -> Option<PathBuf> {
+    // 通过 PowerShell 的 FolderBrowserDialog 让用户可视化选择安装目录。
+    let initial = initial.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{}}; Add-Type -AssemblyName System.Windows.Forms | Out-Null; $dlg = New-Object System.Windows.Forms.FolderBrowserDialog; $dlg.Description = '选择 {APP_NAME} 的安装位置（将在其中创建 {APP_NAME} 文件夹）'; $dlg.SelectedPath = '{initial}'; $dlg.ShowNewFolderButton = $true; if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Console]::Out.Write($dlg.SelectedPath) }}",
+    );
+
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-STA",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .output()
+        .ok()?;
+
+    let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if chosen.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(chosen))
     }
 }
 
@@ -107,32 +188,14 @@ fn create_shortcut(
 }
 
 fn run_installer() {
-    let install_dir = get_install_dir();
+    let default_dir = get_install_dir();
+    // 步骤 1：选择安装位置（默认目录，或由用户自定义）。
+    let install_dir = match select_install_dir(&default_dir) {
+        Some(dir) => dir,
+        None => return,
+    };
     // 记录非致命步骤的失败原因，最终在完成提示里如实反馈，避免假装成功。
     let mut warnings: Vec<String> = Vec::new();
-    let welcome_msg = format!(
-        "欢迎使用 {app} v{ver} 安装向导！\n\n\
-        本程序将把 {app} 安装至您的电脑：\n\
-        {dir}\n\n\
-        安装完成后将自动创建：\n\
-        • 桌面快捷方式\n\
-        • 开始菜单快捷方式\n\
-        • 控制面板卸载项\n\n\
-        点击【确定】立即开始安装，点击【取消】退出向导。",
-        app = APP_NAME,
-        ver = APP_VERSION,
-        dir = install_dir.display()
-    );
-
-    let res = message_box(
-        &format!("{app} v{ver} 安装程序", app = APP_NAME, ver = APP_VERSION),
-        &welcome_msg,
-        MB_OKCANCEL | MB_ICONQUESTION,
-    );
-
-    if res != IDOK {
-        return;
-    }
 
     // 1. 创建目标目录
     if let Err(e) = fs::create_dir_all(&install_dir) {
@@ -326,4 +389,47 @@ fn run_installer() {
 
 fn main() {
     run_installer();
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_appends_app_folder_for_generic_parent() {
+        assert_eq!(
+            resolve_install_dir(Path::new("D:\\Apps")),
+            PathBuf::from("D:\\Apps").join(APP_NAME)
+        );
+    }
+
+    #[test]
+    fn resolve_keeps_existing_app_folder() {
+        assert_eq!(
+            resolve_install_dir(Path::new("D:\\Custom\\Voice2Word")),
+            PathBuf::from("D:\\Custom\\Voice2Word")
+        );
+    }
+
+    #[test]
+    fn resolve_is_case_insensitive_on_app_folder_name() {
+        assert_eq!(
+            resolve_install_dir(Path::new("D:\\voice2word")),
+            PathBuf::from("D:\\voice2word")
+        );
+    }
+
+    #[test]
+    fn resolve_on_drive_root_appends_app_folder() {
+        assert_eq!(
+            resolve_install_dir(Path::new("D:\\")),
+            PathBuf::from("D:\\").join(APP_NAME)
+        );
+    }
+
+    #[test]
+    fn default_install_dir_is_dedicated_app_folder() {
+        let dir = get_install_dir();
+        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some(APP_NAME));
+    }
 }
