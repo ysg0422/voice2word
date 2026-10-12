@@ -69,38 +69,50 @@ fn main() -> Result<()> {
     // 若还按 `config.ui.theme` 读，一旦旧配置里留着 `light`，用户会被困在浅色里无法回到深色。
     ui::theme::Theme::set_light(false);
     info!("界面主题: 深色");
-    // 硬件档案预热（P1-A9）：`HardwareInfo` 的 CPU/内存采集由 sysinfo 负责，
-    // 而 sysinfo 的刷新结果缓存在**进程级**静态状态里，首次调用约 850 ms
-    // （实测 16 核机器），之后同一进程内再取只要 ~1 ms。
+    // 硬件档案采集（P1-A9 / 冷启动）。此前这里是两步串行、都卡在首帧之前：
+    // - sysinfo 的 CPU/内存首采约 850 ms（实测 16 核；结果缓存在**进程级**静态
+    //   状态里，之后同一进程内再取 ~1 ms）；
+    // - wgpu 适配器枚举（`HardwareProfile::detect`）约 2.7 s（同样实测）。
     //
-    // 这一步本来被压在 `AppState::with_hardware` 里、串行地卡在首帧之前。
-    // 现在把它提前到一个后台线程：下面的 wgpu 适配器枚举要花 ~2.7 s（同样实测），
-    // 两者互不共享任何锁（`HardwareProfile::detect` 走 wgpu，sysinfo 走 Win32
-    // API），完全可以在不同的核上并行。于是这 850 ms 被整段藏进 wgpu 的等待窗口，
-    // 首帧前的串行耗时直接少掉它。
+    // 现在整段挪进一条采集线程，主线程立刻继续建库 / 依赖体检 / 初始化引擎，
+    // 到第 3.6 步才 join：等待量从「两笔之和」变成「枚举剩余量」，而档案本身不变。
     //
-    // 结论只是「预热」：返回值丢弃，真正的判定仍在 `with_hardware` 里按真实
-    // `hardware` 档案算。预热慢于 wgpu（例如无独显、wgpu 秒回）时退化为
-    // 「什么都没省」——不会更慢，也不会改变任何语义。
-    let hardware_warm = std::thread::spawn(|| {
+    // 判定**完全等价**，不是「先按 CPU 跑、后面偷偷改」：
+    // - 两个 GPU 开关都关时（`hwaccel_decode=false` 且 `whisper_offload=false`）
+    //   探出来的结果只影响预览硬解与 Whisper 卸载，而这两个开关已经把两条路都
+    //   钉死在 CPU 上——档案直接取 `cpu_only()`，线程里连适配器都不枚举，
+    //   结果与旧写法逐位相同；
+    // - 只要有一个开关打开，跑的就是旧写法**同一个** `HardwareProfile::detect()`，
+    //   只是执行位置从主线程挪到采集线程；join 之后所有下游判定
+    //   （`whisper_gpu` / `gpu_limit_percent` / proxy 硬解后端 / 播放器解码策略 /
+    //   `gpu_mode`）读到的值与旧写法逐位相同。
+    //
+    // 采集线程 panic 时退回 `cpu_only()` 并记一条 warn：与「探不出适配器」同样是
+    // 纯 CPU 路线，越保守越不会出现「按有 GPU 跑、其实没有」的坏情况。
+    // 另外，CPU/内存那笔首采仍会在这条线程里先做掉（结果丢弃），把 sysinfo 的
+    // 冷采样与后面的建库/引擎初始化并行起来——两笔耗时都不再占主线程。
+    let gpu_flags_enabled = config.gpu.hwaccel_decode || config.gpu.whisper_offload;
+    let hardware_probe = std::thread::spawn(move || {
+        // 先采一次 CPU/内存：返回值只是副产品（给下次调用命中缓存），真正要的是
+        // 让 sysinfo 那笔首采在采集线程里发生，主线程稍后取用时直接命中缓存。
         let _ = voice2word::core::HardwareInfo::detect_with_media_profile(
             &engines::HardwareProfile::cpu_only(),
         );
+        if !gpu_flags_enabled {
+            // 两个开关都关：适配器结果没人用，不枚举，直接交回纯 CPU 档案。
+            return engines::HardwareProfile::cpu_only();
+        }
+        // 采集线程里 panic 不该把启动带死（旧写法只会让进程直接崩），
+        // 捕获后按纯 CPU 降级，并留下带位置的日志。
+        std::panic::catch_unwind(engines::HardwareProfile::detect).unwrap_or_else(|_| {
+            warn!("硬件探测线程异常，按纯 CPU 档案继续启动");
+            engines::HardwareProfile::cpu_only()
+        })
     });
-
-    let mut hardware = if !config.gpu.hwaccel_decode && !config.gpu.whisper_offload {
-        engines::HardwareProfile::cpu_only()
-    } else {
-        engines::HardwareProfile::detect()
-    };
-    // GPU 占用策略（config.toml [gpu]）：给桌面/其他应用留显卡的两位总闸
+    // GPU 占用策略（config.toml [gpu]）：给桌面/其他应用留显卡的两位总闸。
+    // 这三条只读配置，与适配器无关，可以在采集线程还在跑的时候就先落地。
     if !config.gpu.hwaccel_decode {
-        hardware.hardware_decode = false;
         info!("GPU 策略: 预览硬解已关闭 (gpu.hwaccel_decode=false)，预览走 CPU 软解");
-    }
-    let whisper_gpu = hardware.use_gpu_pipeline() && config.gpu.whisper_offload;
-    if !whisper_gpu {
-        info!("GPU 策略: 转写推理走纯 CPU (gpu.whisper_offload=false 或无独显/核显不可用)");
     }
     if config.gpu.yield_to_desktop {
         info!("GPU 策略: 让路模式开启，转写/预览子进程降为低于正常优先级，桌面与前台程序优先");
@@ -111,27 +123,6 @@ fn main() -> Result<()> {
     // 读了配置，SenseVoice / 标点 / LLM / FFmpeg 全部硬编码 CREATE_NO_WINDOW，
     // 用户打开「让路」对它们毫无作用——长音频多进程并行时桌面照样卡。
     engines::media_pipeline::set_yield_to_desktop(config.gpu.yield_to_desktop);
-    // GPU 占用上限：让路只降 CPU 调度优先级，压不住已经排进 GPU 队列的命令缓冲，
-    // 想让桌面真正跟手必须按占空比给 GPU 留空窗
-    let gpu_limit_percent = if whisper_gpu {
-        config.gpu.effective_gpu_limit()
-    } else {
-        100
-    };
-    if gpu_limit_percent < 100 {
-        info!(
-            gpu_limit_percent,
-            "GPU 策略: 占空比限速开启，whisper-cli 会周期性挂起给桌面留出 GPU 空窗，转写耗时约放大 {:.2} 倍",
-            100.0 / gpu_limit_percent as f64
-        );
-    }
-    info!(
-        use_gpu_pipeline = hardware.use_gpu_pipeline(),
-        adapter = %hardware.adapter_name,
-        vendor = hardware.vendor.map(|v| v.label()).unwrap_or("—"),
-        "媒体渲染后端已选择"
-    );
-    startup.mark("hardware_detect");
 
     // 3. 打开 SQLite 数据库
     //
@@ -159,6 +150,46 @@ fn main() -> Result<()> {
     let dep_config = config.clone();
     std::thread::spawn(move || check_external_dependencies(&dep_config));
     startup.mark("dependency_check_deferred");
+
+    // 3.6 与硬件采集线程汇合：主线程已把建库、依赖体检跑完，此刻只剩「枚举的
+    //     剩余时间」要等——这正是把探测丢到后台线程的目的。
+    //     档案本身来自采集线程的 `detect()`（开关打开时），或这里的 `cpu_only()`
+    //     （开关全关时，与旧写法同一条分支）。线程若崩溃，`join` 返回 Err，
+    //     同样退回纯 CPU 档案。
+    let mut hardware = match hardware_probe.join() {
+        Ok(profile) if gpu_flags_enabled => profile,
+        _ => engines::HardwareProfile::cpu_only(),
+    };
+    // 用户关掉硬解开关时把档案里的能力也按下去（与旧写法同一处、同一顺序）
+    if !config.gpu.hwaccel_decode {
+        hardware.hardware_decode = false;
+    }
+    let whisper_gpu = hardware.use_gpu_pipeline() && config.gpu.whisper_offload;
+    if !whisper_gpu {
+        info!("GPU 策略: 转写推理走纯 CPU (gpu.whisper_offload=false 或无独显/核显不可用)");
+    }
+    // GPU 占用上限：让路只降 CPU 调度优先级，压不住已经排进 GPU 队列的命令缓冲，
+    // 想让桌面真正跟手必须按占空比给 GPU 留空窗。
+    // 这一步必须在 join 之后：占空比取决于 `whisper_gpu`，而它取决于真实适配器。
+    let gpu_limit_percent = if whisper_gpu {
+        config.gpu.effective_gpu_limit()
+    } else {
+        100
+    };
+    if gpu_limit_percent < 100 {
+        info!(
+            gpu_limit_percent,
+            "GPU 策略: 占空比限速开启，whisper-cli 会周期性挂起给桌面留出 GPU 空窗，转写耗时约放大 {:.2} 倍",
+            100.0 / gpu_limit_percent as f64
+        );
+    }
+    info!(
+        use_gpu_pipeline = hardware.use_gpu_pipeline(),
+        adapter = %hardware.adapter_name,
+        vendor = hardware.vendor.map(|v| v.label()).unwrap_or("—"),
+        "媒体渲染后端已选择"
+    );
+    startup.mark("hardware_detect");
 
     // 4. 初始化底层计算引擎
     let ffmpeg = Arc::new(FFmpegEngine::new(AppConfig::resolve_path(
@@ -291,11 +322,7 @@ fn main() -> Result<()> {
 
     startup.mark("engine_init");
 
-    // 与预热线程汇合：此刻它早已跑完（wgpu 那 2.7 s 足够），join 不产生等待，
-    // 但保证了 `with_hardware` 里那次采集必定命中已预热的缓存。
-    let _ = hardware_warm.join();
-
-    // 5. 编排流水线管线
+    // 5. 编排流水线管线（此时硬件档案已落定）
     let pipeline = Arc::new(TaskPipeline::new(ffmpeg, whisper, sensevoice, llm, punc));
 
     // 6. 初始化全局应用状态

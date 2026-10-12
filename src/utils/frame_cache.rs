@@ -178,6 +178,23 @@ impl FrameCache {
         (time_sec.max(0.0) / TIME_QUANTUM_SEC).round() as i64
     }
 
+    /// 格号 → 该格的取样时间（秒），即这一格的中心。
+    ///
+    /// 预取必须按**格**取时间（而不是沿用请求里的亚格偏移），否则 `10.04` 与 `10.06`
+    /// 会各抽一帧、落进同一个键互相覆盖，白白多跑一次 FFmpeg。
+    fn tick_time(tick: i64) -> f64 {
+        tick as f64 * TIME_QUANTUM_SEC
+    }
+
+    /// 预取目标时间：「请求所在格的下一格」的取样时间（秒）。
+    ///
+    /// 拖动时请求单调推进，下一格几乎必然被下一次请求命中；提前落盘可以把
+    /// 「命中等待 FFmpeg 的几十到几百毫秒」压成一次文件读取。纯函数（不碰任何状态）
+    /// 便于单测；负时间与第 0 格一视同仁地前进一格。
+    pub fn next_tick_time(time_sec: f64) -> f64 {
+        Self::tick_time(Self::tick_of(time_sec) + 1)
+    }
+
     /// 由签名与格号拼键。
     ///
     /// `q10` 是量化精度标记（每秒 10 格）：以后调整精度时一并改标记，旧精度的磁盘帧
@@ -203,7 +220,15 @@ impl FrameCache {
     /// 按候选键顺序在内存 + 磁盘里找帧，命中即返回——邻格命中也算命中。
     ///
     /// 内存里记着但文件已被裁剪/清理的情况视为未命中，不能把不存在的路径交给渲染层。
-    fn lookup_cached(&self, keys: &[String], disk_dir: &Path) -> Option<(String, PathBuf)> {
+    ///
+    /// `register_disk_hits` 决定磁盘命中是否登记进内存 LRU：正式请求要（下次同格直接
+    /// 内存命中），`peek` 这类只读探测不要（探测不该有副作用）。
+    fn lookup_cached(
+        &self,
+        keys: &[String],
+        disk_dir: &Path,
+        register_disk_hits: bool,
+    ) -> Option<(String, PathBuf)> {
         for key in keys {
             if let Some(path) = self.lock_cache().map.get(key).cloned() {
                 if path.exists() {
@@ -212,8 +237,10 @@ impl FrameCache {
             }
             let on_disk = disk_dir.join(format!("{key}.jpg"));
             if on_disk.exists() {
-                self.lock_cache()
-                    .insert(key.clone(), on_disk.clone(), self.max_size);
+                if register_disk_hits {
+                    self.lock_cache()
+                        .insert(key.clone(), on_disk.clone(), self.max_size);
+                }
                 return Some((key.clone(), on_disk));
             }
         }
@@ -240,13 +267,64 @@ impl FrameCache {
 
         // 先按候选键（精确格 → 邻格）找：命中就复用，不起 FFmpeg。
         // 这是「拖动时间轴画面跟手」的关键一步（见 [`NEIGHBOR_TICKS`]）。
-        if let Some((_, cached)) = self.lookup_cached(&keys, &temp_dir) {
+        if let Some((_, cached)) = self.lookup_cached(&keys, &temp_dir, true) {
             return Ok(cached);
         }
 
         // 未命中，只能真抽一帧：按**精确格**取键。
-        // 磁盘文件名直接使用缓存键（含路径+签名哈希），同名视频互不覆盖。
-        drop(keys);
+        self.extract_at(video_path, time_sec, sig, tick, ffmpeg)
+    }
+
+    /// 只读探测：`time_sec` 的精确格或 ±1 邻格是否已有可用帧（内存或磁盘）。
+    ///
+    /// 不抽帧、不写盘、**不登记**内存缓存——供预取/调度路径廉价地问「下一格要不要
+    /// 提前抽」。命中判定与正式请求同源（[`Self::candidate_keys`]），所以探测说
+    /// 「有」的位置，正式请求也一定能立即拿到。
+    pub fn peek(&self, video_path: &Path, time_sec: f64) -> Option<PathBuf> {
+        let sig = Self::signature(video_path);
+        let tick = Self::tick_of(time_sec);
+        let keys = Self::candidate_keys(sig, tick);
+        self.lookup_cached(&keys, &Self::disk_dir(), false)
+            .map(|(_, path)| path)
+    }
+
+    /// 预取「请求位置的下一格」：命中（内存/磁盘）直接返回；未命中则真抽一格落盘。
+    ///
+    /// **必须在后台线程 / 后台执行器里调用**：未命中会起一次 FFmpeg。与
+    /// [`Self::get_or_extract`] 的区别是**不走邻格复用**——预取的目标就是下一格
+    /// 本身，允许邻格复用的话它会把当前这一格原样还回来，等于没预取。
+    /// 抽帧失败时返回错误，调用方按「预取失败」忽略即可（不影响当前请求）。
+    pub fn prefetch_next_tick(
+        &self,
+        video_path: &Path,
+        time_sec: f64,
+        ffmpeg: &FFmpegEngine,
+    ) -> Result<PathBuf> {
+        let next_time = Self::next_tick_time(time_sec);
+        let sig = Self::signature(video_path);
+        let tick = Self::tick_of(next_time);
+        let key = Self::key_at_tick(sig, tick);
+        let temp_dir = Self::disk_dir();
+        // 只按**精确格**找（单键候选）：预取要的是「下一格」本身。
+        if let Some((_, cached)) = self.lookup_cached(&[key], &temp_dir, true) {
+            return Ok(cached);
+        }
+        self.extract_at(video_path, next_time, sig, tick, ffmpeg)
+    }
+
+    /// 真抽一帧并原子落盘（按**精确格**，不走邻格复用）。
+    ///
+    /// 磁盘文件名直接使用缓存键（含路径+签名哈希），同名视频互不覆盖。
+    fn extract_at(
+        &self,
+        video_path: &Path,
+        time_sec: f64,
+        sig: u64,
+        tick: i64,
+        ffmpeg: &FFmpegEngine,
+    ) -> Result<PathBuf> {
+        let temp_dir = Self::disk_dir();
+        let _ = std::fs::create_dir_all(&temp_dir);
         let key = Self::key_at_tick(sig, tick);
         let out_jpg = temp_dir.join(format!("{}.jpg", key));
 
@@ -298,7 +376,10 @@ impl FrameCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // 刻意**不写** `use super::*`：本组只依赖显式列出的名字，父模块增删私有项不会
+    // 悄悄改变这里的解析结果（与 `ui/views/library.rs`、`engines/whisper.rs` 单测同规）。
+    use super::{prune_disk_dir, FrameCache};
+    use std::path::{Path, PathBuf};
 
     fn key_for(path: &str, t: f64) -> String {
         FrameCache::key_at_tick(
@@ -465,6 +546,72 @@ mod tests {
             .filter(|n| n.ends_with(".jpg") && !n.ends_with(".part.jpg"))
             .count();
         assert_eq!(formal, 1, "正式帧应只保留最近 1 个");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 预取目标：请求所在格的**下一格**；同一格内的亚格偏移不改变目标格，
+    /// 负时间先夹到第 0 格再前进一格。
+    #[test]
+    fn next_tick_time_advances_one_quantum() {
+        assert_eq!(FrameCache::next_tick_time(3.0), FrameCache::tick_time(31));
+        // 3.0 与 2.96 都落在第 30 格：预取目标必须一致（否则同格反复抽帧互相覆盖）
+        assert_eq!(
+            FrameCache::next_tick_time(3.0),
+            FrameCache::next_tick_time(2.96)
+        );
+        // 已经跨到下一格时目标随之推进
+        assert_eq!(FrameCache::next_tick_time(3.2), FrameCache::tick_time(33));
+        // 负时间与第 0 格一视同仁：夹到第 0 格后再前进一格
+        assert_eq!(FrameCache::next_tick_time(-5.0), FrameCache::tick_time(1));
+        assert_eq!(FrameCache::next_tick_time(0.0), FrameCache::tick_time(1));
+    }
+
+    /// `peek` 是只读探测：精确格优先、±1 邻格可命中、更远不命中，
+    /// 且**不改动**内存缓存（磁盘命中也不登记）。
+    #[test]
+    fn peek_reports_exact_then_neighbor_without_side_effects() {
+        let cache = FrameCache::new(4);
+        // 不存在的视频：签名只由路径决定，磁盘上不会有它的帧
+        let video = Path::new("Z:/v2w_frame_cache_peek/missing_video.mp4");
+        assert!(cache.peek(video, 3.0).is_none(), "全新位置不应命中");
+        assert_eq!(cache.size(), 0, "peek 未命中不得改动内存缓存");
+
+        // 造一张真实存在的「帧文件」，登记到第 30 格（3.0s）
+        let dir = std::env::temp_dir().join(format!("v2w_peek_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let frame = dir.join("tick30.jpg");
+        std::fs::write(&frame, b"jpg").unwrap();
+        let sig = FrameCache::signature(video);
+        cache.lock_cache().insert(
+            FrameCache::key_at_tick(sig, FrameCache::tick_of(3.0)),
+            frame.clone(),
+            cache.max_size,
+        );
+
+        assert_eq!(cache.peek(video, 3.0), Some(frame.clone()), "精确格命中");
+        // 2.94 落在第 29 格：候选键 29 → 28 → 30，偏晚邻格也能命中
+        assert_eq!(
+            cache.peek(video, 2.94),
+            Some(frame.clone()),
+            "±1 邻格复用必须与正式请求同源"
+        );
+        // 3.2 落在第 32 格：候选键 32 → 31 → 33，离第 30 格两格以上，必须未命中
+        assert!(cache.peek(video, 3.2).is_none(), "±2 格之外必须重新抽帧");
+
+        // 磁盘命中同样不登记（peek 无任何写副作用）：用一个真实帧目录里的唯一键验证
+        let disk_frame =
+            FrameCache::disk_dir().join(format!("{}.jpg", FrameCache::key_at_tick(sig, 55)));
+        std::fs::create_dir_all(FrameCache::disk_dir()).unwrap();
+        std::fs::write(&disk_frame, b"jpg").unwrap();
+        let before = cache.size();
+        assert_eq!(
+            cache.peek(video, 5.5).as_deref(),
+            Some(disk_frame.as_path())
+        );
+        assert_eq!(cache.size(), before, "磁盘命中的 peek 不得登记内存缓存");
+        let _ = std::fs::remove_file(&disk_frame);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

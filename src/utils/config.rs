@@ -1557,6 +1557,26 @@ pub struct PipelineConfig {
     /// 期望说话人数（2~4）。聚类用确定性 k-means，该值直接决定簇数。
     #[serde(default = "default_speaker_count")]
     pub speaker_count: u32,
+    /// 热词 / 自定义提示词（用户清单第 9 项）：人名、品牌、专业术语最容易被音译错，
+    /// 这里填的写法会作为 initial prompt 拼进 whisper-cli 的 `--prompt`，
+    /// 提示模型优先按这些写法输出。
+    ///
+    /// 语义（以转写侧实现为唯一权威，见 `src/engines/whisper.rs`）：
+    /// - **空** = 完全沿用旧的默认提示词（`以下是普通话录音。`），与加这个字段之前逐字节一致；
+    /// - **非空** = 作为 initial prompt 的内容（中文链路仍会拼上简体锚点，理由见 whisper.rs）；
+    /// - 多个词用逗号/顿号分隔；长度上限与清洗规则也在 whisper.rs（200 字符上限，
+    ///   去 NUL / 控制字符 / 半角双引号 / `<|...|>` 特殊 token）。
+    ///
+    /// `#[serde(default)]` 是硬要求：`config.toml` 是手写且被 git 跟踪的，老用户手上
+    /// （以及从新版本回退时写出的）文件里没有这个键，必须照旧能读出来，而不是报「缺少字段」。
+    ///
+    /// **只对 Whisper 生效**，SenseVoice 链路不接这个值：后者走 sherpa-onnx 的
+    /// 单次前向（CTC 类模型，`src/engines/sensevoice.rs` 只给 runner 传
+    /// `--model/--tokens/--vad-model/--input/--threads/--language/--provider`），
+    /// 既没有 initial prompt 也没有解码偏置这类接口，硬塞一个参数只会被 runner 忽略，
+    /// 反而让用户以为「填了没生效是 bug」。界面上的说明文案与此处口径一致。
+    #[serde(default)]
+    pub asr_hotwords: String,
 }
 
 impl Default for AppConfig {
@@ -1604,6 +1624,7 @@ impl Default for AppConfig {
                 parallel_workers: 0,
                 enable_diarization: false,
                 speaker_count: 2,
+                asr_hotwords: String::new(),
             },
             gpu: GpuConfig::default(),
             subtitle_style: SubtitleStyleConfig::default(),
@@ -3790,5 +3811,92 @@ bar = "x"
         assert_eq!(style.bg_style, "shadow");
         assert_eq!(style.alignment, "center");
         assert_eq!(style.bg_opacity, 0.0);
+    }
+}
+
+/// `[pipeline] asr_hotwords`（热词 / 自定义提示词）的配置层回归。
+///
+/// 刻意**不写** `use super::*`：本组只依赖下面显式列出的名字，改名时会在这里直接编译失败。
+#[cfg(test)]
+mod asr_hotwords_config_tests {
+    use super::AppConfig;
+
+    /// 「加这个字段之前」的一份 config.toml：字段齐全，就是没有 asr_hotwords。
+    const LEGACY_CONFIG: &str = r#"
+[paths]
+ffmpeg = "tools/ffmpeg.exe"
+whisper_cli = "tools/whisper-cli.exe"
+whisper_model = "models/whisper/ggml-small-q5_0.bin"
+llama_cli = "tools/llama-completion.exe"
+llm_model = "models/llm/qwen.gguf"
+
+[pipeline]
+language = "zh"
+output_format = "srt"
+enable_polish = false
+whisper_threads = 12
+llm_threads = 4
+llm_ctx = 2048
+"#;
+
+    /// 临时目录 + 一份写好的 config.toml，返回 `(目录, 文件路径)`。
+    /// 沿用本文件既有测试的写法（临时目录 + `process::id()` 防撞车），用完由调用方删。
+    fn write_config(text: &str, tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("v2w_hotwords_cfg_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, text).expect("write config");
+        (dir, path)
+    }
+
+    /// 默认值必须是空串：出厂配置＝「行为与加字段之前一致」。
+    #[test]
+    fn default_hotwords_are_empty() {
+        assert!(
+            AppConfig::default().pipeline.asr_hotwords.is_empty(),
+            "默认值必须是空串，否则老用户会在没配置的情况下突然多出一段提示词"
+        );
+    }
+
+    /// 旧 config.toml（没有该键）必须照旧能读：不报错，字段落成空串，其它字段不受影响。
+    #[test]
+    fn legacy_config_without_hotwords_loads_as_empty() {
+        let (dir, path) = write_config(LEGACY_CONFIG, "legacy");
+        let cfg = AppConfig::load_from_file(&path).expect("旧配置必须照旧能读");
+        assert!(cfg.pipeline.asr_hotwords.is_empty(), "缺字段必须落成空串");
+        assert_eq!(cfg.pipeline.whisper_threads, 12, "其它字段不受影响");
+
+        // 读进来再存一次：空热词原样写回（`asr_hotwords = ""`），再读还是空
+        let again = dir.join("again.toml");
+        cfg.save_to_file(&again).expect("save");
+        let text = std::fs::read_to_string(&again).expect("read");
+        assert!(
+            text.contains("asr_hotwords"),
+            "空值也要照常序列化，界面上「清空热词」才是一次真实的状态变更"
+        );
+        let back = AppConfig::load_from_file(&again).expect("load");
+        assert!(back.pipeline.asr_hotwords.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 非空热词必须原样落盘、原样读回（含中文、逗号、空格、半角引号这种脏字符）。
+    #[test]
+    fn hotwords_round_trip_through_disk() {
+        let (dir, path) = write_config(LEGACY_CONFIG, "roundtrip");
+        let mut cfg = AppConfig::load_from_file(&path).expect("load");
+        let hotwords = "张三, 李四,OpenAI,SenseVoice \"极速\"";
+        cfg.pipeline.asr_hotwords = hotwords.to_string();
+        cfg.save_to_file(&path).expect("save");
+
+        let back = AppConfig::load_from_file(&path).expect("load");
+        assert_eq!(
+            back.pipeline.asr_hotwords, hotwords,
+            "热词要逐字节往返：转义交给 TOML 序列化，清洗是转写侧的事"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

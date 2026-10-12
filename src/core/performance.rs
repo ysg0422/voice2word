@@ -112,7 +112,16 @@ pub struct HardwareInfo {
 }
 
 impl HardwareInfo {
-    /// 全面检测当前系统硬件
+    /// 全面检测当前系统硬件（CPU / 内存 / 全部 GPU 适配器）。
+    ///
+    /// # 别在启动关键路径上直接调它
+    ///
+    /// 内部会新建 wgpu `Instance` 并把所有适配器枚举一遍——实测约 2.7 s。
+    /// GUI 启动路径（`main.rs`）因此把它整段丢进后台采集线程，并且只在
+    /// `GPU 开关打开` 时才会跑；有硬件档案可用时应改用
+    /// [`Self::detect_with_media_profile`]，它复用媒体管线选中的适配器，不额外枚举。
+    ///
+    /// 仍需一次全量枚举的调用点（例如无 GUI 的命令行路径）请自行放到非 UI 线程。
     pub fn detect() -> Self {
         let mut system = System::new_with_specifics(
             RefreshKind::new()
@@ -193,6 +202,10 @@ impl HardwareInfo {
     /// Reuse the adapter selected by the media pipeline. This keeps the CPU
     /// and memory measurements but avoids a second wgpu adapter enumeration
     /// during application startup.
+    ///
+    /// sysinfo 的**首次**采集（约 850 ms，实测）也发生在这里：调用方应把它放在
+    /// 启动关键路径之外（`AppState::with_hardware` 前的汇合点），或确保已有一个
+    /// 线程先采过一次——结果缓存在进程级静态状态里，之后的调用只要 ~1 ms。
     pub fn detect_with_media_profile(profile: &crate::engines::HardwareProfile) -> Self {
         let mut system = System::new_with_specifics(
             RefreshKind::new()

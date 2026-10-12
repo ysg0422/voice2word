@@ -2,7 +2,8 @@
 
 use gpui::prelude::*;
 use gpui::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -21,8 +22,15 @@ impl MainWindow {
     pub(crate) fn render_library_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let total_count = self.state.recent_tasks.len();
 
-        // 为缺失首帧的卡片后台派发缩略图提取（幂等，完成后自动刷新）
-        self.ensure_library_thumbnails(cx);
+        // 缩略图分两步派发（都幂等，完成后 `cx.notify()` 自动续上下一批）：
+        // 1) 解码：只补「视口内 + 上下边距」的卡片，解码结果按
+        //    [`LIBRARY_THUMB_IMAGE_CAP`] 封顶（不再整库常驻内存）；
+        // 2) 提取：把还没有帧文件的卡片抽一帧落盘（视口内的优先）。
+        let thumb_demand = self.library_thumb_decode_demand(cx);
+        self.ensure_library_thumb_decodes(&thumb_demand, cx);
+        self.ensure_library_thumbnails(&thumb_demand, cx);
+        // 记录已删除的卡片：解码结果也一并回收，不占 LRU 名额
+        self.prune_library_thumb_images(cx);
         // 同理补齐文件大小（每任务只 stat 一次，不再逐帧读盘）
         self.ensure_library_sizes(cx);
 
@@ -454,10 +462,16 @@ impl MainWindow {
             .into_iter()
             .map(|task| self.render_library_card(task, cx).into_any_element())
             .collect();
+        // 记录滚动位置与可视子项下标（`ScrollHandle`）：缩略图解码只补视口附近的
+        // 卡片，见 `library_thumb_decode_demand`。句柄存在 GPUI 全局里，因为本模块
+        // 只能改 `views/library.rs`（`MainWindow` 的字段定义在并发改动中的 ui/mod.rs）。
+        let scroll_handle =
+            cx.update_default_global::<LibraryThumbState, _>(|state, _| state.scroll.clone());
         div()
             .id("library-cards-scroll")
             .flex_1()
             .overflow_y_scroll()
+            .track_scroll(&scroll_handle)
             .flex()
             .flex_col()
             .gap(px(Theme::SPACE_3))
@@ -550,14 +564,16 @@ impl MainWindow {
         .detach();
     }
 
-    /// 为视频库卡片异步预提取首帧缩略图。
+    /// 为视频库卡片异步预提取首帧缩略图（**帧文件**；解码是下一步的事）。
+    ///
     /// 复用全局 FrameCache（磁盘级缓存：路径+文件签名+时间键，跨会话命中），时间 0.0 即首帧；
     /// 每个任务仅派发一次，失败时写入空路径标记防止逐帧重试刷爆后台。
-    fn ensure_library_thumbnails(&mut self, cx: &mut Context<Self>) {
-        const MAX_THUMB_WORKERS: usize = 2;
+    /// `demand`（视口内 + 上下边距的卡片 id）优先派发：滚动到的卡片要先有帧文件，
+    /// 解码才有得做。
+    fn ensure_library_thumbnails(&mut self, demand: &[i64], cx: &mut Context<Self>) {
         // 先收集待派发项（只取 id 与路径），避免在借用 recent_tasks 的同时
         // 修改 library_thumb_inflight，也避免克隆整段字幕数据
-        let pending: Vec<(i64, PathBuf)> = self
+        let mut pending: Vec<(i64, PathBuf)> = self
             .state
             .recent_tasks
             .iter()
@@ -567,6 +583,10 @@ impl MainWindow {
             })
             .map(|t| (t.id, PathBuf::from(&t.file_path)))
             .collect();
+
+        // 视口内的卡片排到最前（稳定排序：其余保持列表原序）
+        let priority: HashSet<i64> = demand.iter().copied().collect();
+        pending.sort_by_key(|(id, _)| !priority.contains(id));
 
         for (task_id, video_path) in pending {
             // A render can revisit this method frequently. Bound background
@@ -608,6 +628,129 @@ impl MainWindow {
             })
             .detach();
         }
+    }
+
+    /// 本帧需要**解码结果**的卡片 id（按列表顺序）：视口内 + 上下各
+    /// [`LIBRARY_THUMB_PREFETCH_MARGIN`] 张。
+    ///
+    /// 小库（卡片数 ≤ [`LIBRARY_THUMB_IMAGE_CAP`]）直接整库解码——与改造前的行为
+    /// 一致，任何卡片都不闪占位；大库只补视口附近，这正是「50 条库 ≈ 100MB 常驻」
+    /// 收敛成「常驻十几到几十 MB」的关键。滚动句柄在首次 prepaint 之前还没有子项
+    /// 信息（`children_count()==0`），此时按「列表开头铺到上限」派发，避免首帧空转。
+    fn library_thumb_decode_demand(&mut self, cx: &mut Context<Self>) -> Vec<i64> {
+        let ids = self.library_visible_ids();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        if ids.len() <= LIBRARY_THUMB_IMAGE_CAP {
+            return ids;
+        }
+        let (top, bottom, tracked_children) =
+            cx.update_default_global::<LibraryThumbState, _>(|state, _| {
+                (
+                    state.scroll.top_item(),
+                    state.scroll.bottom_item(),
+                    state.scroll.children_count(),
+                )
+            });
+        let range = if tracked_children == 0 {
+            0..LIBRARY_THUMB_IMAGE_CAP.min(ids.len())
+        } else {
+            thumb_demand_slice(ids.len(), top, bottom, LIBRARY_THUMB_PREFETCH_MARGIN)
+        };
+        ids[range].to_vec()
+    }
+
+    /// 为「视口内 + 上下边距」的卡片补派发**后台解码**任务。
+    ///
+    /// 复用与提取同一份预算（[`MAX_THUMB_WORKERS`] 并发 + `library_thumb_inflight`
+    /// 去重），把「已提取到帧文件」的卡片解码成可直接上传纹理的 `RenderImage`。
+    /// 解码在后台线程完成（960 宽的 JPG 解一次十几毫秒，放渲染线程就是稳定掉帧），
+    /// 交互路径不受影响；失败按帧文件是否还在决定「重来一次」还是「不再重试」。
+    fn ensure_library_thumb_decodes(&mut self, demand: &[i64], cx: &mut Context<Self>) {
+        for &task_id in demand {
+            if self.library_thumb_inflight.len() >= MAX_THUMB_WORKERS {
+                break;
+            }
+            if self.library_thumb_inflight.contains(&task_id) {
+                continue;
+            }
+            if cx.update_default_global::<LibraryThumbState, _>(|state, _| {
+                state.images.contains(task_id)
+            }) {
+                continue;
+            }
+            // 还没有帧文件（提取未完成），或提取失败记了空路径：本帧不派发。
+            // 提取完成会 notify，下一帧自然续上。
+            let Some(frame_path) = self.library_thumbs.get(&task_id).cloned() else {
+                continue;
+            };
+            if frame_path.as_os_str().is_empty() {
+                continue;
+            }
+            self.library_thumb_inflight.insert(task_id);
+
+            cx.spawn(async move |this, cx| {
+                let (decoded, frame_path) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let decoded = crate::ui::editor::render_image_from_frame_file(&frame_path);
+                        (decoded, frame_path)
+                    })
+                    .await;
+
+                let _ = this.update(cx, |this, cx| {
+                    this.library_thumb_inflight.remove(&task_id);
+                    if let Some(image) = decoded {
+                        let stale = cx.update_default_global::<LibraryThumbState, _>(|state, _| {
+                            state.images.insert(task_id, image)
+                        });
+                        if !stale.is_empty() {
+                            // 显式回收换下来的旧图：GPUI 精灵图集只按 image_id 释放
+                            // （`Window::drop_image`），没人调就永远常驻显存。本渲染
+                            // 链路拿不到 `&mut Window`（`render_library_layout` 的调用
+                            // 点没有窗口参数），所以走 `defer`：回调在本轮效果处理末尾
+                            // 执行，此时所有窗口都不在栈上，`App::drop_image` 会遍历
+                            // 每个窗口把纹理删掉（gpui 0.2.2）。
+                            cx.defer(move |cx| {
+                                for image in stale {
+                                    cx.drop_image(image, None);
+                                }
+                            });
+                        }
+                    } else if frame_path.exists() {
+                        // 帧文件还在却解不出来（损坏）：按提取失败同一策略记空路径，
+                        // 不再逐帧重试；渲染回到占位框。
+                        this.library_thumbs.insert(task_id, PathBuf::new());
+                    } else {
+                        // 帧文件已被磁盘裁剪：丢掉路径，下一帧重新提取一帧再解码（自愈）。
+                        this.library_thumbs.remove(&task_id);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// 清掉记录已被删除的卡片解码结果（`library_thumbs` 是删除/刷新后 `retain` 过的
+    /// 真相来源），回收同样走 `defer` + `drop_image`。
+    fn prune_library_thumb_images(&mut self, cx: &mut Context<Self>) {
+        if cx.update_default_global::<LibraryThumbState, _>(|state, _| state.images.is_empty()) {
+            return;
+        }
+        let live: HashSet<i64> = self.library_thumbs.keys().copied().collect();
+        let stale = cx.update_default_global::<LibraryThumbState, _>(|state, _| {
+            state.images.remove_missing(&live)
+        });
+        if stale.is_empty() {
+            return;
+        }
+        cx.defer(move |cx| {
+            for image in stale {
+                cx.drop_image(image, None);
+            }
+        });
     }
 
     /// 单条视频卡片 —— 横向布局：缩略图 | 信息区 | 操作按钮
@@ -731,10 +874,29 @@ impl MainWindow {
                     .border_color(Theme::border_subtle())
                     .relative();
 
-                match self.library_thumbs.get(&task_id) {
-                    Some(path) if !path.as_os_str().is_empty() => thumb_box
+                // 缩略图不再走 `img(路径)`：GPUI 会把每张解码结果永久留在资产缓存里
+                // （`App::fetch_asset` 只增不删，50 条库 ≈ 100MB）。改渲染后台线程
+                // 解码好的 `RenderImage`（见 `ensure_library_thumb_decodes`），内存里
+                // 只留最近使用的 [`LIBRARY_THUMB_IMAGE_CAP`] 张。
+                let has_frame = self
+                    .library_thumbs
+                    .get(&task_id)
+                    .is_some_and(|p| !p.as_os_str().is_empty());
+                let thumb_image = if has_frame {
+                    cx.update_default_global::<LibraryThumbState, _>(|state, _| {
+                        state.images.get(task_id).cloned()
+                    })
+                } else {
+                    None
+                };
+                match thumb_image {
+                    Some(image) => thumb_box
                         // 视频首帧铺满卡片，Cover 裁剪对齐 16:9
-                        .child(img(path.clone()).size_full().object_fit(ObjectFit::Cover))
+                        .child(
+                            img(ImageSource::Render(image))
+                                .size_full()
+                                .object_fit(ObjectFit::Cover),
+                        )
                         // 底部信息条：格式 + 时长
                         .child(
                             div()
@@ -765,7 +927,7 @@ impl MainWindow {
                                         .child(dur_str.clone()),
                                 ),
                         ),
-                    _ => thumb_box
+                    None => thumb_box
                         .flex()
                         .items_center()
                         .justify_center()
@@ -1062,11 +1224,156 @@ fn library_ext_label(file_name: &str) -> String {
         .to_uppercase()
 }
 
+/// 视频库缩略图**解码结果**的内存上限（张）。
+///
+/// 卡片改走自解码的 `RenderImage` 之前，GPUI 的资产缓存（`App::fetch_asset`）只增
+/// 不删：一张 960×540 的帧解码后 ≈ 2MB RGBA，50 条库就是 100MB，而且随新建/刷新
+/// 只涨不降。这里按「最近使用的 N 张」封顶，换下来的整张交还 GPUI 回收：
+/// - 32 张 ≈ 64MB 上限；实际常驻的只是「视口内 + 上下边距」的十几张（≈ 20~30MB），
+///   因为解码是**按可视范围按需派发**的（见 `library_thumb_decode_demand`）；
+/// - 32 张也覆盖 4K 全屏一屏（卡片高约 100px，2160px 视口 ≈ 22 张）再留一屏滚动余量，
+///   避免「滚动到哪都要重解码」；
+/// - 卡片总数 ≤ 上限的小库仍然整库解码（与改造前行为一致，不闪占位）。
+const LIBRARY_THUMB_IMAGE_CAP: usize = 32;
+
+/// 视口上下各多解码几张：滚动时下一屏的卡片已经就绪，不至于边滚边闪占位。
+const LIBRARY_THUMB_PREFETCH_MARGIN: usize = 4;
+
+/// 缩略图管线（提取 + 解码）共用的后台并发上限。
+///
+/// 渲染每帧都可能重入派发路径，必须封顶：大库的缩略图工作不能把 Whisper 的 CPU
+/// 抢光。提取与解码共用同一份预算（`library_thumb_inflight` 是同一个去重集合）。
+const MAX_THUMB_WORKERS: usize = 2;
+
+/// 「最近使用的 N 张」LRU。
+///
+/// 命中/插入都把键移到队尾，超上限时淘汰队头；`insert`/`remove_missing` 把被淘汰的
+/// 负载**返回**给调用方——GPUI 的精灵图集只认 `drop_image` 这一条回收路径，丢之前
+/// 必须显式交还（见 `render_monitor_picture` / `cached_static_image` 的注释）。
+///
+/// 负载做成泛型只为单测：用哨兵值即可钉死「上限 / 命中提升 / 替换回收」语义，
+/// 不必为了测 LRU 去构造真实的 `RenderImage`（生产实例是 `Arc<RenderImage>`）。
+struct ThumbImageLru<T> {
+    cap: usize,
+    map: HashMap<i64, T>,
+    /// 最近使用的在队尾
+    order: VecDeque<i64>,
+}
+
+impl<T> ThumbImageLru<T> {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn contains(&self, id: i64) -> bool {
+        self.map.contains_key(&id)
+    }
+
+    /// 命中并把该卡片提升为「最近使用」。
+    fn get(&mut self, id: i64) -> Option<&T> {
+        if !self.map.contains_key(&id) {
+            return None;
+        }
+        self.touch(id);
+        self.map.get(&id)
+    }
+
+    fn touch(&mut self, id: i64) {
+        self.order.retain(|k| *k != id);
+        self.order.push_back(id);
+    }
+
+    /// 插入/替换一张解码结果，返回**需要调用方显式回收**的旧图：
+    /// 同一 id 被重新解码替换下来的旧图，以及超上限淘汰的最久未用项。
+    fn insert(&mut self, id: i64, value: T) -> Vec<T> {
+        self.touch(id);
+        let mut stale = Vec::new();
+        if let Some(old) = self.map.insert(id, value) {
+            stale.push(old);
+        }
+        while self.map.len() > self.cap {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.map.remove(&oldest) {
+                stale.push(old);
+            }
+        }
+        stale
+    }
+
+    /// 清掉已经不在记录列表里的卡片（记录被删除/库被刷新），返回需要显式回收的图。
+    fn remove_missing(&mut self, live: &HashSet<i64>) -> Vec<T> {
+        let gone: Vec<i64> = self
+            .map
+            .keys()
+            .copied()
+            .filter(|id| !live.contains(id))
+            .collect();
+        let mut stale = Vec::new();
+        for id in gone {
+            self.order.retain(|k| *k != id);
+            if let Some(old) = self.map.remove(&id) {
+                stale.push(old);
+            }
+        }
+        stale
+    }
+}
+
+/// 视频库缩略图的跨帧状态：解码结果 LRU + 卡片列表的滚动句柄。
+///
+/// 存在 GPUI 全局（`App::update_default_global`）而不是 `MainWindow` 字段里：本模块
+/// 按并发任务边界只能改 `views/library.rs`，而 `MainWindow` 的结构体定义在
+/// 并发改动中的 `ui/mod.rs`。全局随 App 生命周期存活，等价于视图级状态。
+struct LibraryThumbState {
+    images: ThumbImageLru<Arc<RenderImage>>,
+    /// 卡片列表滚动容器（`.track_scroll`）的句柄：用它拿到**可视首尾下标**，
+    /// 解码派发只补视口附近，不再整库常驻。
+    scroll: ScrollHandle,
+}
+
+impl Default for LibraryThumbState {
+    fn default() -> Self {
+        Self {
+            images: ThumbImageLru::new(LIBRARY_THUMB_IMAGE_CAP),
+            scroll: ScrollHandle::new(),
+        }
+    }
+}
+
+impl Global for LibraryThumbState {}
+
+/// 「可视首尾下标 + 上下边距」→ 要解码的下标区间。
+///
+/// 抽成纯函数便于单测：`top`/`bottom` 来自滚动句柄（列表为空或尺寸未定时都可能是 0），
+/// 返回区间保证落在 `0..len` 内，且列表非空时至少含一张卡片——派发循环靠它保证
+/// 「视口里的卡片一定会被解码」。
+fn thumb_demand_slice(len: usize, top: usize, bottom: usize, margin: usize) -> Range<usize> {
+    if len == 0 {
+        return 0..0;
+    }
+    let last = len - 1;
+    let top = top.min(last);
+    let bottom = bottom.max(top).min(last);
+    let start = top.saturating_sub(margin);
+    let end = bottom.saturating_add(margin).saturating_add(1).min(len);
+    start..end
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         export_spec_for, format_file_size, library_ext_label, library_ordered_tasks,
-        library_task_index,
+        library_task_index, thumb_demand_slice, ThumbImageLru,
     };
     use crate::storage::TaskRecord;
 
@@ -1181,5 +1488,59 @@ mod tests {
             library_ordered_tasks(&tasks, &[123]).is_empty(),
             "全部查不到时不应渲染任何卡片"
         );
+    }
+
+    /// 缩略图解码缓存的上限与回收语义：满了淘汰最久未用的那张、命中会提升、
+    /// 同一张重新解码要把**旧图交还**给调用方（GPUI 靠 `drop_image` 释放纹理，
+    /// 不交还就等于显存常驻）。
+    #[test]
+    fn thumb_image_lru_caps_and_returns_replaced_images() {
+        let mut lru: ThumbImageLru<u32> = ThumbImageLru::new(2);
+        assert!(lru.insert(1, 10).is_empty(), "未超上限：没有旧图需要回收");
+        assert!(lru.insert(2, 20).is_empty());
+
+        // 命中会把 1 提升为最近使用：下一个被淘汰的应是 2 而不是 1
+        assert_eq!(lru.get(1), Some(&10));
+        assert_eq!(lru.insert(3, 30), vec![20], "超上限淘汰最久未用的 2");
+        assert!(lru.contains(1) && lru.contains(3) && !lru.contains(2));
+
+        // 同一 id 重新解码：旧图必须交还给调用方显式回收
+        assert_eq!(lru.insert(1, 11), vec![10], "替换下来的旧图要显式回收");
+        assert_eq!(lru.get(1), Some(&11));
+    }
+
+    /// 记录被删除/库被刷新后，对应卡片的解码结果要能被清掉并交还回收。
+    #[test]
+    fn thumb_image_lru_prunes_missing_records() {
+        let mut lru: ThumbImageLru<u32> = ThumbImageLru::new(4);
+        lru.insert(1, 10);
+        lru.insert(2, 20);
+        lru.insert(3, 30);
+
+        let live: std::collections::HashSet<i64> = [2_i64, 3].into_iter().collect();
+        assert_eq!(lru.remove_missing(&live), vec![10], "只清掉已删除的记录");
+        assert!(!lru.contains(1) && lru.contains(2) && lru.contains(3));
+        // 全都在：没有任何东西需要回收
+        assert!(lru.remove_missing(&live).is_empty());
+    }
+
+    /// 可视范围 → 解码派发区间：上下各留预取边距、两端夹进列表、空列表给空区间。
+    #[test]
+    fn thumb_demand_covers_viewport_with_margin() {
+        assert_eq!(
+            thumb_demand_slice(0, 0, 0, 4),
+            0..0,
+            "空列表不该派发任何解码"
+        );
+        // 视口在列表开头：上边距夹到 0
+        assert_eq!(thumb_demand_slice(50, 0, 7, 4), 0..12);
+        // 视口在中段：上下各扩 4 张
+        assert_eq!(thumb_demand_slice(50, 20, 27, 4), 16..32);
+        // 视口在结尾：下边距夹到 len
+        assert_eq!(thumb_demand_slice(50, 42, 49, 4), 38..50);
+        // 退化输入（首帧滚动句柄什么都没报）：至少仍覆盖一张，且不越界
+        assert_eq!(thumb_demand_slice(50, 0, 0, 0), 0..1);
+        // 越界下标先夹到末项、再按边距向两侧扩展（这里正好盖满整个 5 条列表）
+        assert_eq!(thumb_demand_slice(5, 99, 99, 4), 0..5);
     }
 }

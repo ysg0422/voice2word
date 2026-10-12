@@ -1,6 +1,6 @@
 //! 右侧转写参数配置抽屉及硬件监控部件
 //!
-//! 结构：标题 → 文件卡片 → 识别引擎档位栅格 → 转写参数（语言/格式/润色/线程）→ 硬件监控 → 主操作 CTA
+//! 结构：标题 → 文件卡片 → 识别引擎档位栅格 → 转写参数（语言/格式/润色/说话人/线程/热词）→ 硬件监控 → 主操作 CTA
 
 use gpui::prelude::*;
 use gpui::*;
@@ -168,6 +168,104 @@ fn tier_downloading(tier: WhisperModelTier, current: Option<&str>) -> bool {
     match tier.download_item_id() {
         Some(id) => current == id,
         None => current.starts_with("sensevoice"),
+    }
+}
+
+/// 热词输入框的编辑态。
+///
+/// # 为什么放在线程局部而不是 `MainWindow` 字段
+/// 本窗的界面状态惯例是挂在 `MainWindow` 上（见 `src/ui/mod.rs` 的 `api_base_input`、
+/// `focused_api_field`），但本轮只允许改 `whisper.rs` / `config.rs` / `config_drawer.rs`，
+/// 而 `MainWindow` 的定义在 `src/ui/mod.rs`（正被并发修改）。GPUI 在本仓是单线程的，
+/// 线程局部的 `RefCell` 与「挂在 `MainWindow` 上」语义等价，只是搬了个家。
+struct HotwordsInput {
+    /// 输入框的焦点句柄。必须**跨帧复用同一个**：每帧 `cx.focus_handle()` 新建一个，
+    /// `window.focus()` 就会指到一个已经不在渲染树里的焦点上，键盘输入随即丢失。
+    focus: Option<FocusHandle>,
+    /// 光标位置（字符下标，不是字节：自绘输入框一律按 `char` 计数）。
+    cursor: usize,
+    /// 输入框是否持有焦点。**只驱动外观**（描边高亮 + 光标块）——判断「这次按键该不该
+    /// 被接管」用的是 `FocusHandle::is_focused(window)`，拦截器里拿得到 `Window`，更权威。
+    focused: bool,
+    /// 键盘拦截器句柄（一次性挂上，见 `MainWindow::ensure_hotwords_hooks`）。
+    /// `Subscription` 一 drop 就等于注销，所以「只挂一次」的守卫得跟它一起常驻。
+    key_hook: Option<Subscription>,
+    /// 失焦订阅句柄（同上）。
+    blur_hook: Option<Subscription>,
+}
+
+thread_local! {
+    static HOTWORDS_INPUT: std::cell::RefCell<HotwordsInput> = const {
+        std::cell::RefCell::new(HotwordsInput {
+            focus: None,
+            cursor: 0,
+            focused: false,
+            key_hook: None,
+            blur_hook: None,
+        })
+    };
+}
+
+/// 焦点在框里时，光标左右各保留多少个可见字符。
+///
+/// 抽屉只有 350px 宽，而热词上限是 200 字符（`whisper.rs` 的 `MAX_ASR_HOTWORDS_CHARS`）：
+/// 整串渲染会被 `.truncate()` 从尾部切掉，光标一旦跑到后面就再也看不见，用户就不知道自己
+/// 在改哪一段。这里改成围绕光标的滑窗。
+const HOTWORDS_VIEW_CHARS: usize = 19;
+
+/// 围绕光标切出可见窗口：`(光标左侧, 光标右侧)`。
+///
+/// 两侧被切掉时补一个 `…`：没有这个记号，用户会以为「屏幕上的就是全部」，
+/// 在长词表中改到中间一段时尤其容易看错。
+fn hotwords_display_window(text: &str, cursor: usize) -> (String, String) {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let start = cursor.saturating_sub(HOTWORDS_VIEW_CHARS);
+    let end = cursor.saturating_add(HOTWORDS_VIEW_CHARS).min(chars.len());
+    let mut before = String::new();
+    if start > 0 {
+        before.push('…');
+    }
+    before.extend(&chars[start..cursor]);
+    let mut after: String = chars[cursor..end].iter().collect();
+    if end < chars.len() {
+        after.push('…');
+    }
+    (before, after)
+}
+
+/// 裸键（空格 / 退格 / Delete）在热词输入框里的编辑核（纯函数，有单测）。
+///
+/// 为什么不直接复用 `crate::ui::apply_line_edit`：那条按 `keystroke.key` 判「可打印单字符」，
+/// 而空格键的键名是 `"space"`（多字符），于是它插不进空格——热词里空格恰恰是常用分隔符，
+/// 这一格只能由这里补上。返回 `true` 表示这个键由本函数处理掉了。
+fn apply_hotwords_bare_key(buffer: &mut String, cursor: &mut usize, key: &str) -> bool {
+    let mut chars: Vec<char> = buffer.chars().collect();
+    let total = chars.len();
+    *cursor = (*cursor).min(total);
+    match key.to_ascii_lowercase().as_str() {
+        "space" => {
+            chars.insert(*cursor, ' ');
+            *buffer = chars.into_iter().collect();
+            *cursor += 1;
+            true
+        }
+        "backspace" | "back" | "\u{8}" => {
+            if *cursor > 0 {
+                chars.remove(*cursor - 1);
+                *cursor -= 1;
+                *buffer = chars.into_iter().collect();
+            }
+            true
+        }
+        "delete" | "del" | "\u{7f}" => {
+            if *cursor < total {
+                chars.remove(*cursor);
+                *buffer = chars.into_iter().collect();
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -896,6 +994,9 @@ impl MainWindow {
                 },
                 cx,
             ))
+            // 热词 / 自定义提示词：识别相关的最后一格（人名、品牌、专业术语的音译纠正）。
+            // 追加在末尾、不挪动任何既有条目：抽屉布局是用户肌肉记忆的一部分。
+            .child(self.render_hotwords_row(cx))
     }
 
     /// 参数分组：小标题 + 分段选择器行
@@ -947,6 +1048,247 @@ impl MainWindow {
             );
         }
         row
+    }
+
+    /// 「热词 / 自定义提示词」输入行（落盘键：`[pipeline] asr_hotwords`）。
+    ///
+    /// # 外观状态为什么自己维护
+    /// 这条渲染链（`render_sidebar` → 本函数）拿不到 `Window`，问不了 GPUI「这个框现在有焦点吗」。
+    /// 本窗其它输入框都靠 `MainWindow::render` 每帧从窗口焦点同步一份 bool（见 `src/ui/mod.rs`
+    /// 的 `focused_api_field`），而那个同步点在禁改文件里。于是改成事件驱动：点击置真；
+    /// 失焦订阅与键盘拦截器里置假，两处都会 `cx.notify()`。
+    ///
+    /// # 键盘为什么走全局拦截器
+    /// 本窗的裸键动作（空格 = 播放/暂停、Delete/Backspace = 删除当前句、Ctrl+Z = 撤销字幕）
+    /// 用 `MainWindow::any_input_focused` 判定是否放行，而那份焦点句柄清单写死在
+    /// `src/ui/mod.rs`（禁改）。本框不在清单里，若只挂 `on_key_down`：空格会被动作系统吃掉
+    /// （既打不出空格，又顺带切换播放），Delete 还会删掉一句字幕。`App::intercept_keystrokes`
+    /// 在动作分发**之前**执行，正好只接管这几个冲突键；其余按键照旧走元素自己的 `on_key_down`，
+    /// 与同窗其它输入框共用 `crate::ui::apply_line_edit` 那套最小编辑集合。
+    fn render_hotwords_row(&mut self, cx: &mut Context<Self>) -> Div {
+        let focus = match HOTWORDS_INPUT.with(|s| s.borrow().focus.clone()) {
+            Some(handle) => handle,
+            None => {
+                let created = cx.focus_handle();
+                HOTWORDS_INPUT.with(|s| s.borrow_mut().focus = Some(created.clone()));
+                created
+            }
+        };
+        let (focused, cursor) = HOTWORDS_INPUT.with(|s| {
+            let s = s.borrow();
+            (s.focused, s.cursor)
+        });
+        let raw = self.state.config.pipeline.asr_hotwords.clone();
+        let char_count = raw.chars().count();
+        let (before, after) = hotwords_display_window(&raw, cursor.min(char_count));
+        let has_content = char_count > 0;
+        let click_focus = focus.clone();
+
+        let input_box = primitives::text_input(focused, 120.0)
+            .id("asr-hotwords-input")
+            .track_focus(&focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    window.focus(&click_focus);
+                    HOTWORDS_INPUT.with(|s| {
+                        let mut s = s.borrow_mut();
+                        s.focused = true;
+                        // 点进来时光标落到末尾：这个框的主用法是「在末尾补一个词」
+                        s.cursor = this.state.config.pipeline.asr_hotwords.chars().count();
+                    });
+                    this.ensure_hotwords_hooks(window, cx);
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                // 能走到这里的按键都是「动作系统不争」的那些：空格 / 退格 / Delete / Ctrl+Z 系
+                // 已在拦截器里被接管，剩下的一律共用本窗其它输入框那套编辑核，不在这里再写一份。
+                let mut cursor = HOTWORDS_INPUT.with(|s| s.borrow().cursor);
+                if crate::ui::apply_line_edit(
+                    &mut this.state.config.pipeline.asr_hotwords,
+                    &mut cursor,
+                    event,
+                    cx,
+                ) {
+                    HOTWORDS_INPUT.with(|s| s.borrow_mut().cursor = cursor);
+                    // 逐键落盘：转写侧每次拼命令行都现读 config.toml，「改完即时生效」
+                    // 就落在这一次写入上（与同卡片其它设置项同一套 persist 口径）。
+                    this.state.persist_config();
+                    cx.notify();
+                }
+            }))
+            .child(if focused {
+                div()
+                    .flex()
+                    .items_center()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .text_color(Theme::text_primary())
+                    .child(before)
+                    .child(div().text_color(Theme::accent_blue()).child("▌"))
+                    .child(after)
+            } else if char_count == 0 {
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .truncate()
+                    .child("例如：张三, 李四, OpenAI, 量子纠缠")
+            } else {
+                div()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .text_color(Theme::text_primary())
+                    .truncate()
+                    .child(raw)
+            });
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_1))
+            .child(primitives::field_label("热词提示词"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(Theme::SPACE_1_5))
+                    .w_full()
+                    .child(div().flex_1().min_w(px(0.0)).child(input_box))
+                    .children(has_content.then(|| {
+                        primitives::chip_clickable("清空", false, false)
+                            .id("hotwords-clear")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.config.pipeline.asr_hotwords.clear();
+                                HOTWORDS_INPUT.with(|s| s.borrow_mut().cursor = 0);
+                                this.state.persist_config();
+                                cx.notify();
+                            }))
+                    }))
+                    .child(
+                        primitives::chip_clickable("粘贴", false, false)
+                            .id("hotwords-paste")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let Some(text) = cx.read_from_clipboard().and_then(|it| it.text())
+                                else {
+                                    return;
+                                };
+                                // 多行文本折成一行：热词是「一行词表」，换行在提示词里没有语义
+                                //（whisper.rs 侧还会把控制字符再折一遍，这里先折成逗号更直观）。
+                                let flat = text.trim().replace(['\r', '\n'], "，");
+                                if flat.is_empty() {
+                                    return;
+                                }
+                                let new_cursor = {
+                                    let buffer = &mut this.state.config.pipeline.asr_hotwords;
+                                    if !buffer.is_empty()
+                                        && !buffer.ends_with(',')
+                                        && !buffer.ends_with('，')
+                                    {
+                                        buffer.push('，');
+                                    }
+                                    buffer.push_str(&flat);
+                                    buffer.chars().count()
+                                };
+                                HOTWORDS_INPUT.with(|s| s.borrow_mut().cursor = new_cursor);
+                                this.state.persist_config();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_muted())
+                    // 浅显说明：只讲「填什么、怎么分隔、会发生什么」。末尾一句写明仅 Whisper 生效——
+                    // SenseVoice 走 sherpa-onnx 的单次前向（CTC 类），没有 initial prompt /
+                    // 解码偏置这类接口，硬塞参数只会被 runner 忽略，不如讲清楚。
+                    .child(
+                        "填人名、品牌、专业术语，用逗号分隔；识别时会提示模型优先按这些写法输出。\
+                         仅 Whisper 引擎生效（SenseVoice 无提示词接口）。",
+                    ),
+            )
+    }
+
+    /// 热词输入框的一次性全局钩子：键盘拦截 + 失焦订阅。
+    ///
+    /// 挂在「第一次点击输入框」那一刻，而不是每帧渲染时：`Subscription` 一 drop 就注销，
+    /// 必须留一份活到窗口结束，而每帧挂一份会越积越多。点击时手上同时有 `Window` 与 `Context`，
+    /// 正好是这两类钩子都需要的时刻（渲染路径没有 `Window`）。
+    fn ensure_hotwords_hooks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (handle, need_keys, need_blur) = HOTWORDS_INPUT.with(|s| {
+            let s = s.borrow();
+            (s.focus.clone(), s.key_hook.is_none(), s.blur_hook.is_none())
+        });
+        let Some(handle) = handle else {
+            return;
+        };
+
+        if need_keys {
+            let weak = cx.weak_entity();
+            let focus = handle.clone();
+            let sub = cx.intercept_keystrokes(move |event: &KeystrokeEvent, window, cx| {
+                let focused_now = focus.is_focused(window);
+                // 外观标记在这里自愈：渲染时拿不到 `Window`，真实焦点只有拦截器（每次按键）
+                // 与失焦订阅（每次失焦）看得见。
+                let stale = HOTWORDS_INPUT.with(|s| s.borrow().focused != focused_now);
+                if stale {
+                    HOTWORDS_INPUT.with(|s| s.borrow_mut().focused = focused_now);
+                    let _ = weak.update(cx, |_, cx| cx.notify());
+                }
+                if !focused_now {
+                    return; // 焦点不在热词框：一个按键都不碰
+                }
+                // 只接管会与全局裸键动作打架的那几个键；返回 true 才 `stop_propagation()`，
+                // 于是「空格切播放 / Delete 删字幕 / Ctrl+Z 撤销字幕」都不会发生。
+                let consumed = weak
+                    .update(cx, |this, cx| {
+                        this.intercept_hotwords_keystroke(&event.keystroke, cx)
+                    })
+                    .unwrap_or(false);
+                if consumed {
+                    cx.stop_propagation();
+                }
+            });
+            HOTWORDS_INPUT.with(|s| s.borrow_mut().key_hook = Some(sub));
+        }
+
+        if need_blur {
+            let weak = cx.weak_entity();
+            let sub = window.on_focus_out(&handle, cx, move |_event, _window, cx| {
+                HOTWORDS_INPUT.with(|s| s.borrow_mut().focused = false);
+                let _ = weak.update(cx, |_, cx| cx.notify());
+            });
+            HOTWORDS_INPUT.with(|s| s.borrow_mut().blur_hook = Some(sub));
+        }
+    }
+
+    /// 冲突按键的就地编辑：返回 `true` 表示这个键由热词输入框接管。
+    ///
+    /// 接管范围刻意只有「动作系统会误伤」的几类：空格（裸键 = 播放/暂停，且键名是多字符
+    /// 所以 `apply_line_edit` 插不进去）、退格 / Delete（裸键 = 删除当前句）、Ctrl+Z 系
+    /// （裸键 = 撤销**字幕**，不是撤销这段文本）。其余按键一律放行给元素自己的 `on_key_down`，
+    /// 编辑行为与同窗其它输入框保持一致。
+    fn intercept_hotwords_keystroke(
+        &mut self,
+        keystroke: &Keystroke,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = keystroke.key.to_ascii_lowercase();
+        if keystroke.modifiers.control && matches!(key.as_str(), "z" | "y") {
+            // 本框没有撤销栈：吞掉即可，绝不能让动作系统去改字幕。
+            return true;
+        }
+        let mut cursor = HOTWORDS_INPUT.with(|s| s.borrow().cursor);
+        let consumed = apply_hotwords_bare_key(
+            &mut self.state.config.pipeline.asr_hotwords,
+            &mut cursor,
+            &key,
+        );
+        if consumed {
+            HOTWORDS_INPUT.with(|s| s.borrow_mut().cursor = cursor);
+            self.state.persist_config();
+            cx.notify();
+        }
+        consumed
     }
 
     /// 渲染硬件与模型资源监控对比卡片 (CPU / 内存实时对比)
@@ -1093,8 +1435,8 @@ mod tests {
     // 这里刻意不用 `use super::*`：父模块的 `use gpui::*` 会把 gpui 自带的
     // `test` 属性宏带进来，遮蔽内建的 `#[test]`，导致展开递归超限。
     use super::{
-        bundle_size_text, speaker_options, tier_downloading, tier_size_text, tier_status_text,
-        TIER_TAGLINES,
+        apply_hotwords_bare_key, bundle_size_text, hotwords_display_window, speaker_options,
+        tier_downloading, tier_size_text, tier_status_text, HOTWORDS_VIEW_CHARS, TIER_TAGLINES,
     };
     use crate::app::WhisperModelTier;
     use crate::engines::MAX_SPEAKERS;
@@ -1196,5 +1538,75 @@ mod tests {
             WhisperModelTier::SenseVoice,
             Some("whisper-base")
         ));
+    }
+
+    /// 热词框的裸键编辑核：空格必须能打出来（`apply_line_edit` 的键名判据做不到这一点），
+    /// 退格删光标前一个字符、Delete 删光标后一个字符，其它键一律放行。
+    #[test]
+    fn hotwords_bare_keys_edit_at_cursor() {
+        let mut buffer = "张三李四".to_string();
+        let mut cursor = 2; // 「张」「三」之后
+
+        // 空格：插在光标处（自绘输入框里唯一能打出空格的地方）
+        assert!(apply_hotwords_bare_key(&mut buffer, &mut cursor, "space"));
+        assert_eq!(buffer, "张三 李四");
+        assert_eq!(cursor, 3);
+
+        // 退格：删光标前的那个空格
+        assert!(apply_hotwords_bare_key(
+            &mut buffer,
+            &mut cursor,
+            "backspace"
+        ));
+        assert_eq!(buffer, "张三李四");
+        assert_eq!(cursor, 2);
+
+        // Delete：删光标后的「李」（光标不动）
+        assert!(apply_hotwords_bare_key(&mut buffer, &mut cursor, "delete"));
+        assert_eq!(buffer, "张三四");
+        assert_eq!(cursor, 2);
+
+        // 到边界也不 panic、不越界
+        cursor = 0;
+        assert!(apply_hotwords_bare_key(
+            &mut buffer,
+            &mut cursor,
+            "backspace"
+        ));
+        assert_eq!(buffer, "张三四");
+        cursor = buffer.chars().count();
+        assert!(apply_hotwords_bare_key(&mut buffer, &mut cursor, "delete"));
+        assert_eq!(buffer, "张三四");
+
+        // 别的键不归它管（交给 `apply_line_edit`）
+        assert!(!apply_hotwords_bare_key(&mut buffer, &mut cursor, "a"));
+        assert!(!apply_hotwords_bare_key(&mut buffer, &mut cursor, "left"));
+        assert_eq!(buffer, "张三四");
+    }
+
+    /// 光标窗口：长热词里光标必须留在可见范围内，两侧被切掉时给出省略号。
+    #[test]
+    fn hotwords_display_window_keeps_cursor_visible() {
+        // 短文本整段可见，不加省略号
+        let (before, after) = hotwords_display_window("张三,李四", 3);
+        assert_eq!((before.as_str(), after.as_str()), ("张三,", "李四"));
+
+        // 光标越界（缓冲刚被清空过）时夹到末尾，不 panic
+        let (before, after) = hotwords_display_window("张三", 99);
+        assert_eq!((before.as_str(), after.as_str()), ("张三", ""));
+
+        // 长文本：光标左右各 `HOTWORDS_VIEW_CHARS` 个字符，两侧都补省略号
+        let long = "人".repeat(300);
+        let (before, after) = hotwords_display_window(&long, 150);
+        assert_eq!(before.chars().count(), HOTWORDS_VIEW_CHARS + 1, "{before}");
+        assert_eq!(after.chars().count(), HOTWORDS_VIEW_CHARS + 1, "{after}");
+        assert!(before.starts_with('…') && after.ends_with('…'));
+
+        // 光标在头部 / 尾部时只有一侧需要省略号
+        let (before, after) = hotwords_display_window(&long, 0);
+        assert!(!before.starts_with('…') && before.is_empty());
+        assert!(after.ends_with('…'));
+        let (before, after) = hotwords_display_window(&long, 300);
+        assert!(before.starts_with('…') && !after.ends_with('…') && after.is_empty());
     }
 }
