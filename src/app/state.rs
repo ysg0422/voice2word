@@ -1273,34 +1273,32 @@ impl AppState {
         self.load_task_with(task, true);
     }
 
-    /// 删除历史任务记录（若当前工作区正显示该工程，则静默补位至下一条或彻底清空，不切换页面）。
+    /// 删除历史任务记录（若被删的正是当前工作区工程，则静默补位至列表最新一条或彻底清空，不切换页面）。
     ///
     /// 返回删除是否成功。此前这里是 `let _ = self.db.delete_task(id)`，删库失败被
     /// 完全静默：界面照样刷新、照样提示「已删除该记录」，而记录其实还在库里，下次
     /// 刷新列表它又冒出来。失败时**不**做补位/清空——工程仍在，不该被切走。
     pub fn delete_task_record(&mut self, id: i64) -> anyhow::Result<()> {
-        let deleted_task = self.recent_tasks.iter().find(|t| t.id == id).cloned();
         self.db.delete_task(id)?;
         self.refresh_recent_tasks();
 
-        if let Some(task) = deleted_task {
-            let is_current = self
-                .selected_file
-                .as_ref()
-                .map(|p| {
-                    p == &PathBuf::from(&task.file_path)
-                        || p.to_string_lossy().replace('\\', "/")
-                            == task.file_path.replace('\\', "/")
-                })
-                .unwrap_or(false);
-
-            if is_current {
-                if let Some(next_task) = self.recent_tasks.first().cloned() {
-                    // 静默补位：只换数据，不把用户拽离视频库页面
-                    self.load_task_with(&next_task, false);
-                } else {
-                    self.clear_current_workspace();
-                }
+        // 判定「被删的是不是当前工作区」必须用主键 `active_task_id`，不能比文件
+        // 路径：同一路径允许多条历史记录（每次转写各插一行），按路径比较会把
+        // 「删掉同路径的另一条老记录」也误判成删掉当前工程，把用户正在编辑的
+        // 工作区无故切走；而且 `selected_file` 与 `active_task_id` 不一定同步。
+        // `active_task_id` 由 `load_task_with` / `load_from_cache` 维护、
+        // `clear_current_workspace` 清空，是权威来源。
+        //
+        // 注意：即便列表里找不到该 id（`refresh_recent_tasks` 后 recent_tasks 无此项），
+        // 只要主键命中就照常补位/清空——库已删成功，工作区不能继续指向已消失的记录。
+        if self.active_task_id == Some(id) {
+            // `refresh_recent_tasks` 已把被删项移出，`first()` 即删后最新一条
+            // （`list_recent_tasks` 按 id 倒序）。
+            if let Some(next_task) = self.recent_tasks.first().cloned() {
+                // 静默补位：只换数据，不把用户拽离视频库页面
+                self.load_task_with(&next_task, false);
+            } else {
+                self.clear_current_workspace();
             }
         }
         Ok(())
@@ -1926,6 +1924,11 @@ impl AppState {
                 Err(err) => {
                     tracing::warn!(error = %err, "字幕写库失败，改动尚未持久化");
                     self.record_db_write_error(format!("字幕保存失败：{err}"));
+                    // 写失败必须把脏标记重新置回：否则下面关窗守卫读到的
+                    // `segments_dirty` 是「已保存」，直接放行关闭窗口，用户重启后
+                    // 改动全丢（与 db_write_error 提示条同时存在，自相矛盾）。
+                    // 保持脏 → 后续 flush 会重试，守卫也仍会拦截关闭。
+                    self.segments_dirty = true;
                 }
             }
         }
@@ -3269,6 +3272,60 @@ mod tests {
             .expect("换文件后应查到 B 的缓存");
         assert_eq!(hit.id, id);
         assert_eq!(hit.segments[0].text, "B 文件第一句");
+    }
+
+    /// 删除「同路径的另一条历史记录」不能切走当前工作区。
+    ///
+    /// 回归护栏：此前 `delete_task_record` 用 `selected_file` 路径比较判定
+    /// 「被删的是不是当前工程」。同一路径允许多条记录（每次转写各插一行），
+    /// 删掉同路径的另一条会把当前工程无故补位切走。改为按 `active_task_id`
+    /// 主键判定后，删非当前记录应原样保留工作区。
+    #[test]
+    fn deleting_same_path_sibling_keeps_current_workspace() {
+        let mut state = test_state(Vec::new());
+        let path = "D:/video/same.mp4";
+        let older = state
+            .db
+            .insert_task(
+                path,
+                "same.mp4",
+                3.0,
+                "completed",
+                &[Segment::new(1, 0.0, 3.0, "旧记录")],
+                None,
+            )
+            .expect("插入旧记录应成功");
+        let current = state
+            .db
+            .insert_task(
+                path,
+                "same.mp4",
+                3.0,
+                "completed",
+                &[Segment::new(1, 0.0, 3.0, "当前记录")],
+                None,
+            )
+            .expect("插入当前记录应成功");
+
+        state.refresh_recent_tasks();
+        let current_task = state
+            .recent_tasks
+            .iter()
+            .find(|t| t.id == current)
+            .cloned()
+            .expect("列表应能取到当前记录");
+        state.load_task_with(&current_task, false);
+        assert_eq!(state.active_task_id, Some(current));
+
+        // 删同路径的**另一条**记录：当前工作区必须原样保留
+        state.delete_task_record(older).expect("删除应成功");
+        assert_eq!(
+            state.active_task_id,
+            Some(current),
+            "删同路径另一条记录不应切走当前工作区"
+        );
+        assert_eq!(state.segments.len(), 1, "当前工程字幕不应被清空");
+        assert_eq!(state.segments[0].text, "当前记录");
     }
 
     /// 缓存命中必须返回**同一个 Arc**（指针相等），而不是每帧深拷贝一份新记录。
