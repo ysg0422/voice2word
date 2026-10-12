@@ -212,8 +212,11 @@ fn run_installer() {
         reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{app}\" /f >nul 2>&1\r\n\
         del /f /q \"%USERPROFILE%\\Desktop\\{app}.lnk\" >nul 2>&1\r\n\
         del /f /q \"%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\{app}.lnk\" >nul 2>&1\r\n\
+        echo 即将删除 {app} 的安装目录（其中包含您的用户数据）：\"{dir}\"\r\n\
+        msg * \"{app} 卸载即将完成：将删除以下目录（其中包含您的用户数据），删除后不可恢复：{dir}\"\r\n\
+        timeout /t 5 /nobreak >nul\r\n\
         rmdir /s /q \"{dir}\" >nul 2>&1\r\n\
-        msg * \"{app} 已成功从您的电脑中卸载。\"\r\n",
+        echo {app} 已从您的电脑中卸载。\r\n",
         app = APP_NAME,
         exe = APP_EXE_NAME,
         dir = install_dir.display(),
