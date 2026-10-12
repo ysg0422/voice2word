@@ -56,6 +56,44 @@ fn utc_now() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// 反序列化后归一「全空白」的分段字段。
+///
+/// `Segment` 的字符串字段在 JSON 里可能以**空白串**而不是 `null` / 空串落库
+/// （旧版本、外部工具或界面误存）。这类值必须在装载时消掉：
+/// - `translation` / `translation_lang` / `language`：空白串会让
+///   `translation_matches()` 误判「已有译文且就是目标语言」，界面上出现
+///   「已翻译」的空行，还会跳过真正需要的重译；
+/// - `polished`：`display_text()` 只把「trim 后为空」的润色稿视为未润色，
+///   归一成空串后与「从未润色」的语义完全一致，消费点也无需各自判空。
+fn normalize_segment_blanks(segments: &mut [Segment]) {
+    for seg in segments.iter_mut() {
+        if seg
+            .translation
+            .as_deref()
+            .is_some_and(|text| text.trim().is_empty())
+        {
+            seg.translation = None;
+        }
+        if seg
+            .translation_lang
+            .as_deref()
+            .is_some_and(|lang| lang.trim().is_empty())
+        {
+            seg.translation_lang = None;
+        }
+        if seg
+            .language
+            .as_deref()
+            .is_some_and(|lang| lang.trim().is_empty())
+        {
+            seg.language = None;
+        }
+        if seg.polished.trim().is_empty() {
+            seg.polished = String::new();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskRecord {
     pub id: i64,
@@ -425,6 +463,9 @@ impl Database {
     ///
     /// 句数与首句摘录交给 SQLite 的 JSON 函数直接算，避免把每条工程的
     /// `segments_json` 全量反序列化——历史库越大，这一项越是启动瓶颈。
+    /// 摘录口径与 `Segment::display_text` 对齐：`polished` 只有在**去掉全部
+    /// ASCII 空白字符**后仍非空才算数（SQLite 的 `TRIM(X)` 默认只去半角空格、
+    /// 不去 `\n` / `\t`，所以 SQL 里显式列出空白字符集），否则回退到 `text`。
     pub fn list_recent_tasks(&self, limit: usize) -> Result<Vec<TaskRecord>> {
         let conn = self.lock_conn();
         let mut stmt = conn.prepare(
@@ -432,7 +473,8 @@ impl Database {
                     CASE WHEN json_valid(segments_json)
                          THEN COALESCE(json_array_length(segments_json), 0) ELSE 0 END,
                     CASE WHEN json_valid(segments_json)
-                         THEN COALESCE(NULLIF(json_extract(segments_json, '$[0].polished'), ''),
+                         THEN COALESCE(NULLIF(TRIM(json_extract(segments_json, '$[0].polished'),
+                                                  ' ' || char(9) || char(10) || char(11) || char(12) || char(13)), ''),
                                        json_extract(segments_json, '$[0].text'), '') ELSE '' END
              FROM tasks ORDER BY id DESC LIMIT ?1",
         )?;
@@ -482,10 +524,12 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(json
+        let mut segments: Vec<Segment> = json
             .as_deref()
             .and_then(|s| serde_json::from_str::<Vec<Segment>>(s).ok())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        normalize_segment_blanks(&mut segments);
+        Ok(segments)
     }
 
     /// 把一条列表记录补齐为「已装载字幕」的完整记录（失败时保留原记录）
@@ -585,7 +629,10 @@ impl Database {
     /// created_at, metrics_json, content_hash）转成 `TaskRecord`。
     fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRecord> {
         let segments_json: String = row.get(5)?;
-        let segments: Vec<Segment> = serde_json::from_str(&segments_json).unwrap_or_default();
+        let mut segments: Vec<Segment> = serde_json::from_str(&segments_json).unwrap_or_default();
+        // 反序列化即归一：`sample_text` 与写回路径共用这份内存态，
+        // 让「全空白」在内存里就变成 None / 空串。
+        normalize_segment_blanks(&mut segments);
         let metrics_json: Option<String> = row.get(7).unwrap_or(None);
         let metrics: Option<crate::core::PipelinePerformanceMetrics> = metrics_json
             .as_deref()
@@ -1680,6 +1727,54 @@ mod tests {
             d,
             Some(9.0),
             "末句变短时 duration 不应回退（沿用 MAX 口径）"
+        );
+    }
+
+    /// 全空白的可选字段既不应被当成「真有译文」，也不应顶掉列表摘要的正文。
+    ///
+    /// 两条路径各锁一条：
+    /// 1. 反序列化归一——`translation_lang = Some("\t")` 会让
+    ///    `translation_matches()` 判真，界面出现「已翻译」的空行；全空白
+    ///    `polished` 也会让 `display_text()` 的判空逻辑多绕一圈。
+    /// 2. 列表摘要 SQL——`polished = "  \n "` 若只认空串的 `NULLIF(..., '')`，
+    ///    就会被 `list_recent_tasks` 当成首句正文带进历史列表。SQLite 的
+    ///    `TRIM(X)` 默认只去半角空格、不去 `\n` / `\t`，所以 SQL 侧必须用
+    ///    显式字符集 trim。
+    #[test]
+    fn 空白段落字段装载时归一化() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let mut blank = Segment::new(1, 0.0, 1.0, "正文");
+        blank.polished = "  \n ".to_string();
+        blank.translation = Some("   ".to_string());
+        blank.translation_lang = Some("\t".to_string());
+        blank.language = Some(" \r\n".to_string());
+        let id = db
+            .insert_task(
+                "D:/blank.mp4",
+                "blank.mp4",
+                1.0,
+                "completed",
+                &[blank],
+                None,
+            )
+            .unwrap();
+
+        let loaded = db.load_task_segments(id).unwrap();
+        assert_eq!(loaded.len(), 1, "装载回来的句数应与插入一致");
+        let seg = &loaded[0];
+        assert!(seg.polished.is_empty(), "全空白 polished 应归一为空串");
+        assert!(seg.translation.is_none(), "全空白译文应归一为 None");
+        assert!(
+            seg.translation_lang.is_none(),
+            "全空白目标语言应归一为 None"
+        );
+        assert!(seg.language.is_none(), "全空白识别语言应归一为 None");
+        assert_eq!(seg.display_text(), "正文", "归一后应回退到原始正文");
+
+        let recent = db.list_recent_tasks(1).unwrap();
+        assert_eq!(
+            recent[0].sample_text, "正文",
+            "列表摘要应穿透全空白 polished 取正文"
         );
     }
 }
