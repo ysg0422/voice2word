@@ -21,11 +21,18 @@ use crate::subtitle::SubtitleWriter;
 ///
 /// TXT 分支必须显式提醒时间轴是合成的——用户很可能接着导出 SRT，而那份时间
 /// 完全不是真的。
-fn self_notice_import(this: &mut MainWindow, stem: &str, count: usize, is_txt: bool) {
+///
+/// LRC 同样要提醒，但理由和措辞都不同：LRC 每行只带**起点**时间，`reader` 用
+/// 「下一行的起点」补齐中间各句的终点，只有**最后一句**的终点是按字数估算的。
+/// 也就是说除末句外的时间轴都来自文件里的真实标注，唯独末句是猜的，所以文案
+/// 只把末句点出来，不必像 TXT 那样否定整条时间轴。
+fn self_notice_import(this: &mut MainWindow, stem: &str, count: usize, is_txt: bool, is_lrc: bool) {
     this.notice = Some(if is_txt {
         format!(
             "已导入「{stem}」{count} 句；纯文本没有时间信息，已按字数合成占位时间轴，导出前请核对"
         )
+    } else if is_lrc {
+        format!("已导入「{stem}」{count} 句；最后一句的结束时间为按字数估算，导出前请核对")
     } else {
         format!("已导入「{stem}」{count} 句字幕")
     });
@@ -914,7 +921,8 @@ impl MainWindow {
         .detach();
     }
 
-    /// 导入一个**已有的字幕文件**（SRT / VTT / TXT）作为当前工程，跳过转写。
+    /// 导入一个**已有的字幕文件**（SRT / WebVTT / LRC / ASS(SSA) / TTML(EBU-TT-D /
+    /// Netflix TTAL) / JSON / 纯文本）作为当前工程，跳过转写。
     ///
     /// # 为什么需要它
     ///
@@ -927,15 +935,21 @@ impl MainWindow {
     ///   被剪过）。直接发布成当前工程，用户自己决定要不要再选视频。
     /// - **清空撤销栈**：与「转写完成」同一处理——上一支片子的快照留在栈里，Ctrl+Z
     ///   会把旧字幕灌回来并按新工程落库，属于数据损坏。
-    /// - **TXT 的时间是编出来的**：`reader` 按字数合成占位时间轴，这里必须明说，
-    ///   否则用户导出 SRT 时会以为时间是准的。
+    /// - **TXT / LRC 的时间带估算成分**：TXT 整条时间轴都是 `reader` 按字数合成的；
+    ///   LRC 只有每行的起点时间，中间各句用下一行起点补齐，**最后一句**的结束时间
+    ///   同样按字数估算。两者都得明说，否则用户导出 SRT 时会以为时间是准的。
     /// - **不落库**：导入的工程没有对应的媒体记录，`active_task_id` 置 `None`，
     ///   用户要留存就自己导出（或后续接一个「另存为工程」）。
     pub(crate) fn import_subtitle_file(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let handle = rfd::AsyncFileDialog::new()
                 .set_title("导入字幕文件")
-                .add_filter("字幕文件", &["srt", "vtt", "txt"])
+                .add_filter(
+                    "字幕文件",
+                    &[
+                        "srt", "vtt", "txt", "json", "lrc", "ass", "ssa", "ttml", "dfxp", "ttal",
+                    ],
+                )
                 .pick_file()
                 .await;
             let Some(handle) = handle else { return };
@@ -962,11 +976,15 @@ impl MainWindow {
                             seg.index = i + 1;
                         }
                         let count = segs.len();
-                        let is_txt = path
+                        // 扩展名只取一次并统一成小写：`is_txt` / `is_lrc` 两处判断共用它，
+                        // 避免两份 `extension()` 拷贝各改各的而漂移。
+                        let ext = path
                             .extension()
                             .and_then(|e| e.to_str())
-                            .map(|e| e.eq_ignore_ascii_case("txt"))
-                            .unwrap_or(false);
+                            .map(|e| e.to_ascii_lowercase())
+                            .unwrap_or_default();
+                        let is_txt = ext == "txt";
+                        let is_lrc = ext == "lrc";
                         let stem = path
                             .file_stem()
                             .map(|s| s.to_string_lossy().to_string())
@@ -991,7 +1009,7 @@ impl MainWindow {
                         this.state.active_tab = WorkspaceTab::Editor;
                         this.subtitle_list_followed_sel = None;
 
-                        self_notice_import(this, &stem, count, is_txt);
+                        self_notice_import(this, &stem, count, is_txt, is_lrc);
                         cx.notify();
                     }
                     Err(e) => {

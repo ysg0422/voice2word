@@ -1,8 +1,19 @@
-//! 字幕导入：把 SRT / WebVTT / 纯文本读回 `Vec<Segment>`
+//! 字幕导入：把 SRT / WebVTT / LRC / ASS(SSA) / TTML 系 / JSON / 纯文本读回 `Vec<Segment>`
 //!
-//! Voice2Word 能写出八种字幕格式，却一种也读不回来。用户手里有同事发来的 SRT，
-//! 或者想修一版自己上次导出的字幕时，只能把整段视频重新转写一遍——又慢又费钱。
-//! 本模块补上这条缺失的导入链路。
+//! Voice2Word 能写出八种字幕格式，导入侧却长期只认 SRT / WebVTT / 纯文本：用户手里
+//! 有同事发来的 LRC 唱词、剪辑交付的 ASS，或者想修一版自己上次导出的 JSON / TTML 时，
+//! 只能把整段视频重新转写一遍——又慢又费钱。本模块把导入侧补齐到与导出侧同一张格式表，
+//! 导出什么格式就能原样读回什么格式。
+//!
+//! **各格式的时间信息完整度不同**，导入时必须区别对待，否则会把「猜出来的时间轴」
+//! 当成文件里的真实标注：
+//! - SRT / WebVTT / ASS / TTML / JSON 都带起止时间，读回的就是文件里的原始值；
+//! - LRC 每行只带起点，中间各句的终点由**下一行的起点**补齐，只有最后一句的终点
+//!   按字数估算（[`LRC_TAIL_SECONDS_PER_CHAR`]）；
+//! - TXT 完全没有时间信息，整条时间轴都是按字数合成的占位值
+//!   （[`TXT_SECONDS_PER_CHAR`]）。
+//!
+//! 后两种带估算成分，必须由调用方在导入提示里告诉用户（见 `src/ui/actions.rs`）。
 //!
 //! 设计边界：这里**只做纯字符串 → `Vec<Segment>` 的转换**，不碰 UI、不决定读哪个
 //! 文件、不做任何 IO 决策，因此可以被单元测试完整覆盖；真正读盘的动作交给调用方，
@@ -37,6 +48,14 @@ pub enum SubtitleFormat {
     Srt,
     Vtt,
     Txt,
+    /// JSON 结构化字幕（本程序 `JsonSubtitleExporter` 的产物，含词级时间轴等全部字段）
+    Json,
+    /// LRC 歌词 / 唱词
+    Lrc,
+    /// ASS / SSA（Advanced SubStation Alpha）
+    Ass,
+    /// TTML 系（EBU-TT-D / Netflix TTAL / 通用 TTML、DFXP）
+    Ttml,
 }
 
 impl SubtitleFormat {
@@ -50,6 +69,12 @@ impl SubtitleFormat {
             "srt" => Some(Self::Srt),
             "vtt" => Some(Self::Vtt),
             "txt" => Some(Self::Txt),
+            "json" => Some(Self::Json),
+            "lrc" => Some(Self::Lrc),
+            // `ssa` 是 ASS 的旧称，正文结构（`[Events]` / `Dialogue:`）一致，同一实现读取。
+            "ass" | "ssa" => Some(Self::Ass),
+            // `dfxp` 是 TTML 的旧称；`ttal` 是 Netflix 的 TTML 变体，同样按 TTML 读取。
+            "ttml" | "dfxp" | "ttal" => Some(Self::Ttml),
             _ => None,
         }
     }
@@ -60,6 +85,10 @@ impl SubtitleFormat {
             Self::Srt => "SRT 字幕",
             Self::Vtt => "WebVTT 字幕",
             Self::Txt => "纯文本",
+            Self::Json => "JSON 字幕",
+            Self::Lrc => "LRC 歌词",
+            Self::Ass => "ASS 字幕",
+            Self::Ttml => "TTML 字幕",
         }
     }
 }
@@ -145,6 +174,10 @@ pub fn parse(content: &str, format: SubtitleFormat) -> Result<Vec<Segment>> {
         SubtitleFormat::Srt => parse_srt(content),
         SubtitleFormat::Vtt => parse_vtt(content),
         SubtitleFormat::Txt => parse_txt(content),
+        SubtitleFormat::Json => parse_json(content),
+        SubtitleFormat::Lrc => parse_lrc(content),
+        SubtitleFormat::Ass => parse_ass(content),
+        SubtitleFormat::Ttml => parse_ttml(content),
     }
 }
 
@@ -155,7 +188,7 @@ pub fn parse(content: &str, format: SubtitleFormat) -> Result<Vec<Segment>> {
 pub fn read_subtitle_file(path: &Path) -> Result<Vec<Segment>> {
     let format = SubtitleFormat::from_path(path).with_context(|| {
         format!(
-            "不支持的字幕扩展名（只支持 .srt / .vtt / .txt）：{}",
+            "不支持的字幕扩展名（只支持 .srt / .vtt / .txt / .json / .lrc / .ass / .ssa / .ttml / .dfxp / .ttal）：{}",
             path.display()
         )
     })?;
@@ -347,6 +380,834 @@ fn finalize_segments(mut segments: Vec<Segment>, what: &str) -> Result<Vec<Segme
         seg.index = i + 1;
     }
     Ok(segments)
+}
+
+/// 解析 JSON 结构化字幕。
+///
+/// JSON 既是 Voice2Word 自己的导出格式（见 [`super::json::JsonSubtitleExporter`]），
+/// 也是二次加工最常用的中间格式，因此导入必须与导出**往返无损**：
+///
+/// - 导出侧的 `raw_text` 写的是 [`Segment::display_text`]（优先润色文本），而
+///   `text` 是按导出模式渲染后的结果（双语时含译文）。导入因此**优先取
+///   `raw_text`**：它才是干净原文，拿 `text` 会把双语拼接或润色结果混进正文。
+/// - 正文落在 `text`、`polished` 保持空，所以导入结果的 [`Segment::display_text`]
+///   与导出前一致，再次导出 SRT/JSON 不会串行。
+/// - `polished` 不是导出字段，往返后一律为空。这是**有意接受**的信息损失：
+///   润色结果是本机产物，导出文件里没有它，也就无从恢复。
+///
+/// 文档结构收两种：导出器产出的根对象（取其中的 `segments`）与裸数组。裸数组是
+/// 为了兼容手写 / 第三方工具产出的简化文档——它们通常直接给一个片段列表，没有
+/// `format` / `version` 这些外壳，为此拒收整份文件没有意义。
+///
+/// 容错原则与 SRT/VTT 导入一致：单个坏块（时间戳缺失或倒挂、正文为空、元素根本
+/// 不是对象）只丢它自己，后面的块照常解析；只有整篇一个可用块都没有时才由
+/// [`finalize_segments`] 报错。
+pub fn parse_json(content: &str) -> Result<Vec<Segment>> {
+    let text = strip_bom(content);
+    let doc: serde_json::Value =
+        serde_json::from_str(text).with_context(|| "JSON 字幕解析失败：内容不是合法 JSON")?;
+
+    // 根数组直接当片段列表用，根对象取 `segments`。其余情况（根是数字 / 字符串 /
+    // 布尔 / null，或对象里没有数组型的 `segments`）属于「文档结构不对」，是前置
+    // 错误：它与「结构没错但一块都解析不出来」对用户的含义完全不同，必须分开报。
+    let items = match &doc {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(map) => match map.get("segments") {
+            Some(serde_json::Value::Array(items)) => items,
+            _ => bail!(
+                "JSON 字幕文档结构不对：根对象里缺少数组字段 \"segments\"\
+                 （或该字段不是数组）"
+            ),
+        },
+        _ => bail!("JSON 字幕文档结构不对：根节点既不是片段数组，也不是含 \"segments\" 的对象"),
+    };
+
+    let mut segments = Vec::new();
+    for item in items {
+        // 元素不是对象（数字 / 字符串 / null 等）时反序列化直接失败，按坏块跳过。
+        let Ok(input) = serde_json::from_value::<JsonSegmentIn>(item.clone()) else {
+            continue;
+        };
+        // 没有时间轴就无法定位，整块跳过。时间戳同时接受 JSON 数字与 `"00:00:01.500"`
+        // 这类字符串（手写 / 第三方工具常见写法），统一交给 [`parse_timestamp`]，
+        // 不为 JSON 另造一套时间解析；两种都取不到才判为坏块。
+        let (Some(start), Some(end)) = (
+            json_timestamp(input.start.as_ref()),
+            json_timestamp(input.end.as_ref()),
+        ) else {
+            continue;
+        };
+        // 倒挂的时间轴（`end < start`）会让下游算出负时长，同样按坏块处理。
+        if end < start {
+            continue;
+        }
+        // 正文优先 `raw_text`；两者都取不到时说明这块没有可用内容，跳过。
+        let Some(body) = pick_body_text(input.raw_text.as_ref(), input.text.as_ref()) else {
+            continue;
+        };
+
+        // `index` 一律传 0：输入里的序号只当分块标记，最终由 [`finalize_segments`]
+        // 按出现顺序重排为 1..n（手改过的 JSON 序号经常错乱甚至重复）。
+        let mut seg = Segment::new(0, start, end, body);
+        seg.translation = opt_body(input.translation.as_ref());
+        seg.translation_lang = opt_identifier(input.translation_lang.as_ref());
+        seg.language = opt_identifier(input.language.as_ref());
+        seg.confidence = input.confidence.as_ref().and_then(|v| v.as_f64());
+        // speaker 越界（超出 u32 上限）按「没有说话人信息」处理，不影响整块字幕。
+        seg.speaker = input
+            .speaker
+            .as_ref()
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok());
+        // 词级时间戳是可选增强信息：缺失或形状不符时置空表，绝不因此丢掉整块字幕。
+        seg.words = input
+            .words
+            .and_then(|v| serde_json::from_value::<Vec<super::segment::WordTiming>>(v).ok())
+            .unwrap_or_default();
+        // `polished` 保持 Segment::new 的空值：它不是导出字段，没有可恢复的来源。
+        segments.push(seg);
+    }
+    finalize_segments(segments, "JSON")
+}
+
+/// JSON 片段的宽松中间结构体。
+///
+/// 字段一律用 [`serde_json::Value`] 承接，而不是直接声明
+/// `Option<String>` / `Option<f64>` / `Option<u32>`。原因：导入规则要求「非字符串
+/// 或纯空白 → None」「speaker 越界 → None」这类**逐字段降级**，而强类型字段一旦
+/// 类型不符会让 `from_value` 整体失败，连时间轴与正文一起丢掉——一处元数据格式
+/// 不对就报废整块字幕，代价太大。用 `Value` 承接后，单个字段坏掉只影响它自己。
+/// 时间轴同样用 `Value` 承接：导出器写的是数字，但手写 / 第三方工具常写成
+/// `"00:00:01.500"` 这样的字符串，交给 [`json_timestamp`] 两种都能认。
+#[derive(serde::Deserialize)]
+struct JsonSegmentIn {
+    start: Option<serde_json::Value>,
+    end: Option<serde_json::Value>,
+    text: Option<serde_json::Value>,
+    raw_text: Option<serde_json::Value>,
+    translation: Option<serde_json::Value>,
+    translation_lang: Option<serde_json::Value>,
+    language: Option<serde_json::Value>,
+    confidence: Option<serde_json::Value>,
+    speaker: Option<serde_json::Value>,
+    words: Option<serde_json::Value>,
+}
+/// 取正文：优先 `raw_text`，缺失 / 非字符串 / 纯空白时回退 `text`。
+///
+/// 两者都取不到时返回 `None`——没有文本的块既没有意义也无法呈现，直接跳过。
+fn pick_body_text(
+    raw_text: Option<&serde_json::Value>,
+    text: Option<&serde_json::Value>,
+) -> Option<String> {
+    opt_body(raw_text).or_else(|| opt_body(text))
+}
+
+/// 取用户可见的文本（正文 / 译文）：非字符串或纯空白按缺失处理，其余**逐字保留**。
+///
+/// 只 `trim` 判空、不 `trim` 存值：正文里可能有刻意保留的换行与缩进，按字节裁剪
+/// 会破坏中文（一个汉字占三字节，切在中间会 panic 或切出乱码）；而首尾空白一旦被
+/// 吃掉，「导出 → 导入」的字段比对就会莫名其妙地不等。
+fn opt_body(value: Option<&serde_json::Value>) -> Option<String> {
+    let s = value?.as_str()?;
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// 取语言标识这类用于**精确比较**的短字符串，顺带去掉首尾空白。
+///
+/// 空白字符串按 `None` 而不是 `Some("")`：与 [`Segment::has_translation`] 的语义对齐
+/// （纯空白不算「已翻译」）。若这里留下 `Some("")`，下游会把该段判成「已翻译」，
+/// 质检面板显示 100% 而画面上却一片空白。语言标识同理去空白，否则 `" English "`
+/// 会被 [`Segment::translation_matches`] 当成另一种语言而触发重译。
+fn opt_identifier(value: Option<&serde_json::Value>) -> Option<String> {
+    let s = value?.as_str()?.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// 取时间戳：JSON 数字直接用，字符串交给 [`parse_timestamp`]。
+///
+/// 导出器写的是数字，但手写 / 第三方工具常把时间轴写成 `"00:00:01.500"` 这样的
+/// 字符串；复用 [`parse_timestamp`] 而不是另造一套，两种来源的行为才能完全一致。
+/// 其余类型（布尔 / 数组 / 对象 / null）按缺失处理，由调用方跳过该块。
+fn json_timestamp(value: Option<&serde_json::Value>) -> Option<f64> {
+    match value? {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => parse_timestamp(s),
+        _ => None,
+    }
+}
+
+/// LRC 唱词每字估算的演唱秒数（时间轴是**估算值**，不是文件里给出的）。
+///
+/// 与 [`TXT_SECONDS_PER_CHAR`] 同源：都是「文件里没有时间信息时按字数猜时长」的兜底
+/// 策略，取值保持一致，用户校对时的心智模型才统一。
+const LRC_TAIL_SECONDS_PER_CHAR: f64 = 0.3;
+/// 最后一条唱词的最短估算时长（秒）。
+///
+/// 取 1.5 秒而不是纯文本的 1.0 秒：唱词一句通常比纯文本一行唱得久，下限过低会让尾句
+/// 一闪而过，用户来不及看清。
+const LRC_TAIL_MIN_DURATION: f64 = 1.5;
+
+/// 解析 LRC 歌词文本。
+///
+/// 只认行首的 `[mm:ss.xx]` / `[mm:ss.xxx]` / `[mm:ss]` / `[hh:mm:ss.xx]` 时间标签。
+/// `[ar:...]`、`[ti:...]`、`[al:...]`、`[by:...]`、`[offset:...]` 这类元数据标签解析
+/// 不出时间，因此自然被忽略——不必另外维护一张元数据白名单：LRC 的标签名没有权威
+/// 清单，白名单必然漏，靠「能不能解析成时间」判别反而不会误伤。
+///
+/// 每条唱词的结束时间取**下一条时间标签的起点**：LRC 只给起始时间，下一句开唱即上一句
+/// 唱完，这是播放器通行的做法。最后一条没有「下一条」可依，只能按字数估算，因此调用方
+/// 应当提示用户「时间轴末段为估算值，需要人工校对」。
+pub fn parse_lrc(content: &str) -> Result<Vec<Segment>> {
+    let text = normalize_newlines(strip_bom(content));
+    // 先收集全部时间行（含空正文的「静音边界」），再统一组装：结束时间要看**下一条**，
+    // 边扫边定 end 需要额外的状态机，分两步更直白，也不容易漏掉边界情况。
+    let mut entries: Vec<(f64, String)> = Vec::new();
+    for line in text.split('\n') {
+        if let Some(entry) = parse_lrc_line(line) {
+            entries.push(entry);
+        }
+    }
+    let mut segments = Vec::new();
+    for (i, (start, body)) in entries.iter().enumerate() {
+        // 空正文的时间行只当「静音边界」用：它本身不是字幕，但仍是上一条结束时间的
+        // 候选，因此不能从 entries 里删掉，否则上一句会一直唱到下一句开头。
+        if body.is_empty() {
+            continue;
+        }
+        let end = match entries.get(i + 1) {
+            Some((next_start, _)) => *next_start,
+            None => *start + lrc_tail_estimate(body),
+        };
+        // `end < start` 只丢这一条：时间倒挂多半是手改留下的，为它丢掉整篇等于让用户
+        // 重做一遍导入，代价完全不成比例。
+        if end < *start {
+            continue;
+        }
+        segments.push(Segment::new(0, *start, end, body.clone()));
+    }
+    finalize_segments(segments, "LRC")
+}
+
+/// 解析一行 LRC，返回 `(起始秒, 正文)`；该行没有可用时间标签时返回 `None`。
+fn parse_lrc_line(line: &str) -> Option<(f64, String)> {
+    let mut rest = line.trim_start();
+    // 时间标签必须在行首；行首不是 `[` 的行（纯歌词、说明文字、空行）整行跳过。
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let mut start: Option<f64> = None;
+    // 连续吃掉行首的所有 `[...]`：一行可以有多个时间标签（同一句副歌重复出现），但只取
+    // 第一个能解析成时间的标签，其余标签只当分隔符。
+    while let Some(after_open) = rest.strip_prefix('[') {
+        // 没有配对的 `]`：这行结构已经坏了，整行作废，不要猜标签到哪儿结束。
+        let close = after_open.find(']')?;
+        if start.is_none() {
+            start = parse_timestamp(&after_open[..close]);
+        }
+        rest = &after_open[close + 1..];
+    }
+    // 一个时间标签都没有（例如整行只有 `[ti:标题]`）：这行不是唱词。
+    Some((start?, rest.trim().to_string()))
+}
+
+/// 估算最后一条唱词的时长（秒）。
+///
+/// 按**字符**数而不是字节数估算：一个汉字占 3 字节，按字节算会把中文尾句估成三倍长。
+/// 这是估算值，不是文件里给出的真实时间。
+fn lrc_tail_estimate(body: &str) -> f64 {
+    (body.chars().count() as f64 * LRC_TAIL_SECONDS_PER_CHAR).max(LRC_TAIL_MIN_DURATION)
+}
+
+/// 解析 ASS / SSA 字幕文本。
+///
+/// 只读 `[Events]` 段里的 `Dialogue:` 行：`[Script Info]`、`[V4+ Styles]`、`[Fonts]`
+/// 等段落里也可能出现形如 `Dialogue:` 的行（注释模板、示例行），把它们当字幕会凭空多出
+/// 内容，因此段名不匹配就立刻停止收集，直到下一个 `[...]` 段名。
+pub fn parse_ass(content: &str) -> Result<Vec<Segment>> {
+    let text = normalize_newlines(strip_bom(content));
+    let mut segments = Vec::new();
+    let mut in_events = false;
+    // 说话人编号全篇共用一张表：同一名字无论出现多少次都必须拿到同一个编号，否则下游按
+    // 编号分色/分组时会把人拆成好几个。
+    let mut seen_speakers: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        let line = line.trim();
+        // 段名行：`[Events]` 进入事件段，任何其它 `[...]` 都退出事件段。
+        if let Some(rest) = line.strip_prefix('[') {
+            let name = match rest.split_once(']') {
+                Some((name, _)) => name,
+                None => rest,
+            };
+            in_events = name.trim().eq_ignore_ascii_case("Events");
+            continue;
+        }
+        if !in_events {
+            continue;
+        }
+        // 段内只认 `Dialogue:`（大小写不敏感，前导空白已由 trim 去掉）；
+        // `Comment:`、`Format:`、`Picture:` 等一律跳过。
+        let Some(fields_text) = strip_prefix_ignore_ascii_case(line, "Dialogue:") else {
+            continue;
+        };
+        // 字段顺序固定为 Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text。
+        // 必须用 `splitn(10, ...)`：Text 里可以有逗号，靠 limit 把剩余内容整段留给最后
+        // 一个字段，否则文本会在第一个逗号处被截断。
+        let fields: Vec<&str> = fields_text.splitn(10, ',').collect();
+        if fields.len() < 10 {
+            continue; // 字段数不足是坏行，丢掉它但不影响后面的行
+        }
+        let Some(start) = parse_timestamp(fields[1].trim()) else {
+            continue;
+        };
+        let Some(end) = parse_timestamp(fields[2].trim()) else {
+            continue;
+        };
+        if end < start {
+            continue;
+        }
+        // 先剥 `{...}` 覆盖码、再还原 `\N` 之类的标记：顺序不能反——覆盖码里也可能出现
+        // `\N`，先还原就会把排版指令误当换行。
+        let decoded = decode_ass_text_markers(&strip_ass_override_blocks(fields[9]));
+        let body = decoded.trim();
+        if body.is_empty() {
+            continue;
+        }
+        // 说话人启发式：ASS 的 Name 字段是演员/说话人名，第三方工具常填真实人名。但大量
+        // 文件（包括本项目的导出侧）全篇写 `Default` 或留空，此时强行加标签只会给每句挂
+        // 上无意义的「说话人 1」，因此这两种情况一律视为没有说话人。
+        let name = fields[4].trim();
+        let speaker = if name.is_empty() || name.eq_ignore_ascii_case("Default") {
+            None
+        } else {
+            Some(ass_speaker_index(&mut seen_speakers, name))
+        };
+        let mut seg = Segment::new(0, start, end, body);
+        seg.speaker = speaker;
+        segments.push(seg);
+    }
+    finalize_segments(segments, "ASS")
+}
+
+/// 剥掉 ASS 的 `{...}` 覆盖标签，返回剩下的正文字符串。
+///
+/// `{` 到 `}` 之间的内容（`{\i1}`、`{\pos(10,10)}`）是排版指令，不是字幕文本。未闭合的
+/// `{` 之后的整段一并丢弃：既然分不清指令到哪里结束，留下来只会把半截指令混进字幕，
+/// 宁可让这一行少一截，也不污染文本。
+fn strip_ass_override_blocks(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_brace = false;
+    for ch in raw.chars() {
+        match ch {
+            '{' => in_brace = true,
+            '}' if in_brace => in_brace = false,
+            _ if in_brace => {}
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// 把 ASS 的换行/空格标记还原成真实字符。
+///
+/// `\N` 是 ASS 的硬换行。`\n` 是同一语义的旧写法（SSA 时代起两种都收），本项目的导出侧
+/// 也正是用 `\N` 表达双语/折行的换行；只认 `\N` 的话，含 `\n` 的文件会把同一句的上下两
+/// 行拼成一长行，与导出语义对不上。`\h` 是不换行的硬空格（常用来保住行首空格），还原成
+/// 普通空格。其余 `\x` 原样保留：不认识的转义宁可留着，也不要凭猜测删掉用户原文里的字符。
+fn decode_ass_text_markers(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('N' | 'n') => out.push('\n'),
+            // 只认小写 `\h`：ASS 规范里的硬空格就是 `\h`，大写 `\H` 不是合法标记，
+            // 因此按未知转义原样保留，不凭猜测转换。
+            Some('h') => out.push(' '),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// 大小写不敏感地剥掉 ASCII 前缀；不匹配返回 `None`。
+///
+/// 用 `str::get` 取前缀而不是直接按字节切片：前缀长度可能落在多字节字符中间，
+/// `&line[..n]` 会 panic，而 ASS 文件里出现中文行完全正常。
+fn strip_prefix_ignore_ascii_case<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = line.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        Some(&line[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// 取说话人编号：首次出现的名字依次编号 0、1、2…，重复出现复用原编号。
+fn ass_speaker_index(seen: &mut Vec<String>, name: &str) -> u32 {
+    match seen.iter().position(|n| n == name) {
+        Some(pos) => pos as u32,
+        None => {
+            seen.push(name.to_string());
+            (seen.len() - 1) as u32
+        }
+    }
+}
+
+/// 解析 TTML 系字幕（EBU-TT-D / Netflix TTAL / 通用 TTML）。
+///
+/// # 为什么手写扫描器而不是引入 XML 依赖
+///
+/// 本项目只依赖 `regex` / `serde_json`，没有 XML 解析库（见 `Cargo.toml`）。为一个
+/// 「读回自家导出文件」的次要功能引入完整 XML 依赖并不划算：依赖体积、编译时间与
+/// 供应链面都会随之上涨。而这里要识别的结构极其有限——根语言、`<p>` 时间轴、
+/// `<span xml:lang>` 语言切分、`<br/>` 换行与五个预定义实体——手写一个「容错优先」
+/// 的小状态机反而更贴合需求。
+///
+/// # 为什么不用正则
+///
+/// 正文里可能同时出现属性引号、被转义的 `&lt;p&gt;` 与真实标签，正则很难在不回溯
+/// 爆炸的前提下正确跳过引号内的 `>`。逐字符扫描只有「在不在引号里」一个状态，
+/// 实现与验证成本都低得多。
+///
+/// # 容错原则
+///
+/// 与 SRT / VTT 一致：单个 `<p>` 的时间轴缺失、解析失败或 `end < begin` 只丢那一块，
+/// 继续处理后面的块；只有整篇一个可用块都没有时，才由 [`finalize_segments`] 报错。
+///
+/// # 为什么 `.xml` 不进 `SubtitleFormat::from_path`
+///
+/// `.xml` 是通用后缀，Final Cut / Premiere 工程与普通数据文件都可能用它，按后缀就
+/// 认定是字幕会造成「导入成功但内容全乱」。安全集合是字幕专有的 `.ttml` / `.dfxp` /
+/// `.ttal`；扩展名分派由 `reader.rs` 统一维护，本文件只提供纯字符串解析。
+pub fn parse_ttml(content: &str) -> Result<Vec<Segment>> {
+    let text = normalize_newlines(strip_bom(content));
+    let doc_lang = ttml_document_lang(&text);
+    let mut segments = Vec::new();
+    // 字节游标顺序推进：每处理完一块就跳过它的 `</p>`，避免把同一块重复匹配。
+    let mut cursor = 0usize;
+    while let Some(at) = find_element_start(&text, cursor, "p") {
+        let Some((attrs, after_open, self_closing)) = scan_start_tag(&text, at, "p") else {
+            // 标签始终没有闭合：文档已被截断，后面不可能再有完整块。
+            break;
+        };
+        // `<p ... />` 没有正文，跳过即可；不能拿它的后续内容去找 `</p>`。
+        if self_closing {
+            cursor = after_open;
+            continue;
+        }
+        let Some(body_len) = text[after_open..].find("</p>") else {
+            break;
+        };
+        let body = &text[after_open..after_open + body_len];
+        cursor = after_open + body_len + "</p>".len();
+        if let Some(segment) = build_ttml_segment(&attrs, body, doc_lang.as_deref()) {
+            segments.push(segment);
+        }
+    }
+    finalize_segments(segments, "TTML")
+}
+
+/// 在 `text[from..]` 中寻找名为 `name` 的**开**标签，返回 `<` 的字节下标。
+///
+/// 为什么要求名字后面是空白 / `>` / `/`：否则找 `<p` 时会误命中 `<person>`、
+/// `<publisher>` 这类同前缀元素，把无关内容当成字幕块。
+fn find_element_start(text: &str, from: usize, name: &str) -> Option<usize> {
+    let mut cursor = from;
+    while let Some(rel) = text[cursor..].find('<') {
+        let at = cursor + rel;
+        let after = at + 1;
+        if text[after..].starts_with(name) {
+            let boundary = text[after + name.len()..].chars().next();
+            let is_boundary = match boundary {
+                None => true,
+                Some(c) => c.is_whitespace() || c == '>' || c == '/',
+            };
+            if is_boundary {
+                return Some(at);
+            }
+        }
+        cursor = after;
+    }
+    None
+}
+
+/// 扫描 `tag_at` 处的开标签，返回 `(属性串, 标签结束后的下标, 是否自闭合)`。
+///
+/// 引号内的 `>` 不能当作标签结束：属性值里出现 `>`（如某些 style 表达式）时，
+/// 若不做引号状态判断，标签会被从中间截断，后面所有块的解析跟着错位。
+fn scan_start_tag(text: &str, tag_at: usize, name: &str) -> Option<(String, usize, bool)> {
+    let content_start = tag_at + 1 + name.len();
+    let mut quote: Option<char> = None;
+    for (offset, ch) in text[content_start..].char_indices() {
+        match ch {
+            '"' | '\'' => {
+                if quote == Some(ch) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(ch);
+                }
+            }
+            '>' if quote.is_none() => {
+                let attrs = &text[content_start..content_start + offset];
+                let self_closing = attrs.trim_end().ends_with('/');
+                return Some((attrs.to_string(), content_start + offset + 1, self_closing));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 从属性串里取名为 `name` 的属性值（去引号）。找不到返回 `None`。
+///
+/// 只认带引号的值：TTML 的属性值规范上必须加引号，放宽到无引号会带来歧义
+/// （空值与下一个属性名都可能被吞进去），不如直接判为缺失。
+fn ttml_attr(attrs: &str, name: &str) -> Option<String> {
+    let mut search = 0;
+    while let Some(rel) = attrs[search..].find(name) {
+        let at = search + rel;
+        let after = at + name.len();
+        search = after;
+        // 名字必须是独立词：前面是串首或空白，否则可能落在别的属性名/属性值里。
+        let boundary_ok = match attrs[..at].chars().next_back() {
+            None => true,
+            Some(c) => c.is_whitespace(),
+        };
+        if !boundary_ok {
+            continue;
+        }
+        let Some(rest) = attrs[after..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(quote @ ('"' | '\'')) = rest.chars().next() else {
+            continue;
+        };
+        let qlen = quote.len_utf8();
+        if let Some(end) = rest[qlen..].find(quote) {
+            return Some(rest[qlen..qlen + end].to_string());
+        }
+    }
+    None
+}
+
+/// 取根 `<tt>` 上的 `xml:lang`（文档主语言），空值视为未声明。
+///
+/// 文档语言是双语切分的基准：它决定「哪种语言算原文、哪种算译文」。缺失时
+/// [`ttml_split_bilingual`] 会退化为「以第一个带语言的 span 为原文」。
+fn ttml_document_lang(text: &str) -> Option<String> {
+    let at = find_element_start(text, 0, "tt")?;
+    let (attrs, _, _) = scan_start_tag(text, at, "tt")?;
+    let lang = ttml_attr(&attrs, "xml:lang")?;
+    let lang = lang.trim();
+    if lang.is_empty() {
+        None
+    } else {
+        Some(lang.to_string())
+    }
+}
+
+/// 把 TTML 时间表达式解析成秒。
+///
+/// 先交给 [`parse_timestamp`]（覆盖 `HH:MM:SS.mmm` 时钟时间），再兜底处理 TTML
+/// 特有的「数字 + 单位」偏移写法：`ms` / `h` / `m` / `s`。`ms` 必须排在 `s` 之前
+/// 匹配，否则 `500ms` 会先被当成 `500s`。
+///
+/// 帧式时间（`10f`）刻意不支持：换算需要根元素上的 `ttp:frameRate`，而该属性可能
+/// 缺失或与内容不符，猜错帧率会让整条时间轴静默偏移，不如按坏块跳过、由用户显式
+/// 修正。这里因此不写任何帧率默认值。
+fn parse_ttml_time(raw: &str) -> Option<f64> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(seconds) = parse_timestamp(text) {
+        return Some(seconds);
+    }
+    let lower = text.to_ascii_lowercase();
+    for (unit, scale) in [("ms", 0.001), ("h", 3600.0), ("m", 60.0), ("s", 1.0)] {
+        let Some(number) = lower.strip_suffix(unit) else {
+            continue;
+        };
+        let number = number.trim();
+        if number.is_empty() {
+            continue;
+        }
+        // 只接受「数字 + 至多一个小数点」，挡住 `1h2m` 这类组合写法。
+        let mut seen_dot = false;
+        let mut digits_only = true;
+        for b in number.bytes() {
+            match b {
+                b'0'..=b'9' => {}
+                b'.' if !seen_dot => seen_dot = true,
+                _ => {
+                    digits_only = false;
+                    break;
+                }
+            }
+        }
+        if !digits_only {
+            continue;
+        }
+        if let Ok(value) = number.parse::<f64>() {
+            return Some(value * scale);
+        }
+    }
+    None
+}
+
+/// 由 `<p>` 的属性与正文构造一条 `Segment`；缺时间轴或正文为空时返回 `None`。
+///
+/// 结束时间优先取 `end`，没有 `end` 时用 `begin + dur` 兜底——两种写法在 TTML
+/// 里都常见，只认其中一种会让另一半文件整篇失败。
+fn build_ttml_segment(attrs: &str, body: &str, doc_lang: Option<&str>) -> Option<Segment> {
+    let begin = parse_ttml_time(&ttml_attr(attrs, "begin")?)?;
+    let end = match ttml_attr(attrs, "end") {
+        Some(raw) => parse_ttml_time(&raw)?,
+        None => {
+            let dur = parse_ttml_time(&ttml_attr(attrs, "dur")?)?;
+            begin + dur
+        }
+    };
+    // `end < begin` 的倒挂块必须丢：留着会让播放器算出负时长。
+    if end < begin {
+        return None;
+    }
+    let (spans, bare) = ttml_inline_pieces(body);
+    let (original, translation) = ttml_split_bilingual(&spans, &bare, doc_lang);
+    let text = ttml_normalize_text(&original);
+    if text.is_empty() {
+        return None;
+    }
+    let mut segment = Segment::new(0, begin, end, text);
+    let translation = translation.and_then(|(trans, lang)| {
+        let trans = ttml_normalize_text(&trans);
+        (!trans.is_empty()).then_some((trans, lang))
+    });
+    if let Some((trans, lang)) = translation {
+        segment.translation = Some(trans);
+        segment.translation_lang = lang;
+    }
+    segment.speaker = ttml_attr(attrs, "ttm:agent")
+        .as_deref()
+        .and_then(parse_ttml_speaker);
+    Some(segment)
+}
+
+/// `ttm:agent` 的 `xml:id` → 说话人编号（0 起）。
+///
+/// 与导出侧 `speaker_agent_id` 的 `spk{N}`（N 从 1 起）互为逆运算：`spk1` → `0`。
+/// 非 `spk` 前缀或编号为 0 的 id（如 `narrator`、`spk0`）一律不映射，宁可让说话人
+/// 留空，也不要凭猜测把旁白错归给某个人。
+fn parse_ttml_speaker(id: &str) -> Option<u32> {
+    let digits = id.strip_prefix("spk")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u32>().ok()?.checked_sub(1)
+}
+
+/// 拆出 `<p>` 正文里的语言 span 与裸文本，返回 `(spans, bare)`。
+///
+/// `spans` 每项是 `(span 上的 xml:lang, 文本)`，`bare` 是所有不在 span 内的文本
+/// （含 `<br/>` 产生的换行）。相邻且语言相同的 span 会合并：karaoke 逐字切分或
+/// 分段样式会产生大量同语言碎片，逐片成段会把一句话拆成好几条字幕。
+///
+/// 未闭合的 `<span>` 视为文档截断，把剩余内容降级为裸文本而不是整段丢弃。
+fn ttml_inline_pieces(body: &str) -> (Vec<(Option<String>, String)>, String) {
+    let mut spans: Vec<(Option<String>, String)> = Vec::new();
+    let mut bare = String::new();
+    let mut cursor = 0usize;
+    while let Some(at) = find_element_start(body, cursor, "span") {
+        let Some((attrs, after_open, self_closing)) = scan_start_tag(body, at, "span") else {
+            break;
+        };
+        // 开标签之前的裸文本先归入裸文本缓冲。
+        bare.push_str(&ttml_inline_text(&body[cursor..at]));
+        cursor = after_open;
+        if self_closing {
+            continue;
+        }
+        let Some(body_len) = body[cursor..].find("</span>") else {
+            bare.push_str(&ttml_inline_text(&body[cursor..]));
+            cursor = body.len();
+            break;
+        };
+        let inner = &body[cursor..cursor + body_len];
+        cursor += body_len + "</span>".len();
+        let lang = ttml_attr(&attrs, "xml:lang")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let text = ttml_inline_text(inner);
+        let merge_last = spans
+            .last()
+            .is_some_and(|(last_lang, _)| *last_lang == lang);
+        if merge_last {
+            if let Some((_, last_text)) = spans.last_mut() {
+                last_text.push_str(&text);
+            }
+            continue;
+        }
+        spans.push((lang, text));
+    }
+    bare.push_str(&ttml_inline_text(&body[cursor..]));
+    (spans, bare)
+}
+
+/// span 的有效语言：span 自己声明了就用它，否则继承文档语言。
+///
+/// 继承是 TTML 语义的一部分——`<span>` 不写 `xml:lang` 就表示与文档同语言，
+/// 不继承会把「未标注」错当成「另一种语言」，从而凭空生成译文。
+fn ttml_effective_lang<'a>(
+    span_lang: &'a Option<String>,
+    doc_lang: Option<&'a str>,
+) -> Option<&'a str> {
+    span_lang.as_deref().or(doc_lang)
+}
+
+/// 把 `(spans, bare)` 切成「原文 + 可选译文」。
+///
+/// 基准语言取文档语言；文档没声明时退化为第一个带语言的 span（Netflix TTAL 常见
+/// 写法）。原文优先取「有效语言 == 基准语言」的第一个非空 span，其次是裸文本，最后
+/// 才兜底用第一个非空 span；译文取第一个「有效语言 != 基准语言」的非空 span，语言
+/// 标记原样带出。这样单语文件不会凭空长出译文，双语文件也不依赖 span 的先后顺序。
+fn ttml_split_bilingual(
+    spans: &[(Option<String>, String)],
+    bare: &str,
+    doc_lang: Option<&str>,
+) -> (String, Option<(String, Option<String>)>) {
+    let base = doc_lang.or_else(|| spans.iter().find_map(|(lang, _)| lang.as_deref()));
+    let original = spans
+        .iter()
+        .find(|(lang, text)| !text.is_empty() && ttml_effective_lang(lang, doc_lang) == base)
+        .map(|(_, text)| text.clone())
+        .or_else(|| (!bare.is_empty()).then_some(bare.to_string()))
+        .or_else(|| {
+            spans
+                .iter()
+                .find(|(_, text)| !text.is_empty())
+                .map(|(_, text)| text.clone())
+        })
+        .unwrap_or_default();
+    let translation = spans
+        .iter()
+        .find(|(lang, text)| !text.is_empty() && ttml_effective_lang(lang, doc_lang) != base)
+        .map(|(lang, text)| (text.clone(), lang.clone()));
+    (original, translation)
+}
+
+/// 归一化一条字幕文本：逐行去首尾空白、丢掉空行、用 `\n` 重新拼接。
+///
+/// 为什么按行 trim：`<p>` 的源码缩进换行与 `<br/>` 产生的换行在字符串层面无法区分，
+/// 保留缩进会导出「　你好」这类带前导空格的字幕。代价是行内刻意的首尾空格会丢失，
+/// 这在字幕场景可以接受（首尾空格本就不该出现在画面里）。
+fn ttml_normalize_text(raw: &str) -> String {
+    raw.split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 把一段内联标记转成纯文本：解实体、`<br/>` 变 `\n`、其余标签剥掉。
+fn ttml_inline_text(raw: &str) -> String {
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&decode_xml_entities(&rest[..lt]));
+        let after = &rest[lt + 1..];
+        let Some(gt) = after.find('>') else {
+            // 没有闭合的 `<`：文档已被截断，余下内容不再当正文，避免半截标记写进字幕。
+            return out;
+        };
+        if is_br_tag(&after[..gt]) {
+            out.push('\n');
+        }
+        rest = &after[gt + 1..];
+    }
+    out.push_str(&decode_xml_entities(rest));
+    out
+}
+
+/// 判断标签名是否为 `br`（允许 `br/`、`BR`、`br /` 等写法）。
+fn is_br_tag(tag: &str) -> bool {
+    let tag = tag.trim();
+    let tag = tag.strip_suffix('/').unwrap_or(tag).trim_end();
+    tag.eq_ignore_ascii_case("br")
+}
+
+/// 解码 XML 预定义实体与数字字符引用，未知实体原样保留。
+///
+/// 未知实体（如 `&nbsp;`）保留原文而不是丢弃：TTML 只预定义了五个实体，保留能让
+/// 用户看到真实输入，也避免「解错比不解更糟」。数字引用支持十进制 `&#20013;` 与
+/// 十六进制 `&#x4E2D;`，越界码点同样原样保留。
+fn decode_xml_entities(raw: &str) -> String {
+    if !raw.contains('&') {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp + 1..];
+        let decoded = tail
+            .find(';')
+            .and_then(|semi| decode_entity(&tail[..semi]).map(|ch| (semi, ch)));
+        if let Some((semi, ch)) = decoded {
+            out.push(ch);
+            rest = &tail[semi + 1..];
+            continue;
+        }
+        // 未知实体或缺少 `;`：原样保留 `&`，从 `&` 之后继续扫描。
+        out.push('&');
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 解码单个实体名（`&` 与 `;` 之间、不含两端）。无法识别返回 `None`。
+fn decode_entity(name: &str) -> Option<char> {
+    match name {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => decode_numeric_entity(name),
+    }
+}
+
+/// 解码数字字符引用（`#123` / `#x4E2D`）；非数字引用返回 `None`。
+fn decode_numeric_entity(name: &str) -> Option<char> {
+    let digits = name.strip_prefix('#')?;
+    let (radix, digits) = match digits
+        .strip_prefix('x')
+        .or_else(|| digits.strip_prefix('X'))
+    {
+        Some(hex) => (16u32, hex),
+        None => (10u32, digits),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let code = u32::from_str_radix(digits, radix).ok()?;
+    char::from_u32(code)
 }
 
 #[cfg(test)]
@@ -612,10 +1473,39 @@ cue-1
             SubtitleFormat::from_path(Path::new("c.txt")),
             Some(SubtitleFormat::Txt)
         );
-        assert_eq!(SubtitleFormat::from_path(Path::new("d.ass")), None);
+        assert_eq!(
+            SubtitleFormat::from_path(Path::new("d.json")),
+            Some(SubtitleFormat::Json)
+        );
+        assert_eq!(
+            SubtitleFormat::from_path(Path::new("e.LRC")),
+            Some(SubtitleFormat::Lrc)
+        );
+        // `ass` 与旧称 `ssa` 走同一实现；`ttml` 的旧称 `dfxp` 与 Netflix 变体 `ttal` 同理。
+        assert_eq!(
+            SubtitleFormat::from_path(Path::new("f.ass")),
+            Some(SubtitleFormat::Ass)
+        );
+        assert_eq!(
+            SubtitleFormat::from_path(Path::new("g.SSA")),
+            Some(SubtitleFormat::Ass)
+        );
+        assert_eq!(
+            SubtitleFormat::from_path(Path::new("h.ttml")),
+            Some(SubtitleFormat::Ttml)
+        );
+        assert_eq!(
+            SubtitleFormat::from_path(Path::new("i.DFXP")),
+            Some(SubtitleFormat::Ttml)
+        );
+        assert_eq!(
+            SubtitleFormat::from_path(Path::new("j.ttal")),
+            Some(SubtitleFormat::Ttml)
+        );
         assert_eq!(SubtitleFormat::from_path(Path::new("noext")), None);
-        assert_eq!(SubtitleFormat::from_path(Path::new("e.srt.bak")), None);
+        assert_eq!(SubtitleFormat::from_path(Path::new("k.srt.bak")), None);
         assert_eq!(SubtitleFormat::Srt.label(), "SRT 字幕");
+        assert_eq!(SubtitleFormat::Lrc.label(), "LRC 歌词");
     }
 
     /// 中文文本必须逐字保真：解析路径上任何按字节切片/截断的实现都会在多字节
@@ -652,6 +1542,40 @@ cue-1
         assert_eq!(parse(srt, SubtitleFormat::Txt).unwrap().len(), 3);
         // 纯文本交给 SRT 解析没有时间轴，应当报错
         assert!(parse(txt, SubtitleFormat::Srt).is_err());
+
+        // 新增的四种格式同样必须走各自的实现：各给一份最小样本，文本与起点都要对得上。
+        // 这条断言钉的是「枚举加了、分派漏了」这种静默错误——它不会报错，只会让用户
+        // 拿到一份格式套错、内容全乱的工程。
+        let json = r#"{"segments":[{"start":5.0,"end":6.0,"text":"JSON 文本"}]}"#;
+        let d = parse(json, SubtitleFormat::Json).unwrap();
+        assert_eq!(d[0].text, "JSON 文本");
+        assert_eq!(d[0].start, 5.0);
+
+        let lrc = "[00:07.00]LRC 文本\n";
+        let e = parse(lrc, SubtitleFormat::Lrc).unwrap();
+        assert_eq!(e[0].text, "LRC 文本");
+        assert_eq!(e[0].start, 7.0);
+
+        let ass = concat!(
+            "[Events]\n",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+            "Dialogue: 0,0:00:08.00,0:00:09.00,Default,,0,0,0,,ASS 文本\n",
+        );
+        let f = parse(ass, SubtitleFormat::Ass).unwrap();
+        assert_eq!(f[0].text, "ASS 文本");
+        assert_eq!(f[0].start, 8.0);
+
+        let ttml = concat!(
+            r#"<tt xmlns="http://www.w3.org/ns/ttml"><body><div>"#,
+            r#"<p begin="00:00:10.000" end="00:00:11.000">TTML 文本</p>"#,
+            "</div></body></tt>",
+        );
+        let g = parse(ttml, SubtitleFormat::Ttml).unwrap();
+        assert_eq!(g[0].text, "TTML 文本");
+        assert_eq!(g[0].start, 10.0);
+
+        // LRC 唱词里没有 `[Events]` / `Dialogue:`，交给 ASS 解析应当报错而不是硬套。
+        assert!(parse(lrc, SubtitleFormat::Ass).is_err());
     }
 
     /// GBK 兜底：国内大量老字幕是 GBK 编码，UTF-8 解码会失败。这里真的写一个
@@ -730,11 +1654,738 @@ cue-1
     #[test]
     fn read_subtitle_file_rejects_unknown_extension() {
         let dir = temp_dir("badext");
-        let path = dir.join("movie.ass");
+        let path = dir.join("movie.xml");
         std::fs::write(&path, "whatever").unwrap();
 
         let err = read_subtitle_file(&path).unwrap_err().to_string();
-        assert!(err.contains("movie.ass"), "错误信息应带路径: {err}");
+        assert!(err.contains("movie.xml"), "错误信息应带路径: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 用真实导出器做一次「导出 → 导入」往返：结构化字段必须逐个原样回来。
+    /// 这条钉住导入与导出的字段名 / 语义对齐，任何一侧改名都会在这里断。
+    #[test]
+    fn json_export_import_round_trip_preserves_fields() {
+        use crate::subtitle::json::JsonSubtitleExporter;
+        use crate::subtitle::segment::WordTiming;
+        use crate::subtitle::ExportMode;
+        let dir = temp_dir("json_rt");
+        let path = dir.join("rt.json");
+
+        let mut first = Segment::new(1, 0.0, 1.5, "你好");
+        first.translation = Some("Hello".to_string());
+        first.translation_lang = Some("English".to_string());
+        first.language = Some("zh".to_string());
+        first.confidence = Some(-0.42);
+        first.speaker = Some(3);
+        first.words = vec![
+            WordTiming {
+                word: "你".to_string(),
+                start: 0.0,
+                end: 0.7,
+            },
+            WordTiming {
+                word: "好".to_string(),
+                start: 0.7,
+                end: 1.5,
+            },
+        ];
+        let source = vec![first, Segment::new(2, 1.5, 3.0, "第二句")];
+
+        JsonSubtitleExporter::write_to_file(
+            &source,
+            &path,
+            Some("demo.mp4"),
+            ExportMode::Bilingual,
+            Some("English"),
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let back = parse_json(&raw).unwrap();
+
+        assert_eq!(back.len(), 2, "往返后条数必须一致");
+        let seg = &back[0];
+        assert_eq!(seg.index, 1);
+        assert_eq!(seg.start, 0.0);
+        assert_eq!(seg.end, 1.5);
+        // 导出的 `text` 是双语渲染结果，`raw_text` 才是原文，导入必须落在后者上
+        assert_eq!(seg.text, "你好", "正文应取导出的 raw_text（原文）");
+        assert_eq!(seg.polished, "", "polished 不是导出字段，往返后保持空");
+        assert_eq!(seg.display_text(), "你好", "display_text 必须与导出前一致");
+        assert_eq!(seg.translation.as_deref(), Some("Hello"));
+        assert_eq!(seg.translation_lang.as_deref(), Some("English"));
+        assert_eq!(seg.language.as_deref(), Some("zh"));
+        assert_eq!(seg.confidence, Some(-0.42));
+        assert_eq!(seg.speaker, Some(3));
+        assert_eq!(seg.words, source[0].words, "词级时间戳往返必须逐条一致");
+
+        let clean = &back[1];
+        assert_eq!(clean.index, 2);
+        assert_eq!(clean.text, "第二句");
+        assert_eq!(clean.translation, None, "没有译文的块往返后仍是 None");
+        assert!(clean.words.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// 手工 / 第三方文档里 `text` 常被塞进双语拼接或润色后的整段，`raw_text` 才是
+    /// 干净原文；导入必须优先取 `raw_text`，否则原文会被译文污染。
+    #[test]
+    fn json_prefers_raw_text_over_text() {
+        let doc = r#"[{"start":0,"end":1,"text":"你好\nHello","raw_text":"你好"}]"#;
+        let segs = parse_json(doc).unwrap();
+        assert_eq!(segs[0].text, "你好", "正文应优先取 raw_text");
+
+        // raw_text 缺失时回退到 text：少一个字段不该让整块消失
+        let doc2 = r#"[{"start":0,"end":1,"text":"只有 text"}]"#;
+        assert_eq!(parse_json(doc2).unwrap()[0].text, "只有 text");
+
+        // 纯空白 raw_text 视同缺失，同样回退
+        let doc3 = r#"[{"start":0,"end":1,"text":"回退目标","raw_text":"   "}]"#;
+        assert_eq!(parse_json(doc3).unwrap()[0].text, "回退目标");
+    }
+
+    /// 只有时间轴 + 正文的最小文档必须能导入：其余字段一律 None / 空表，
+    /// 「缺元数据」不是坏块。
+    #[test]
+    fn json_missing_optional_fields_become_none_and_empty_words() {
+        let segs = parse_json(r#"[{"start":1.5,"end":2.5,"text":"最小块"}]"#).unwrap();
+        let seg = &segs[0];
+        assert_eq!(seg.index, 1);
+        assert_eq!(seg.start, 1.5);
+        assert_eq!(seg.end, 2.5);
+        assert_eq!(seg.text, "最小块");
+        assert_eq!(seg.translation, None, "缺失 translation 应为 None");
+        assert_eq!(seg.translation_lang, None);
+        assert_eq!(seg.language, None);
+        assert_eq!(seg.confidence, None);
+        assert_eq!(seg.speaker, None);
+        assert!(seg.words.is_empty(), "缺失 words 应为空表");
+        assert_eq!(seg.polished, "");
+
+        // 显式 null 与纯空白字符串同样按「没有」处理：空白译文若存成 Some("")，
+        // 下游会把该段判成「已翻译」，质检显示 100% 而画面上什么都没有。
+        let blank = r#"[{"start":0,"end":1,"text":"x","translation":"   ","translation_lang":" ",
+        "language":null,"confidence":null,"speaker":null,"words":null}]"#;
+        let seg2 = &parse_json(blank).unwrap()[0];
+        assert_eq!(seg2.translation, None, "纯空白译文按 None 处理");
+        assert_eq!(seg2.translation_lang, None);
+        assert_eq!(seg2.language, None);
+        assert_eq!(seg2.confidence, None);
+        assert_eq!(seg2.speaker, None);
+        assert!(seg2.words.is_empty());
+        assert!(!seg2.has_translation(), "空白译文不算已翻译");
+    }
+    /// `words` 形状不符（不是数组 / 词条缺字段）时只丢词级信息，整块字幕必须保留：
+    /// 词级时间戳是可选增强信息，不该成为丢掉一条字幕的理由。
+    #[test]
+    fn json_words_shape_mismatch_becomes_empty_without_dropping_block() {
+        let doc = r#"[{"start":0,"end":1,"text":"保留我","words":"不是数组"}]"#;
+        let segs = parse_json(doc).unwrap();
+        assert_eq!(segs.len(), 1, "words 形状不符不该丢整块");
+        assert_eq!(segs[0].text, "保留我");
+        assert!(segs[0].words.is_empty(), "形状不符时词级时间戳置空");
+
+        let doc2 = r#"[{"start":0,"end":1,"text":"也保留","words":[{"word":"a","start":0}]}]"#;
+        let segs2 = parse_json(doc2).unwrap();
+        assert_eq!(segs2.len(), 1, "词条缺字段同样只丢词级信息");
+        assert!(segs2[0].words.is_empty());
+    }
+
+    /// 坏块（缺 end / end 早于 start / 元素不是对象）只丢自己，好块照常导入，
+    /// 且输出序号按出现顺序重排 1..n——输入序号错乱不能带进结果。
+    #[test]
+    fn json_skips_bad_blocks_and_renumbers_indices() {
+        let doc = r#"{"segments":[
+        {"index":7,"start":0,"end":1,"text":"第一"},
+        {"start":1,"text":"缺 end"},
+        {"start":2,"end":1.5,"text":"时间倒挂"},
+        42,
+        {"index":7,"start":3,"end":4,"text":"第二"}
+    ]}"#;
+        let segs = parse_json(doc).unwrap();
+        assert_eq!(segs.len(), 2, "只保留两个好块");
+        assert_eq!(segs[0].text, "第一");
+        assert_eq!(segs[1].text, "第二");
+        assert_eq!(segs[0].index, 1);
+        assert_eq!(segs[1].index, 2, "序号必须重排为 1..n，不复用输入序号");
+    }
+    /// 非法 JSON、根对象缺 segments、segments 不是数组、空数组四种情况都必须报错，
+    /// 且错误文案要能定位问题（提到 JSON / segments），不能是一句无信息的失败。
+    #[test]
+    fn json_errors_when_document_is_not_json_or_has_no_segments() {
+        let not_json = parse_json("这不是 JSON").unwrap_err().to_string();
+        assert!(
+            not_json.contains("JSON"),
+            "非法 JSON 的错误要说明 JSON: {not_json}"
+        );
+
+        let no_segments = parse_json(r#"{"format":"x"}"#).unwrap_err().to_string();
+        assert!(
+            no_segments.contains("segments"),
+            "缺 segments 数组要指明字段名: {no_segments}"
+        );
+
+        let segments_not_array = parse_json(r#"{"segments":{}}"#).unwrap_err().to_string();
+        assert!(
+            segments_not_array.contains("segments"),
+            "segments 不是数组也要报结构错误: {segments_not_array}"
+        );
+
+        let empty = parse_json("[]").unwrap_err().to_string();
+        assert!(
+            empty.contains("JSON"),
+            "空数组应报「没有可用字幕块」: {empty}"
+        );
+    }
+
+    /// 裸数组（手写 / 第三方工具的简化文档）必须与完整文档同样接受。
+    #[test]
+    fn json_accepts_bare_segments_array() {
+        let doc = r#"[{"start":0,"end":1,"text":"甲"},{"start":1,"end":2,"text":"乙"}]"#;
+        let segs = parse_json(doc).unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "甲");
+        assert_eq!(segs[1].text, "乙");
+        assert_eq!(segs[0].index, 1);
+        assert_eq!(segs[1].index, 2);
+    }
+
+    /// 带 UTF-8 BOM 的 JSON（记事本另存）必须先剥 BOM 再解析，
+    /// 否则第一块会连 BOM 一起被当成非法 JSON，整份文件都读不进来。
+    #[test]
+    fn json_strips_bom_before_parsing() {
+        let doc = format!("\u{FEFF}{}", r#"[{"start":0,"end":1,"text":"带 BOM"}]"#);
+        let segs = parse_json(&doc).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "带 BOM");
+    }
+
+    /// 时间轴写成字符串（手写 / 第三方工具常见）时同样要能导入：JSON 数字与
+    /// `"MM:SS.mmm"` 字符串走同一条解析路径，否则同一份文档换个写法就整篇读不进来。
+    #[test]
+    fn json_accepts_string_timestamps_via_parse_timestamp() {
+        let doc = r#"[{"start":"00:00:01.500","end":"00:00:02,250","text":"字符串时间轴"}]"#;
+        let segs = parse_json(doc).unwrap();
+        assert_eq!(segs[0].start, 1.5, "字符串起始时间必须按秒解析");
+        assert_eq!(segs[0].end, 2.25, "逗号与点号作毫秒分隔符都要认");
+        assert_eq!(segs[0].text, "字符串时间轴");
+    }
+
+    /// LRC 只给起始时间，一条的结束时间必须取**下一条时间标签的起点**：
+    /// 取错会让整篇时间轴整体错位，这是导入 LRC 最基础的形状。
+    #[test]
+    fn lrc_reads_basic_lines_with_end_from_next_start() {
+        let content = "[00:01.00]第一句\n[00:05.50]第二句\n";
+        let segs = parse_lrc(content).unwrap();
+        assert_eq!(segs.len(), 2, "两行唱词应产出两条字幕");
+        assert_eq!(segs[0].index, 1, "输出序号应从 1 重排");
+        assert_eq!(segs[0].start, 1.0, "起始时间应取标签里的秒数");
+        assert_eq!(segs[0].end, 5.5, "结束时间应取下一标签的起点");
+        assert_eq!(segs[0].text, "第一句", "正文应保真");
+        assert_eq!(segs[1].index, 2, "第二条序号为 2");
+        assert_eq!(segs[1].start, 5.5, "第二条起点应接第一条终点");
+        assert_eq!(segs[1].text, "第二句", "第二条正文应保真");
+    }
+
+    /// 一行多个时间标签（副歌重复出现）时只取第一个能解析成时间的标签：
+    /// 取错会让这一句跑到别的时间点，其余标签只当分隔符。
+    #[test]
+    fn lrc_uses_first_tag_when_line_has_multiple_timestamps() {
+        let content = "[00:10.00][00:20.00]副歌\n";
+        let segs = parse_lrc(content).unwrap();
+        assert_eq!(segs.len(), 1, "一行多标签仍只是一条唱词");
+        assert_eq!(segs[0].start, 10.0, "应取第一个能解析成时间的标签");
+        assert_eq!(segs[0].text, "副歌", "标签后的剩余文本才是正文");
+    }
+
+    /// 元数据标签（ti/ar/al/by/offset）解析不出时间，应被自然忽略；行首没有标签、
+    /// 或 `[` 没有配对 `]` 的行整行跳过。三类混在一起测，确保不会互相连累。
+    #[test]
+    fn lrc_skips_metadata_tags_and_plain_lines() {
+        let content = "\
+[ti:标题]
+[ar:歌手]
+[al:专辑]
+[by:制作者]
+[offset:500]
+这一行没有标签
+[00:01.00]正文
+[00:07.00缺少右括号
+";
+        let segs = parse_lrc(content).unwrap();
+        assert_eq!(segs.len(), 1, "只有带时间标签的正文行才产出字幕");
+        assert_eq!(segs[0].text, "正文", "正文应保真");
+        assert_eq!(segs[0].start, 1.0, "起始时间应取标签里的秒数");
+    }
+
+    /// 最后一条没有「下一条」可依，只能按字数估算：短句落到最短时长下限，长句按
+    /// 每字 0.3 秒 计算。这是估算值，必须可预测，用户才知道要不要校对。
+    #[test]
+    fn lrc_last_line_end_is_estimated_from_char_count() {
+        let short = parse_lrc("[00:10.00]短\n").unwrap();
+        assert!(
+            (short[0].end - 10.0 - 1.5).abs() < 1e-9,
+            "单字尾句应落到 1.5 秒下限: {}",
+            short[0].end
+        );
+
+        let body = "十个字的一句话呀"; // 8 个字符
+        let long = parse_lrc(&format!("[00:00.00]{body}\n")).unwrap();
+        assert!(
+            (long[0].end - 8.0 * 0.3).abs() < 1e-9,
+            "长尾句应按每字 0.3 秒估算: {}",
+            long[0].end
+        );
+    }
+
+    /// `[00:10.00]` 后面没有字的时间行是「静音边界」：它本身不产出字幕，但仍是上一条
+    /// 结束时间的候选——直接丢掉会让上一句一直唱到下一句开头。
+    #[test]
+    fn lrc_empty_text_tag_acts_as_silence_boundary() {
+        let content = "[00:01.00]第一句\n[00:03.00]\n[00:08.00]第二句\n";
+        let segs = parse_lrc(content).unwrap();
+        assert_eq!(segs.len(), 2, "空文本的时间行本身不产出字幕");
+        assert_eq!(segs[0].text, "第一句", "第一条正文应保真");
+        assert_eq!(segs[0].end, 3.0, "空文本行仍是上一条结束时间的候选");
+        assert_eq!(segs[1].text, "第二句", "空文本行之后的下一条照常解析");
+        assert_eq!(segs[1].start, 8.0, "下一条起点应取自己的标签时间");
+    }
+
+    /// 时间倒挂只丢那一条：手改过的 LRC 常有一两处乱序，为它丢掉整篇等于让用户重做
+    /// 一遍，因此其余唱词照常产出、序号照常重排。
+    #[test]
+    fn lrc_skips_out_of_order_blocks_but_keeps_good() {
+        let content = "[00:20.00]倒挂\n[00:10.00]正常\n[00:30.00]最后\n";
+        let segs = parse_lrc(content).unwrap();
+        assert_eq!(segs.len(), 2, "倒挂的那一条应被丢掉");
+        assert_eq!(segs[0].index, 1, "跳过的坏块不占序号");
+        assert_eq!(segs[0].text, "正常", "倒挂之后的好块应保留");
+        assert_eq!(segs[0].start, 10.0, "保留块起点应取自己的标签时间");
+        assert_eq!(segs[0].end, 30.0, "保留块终点应取下一条起点");
+        assert_eq!(segs[1].text, "最后", "最后一条应保留");
+    }
+
+    /// 一条可用唱词都没有时要报错而不是返回空表：返回空表会让调用方以为「导入成功但
+    /// 字幕是空的」，用户拿不到任何反馈。
+    #[test]
+    fn lrc_errors_when_nothing_parsable() {
+        assert!(parse_lrc("").is_err(), "空输入应报错");
+        assert!(
+            parse_lrc("[ti:标题]\n[ar:歌手]\n[offset:500]\n").is_err(),
+            "只有元数据标签时应报错"
+        );
+        assert!(
+            parse_lrc("这一行没有时间标签\n随便写写\n").is_err(),
+            "没有时间标签时应报错"
+        );
+    }
+
+    /// BOM 与 CRLF 是 Windows 记事本另存的默认产物：不处理的话第一行会变成「带 BOM 的
+    /// 怪文本」而丢掉，时间戳行尾挂着 `\r` 也会解析失败。
+    #[test]
+    fn lrc_handles_bom_and_crlf() {
+        let content = "\u{FEFF}[00:01.00]第一句\r\n[00:03.00]第二句\r\n";
+        let segs = parse_lrc(content).unwrap();
+        assert_eq!(segs.len(), 2, "BOM 与 CRLF 不应影响解析");
+        assert_eq!(segs[0].text, "第一句", "正文应保真");
+        assert_eq!(segs[0].end, 3.0, "结束时间仍应取下一标签起点");
+    }
+
+    /// 只解析 `[Events]` 段：别的段落里出现的 `Dialogue:` 行（注释模板、示例）一律不算
+    /// 字幕，否则会凭空多出内容；`Comment:` 也不是对白。
+    #[test]
+    fn ass_reads_dialogue_lines_only_from_events_section() {
+        let content = "\
+[Script Info]
+Title: 测试
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,不该被读到
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,事件段里的对白
+Comment: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,,注释不是对白
+
+[Fonts]
+Dialogue: 0,0:00:06.00,0:00:07.00,Default,,0,0,0,,字体段里的伪对白
+";
+        let segs = parse_ass(content).unwrap();
+        assert_eq!(segs.len(), 1, "只有 [Events] 段里的对白算字幕");
+        assert_eq!(segs[0].index, 1, "序号应从 1 重排");
+        assert_eq!(segs[0].start, 3.0, "起始时间应取 Start 字段");
+        assert_eq!(segs[0].end, 4.0, "结束时间应取 End 字段");
+        assert_eq!(segs[0].text, "事件段里的对白", "正文应保真");
+    }
+
+    /// 覆盖码 `{...}` 要整段丢掉，`\N` 与 `\n` 都要还原成换行（导出侧正是用 `\N` 表达
+    /// 换行），`\h` 还原成空格；未闭合的 `{` 之后整段丢弃，避免半截指令混进字幕。
+    #[test]
+    fn ass_converts_newline_markers_and_strips_override_tags() {
+        let content = "\
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\pos(10,10)}第一行\\N第二行\\n第三行\\h空格
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,保留{未闭合的覆盖码
+";
+        let segs = parse_ass(content).unwrap();
+        assert_eq!(segs.len(), 2, "两条对白都应保留");
+        assert_eq!(
+            segs[0].text, "第一行\n第二行\n第三行 空格",
+            "\\N 与 \\n 应还原成换行，\\h 应还原成空格"
+        );
+        assert_eq!(segs[1].text, "保留", "未闭合的覆盖码之后整段丢弃");
+    }
+
+    /// ASS 的 Name 字段是演员/说话人名：按首次出现顺序编号，同一人复用同一编号。
+    /// 顺序错乱会让说话人归属整体错位（下游按编号分色、分组）。
+    #[test]
+    fn ass_maps_name_field_to_speaker_in_first_seen_order() {
+        let content = "\
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,小明,0,0,0,,第一句
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,小红,0,0,0,,第二句
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,小明,0,0,0,,第三句
+";
+        let segs = parse_ass(content).unwrap();
+        assert_eq!(segs.len(), 3, "三条对白都应保留");
+        assert_eq!(segs[0].speaker, Some(0), "首个说话人编号为 0");
+        assert_eq!(segs[1].speaker, Some(1), "第二个说话人编号为 1");
+        assert_eq!(segs[2].speaker, Some(0), "同一说话人复用原编号");
+    }
+
+    /// Name 为空或 `Default` 时不应强加说话人标签：大量文件全篇写 `Default`，强行编号
+    /// 只会给每句挂上无意义的「说话人 1」。大小写不同也要认。
+    #[test]
+    fn ass_default_name_leaves_speaker_empty() {
+        let content = "\
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,Default,0,0,0,,第一句
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,第二句
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,DEFAULT,0,0,0,,第三句
+";
+        let segs = parse_ass(content).unwrap();
+        assert_eq!(segs.len(), 3, "三条对白都应保留");
+        for seg in &segs {
+            assert_eq!(seg.speaker, None, "Default 或空 Name 不应产生说话人");
+        }
+    }
+
+    /// 段内只认 `Dialogue:`：`Comment:` 要跳过；时间戳解析失败、`end < start`、字段数
+    /// 不足 10 的坏行也各自跳过，但都不影响后面的好行。
+    #[test]
+    fn ass_skips_comment_and_bad_time_lines() {
+        let content = "\
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Comment: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,注释不是字幕
+Dialogue: 0,坏时间,0:00:03.00,Default,,0,0,0,,坏开始时间
+Dialogue: 0,0:00:05.00,0:00:04.00,Default,,0,0,0,,时间倒挂
+Dialogue: 0,0:00:06.00,0:00:07.00,Default,,0,0,0
+Dialogue: 0,0:00:08.00,0:00:09.00,Default,,0,0,0,,好行
+";
+        let segs = parse_ass(content).unwrap();
+        assert_eq!(segs.len(), 1, "只有最后一行是可用对白");
+        assert_eq!(segs[0].index, 1, "跳过的坏块不占序号");
+        assert_eq!(segs[0].start, 8.0, "起始时间应取 Start 字段");
+        assert_eq!(segs[0].end, 9.0, "结束时间应取 End 字段");
+        assert_eq!(segs[0].text, "好行", "正文应保真");
+    }
+
+    /// Text 是最后一个字段，里面可以有逗号：必须用 `splitn(10, ...)` 让 limit 保住剩余
+    /// 内容，否则文本会在第一个逗号处被截断，而中英对照里逗号极常见。
+    #[test]
+    fn ass_keeps_commas_inside_text_field() {
+        let content = "\
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,第一句,还有,两个逗号
+";
+        let segs = parse_ass(content).unwrap();
+        assert_eq!(segs[0].text, "第一句,还有,两个逗号", "逗号必须保真");
+    }
+
+    /// 没有 `[Events]` 段、或段内一条 `Dialogue:` 都没有时要报错，理由同 LRC：
+    /// 返回空表会让调用方以为导入成功，用户拿不到任何反馈。
+    #[test]
+    fn ass_errors_when_no_dialogue() {
+        assert!(parse_ass("").is_err(), "空输入应报错");
+        assert!(
+            parse_ass("[Script Info]\nTitle: 测试\n").is_err(),
+            "没有 [Events] 段时应报错"
+        );
+        let only_comment = concat!(
+            "[Events]\n",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+            "Comment: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,只有注释\n",
+        );
+        assert!(parse_ass(only_comment).is_err(), "只有注释时应报错");
+    }
+
+    /// 同理，ASS 文件在 Windows 上几乎都是 CRLF，第三方工具还会加 BOM：两者都要先处理
+    /// 掉，否则 `[Events]` 段名都认不出来，整篇被判成「没有对白」。
+    #[test]
+    fn ass_handles_bom_and_crlf() {
+        let content = concat!(
+            "\u{FEFF}[Events]\r\n",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n",
+            "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,对白\r\n",
+        );
+        let segs = parse_ass(content).unwrap();
+        assert_eq!(segs.len(), 1, "BOM 与 CRLF 不应影响解析");
+        assert_eq!(segs[0].text, "对白", "正文应保真");
+        assert_eq!(segs[0].start, 1.0, "起始时间应取 Start 字段");
+    }
+
+    /// 建一条测试用 `Segment`，顺带填上译文与译文语言。
+    fn ttml_test_segment(
+        start: f64,
+        end: f64,
+        text: &str,
+        translation: Option<&str>,
+        translation_lang: Option<&str>,
+    ) -> Segment {
+        let mut segment = Segment::new(0, start, end, text);
+        segment.translation = translation.map(str::to_string);
+        segment.translation_lang = translation_lang.map(str::to_string);
+        segment
+    }
+
+    /// EBU-TT-D 单语文件的基线：`<p>` 的时间轴与正文都要读对，序号按出现顺序重排。
+    #[test]
+    fn ttml_reads_ebu_ttd_single_language() {
+        let content = r#"<?xml version="1.0" encoding="UTF-8"?>
+<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="zh" ttp:timeBase="media" ttp:cellResolution="32 15">
+  <body><div>
+    <p xml:id="p1" begin="00:00:01.000" end="00:00:02.500">第一句</p>
+    <p xml:id="p2" begin="00:00:03.000" end="00:00:04.000">第二句</p>
+  </div></body>
+</tt>
+"#;
+        let segs = parse_ttml(content).unwrap();
+        assert_eq!(segs.len(), 2, "两句都应解析出来");
+        assert_eq!(segs[0].text, "第一句");
+        assert_eq!(segs[0].start, 1.0);
+        assert_eq!(segs[0].end, 2.5);
+        assert_eq!(segs[0].index, 1, "输出序号应重排为 1..n");
+        assert_eq!(segs[1].text, "第二句");
+        assert_eq!(segs[1].index, 2);
+        assert_eq!(segs[1].start, 3.0);
+    }
+
+    /// 文档语言是切分基准：标了 `xml:lang="en"` 的 span 是译文，裸文本（文档语言）是
+    /// 原文；相邻同语言的 span 必须合并成一句，不能被逐片拆成多条字幕。
+    #[test]
+    fn ttml_bilingual_split_by_document_language() {
+        let content = r#"<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="zh" ttp:timeBase="media">
+  <body><div>
+    <p begin="1s" end="2.5s"><span xml:lang="en">Hello</span><br/>你好</p>
+    <p begin="3s" end="4s"><span>Hel</span><span>lo</span></p>
+  </div></body>
+</tt>
+"#;
+        let segs = parse_ttml(content).unwrap();
+        assert_eq!(segs.len(), 2, "两句都应解析");
+        assert_eq!(segs[0].text, "你好", "文档语言一侧应作为原文");
+        assert_eq!(
+            segs[0].translation.as_deref(),
+            Some("Hello"),
+            "另一种语言应作为译文"
+        );
+        assert_eq!(segs[0].translation_lang.as_deref(), Some("en"));
+        assert_eq!(segs[1].text, "Hello", "相邻同语言 span 应合并成一句");
+        assert!(segs[1].translation.is_none(), "单语段落不应凭空长出译文");
+    }
+
+    /// Netflix TTAL 常常不写根 `xml:lang`：此时以第一个带语言的 span 作为原文基准，
+    /// 避免把「未声明文档语言」误判成「整篇都是译文」。
+    #[test]
+    fn ttml_netflix_ttal_without_doc_lang_uses_first_span_as_original() {
+        let content = r#"<tt xmlns="http://www.w3.org/ns/ttml" ttp:timeBase="media" ttp:contentProfiles="http://www.netflix.com/ttml/profile/ntflx-ttal-1.0">
+  <body><div>
+    <p begin="00:00:01.000" end="00:00:02.000"><span xml:lang="en">Hello</span><br/>你好</p>
+  </div></body>
+</tt>
+"#;
+        let segs = parse_ttml(content).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(
+            segs[0].text, "Hello",
+            "无文档语言时以第一个 span 语言为原文"
+        );
+        assert!(segs[0].translation.is_none(), "没有第二种语言就没有译文");
+    }
+
+    /// `<br/>` 必须变成真正的换行（TTML 用换行而非空格断行）；预定义实体要还原、
+    /// 未知实体（如 `&nbsp;`）要原样保留。
+    #[test]
+    fn ttml_br_becomes_newline_and_entities_are_decoded() {
+        let content = r#"<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="en">
+  <body><div>
+    <p begin="0s" end="1s">A &amp; B &lt;tag&gt; AB &nbsp;</p>
+    <p begin="2s" end="3s">上<BR />下</p>
+  </div></body>
+</tt>
+"#;
+        let segs = parse_ttml(content).unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(
+            segs[0].text, "A & B <tag> AB &nbsp;",
+            "转义应还原，未知实体原样保留"
+        );
+        assert_eq!(segs[1].text, "上\n下", "<br/> 应变成换行");
+    }
+
+    /// 说话人映射：`spk{N}`（N 从 1 起）还原成 0 起的编号，非 `spk` 前缀的 id 不映射。
+    #[test]
+    fn ttml_ttm_agent_maps_to_speaker() {
+        let content = r#"<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="zh">
+  <body><div>
+    <p begin="0s" end="1s" ttm:agent="spk1">甲</p>
+    <p begin="1s" end="2s" ttm:agent="spk2">乙</p>
+    <p begin="2s" end="3s" ttm:agent="narrator">旁白</p>
+    <p begin="3s" end="4s">无标签</p>
+  </div></body>
+</tt>
+"#;
+        let segs = parse_ttml(content).unwrap();
+        assert_eq!(segs.len(), 4);
+        assert_eq!(segs[0].speaker, Some(0), "spk1 应映射成 0 号说话人");
+        assert_eq!(segs[1].speaker, Some(1), "spk2 应映射成 1 号说话人");
+        assert_eq!(segs[2].speaker, None, "非 spk 前缀的 id 不应映射");
+        assert_eq!(segs[3].speaker, None, "无 agent 属性不应映射");
+    }
+
+    /// 坏块一律跳过、好块照常保留：缺时间轴、时间戳非法、end < begin、空正文、
+    /// 自闭合 `<p/>` 各丢一块，剩下两块并重排序号。这是容错原则的核心回归。
+    #[test]
+    fn ttml_skips_bad_blocks_but_keeps_good() {
+        let content = r#"<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="zh">
+  <body><div>
+    <p xml:id="p1">缺时间轴</p>
+    <p begin="not-a-time" end="2s">坏时间戳</p>
+    <p begin="5s" end="3s">时间倒挂</p>
+    <p begin="6s" end="7s"></p>
+    <p begin="8s" end="9s" />
+    <p begin="10s" end="11s">好的一</p>
+    <p begin="12s" end="13s">好的二</p>
+  </div></body>
+</tt>
+"#;
+        let segs = parse_ttml(content).unwrap();
+        assert_eq!(segs.len(), 2, "坏块应被跳过，只留两条好块");
+        assert_eq!(segs[0].text, "好的一");
+        assert_eq!(segs[1].text, "好的二");
+        assert_eq!(segs[0].index, 1, "序号应重排为 1..n");
+        assert_eq!(segs[1].index, 2);
+    }
+
+    /// TTML 的「数字 + 单位」偏移写法：`ms`/`h`/`m`/`s` 都要支持，缺 `end` 时用
+    /// `begin + dur`；帧式时间（`10f`）需要帧率、无法可靠换算，按坏块跳过。
+    #[test]
+    fn ttml_offset_time_unit_suffix_is_supported() {
+        let content = r#"<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="zh" ttp:frameRate="25">
+  <body><div>
+    <p begin="1.5s" end="2s">A</p>
+    <p begin="500ms" end="1.5s">B</p>
+    <p begin="90m" end="2h">C</p>
+    <p begin="1s" dur="2.5s">D</p>
+    <p begin="10f" end="11f">帧时间不支持</p>
+  </div></body>
+</tt>
+"#;
+        let segs = parse_ttml(content).unwrap();
+        assert_eq!(segs.len(), 4, "帧式时间应作为坏块跳过");
+        assert_eq!(segs[0].start, 1.5);
+        assert_eq!(segs[0].end, 2.0);
+        assert_eq!(segs[1].start, 0.5, "500ms 应换算成 0.5 秒");
+        assert_eq!(segs[1].end, 1.5);
+        assert_eq!(segs[2].start, 5400.0, "90 分钟应换算成秒");
+        assert_eq!(segs[2].end, 7200.0, "2 小时应换算成秒");
+        assert_eq!(segs[3].start, 1.0);
+        assert_eq!(segs[3].end, 3.5, "end 缺失时用 begin + dur");
+    }
+
+    /// 整篇没有任何可用块时必须报错（而不是返回空表），错误信息要指明是 TTML，
+    /// 否则用户无从判断是哪一种字幕读失败了。
+    #[test]
+    fn ttml_errors_when_no_paragraphs() {
+        let empty = parse_ttml("").unwrap_err().to_string();
+        assert!(
+            empty.contains("TTML"),
+            "空文档的错误信息应指明 TTML: {empty}"
+        );
+
+        let no_p = r#"<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="zh">
+  <body><div></div></body>
+</tt>
+"#;
+        assert!(parse_ttml(no_p).is_err(), "没有 <p> 应报错");
+
+        let all_bad = r#"<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="zh">
+  <body><div>
+    <p>无时间轴</p>
+    <p begin="bad" end="worse">坏时间戳</p>
+  </div></body>
+</tt>
+"#;
+        assert!(parse_ttml(all_bad).is_err(), "全是坏块应报错");
+    }
+
+    /// 往返闭环：导出器写出的 EBU-TT-D / Netflix TTAL 再读回来，文本、译文、译文语言
+    /// 与时间轴都必须一致。这条测试同时钉住「双语 span + `<br/>` + 裸原文」的互逆关系。
+    #[test]
+    fn ttml_export_import_round_trip_preserves_text() {
+        use crate::subtitle::{ExportMode, TtmlExporter, TtmlProfile};
+
+        let segments = vec![
+            ttml_test_segment(1.0, 2.5, "第一句中文", Some("First line"), Some("en")),
+            ttml_test_segment(
+                3.0,
+                4.25,
+                "第二句 & 更长的中文",
+                Some("Second line"),
+                Some("en"),
+            ),
+        ];
+        let dir = temp_dir("ttml_roundtrip");
+        for (tag, profile) in [
+            ("ebu", TtmlProfile::EbuTtD),
+            ("ttal", TtmlProfile::NetflixTtal),
+        ] {
+            let path = dir.join(format!("out_{tag}.ttml"));
+            TtmlExporter::write_to_file(
+                &segments,
+                &path,
+                "zh",
+                Some("en"),
+                ExportMode::Bilingual,
+                profile,
+            )
+            .unwrap();
+            let written = std::fs::read_to_string(&path).unwrap();
+            let read_back = parse_ttml(&written).unwrap();
+            assert_eq!(read_back.len(), 2, "{tag}: 往返后应仍是两句");
+            assert_eq!(read_back[0].text, "第一句中文", "{tag}: 原文应保真");
+            assert_eq!(
+                read_back[0].translation.as_deref(),
+                Some("First line"),
+                "{tag}: 译文应保真"
+            );
+            assert_eq!(
+                read_back[0].translation_lang.as_deref(),
+                Some("en"),
+                "{tag}: 译文语言应保真"
+            );
+            assert_eq!(read_back[0].start, 1.0, "{tag}: 起始时间应保真");
+            assert_eq!(read_back[0].end, 2.5, "{tag}: 结束时间应保真");
+            assert_eq!(
+                read_back[1].text, "第二句 & 更长的中文",
+                "{tag}: 转义与还原应闭环"
+            );
+            assert_eq!(read_back[1].start, 3.0);
+            assert_eq!(read_back[1].end, 4.25);
+            let _ = std::fs::remove_file(&path);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
