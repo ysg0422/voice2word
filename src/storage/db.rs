@@ -130,7 +130,7 @@ impl Database {
     /// 或未来某次迁移必须严格只跑一次）就无从下手——它只会在列已存在时静默跳过、
     /// 在真出问题时也静默失败（返回值被 `let _ =` 吞掉）。版本号把「当前库处在哪个
     /// schema 阶段」变成可读、可断言的状态。
-    pub const SCHEMA_VERSION: i32 = 2;
+    pub const SCHEMA_VERSION: i32 = 3;
 
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -293,7 +293,7 @@ impl Database {
     /// DDL 与版本号是**两次独立的写**。若不用事务，中途失败（磁盘满、库被外部
     /// 工具锁死、进程被杀）就会留下「列已加、版本没推」的半迁移状态：下次启动
     /// 重跑时 `ALTER TABLE ADD COLUMN content_hash` 会因列已存在而报错，而错误
-    /// 一旦被吞掉，程序就会带着一个**版本号撒谎的库**继续跑（以为是 v2，其实
+    /// 一旦被吞掉，程序就会带着一个**版本号撒谎的库**继续跑（以为已是最新，其实
     /// 索引可能没建上）。把 `BEGIN IMMEDIATE … COMMIT` 包住「补列 + 建索引 +
     /// 推进 user_version」，任何一步失败都整体 ROLLBACK：库要么停在旧版本、
     /// 下次干净重试，要么完整升到新版本，不存在中间态。
@@ -334,10 +334,10 @@ impl Database {
         // SELECT 它——不补这一列，老库升到 v2 后每次读历史列表都报
         // `no such column: created_at`，视频库列表与缓存命中永久失效。
         //
-        // 为什么不新增 v3：`SCHEMA_VERSION=2` 是上一个提交刚引入的，v2 从未发布，
-        // 真实世界里不存在「user_version=2 且缺 created_at」的库（真实老库全是
-        // v0/v1）。新增 v3 就得再写一段专门照顾这种并不存在的库；把补列并入 v1→v2，
-        // 则 v0/v1 两种老库一步到位，版本号仍停在 2。
+        // 为什么把 created_at 并入 v1→v2 而不是单开一段迁移：`SCHEMA_VERSION` 从 1 跳到 2
+        // 是上一个提交刚做的，真实世界里不存在「user_version=2 且缺 created_at」的库
+        //（真实老库全是 v0/v1）。单开一段 v2→v3 只会照顾这种并不存在的库；把补列并入
+        // v1→v2，则 v0/v1 两种老库一步到位。content_hash 另有一段 v2→v3（见下）。
         //
         // 默认值为什么不是 `CURRENT_TIMESTAMP`：`ALTER TABLE ADD COLUMN` **不允许
         // 非常量默认值**——表里已有行时 `DEFAULT CURRENT_TIMESTAMP` 与
@@ -909,6 +909,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 回归：`user_version=2` 但缺 `content_hash` 的库必须被 v2→v3 迁移补齐。
+    ///
+    /// 这正是本轮修掉的 bug：`SCHEMA_VERSION` 曾停在 2，而 `apply_migrations` 里
+    /// 已存在 v2→v3 段，于是 `from >= SCHEMA_VERSION` 让这类库**永远跳过**该段——
+    /// 列与索引永久缺失，缓存命中查询直接 `no such column: content_hash`。修法是让
+    /// 版本号与迁移段一致（推进到 3），本用例即锁死这一行为。
+    #[test]
+    fn v2_db_without_fingerprint_upgrades_to_v3() {
+        let dir = tmp_dir("v2_to_v3");
+        let path = dir.join("legacy_v2.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     file_path TEXT NOT NULL,
+                     file_name TEXT NOT NULL,
+                     duration REAL DEFAULT 0.0,
+                     status TEXT NOT NULL,
+                     segments_json TEXT NOT NULL,
+                     metrics_json TEXT,
+                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                 );
+                 INSERT INTO tasks (file_path, file_name, duration, status, segments_json, created_at)
+                     VALUES ('D:/v2/a.mp4', 'a.mp4', 1.0, 'completed', '[]', '2026-09-19 02:58:21');
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+            // 前置：这是 v2 且缺 content_hash，正是旧版本号会让迁移跳过的形状
+            assert!(
+                !Database::column_exists(&conn, "content_hash").unwrap(),
+                "前置条件：v2 库不应有 content_hash 列"
+            );
+        }
+
+        let db = Database::open(&path).expect("v2 库应能迁移后打开");
+        assert_eq!(
+            user_version(&db),
+            Database::SCHEMA_VERSION,
+            "版本号应推进到当前版本"
+        );
+        {
+            let conn = db.lock_conn();
+            assert!(
+                Database::column_exists(&conn, "content_hash").unwrap(),
+                "v2→v3 应补齐 content_hash 列"
+            );
+        }
+        assert!(
+            index_exists(&db, "idx_tasks_content_hash"),
+            "v2→v3 应建上内容指纹索引"
+        );
+        // 迁移不改数据，且新列可写
+        let id = db
+            .insert_task(
+                "D:/v2/b.mp4",
+                "b.mp4",
+                1.0,
+                "completed",
+                &seg("v3 后"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(db.load_task_segments(id).unwrap()[0].text, "v3 后");
+        let n: i64 = db
+            .lock_conn()
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "迁移不应丢数据");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// 「库被占用」是唯一允许重试的错误类别，其余错误必须立刻返回，
     /// 否则一次约束冲突会被拖成好几秒的假死。
     #[test]
@@ -1055,8 +1127,8 @@ mod tests {
         .is_some()
     }
 
-    /// v0 → v2：最老的库（`user_version=0`、只有 `tasks` 表、缺 `created_at`）迁移后
-    /// 必须：版本推进到 2、补齐 `created_at`/`metrics_json`/`content_hash` 三列、建上
+    /// v0 → v3：最老的库（`user_version=0`、只有 `tasks` 表、缺 `created_at`）迁移后
+    /// 必须：版本推进到 3、补齐 `created_at`/`metrics_json`/`content_hash` 三列、建上
     /// `idx_tasks_content_hash`、原有行一条不少，**并且历史列表与缓存查询真的可用**
     /// ——「列齐了但查询仍报 `no such column: created_at`」正是本次修复的缺口。
     #[test]
@@ -1070,7 +1142,7 @@ mod tests {
         assert_eq!(
             user_version(&db),
             Database::SCHEMA_VERSION,
-            "版本号应推进到 v2"
+            "版本号应推进到当前版本"
         );
         let conn = db.lock_conn();
         assert!(
