@@ -49,6 +49,8 @@ actions!(
         OpenCommandPalette,
         /// 打开 / 关闭字幕「查找替换」面板
         OpenReplacePanel,
+        /// 打开 / 关闭快捷键速查面板 (F1)
+        OpenShortcutsHelp,
         /// 裸空格（焦点不在输入框时）：播放 / 暂停当前预览
         TogglePlaybackBare,
         /// 裸 Delete / Backspace（焦点不在输入框时）：删除当前选中的字幕片段
@@ -80,7 +82,7 @@ pub const BARE_KEYS: [&str; 3] = ["space", "delete", "backspace"];
 
 /// [`SHORTCUT_SPECS`] 的条目数：定长数组与测试共用同一个常量，
 /// 以后加绑定只改这一处，不会再出现「表里加了、长度常量忘了改」。
-pub const SPEC_COUNT: usize = 17;
+pub const SPEC_COUNT: usize = 18;
 
 /// 默认键位表的唯一事实来源：启动时按此注册，速查表也按此校验。
 pub const SHORTCUT_SPECS: [ShortcutSpec; SPEC_COUNT] = [
@@ -158,6 +160,13 @@ pub const SHORTCUT_SPECS: [ShortcutSpec; SPEC_COUNT] = [
         hint_key: "Ctrl+H",
         hint: "查找替换",
     },
+    // F1 是「帮助」的通用约定（浏览器、Office、各类编辑器都是它），而速查面板只做
+    // 展示、不碰任何数据，可以全局安全生效；绑成 Ctrl+? 之类的组合反而没人会按。
+    ShortcutSpec {
+        key: "f1",
+        hint_key: "F1",
+        hint: "快捷键速查",
+    },
     // 裸键最小交互集：只在焦点不在输入框时由 `.on_action` 放行（见 `BARE_KEYS`）。
     // 空格是播放/暂停的通用约定（播放器、剪辑软件都是它），与 Ctrl+Space 并存：
     // 前者给「手在鼠标上」的场景，后者给「正在打字」的场景，两条互不覆盖。
@@ -202,6 +211,7 @@ fn binding_for(key: &str) -> KeyBinding {
         "ctrl-shift-z" => KeyBinding::new(key, Redo, None),
         "ctrl-y" => KeyBinding::new(key, Redo, None),
         "ctrl-h" => KeyBinding::new(key, OpenReplacePanel, None),
+        "f1" => KeyBinding::new(key, OpenShortcutsHelp, None),
         // 裸键：与上面的修饰键组合是两条独立绑定，键位描述不会互相覆盖。
         "space" => KeyBinding::new(key, TogglePlaybackBare, None),
         "delete" => KeyBinding::new(key, DeleteActiveSegment, None),
@@ -221,7 +231,7 @@ pub fn bind_default_keys(cx: &mut gpui::App) {
 /// 与 [`SHORTCUT_SPECS`]（真正的绑定表）同一份动作清单，逐条对齐由本文件末尾的
 /// 测试守着——补了绑定却忘了写速查表、或速查表里留着已经删掉的键位，都会先在这里
 /// 失败，而不是让用户对着界面上写错的键位按半天。
-pub const SHORTCUT_HINTS: [(&str, &str); 15] = [
+pub const SHORTCUT_HINTS: [(&str, &str); 16] = [
     ("Ctrl+Space", "播放/暂停"),
     ("Alt+↑↓", "上/下句"),
     ("Alt+←→", "±1 秒"),
@@ -237,12 +247,86 @@ pub const SHORTCUT_HINTS: [(&str, &str); 15] = [
     ("Space", "播放/暂停(裸键)"),
     ("Delete", "删除当前句(裸键)"),
     ("Backspace", "删除当前句(裸键)"),
+    ("F1", "快捷键速查"),
 ];
+
+/// 一组速查行：（分组名，该组里每行的（键位文本，说明））。
+pub type ShortcutGroup = (&'static str, Vec<(&'static str, &'static str)>);
+
+/// 速查面板里的分组顺序。
+///
+/// 十几条键位平铺成一列时，播放、编辑、导出混在一起，找一条得逐行扫；按「用户此刻
+/// 想干什么」分组后，找键位变成先找组、再找行。顺序表放在这里而不是视图里，是为了
+/// 让面板与测试共用同一份定义（测试会检查分组顺序、每组非空、没有重复分组）。
+pub const SHORTCUT_GROUP_ORDER: [&str; 6] = [
+    "播放与跳转",
+    "编辑与撤销",
+    "查找与面板",
+    "文件与导出",
+    "转写任务",
+    "删除（裸键）",
+];
+
+/// 没登记分组的键位落到哪个分组。
+///
+/// 分组只是展示层信息，不是绑定的前置条件：将来加了新绑定却忘了登记分组时，它应该
+/// 出现在面板的最后一块，而不是从面板里消失（那等于又造出一条「只有作者知道」的
+/// 快捷键）。有这层兜底，漏登记最多是分组难看，不会丢信息。
+pub const SHORTCUT_GROUP_OTHER: &str = "其它";
+
+/// 一条键位描述属于哪个分组。
+///
+/// 按动作语义归类：`ctrl-space` 与裸 `space` 都是播放，归同一组——用户在面板里是拿
+/// 「我想干什么」找键位，而不是拿键位反查动作，所以同义键位不该被拆到两个组里。
+pub fn group_of(key: &str) -> &'static str {
+    match key {
+        "ctrl-space" | "space" | "alt-up" | "alt-down" | "alt-left" | "alt-right" => "播放与跳转",
+        "ctrl-z" | "ctrl-shift-z" | "ctrl-y" => "编辑与撤销",
+        "ctrl-f" | "ctrl-k" | "ctrl-h" | "f1" => "查找与面板",
+        "ctrl-e" => "文件与导出",
+        "ctrl-enter" | "escape" => "转写任务",
+        "delete" | "backspace" => "删除（裸键）",
+        _ => SHORTCUT_GROUP_OTHER,
+    }
+}
+
+/// 按分组整理好的速查行，供快捷键速查面板直接渲染。
+///
+/// 直接由 [`SHORTCUT_SPECS`] 推导，而不是手写第二份清单——手写那份迟早与真正注册的
+/// 键位对不上（这个坑在 [`SHORTCUT_HINTS`] 上已经踩过一次）。同一分组里键位文本相同
+/// 的条目只留一条（`Alt+↑↓` 是两条绑定共用一行文案），键位不同、说明相同则各自保留
+/// （`Delete` 与 `Backspace` 都删当前句，但用户需要知道自己能按哪个键）。
+///
+/// 分组按 [`SHORTCUT_GROUP_ORDER`] 的顺序返回，空分组不返回（面板上挂一个空标题会
+/// 让人以为那组键位丢了）。
+pub fn grouped_shortcut_rows() -> Vec<ShortcutGroup> {
+    let mut groups: Vec<ShortcutGroup> = SHORTCUT_GROUP_ORDER
+        .iter()
+        .map(|name| (*name, Vec::new()))
+        // 兜底组固定在表尾，`group_of` 的默认返回值一定落在它身上。
+        .chain(std::iter::once((SHORTCUT_GROUP_OTHER, Vec::new())))
+        .collect();
+    for spec in SHORTCUT_SPECS {
+        let index = groups
+            .iter()
+            .position(|(name, _)| *name == group_of(spec.key))
+            // `unwrap_or` 的参数在这里求值时还没有可变借用，取表尾当兜底组。
+            .unwrap_or(groups.len() - 1);
+        let rows = &mut groups[index].1;
+        if rows.iter().any(|(key, _)| *key == spec.hint_key) {
+            continue;
+        }
+        rows.push((spec.hint_key, spec.hint));
+    }
+    groups.retain(|(_, rows)| !rows.is_empty());
+    groups
+}
 
 #[cfg(test)]
 mod tests {
     use super::{
-        binding_for, DeleteActiveSegment, TogglePlaybackBare, BARE_KEYS, SHORTCUT_HINTS,
+        binding_for, group_of, grouped_shortcut_rows, DeleteActiveSegment, OpenShortcutsHelp,
+        TogglePlaybackBare, BARE_KEYS, SHORTCUT_GROUP_ORDER, SHORTCUT_GROUP_OTHER, SHORTCUT_HINTS,
         SHORTCUT_SPECS, SPEC_COUNT,
     };
 
@@ -368,12 +452,105 @@ mod tests {
         assert_ne!(space, delete, "空格与删除键不应落到同一个动作上");
     }
 
+    /// F1 必须真的落在「快捷键速查」动作上：面板入口只写在这一条绑定上，接错线
+    /// （比如并到 Esc 上）面板就再也打不开，所以这里按动作名钉死，不只看「能解析」。
+    #[test]
+    fn f1_opens_shortcuts_help() {
+        use gpui::Action as _;
+
+        assert_eq!(
+            binding_for("f1").action().name(),
+            OpenShortcutsHelp::name_for_type(),
+            "F1 应绑定「快捷键速查」"
+        );
+        assert!(
+            SHORTCUT_HINTS
+                .iter()
+                .any(|(key, hint)| *key == "F1" && *hint == "快捷键速查"),
+            "速查表里应有 F1 条目"
+        );
+        // F1 不落在打字路径上，没有「焦点在输入框就失效」的语义，不该混进裸键集。
+        assert!(!BARE_KEYS.contains(&"f1"), "F1 不该出现在裸键表里");
+    }
+
+    /// 每个键位都必须显式登记分组：漏登记时 `group_of` 会兜底到「其它」，
+    /// 面板上多出一块无名分组，这里直接拦下来。
+    #[test]
+    fn every_spec_has_a_named_group() {
+        for spec in SHORTCUT_SPECS {
+            let group = group_of(spec.key);
+            assert_ne!(
+                group, SHORTCUT_GROUP_OTHER,
+                "键位 {} 没有登记到任何分组",
+                spec.key
+            );
+            assert!(
+                SHORTCUT_GROUP_ORDER.contains(&group),
+                "键位 {} 落到了未登记的分组 {group}",
+                spec.key
+            );
+        }
+    }
+
+    /// 未登记的键位描述兜底成「其它」而不是 panic：分组是展示层信息，将来加绑定
+    /// 忘了登记时仍要能在面板上看到它。
+    #[test]
+    fn unknown_key_falls_back_to_other_group() {
+        assert_eq!(group_of("ctrl-alt-shift-f13"), SHORTCUT_GROUP_OTHER);
+    }
+
+    /// 面板内容必须与速查表逐条一致（去重后比较）：两条绑定共用一行文案
+    /// （`Alt+↑↓`）时只该显示一行，但也不能因此少显示别的条目。
+    #[test]
+    fn grouped_rows_mirror_hints_table() {
+        let mut grouped: Vec<(&str, &str)> = grouped_shortcut_rows()
+            .into_iter()
+            .flat_map(|(_, rows)| rows)
+            .collect();
+        grouped.sort_unstable();
+        grouped.dedup();
+
+        let mut expected: Vec<(&str, &str)> = SHORTCUT_HINTS.to_vec();
+        expected.sort_unstable();
+        expected.dedup();
+
+        assert_eq!(grouped, expected, "面板内容与速查表不一致");
+    }
+
+    /// 分组按 [`SHORTCUT_GROUP_ORDER`] 的顺序出现、且没有空分组：顺序错乱会让用户
+    /// 找不到键位，空标题会让人以为那组键位丢了。
+    #[test]
+    fn groups_are_ordered_and_nonempty() {
+        let rows = grouped_shortcut_rows();
+        assert!(!rows.is_empty(), "速查面板一行都没有");
+
+        let mut seen: Vec<&str> = Vec::new();
+        for (name, entries) in &rows {
+            assert!(!entries.is_empty(), "分组 {name} 是空的");
+            assert!(!seen.contains(name), "分组 {name} 出现了两次");
+            seen.push(name);
+        }
+        // 出现的分组必须保持分组表的相对顺序（「其它」兜底组固定在表尾）。
+        let positions: Vec<usize> = seen
+            .iter()
+            .map(|name| {
+                SHORTCUT_GROUP_ORDER
+                    .iter()
+                    .position(|candidate| candidate == name)
+                    .unwrap_or(SHORTCUT_GROUP_ORDER.len())
+            })
+            .collect();
+        let mut sorted = positions.clone();
+        sorted.sort_unstable();
+        assert_eq!(positions, sorted, "分组顺序与 SHORTCUT_GROUP_ORDER 不一致");
+    }
+
     /// 定长数组的 N 与常量必须一致：改了表却忘了改 N 时，这里会先失败
     /// （N 被写大时多余项会退化成默认值，键位描述为空，同样是错的）。
     #[test]
     fn spec_count_matches_array_length() {
         assert_eq!(SHORTCUT_SPECS.len(), SPEC_COUNT);
-        assert_eq!(SPEC_COUNT, 17, "新增绑定后请同步更新 SPEC_COUNT");
+        assert_eq!(SPEC_COUNT, 18, "新增绑定后请同步更新 SPEC_COUNT");
         // 每条裸键都恰好出现一次，不多不少。
         for key in BARE_KEYS {
             let count = SHORTCUT_SPECS.iter().filter(|spec| spec.key == key).count();

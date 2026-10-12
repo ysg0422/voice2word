@@ -4,3 +4,4 @@ pub mod benchmark;
 pub mod completion;
 pub mod confirm;
 pub mod hardware_setup;
+pub mod help;
