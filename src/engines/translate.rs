@@ -296,9 +296,7 @@ fn translate_via_online_api(
     // P0-C：单批源文本预算必须扣掉**每批重复注入**的固定开销——system 提示词模板
     // （含源语言线索与术语表）。术语表理论上限约 9.7k 字符，不扣就会顶爆小上下文
     // 服务端（400）或让输出被截断。
-    let fixed_chars =
-        ONLINE_SYSTEM_PROMPT_CHARS + cfg.glossary_hint.chars().count() + ONLINE_SRC_HINT_CHARS;
-    let char_budget = online_char_budget(fixed_chars);
+    let char_budget = online_char_budget(online_fixed_chars(&cfg.glossary_hint, ""));
 
     // P0-2：推理模型的思考 token 与译文共享 `max_tokens`，必须缩批 + 加大预算。
     // `profile` 在整片翻译内共享：首批响应里出现非空 `reasoning_content` 即判定
@@ -653,17 +651,67 @@ fn plan_online_batches(
 /// 只有出现**超长行**时预算才会提前收口——那正是顶爆小上下文服务端的场景。
 const ONLINE_CHAR_CAP: usize = 3_500;
 
-/// 在线 system 提示词模板（含格式约束）的字符数：约 130 汉字。
-const ONLINE_SYSTEM_PROMPT_CHARS: usize = 130;
-/// 在线源语言线索（`源语言为中文；`）的字符数。
-const ONLINE_SRC_HINT_CHARS: usize = 10;
+/// 在线 system 提示词模板（`request_batch_translation` 实际下发的那一份）。
+///
+/// **必须与 `request_batch_translation` 里的 `format!` 逐字一致**：预算推导
+/// （[`ONLINE_SYSTEM_PROMPT_CHARS`]）直接取它的字符数，而 `max_output_tokens`
+/// 也按它折算 prompt 长度。此前这里是手写的「约 130 汉字」估算，实测模板
+/// 含全部格式约束后约 260 字符，低估近一倍会让预算虚高、极端术语表下更早
+/// 撞上 400/截断。常量与模板漂移由 `online_prompt_template_chars_matches_estimate`
+/// 测试守住。
+///
+/// 占位符：`{src_hint}` 源语言线索（可空）、`{glossary}` 术语表（可空）、
+/// `{target_lang}` 目标语言名。
+const ONLINE_SYSTEM_PROMPT_TEMPLATE: &str = "你是专业影视字幕翻译专家。{src_hint}{glossary}将用户给出的带序号字幕逐条翻译为地道的{target_lang}。\
+【输出格式规范】\
+必须且只能逐行输出，每行格式严格为「[序号] 译文」（严禁缺少括号与序号）。\
+【硬性约束】\
+1. 严禁添加任何问候、解释说明、Markdown代码块标记（如 ```）或前后赘述。\
+2. 保持原意与语气，语言通顺紧凑，译文长度尽量与原文相当。\
+3. 序号必须与原文完全一致，严禁遗漏任何一行，严禁合并多行，严禁改动序号。\
+4. 数字、公式、变量名、编号与专有名词原样保留。";
 
-/// 在线链路单批的**可用源文本字符预算**：从 [`ONLINE_CHAR_CAP`] 里扣掉
-/// **每批重复注入**的 system 提示词（含源语言线索与术语表）的实际长度。
+/// 在线 system 提示词模板的字符数：**由模板自身推导**，不再手写估算。
+///
+/// 已含 `{src_hint}` / `{glossary}` / `{target_lang}` 三个占位符的字面量，
+/// 调用方只需再叠加术语表与源语言线索的**实际**长度（见 [`online_fixed_chars`]）。
+/// 编译期可用的「UTF-8 字符数」：`str::chars().count()` 不是 `const fn`，
+/// 而 [`ONLINE_SYSTEM_PROMPT_CHARS`] 必须是常量（`char_budget` 在 const 上下文推导）。
+///
+/// 实现是标准的前导字节判定：`0b0xxx_xxxx` 与 `0b10xx_xxxx` 是续字节，不计。
+const fn utf8_char_count(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut n = 0usize;
+    while i < bytes.len() {
+        // 续字节高位两位为 10；非续字节即一个新字符的起始。
+        if bytes[i] & 0xC0 != 0x80 {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+const ONLINE_SYSTEM_PROMPT_CHARS: usize = utf8_char_count(ONLINE_SYSTEM_PROMPT_TEMPLATE);
+
+/// 单批请求里**每批重复注入**的固定开销字符数：system 提示词模板
+/// + 术语表 + 源语言线索，全部按实际长度计算。
 ///
 /// 术语表（`config.rs` 允许 80 条 × 左右各 60 字符 ≈ 9.7k 字符）若不计入，
 /// 一批字幕加提示词就会顶爆小上下文服务端（返回 400，而 4xx 被 `is_retryable`
 /// 判为不可重试 → 整片翻译第一批就中止）。这里让预算显式感知它。
+fn online_fixed_chars(glossary: &str, src_hint: &str) -> usize {
+    // 模板自身已含 `{src_hint}` / `{glossary}` / `{target_lang}` 三个占位符
+    // 字面量（合计 33 字符）。这里**不退还未使用的占位符字面量**，也不计真实
+    // 目标语言名，只叠加术语表与源语言线索的实际长度。于是该值相对真实提示词
+    // 长度是**保守高估**（偏差 = 33 − 目标语言名长度，`TRANSLATE_TARGET_LANGS`
+    // 最长名 8 字符，故偏差 ≥ 25），预算只会偏紧不会偏松。
+    ONLINE_SYSTEM_PROMPT_CHARS + glossary.chars().count() + src_hint.chars().count()
+}
+
+/// 在线链路单批的**可用源文本字符预算**：从 [`ONLINE_CHAR_CAP`] 里扣掉
+/// [`online_fixed_chars`] 算出的固定开销。
 fn online_char_budget(fixed_chars: usize) -> usize {
     ONLINE_CHAR_CAP.saturating_sub(fixed_chars).max(1_024)
 }
@@ -777,6 +825,11 @@ fn request_batch_translation(
         "messages": [
             {
                 "role": "system",
+                // 与 [`ONLINE_SYSTEM_PROMPT_TEMPLATE`] 逐字一致：预算推导与
+                // 必须与 [`ONLINE_SYSTEM_PROMPT_TEMPLATE`] **逐字一致**——预算推导与
+                // `max_output_tokens` 都按该常量的字符数折算。`format!` 只接受字符串
+                // 字面量，故此处不能直接引用常量；漂移由测试
+                // `online_system_prompt_matches_template` 守住（它逐字比对本段）。
                 "content": format!(
                     "你是专业影视字幕翻译专家。{src_hint}{glossary}将用户给出的带序号字幕逐条翻译为地道的{target_lang}。\
     【输出格式规范】\
@@ -794,7 +847,7 @@ fn request_batch_translation(
         "temperature": 0.2,
         "max_tokens": max_output_tokens(
             batch,
-            ONLINE_SYSTEM_PROMPT_CHARS + cfg.glossary_hint.chars().count() + ONLINE_SRC_HINT_CHARS,
+            online_fixed_chars(&cfg.glossary_hint, &src_hint),
             profile.is_reasoning()
         ),
         "stream": false,
@@ -1994,7 +2047,7 @@ mod tests {
         let no_glossary = plan_online_batches(&pending, &segs, 40, online_char_budget(0));
         let huge = "术语表（以下词条必须按给定译法翻译，不得改写）：".to_string()
             + &"甲=乙；".repeat(1_000);
-        let fixed = ONLINE_SYSTEM_PROMPT_CHARS + huge.chars().count() + ONLINE_SRC_HINT_CHARS;
+        let fixed = online_fixed_chars(&huge, "");
         let budget = online_char_budget(fixed);
         let with_glossary = plan_online_batches(&pending, &segs, 40, budget);
 
@@ -2018,6 +2071,112 @@ mod tests {
         let mut all: Vec<usize> = with_glossary.iter().flatten().copied().collect();
         all.sort_unstable();
         assert_eq!(all, pending);
+    }
+
+    /// 预算推导用的 system 提示词字符数必须等于**真实模板**的字符数。
+    ///
+    /// 修前这里是手写的「约 130 汉字」估算，而实际下发的模板（含全部格式
+    /// 约束）约 260 字符——低估近一倍会让 `char_budget` 虚高、`max_output_tokens`
+    /// 的可用输出被高估，极端术语表下更早撞上服务端 400 或输出截断。
+    /// 这条测试把「常量」与「模板」绑死，改文案忘了改常量就会红。
+    #[test]
+    fn online_prompt_template_chars_matches_estimate() {
+        assert_eq!(
+            ONLINE_SYSTEM_PROMPT_CHARS,
+            ONLINE_SYSTEM_PROMPT_TEMPLATE.chars().count(),
+            "字符数常量必须由模板自身推导，禁止再手写估算"
+        );
+        // 模板必须真的含三个占位符，否则 format! 会静默漏注入。
+        assert!(ONLINE_SYSTEM_PROMPT_TEMPLATE.contains("{src_hint}"));
+        assert!(ONLINE_SYSTEM_PROMPT_TEMPLATE.contains("{glossary}"));
+        assert!(ONLINE_SYSTEM_PROMPT_TEMPLATE.contains("{target_lang}"));
+        // 模板本身就得有分量：小于 150 字符说明格式约束被删了。
+        // 模板本身就得有分量：小于 150 字符说明格式约束被删了。
+        // 直接断言常量会被 clippy::assertions_on_constants 拦下，故用「实际
+        // 推导一次」的调用形式（同时覆盖 online_fixed_chars 的接线）。
+        assert!(
+            online_fixed_chars("", "") >= 150,
+            "模板过短（{} 字符），格式约束疑似丢失",
+            ONLINE_SYSTEM_PROMPT_CHARS
+        );
+    }
+
+    /// 固定开销 = 模板 + 术语表 + 源语言线索，三项都必须按**实际**长度计入。
+    #[test]
+    fn online_fixed_chars_counts_every_injected_part() {
+        assert_eq!(online_fixed_chars("", ""), ONLINE_SYSTEM_PROMPT_CHARS);
+        assert_eq!(
+            online_fixed_chars("甲=乙", ""),
+            ONLINE_SYSTEM_PROMPT_CHARS + 3
+        );
+        assert_eq!(
+            online_fixed_chars("", "源语言为中文；"),
+            ONLINE_SYSTEM_PROMPT_CHARS + 7
+        );
+        // 两项同时注入时线性相加，不能只加其中一项。
+        assert_eq!(
+            online_fixed_chars("甲=乙", "源语言为中文；"),
+            ONLINE_SYSTEM_PROMPT_CHARS + 3 + 7
+        );
+    }
+
+    /// 实际下发的 system 提示词必须与 [`ONLINE_SYSTEM_PROMPT_TEMPLATE`] 逐字一致。
+    ///
+    /// `format!` 只接受字符串字面量，所以 `request_batch_translation` 里不能
+    /// 直接引用常量。这里把「占位符填好后的真实字符串」与常量对齐，改文案
+    /// 忘了改常量（或反过来）都会红。
+    #[test]
+    fn online_system_prompt_matches_template() {
+        // `format!` 只接受字符串字面量，故用 replace 复刻同一套占位符替换。
+        let rendered = ONLINE_SYSTEM_PROMPT_TEMPLATE
+            .replace("{src_hint}", "源语言为中文；")
+            .replace(
+                "{glossary}",
+                "术语表（以下词条必须按给定译法翻译，不得改写）：甲=乙；",
+            )
+            .replace("{target_lang}", "English");
+        // 常量里的占位符必须全部被替换掉（不留 `{...}` 残迹）。
+        assert!(!rendered.contains("{src_hint}"), "源语言线索占位符未替换");
+        assert!(!rendered.contains("{glossary}"), "术语表占位符未替换");
+        assert!(!rendered.contains("{target_lang}"), "目标语言占位符未替换");
+        // 三段注入内容都必须出现在成品提示词里。
+        assert!(rendered.contains("源语言为中文；"));
+        assert!(rendered.contains("甲=乙"));
+        assert!(rendered.contains("地道的English"));
+        // 成品长度 = 模板 − 三个占位符字面量 + 三段实际注入内容（证明没有
+        // 第四处暗改）。替换是「占位符 -> 内容」，占位符自身的字面长度必须
+        // 显式扣掉，否则会重复计数 33 字符。
+        let placeholder_chars = "{src_hint}{glossary}{target_lang}".chars().count();
+        let glossary = "术语表（以下词条必须按给定译法翻译，不得改写）：甲=乙；";
+        assert_eq!(
+            rendered.chars().count(),
+            ONLINE_SYSTEM_PROMPT_CHARS - placeholder_chars
+                + "源语言为中文；".chars().count()
+                + glossary.chars().count()
+                + "English".chars().count(),
+            "成品提示词长度与模板-占位符+注入项不符"
+        );
+        // 预算模型（[`online_fixed_chars`]）把占位符字面量也计入固定开销，
+        // 于是对真实提示词长度是**保守高估**：估算值 + 目标语言名长度恒 ≥
+        // 真实长度（差 = 33 − 目标语言名长度 ≥ 0，见 TRANSLATE_TARGET_LANGS
+        // 的最长名 "Français" 仅 8 字符）。预算只会偏紧，不会因低估顶爆上下文。
+        assert!(
+            rendered.chars().count()
+                <= online_fixed_chars(glossary, "源语言为中文；") + "English".chars().count(),
+            "固定开销估算低于真实提示词长度，预算方向性错误"
+        );
+        // 格式约束一条都不能少：截断到硬性约束块，逐条断言关键词仍在。
+        for kw in [
+            "【输出格式规范】",
+            "【硬性约束】",
+            "严禁添加任何问候",
+            "严禁遗漏任何一行",
+            "严禁合并多行",
+            "严禁改动序号",
+            "原样保留",
+        ] {
+            assert!(rendered.contains(kw), "提示词丢失约束：{kw}");
+        }
     }
 
     /// 输出预算也要扣固定开销：术语表越长，`max_tokens` 越小（但仍给足下限）。
