@@ -372,7 +372,7 @@ impl VideoPlayerEngine {
         let generation = self.generation.clone();
         let play_instant_target = self.play_start_instant.clone();
 
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name(format!("v2w-preview-{gen}"))
             .spawn(move || {
                 let mut frame_index: u64 = 0;
@@ -387,6 +387,8 @@ impl VideoPlayerEngine {
                     let mut buf = vec![0u8; frame_bytes];
                     match stdout.read_exact(&mut buf) {
                         Ok(()) => {
+                            // 预检只是快速出口；真正决定写不写的是下面持锁写回点的复查，
+                            // 因为从预检到写回之间隔着最长约 40ms 的让帧 sleep。
                             if generation.load(Ordering::SeqCst) != gen {
                                 break;
                             }
@@ -397,6 +399,11 @@ impl VideoPlayerEngine {
                                 let now = Instant::now();
                                 active_start = Some(now);
                                 if let Ok(mut lock) = play_instant_target.lock() {
+                                    // 锚点与帧同属一次播放会话：代次已过期就不能再写，
+                                    // 否则旧线程会覆盖新会话/暂停恢复后的时钟锚点。
+                                    if generation.load(Ordering::SeqCst) != gen {
+                                        break;
+                                    }
                                     *lock = Some(now);
                                 }
                             }
@@ -412,21 +419,40 @@ impl VideoPlayerEngine {
                                 frame_index += 1;
                                 continue;
                             }
-                            if let Ok(mut lock) = frame_target.lock() {
-                                *lock = Some(Arc::new(PlayerFrame {
+                            // 写回点必须在**持锁状态下**复查代次：从预检到这里隔着最长约
+                            // 40ms 的让帧 sleep，期间 stop()/seek（play()）可能已自增
+                            // generation 并清空缓冲；不复查就会把过期帧盖回新会话，表现为
+                            // 跳转后监视器闪回旧画面、stop() 后 get_frame() 又有值。
+                            if !try_publish_frame(
+                                &frame_target,
+                                &frame_version_target,
+                                &generation,
+                                &is_playing_flag,
+                                gen,
+                                PlayerFrame {
                                     data: buf,
                                     width: frame_w,
                                     height: frame_h,
-                                }));
-                                frame_version_target.fetch_add(1, Ordering::SeqCst);
+                                },
+                            ) {
+                                // 代次已过期或已停止：本次会话结束，退出出帧循环。
+                                break;
                             }
                             frame_index += 1;
                         }
                         Err(_) => break,
                     }
                 }
-            })
-            .ok();
+            });
+
+        // 线程创建失败不能吞：`is_playing` 若停在 true，界面会一直显示「正在播放」
+        // 却永远没有新帧。`apply_spawn_result` 就地复位播放状态并记录错误
+        // （`play()` 返回 `()`，错误无法向上返回，就地记录是本文件既有约定，见启动
+        // 视频流失败的两处处理），这里再回收已启动的音视频子进程，避免留下占着
+        // 视频文件句柄的孤儿进程。
+        if apply_spawn_result(spawn_result, &self.is_playing, gen).is_none() {
+            self.kill_procs();
+        }
 
         info!(
             start = start_seconds,
@@ -521,6 +547,54 @@ impl VideoPlayerEngine {
             }
         }
         Ok(child)
+    }
+}
+
+/// 把一帧写回共享缓冲，返回是否成功写入。
+///
+/// 写入前**在已持有帧锁的状态下**复查代次与播放标志：`stop()` / seek（`play()`）
+/// 会自增 `generation`，而出帧线程从读到数据到真正写回之间隔着最长约 40ms 的
+/// 让帧 `sleep`，期间旧会话可能已被终止并清空缓冲。缺少这层复查时，旧线程睡醒后
+/// 仍会把过期帧盖回去：`stop()` 后 `get_frame()` 又拿到旧画面、跳转后监视器闪回
+/// 跳转前的帧。
+fn try_publish_frame(
+    frame_slot: &Mutex<Option<Arc<PlayerFrame>>>,
+    frame_version: &AtomicU64,
+    generation: &AtomicU64,
+    is_playing: &AtomicBool,
+    gen: u64,
+    frame: PlayerFrame,
+) -> bool {
+    let Ok(mut lock) = frame_slot.lock() else {
+        // 锁中毒（持锁线程 panic）时直接丢弃本帧，不把状态写坏。
+        return false;
+    };
+    if generation.load(Ordering::SeqCst) != gen || !is_playing.load(Ordering::SeqCst) {
+        return false;
+    }
+    *lock = Some(Arc::new(frame));
+    frame_version.fetch_add(1, Ordering::SeqCst);
+    true
+}
+
+/// 收尾出帧线程的 `spawn` 结果：失败时立刻复位 `is_playing` 并就地记录日志，返回
+/// `None`；成功时把 `JoinHandle` 原样带回（本文件不 join 出帧线程，交由调用方丢弃）。
+///
+/// 抽成独立函数是为了让「spawn 失败 → 状态复位」这条路径能用注入的 `Err` 直接
+/// 单测，不必真的制造线程创建失败。复位与日志都必须发生：若 `is_playing` 停在
+/// true，界面会永久显示「正在播放」却不会再有任何新帧。
+fn apply_spawn_result<T>(
+    spawn_result: std::io::Result<T>,
+    is_playing: &AtomicBool,
+    gen: u64,
+) -> Option<T> {
+    match spawn_result {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            is_playing.store(false, Ordering::SeqCst);
+            error!(gen, error = %e, "出帧线程创建失败，已复位播放状态");
+            None
+        }
     }
 }
 
@@ -627,5 +701,105 @@ mod tests {
         assert_eq!(VideoPlayerEngine::clamp_start_seconds(12.5), 12.5);
         // NaN 若漏进基线，时间读数与一切比较都会变成 NaN。
         assert_eq!(VideoPlayerEngine::clamp_start_seconds(f64::NAN), 0.0);
+    }
+
+    fn frame_with_marker(marker: u8) -> PlayerFrame {
+        PlayerFrame {
+            data: vec![marker; 4 * 4 * 4],
+            width: 4,
+            height: 4,
+        }
+    }
+
+    /// 缺陷 2 回归：`stop()` / seek（重播）之后，旧出帧线程不得把过期帧写回缓冲。
+    ///
+    /// 时序：出帧线程通过预检拿到自己的代次 → 让帧 `sleep` 期间 `stop()` / `play()`
+    /// 自增 `generation` 并清空缓冲 → 线程睡醒后仍尝试写帧。写回点必须在**持锁状态
+    /// 下**复查代次并放弃：既不覆盖缓冲，也不推进 `frame_version`。
+    #[test]
+    fn stale_frame_not_written_after_stop_or_seek() {
+        let engine = VideoPlayerEngine::new("ffmpeg");
+        engine.is_playing.store(true, Ordering::SeqCst);
+        // 出帧线程启动时记下的代次（通过预检的那一代）
+        let stale_gen = engine.generation();
+
+        // 对照组：代次未过期时写回必须生效
+        assert!(try_publish_frame(
+            &engine.current_frame,
+            &engine.frame_version,
+            &engine.generation,
+            &engine.is_playing,
+            stale_gen,
+            frame_with_marker(0x11),
+        ));
+        assert!(engine.get_frame().is_some(), "有效代次的帧应写入缓冲");
+        let version_after_valid_write = engine.frame_version();
+
+        // 场景 A：stop() 自增代次并清空缓冲，旧线程睡醒后仍尝试写回
+        engine.stop();
+        assert!(!try_publish_frame(
+            &engine.current_frame,
+            &engine.frame_version,
+            &engine.generation,
+            &engine.is_playing,
+            stale_gen,
+            frame_with_marker(0x22),
+        ));
+        assert!(engine.get_frame().is_none(), "stop() 之后不得写回过期帧");
+        assert_eq!(
+            engine.frame_version(),
+            version_after_valid_write,
+            "过期帧不得推进帧版本号"
+        );
+
+        // 场景 B：seek / 重播走 play() 的代次自增（这里只模拟自增这一步）
+        engine.is_playing.store(true, Ordering::SeqCst);
+        let new_gen = engine.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(!try_publish_frame(
+            &engine.current_frame,
+            &engine.frame_version,
+            &engine.generation,
+            &engine.is_playing,
+            stale_gen,
+            frame_with_marker(0x33),
+        ));
+        assert!(engine.get_frame().is_none(), "seek 之后不得写回过期帧");
+
+        // 新代次的写回必须被接受：被拒的原因是代次过期，而不是通道本身坏掉
+        assert!(try_publish_frame(
+            &engine.current_frame,
+            &engine.frame_version,
+            &engine.generation,
+            &engine.is_playing,
+            new_gen,
+            frame_with_marker(0x44),
+        ));
+        assert!(engine.get_frame().is_some(), "新代次的帧应能写入缓冲");
+    }
+
+    /// 缺陷 1 回归：出帧线程创建失败时播放标志必须复位，界面不能停在「正在播放」。
+    ///
+    /// 用注入的 `Err` 驱动复位路径，不真的制造线程创建失败。
+    #[test]
+    fn spawn_failure_clears_is_playing() {
+        let is_playing = AtomicBool::new(true);
+        let injected: std::io::Result<()> = Err(std::io::Error::other("注入的 spawn 失败"));
+        assert!(
+            apply_spawn_result(injected, &is_playing, 7).is_none(),
+            "spawn 失败应返回 None"
+        );
+        assert!(
+            !is_playing.load(Ordering::SeqCst),
+            "spawn 失败后 is_playing 必须复位为 false"
+        );
+
+        // 成功路径不得误伤播放状态
+        let is_playing = AtomicBool::new(true);
+        let ok: std::io::Result<()> = Ok(());
+        assert!(apply_spawn_result(ok, &is_playing, 7).is_some());
+        assert!(
+            is_playing.load(Ordering::SeqCst),
+            "spawn 成功不应复位播放状态"
+        );
     }
 }

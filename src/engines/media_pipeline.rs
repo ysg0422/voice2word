@@ -26,6 +26,8 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tracing::{info, warn};
 
+use crate::engines::ffmpeg::{run_with_deadline, SUBPROCESS_LONG_TIMEOUT, SUBPROCESS_TIMEOUT};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderBackend {
     Gpu,
@@ -403,7 +405,19 @@ pub struct ProxyManager {
     /// `Some(hw)` 只是**首选**后端：执行时按 [`hwaccel_attempt_chain`] 依次回退
     /// 其余硬件候选，最后兜底软解，因此单个后端不可用不会让代理失败。
     hwaccel: Option<HwAccel>,
-    lock: Mutex<()>,
+    /// 转码闸门表：**输出文件路径 → 该路转码的互斥量**。
+    ///
+    /// `ensure_proxy` 真正需要串行化的共享资源只有一个：`proxy_path()` 算出来的
+    /// 那个 `%TEMP%` 输出文件。同一路输出由「源文件 stem + 字节数 + 修改秒数 +
+    /// 目标高度」决定，两条请求撞上同一素材时 `-y` 会互相覆盖，因此**同一路径**
+    /// 只能有一条转码在跑；而不同输出之间没有任何共享句柄，不该互相排队。
+    ///
+    /// 这张表取代了过去那把把整段转码 + 回退链罩住的单把 `Mutex<()>`：那把锁让
+    /// 「A 的 4K 代理」把「B 的代理请求（哪怕缓存早就命中）」和别的阶段一起堵住，
+    /// 纯属白等。现在全局锁只在取 / 建闸门时短暂持有（微秒级），耗时转码只压住
+    /// 同一个输出路径的并发请求；等锁的人拿到锁后会先复查文件，通常直接复用前
+    /// 一条刚转完的结果，不会再重复转一遍。
+    in_flight: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     height_cache: Mutex<HashMap<PathBuf, (FileSignature, Option<u32>)>>,
 }
 
@@ -431,6 +445,15 @@ fn file_signature(path: &Path) -> FileSignature {
     }
 }
 
+/// 代理文件是否已经可用：存在且大于 1KB。
+///
+/// 1KB 是原 `ensure_proxy` / `existing_proxy` 里就有的「完整代理」判据（`-y`
+/// 写到一半被中断的截断 mp4 远小于它）。抽成一个函数，是为了让**无锁快路径**
+/// 与**等锁后的复查**共用同一判据，不会再出现两处阈值各改各的。
+fn proxy_ready(out: &Path) -> bool {
+    out.exists() && out.metadata().map(|m| m.len() > 1024).unwrap_or(false)
+}
+
 impl ProxyManager {
     /// 默认构造：**纯软解**，与加硬解之前的历史行为完全一致。
     pub fn new<P: AsRef<Path>>(ffmpeg_path: P) -> Self {
@@ -445,7 +468,7 @@ impl ProxyManager {
         Self {
             ffmpeg_path: ffmpeg_path.as_ref().to_path_buf(),
             hwaccel,
-            lock: Mutex::new(()),
+            in_flight: Mutex::new(HashMap::new()),
             height_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -519,6 +542,21 @@ impl ProxyManager {
         ))
     }
 
+    /// 取某条输出路径的转码闸门：同一路径的并发调用拿到同一把锁，不同路径互不相干。
+    ///
+    /// 顺手回收没人持有的闸门（表里只剩它自己这一份强引用），避免「预览过的文件
+    /// 越多、表越大」。回收是安全的：只有在线程既不持有、也不等待它时才会发生
+    /// （等待者手里也有一份 `Arc`，强引用计数至少为 2），因此新插入的闸门不会与
+    /// 旧闸门并发生效。
+    fn transcode_gate(&self, out: &Path) -> Arc<Mutex<()>> {
+        let mut gates = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+        gates
+            .entry(out.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     pub fn existing_proxy<P: AsRef<Path>>(&self, source: P, height: u32) -> Option<PathBuf> {
         let source = source.as_ref();
         if let Some(h) = self.probe_height(source) {
@@ -527,7 +565,7 @@ impl ProxyManager {
             }
         }
         let out = self.proxy_path(source, height);
-        if out.exists() && out.metadata().map(|m| m.len() > 1024).unwrap_or(false) {
+        if proxy_ready(&out) {
             Some(out)
         } else {
             None
@@ -548,9 +586,19 @@ impl ProxyManager {
             }
         }
 
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        // 无锁快路径：现成的完整代理直接复用。旧代码把这段判定圈在全局锁里，
+        // 于是「代理早就转好了」的请求也要排在别人几分钟的 4K 转码后面白等。
         let out = self.proxy_path(source, height);
-        if out.exists() && out.metadata().map(|m| m.len() > 1024).unwrap_or(false) {
+        if proxy_ready(&out) {
+            return Ok(out);
+        }
+
+        // 慢路径：只有真要转码才进锁，且锁**按输出路径**分配（见 `in_flight`
+        // 字段说明）：不同素材的转码互不阻塞，同一素材的后续请求在这里排队，
+        // 拿到锁后先复查文件，多数情况直接复用刚转完的结果。
+        let gate = self.transcode_gate(&out);
+        let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        if proxy_ready(&out) {
             return Ok(out);
         }
 
@@ -598,6 +646,11 @@ impl ProxyManager {
 
     /// 跑一次代理转码，只负责「启动 + 等退出码」，成败判定留给调用方
     /// （[`Self::ensure_proxy`] 需要据退出码决定要不要回退重试）。
+    ///
+    /// 这里复用 `ffmpeg.rs` 的截止期执行器（`run_with_deadline`：轮询 + 超时 kill +
+    /// 后台线程抽干管道），本文件不再写第二套「轮询 + kill」：过去这里是裸的
+    /// `cmd.status()`，没有任何上界，坏素材会让转码线程永远挂住、UI 一直转圈。
+    /// 转码耗时与素材时长成正比，因此用长任务截止期（600 秒）而不是探测用的 120 秒。
     fn run_proxy(
         &self,
         source: &Path,
@@ -607,8 +660,18 @@ impl ProxyManager {
         threads: u32,
     ) -> Result<std::process::ExitStatus> {
         let mut cmd = self.proxy_cmd(source, out, height, hwaccel, threads);
-        cmd.status()
-            .with_context(|| format!("启动代理生成失败: {:?}", self.ffmpeg_path))
+        let output = run_with_deadline(&mut cmd, SUBPROCESS_LONG_TIMEOUT)
+            .with_context(|| format!("启动代理生成失败: {:?}", self.ffmpeg_path))?;
+        if !output.status.success() {
+            // 旧写法让子进程继承控制台，错误信息由 FFmpeg 自己吐；换成截止期执行器
+            // 后 stdout / stderr 由我们收齐，失败时在这里补一条，别把排障信息丢掉。
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                stderr = %stderr.trim(),
+                "代理转码退出码非零，FFmpeg 输出如下"
+            );
+        }
+        Ok(output.status)
     }
 
     fn probe_height(&self, source: &Path) -> Option<u32> {
@@ -627,7 +690,12 @@ impl ProxyManager {
 
         let mut cmd = Command::new(&self.ffmpeg_path);
         apply_no_window(&mut cmd);
-        let output = cmd.arg("-i").arg(source).output().ok()?;
+        cmd.arg("-i").arg(source);
+        // 与 `run_proxy` 复用同一套截止期执行器（见 `run_with_deadline`）：`ffmpeg -i`
+        // 探测坏素材 / 网络盘时可能长时间不返回，而这条路径会被 UI 线程同步调用
+        // （`existing_proxy` → `probe_height`），一旦挂住就是整窗卡死。超时与启动
+        // 失败都按「测不出来」处理（`None`），与旧的 `.output().ok()?` 语义一致。
+        let output = run_with_deadline(&mut cmd, SUBPROCESS_TIMEOUT).ok()?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         let height = parse_ffmpeg_height(&stderr);
         self.height_cache
@@ -1396,6 +1464,8 @@ pub fn convert_nv12_frame(
 mod tests {
     use super::*;
 
+    use std::time::{Duration, Instant};
+
     #[test]
     fn nv12_black_is_near_black() {
         let w = 2u32;
@@ -1986,5 +2056,121 @@ mod tests {
         assert_eq!(hwaccel_name(None), "software");
         assert_eq!(hwaccel_name(Some(HwAccel::D3d11va)), "d3d11va");
         assert_eq!(hwaccel_name(Some(HwAccel::D3d12va)), "d3d12va");
+    }
+
+    /// 假的长跑命令：`ping` / `sleep` 都是**直接子进程**，被 kill 后不会留下还在
+    /// 往管道里写字的孙子进程，因此超时回收路径是干净的（与 `ffmpeg.rs` 同款手法）。
+    #[cfg(target_os = "windows")]
+    fn 长跑假命令() -> Command {
+        let mut cmd = Command::new("ping");
+        cmd.args(["-n", "30", "127.0.0.1"]);
+        cmd
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn 长跑假命令() -> Command {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        cmd
+    }
+
+    /// 缺陷回归：代理链路的子进程调用必须带截止期，超时要在预算内杀干净并报错。
+    ///
+    /// `ensure_proxy` 的两处子进程调用（转码、分辨率探测）过去是裸的 `status()` /
+    /// `output()`，没有任何上界：坏素材会让后台转码线程永远挂住、UI 一直转圈。
+    /// 现在两处都复用 `ffmpeg.rs` 的 `run_with_deadline`，这条测试钉住该执行器在本
+    /// 模块里的可用性与超时语义——1 秒预算内返回 `Err`，且错误信息说明是超时。
+    #[test]
+    fn media_pipeline_subprocess_is_killed_after_deadline() {
+        let mut cmd = 长跑假命令();
+        let started = Instant::now();
+        let err = run_with_deadline(&mut cmd, Duration::from_millis(200))
+            .expect_err("超过截止期的子进程必须报错，不能等它自然结束");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "超时路径必须在预算内返回，实际耗时 {elapsed:?}"
+        );
+        assert!(
+            err.to_string().contains("超时"),
+            "错误信息应说明超时: {err}"
+        );
+    }
+
+    /// 锁粒度回归：转码闸门按输出路径拆分，且命中缓存的快路径不排队等锁。
+    ///
+    /// 老实现是一把罩住整段转码 + 回退链的单锁——A 的 4K 代理在转时，B 的请求
+    /// （哪怕结果早就在缓存里）也只能排队。这条测试同时钉住两件事：
+    /// 1) 两个不同输出拿到的是两把不同的闸门，同一输出复用同一把，且没人持有后
+    ///    会被回收（表不会随预览过的文件无限增长）；
+    /// 2) 主线程攥着某输出的闸门时，另一个线程里命中缓存的那次 `ensure_proxy`
+    ///    仍必须立刻返回——它走的是无锁快路径，不进任何闸门。
+    #[test]
+    fn 代理转码闸门按输出路径拆分且缓存快路径不等锁() {
+        // 假 ffmpeg 路径：探测会立刻失败（spawn 失败 → None），测试不需要真 ffmpeg。
+        let mgr = Arc::new(ProxyManager::new("voice2word-test-ffmpeg-missing"));
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let src =
+            std::env::temp_dir().join(format!("v2w_gate_{}_{}.mp4", std::process::id(), nanos));
+        let out = mgr.proxy_path(&src, 720);
+        let other = mgr.proxy_path(&src, 480);
+        assert_ne!(out, other, "前提：不同目标高度对应不同输出文件");
+
+        // 1) 闸门按输出拆分 + 没人持有时回收
+        let gate_a = mgr.transcode_gate(&out);
+        let gate_b = mgr.transcode_gate(&other);
+        assert!(
+            !Arc::ptr_eq(&gate_a, &gate_b),
+            "不同输出不应共用同一把锁（那正是要被修掉的全局锁粒度）"
+        );
+        let gate_c = mgr.transcode_gate(&other);
+        assert!(
+            Arc::ptr_eq(&gate_b, &gate_c),
+            "同一输出必须复用同一把闸门，否则两条请求会并发写同一个文件"
+        );
+        drop(gate_a);
+        drop(gate_b);
+        drop(gate_c);
+        let gate_d = mgr.transcode_gate(&out);
+        assert_eq!(
+            mgr.in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1,
+            "无人持有的闸门应被回收，表不能随预览过的文件无限增长"
+        );
+        drop(gate_d);
+
+        // 2) 缓存命中不等锁：先把 out 写成「完整代理」
+        std::fs::write(&out, [0u8; 4096]).expect("写入假代理文件");
+        assert!(proxy_ready(&out), "前提：假代理应被判定为可用");
+
+        // 先把闸门绑定到局部变量：`transcode_gate` 返回的 Arc 若是临时值，语句结束后即释放，
+        // guard 借用它去 lock 会触发 E0716（temporary value dropped while borrowed）。
+        let gate_held = mgr.transcode_gate(&out);
+        let guard = gate_held.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let mgr = Arc::clone(&mgr);
+            let src = src.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(mgr.ensure_proxy(&src, 720));
+            })
+        };
+        let got = rx.recv_timeout(Duration::from_millis(500));
+        drop(guard);
+        let _ = worker.join();
+        let got = got.expect("缓存命中的快路径必须立即返回，不能等待转码闸门");
+        assert_eq!(
+            got.expect("缓存存在时必须直接复用"),
+            out,
+            "命中缓存时返回的必须是现成的代理文件"
+        );
+
+        let _ = std::fs::remove_file(&out);
     }
 }

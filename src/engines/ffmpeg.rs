@@ -49,10 +49,10 @@ fn temp_wav_path(stem: &str) -> PathBuf {
 }
 
 /// 短任务截止期：元数据探测 / 抽帧 / WAV 切片（秒级操作，120 秒足够覆盖冷启动抖动）。
-const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 重活截止期：整轨音频提取 / 窗口提取 / 字幕烧录（耗时与素材时长成正比，10 分钟为保守上界）。
-const SUBPROCESS_LONG_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const SUBPROCESS_LONG_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// 截止期轮询间隔：25 毫秒对秒级任务几乎无额外延迟，又不会把等待变成忙等。
 const DEADLINE_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -90,7 +90,11 @@ fn wait_with_deadline(child: &mut Child, timeout: Duration, what: &str) -> Resul
 /// 输出必须由后台线程持续抽干：等待期间子进程若把 64KB 管道写满，双方会互相
 /// 等待，表现和卡死一模一样。超时路径由主线程 kill，两个读取线程等到管道
 /// EOF 会自行结束。
-fn run_with_deadline(cmd: &mut Command, timeout: Duration) -> Result<Output> {
+///
+/// `pub(crate)` 是给 `crate::engines::media_pipeline` 的代理转码 / 分辨率探测
+/// 用的：那边只需要「带截止期 + 收齐输出」这一套行为，**不该**再抄一份轮询 +
+/// kill 逻辑，超时预算也复用本文件的 `SUBPROCESS_TIMEOUT` / `SUBPROCESS_LONG_TIMEOUT`。
+pub(crate) fn run_with_deadline(cmd: &mut Command, timeout: Duration) -> Result<Output> {
     let what = cmd.get_program().to_string_lossy().into_owned();
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd

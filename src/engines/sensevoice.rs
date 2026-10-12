@@ -130,6 +130,38 @@ pub fn stderr_provider_fallback(stderr: &str) -> bool {
         || stderr.contains("Available providers:")
 }
 
+/// 一次 `record_provider` 回报的纯函数判定结果（不碰锁、不发日志，可直接单测）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderReportOutcome {
+    /// `Some` 表示本次回报是 slot 的首次写入，携带该落盘状态；`None` 表示只读重复回报。
+    stored: Option<ProviderStatus>,
+    /// `Some` 表示本次回报应产生一条回落告警；`None` 表示本次不得告警。
+    warns_on_this_call: Option<String>,
+}
+
+/// 判定「本次 provider 回报」是否应写状态、是否应告警。
+///
+/// 判定基准是 slot 的**实况** `seen`，而不是本次入参：
+/// - `seen` 为空（本次才是首次回报）：状态写入本次入参，告警文案也由本次入参推出；
+/// - `seen` 已有值：后到的重复/矛盾回报既不覆盖状态，也不产生告警——否则同一次运行里
+///   会先报「已回落到 CPU」、再被一条「将使用 GPU」的矛盾值刷屏，且把一次性告警额度
+///   提前吃掉，导致真正的首次回落反而静默。语义与 punc.rs 的 `record_provider` 一致。
+fn provider_report_outcome(
+    seen: Option<&ProviderStatus>,
+    incoming: &ProviderStatus,
+) -> ProviderReportOutcome {
+    if seen.is_some() {
+        return ProviderReportOutcome {
+            stored: None,
+            warns_on_this_call: None,
+        };
+    }
+    ProviderReportOutcome {
+        stored: Some(incoming.clone()),
+        warns_on_this_call: provider_fallback_notice(&incoming.requested, &incoming.actual),
+    }
+}
+
 #[derive(Clone)]
 pub struct SenseVoiceEngine {
     runner_path: PathBuf,
@@ -254,6 +286,10 @@ impl SenseVoiceEngine {
     /// 记录 runner 回报的 provider 实况；命中回落时打印一次可操作告警。
     ///
     /// 首次回报为准：并行切块时多个 worker 进程回报的是同一条事实，后到的只算重复。
+    /// 是否就「本次回报」告警，必须按 slot 的**实况**（`slot.is_none()`）判定，而不是
+    /// 看本次入参：同一次运行里，先到的回报已把实况写掉后，后到的矛盾值既不得覆盖
+    /// 状态，更不能借着它去刷一条与实际状态相反的告警（例如先报「已回落 CPU」，
+    /// 紧接着又报「将使用 GPU」）。口径与 punc.rs 的 `record_provider` 保持一致。
     fn record_provider(&self, requested: &str, actual: &str) {
         let status = ProviderStatus {
             requested: requested.trim().to_string(),
@@ -263,13 +299,19 @@ impl SenseVoiceEngine {
             .provider_status
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if slot.is_none() {
-            *slot = Some(status.clone());
+        // 实况判定：只有「本次才是首次回报」的那一次才允许写状态并告警。
+        let first = slot.is_none();
+        let outcome = provider_report_outcome(slot.as_ref(), &status);
+        if let Some(stored) = outcome.stored.clone() {
+            *slot = Some(stored);
         }
         drop(slot);
-        if let Some(notice) = provider_fallback_notice(&status.requested, &status.actual) {
-            if !self.fallback_reported.swap(true, Ordering::SeqCst) {
-                warn!("{notice}");
+        // 告警文案取自实际落盘的状态（实况），而不是本次入参。
+        if first {
+            if let Some(notice) = provider_fallback_notice(&status.requested, &status.actual) {
+                if !self.fallback_reported.swap(true, Ordering::SeqCst) {
+                    warn!("{notice}");
+                }
             }
         }
     }
@@ -1126,6 +1168,71 @@ mod tests {
         engine.record_provider("dml", "cpu");
         engine.record_provider("dml", "cpu");
         assert_eq!(engine.provider_status().unwrap().actual, "cpu");
+    }
+
+    /// 回落告警只在「slot 首次写入」那一次发出；后到的矛盾回报既不重复告警，
+    /// 也不覆盖已有状态。
+    ///
+    /// 缺陷面：旧实现拿**本次入参**去算告警，于是同一次运行里可能先后打出互相
+    /// 矛盾的两条：一条按「dml 回落 cpu」报「已回落到 CPU」，另一条按后到的
+    /// 「dml 吃到 dml」报「将使用 GPU」；且 `fallback_reported` 在第一次就被后到的
+    /// 非回落入参 swap 成 true，把本该只报一次的一次性额度吃掉，后续真正的首次回落
+    /// 反而静默。
+    ///
+    /// 告警经 tracing 宏发出，测试里不便拦截，故把「是否应告警 + 告警文案」
+    /// 抽成纯函数 `provider_report_outcome` 直接断言；同一入参序列也对引擎状态机
+    /// 验一遍，保证纯函数与真实 `record_provider` 口径一致。
+    #[test]
+    fn fallback_warning_fires_once_per_slot_transition() {
+        // 场景：slot 为空时首次回报 dml 回落 cpu，随后同一 slot 又来一条 dml 吃到 dml。
+        let first = provider_report_outcome(
+            None,
+            &ProviderStatus {
+                requested: "dml".into(),
+                actual: "cpu".into(),
+            },
+        );
+        assert_eq!(
+            first.stored.as_ref().map(|s| s.actual.as_str()),
+            Some("cpu"),
+            "首次回报必须写入 slot（落盘的是实况）"
+        );
+        let notice = first
+            .warns_on_this_call
+            .as_deref()
+            .expect("首次回报就是回落，必须产生告警记录");
+        assert!(
+            notice.contains("dml") && notice.contains("cpu"),
+            "告警文案必须取自落盘实况（dml→cpu），而不是后到的入参: {notice}"
+        );
+
+        // 第二次回报：slot 已有实况，既不覆盖状态，也不得再产生告警。
+        let seen = first.stored.as_ref();
+        let second = provider_report_outcome(
+            seen,
+            &ProviderStatus {
+                requested: "dml".into(),
+                actual: "dml".into(),
+            },
+        );
+        assert_eq!(
+            second.stored, None,
+            "slot 已有实况后，后到的矛盾回报不得覆盖状态"
+        );
+        assert_eq!(
+            second.warns_on_this_call, None,
+            "一次 slot 转换只告警一次：第二次回报不得重复告警"
+        );
+
+        // 同一入参序列走一遍真实 record_provider：状态机口径必须与纯函数一致。
+        let engine = engine_with_dummy_paths();
+        engine.record_provider("dml", "cpu");
+        engine.record_provider("dml", "dml");
+        assert_eq!(
+            engine.provider_status().unwrap().actual,
+            "cpu",
+            "真实状态机同样以首次回报为准，矛盾值不得覆盖"
+        );
     }
 
     // ---- 单会话线程数夹取：必须与文档/设置页量程一致 ----
