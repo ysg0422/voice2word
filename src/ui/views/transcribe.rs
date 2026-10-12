@@ -8,6 +8,7 @@ use super::super::theme::Theme;
 use super::super::types::{ConfirmAction, ConfirmDialogInfo};
 use super::super::MainWindow;
 use crate::app::state::{ProcessStatus, QueueState, WorkspaceTab};
+use crate::ui::format_mm_ss;
 // 质检报告是 `segment.rs` 里的纯逻辑：这里只把结果画出来，不在界面层重算判据。
 use crate::subtitle::segment::{quality_report, QualityCategory, QualityReport};
 use crate::subtitle::Segment;
@@ -239,11 +240,8 @@ impl MainWindow {
                     };
                     let total_dur = self.state.transcribe_duration;
                     let cur_sec = self.state.streaming_current_sec;
-                    let cur_mm = (cur_sec / 60.0) as u32;
-                    let cur_ss = (cur_sec % 60.0) as u32;
-                    let tot_mm = (total_dur / 60.0) as u32;
-                    let tot_ss = (total_dur % 60.0) as u32;
-
+                    // `mm:ss` 换算统一走 `ui::format_mm_ss`：本文件此前手写的三份
+                    // 与状态栏各自维护的同一换算，现在同源。
                     let display_ratio = if total_dur > 0.0 && cur_sec > 0.0 {
                         (cur_sec / total_dur).clamp(0.0, 1.0)
                     } else {
@@ -317,7 +315,7 @@ impl MainWindow {
                                         } else {
                                             primitives::badge("Whisper Turbo (GPU加速)")
                                         })
-                                        .child(primitives::badge(format!("{tot_mm:02}:{tot_ss:02}"))),
+                                        .child(primitives::badge(format_mm_ss(total_dur))),
                                 ),
                         )
                         // 2. 实时流式字幕视窗卡片
@@ -348,7 +346,12 @@ impl MainWindow {
                                                 .font_weight(FontWeight::BOLD)
                                                 .text_color(Theme::text_secondary())
                                                 .child(if total_dur > 0.0 {
-                                                    format!("进度: {cur_mm:02}:{cur_ss:02} / {tot_mm:02}:{tot_ss:02} ({:.1}%)", display_ratio * 100.0)
+                                                    format!(
+                                                        "进度: {} / {} ({:.1}%)",
+                                                        format_mm_ss(cur_sec),
+                                                        format_mm_ss(total_dur),
+                                                        display_ratio * 100.0
+                                                    )
                                                 } else {
                                                     "正在实时推流...".to_string()
                                                 }),
@@ -384,12 +387,12 @@ impl MainWindow {
                                             .justify_end()
                                             .gap_2()
                                             .children(seg_list.into_iter().enumerate().map(|(i, seg)| {
-                                                let is_last = i == total_items - 1;
-                                                let s_m = (seg.start / 60.0) as u32;
-                                                let s_s = (seg.start % 60.0) as u32;
-                                                let e_m = (seg.end / 60.0) as u32;
-                                                let e_s = (seg.end % 60.0) as u32;
-                                                let time_badge = format!("{s_m:02}:{s_s:02} - {e_m:02}:{e_s:02}");
+                                                let is_last = is_last_stream_row(i, total_items);
+                                                let time_badge = format!(
+                                                    "{} - {}",
+                                                    format_mm_ss(seg.start),
+                                                    format_mm_ss(seg.end)
+                                                );
 
                                                 if is_last {
                                                     div()
@@ -477,7 +480,7 @@ impl MainWindow {
                                         .gap_0p5()
                                         .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("总体进度"))
                                         .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::accent_mint()).child(format!("{:.1}%", display_ratio * 100.0)))
-                                        .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child(format!("{cur_mm:02}:{cur_ss:02} / {tot_mm:02}:{tot_ss:02}"))),
+                                        .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child(format!("{} / {}", format_mm_ss(cur_sec), format_mm_ss(total_dur)))),
                                 )
                                 .child(
                                     primitives::card_sm()
@@ -1379,5 +1382,50 @@ impl MainWindow {
                     })),
             )
             .into_any_element()
+    }
+}
+
+/// 流式看板里「当前行是不是最后一行」的判据（`i` 从 0 起，纯函数便于单测）。
+///
+/// 为什么要单独判空：看板外层用 `seg_count`（数据源计数）决定显示占位文案还是
+/// 字幕窗口，而窗口列表后面还会 `take(3)`，两者口径可能不一致——`seg_count > 0`
+/// 时窗口仍可能为空。旧写法 `i == total_items - 1` 在空列表时会回绕成
+/// `usize::MAX`，`i != usize::MAX` 恰好恒真才没 panic，判据本身已经悬空。
+fn is_last_stream_row(i: usize, total: usize) -> bool {
+    total > 0 && i.checked_add(1) == Some(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_last_stream_row;
+    use crate::ui::split_mm_ss;
+
+    /// 回归（P1）：数据计数与实际渲染行数口径不一致时，流式看板不得 panic。
+    /// 空窗口下「没有最后一行」是显式语义，而不是靠回绕后的比较侥幸恒假。
+    #[test]
+    fn streaming_dashboard_survives_count_without_segments() {
+        // 窗口为空：任何行都不是最后一行，不发生回绕
+        assert!(!is_last_stream_row(0, 0));
+        assert!(!is_last_stream_row(7, 0));
+
+        // 窗口非空：只有最后一行命中
+        assert!(is_last_stream_row(0, 1));
+        assert!(!is_last_stream_row(0, 2));
+        assert!(is_last_stream_row(2, 3));
+        assert!(!is_last_stream_row(1, 3));
+    }
+
+    /// 边界：秒 → `mm:ss` 的换算在负数 / `NaN` / `0` / 跨分钟 / 跨小时下
+    /// 都不许 panic 或回绕（`as u32` 的饱和语义由 `split_mm_ss` 显式兜住）。
+    #[test]
+    fn streaming_dashboard_time_badge_survives_bad_durations() {
+        assert_eq!(split_mm_ss(0.0), (0, 0));
+        assert_eq!(split_mm_ss(-1.0), (0, 0));
+        assert_eq!(split_mm_ss(f64::NAN), (0, 0));
+        assert_eq!(split_mm_ss(f64::INFINITY), (0, 0));
+        assert_eq!(split_mm_ss(59.9), (0, 59));
+        assert_eq!(split_mm_ss(60.0), (1, 0));
+        assert_eq!(split_mm_ss(61.0), (1, 1));
+        assert_eq!(split_mm_ss(3661.0), (61, 1));
     }
 }

@@ -6,14 +6,18 @@
 //! ## 双主题
 //! 每个 token 都是一个「深色值 / 浅色值」二元组，运行时按全局开关二选一，
 //! 因此调用点无需感知主题（`Theme::bg_card()` 在两种主题下都成立）。
-//! 例外是「媒体区」相关 token（`bg_media` / `text_on_media` / `text_subtitle` /
-//! `text_on_saturated`）：视频画面与时间轴胶囊在任何主题下都是深底，
-//! 这些位置必须恒定用浅色文字，否则浅色主题下会变成深底深字。
+//! 「监视器衬底」相关 token（`bg_media` / `bg_media_deep` / `text_on_media` /
+//! `accent_on_media`）同样随主题翻转：浅色主题下衬底是浅灰、文字是深灰。
+//! 不外翻的例外只剩压在视频画面/图片上的浮层与饱和胶囊（`bg_scrim_soft` /
+//! `bg_overlay` / `text_subtitle` / `text_on_overlay` / `text_on_saturated`），
+//! 这些位置任何主题下都是深底浅字。
 //!
-//! 文字对比度（深色主题按最亮的常规底色 `bg_hover`、浅色主题按 `bg_hover` 校验，
-//! WCAG AA 正文要求 ≥ 4.5:1）：
-//! - 深色：`text_primary` 13.5~17.5、`text_secondary` 5.8~7.5、`text_muted` 4.9~6.3
-//! - 浅色：`text_primary` 15.8~17.2、`text_secondary` 6.2~7.1、`text_muted` 4.6~5.2
+//! 文字对比度（WCAG AA 正文要求 ≥ 4.5:1；区间为全调色板底色上的实测值，
+//! `bg_stat_track` 只是色带、不承字，不计入）：
+//! - 深色：`text_primary` 约 13.2~18.5、`text_secondary` 约 5.7~8.0、`text_muted` 约 4.8~6.8
+//! - 浅色：`text_primary` 约 13.2~17.7、`text_secondary` 约 4.9~6.6、`text_muted` 约 6.1~8.2
+//!   浅色的 `text_code`（约 5.7~7.6）与 `accent_on_media`（约 5.7~7.7）同样全区间 ≥ 4.5，
+//!   两者的最低值都落在 `bg_media_deep` 上。
 //!   `text_disabled` 只用于禁用态，不参与正文对比度要求。
 
 use gpui::{rgb, rgba, Rgba};
@@ -203,7 +207,7 @@ impl Theme {
     /// 弱化标签 / 元信息（仍满足 AA）
     #[inline]
     pub fn text_muted() -> Rgba {
-        Self::c(0x94949e, 0x6b6b76)
+        Self::c(0x94949e, 0x4e4e58)
     }
     /// 禁用态文字（不参与正文对比度要求）
     #[inline]
@@ -213,7 +217,7 @@ impl Theme {
     /// 等宽代码 / 时间戳
     #[inline]
     pub fn text_code() -> Rgba {
-        Self::c(0x38bdf8, 0x0284c7)
+        Self::c(0x38bdf8, 0x075985)
     }
     /// **亮色**强调底（薄荷 / 橙色）上的文字，两种主题下都取深色。
     ///
@@ -243,7 +247,7 @@ impl Theme {
     /// 监视器衬底上的强调文字（「正在同步视频画面…」）。
     #[inline]
     pub fn accent_on_media() -> Rgba {
-        Self::c(0x34d399, 0x0d9668)
+        Self::c(0x34d399, 0x065f46)
     }
     /// 压在**图片**上的角标条文字（缩略图的 MP4 / 时长角标）。
     /// 恒为浅色——角标条底色 `bg_overlay` 恒深，不随主题变。
@@ -608,4 +612,112 @@ impl Theme {
     /// 字幕预览框的宽度约束（手动拖动的可调区间）
     pub const PREVIEW_BOX_MIN_W: f32 = 140.0;
     pub const PREVIEW_BOX_MAX_W: f32 = 560.0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// sRGB 单通道线性化（WCAG 2.x 相对亮度定义）
+    fn linearize(channel: f32) -> f32 {
+        if channel <= 0.03928 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// WCAG 相对亮度：0（黑）~ 1（白）
+    fn relative_luminance(color: Rgba) -> f32 {
+        0.2126 * linearize(color.r) + 0.7152 * linearize(color.g) + 0.0722 * linearize(color.b)
+    }
+
+    /// WCAG 对比度：1.0（同色）~ 21.0（纯黑白）
+    fn contrast_ratio(fg: Rgba, bg: Rgba) -> f32 {
+        let lum_fg = relative_luminance(fg);
+        let lum_bg = relative_luminance(bg);
+        let (hi, lo) = if lum_fg >= lum_bg {
+            (lum_fg, lum_bg)
+        } else {
+            (lum_bg, lum_fg)
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 公式自检：纯黑白应约为 21.0，同色应恰为 1.0。
+    /// 公式若写错，下面的主题断言会整体失真，所以先把公式本身钉死。
+    #[test]
+    fn 对比度公式自检黑白与同色() {
+        let ratio = contrast_ratio(rgb(0x000000), rgb(0xffffff));
+        assert!(
+            (ratio - 21.0).abs() < 0.01,
+            "纯黑白对比度应约为 21.0，实际 {ratio:.4}"
+        );
+        let muted = Theme::text_muted();
+        let same = contrast_ratio(muted, muted);
+        assert!(
+            (same - 1.0).abs() < 1e-4,
+            "同色对比度应恰为 1.0，实际 {same:.4}"
+        );
+    }
+
+    /// 浅色主题下，正文类 token 相对全部底色都要满足 WCAG AA（≥ 4.5）。
+    ///
+    /// 这是本次调色板修订的回归锁：浅色的 `text_muted`（0x4e4e58）、
+    /// `text_code`（0x075985）、`accent_on_media`（0x065f46）正是为此调深的，
+    /// 三者最低值都出现在 `bg_media_deep` 上。测试结束还原全局主题开关，
+    /// 避免影响同进程内的其他用例（门禁以 `--test-threads=1` 运行）。
+    #[test]
+    fn 浅色主题正文token全底色达到aa对比度() {
+        Theme::set_light(true);
+        let cases: [(&str, Rgba, Rgba); 10] = [
+            (
+                "text_muted @ bg_media_deep",
+                Theme::text_muted(),
+                Theme::bg_media_deep(),
+            ),
+            (
+                "text_muted @ bg_hover",
+                Theme::text_muted(),
+                Theme::bg_hover(),
+            ),
+            ("text_muted @ bg_app", Theme::text_muted(), Theme::bg_app()),
+            ("text_code @ bg_app", Theme::text_code(), Theme::bg_app()),
+            (
+                "text_code @ bg_media",
+                Theme::text_code(),
+                Theme::bg_media(),
+            ),
+            (
+                "text_code @ bg_media_deep",
+                Theme::text_code(),
+                Theme::bg_media_deep(),
+            ),
+            (
+                "accent_on_media @ bg_media_deep",
+                Theme::accent_on_media(),
+                Theme::bg_media_deep(),
+            ),
+            (
+                "accent_on_media @ bg_media",
+                Theme::accent_on_media(),
+                Theme::bg_media(),
+            ),
+            (
+                "text_primary @ bg_media_deep",
+                Theme::text_primary(),
+                Theme::bg_media_deep(),
+            ),
+            (
+                "text_secondary @ bg_media_deep",
+                Theme::text_secondary(),
+                Theme::bg_media_deep(),
+            ),
+        ];
+        for (name, fg, bg) in cases {
+            let ratio = contrast_ratio(fg, bg);
+            assert!(ratio >= 4.5, "{name} 对比度 {ratio:.2}，低于 AA 底线 4.5");
+        }
+        Theme::set_light(false);
+    }
 }

@@ -383,6 +383,15 @@ fn thread_slider_max(is_sensevoice: bool, cores: u32) -> u32 {
     cores.max(2).min(hard_max)
 }
 
+/// VAD 阈值滑条的整数档位：先把配置值夹进引擎有效区间，再换算成百分数。
+///
+/// 渲染器只吃 u32；此前是「先取整再夹」，异常配置（例如 0.15）会被记成 15 档，
+/// 与实际生效的 0.30 对不上。先夹后取整后，滑条上的每个档位都真实生效。
+fn vad_slider_value(vad: f64) -> u32 {
+    use crate::engines::whisper::{VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN};
+    (vad.clamp(VAD_THRESHOLD_MIN, VAD_THRESHOLD_MAX) * 100.0).round() as u32
+}
+
 impl MainWindow {
     /// 渲染性能与推理设置工作台
     pub(crate) fn render_performance_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1973,7 +1982,7 @@ impl MainWindow {
             .into_any_element();
 
         // 三个滑条用整数档位（渲染器只吃 u32），显示时再换算回物理量。
-        let hp_val = highpass.round().clamp(0.0, 200.0) as u32;
+        let hp_val = highpass.clamp(0.0, 200.0).round() as u32;
         let hp_slider = self.render_slider(
             "perf-slider-highpass",
             "高通截止",
@@ -1994,7 +2003,7 @@ impl MainWindow {
             },
         );
 
-        let speed_val = (speed * 100.0).round().clamp(100.0, 150.0) as u32;
+        let speed_val = (speed.clamp(1.0, 1.5) * 100.0).round() as u32;
         let speed_slider = self.render_slider(
             "perf-slider-audio-speed",
             "输入音频加速",
@@ -2013,10 +2022,7 @@ impl MainWindow {
 
         // 量程由引擎的有效区间推导，不写死：滑条能选到的值必须全部真的生效
         // （引擎 `set_vad_threshold` 夹到同一区间，否则「拖到 0.15 实际跑 0.30」）。
-        let vad_val = (vad * 100.0).round().clamp(
-            crate::engines::whisper::VAD_THRESHOLD_MIN * 100.0,
-            crate::engines::whisper::VAD_THRESHOLD_MAX * 100.0,
-        ) as u32;
+        let vad_val = vad_slider_value(vad);
         let vad_slider = self.render_slider(
             "perf-slider-vad",
             "静音检测阈值",
@@ -2532,7 +2538,7 @@ impl MainWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_glossary_count, local_model_status, tier_menu_desc};
+    use super::{effective_glossary_count, local_model_status, tier_menu_desc, vad_slider_value};
     use crate::utils::config::TranslateConfig;
 
     /// 回归（P2）：术语表计数必须与**实际注入**一致——超过上限时显示生效数，
@@ -2839,5 +2845,19 @@ mod tests {
             assert!(!desc.trim().is_empty(), "{tier:?} 缺少档位说明");
             assert!(seen.insert(desc), "{tier:?} 的说明与别的档位重复: {desc}");
         }
+    }
+
+    /// 回归（P2）：VAD 配置值越界时，滑条档位必须先夹后取整——
+    /// 与引擎 `set_vad_threshold` 的夹取区间对齐：0.15 这类旧配置
+    /// 界面上显示的档位要和引擎实际生效的区间一致。
+    #[test]
+    fn vad_slider_value_survives_out_of_range_config() {
+        // 低于下限：钉在 30 档（0.30）
+        assert_eq!(vad_slider_value(0.05), 30);
+        assert_eq!(vad_slider_value(0.1), 30);
+        // 高于上限：钉在 80 档（0.80）
+        assert_eq!(vad_slider_value(0.95), 80);
+        // 区间内：原样换算
+        assert_eq!(vad_slider_value(0.5), 50);
     }
 }

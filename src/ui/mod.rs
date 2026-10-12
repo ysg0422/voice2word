@@ -610,6 +610,58 @@ pub(crate) fn low_confidence_indices(
         .collect()
 }
 
+/// 秒 → `(分, 秒)` 的整数拆分（状态栏 / 转写页进度显示的**唯一**换算口径）。
+///
+/// 抽出来是因为同一条换算原本在 `components/status_bar.rs` 与 `views/transcribe.rs`
+/// 里各写了两遍（「另一处改了、这一处忘了」的漂移高发区）。
+///
+/// 口径与改造前的显示逐字一致：
+/// - **截断**而非四舍五入——进度显示不提前跳秒；
+/// - 负数 / `NaN` 夹到 0（时长未就绪、时钟回拨都不该 panic，也不该显示负值）；
+/// - 超过一小时按**分钟累计**（`3661.0 → (61, 1)`）：两处界面都只有 `mm:ss`，
+///   没有 `HH` 位，折成小时反而会改观感。
+pub(crate) fn split_mm_ss(seconds: f64) -> (u32, u32) {
+    // `as u32` 是饱和转换（`NaN` / 负值都落到 0），这里显式兜住非有限值与非正值，
+    // 再夹到 u32 量程：任何输入都不会 panic 或回绕。
+    let total = if seconds.is_finite() && seconds > 0.0 {
+        seconds.min(u32::MAX as f64) as u32
+    } else {
+        0
+    };
+    (total / 60, total % 60)
+}
+
+/// 秒 → `"mm:ss"` 文本（[`split_mm_ss`] 的薄封装，调用点可直接落进 `format!`）。
+pub(crate) fn format_mm_ss(seconds: f64) -> String {
+    let (m, s) = split_mm_ss(seconds);
+    format!("{m:02}:{s:02}")
+}
+
+/// 「可打印单字符」按键的插入核（[`apply_line_edit`] 的默认分支）。
+///
+/// 抽成纯函数是为了单测：`apply_line_edit` 需要 `&mut App`（lib 单测里构造不出
+/// 平台上下文），而这条分支不碰 `App`。
+///
+/// 判据一次迭代完成：**恰好一个字符**才算可打印输入——多字符键名（`space` /
+/// `f5` / `arrowup`）走不到插入路径，与旧 `chars().count() == 1` 判据等价，
+/// 但不再有「先数后取」两步之间那个 `unwrap()`。控制字符同样不插入。
+fn insert_printable_key(buffer: &mut String, cursor: &mut usize, key_raw: &str) -> bool {
+    let mut chars = key_raw.chars();
+    let (Some(ch), None) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    if ch.is_control() {
+        return false;
+    }
+    let mut buf: Vec<char> = buffer.chars().collect();
+    // 光标越界（缓冲被别处整体替换过）时夹到尾部：`Vec::insert` 不接受 `at > len`
+    let at = (*cursor).min(buf.len());
+    buf.insert(at, ch);
+    *buffer = buf.into_iter().collect();
+    *cursor = at + 1;
+    true
+}
+
 /// 把一次按键应用到单行文本缓冲区的光标处（自绘输入框的共用编辑核心）。
 ///
 /// 自绘输入框拿不到系统 IME 组合态，因此这里实现的是「可打印字符直插 + 退格/删除/
@@ -711,19 +763,9 @@ pub(crate) fn apply_line_edit(
             *cursor = total;
             true
         }
-        _ => {
-            if key_raw.chars().count() == 1 {
-                let ch = key_raw.chars().next().unwrap();
-                if !ch.is_control() {
-                    let mut chars: Vec<char> = buffer.chars().collect();
-                    chars.insert(*cursor, ch);
-                    *buffer = chars.into_iter().collect();
-                    *cursor += 1;
-                    return true;
-                }
-            }
-            false
-        }
+        // 可打印单字符插入：判据与插入都在 `insert_printable_key`（纯函数、有单测），
+        // 不再「先 `chars().count() == 1` 再 `chars().next().unwrap()`」两步走。
+        _ => insert_printable_key(buffer, cursor, key_raw),
     }
 }
 
@@ -1444,8 +1486,7 @@ impl MainWindow {
             cx.notify();
             return;
         }
-        let current = state.selected.min(count - 1) as isize;
-        let next = (current + delta).clamp(0, count as isize - 1) as usize;
+        let next = move_palette_selection_row(state.selected, delta, count);
         state.selected = next;
         // 选中行滚进视野，否则过滤出十几条时按 ↓ 会「选到看不见的地方」
         state.scroll.scroll_to_item(next);
@@ -2102,9 +2143,34 @@ fn filter_cache_usable(indices: &[usize], segment_count: usize) -> bool {
     indices.iter().all(|&i| i < segment_count)
 }
 
+/// 结果列表选中行移动 `delta` 格后的新位置（纯函数，便于单测）。
+///
+/// 修的是旧写法里那条悬空判据：`count == 0` 时 `count - 1` 会算术回绕成
+/// `usize::MAX`，此前全靠调用点的 `if count == 0` 提前返回才没踩到。把守卫收进
+/// 函数本体后，任何调用路径都不会碰到回绕，语义也一并钉死：
+/// - 空结果集恒回 0；
+/// - 两端撞住即停、不回绕（`↑` 在第一行 / `↓` 在最后一行都是空操作）；
+/// - 脏的 `selected`（过滤后列表缩短）先夹回有效行再移动；
+/// - 走饱和运算，极端 `delta` 在 debug 构建里也不会溢出 panic。
+fn move_palette_selection_row(selected: usize, delta: isize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let last = count - 1;
+    let current = selected.min(last);
+    if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize).min(last)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{filter_cache_usable, filter_commands, PALETTE_COMMANDS};
+    use super::{
+        filter_cache_usable, filter_commands, insert_printable_key, move_palette_selection_row,
+        PALETTE_COMMANDS,
+    };
 
     /// 不过滤状态下缓存的是 `0..len` 全集：只要没越界就复用（播放期间逐帧重绘
     /// 时零成本命中）。
@@ -2333,5 +2399,74 @@ mod tests {
                 "any_input_focused 漏掉输入焦点句柄: {field}（裸键 Space/Delete 会在该输入框里被误触发）"
             );
         }
+    }
+
+    /// 回归（P1）：结果集为空时移动选中行不得 panic——旧实现 `count - 1` 在
+    /// `count == 0` 时回绕成 `usize::MAX`，判据本身是悬空的；这里把纯函数的
+    /// 语义钉死：空集恒 0，越界夹住、两端不回绕，极端 `delta` 也不溢出。
+    #[test]
+    fn move_palette_selection_with_empty_result_set_does_not_panic() {
+        // 空结果集：任何 delta 都回到 0，不发生算术回绕
+        assert_eq!(move_palette_selection_row(0, 1, 0), 0);
+        assert_eq!(move_palette_selection_row(0, -1, 0), 0);
+        assert_eq!(move_palette_selection_row(9, isize::MAX, 0), 0);
+        assert_eq!(move_palette_selection_row(9, isize::MIN, 0), 0);
+
+        // 非空：两端撞住即停，不回绕
+        assert_eq!(move_palette_selection_row(0, -1, 3), 0);
+        assert_eq!(move_palette_selection_row(2, 1, 3), 2);
+        assert_eq!(move_palette_selection_row(1, -1, 3), 0);
+        assert_eq!(move_palette_selection_row(1, 1, 3), 2);
+
+        // 选中行越界（过滤后列表缩短）：先夹回有效行再移动
+        assert_eq!(move_palette_selection_row(99, 0, 3), 2);
+        assert_eq!(move_palette_selection_row(99, 1, 3), 2);
+
+        // 极端 delta 也不 panic（饱和运算，debug 构建同样安全）
+        assert_eq!(move_palette_selection_row(1, isize::MAX, 3), 2);
+        assert_eq!(move_palette_selection_row(1, isize::MIN, 3), 0);
+    }
+
+    /// 回归（P2）：可打印单字符按键必须一步完成「判据 + 插入 + 光标前移」，
+    /// 且只认**恰好一个**非控制字符——多字符键名（`space` / `f5`）与控制字符
+    /// 都不得进入缓冲区。
+    #[test]
+    fn apply_line_edit_single_char_key_inserts_and_advances_cursor() {
+        // 插到光标处，光标前移一格
+        let mut buf = String::from("ab");
+        let mut cursor = 1usize;
+        assert!(insert_printable_key(&mut buf, &mut cursor, "中"));
+        assert_eq!(buf, "a中b");
+        assert_eq!(cursor, 2);
+
+        // 空缓冲：插到 0 号位
+        let mut buf = String::new();
+        let mut cursor = 0usize;
+        assert!(insert_printable_key(&mut buf, &mut cursor, "x"));
+        assert_eq!(buf, "x");
+        assert_eq!(cursor, 1);
+
+        // 光标越界（缓冲被别处整体替换过）：夹到尾部而不是 panic
+        let mut buf = String::from("ab");
+        let mut cursor = 99usize;
+        assert!(insert_printable_key(&mut buf, &mut cursor, "c"));
+        assert_eq!(buf, "abc");
+        assert_eq!(cursor, 3);
+
+        // 多字符键名不是可打印输入
+        let mut buf = String::from("ab");
+        let mut cursor = 1usize;
+        assert!(!insert_printable_key(&mut buf, &mut cursor, "space"));
+        assert!(!insert_printable_key(&mut buf, &mut cursor, "f5"));
+        assert!(!insert_printable_key(&mut buf, &mut cursor, ""));
+        assert_eq!(buf, "ab", "拒收的键不得改动缓冲区");
+        assert_eq!(cursor, 1, "拒收的键不得移动光标");
+
+        // 控制字符（漏网到默认分支的）同样不插入
+        let mut buf = String::from("ab");
+        let mut cursor = 1usize;
+        assert!(!insert_printable_key(&mut buf, &mut cursor, "\u{1}"));
+        assert_eq!(buf, "ab");
+        assert_eq!(cursor, 1);
     }
 }

@@ -618,12 +618,7 @@ impl MainWindow {
         let dur_str = format_duration_short(task.duration);
 
         // 文件扩展名
-        let ext = task
-            .file_name
-            .rsplit('.')
-            .next()
-            .unwrap_or("MP4")
-            .to_uppercase();
+        let ext = library_ext_label(&task.file_name);
 
         // 文件大小：查**缓存快照**，不在这里 stat。
         //
@@ -1023,9 +1018,21 @@ fn format_file_size(bytes: u64) -> String {
     }
 }
 
+/// 从文件名推断库卡片角标上的扩展名。
+///
+/// `rsplit + next` 对「只有点号」的文件名会拿到空串、对空名字渲染成空白；
+/// 这里跳过空片段并统一回退成 MP4，抽成纯函数便于单测。
+fn library_ext_label(file_name: &str) -> String {
+    file_name
+        .rsplit('.')
+        .find(|s| !s.is_empty())
+        .unwrap_or("MP4")
+        .to_uppercase()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{export_spec_for, format_file_size};
+    use super::{export_spec_for, format_file_size, library_ext_label};
 
     #[test]
     fn file_size_formatting_matches_previous_rendering() {
@@ -1061,5 +1068,16 @@ mod tests {
                 out.display()
             );
         }
+    }
+
+    /// 回归（P2）：文件名扩展名的角标回退——没有扩展名、空名字或只有点号时
+    /// 统一回退成 MP4；正常扩展名一律大写显示。
+    #[test]
+    fn library_extension_falls_back_when_missing() {
+        assert_eq!(library_ext_label("clip.mp4"), "MP4");
+        assert_eq!(library_ext_label("a.b.mkv"), "MKV");
+        assert_eq!(library_ext_label("noext"), "NOEXT");
+        assert_eq!(library_ext_label(""), "MP4");
+        assert_eq!(library_ext_label("..."), "MP4");
     }
 }

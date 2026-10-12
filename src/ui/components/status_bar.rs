@@ -323,10 +323,8 @@ impl MainWindow {
             .child(div().flex().items_center().gap_3().child(if is_processing {
                 let total_dur = self.state.transcribe_duration;
                 let cur_sec = self.state.streaming_current_sec;
-                let cur_mm = (cur_sec / 60.0) as u32;
-                let cur_ss = (cur_sec % 60.0) as u32;
-                let tot_mm = (total_dur / 60.0) as u32;
-                let tot_ss = (total_dur % 60.0) as u32;
+                // `mm:ss` 文本统一走 `ui::format_mm_ss`：异常时长（负数 / NaN / 无穷）
+                // 回退成 00:00，渲染路径上不再做 `as u32` 截断。
                 let display_ratio = if total_dur > 0.0 && cur_sec > 0.0 {
                     (cur_sec / total_dur).clamp(0.0, 1.0)
                 } else {
@@ -354,7 +352,9 @@ impl MainWindow {
                                     .text_size(px(Theme::TEXT_SMALL))
                                     .text_color(Theme::text_secondary())
                                     .child(format!(
-                                        "{cur_mm:02}:{cur_ss:02} / {tot_mm:02}:{tot_ss:02}"
+                                        "{} / {}",
+                                        crate::ui::format_mm_ss(cur_sec),
+                                        crate::ui::format_mm_ss(total_dur)
                                     ))
                             } else {
                                 div()
