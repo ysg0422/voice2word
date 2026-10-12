@@ -1,4 +1,4 @@
-//! 更新检查：只判断「有没有新版」，不下载、不安装。
+//! 更新检查：判断「有没有新版」，并把安装包下载到 `updates/` 目录（不负责安装）。
 //!
 //! # 为什么需要它
 //!
@@ -6,14 +6,14 @@
 //! 渠道能知道——除非自己回仓库页面看。结果是用户长期停在旧版本上：已经修好的 bug
 //! 还在反馈，已经填掉的坑还在踩。本模块补上「告知」这一环：向 GitHub Releases API
 //! 要最新 tag，和编译进二进制的版本比较，**只有更新时**才把版本号、发行说明
-//! （截断后的）和下载页交出去。
+//! （截断后的）、下载页与附件直链交出去。
 //!
 //! # 它**不做**什么
 //!
-//! 只检查，不下载、不替换。静默替换一个正在运行的 exe 是把安装搞坏的经典做法：
-//! 文件被占用导致替换失败、替换到一半断电留下半个 exe、被杀软或签名校验拦下……
-//! 这些失败的代价远大于「用户自己多点一次下载页」。真正的下载与原子替换是另一件
-//! 独立且风险更高的工作，不在这里做。
+//! 不**安装**：`download_update_file` 只把附件落到 `updates/` 目录（先写 `*.part`
+//! 再 `rename`），绝不静默替换正在运行的 exe——文件被占用导致替换失败、替换到一半
+//! 断电留下半个 exe、被杀软或签名校验拦下……这些失败的代价远大于「用户自己多点
+//! 一次下载页」。替换/安装由用户自己完成。
 //!
 //! # 网络与调用时机
 //!
@@ -22,15 +22,17 @@
 //! 点「检查更新」时被调用；界面不会后台轮询，程序启动也不会自动联网——本程序主打
 //! 「完全本地运行」，偷偷联网会破坏这个承诺，还会白白撞上 GitHub 的按 IP 限流。
 //!
-//! 与 [`super::model_download`] 里的模型下载不同，这里**没有镜像回退**：那些镜像
-//! 面向的是几十到几百 MB 的 release 附件，而这里只要一小段 JSON。失败时给出
-//! 可操作的中文错误（见 [`fetch_latest_release`]），由界面决定怎么展示。
+//! [`download_update_file`] 只在用户点了「下载」之后才发起请求，并且和
+//! [`super::model_download`] 里的模型下载一样走加速镜像：GitHub 直链先试
+//! `ghproxy.net` / `gh-proxy.com` / `mirror.ghproxy.com`，全部失败才回退直连。
+//! 失败时给出可操作的中文错误（见 [`fetch_latest_release`]），由界面决定怎么展示。
 //!
 //! # 结构
 //!
-//! 解析（[`parse_latest_release`]）、版本比较（[`is_newer`]）与文案组装
-//! （[`describe`]）都是纯函数，因此能被完整单测覆盖；只有
-//! [`fetch_latest_release`] 碰 IO。
+//! 解析（[`parse_latest_release`]）、版本比较（[`is_newer`]）、文案组装
+//! （[`describe`]）与落盘前的校验（`verify_download` / `magic_matches`）都是纯函数，
+//! 因此能被完整单测覆盖；碰 IO 的只有 [`fetch_latest_release`] 与
+//! [`download_update_file`]。
 
 use std::time::Duration;
 
@@ -137,14 +139,22 @@ pub fn parse_latest_release(body: &str) -> Result<LatestRelease> {
                         .get("browser_download_url")
                         .and_then(|u| u.as_str())
                         .unwrap_or_default()
+                        .trim()
                         .to_string();
+                    // 没有直链的附件根本下不下来，必须在这里跳过：否则一个「名字是
+                    // .exe 但 browser_download_url 缺失」的条目会覆盖掉先前选中的
+                    // 有效 .zip，把 download_url 清空、逼出下面的硬编码回退 URL。
+                    if url.is_empty() {
+                        continue;
+                    }
                     let size = asset.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
-                    // 优先选择 .exe
-                    if lower.ends_with(".exe") || download_url.is_empty() {
+                    let is_exe = lower.ends_with(".exe");
+                    // 优先选择 .exe；否则保留第一个可用的候选（zip 等）
+                    if is_exe || download_url.is_empty() {
                         download_url = url;
                         asset_name = name.to_string();
                         asset_size = size;
-                        if lower.ends_with(".exe") {
+                        if is_exe {
                             break;
                         }
                     }
@@ -366,6 +376,75 @@ fn download_is_complete(written: u64, total_size: u64) -> bool {
     total_size == 0 || written >= total_size
 }
 
+/// 下载内容的最小可信字节数：比它小的一律当成下载源返回的错误页 / 空响应丢弃。
+///
+/// 真实的 Windows 安装包是几十 MB，1 KB 这个下限只用来挡住「HTTP 200 + 一小段
+/// 正文」这类一眼就不是附件的响应。
+const MIN_DOWNLOAD_BYTES: u64 = 1024;
+
+/// 落盘前的**长度**校验：`Ok(())` 表示这份内容可以落盘，`Err(原因)` 表示该下载源
+/// 不可用（调用方换下一个镜像，并把原因留到全部失败时报给用户）。
+///
+/// 抽成纯函数是为了能被单测覆盖：`download_update_file` 本体要联网，测不到。
+/// 两种失败必须都给出原因——只删掉 `.part` 而不记 `last_err`，最后会报成
+/// 「所有下载镜像均不可用」，与真实原因（内容太小 / 被丢弃）完全对不上。
+fn verify_download(written: u64, total_size: u64) -> Result<(), String> {
+    if !download_is_complete(written, total_size) {
+        return Err(format!(
+            "下载不完整：收到 {written} 字节，Content-Length 声明 {total_size} 字节"
+        ));
+    }
+    if written <= MIN_DOWNLOAD_BYTES {
+        return Err(format!(
+            "下载内容只有 {written} 字节，疑似下载源返回了错误页而不是安装包"
+        ));
+    }
+    Ok(())
+}
+
+/// 把服务端给的附件名收敛成一个**纯文件名**。
+///
+/// 附件名来自 GitHub API，`PathBuf::join` 遇到绝对路径会整体替换目标、遇到 `..`
+/// 会向上逃逸：`..\\..\\evil.exe` 会把文件写到 `updates/` 目录之外。这里只保留最后
+/// 一个路径分隔符之后的部分，并挡住 `.` / `..` / 空串。
+fn safe_file_name(raw: &str) -> String {
+    let base = raw
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if base.is_empty() || base == "." || base == ".." {
+        return "voice2word.exe".to_string();
+    }
+    base.to_string()
+}
+
+/// 附件应有的文件头（魔数）；未知扩展名返回 `None`（不校验，保持既有行为）。
+fn expected_magic(name: &str) -> Option<&'static [u8]> {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".exe") {
+        Some(b"MZ")
+    } else if lower.ends_with(".zip") {
+        Some(b"PK\x03\x04")
+    } else {
+        None
+    }
+}
+
+/// 已收到的内容开头是否与附件类型相符。
+///
+/// 镜像 / 代理在限流或出错时经常返回 `HTTP 200` + 一小段 HTML，而且
+/// `Content-Length` 与这段 HTML 的长度一致，长度校验完全看不出问题；只看长度就会
+/// 把错误页 `rename` 成 `voice2word.exe`，界面还提示「新版本已下载就绪」。
+/// 因此落盘前再按魔数确认一次。
+fn magic_matches(name: &str, head: &[u8]) -> bool {
+    match expected_magic(name) {
+        None => true,
+        Some(magic) => head.starts_with(magic),
+    }
+}
+
 /// 下载更新文件到 updates/ 目录，支持镜像加速与断点/临时文件保护。
 pub fn download_update_file(
     download_url: &str,
@@ -380,12 +459,8 @@ pub fn download_update_file(
     let updates_dir = crate::utils::AppConfig::resolve_path("updates");
     fs::create_dir_all(&updates_dir).map_err(|e| anyhow!("创建 updates 目录失败：{e}"))?;
 
-    let final_name = if asset_name.trim().is_empty() {
-        "voice2word.exe"
-    } else {
-        asset_name.trim()
-    };
-    let dest = updates_dir.join(final_name);
+    let final_name = safe_file_name(asset_name);
+    let dest = updates_dir.join(&final_name);
     let part = updates_dir.join(format!("{final_name}.part"));
 
     // 候选下载镜像（国内加速镜像优先，最后兜底 GitHub 直链）
@@ -443,6 +518,10 @@ pub fn download_update_file(
         let mut buf = vec![0u8; 128 * 1024];
         let mut written: u64 = 0;
         let mut download_ok = true;
+        // 落盘前要做魔数校验，但那时文件已经写到磁盘上了；顺手在下载过程中记住开头
+        // 几个字节，省得再把文件打开一次。
+        let mut head = [0u8; 4];
+        let mut head_len = 0usize;
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -454,6 +533,11 @@ pub fn download_update_file(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if head_len < head.len() {
+                        let take = (head.len() - head_len).min(n);
+                        head[head_len..head_len + take].copy_from_slice(&buf[..take]);
+                        head_len += take;
+                    }
                     if let Err(e) = file.write_all(&buf[..n]) {
                         last_err = Some(anyhow!("写入磁盘失败：{e}"));
                         download_ok = false;
@@ -477,15 +561,22 @@ pub fn download_update_file(
 
         drop(file);
 
-        // 截断校验：见 `download_is_complete`。失败则当成该镜像不可用，换下一个。
-        if download_ok && !download_is_complete(written, total_size) {
+        // 落盘前校验：长度（截断 / 过小，见 `verify_download`）与内容类型
+        // （魔数，见 `magic_matches`）。任何一种不过都当成该镜像不可用，换下一个。
+        if download_ok {
+            if let Err(reason) = verify_download(written, total_size) {
+                last_err = Some(anyhow!("{}", reason));
+                download_ok = false;
+            }
+        }
+        if download_ok && !magic_matches(&final_name, &head[..head_len]) {
             last_err = Some(anyhow!(
-                "下载不完整：收到 {written} 字节，Content-Length 声明 {total_size} 字节"
+                "下载内容不是有效的安装包（{final_name} 的文件头不匹配），疑似下载源返回了错误页"
             ));
             download_ok = false;
         }
 
-        if download_ok && written > 1024 {
+        if download_ok {
             if let Err(e) = fs::rename(&part, &dest) {
                 let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
                 let alt_dest = updates_dir.join(format!("voice2word_{timestamp}.exe"));
@@ -710,5 +801,86 @@ mod tests {
         // 少一个字节都不算完整。
         assert!(!download_is_complete(999, 1000));
         assert!(!download_is_complete(0, 1000));
+    }
+
+    /// `.exe` 附件的 `browser_download_url` 缺失时不能覆盖已选中的有效 `.zip`：
+    /// 否则 `download_url` 被清空，最后回退到硬编码 URL（附件名对不上就是 404）。
+    #[test]
+    fn parse_latest_release_ignores_asset_without_download_url() {
+        let body = r#"{
+            "tag_name": "v0.4.0",
+            "assets": [
+                {
+                    "name": "voice2word-windows-x64.zip",
+                    "browser_download_url": "https://example.com/v0.4.0/voice2word-windows-x64.zip",
+                    "size": 25000000
+                },
+                { "name": "voice2word.exe", "size": 27000000 }
+            ]
+        }"#;
+        let r = parse_latest_release(body).expect("必须解析成功");
+        assert_eq!(r.asset_name, "voice2word-windows-x64.zip");
+        assert_eq!(
+            r.download_url,
+            "https://example.com/v0.4.0/voice2word-windows-x64.zip"
+        );
+        assert_eq!(r.asset_size, 25000000);
+    }
+
+    /// 所有附件都没有直链时，才回退到按 tag 拼出的硬编码 URL。
+    #[test]
+    fn parse_latest_release_falls_back_when_no_asset_has_url() {
+        let body =
+            r#"{ "tag_name": "v0.4.0", "assets": [ { "name": "voice2word.exe", "size": 1 } ] }"#;
+        let r = parse_latest_release(body).unwrap();
+        assert_eq!(r.asset_name, "voice2word.exe");
+        assert_eq!(
+            r.download_url,
+            "https://github.com/ysg0422/voice2word/releases/download/v0.4.0/voice2word.exe"
+        );
+    }
+
+    /// 附件名来自服务端，落盘前必须取 basename：绝对路径 / `..` 会逃出 `updates/`。
+    #[test]
+    fn safe_file_name_strips_directories_and_dotdot() {
+        assert_eq!(safe_file_name("voice2word.exe"), "voice2word.exe");
+        assert_eq!(safe_file_name("  voice2word.exe  "), "voice2word.exe");
+        assert_eq!(safe_file_name(r"..\..\evil.exe"), "evil.exe");
+        assert_eq!(safe_file_name("../../evil.exe"), "evil.exe");
+        assert_eq!(safe_file_name(r"C:\Users\Public\x.exe"), "x.exe");
+        // 空名 / 纯目录名一律回退成默认文件名
+        assert_eq!(safe_file_name(""), "voice2word.exe");
+        assert_eq!(safe_file_name(".."), "voice2word.exe");
+        assert_eq!(safe_file_name("."), "voice2word.exe");
+    }
+
+    /// 长度校验必须把「截断」和「过小（疑似错误页）」都判为失败，且各带原因——
+    /// 否则调用方删掉 `.part` 却留下 `last_err = None`，最后会报成
+    /// 「所有下载镜像均不可用」，与真实原因对不上。
+    #[test]
+    fn verify_download_rejects_truncated_and_tiny_payloads() {
+        assert!(verify_download(2000, 2000).is_ok());
+        // 未给 Content-Length：只做下限校验。
+        assert!(verify_download(5000, 0).is_ok());
+
+        let truncated = verify_download(999, 1000).expect_err("截断必须判失败");
+        assert!(truncated.contains("不完整"), "实际：{truncated}");
+
+        let tiny =
+            verify_download(MIN_DOWNLOAD_BYTES, MIN_DOWNLOAD_BYTES).expect_err("过小必须判失败");
+        assert!(tiny.contains("字节"), "实际：{tiny}");
+        assert!(verify_download(0, 0).is_err());
+    }
+
+    /// 代理返回的 HTML 错误页（HTTP 200 + 长度自洽）不能当成安装包落盘。
+    #[test]
+    fn magic_matches_rejects_html_error_page() {
+        assert!(magic_matches("voice2word.exe", b"MZ\x90\x00\x03"));
+        assert!(!magic_matches("voice2word.exe", b"<!DO"));
+        assert!(magic_matches("voice2word-windows-x64.zip", b"PK\x03\x04"));
+        assert!(!magic_matches("voice2word-windows-x64.zip", b"MZ\x90\x00"));
+        // 未知扩展名不校验，保持既有行为。
+        assert!(magic_matches("voice2word.tar.gz", b"\x1f\x8b\x08\x00"));
+        assert!(!magic_matches("voice2word.exe", b""));
     }
 }

@@ -137,14 +137,16 @@ impl FrameCache {
         }
     }
 
-    /// 生成缓存键：完整视频路径 + 文件签名(大小+mtime) + 量化时间（0.5s 精度）
+    /// 生成缓存键：完整视频路径 + 文件签名(大小+mtime，mtime 取到亚秒) + 量化时间（0.5s 精度）
     fn cache_key(video_path: &Path, time_sec: f64) -> String {
         let mut sig_parts: Vec<Vec<u8>> = vec![video_path.to_string_lossy().as_bytes().to_vec()];
         if let Ok(meta) = std::fs::metadata(video_path) {
             sig_parts.push(meta.len().to_le_bytes().to_vec());
             if let Ok(modified) = meta.modified() {
                 if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
-                    sig_parts.push(d.as_secs().to_le_bytes().to_vec());
+                    // 用纳秒级 mtime：只取整秒时，同一秒内被覆盖的同名同大小视频会
+                    // 得到相同的键，从而复用到上一版的旧帧（静默显示错帧）。
+                    sig_parts.push(d.as_nanos().to_le_bytes().to_vec());
                 }
             }
         }
@@ -253,6 +255,36 @@ mod tests {
         let a = key_for(r"C:\videos\lesson.mp4", 12.3);
         let b = key_for(r"C:\videos\lesson.mp4", 12.3);
         assert_eq!(a, b);
+    }
+
+    /// 同路径被覆盖为新视频后旧帧必须失效：文件签名里的 mtime 必须精确到亚秒。
+    /// 只取整秒时，同一秒内被覆盖的同名同大小文件会算出同一个键，从而复用到旧帧
+    /// （界面上显示上一版画面，且稳定复现）。
+    #[test]
+    fn signature_tracks_subsecond_mtime() {
+        let path = std::env::temp_dir().join(format!("v2w_fc_sig_{}.mp4", std::process::id()));
+        std::fs::write(&path, b"AAAA").unwrap();
+
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_500);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(base)
+            .unwrap();
+        let k0 = FrameCache::cache_key(&path, 3.0);
+
+        // 同一整秒内被覆盖（大小不变），只有 mtime 的亚秒部分变化
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(base + std::time::Duration::from_millis(250))
+            .unwrap();
+        let k1 = FrameCache::cache_key(&path, 3.0);
+
+        assert_ne!(k0, k1, "同一秒内被覆盖的同名同大小视频必须失效旧帧");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

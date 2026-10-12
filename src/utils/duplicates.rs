@@ -151,19 +151,39 @@ pub fn describe(groups: &[DuplicateGroup]) -> String {
     )
 }
 
-/// 某一组里「建议保留」的记录 id：**保留组内输入顺序的第一条**。
+/// 某一组里「建议保留」的记录 id：**保留最早入库的那条**（即 id 最小的那条）。
 ///
 /// 为什么不整组清掉：先入库的那条往往已经落过库、甚至人工校对过，后来的重转更
-/// 可能是无意的；把整组删了等于连用户的校对成果一起抹掉。界面按本模块约定的
-/// 输入顺序展示（把要保留的那条排在组内最前），因此这里取 `ids[0]`。
+/// 可能是无意的；把整组删了等于连用户的校对成果一起抹掉。
+///
+/// 这里**不能**取 `ids[0]`：本模块的输入约定是「按时间倒序」（真实的调用方
+/// `Database::list_recent_tasks` 就是 `ORDER BY id DESC`），组内第一条恰恰是
+/// **最新**的那条——按它保留会把最早、最可能已人工校对过的那条建议删掉。因此
+/// 显式取 id 最小者，与输入顺序无关。
 /// 组内只有一个成员时返回它自己；空组返回 `None`（不 panic）。
 pub fn suggested_keeper(group: &DuplicateGroup) -> Option<i64> {
-    group.ids.first().copied()
+    group.ids.iter().copied().min()
 }
 
 /// 某一组里建议**清理**的 id（即除 keeper 之外的全部），保持组内输入顺序。
+///
+/// keeper 是「id 最小」的那条，可能并不在组内首位（输入按时间倒序），所以不能
+/// 简单地 `skip(1)`：必须显式跳过 keeper 本身，同时保持其余记录的输入顺序。
 pub fn suggested_removals(group: &DuplicateGroup) -> Vec<i64> {
-    group.ids.iter().skip(1).copied().collect()
+    let keeper_index = group
+        .ids
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, id)| **id)
+        .map(|(index, _)| index);
+
+    group
+        .ids
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != keeper_index)
+        .map(|(_, id)| *id)
+        .collect()
 }
 
 #[cfg(test)]
@@ -356,7 +376,7 @@ mod tests {
         );
     }
 
-    /// keeper 取组内输入顺序的第一条；单成员组返回它自己；空组返回 `None`。
+    /// keeper 取 id 最小（最早入库）的那条；单成员组返回它自己；空组返回 `None`。
     #[test]
     fn suggested_keeper_handles_all_group_shapes() {
         let records = vec![
@@ -395,6 +415,37 @@ mod tests {
         };
 
         assert_eq!(suggested_removals(&group), vec![9, 13]);
+    }
+
+    /// 真实调用方（`Database::list_recent_tasks` 是 `ORDER BY id DESC`）按时间**倒序**
+    /// 给出记录，组内第一条是**最新**的那条。keeper 必须是**最早**入库（id 最小）的那条，
+    /// 否则「查重」会建议删掉用户可能已人工校对过的老记录——这正是一条真实路径。
+    #[test]
+    fn suggested_keeper_prefers_the_earliest_record_not_the_newest() {
+        let records = vec![
+            FakeRecord::with_hash(30, "newest.mp4", "aa"),
+            FakeRecord::with_hash(10, "oldest.mp4", "aa"),
+            FakeRecord::with_hash(20, "middle.mp4", "aa"),
+        ];
+        let groups = group_by_fingerprint(&records);
+
+        // 分组本身不重排：组内顺序仍严格按输入（时间倒序）。
+        assert_eq!(groups[0].ids, vec![30, 10, 20]);
+        assert_eq!(
+            suggested_keeper(&groups[0]),
+            Some(10),
+            "保留最早入库的那条，而不是组内第一条"
+        );
+        assert_eq!(
+            suggested_removals(&groups[0]),
+            vec![30, 20],
+            "其余按输入顺序列出，且不含 keeper"
+        );
+        // 计数仍与「每组留一条」一致。
+        assert_eq!(
+            describe(&groups),
+            "发现 1 组重复（共 3 条记录，可清理 2 条）"
+        );
     }
 
     /// 同一份输入连算两次必须完全一致：输出里不能混进 HashMap 的迭代顺序。
