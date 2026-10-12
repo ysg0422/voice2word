@@ -1596,6 +1596,12 @@ impl AppConfig {
                 Self::atomic_write(&local_file, &body)
                     .with_context(|| format!("写回本机配置失败: {:?}", local_file))?;
             }
+        } else if local_file.exists() {
+            // 本机覆盖已无内容（例如用户把绝对路径改回默认值、或切了硬件档），
+            // 必须把磁盘上的旧覆盖删掉：否则下次启动 `load_from_file` 会把旧的
+            // 绝对路径重新盖回共享配置，「恢复默认」在重启后被静默撤销。
+            std::fs::remove_file(&local_file)
+                .with_context(|| format!("清理本机配置覆盖失败: {:?}", local_file))?;
         }
 
         let mut on_disk = self.clone();
@@ -2333,6 +2339,37 @@ mod tests {
             .expect("mtime");
 
         assert_eq!(mtime1, mtime2, "内容未变时不应重写文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 绝对路径改回可移植默认后，磁盘上的 `config.local.toml` 必须被清掉：
+    /// 否则下次启动旧绝对路径会被重新盖回来，「恢复默认」在重启后被静默撤销。
+    #[test]
+    fn stale_local_override_is_removed_when_paths_become_portable() {
+        let dir = std::env::temp_dir().join(format!("v2w_cfg_stale_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let main_path = dir.join("config.toml");
+        let local_path = dir.join(super::AppConfig::LOCAL_OVERRIDE);
+
+        let mut cfg = super::AppConfig::default();
+        cfg.paths.ffmpeg = r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe".to_string();
+        cfg.save_to_file(&main_path)
+            .expect("save with absolute path");
+        assert!(local_path.exists(), "绝对路径应产生本机覆盖文件");
+
+        // 用户把路径改回可移植默认值
+        cfg.paths.ffmpeg = super::AppConfig::default().paths.ffmpeg;
+        cfg.save_to_file(&main_path).expect("save portable");
+        assert!(
+            !local_path.exists(),
+            "路径改回可移植后应删除过期的本机覆盖文件"
+        );
+
+        // 读回来必须是可移植默认值，而不是被旧覆盖文件重新盖回的绝对路径
+        let back = super::AppConfig::load_from_file(&main_path).expect("load");
+        assert_eq!(back.paths.ffmpeg, super::AppConfig::default().paths.ffmpeg);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
