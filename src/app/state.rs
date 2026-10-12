@@ -514,6 +514,12 @@ pub struct AppState {
     pub is_playing: bool,
     pub selected_segment_index: Option<usize>,
     pub preview_frame_path: Option<PathBuf>,
+    /// 当前定位帧**自己解码**好的图像（BGRA，可直接当 GPU 纹理上传）。
+    ///
+    /// 与 `preview_frame_path` 并存：解码成功就走这一张（渲染时零解码、零 GPUI 资产缓存），
+    /// 解码失败回退到按路径交给 GPUI 加载。解码在后台抽帧线程里完成，不占渲染线程。
+    /// 为什么不直接用 `img(路径)`：见 `ui::editor::render_monitor_picture` 的分支说明。
+    pub preview_frame_image: Option<Arc<gpui::RenderImage>>,
     pub timeline_zoom: f64,
     pub editing_text: String,
 
@@ -755,6 +761,7 @@ impl AppState {
             is_playing: false,
             selected_segment_index: None,
             preview_frame_path: None,
+            preview_frame_image: None,
             timeline_zoom: 1.0,
             editing_text: String::new(),
             frame_cache: Arc::new(FrameCache::new(100)), // 缓存 100 帧（约占 5-10MB）
@@ -1324,6 +1331,7 @@ impl AppState {
         self.total_duration = 0.0;
         self.selected_segment_index = None;
         self.preview_frame_path = None;
+        self.preview_frame_image = None;
         self.editing_text.clear();
         self.is_playing = false;
         self.preview_source = None;
@@ -3029,6 +3037,7 @@ mod tests {
             segment_count: 1,
             sample_text: "乙工程第一句".to_string(),
             segments_loaded: true,
+            has_translation: false,
             created_at: String::new(),
             content_hash: None,
             metrics: None,
@@ -3071,6 +3080,7 @@ mod tests {
             segment_count: 2,
             sample_text: "第一句话".to_string(),
             segments_loaded: true,
+            has_translation: false,
             created_at: String::new(),
             content_hash: None,
             metrics: None,
@@ -3110,6 +3120,7 @@ mod tests {
             segment_count: 2,
             sample_text: "第一句话".to_string(),
             segments_loaded: true,
+            has_translation: false,
             created_at: String::new(),
             content_hash: None,
             metrics: None,

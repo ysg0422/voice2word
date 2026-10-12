@@ -422,6 +422,12 @@ pub struct MainWindow {
     /// 内嵌播放器 RenderImage 缓存：(帧版本号, 帧宽, 帧高, 已构建的 GPU 纹理图像)。
     /// 帧版本与尺寸均未变时直接复用，避免每次渲染深拷贝帧数据并重新上传纹理。
     pub(crate) cached_live_image: Option<(u64, u32, u32, Arc<RenderImage>)>,
+    /// 监视器**静态定位帧**已经交给 GPUI 的那一张图。
+    ///
+    /// 只留一张：GPUI 的精灵图集只认 `drop_image` 这一条回收路径，不显式回收
+    /// 就等于每帧常驻一张 GPU 纹理（拖动时间轴每 40ms 换一帧）。换帧时用这里的
+    /// 旧引用把上一张交还，显存占用恒定在「一帧」。见 `render_monitor_picture`。
+    pub(crate) cached_static_image: Option<Arc<RenderImage>>,
     /// 字幕清单虚拟列表的滚动位置句柄（uniform_list 仅渲染可视行）
     pub(crate) subtitle_list_scroll: UniformListScrollHandle,
     /// 批量转写队列清单的滚动句柄。
@@ -575,6 +581,9 @@ pub struct MainWindow {
     /// 面板是「非阻塞式冒泡」的轻量浮层而非确认框那种阻塞模态，因此与
     /// `confirm_dialog` 等并存时由渲染顺序决定盖在谁上面（见 `Render::render`）。
     pub(crate) command_palette: Option<CommandPaletteState>,
+    /// 快捷键速查面板 (F1) 是否打开。与命令面板同级的轻量浮层：只影响渲染，
+    /// 不碰任何工程状态，关掉即回到原样。
+    pub(crate) shortcuts_help_open: bool,
     /// 模型与组件管理视图分类：SenseVoice 专区 / Whisper 模型库 / 全部组件
     pub(crate) model_manager_tab: ModelManagerTab,
 }
@@ -849,6 +858,7 @@ impl MainWindow {
             subtitle_panel: EditorSubtitlePanel::default(),
             text_cursor_pos: 0,
             cached_live_image: None,
+            cached_static_image: None,
             subtitle_list_scroll: UniformListScrollHandle::new(),
             batch_queue_scroll: ScrollHandle::new(),
             subtitle_list_followed_sel: None,
@@ -912,6 +922,7 @@ impl MainWindow {
             library_selected: HashSet::new(),
             library_export_busy: false,
             command_palette: None,
+            shortcuts_help_open: false,
             model_manager_tab: default_model_tab,
             custom_color_picker_open: false,
             cached_color_wheel: None,
@@ -1348,6 +1359,8 @@ impl MainWindow {
             self.close_command_palette(cx);
             return;
         }
+        // 两层浮层不叠加：Ctrl+K 在速查面板上按下时，语义就是「换成命令面板」。
+        self.shortcuts_help_open = false;
         let focus = cx.focus_handle();
         self.command_palette = Some(CommandPaletteState {
             query: String::new(),
@@ -1365,6 +1378,36 @@ impl MainWindow {
         if self.command_palette.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// 打开 / 关闭快捷键速查面板 (F1)。
+    ///
+    /// 命令面板开着时不抢 F1：那种状态下面板是唯一的键盘入口（见
+    /// [`Self::overlay_blocks_keys`]），在它上面再叠一层速查面板只会让 Esc 到底关哪一层
+    /// 变得说不清。
+    pub(crate) fn toggle_shortcuts_help(&mut self, cx: &mut Context<Self>) {
+        if self.command_palette.is_some() {
+            return;
+        }
+        self.shortcuts_help_open = !self.shortcuts_help_open;
+        cx.notify();
+    }
+
+    /// 收起快捷键速查面板（Esc / F1 再按一次 / 点遮罩都收敛到这里）。
+    pub(crate) fn close_shortcuts_help(&mut self, cx: &mut Context<Self>) {
+        if self.shortcuts_help_open {
+            self.shortcuts_help_open = false;
+            cx.notify();
+        }
+    }
+
+    /// 是否有「独占键盘」的浮层正开着（命令面板 / 快捷键速查面板）。
+    ///
+    /// 两者都盖住整个窗口，浮层在时底下的界面应该是「看不见也摸不着」的。少了这道闸，
+    /// 用户在速查面板上按 Delete 会静默删掉一句字幕（面板挡着屏幕，他根本看不到自己
+    /// 删了什么）、按 Ctrl+Z 会静默撤销编辑、按 Ctrl+E 会直接往磁盘写一份文件。
+    fn overlay_blocks_keys(&self) -> bool {
+        self.command_palette.is_some() || self.shortcuts_help_open
     }
 
     /// 命令面板里当前是否还有可用的命令（供状态置灰与 Enter 判定复用）。
@@ -1822,13 +1865,14 @@ impl Render for MainWindow {
             // 全局快捷键（F-017）：键位表在 `shortcuts::bind_default_keys` 注册，
             // 这里只负责把动作接到具体的界面行为上。
             //
-            // 除 Esc / Ctrl+K 两个「面板自己的键」外，其余监听器一律先看
-            // `command_palette` 是否打开并直接返回：面板打开时它是唯一的键盘入口，
-            // 不拦这一刀的话，在面板里敲字会顺带触发底下的全局动作——Ctrl+Z 会静默
-            // 撤销字幕编辑、Ctrl+F 会把焦点抢到搜索框上让面板从此收不到按键。
+            // 除 Esc / Ctrl+K / F1 这几个「浮层自己的键」外，其余监听器一律先问
+            // `overlay_blocks_keys()`：命令面板与快捷键速查面板打开时，它们是唯一的
+            // 键盘入口。不拦这一刀的话，在浮层里敲字会顺带触发底下的全局动作——Ctrl+Z
+            // 会静默撤销字幕编辑、Ctrl+F 会把焦点抢到搜索框上让浮层从此收不到按键、
+            // Delete 会删掉一句被遮住看不清的字幕。
             .on_action(
                 cx.listener(|this, _: &shortcuts::TogglePlayback, _window, cx| {
-                    if this.command_palette.is_some() {
+                    if this.overlay_blocks_keys() {
                         return;
                     }
                     // 转写期间预览解码会与 ASR 抢 CPU/内存带宽，此时不允许用快捷键起播
@@ -1846,7 +1890,7 @@ impl Render for MainWindow {
                         cx.propagate();
                         return;
                     }
-                    if this.command_palette.is_some() {
+                    if this.overlay_blocks_keys() {
                         cx.propagate();
                         return;
                     }
@@ -1859,7 +1903,7 @@ impl Render for MainWindow {
             )
             .on_action(
                 cx.listener(|this, _: &shortcuts::PrevSegment, _window, cx| {
-                    if this.command_palette.is_some() {
+                    if this.overlay_blocks_keys() {
                         return;
                     }
                     this.jump_prev_segment(cx);
@@ -1867,7 +1911,7 @@ impl Render for MainWindow {
             )
             .on_action(
                 cx.listener(|this, _: &shortcuts::NextSegment, _window, cx| {
-                    if this.command_palette.is_some() {
+                    if this.overlay_blocks_keys() {
                         return;
                     }
                     this.jump_next_segment(cx);
@@ -1875,7 +1919,7 @@ impl Render for MainWindow {
             )
             .on_action(
                 cx.listener(|this, _: &shortcuts::SeekBackward, _window, cx| {
-                    if this.command_palette.is_some() {
+                    if this.overlay_blocks_keys() {
                         return;
                     }
                     if this.state.segments.is_empty() {
@@ -1890,7 +1934,7 @@ impl Render for MainWindow {
             )
             .on_action(
                 cx.listener(|this, _: &shortcuts::SeekForward, _window, cx| {
-                    if this.command_palette.is_some() {
+                    if this.overlay_blocks_keys() {
                         return;
                     }
                     if this.state.segments.is_empty() {
@@ -1905,7 +1949,7 @@ impl Render for MainWindow {
             )
             .on_action(
                 cx.listener(|this, _: &shortcuts::StartTranscription, _window, cx| {
-                    if this.command_palette.is_some() {
+                    if this.overlay_blocks_keys() {
                         return;
                     }
                     if matches!(this.state.status, ProcessStatus::Processing { .. }) {
@@ -1943,6 +1987,12 @@ impl Render for MainWindow {
                         this.close_command_palette(cx);
                         return;
                     }
+                    // 速查面板比命令面板「更薄」（纯展示、无输入焦点），关它的优先级
+                    // 也低一格，排在命令面板之后、确认框之前。
+                    if this.shortcuts_help_open {
+                        this.close_shortcuts_help(cx);
+                        return;
+                    }
                     if this.completion_dialog.take().is_some()
                         || this.benchmark_dialog.take().is_some()
                     {
@@ -1972,14 +2022,21 @@ impl Render for MainWindow {
             )
             .on_action(
                 cx.listener(|this, _: &shortcuts::ExportSubtitle, _window, cx| {
-                    if this.command_palette.is_some() {
+                    if this.overlay_blocks_keys() {
                         return;
                     }
                     this.perform_editor_export(cx);
                 }),
             )
-            .on_action(cx.listener(|this, _: &shortcuts::Undo, _window, cx| {
-                if this.command_palette.is_some() {
+            .on_action(cx.listener(|this, _: &shortcuts::Undo, window, cx| {
+                // 就地编辑未提交时放行：动作分发早于 `on_key_down`（见本文件 Esc 分支同型
+                // 注释），否则输入框拿不到这次 Ctrl+Z，而撤销已经把快照回滚；随后回车会把
+                // 基于旧内容的缓冲重新提交回去，一次撤销反过来被下一次回车抵消。
+                if this.any_input_focused(window, cx) {
+                    cx.propagate();
+                    return;
+                }
+                if this.overlay_blocks_keys() {
                     return;
                 }
                 // 键位是全局的，但撤销对象只能是字幕编辑；栈空时什么都不做，
@@ -1991,8 +2048,14 @@ impl Render for MainWindow {
                     cx.notify();
                 }
             }))
-            .on_action(cx.listener(|this, _: &shortcuts::Redo, _window, cx| {
-                if this.command_palette.is_some() {
+            .on_action(cx.listener(|this, _: &shortcuts::Redo, window, cx| {
+                // 与 Undo 同因：输入框持有焦点时把组合键让回去，避免快照回滚与未提交的
+                // 输入缓冲各行其是。
+                if this.any_input_focused(window, cx) {
+                    cx.propagate();
+                    return;
+                }
+                if this.overlay_blocks_keys() {
                     return;
                 }
                 if this.state.redo() {
@@ -2002,7 +2065,7 @@ impl Render for MainWindow {
             }))
             .on_action(
                 cx.listener(|this, _: &shortcuts::FocusSubtitleSearch, window, cx| {
-                    if this.command_palette.is_some() {
+                    if this.overlay_blocks_keys() {
                         return;
                     }
                     // 搜索框在剪辑台里，先切页再聚焦；若本帧尚未挂载，聚焦调用会静默失效，
@@ -2023,8 +2086,14 @@ impl Render for MainWindow {
                 }),
             )
             .on_action(
+                cx.listener(|this, _: &shortcuts::OpenShortcutsHelp, _window, cx| {
+                    // 纯展示面板：只切一个 bool，没有输入框焦点要交接。
+                    this.toggle_shortcuts_help(cx);
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &shortcuts::OpenReplacePanel, window, cx| {
-                    if this.command_palette.is_some() {
+                    if this.overlay_blocks_keys() {
                         return;
                     }
                     // Ctrl+H：与 Ctrl+F 同一套「先切页、再展开/聚焦」的写法。
@@ -2045,8 +2114,14 @@ impl Render for MainWindow {
                         cx.propagate();
                         return;
                     }
-                    if this.command_palette.is_some() {
+                    if this.overlay_blocks_keys() {
                         cx.propagate();
+                        return;
+                    }
+                    // 流水线进行中删句只改内存：完成时整表替换会把这次删除无声吞掉，
+                    // 用户却以为已经删了。与 Ctrl+Enter（StartTranscription）同型，
+                    // 处理中一律不放行。
+                    if should_ignore_delete_in_status(&this.state.status) {
                         return;
                     }
                     this.state.delete_selected_segment();
@@ -2080,7 +2155,7 @@ impl Render for MainWindow {
                     .overflow_hidden()
                     .child(match tab {
                         WorkspaceTab::Editor => self
-                            .render_editor_layout(viewport_w, viewport_h, cx)
+                            .render_editor_layout(viewport_w, viewport_h, window, cx)
                             .into_any_element(),
                         WorkspaceTab::Generate => {
                             self.render_generate_layout(cx).into_any_element()
@@ -2112,6 +2187,15 @@ impl Render for MainWindow {
         // 之前，两者万一并存时确认框仍然盖在最上层，与 Esc 的优先级顺序一致。
         let root = if self.command_palette.is_some() {
             root.child(self.render_command_palette(window, cx))
+        } else {
+            root
+        };
+
+        // 快捷键速查面板 (F1)：与命令面板同级的轻量浮层。两层不会同时出现
+        // （见 `toggle_shortcuts_help` / `toggle_command_palette`），这里的先后顺序
+        // 只是兜底——万一并存，命令面板仍然拿焦点。
+        let root = if self.shortcuts_help_open {
+            root.child(self.render_shortcuts_help(cx))
         } else {
             root
         };
@@ -2165,11 +2249,19 @@ fn move_palette_selection_row(selected: usize, delta: isize, count: usize) -> us
     }
 }
 
+/// 转写 / 翻译流水线进行中时，裸 Delete（`shortcuts::DeleteActiveSegment`）是否必须被忽略。
+///
+/// 流水线完成会用整表替换 `state.segments`，处理中删除只改内存、随后被无声覆盖，
+/// 用户却以为已经删掉。判据抽成纯函数以便在无 GUI 的单测里钉死（见 `mod tests`）。
+fn should_ignore_delete_in_status(status: &ProcessStatus) -> bool {
+    matches!(status, ProcessStatus::Processing { .. })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         filter_cache_usable, filter_commands, insert_printable_key, move_palette_selection_row,
-        PALETTE_COMMANDS,
+        should_ignore_delete_in_status, PALETTE_COMMANDS,
     };
 
     /// 不过滤状态下缓存的是 `0..len` 全集：只要没越界就复用（播放期间逐帧重绘
@@ -2399,6 +2491,73 @@ mod tests {
                 "any_input_focused 漏掉输入焦点句柄: {field}（裸键 Space/Delete 会在该输入框里被误触发）"
             );
         }
+    }
+
+    /// 裸 Delete 在流水线进行中必须被忽略：删除只改内存，完成时的整表替换会把它
+    /// 无声吞掉，用户却以为已经删了。判据是纯函数，四种状态逐一钉死。
+    #[test]
+    fn delete_ignored_only_while_processing() {
+        use crate::app::state::ProcessStatus;
+
+        assert!(should_ignore_delete_in_status(&ProcessStatus::Processing {
+            stage: "转写".to_string(),
+            progress: 0.5,
+            detail: String::new(),
+        }));
+        assert!(!should_ignore_delete_in_status(&ProcessStatus::Idle));
+        assert!(!should_ignore_delete_in_status(&ProcessStatus::Completed));
+        assert!(!should_ignore_delete_in_status(&ProcessStatus::Failed(
+            "失败".to_string(),
+        )));
+    }
+
+    /// 撤销 / 重做的输入焦点门控接线护栏。
+    ///
+    /// 处理函数依赖 `Window` / `App`，纯单测里构造不出焦点，退化为源码文本断言
+    /// （与 `any_input_focused_aggregates_every_text_input` 同法）：两个动作的处理器体
+    /// 里都必须先判 `any_input_focused` 并 `cx.propagate()`，否则就地编辑未提交时按
+    /// Ctrl+Z 会回滚快照，随后回车把基于旧内容的缓冲重新提交，撤销被下一次回车抵消。
+    #[test]
+    fn undo_and_redo_propagate_when_input_focused() {
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
+        for action in ["Undo", "Redo"] {
+            // 锚在监听器签名上：文件别处的注释也出现过裸 `shortcuts::Undo`，
+            // 只按动作名定位会命中注释而不是处理器。
+            let marker = format!("&shortcuts::{action}, ");
+            let start = src
+                .find(&marker)
+                .unwrap_or_else(|| panic!("{action} 动作处理器必须存在"));
+            let body = &src[start..];
+            let end = body
+                .find(".on_action")
+                .unwrap_or_else(|| panic!("{action} 处理器之后必须还有下一个 on_action"));
+            let body = &body[..end];
+            assert!(
+                body.contains("this.any_input_focused(window, cx)"),
+                "{action} 缺少输入焦点守卫（监听器参数名须为 window）"
+            );
+            assert!(
+                body.contains("cx.propagate()"),
+                "{action} 命中输入焦点时未 cx.propagate()，输入框收不到按键"
+            );
+        }
+    }
+
+    /// 裸 Delete 的处理中守卫必须真的接在处理器上，而不是只定义了纯函数。
+    #[test]
+    fn delete_handler_uses_processing_guard() {
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
+        let start = src
+            .find("&shortcuts::DeleteActiveSegment, ")
+            .expect("DeleteActiveSegment 动作处理器必须存在");
+        let body = &src[start..];
+        let end = body
+            .find("this.state.delete_selected_segment()")
+            .expect("处理器必须调用 delete_selected_segment");
+        assert!(
+            body[..end].contains("should_ignore_delete_in_status(&this.state.status)"),
+            "DeleteActiveSegment 缺少处理中守卫；处理中删除会被流水线完成时的整表替换吞掉"
+        );
     }
 
     /// 回归（P1）：结果集为空时移动选中行不得 panic——旧实现 `count - 1` 在

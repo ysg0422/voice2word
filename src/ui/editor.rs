@@ -10,12 +10,15 @@ use super::primitives;
 use super::theme::Theme;
 use super::{apply_line_edit, EditorExportFormat, EditorSubtitlePanel, MainWindow, StyleField};
 use crate::app::state::{ProcessStatus, WorkspaceTab};
+use crate::subtitle::segment::WordTiming;
 use crate::subtitle::{ExportMode, Segment};
 use crate::utils::time::{format_duration_short, seconds_to_hms, seconds_to_timestamp_short};
 use gpui::prelude::*;
 use gpui::*;
 use image::{Frame, ImageBuffer, Rgba};
 use smallvec::SmallVec;
+use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 
 /// 字幕配置 → 预览配色 `(文字色, 底色, 描边色)`。
@@ -175,6 +178,142 @@ pub(crate) fn is_playing_at(start: f64, end: f64, t: f64) -> bool {
     t >= start && t < end
 }
 
+/// 逐词高亮里单个词的标记态：只有「已读完 / 正在读」两种可画状态。
+///
+/// 词级时间戳没有亚词精度（whisper token 级 offsets），无法表达词内百分比，
+/// 因此当前词整词强调、已读词整词加底色；尚未开始的词不产生标记，保持默认样式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WordMark {
+    /// 已读完（`now >= word.end`）
+    Read,
+    /// 正在读（`word.start <= now < word.end`）
+    Current,
+}
+
+/// 覆盖层文本里**原文行**的起始字节偏移；定位不到时返回 `None`。
+///
+/// 逐词高亮必须落在原文行上：译文行没有词级时间戳（双语导出是
+/// `format!("{译文}\n{原文}")`，见 [`Segment::export_text`]），把词的字节区间直接
+/// 叠加到整段文本上会在双语模式下整体错位。三种导出模式各自的原文行位置：
+/// - [`ExportMode::RawOnly`]：整段就是原文，偏移恒为 0；
+/// - [`ExportMode::TranslationOnly`]：有译文时整段是译文，没有原文行可高亮（`None`）；
+///   译文为空 / 纯空白时 `export_text` 回退原文，此时 `display == raw` 按原文处理；
+/// - [`ExportMode::Bilingual`]：译文为空、或译文与原文去重成单行时 `display == raw`；
+///   否则原文必定是最后一行，且其前一字节是换行符。
+pub(crate) fn raw_line_byte_start(
+    display_text: &str,
+    raw_text: &str,
+    mode: ExportMode,
+) -> Option<usize> {
+    match mode {
+        ExportMode::RawOnly => Some(0),
+        ExportMode::TranslationOnly => {
+            if display_text == raw_text {
+                Some(0)
+            } else {
+                None
+            }
+        }
+        ExportMode::Bilingual => {
+            if display_text == raw_text {
+                Some(0)
+            } else if display_text.len() > raw_text.len()
+                && display_text.ends_with(raw_text)
+                && display_text.as_bytes()[display_text.len() - raw_text.len() - 1] == b'\n'
+            {
+                Some(display_text.len() - raw_text.len())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// 逐词高亮的核心纯函数：把 `words` 的词级时间轴映射成 `text` 上的字节区间标记。
+///
+/// `text` 是**原文行**（调用方先用 [`raw_line_byte_start`] 定位），返回的区间是相对
+/// `text` 起点的字节偏移。行为约定：
+/// - `words` 为空（旧记录 / 非 Whisper 引擎）、`text` 为空、时间非有限、段区间非法
+///   （`seg_end <= seg_start`）、`now` 早于段起点 → 返回空表，渲染退回纯文本；
+/// - 词文本与 `text` 顺序对不齐（用户改过错字 / 词表来自旧识别结果）→ 整体返回空表。
+///   这是保守退化：宁可整句不高亮，也不能把高亮画到错位的字上。返回空表时调用方走
+///   纯文本分支，天然不会产生非 char-boundary 区间；
+/// - 区间按文本顺序产生且互不重叠（顺序消费 `cursor`），满足 `StyledText::with_highlights`
+///   对升序、不重叠的要求；
+/// - 词级时间戳没有亚词精度：第 1..N-1 个词（`now >= end`）记 [`WordMark::Read`]，
+///   第 N 个词（`start <= now < end`）记 [`WordMark::Current`]，之后的词不产生区间；
+///   `now` 晚于段终点时所有词自然落入「已读完」。
+pub(crate) fn karaoke_word_marks(
+    text: &str,
+    words: &[WordTiming],
+    now_sec: f64,
+    seg_start: f64,
+    seg_end: f64,
+) -> Vec<(Range<usize>, WordMark)> {
+    let mut marks = Vec::new();
+    if text.is_empty()
+        || words.is_empty()
+        || !now_sec.is_finite()
+        || !seg_start.is_finite()
+        || !seg_end.is_finite()
+        || seg_end <= seg_start
+        || now_sec < seg_start
+    {
+        return marks;
+    }
+
+    // 顺序消费：每个词只从上一个词的结束位置往后找，保证区间升序且不重叠；
+    // 任一环找不到即认定「文本与词表已对不齐」，整体退化为不高亮。
+    let mut cursor = 0usize;
+    for w in words {
+        // whisper 的 token 文本可能带前导空格；比对用 trim 后的内容，
+        // 但区间长度取 needle 本身（即显示文本里的真实字节数）。
+        let needle = w.word.trim();
+        if needle.is_empty() || !w.start.is_finite() || !w.end.is_finite() {
+            continue;
+        }
+        let Some(rel) = text[cursor..].find(needle) else {
+            return Vec::new();
+        };
+        let start = cursor + rel;
+        let end = start + needle.len();
+        cursor = end;
+        // 已读完 / 正在读：零长或倒挂的词区间（end <= start）在 now 越过 end 后
+        // 直接算「已读完」，不会出现「瞬时当前词」闪烁。
+        if now_sec >= w.end {
+            marks.push((start..end, WordMark::Read));
+        } else if now_sec >= w.start {
+            marks.push((start..end, WordMark::Current));
+        }
+    }
+    marks
+}
+
+/// 词级高亮的视觉样式：当前词换强调色 + 加粗；已读词只加浅色底。
+///
+/// 样式全部取自 [`Theme`]，不硬编码颜色，浅色 / 深色主题自动跟随：
+/// - 已读词用 `background_color: Theme::tint_mint_soft()`（与编辑器「播放中」胶囊
+///   同源，见 `render_video_monitor` 标头）。不用「弱化字色」的理由：覆盖层字色与
+///   字号由用户的字幕样式配置决定（`subtitle_computed_colors`），调暗前景色会和用户
+///   配色打架；`HighlightStyle::fade_out` 在亮画面 / 浅色主题下还可能把字淡到看不清。
+///   底色方案只动底色，用户字色、字号原样保留。
+/// - 当前词用 `color: Theme::accent_mint()` + `FontWeight::BOLD`。mint 在本应用里就是
+///   「播放 / 进度」语义色（进度条、时间轴激活块、「播放中」胶囊），无需为此引入新
+///   模式色；加粗让「当前词」在浅底已读词的包围下依然突出。
+pub(crate) fn karaoke_mark_style(mark: WordMark) -> HighlightStyle {
+    match mark {
+        WordMark::Current => HighlightStyle {
+            color: Some(Theme::accent_mint().into()),
+            font_weight: Some(FontWeight::BOLD),
+            ..Default::default()
+        },
+        WordMark::Read => HighlightStyle {
+            background_color: Some(Theme::tint_mint_soft().into()),
+            ..Default::default()
+        },
+    }
+}
+
 /// 监视器「视口内屏」（画面可用的那块黑底区域）的像素尺寸估算。
 ///
 /// 由窗口视口尺寸、布局模式（左右二分 / 上下堆叠）与右侧面板宽度推出，用于把画面按
@@ -237,12 +376,41 @@ fn speaker_border(speaker: u32) -> gpui::Rgba {
     }
 }
 
+/// 把磁盘上的帧文件解码成 GPUI 可直接上传纹理的 `RenderImage`。
+///
+/// 为什么不让 GPUI 自己按路径加载（`img(路径)`）见 `render_monitor_picture`
+/// 的分支说明：那条路每张图都会永久留在 `App::loading_assets` 里，拖动时间轴
+/// 每 40ms 就多一张，几百 MB 起。这里由抽帧线程顺手解码，解码结果只保留当前帧。
+///
+/// **必须跑在后台线程**：960 宽的 JPG 解一次十几毫秒，放渲染线程就是稳定掉帧。
+///
+/// 字节序固定 BGRA：GPUI 的图集纹理格式是 `B8G8R8A8_UNORM`（见 gpui
+/// `platform/windows/directx_atlas.rs`），而 `image` crate 给的是 RGBA，
+/// 两者 R/B 相反——与内嵌播放器同源（`video_player` 里 ffmpeg 直出 bgra）。
+pub(crate) fn render_image_from_frame_file(path: &Path) -> Option<Arc<RenderImage>> {
+    let decoded = image::open(path).ok()?;
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut bytes = rgba.into_raw();
+    // 就地交换 R/B 两个通道（image 给的是 RGBA，GPUI 要 BGRA）
+    let mut offset = 0;
+    while offset + 2 < bytes.len() {
+        bytes.swap(offset, offset + 2);
+        offset += 4;
+    }
+    let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, bytes)?;
+    Some(Arc::new(RenderImage::new(SmallVec::from_elem(
+        Frame::new(buffer),
+        1,
+    ))))
+}
 impl MainWindow {
     /// 渲染类似剪映 / Premiere 风格的剪辑工作区布局 (左中右之 中：视频与时间轴，右：字幕属性)
     pub(crate) fn render_editor_layout(
         &mut self,
         viewport_w: f32,
         viewport_h: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
@@ -322,7 +490,7 @@ impl MainWindow {
                             .border_b_1()
                             .border_color(Theme::border())
                             .overflow_hidden()
-                            .child(self.render_video_monitor(monitor_screen, cx)),
+                            .child(self.render_video_monitor(monitor_screen, window, cx)),
                     )
                     .child(
                         div()
@@ -377,7 +545,7 @@ impl MainWindow {
                             .h_full()
                             .min_w(px(EDITOR_LEFT_MIN_W))
                             .overflow_hidden()
-                            .child(self.render_video_monitor(monitor_screen, cx)),
+                            .child(self.render_video_monitor(monitor_screen, window, cx)),
                     )
                     // 中间：可自由拖动的分隔条（宽度不超过窗口的 50%）
                     .child(
@@ -421,6 +589,7 @@ impl MainWindow {
     pub(crate) fn render_video_monitor(
         &mut self,
         screen: (f32, f32),
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let cur_time = self.state.current_time;
@@ -518,7 +687,7 @@ impl MainWindow {
                         }
                         stage
                             // 视频画面展示 (实时内嵌播放 vs 静态时间轴帧)
-                            .child(self.render_monitor_picture())
+                            .child(self.render_monitor_picture(window, cx))
                             // 字幕覆盖层：完全由 config.subtitle_style 驱动，
                             // 主界面改样式即时反映在这里（预览按 PREVIEW_SCALE 缩放显示）
                             .child({
@@ -566,7 +735,44 @@ impl MainWindow {
                                             .line_height(px(font_px * style.line_spacing))
                                             // 预览与导出同源：按当前导出内容模式渲染，
                                             // 译好之后在监视器里就能直接看到译文/双语。
-                                            .child(seg.export_text(export_mode))
+                                            // 有词级时间戳时，原文行做「卡拉 OK」逐词高亮：已读词加薄荷浅底、
+                                            // 当前词换强调色加粗（样式见 `karaoke_mark_style`）；双语模式下译文行
+                                            // 没有词级时间，只高亮原文行。
+                                            .child({
+                                                let display_text = seg.export_text(export_mode);
+                                                let raw_text = seg.display_text();
+                                                let highlights = raw_line_byte_start(
+                                                    &display_text,
+                                                    raw_text,
+                                                    export_mode,
+                                                )
+                                                .map(
+                                                    |base| -> Vec<(Range<usize>, HighlightStyle)> {
+                                                        karaoke_word_marks(
+                                                            raw_text, &seg.words, cur_time,
+                                                            seg.start, seg.end,
+                                                        )
+                                                        .into_iter()
+                                                        .map(|(range, mark)| {
+                                                            (
+                                                                base + range.start
+                                                                    ..base + range.end,
+                                                                karaoke_mark_style(mark),
+                                                            )
+                                                        })
+                                                        .collect()
+                                                    },
+                                                )
+                                                .unwrap_or_default();
+                                                if highlights.is_empty() {
+                                                    // 无词级信息 / 文本与词表被改到对不齐：退回纯文本，外观与改动前一致。
+                                                    display_text.into_any_element()
+                                                } else {
+                                                    StyledText::new(display_text)
+                                                        .with_highlights(highlights)
+                                                        .into_any_element()
+                                                }
+                                            })
                                     } else {
                                         div()
                                     })
@@ -685,7 +891,7 @@ impl MainWindow {
 
     /// 监视器画面内容：实时内嵌播放帧 vs 静态时间轴帧 vs 占位提示。
     /// 帧尺寸随视频真实宽高比动态变化，纹理构建与缓存均以本帧自带尺寸为准。
-    fn render_monitor_picture(&mut self) -> Div {
+    fn render_monitor_picture(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let live_frame = self.state.video_player.get_frame();
         let live_version = self.state.video_player.frame_version();
 
@@ -714,6 +920,14 @@ impl MainWindow {
                                 Frame::new(buffer),
                                 1,
                             )));
+                            // 换帧时把上一张显式交还给 GPUI：精灵图集只按 image_id 回收
+                            // （`Window::drop_image` → `Direct3DAtlas::remove`，见 gpui 0.2.2
+                            // window.rs 与 platform/windows/directx_atlas.rs）。不回收，
+                            // 就等于每渲染一帧都留一张常驻 GPU 纹理：播放几分钟显存见底，
+                            // 之后一路掉帧——「越看越卡」就是这么来的。
+                            if let Some((_, _, _, old)) = self.cached_live_image.take() {
+                                cx.drop_image(old, Some(window));
+                            }
                             self.cached_live_image =
                                 Some((live_version, frame_w, frame_h, new_img.clone()));
                             Some(new_img)
@@ -732,9 +946,37 @@ impl MainWindow {
             } else {
                 div().size_full()
             }
+        } else if let Some(frame_img) = self.state.preview_frame_image.clone() {
+            // 时间轴定位帧走**我们自己解码**的 RenderImage，而不是 `img(路径)`。
+            //
+            // `img(路径)` 那条路有两个只涨不跌的口子（都读自 gpui 0.2.2 源码）：
+            //   1) 解码结果按「资源哈希」塞进 `App::loading_assets` 后永不回收
+            //      （`App::fetch_asset` 只增不删），一张 960 宽的帧 ≈ 2MB RGBA；
+            //   2) GPU 侧在精灵图集里留一张只按 image_id 回收的纹理，没人调
+            //      `drop_image` 就永远不释放。
+            // 拖动时间轴是「每 40ms 一个新路径」，于是内存与显存随时间线性上涨，
+            // 用久了就是卡。这里只持有**当前这一张**，换帧时把上一张交还回收。
+            if !matches!(
+                self.cached_static_image.as_ref(),
+                Some(old) if Arc::ptr_eq(old, &frame_img)
+            ) {
+                if let Some(old) = self.cached_static_image.replace(frame_img.clone()) {
+                    cx.drop_image(old, Some(window));
+                }
+            }
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    img(ImageSource::Render(frame_img))
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
+                )
         } else if let Some(ref frame_path) = self.state.preview_frame_path {
-            // `preview_frame_path` 只在**确认文件存在**时被写入（见 actions.rs 的帧抽取
-            // 回写点），因此这里不再逐帧 `exists()`。空 `Some` 不会出现。
+            // 解码失败时的兜底：仍交给 GPUI 的资源加载器按路径读。
+            // 只影响这一帧，下一帧解码成功就又回到上面的分支。
             div()
                 .size_full()
                 .flex()
@@ -5569,12 +5811,15 @@ impl MainWindow {
 mod tests {
     use super::translated_out_count;
     use super::{
-        click_seek_target, fit_video_size, is_playing_at, monitor_screen_size,
+        click_seek_target, fit_video_size, is_playing_at, karaoke_mark_style, karaoke_word_marks,
+        monitor_screen_size, raw_line_byte_start, render_image_from_frame_file, WordMark,
         EDITOR_STACK_MONITOR_H, MONITOR_VIDEO_FIT_FRAC,
     };
-    use crate::subtitle::Segment;
+    use crate::subtitle::segment::WordTiming;
+    use crate::subtitle::{ExportMode, Segment};
     use crate::ui::primitives::should_consume_scroll;
     use crate::ui::theme::Theme;
+    use gpui::FontWeight;
 
     /// 回归（P2）：「已全部翻译」的判定必须用**实际译出**口径。
     /// 引擎可能给空串/纯空白译文打上 `translation_lang`（或直接复制原文），
@@ -5769,5 +6014,228 @@ mod tests {
         // 零长片段（start == end）半开区间恒为 false：既不会同时点亮相邻两句，
         // 也不存在「点不亮」之外的第三种状态。
         assert!(!is_playing_at(3.0, 3.0, 3.0), "零长片段不得激活");
+    }
+
+    // ==================== 监视器逐词高亮（卡拉 OK） ====================
+
+    /// 测试用词级时间戳构造：`(词文本, start, end)`。
+    fn words_of(words: &[(&str, f64, f64)]) -> Vec<WordTiming> {
+        words
+            .iter()
+            .map(|(word, start, end)| WordTiming {
+                word: (*word).to_string(),
+                start: *start,
+                end: *end,
+            })
+            .collect()
+    }
+
+    /// 逐词推进：`now` 落在第 2 个词中间时，第 1 个词整词「已读」、第 2 个词整词
+    /// 「当前」，第 3 个词（尚未开始）不产生任何区间。
+    ///
+    /// 词级时间戳没有亚词精度，无法表达「词内读到 40%」，因此第 1 词必然是整词已读
+    /// 而不是部分已读；第 2 词用「当前」而不是「已读」，否则高亮会提前一整词。
+    /// 词文本沿用 whisper token 的带前导空格形态，比对必须按 `trim()` 后的内容命中。
+    #[test]
+    fn karaoke_marks_progresses_word_by_word() {
+        let words = words_of(&[(" 今天", 0.0, 1.0), ("天气", 1.0, 2.0), (" 很好", 2.0, 3.0)]);
+        let marks = karaoke_word_marks("今天天气很好", &words, 1.5, 0.0, 3.0);
+        assert_eq!(
+            marks,
+            vec![(0..6, WordMark::Read), (6..12, WordMark::Current)],
+            "第 2 词进行中：前词已读、当前词当前，后续词无区间"
+        );
+    }
+
+    /// 边界与退化输入：`now` 早于段起点、词表为空、文本为空、时间非有限、段区间
+    /// 非法都不得产生标记（不 panic、不高亮），调用方据此退回纯文本。
+    /// 词表内单条词的时间非法时只跳过该词，不影响其余词的对齐与标记。
+    #[test]
+    fn karaoke_marks_out_of_range_or_degenerate_inputs_are_empty() {
+        let words = words_of(&[("你好", 0.0, 1.0), ("世界", 1.0, 2.0)]);
+        assert!(karaoke_word_marks("你好世界", &words, -0.1, 0.0, 2.0).is_empty());
+        assert!(karaoke_word_marks("你好世界", &[], 0.5, 0.0, 2.0).is_empty());
+        assert!(karaoke_word_marks("", &words, 0.5, 0.0, 2.0).is_empty());
+        assert!(karaoke_word_marks("你好世界", &words, f64::NAN, 0.0, 2.0).is_empty());
+        assert!(karaoke_word_marks("你好世界", &words, 0.5, 2.0, 2.0).is_empty());
+        let bad_time = words_of(&[("你好", f64::NAN, f64::NAN), ("世界", 1.0, 2.0)]);
+        assert_eq!(
+            karaoke_word_marks("你好世界", &bad_time, 1.5, 0.0, 2.0),
+            vec![(6..12, WordMark::Current)]
+        );
+    }
+
+    /// 边界：`now` 晚于段终点（或正好等于最后时间戳的半开区间右界）时，所有词都算
+    /// 「已读完」，不会留下一个永远处于「当前」的词。
+    #[test]
+    fn karaoke_marks_after_end_marks_all_words_read() {
+        let words = words_of(&[("你好", 0.0, 1.0), ("世界", 1.0, 2.0)]);
+        assert_eq!(
+            karaoke_word_marks("你好世界", &words, 2.0, 0.0, 2.0),
+            vec![(0..6, WordMark::Read), (6..12, WordMark::Read)],
+            "now == 最后词 end：整句读完（半开区间右界）"
+        );
+        assert_eq!(
+            karaoke_word_marks("你好世界", &words, 99.0, 0.0, 2.0),
+            vec![(0..6, WordMark::Read), (6..12, WordMark::Read)]
+        );
+    }
+
+    /// 容错：用户编辑过句子、词表还是旧识别的（顺序对不齐）→ 整体退化为无高亮，
+    /// 而不是把某个词硬画到别处；返回的区间永远落在 char boundary 上，绝不 panic。
+    #[test]
+    fn karaoke_marks_misaligned_text_degrades_without_panic() {
+        let words = words_of(&[("今天", 0.0, 1.0), ("天气", 1.0, 2.0)]);
+        // 第 1 个词命中、第 2 个词找不到：整句放弃高亮
+        assert!(karaoke_word_marks("今天情况尚可", &words, 1.5, 0.0, 3.0).is_empty());
+        // 与词表完全无关的文本同样安全
+        let text = "完全不同的内容";
+        let marks = karaoke_word_marks(text, &words, 1.5, 0.0, 3.0);
+        assert!(marks.is_empty());
+        for (range, _) in &marks {
+            assert!(text.is_char_boundary(range.start));
+            assert!(text.is_char_boundary(range.end));
+        }
+        // 词的顺序颠倒（后词先出现）同样按「对不齐」处理，不得乱序产出区间
+        let reversed = words_of(&[("世界", 0.0, 1.0), ("你好", 1.0, 2.0)]);
+        assert!(karaoke_word_marks("你好世界", &reversed, 1.5, 0.0, 2.0).is_empty());
+    }
+
+    /// 多字节文本（中文 + emoji）的区间必须落在 char boundary 上：emoji 是 4 字节，
+    /// 按字节切片时最容易踩到「半个字符」。
+    #[test]
+    fn karaoke_marks_land_on_char_boundaries_for_multibyte_text() {
+        let text = "今天 😀 很好";
+        let words = words_of(&[("今天", 0.0, 1.0), ("😀", 1.0, 2.0), ("很好", 2.0, 3.0)]);
+        assert_eq!(
+            karaoke_word_marks(text, &words, 1.5, 0.0, 3.0),
+            vec![(0..6, WordMark::Read), (7..11, WordMark::Current)]
+        );
+        let marks = karaoke_word_marks(text, &words, 2.5, 0.0, 3.0);
+        assert_eq!(
+            marks,
+            vec![
+                (0..6, WordMark::Read),
+                (7..11, WordMark::Read),
+                (12..18, WordMark::Current)
+            ]
+        );
+        for (range, _) in &marks {
+            assert!(text.is_char_boundary(range.start), "区间起点必须在字符边界");
+            assert!(text.is_char_boundary(range.end), "区间终点必须在字符边界");
+        }
+    }
+
+    /// 双语导出（`译文\n原文`）：原文行起点 = 译文行字节数 + 1（换行符），词级高亮
+    /// 只叠加在原文行内、不碰译文行；译文与原文去重成单行时偏移回到 0。
+    #[test]
+    fn bilingual_highlights_land_in_raw_line_only() {
+        let mut seg = Segment::new(1, 0.0, 2.0, "今天");
+        seg.translation = Some("Today".to_string());
+        seg.words = words_of(&[("今天", 0.0, 1.0)]);
+        let display = seg.export_text(ExportMode::Bilingual);
+        assert_eq!(display, "Today\n今天");
+        let base = raw_line_byte_start(&display, seg.display_text(), ExportMode::Bilingual)
+            .expect("双语导出必须能定位原文行");
+        assert_eq!(base, "Today\n".len());
+        // 原文行内的区间叠加 base 后仍落在原文行内（不越界到译文行）
+        let marks = karaoke_word_marks(seg.display_text(), &seg.words, 0.5, seg.start, seg.end);
+        assert_eq!(marks, vec![(0..6, WordMark::Current)]);
+        for (range, _) in &marks {
+            assert!(base + range.start >= "Today\n".len());
+            assert!(base + range.end <= display.len());
+        }
+        // 译文与原文一致（中翻中）时 export_text 去重成单行：按原文整段处理
+        let mut same = seg.clone();
+        same.translation = Some("今天".to_string());
+        let dedup = same.export_text(ExportMode::Bilingual);
+        assert_eq!(dedup, "今天");
+        assert_eq!(
+            raw_line_byte_start(&dedup, same.display_text(), ExportMode::Bilingual),
+            Some(0)
+        );
+    }
+
+    /// 仅译文模式：文本行是译文（没有词级时间），返回 `None` 不做逐词高亮；
+    /// 译文缺失时 `export_text` 回退原文，此时仍按原文行高亮；原文模式恒为整段。
+    #[test]
+    fn translation_only_mode_has_no_word_highlight() {
+        let mut seg = Segment::new(1, 0.0, 2.0, "今天");
+        seg.translation = Some("Today".to_string());
+        let display = seg.export_text(ExportMode::TranslationOnly);
+        assert_eq!(display, "Today");
+        assert_eq!(
+            raw_line_byte_start(&display, seg.display_text(), ExportMode::TranslationOnly),
+            None
+        );
+        assert_eq!(
+            raw_line_byte_start(&display, seg.display_text(), ExportMode::RawOnly),
+            Some(0)
+        );
+        let mut fallback = seg.clone();
+        fallback.translation = None;
+        let text = fallback.export_text(ExportMode::TranslationOnly);
+        assert_eq!(text, "今天");
+        assert_eq!(
+            raw_line_byte_start(&text, fallback.display_text(), ExportMode::TranslationOnly),
+            Some(0)
+        );
+    }
+
+    /// 样式语义：当前词换强调色 + 加粗；已读词只加浅底，**不动**字色与字重
+    /// （覆盖层字色 / 字号属于用户字幕配置，必须原样保留）。
+    #[test]
+    fn karaoke_styles_emphasize_current_and_wash_read_words() {
+        let current = karaoke_mark_style(WordMark::Current);
+        assert!(current.color.is_some(), "当前词必须有强调色");
+        assert_eq!(current.font_weight, Some(FontWeight::BOLD));
+        assert!(current.background_color.is_none());
+
+        let read = karaoke_mark_style(WordMark::Read);
+        assert!(read.background_color.is_some(), "已读词加浅底");
+        assert!(read.color.is_none(), "已读词不得覆盖用户字色");
+        assert!(read.font_weight.is_none(), "已读词不得覆盖用户字重");
+    }
+
+    /// 帧解码助手必须交出 **BGRA**：GPUI 图集纹理是 B8G8R8A8，而 `image` crate 给的是
+    /// RGBA。搞反了就是红蓝互换（人脸变蓝、天空变橙），而且只在静态定位帧上出现、
+    /// 播放时又正常——这种「一半对一半错」的配色 bug 极难靠肉眼定位，所以钉死字节序。
+    #[test]
+    fn frame_decode_helper_returns_bgra_bytes() {
+        let path = std::env::temp_dir().join(format!("v2w_frame_bgra_{}.png", std::process::id()));
+        let mut img = image::RgbaImage::new(2, 2);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgba([255, 0, 0, 255]); // 纯红
+        }
+        img.save(&path).expect("写出测试图");
+
+        let decoded = render_image_from_frame_file(&path).expect("正常图片应解码成功");
+        let bytes = decoded.as_bytes(0).expect("应有一帧");
+        assert_eq!(
+            &bytes[0..4],
+            &[0, 0, 255, 255],
+            "红色像素在 BGRA 里应是 00 00 FF FF"
+        );
+        assert_eq!(bytes.len(), 2 * 2 * 4, "像素数不该被改动");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 坏文件 / 不存在的路径只返回 None，绝不能 panic：调用点在后台抽帧线程里，
+    /// panic 会连累整条抽帧循环，时间轴就此不再更新画面。
+    #[test]
+    fn frame_decode_helper_degrades_without_panicking() {
+        let path = std::env::temp_dir().join(format!("v2w_frame_bad_{}.jpg", std::process::id()));
+        std::fs::write(&path, b"not an image at all").unwrap();
+        assert!(
+            render_image_from_frame_file(&path).is_none(),
+            "非图片应返回 None"
+        );
+        assert!(
+            render_image_from_frame_file(std::path::Path::new("Z:/definitely/missing.jpg"))
+                .is_none(),
+            "不存在的路径应返回 None"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -1,9 +1,11 @@
 //! 视频帧智能缓存系统 — 解决时间轴拖动卡顿问题
 //!
-//! 缓存键 = 完整视频路径 + 文件签名(大小+mtime) + 量化时间(0.5s 精度)：
+//! 缓存键 = 完整视频路径 + 文件签名(大小+mtime) + 量化时间(0.1s 精度)：
 //! - 完整路径而非仅文件名，避免不同目录同名视频互相串缓存；
 //! - 文件签名使同路径被覆盖为新视频后旧帧自动失效；
-//! - 哈希采用跨进程稳定的 FNV-1a，保证重启后磁盘帧文件仍可命中复用。
+//! - 哈希采用跨进程稳定的 FNV-1a，保证重启后磁盘帧文件仍可命中复用；
+//! - 请求位置附近已有帧时**复用邻格**（见 [`NEIGHBOR_TICKS`]）：拖动时间轴时每 40ms
+//!   就有一次抽帧请求，若每次都真起 FFmpeg，画面必然跟不上游标。
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
@@ -16,13 +18,28 @@ use crate::engines::FFmpegEngine;
 /// 磁盘帧目录的保留文件数上限。
 ///
 /// 内存缓存有 `max_size` 上限，但磁盘上的 `%TEMP%/v2w_frames` 原先只增不减：
-/// 每拖动一次时间轴（0.5s 量化）就可能落一个新 JPG，视频库每张卡片也会落一张，
+/// 每拖动一次时间轴（0.1s 量化，比过去细 5 倍）就可能落一个新 JPG，视频库每张卡片也会落一张，
 /// 长期使用后该目录会累积成千上万个文件。按「最近使用」保留最近 N 个即可。
 const DISK_KEEP_FILES: usize = 400;
 
 /// 每新增这么多帧才扫一次磁盘目录。
 /// 扫描需要 `read_dir` + 每个文件的 metadata，不能每抽一帧都做一遍。
 const PRUNE_EVERY: usize = 32;
+
+/// 时间量化精度（秒）——每秒 10 格，即拖动时最高 10 帧/秒的画面更新粒度。
+///
+/// 这里过去是 0.5s：拖动时间轴时 100~400ms 的位移会算出同一个缓存键，命中同一张
+/// 旧帧，表现为「游标在动、监视器画面纹丝不动」。10 格/秒大致对应人眼能分辨出
+/// 「画面在跟手」的下限，磁盘侧另有 [`DISK_KEEP_FILES`] 兜底，不会因为变密就爆盘。
+const TIME_QUANTUM_SEC: f64 = 0.1;
+
+/// 邻格复用窗口（单位：量化格）。
+///
+/// 请求位置的 ±1 格内已有帧就直接复用，不再起 FFmpeg：拖动时间轴时每 40ms 来一次
+/// 请求，而真抽一帧要几十到几百毫秒——每次都真抽，画面更新率就是抽帧速度而不是
+/// 拖动速度。复用带来的最大时间偏差 = 1 格 + 半个量化误差 ≈ 0.15s，拖动中看不出来；
+/// 单击定位仍先看**精确格**（偏差 ≤ 0.05s），只有精确格没有才退到邻格。
+const NEIGHBOR_TICKS: i64 = 1;
 
 /// 按修改时间保留磁盘帧目录里最近的 `keep` 个 JPG，其余删除。
 ///
@@ -137,23 +154,70 @@ impl FrameCache {
         }
     }
 
-    /// 生成缓存键：完整视频路径 + 文件签名(大小+mtime，mtime 取到亚秒) + 量化时间（0.5s 精度）
-    fn cache_key(video_path: &Path, time_sec: f64) -> String {
+    /// 视频文件签名：路径 + 大小 + 亚秒 mtime。
+    ///
+    /// 只用路径不够：同一路径被覆盖成新视频后，旧帧必须失效。只取整秒 mtime 也不够，
+    /// 同一秒内被覆盖的同名同大小视频会得到相同的键，从而复用到上一版的旧帧
+    /// （静默显示错帧）。
+    fn signature(video_path: &Path) -> u64 {
         let mut sig_parts: Vec<Vec<u8>> = vec![video_path.to_string_lossy().as_bytes().to_vec()];
         if let Ok(meta) = std::fs::metadata(video_path) {
             sig_parts.push(meta.len().to_le_bytes().to_vec());
             if let Ok(modified) = meta.modified() {
                 if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
-                    // 用纳秒级 mtime：只取整秒时，同一秒内被覆盖的同名同大小视频会
-                    // 得到相同的键，从而复用到上一版的旧帧（静默显示错帧）。
                     sig_parts.push(d.as_nanos().to_le_bytes().to_vec());
                 }
             }
         }
         let refs: Vec<&[u8]> = sig_parts.iter().map(|v| v.as_slice()).collect();
-        let path_sig = stable_hash(&refs);
-        let quantized = (time_sec * 2.0).round() as i64;
-        format!("{:016x}_{}", path_sig, quantized)
+        stable_hash(&refs)
+    }
+
+    /// 时间 → 缓存格号（负时间落回第 0 格）
+    fn tick_of(time_sec: f64) -> i64 {
+        (time_sec.max(0.0) / TIME_QUANTUM_SEC).round() as i64
+    }
+
+    /// 由签名与格号拼键。
+    ///
+    /// `q10` 是量化精度标记（每秒 10 格）：以后调整精度时一并改标记，旧精度的磁盘帧
+    /// 自然不再匹配，交给目录裁剪清掉即可，不必手写迁移。
+    fn key_at_tick(sig: u64, tick: i64) -> String {
+        format!("{:016x}_q10_{}", sig, tick)
+    }
+
+    /// 请求位置可接受的候选键，按优先级排列：精确格 → 偏早的邻格 → 偏晚的邻格。
+    ///
+    /// 偏早优先：剪辑时「比目标时刻稍早一帧」看到的是这一句的开头，而「稍晚一帧」
+    /// 可能已经跳到下一句的画面上了。
+    fn candidate_keys(sig: u64, tick: i64) -> Vec<String> {
+        let mut keys = Vec::with_capacity(1 + 2 * NEIGHBOR_TICKS as usize);
+        keys.push(Self::key_at_tick(sig, tick));
+        for step in 1..=NEIGHBOR_TICKS {
+            keys.push(Self::key_at_tick(sig, (tick - step).max(0)));
+            keys.push(Self::key_at_tick(sig, tick + step));
+        }
+        keys
+    }
+
+    /// 按候选键顺序在内存 + 磁盘里找帧，命中即返回——邻格命中也算命中。
+    ///
+    /// 内存里记着但文件已被裁剪/清理的情况视为未命中，不能把不存在的路径交给渲染层。
+    fn lookup_cached(&self, keys: &[String], disk_dir: &Path) -> Option<(String, PathBuf)> {
+        for key in keys {
+            if let Some(path) = self.lock_cache().map.get(key).cloned() {
+                if path.exists() {
+                    return Some((key.clone(), path));
+                }
+            }
+            let on_disk = disk_dir.join(format!("{key}.jpg"));
+            if on_disk.exists() {
+                self.lock_cache()
+                    .insert(key.clone(), on_disk.clone(), self.max_size);
+                return Some((key.clone(), on_disk));
+            }
+        }
+        None
     }
 
     fn disk_dir() -> PathBuf {
@@ -167,27 +231,24 @@ impl FrameCache {
         time_sec: f64,
         ffmpeg: &FFmpegEngine,
     ) -> Result<PathBuf> {
-        let key = Self::cache_key(video_path, time_sec);
-
-        // 尝试从内存缓存获取
-        if let Some(path) = self.lock_cache().map.get(&key).cloned() {
-            if path.exists() {
-                return Ok(path);
-            }
-        }
+        let sig = Self::signature(video_path);
+        let tick = Self::tick_of(time_sec);
+        let keys = Self::candidate_keys(sig, tick);
 
         let temp_dir = Self::disk_dir();
         let _ = std::fs::create_dir_all(&temp_dir);
 
-        // 磁盘文件名直接使用缓存键（含路径+签名哈希），同名视频互不覆盖
-        let out_jpg = temp_dir.join(format!("{}.jpg", key));
-
-        // 检查磁盘是否已存在抽取过的帧，存在则直接复用
-        if out_jpg.exists() {
-            self.lock_cache()
-                .insert(key.clone(), out_jpg.clone(), self.max_size);
-            return Ok(out_jpg);
+        // 先按候选键（精确格 → 邻格）找：命中就复用，不起 FFmpeg。
+        // 这是「拖动时间轴画面跟手」的关键一步（见 [`NEIGHBOR_TICKS`]）。
+        if let Some((_, cached)) = self.lookup_cached(&keys, &temp_dir) {
+            return Ok(cached);
         }
+
+        // 未命中，只能真抽一帧：按**精确格**取键。
+        // 磁盘文件名直接使用缓存键（含路径+签名哈希），同名视频互不覆盖。
+        drop(keys);
+        let key = Self::key_at_tick(sig, tick);
+        let out_jpg = temp_dir.join(format!("{}.jpg", key));
 
         // 抽帧先落到**本进程独占**的临时文件，成功后 rename 到最终名。
         //
@@ -240,7 +301,10 @@ mod tests {
     use super::*;
 
     fn key_for(path: &str, t: f64) -> String {
-        FrameCache::cache_key(Path::new(path), t)
+        FrameCache::key_at_tick(
+            FrameCache::signature(Path::new(path)),
+            FrameCache::tick_of(t),
+        )
     }
 
     #[test]
@@ -272,7 +336,7 @@ mod tests {
             .unwrap()
             .set_modified(base)
             .unwrap();
-        let k0 = FrameCache::cache_key(&path, 3.0);
+        let k0 = key_for(&path.to_string_lossy(), 3.0);
 
         // 同一整秒内被覆盖（大小不变），只有 mtime 的亚秒部分变化
         std::fs::OpenOptions::new()
@@ -281,16 +345,47 @@ mod tests {
             .unwrap()
             .set_modified(base + std::time::Duration::from_millis(250))
             .unwrap();
-        let k1 = FrameCache::cache_key(&path, 3.0);
+        let k1 = key_for(&path.to_string_lossy(), 3.0);
 
         assert_ne!(k0, k1, "同一秒内被覆盖的同名同大小视频必须失效旧帧");
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 0.1s 量化：格内共享同一张帧，跨格不共享。
+    ///
+    /// 这里守住的是「精度别被改回 0.5s」——过去 0.5s 精度下拖动时间轴会出现
+    /// 「游标在动、画面不跟手」，正是本模块要根治的毛病。
     #[test]
     fn quantized_time_shares_entry() {
-        assert_eq!(key_for(r"C:\v.mp4", 10.01), key_for(r"C:\v.mp4", 10.24));
-        assert_ne!(key_for(r"C:\v.mp4", 10.01), key_for(r"C:\v.mp4", 10.51));
+        // 10.01 与 10.04 都在第 100 格（10.00~10.05）
+        assert_eq!(key_for(r"C:\v.mp4", 10.01), key_for(r"C:\v.mp4", 10.04));
+        // 10.21 落在第 102 格，必须换帧
+        assert_ne!(key_for(r"C:\v.mp4", 10.01), key_for(r"C:\v.mp4", 10.21));
+        // 旧 0.5s 精度下 10.01 与 10.24 会撞键，现在必须区分开
+        assert_ne!(key_for(r"C:\v.mp4", 10.01), key_for(r"C:\v.mp4", 10.24));
+    }
+
+    /// 邻格复用：候选键顺序为「精确格 → 偏早邻格 → 偏晚邻格」，且负格号夹到 0。
+    ///
+    /// 顺序不能乱：偏早优先，拖动时看到的是这一句的开头；偏晚可能已经跳到下一句画面。
+    #[test]
+    fn neighbor_tick_reuses_nearby_frame() {
+        let sig = 0x1234_5678_9abc_def0_u64;
+        let keys = FrameCache::candidate_keys(sig, 100);
+        assert_eq!(keys.len(), 3, "1 个精确格 + 前后各 1 个邻格");
+        assert_eq!(keys[0], FrameCache::key_at_tick(sig, 100));
+        assert_eq!(
+            keys[1],
+            FrameCache::key_at_tick(sig, 99),
+            "偏早邻格优先于偏晚"
+        );
+        assert_eq!(keys[2], FrameCache::key_at_tick(sig, 101));
+
+        // 第 0 格没有「-1 格」：夹到 0 而不是负数（负数键会生成永不命中的文件名）
+        let first = FrameCache::candidate_keys(sig, 0);
+        assert_eq!(first[0], FrameCache::key_at_tick(sig, 0));
+        assert_eq!(first[1], FrameCache::key_at_tick(sig, 0));
+        assert_eq!(first[2], FrameCache::key_at_tick(sig, 1));
     }
 
     #[test]

@@ -7,8 +7,9 @@ use tracing::info;
 
 use super::types::{BatchSummary, CompletionDialogInfo};
 use super::{EditorExportFormat, MainWindow};
-use crate::app::state::{ProcessStatus, QueueState, WorkspaceTab};
+use crate::app::state::{AppState, ProcessStatus, QueueState, WorkspaceTab};
 use crate::core::PipelineEvent;
+use crate::subtitle::audit::{EditKind, EditRecord};
 use crate::subtitle::writer::export_spec_for;
 use crate::subtitle::Segment;
 use crate::subtitle::SubtitleWriter;
@@ -170,6 +171,141 @@ pub(crate) fn translated_out_count(segments: &[Segment], target: &str) -> usize 
 pub(crate) fn translation_coverage(segments: &[Segment], target: &str) -> (usize, usize) {
     let done = translated_out_count(segments, target);
     (done, expected_translation_count(segments))
+}
+
+/// 把导入的字幕灌进工作台（同步、不 spawn），返回给用户看的提示文案；`segs`
+/// 为空时置红色状态并返回 `None`。
+///
+/// 抽成不依赖 `MainWindow` 的纯状态函数有两个理由：一是「替换整份文档」的收尾
+/// 步骤（重新编号、清撤销栈、清预览缓存、选首句、文案拼装）必须逐字一致；二是
+/// 收尾里最关键的一步——替换前先把上一个工程的未保存编辑落库——能在单测里直接
+/// 用一份内存 `AppState` 验证。
+///
+/// 为什么替换前必须 flush：导入的字幕会整份顶掉 `segments`，而 `segments` 里
+/// 可能还压着用户没保存的编辑（`segments_dirty == true`）。跳过这一步，那些改动
+/// 不但没进库，还会连 `active_task_id` 一起被置空，从此没有任何路径能把它们写
+/// 回去——用户视角就是「导入一份字幕，上一份的修改全丢了」。
+fn install_imported_subtitles(
+    state: &mut AppState,
+    path: &Path,
+    mut segs: Vec<Segment>,
+) -> Option<String> {
+    if segs.is_empty() {
+        state.status = ProcessStatus::Failed("字幕文件里没有可用的字幕行".to_string());
+        return None;
+    }
+    // 句序号重新按输出顺序编号：外部文件的序号常常是错的或重复的，
+    // 而下游（选中、质检、落库）全部按 `index` 索引。
+    for (i, seg) in segs.iter_mut().enumerate() {
+        seg.index = i + 1;
+    }
+    let count = segs.len();
+    // 扩展名只取一次并统一成小写：`is_txt` / `is_lrc` 两处判断共用它，
+    // 避免两份 `extension()` 拷贝各改各的而漂移。
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "导入的字幕".to_string());
+
+    // 换文档前先把上一个工程的未保存编辑落库：flush 依赖**旧的** active_task_id，
+    // 必须排在下面对 `segments` / `active_task_id` 的赋值之前，否则改动既没写进
+    // 旧工程的库行、也失去了写回坐标，用户视角就是「导入一次丢一次修改」。
+    state.flush_segments_if_dirty();
+
+    state.segments = segs;
+    // 导入的字幕不属于历史库里的任何一条记录：置空避免把编辑
+    // 写回到别的工程的库行上（那是静默数据损坏）。
+    state.active_task_id = None;
+    state.selected_file = Some(path.to_path_buf());
+    state.reset_edit_history();
+    state.bump_segments_revision();
+    state.clear_streaming();
+    state.status = ProcessStatus::Idle;
+    if let Some(first) = state.segments.first() {
+        state.select_segment(first.index);
+    }
+    // 导入的是别人的字幕：波形/首帧都对不上，先清掉旧工程的缓存，
+    // 免得监视器还显示上一支片子的画面。
+    state.preview_source = None;
+    state.waveform = None;
+    state.active_tab = WorkspaceTab::Editor;
+
+    Some(import_notice(&stem, count, ext == "txt", ext == "lrc"))
+}
+
+/// 转写线程退出后的兜底收尾：事件通道关闭时调用，只在状态仍停在 `Processing`
+/// 时才动手，返回 `state.batch_running`（调用方据此决定要不要续跑批量队列）。
+///
+/// 正常跑完时管线一定先发 `Finished` 或 `Error`，事件分支已把状态收回 `Idle`，
+/// 这里读到非 `Processing` 直接返回。真正需要兜底的是**线程异常退出**（典型是
+/// panic）：没有终态事件、发送端析构、接收端读到 `None`，界面就会永远停在
+/// 「转写中」，而且 `start_processing_for` 的 `Processing` 守卫会让用户再也开不了
+/// 下一单，只能重启程序。
+fn settle_aborted_transcription(state: &mut AppState) -> bool {
+    if !state.is_processing() {
+        return false;
+    }
+    if state.cancel_requested {
+        // 用户主动终止：静默收尾，不弹完成框、不把「失败」写进历史库
+        // （与 Finished/Error 两个分支里的取消处理逐字一致）。
+        state.cancel_requested = false;
+        state.status = ProcessStatus::Idle;
+        state.transcribe_file = None;
+        state.transcribe_duration = 0.0;
+        state.clear_streaming();
+        state.finish_active_queue_item(Err("已取消".to_string()));
+        state.batch_running = false;
+    } else if state.batch_running {
+        // 批量中途线程异常退出：把当前这一条记为失败并解锁 UI，返回 `true`
+        // 让调用方立刻续跑下一项——一个坏条目不该让整批永远卡住。
+        state.transcribe_file = None;
+        state.transcribe_duration = 0.0;
+        state.clear_streaming();
+        state.finish_active_queue_item(Err("转写意外中断：后台任务提前退出".to_string()));
+    } else {
+        // 单文件：没有队列可续，直接以失败态告知用户，让「开始转写」重新可点。
+        state.clear_streaming();
+        state.transcribe_file = None;
+        state.transcribe_duration = 0.0;
+        state.status = ProcessStatus::Failed("转写意外中断：运行时线程已退出".to_string());
+    }
+    state.batch_running
+}
+
+/// 清空全部译文：先快照、再改动、落库并记一条审计；没有译文时返回 `false`。
+///
+/// 快照必须在改动之前：`Ctrl+Z` 要把**清空之前**的整份译文换回来。审计记录用
+/// `index = 0` 表示这不是针对单句的操作，`before` 写清空前的句数，日志面板
+/// 据此能看出「这一条是整批清空」。
+fn clear_translations_with_undo(state: &mut AppState) -> bool {
+    let cleared = state
+        .segments
+        .iter()
+        .filter(|s| s.translation.is_some())
+        .count();
+    if cleared == 0 {
+        return false;
+    }
+    state.snapshot_for_undo();
+    for seg in &mut state.segments {
+        seg.translation = None;
+        seg.translation_lang = None;
+    }
+    state.segments_dirty = true;
+    state.flush_segments_if_dirty();
+    state.edit_log.push(EditRecord {
+        index: 0,
+        kind: EditKind::Translation,
+        before: format!("{cleared} 句译文"),
+        after: String::new(),
+        at: chrono::Local::now(),
+    });
+    true
 }
 
 impl MainWindow {
@@ -1070,52 +1206,16 @@ impl MainWindow {
     /// 把读好的字幕句灌进当前工程，返回给用户看的提示文案；`segs` 为空时置红色
     /// 状态并返回 `None`。
     ///
-    /// 抽成**同步**函数（不 spawn、不碰对话框）是这次改动的关键：两条入口只差
-    /// 「路径从哪来」，剩下的重新编号、清撤销栈、清预览缓存、选首句、文案拼装
-    /// 必须逐字一致。
-    fn apply_imported_subtitle(&mut self, path: &Path, mut segs: Vec<Segment>) -> Option<String> {
-        if segs.is_empty() {
-            self.state.status = ProcessStatus::Failed("字幕文件里没有可用的字幕行".to_string());
-            return None;
-        }
-        // 句序号重新按输出顺序编号：外部文件的序号常常是错的或重复的，
-        // 而下游（选中、质检、落库）全部按 `index` 索引。
-        for (i, seg) in segs.iter_mut().enumerate() {
-            seg.index = i + 1;
-        }
-        let count = segs.len();
-        // 扩展名只取一次并统一成小写：`is_txt` / `is_lrc` 两处判断共用它，
-        // 避免两份 `extension()` 拷贝各改各的而漂移。
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .unwrap_or_default();
-        let stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "导入的字幕".to_string());
-
-        self.state.segments = segs;
-        // 导入的字幕不属于历史库里的任何一条记录：置空避免把编辑
-        // 写回到别的工程的库行上（那是静默数据损坏）。
-        self.state.active_task_id = None;
-        self.state.selected_file = Some(path.to_path_buf());
-        self.state.reset_edit_history();
-        self.state.bump_segments_revision();
-        self.state.clear_streaming();
-        self.state.status = ProcessStatus::Idle;
-        if let Some(first) = self.state.segments.first() {
-            self.state.select_segment(first.index);
-        }
-        // 导入的是别人的字幕：波形/首帧都对不上，先清掉旧工程的缓存，
-        // 免得监视器还显示上一支片子的画面。
-        self.state.preview_source = None;
-        self.state.waveform = None;
-        self.state.active_tab = WorkspaceTab::Editor;
+    /// 实际的状态改动在 [`install_imported_subtitles`] 里完成（同步、不 spawn、不
+    /// 碰对话框）：两条导入入口只差「路径从哪来」，先落库再换文档、重新编号、清
+    /// 撤销栈、清预览缓存、选首句、文案拼装必须逐字一致。这里只负责 `MainWindow`
+    /// 自己的界面缓存失效。
+    fn apply_imported_subtitle(&mut self, path: &Path, segs: Vec<Segment>) -> Option<String> {
+        let notice = install_imported_subtitles(&mut self.state, path, segs)?;
+        // 清单的「跟随选中」缓存记的是旧文档的行位置：整份文档换了必须让它失效，
+        // 否则下一帧会按旧位置去定位新文档。
         self.subtitle_list_followed_sel = None;
-
-        Some(import_notice(&stem, count, ext == "txt", ext == "lrc"))
+        Some(notice)
     }
 
     /// 处理从操作系统拖入窗口的文件（GPUI 把外部文件拖放包装成一次内部 drag/drop）。
@@ -1814,10 +1914,19 @@ impl MainWindow {
         // 后台通过独立线程执行 Tokio 异步管线，不阻塞 UI 主线程
         let in_file = input_file.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            // 运行时创建失败不能在后台线程里 panic：那会让线程带着未发送的终态
+            // 事件消失，界面卡在「转写中」。显式发一条 Error 事件，走与管线报错
+            // 相同的收尾路径（清状态、批量续跑）。
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap();
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    let _ = tx.send(PipelineEvent::Error(format!("转写运行时初始化失败：{err}")));
+                    return;
+                }
+            };
             rt.block_on(async move {
                 if let Err(err) = pipeline
                     .run_with_options(
@@ -1843,7 +1952,21 @@ impl MainWindow {
 
         // 使用 GPUI 官方实体协程封装，避免复用 AsyncApp 引用造成重入借用冲突。
         cx.spawn(async move |this, cx| {
-            while let Some(first_event) = rx.recv().await {
+            loop {
+                let Some(first_event) = rx.recv().await else {
+                    // 通道关闭：发送端（后台线程）已析构。正常跑完时 Finished/Error
+                    // 分支已把状态收回 Idle，这里无事可做；若状态仍停在 Processing，
+                    // 说明线程异常退出（panic 等）——必须在这里兜底收尾，否则界面
+                    // 永远显示「转写中」，且 `start_processing_for` 的 Processing
+                    // 守卫会让用户再也开不了下一单。
+                    let _ = this.update(cx, |this, cx| {
+                        if settle_aborted_transcription(&mut this.state) {
+                            this.advance_batch_queue(cx);
+                        }
+                        cx.notify();
+                    });
+                    break;
+                };
                 // Whisper 会连续产生大量事件，先聚合一个短窗口，保证 GPUI
                 // 每帧只执行一次实体更新，避免高频重入 App RefCell。
                 cx.background_executor()
@@ -1854,6 +1977,9 @@ impl MainWindow {
                     events.push(event);
                 }
 
+                // Finished/Error 是管线的终态事件：处理完就退出事件循环，不再等
+                // 通道关闭——终态之后不该再有任何事件改变界面状态。
+                let mut terminal = false;
                 let _ = this.update(cx, |this, cx| {
                     for event in events {
                         match event {
@@ -2007,6 +2133,7 @@ impl MainWindow {
                                 if this.state.batch_running {
                                     this.advance_batch_queue(cx);
                                 }
+                                terminal = true;
                             }
                             PipelineEvent::Error(err) => {
                                 if this.state.cancel_requested {
@@ -2031,11 +2158,16 @@ impl MainWindow {
                                 if this.state.batch_running {
                                     this.advance_batch_queue(cx);
                                 }
+                                terminal = true;
                             }
                         }
                     }
                     cx.notify();
                 });
+
+                if terminal {
+                    break;
+                }
             }
         })
         .detach();
@@ -2555,6 +2687,17 @@ impl MainWindow {
                 // 仅当当前抽取结果依然是最新位置时才提交 UI 渲染，杜绝旧帧闪现与滞后延迟感
                 if is_latest {
                     if let Ok(frame_path) = frame_result {
+                        // 顺手把这一帧解码成 GPUI 能直接上传的纹理数据。
+                        // 解码放后台线程：960 宽的 JPG 解一次十几毫秒，丢给渲染线程
+                        // 就是每次换帧稳定掉一帧；解码失败返回 None，渲染侧回退到
+                        // 「按路径交给 GPUI 加载」的老行为，功能不受影响。
+                        let decode_path = frame_path.clone();
+                        let decoded = cx
+                            .background_executor()
+                            .spawn(async move {
+                                crate::ui::editor::render_image_from_frame_file(&decode_path)
+                            })
+                            .await;
                         let _ = this.update(cx, |this, cx| {
                             // 在这里判一次存在性：`get_or_extract` 正常返回的路径都已落盘，
                             // 但磁盘帧目录会按「最近使用」裁剪——把存在性收敛到后台更新点，
@@ -2564,6 +2707,15 @@ impl MainWindow {
                             } else {
                                 None
                             };
+                            // 旧帧在这里只是「放下」（Arc 少一个引用），真正的纹理回收
+                            // 在渲染侧换图时做——只有那里拿得到 `&mut Window`，
+                            // 能调 `drop_image`（见 render_monitor_picture）。
+                            this.state.preview_frame_image =
+                                if this.state.preview_frame_path.is_some() {
+                                    decoded
+                                } else {
+                                    None
+                                };
                             cx.notify();
                         });
                     }
@@ -3048,25 +3200,24 @@ impl MainWindow {
     }
 
     /// 清空当前字幕列表中的全部译文，恢复单语状态。
+    ///
+    /// 清空整批译文同样是一次可撤销的编辑：快照、清空、落库、审计都在
+    /// [`clear_translations_with_undo`] 里。修前这里直接改 `segments`，用户误点
+    /// 一下整份译文就没了，连 Ctrl+Z 都救不回来。
     pub(crate) fn clear_all_translations(&mut self, cx: &mut Context<Self>) {
         if self.state.is_translating {
             self.notice = Some("翻译正在进行中，请先取消翻译再清空译文".to_string());
             cx.notify();
             return;
         }
-        let had_trans = self.state.segments.iter().any(|s| s.translation.is_some());
-        if !had_trans {
-            self.notice = Some("当前没有译文可清空".to_string());
-            cx.notify();
-            return;
-        }
-        for seg in &mut self.state.segments {
-            seg.translation = None;
-            seg.translation_lang = None;
-        }
-        self.state.segments_dirty = true;
-        self.state.flush_segments_if_dirty();
-        self.notice = Some("已清空全部译文，已恢复为单语显示".to_string());
+        self.notice = Some(
+            if clear_translations_with_undo(&mut self.state) {
+                "已清空全部译文，已恢复为单语显示"
+            } else {
+                "当前没有译文可清空"
+            }
+            .to_string(),
+        );
         cx.notify();
     }
 
@@ -3380,6 +3531,7 @@ impl MainWindow {
 #[cfg(test)]
 mod tests {
     use super::{editor_export_format_string, export_spec_for};
+    use crate::subtitle::Segment;
     use crate::ui::EditorExportFormat;
 
     /// 回归（重构护栏）：`perform_editor_export` 里原本内联着两份 match
@@ -3428,7 +3580,6 @@ mod tests {
     /// 空白显示成「翻译完成」；分母还必须排除空源句，否则会永远「部分完成」。
     #[test]
     fn translation_coverage_ignores_blank_translations_and_empty_sources() {
-        use crate::subtitle::Segment;
         let mut with_blank = Segment::new(1, 0.0, 1.0, "你好");
         with_blank.translation = Some("   ".to_string());
         with_blank.translation_lang = Some("English".to_string()); // 脏标签：有标签无译文
