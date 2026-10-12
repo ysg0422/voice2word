@@ -403,6 +403,34 @@ pub(crate) fn render_image_from_frame_file(path: &Path) -> Option<Arc<RenderImag
         1,
     ))))
 }
+/// 监视器画面来源判定。抽成纯函数是为了把「同版本第二次渲染不得掉回静态帧/
+/// 占位」这条语义脱离 GUI 单测钉住（见文件末尾 `mod tests`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MonitorPictureSource {
+    /// 播放器有画面，且本帧取到了未消费的新版本帧 → 重建 RenderImage
+    LiveNewFrame,
+    /// 播放器有画面，但本版本已消费过 → 复用已构建的 RenderImage（不得重建、不得掉静态帧）
+    LiveReuse,
+    /// 播放器有画面，但既没有新帧也没有可用纹理 → 留空等下一帧（不得掉静态帧）
+    LivePending,
+    /// 播放器无画面（未播放 / `stop()` 之后）→ 静态时间轴帧 / 占位链路
+    Static,
+}
+
+pub(crate) fn monitor_picture_source(
+    has_live_picture: bool,
+    has_new_frame: bool,
+    has_cached_image: bool,
+) -> MonitorPictureSource {
+    if !has_live_picture {
+        return MonitorPictureSource::Static;
+    }
+    match (has_new_frame, has_cached_image) {
+        (true, _) => MonitorPictureSource::LiveNewFrame,
+        (false, true) => MonitorPictureSource::LiveReuse,
+        (false, false) => MonitorPictureSource::LivePending,
+    }
+}
 impl MainWindow {
     /// 渲染类似剪映 / Premiere 风格的剪辑工作区布局 (左中右之 中：视频与时间轴，右：字幕属性)
     pub(crate) fn render_editor_layout(
@@ -898,24 +926,28 @@ impl MainWindow {
     /// 监视器画面内容：实时内嵌播放帧 vs 静态时间轴帧 vs 占位提示。
     /// 帧尺寸随视频真实宽高比动态变化，纹理构建与缓存均以本帧自带尺寸为准。
     fn render_monitor_picture(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let live_frame = self.state.video_player.get_frame();
-        let live_version = self.state.video_player.frame_version();
+        // 「当前有画面」由播放器侧维护（发布帧置 true、stop() 置 false、暂停保留定格帧）：
+        // 帧被 `take_unconsumed_frame` 取走后槽位本来就是空的，旧的
+        // `get_frame().is_some()` 判据会把「画面已交给 UI 显示」误判成「没有画面」。
+        let has_live_picture = self.state.video_player.has_live_picture();
+        // 只有未消费的新版本帧才会被取走（槽位里的 Arc 直接移交，不 clone 数据）。
+        // 同一版本的第二次渲染拿到 None——此时复用 `cached_live_image` 里的纹理，
+        // 绝不能因为「没取到帧」掉回静态帧/占位（那会闪）。
+        let live_frame = self.state.video_player.take_unconsumed_frame();
+        let source = monitor_picture_source(
+            has_live_picture,
+            live_frame.is_some(),
+            self.cached_live_image.is_some(),
+        );
 
-        if let Some(frame) = live_frame {
+        if source != MonitorPictureSource::Static {
             // GPUI RenderImage 底层纹理严格要求 BGRA 格式（wgpu::TextureFormat::Bgra8Unorm），FFmpeg 已按 bgra 直出。
-            // 按 (帧版本, 尺寸) 缓存 RenderImage：未变直接复用（零拷贝、零纹理重传），仅新帧到来时重建一次。
-            let (frame_w, frame_h) = (frame.width, frame.height);
-            let cached_hit = match self.cached_live_image.as_ref() {
-                Some((version, width, height, cached_img))
-                    if *version == live_version && *width == frame_w && *height == frame_h =>
-                {
-                    Some(cached_img.clone())
-                }
-                _ => None,
-            };
-            let render_img: Option<Arc<RenderImage>> = match cached_hit {
-                Some(cached_img) => Some(cached_img),
-                None => {
+            // 画面来源只由 `monitor_picture_source` 决定：新版本帧重建纹理、同版本复用缓存。
+            let render_img: Option<Arc<RenderImage>> = match (source, live_frame) {
+                (MonitorPictureSource::LiveNewFrame, Some((version, frame))) => {
+                    let (frame_w, frame_h) = (frame.width, frame.height);
+                    // 帧已被 take 成独占 Arc，`try_unwrap` 必然成功——这里就是每帧
+                    // 3.7MB 深拷贝的消失点；clone 兜底只防异常路径 panic。
                     let data = match Arc::try_unwrap(frame) {
                         Ok(f) => f.data,
                         Err(arc) => arc.data.clone(),
@@ -935,12 +967,21 @@ impl MainWindow {
                                 cx.drop_image(old, Some(window));
                             }
                             self.cached_live_image =
-                                Some((live_version, frame_w, frame_h, new_img.clone()));
+                                Some((version, frame_w, frame_h, new_img.clone()));
                             Some(new_img)
                         }
                         None => None,
                     }
                 }
+                // 同版本第二次渲染：复用已构建的纹理。(版本, 宽, 高) 判据由 take 协议
+                // 保证——播放器只在版本前进时交出帧，能进这里缓存就是当前版本的图。
+                (MonitorPictureSource::LiveReuse, _) => self
+                    .cached_live_image
+                    .as_ref()
+                    .map(|(_, _, _, cached_img)| cached_img.clone()),
+                // 有画面但这帧既没有新帧也没有缓存纹理（首帧未到 / 缓存缺失）：留空等
+                // 下一帧，同样不得掉回静态帧分支。
+                _ => None,
             };
             if let Some(render_img) = render_img {
                 div()
@@ -5845,8 +5886,9 @@ impl MainWindow {
 mod tests {
     use super::{
         click_seek_target, fit_video_size, is_playing_at, karaoke_mark_style, karaoke_word_marks,
-        monitor_screen_size, raw_line_byte_start, render_image_from_frame_file, WordMark,
-        EDITOR_STACK_MONITOR_H, MONITOR_VIDEO_FIT_FRAC,
+        monitor_picture_source, monitor_screen_size, raw_line_byte_start,
+        render_image_from_frame_file, MonitorPictureSource, WordMark, EDITOR_STACK_MONITOR_H,
+        MONITOR_VIDEO_FIT_FRAC,
     };
     use crate::subtitle::segment::WordTiming;
     use crate::subtitle::{ExportMode, Segment};
@@ -6271,5 +6313,41 @@ mod tests {
             "不存在的路径应返回 None"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 监视器画面来源判据：播放器「有画面」时，同版本的第二次渲染必须复用已建好的
+    /// 纹理——掉回静态帧/占位会在稳定播放与暂停定格时整帧闪一下；而 `stop()` 之后
+    /// （`has_live_picture=false`）即使 `cached_live_image` 里还留着旧纹理，
+    /// 也必须回到静态定位帧链路，否则跳转后会看到跳转前的旧画面。
+    #[test]
+    fn monitor_picture_source_pins_live_reuse_and_stop_fallback() {
+        // 取到新版本帧：重建（唯一一次 take，之后槽位为空）
+        assert_eq!(
+            monitor_picture_source(true, true, true),
+            MonitorPictureSource::LiveNewFrame
+        );
+        assert_eq!(
+            monitor_picture_source(true, true, false),
+            MonitorPictureSource::LiveNewFrame
+        );
+        // 同版本第二次渲染：复用缓存纹理，不得落回静态帧
+        assert_eq!(
+            monitor_picture_source(true, false, true),
+            MonitorPictureSource::LiveReuse
+        );
+        // 有画面但没纹理（首帧未到/缓存缺失）：留空等下一帧，也不落静态帧
+        assert_eq!(
+            monitor_picture_source(true, false, false),
+            MonitorPictureSource::LivePending
+        );
+        // stop() 之后：播放器无画面，缓存里残留的旧纹理不得拦住静态帧链路
+        assert_eq!(
+            monitor_picture_source(false, false, true),
+            MonitorPictureSource::Static
+        );
+        assert_eq!(
+            monitor_picture_source(false, true, false),
+            MonitorPictureSource::Static
+        );
     }
 }

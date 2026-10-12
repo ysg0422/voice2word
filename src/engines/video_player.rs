@@ -36,8 +36,17 @@ pub struct VideoPlayerEngine {
     ffplay_path: PathBuf,
     policy: DecodePolicy,
 
-    // 以 Arc 共享最新帧：出帧线程写入，UI 只克隆指针，杜绝每帧 3.68MB 深拷贝
+    // 以 Arc 共享最新帧：出帧线程写入，UI 通过 `take_unconsumed_frame` **取走**，
+    // 取走即独占（引用计数 1），杜绝每帧 3.68MB 深拷贝。
     current_frame: Arc<Mutex<Option<Arc<PlayerFrame>>>>,
+    /// 播放器当前是否持有一幅可显示的实时画面：发布帧时置 true、`stop()` 置 false，
+    /// 暂停（`pause_clock`）不动——定格帧仍算「有画面」。
+    /// UI 用它取代旧的 `get_frame().is_some()` 判据：帧被 UI 取走后槽位本来就是空的，
+    /// 但画面仍在 UI 的 RenderImage 缓存里显示，不能因此掉回静态帧分支（会闪）。
+    has_live_picture: Arc<AtomicBool>,
+    /// 已被 UI 消费（take）到的帧版本号：与 `frame_version` 相等即「本版本已取走」。
+    /// 同一版本的第二次渲染必须拿不到帧，否则会重复重建纹理、白拷一遍像素。
+    consumed_frame_version: AtomicU64,
     /// 出帧尺寸（随视频真实分辨率等比适配，set_frame_dimensions 驱动）
     frame_width: AtomicU32,
     frame_height: AtomicU32,
@@ -76,6 +85,8 @@ impl VideoPlayerEngine {
             ffplay_path: ffplay,
             policy,
             current_frame: Arc::new(Mutex::new(None)),
+            has_live_picture: Arc::new(AtomicBool::new(false)),
+            consumed_frame_version: AtomicU64::new(0),
             frame_width: AtomicU32::new(PLAYER_WIDTH),
             frame_height: AtomicU32::new(PLAYER_HEIGHT),
             frame_version: Arc::new(AtomicU64::new(0)),
@@ -94,9 +105,38 @@ impl VideoPlayerEngine {
     }
 
     /// 最新一帧 BGRA（播放中或暂停后都可用，严格匹配 GPUI Bgra8Unorm，避免红蓝颠倒与暂停闪黑）。
-    /// 返回 Arc 指针克隆而非深拷贝，UI 层配合 frame_version 缓存 RenderImage 实现零拷贝复用。
+    /// 返回 Arc 指针克隆而非深拷贝；UI 的正常路径走 `take_unconsumed_frame`，
+    /// 这里保留给「只看一眼、不接管所有权」的调用方与回归测试。
     pub fn get_frame(&self) -> Option<Arc<PlayerFrame>> {
         self.current_frame.lock().ok()?.clone()
+    }
+
+    /// 取走「尚未被 UI 消费」的当前帧：零拷贝，直接把槽位里的 `Arc<PlayerFrame>` 交出去。
+    ///
+    /// 返回 `Some((帧版本, 帧))` 当且仅当 `frame_version` 比已消费版本新；同一版本的
+    /// 第二次调用返回 `None`——UI 据此**复用**自己缓存的 RenderImage，而不是重建纹理，
+    /// 更不能因此掉回静态帧/占位（那会闪）。取走后槽位为空、Arc 引用计数为 1，
+    /// 调用方 `Arc::try_unwrap` 必然成功：这就是「每帧一次整帧深拷贝」的消失点。
+    pub fn take_unconsumed_frame(&self) -> Option<(u64, Arc<PlayerFrame>)> {
+        let mut lock = self.current_frame.lock().ok()?;
+        let version = self.frame_version.load(Ordering::SeqCst);
+        if version == self.consumed_frame_version.load(Ordering::SeqCst) {
+            return None;
+        }
+        // 版本比已消费新、槽位却为空：`stop()` 清帧会留下这种组合（版本号不回退）。
+        // 没有画面可取，也不推进已消费版本，等下一帧发布。
+        let frame = lock.take()?;
+        self.consumed_frame_version.store(version, Ordering::SeqCst);
+        Some((version, frame))
+    }
+
+    /// 播放器当前是否持有一幅可显示的实时画面（发布过帧且未 `stop()`；暂停保留定格帧）。
+    ///
+    /// UI 用它取代 `get_frame().is_some()`：帧被 UI 取走后槽位为空，但画面仍在 UI 的
+    /// RenderImage 缓存里，此时**不能**掉回静态帧分支。`stop()` 翻回 false 之后，
+    /// 监视器才能回到静态定位帧那条路（时间轴跳转、开始转写等入口都经过 `stop()`）。
+    pub fn has_live_picture(&self) -> bool {
+        self.has_live_picture.load(Ordering::SeqCst)
     }
 
     /// 设定视频源分辨率：在 1280x720 预算内等比适配出帧尺寸（偶数对齐）。
@@ -185,6 +225,10 @@ impl VideoPlayerEngine {
         if let Ok(mut lock) = self.current_frame.lock() {
             *lock = None;
         }
+        // 「当前有画面」判据与槽位同源翻回 false：UI 靠它取代 `get_frame().is_some()`
+        // （帧被 take 之后槽位本来就是空的，不能再当判据），回到静态定位帧那条路。
+        // 暂停不走这里，定格帧的判据保持 true。
+        self.has_live_picture.store(false, Ordering::SeqCst);
     }
 
     fn kill_procs(&self) {
@@ -368,6 +412,7 @@ impl VideoPlayerEngine {
 
         let frame_target = self.current_frame.clone();
         let frame_version_target = self.frame_version.clone();
+        let has_live_picture_target = self.has_live_picture.clone();
         let is_playing_flag = self.is_playing.clone();
         let generation = self.generation.clone();
         let play_instant_target = self.play_start_instant.clone();
@@ -426,6 +471,7 @@ impl VideoPlayerEngine {
                             if !try_publish_frame(
                                 &frame_target,
                                 &frame_version_target,
+                                &has_live_picture_target,
                                 &generation,
                                 &is_playing_flag,
                                 gen,
@@ -560,6 +606,7 @@ impl VideoPlayerEngine {
 fn try_publish_frame(
     frame_slot: &Mutex<Option<Arc<PlayerFrame>>>,
     frame_version: &AtomicU64,
+    has_live_picture: &AtomicBool,
     generation: &AtomicU64,
     is_playing: &AtomicBool,
     gen: u64,
@@ -574,6 +621,9 @@ fn try_publish_frame(
     }
     *lock = Some(Arc::new(frame));
     frame_version.fetch_add(1, Ordering::SeqCst);
+    // 「当前有画面」判据在**锁内**置位：UI 先看到 true，再 take 必定能看到帧；
+    // 反过来（先置位再写槽位）会让 UI 取到空槽位而误判没有画面。
+    has_live_picture.store(true, Ordering::SeqCst);
     true
 }
 
@@ -727,6 +777,7 @@ mod tests {
         assert!(try_publish_frame(
             &engine.current_frame,
             &engine.frame_version,
+            &engine.has_live_picture,
             &engine.generation,
             &engine.is_playing,
             stale_gen,
@@ -740,6 +791,7 @@ mod tests {
         assert!(!try_publish_frame(
             &engine.current_frame,
             &engine.frame_version,
+            &engine.has_live_picture,
             &engine.generation,
             &engine.is_playing,
             stale_gen,
@@ -758,6 +810,7 @@ mod tests {
         assert!(!try_publish_frame(
             &engine.current_frame,
             &engine.frame_version,
+            &engine.has_live_picture,
             &engine.generation,
             &engine.is_playing,
             stale_gen,
@@ -769,6 +822,7 @@ mod tests {
         assert!(try_publish_frame(
             &engine.current_frame,
             &engine.frame_version,
+            &engine.has_live_picture,
             &engine.generation,
             &engine.is_playing,
             new_gen,
@@ -801,5 +855,157 @@ mod tests {
             is_playing.load(Ordering::SeqCst),
             "spawn 成功不应复位播放状态"
         );
+    }
+
+    /// 零拷贝协议：新版本帧只交出去一次，且交出去的必须是**独占** Arc。
+    ///
+    /// 引用计数为 1 才能让 UI 侧 `Arc::try_unwrap` 必然成功——这条断言就是
+    /// 「每帧 3.7MB 深拷贝」消失的证据。同一版本第二次取帧必须拿不到：
+    /// UI 拿到 None 就该复用自己缓存的 RenderImage，而不是重建/掉静态帧。
+    #[test]
+    fn take_unconsumed_frame_hands_over_exclusive_arc_once() {
+        let engine = VideoPlayerEngine::new("ffmpeg");
+        engine.is_playing.store(true, Ordering::SeqCst);
+        let gen = engine.generation();
+        assert!(try_publish_frame(
+            &engine.current_frame,
+            &engine.frame_version,
+            &engine.has_live_picture,
+            &engine.generation,
+            &engine.is_playing,
+            gen,
+            frame_with_marker(0x5A),
+        ));
+
+        let (v1, f1) = engine.take_unconsumed_frame().expect("新版本帧应能取走");
+        assert_eq!(v1, engine.frame_version());
+        assert_eq!(f1.data[0], 0x5A, "取到的应是刚发布的那一帧");
+        assert_eq!(
+            Arc::strong_count(&f1),
+            1,
+            "取走后必须独占：UI 侧 try_unwrap 才会成功（零拷贝）"
+        );
+        assert!(engine.get_frame().is_none(), "帧取走后槽位应为空");
+        assert!(
+            engine.take_unconsumed_frame().is_none(),
+            "同一版本不得二次取帧：UI 必须复用已缓存的纹理"
+        );
+
+        // 新版本发布后再次可取：版本号单调前进
+        assert!(try_publish_frame(
+            &engine.current_frame,
+            &engine.frame_version,
+            &engine.has_live_picture,
+            &engine.generation,
+            &engine.is_playing,
+            gen,
+            frame_with_marker(0x6B),
+        ));
+        let (v2, f2) = engine.take_unconsumed_frame().expect("新版本帧应能取走");
+        assert!(v2 > v1, "帧版本必须单调前进: {v1} -> {v2}");
+        assert_eq!(f2.data[0], 0x6B);
+        assert!(engine.take_unconsumed_frame().is_none());
+    }
+
+    /// 会话重启回归：`stop()`（时间轴跳转 / 上下句 / 暂停都经过它）清帧之后，
+    /// 新会话的首帧必须能正常取到——消费游标不能因为清帧而卡死。
+    #[test]
+    fn take_recovers_after_stop_once_new_session_publishes() {
+        let engine = VideoPlayerEngine::new("ffmpeg");
+        engine.is_playing.store(true, Ordering::SeqCst);
+        let gen1 = engine.generation();
+        assert!(try_publish_frame(
+            &engine.current_frame,
+            &engine.frame_version,
+            &engine.has_live_picture,
+            &engine.generation,
+            &engine.is_playing,
+            gen1,
+            frame_with_marker(0x41),
+        ));
+        assert!(engine.take_unconsumed_frame().is_some());
+        assert!(engine.take_unconsumed_frame().is_none());
+
+        engine.stop();
+        assert!(
+            engine.take_unconsumed_frame().is_none(),
+            "stop() 后槽位已清，不应有帧可取"
+        );
+
+        // 新会话：play() 会先 stop() 再自增代次（这里只模拟这两步）
+        engine.is_playing.store(true, Ordering::SeqCst);
+        let gen2 = engine.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(try_publish_frame(
+            &engine.current_frame,
+            &engine.frame_version,
+            &engine.has_live_picture,
+            &engine.generation,
+            &engine.is_playing,
+            gen2,
+            frame_with_marker(0x42),
+        ));
+        let (v, f) = engine.take_unconsumed_frame().expect("新会话首帧应能取走");
+        assert!(v > 1, "版本号必须继续单调前进: {v}");
+        assert_eq!(f.data[0], 0x42);
+        assert!(engine.has_live_picture(), "新会话发布帧后判据应为 true");
+    }
+
+    /// 「当前有画面」判据：发布置 true、暂停保留 true、`stop()` 置 false。
+    ///
+    /// UI 用它取代 `get_frame().is_some()`；而帧被 take 之后槽位为空，
+    /// 判据绝不能因此翻回 false（否则暂停定格时会闪回静态帧/占位）。
+    #[test]
+    fn live_picture_flag_tracks_publish_pause_and_stop() {
+        let engine = VideoPlayerEngine::new("ffmpeg");
+        assert!(!engine.has_live_picture(), "未发布过帧不该有画面");
+
+        engine.is_playing.store(true, Ordering::SeqCst);
+        let gen = engine.generation();
+        assert!(try_publish_frame(
+            &engine.current_frame,
+            &engine.frame_version,
+            &engine.has_live_picture,
+            &engine.generation,
+            &engine.is_playing,
+            gen,
+            frame_with_marker(0x21),
+        ));
+        assert!(engine.has_live_picture(), "发布帧后判据应为 true");
+
+        // 帧被 UI 取走：槽位空了，但画面已交给 UI 显示，判据必须仍是 true
+        let _ = engine.take_unconsumed_frame().expect("新版本帧应能取走");
+        assert!(engine.get_frame().is_none(), "取走后槽位应为空");
+        assert!(
+            engine.has_live_picture(),
+            "画面已交给 UI 缓存，判据不能因槽位为空而变 false"
+        );
+
+        // 暂停保留定格帧：判据不动
+        engine.pause_clock();
+        assert!(
+            engine.has_live_picture(),
+            "暂停必须保留定格帧的「有画面」判据"
+        );
+
+        // stop()：判据翻回 false，UI 回到静态定位帧那条路
+        engine.stop();
+        assert!(!engine.has_live_picture(), "stop() 后判据必须为 false");
+        assert!(
+            engine.take_unconsumed_frame().is_none(),
+            "stop() 后不应有帧可取"
+        );
+
+        // stop() 之后过期帧的写回被拒，也不得把判据翻回 true
+        engine.is_playing.store(true, Ordering::SeqCst);
+        assert!(!try_publish_frame(
+            &engine.current_frame,
+            &engine.frame_version,
+            &engine.has_live_picture,
+            &engine.generation,
+            &engine.is_playing,
+            gen,
+            frame_with_marker(0x31),
+        ));
+        assert!(!engine.has_live_picture(), "过期帧不得把判据翻回 true");
     }
 }

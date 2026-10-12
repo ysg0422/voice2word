@@ -906,6 +906,41 @@ pub(crate) struct DerivedSnapshot {
     pub(crate) quality_report: Arc<QualityReport>,
 }
 
+/// 术语表原文的内容指纹：`(UTF-8 字节长度, FNV-1a 64 位哈希)`。
+///
+/// # 为什么键里存指纹而不是原文
+///
+/// 键里放 `String` 的话，每个构造键的调用点都得先 `glossary.clone()`——`derived_snapshot()`
+/// 每帧被多处消费，等于每帧白拷好几份可能上 KB 的术语表原文，只为做一次内容比较。
+/// 指纹是定长 `Copy` 值，进键零堆分配。
+///
+/// # 为什么与「按字符串相等」等价
+///
+/// 内容不变 ⇒ 长度与哈希都不变（纯函数），必命中；内容变了（哪怕字节长度不变）
+/// 哈希几乎必然变，必重算。算法与 `src/utils/frame_cache.rs` 的 `stable_hash`
+/// **逐字等价**（那边是私有 fn，本次改动范围不允许改它，因此这里放一份等价实现，
+/// 双方注释互相指认；将来若要统一，应把它提为 `pub(crate)` 后删掉这份）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GlossaryFingerprint {
+    /// 原文的 UTF-8 字节长度。
+    pub(crate) len: usize,
+    /// FNV-1a 64 位哈希值。
+    pub(crate) hash: u64,
+}
+
+/// 计算 [`GlossaryFingerprint`]：FNV-1a 64 位，纯函数、跨进程稳定。
+pub(crate) fn glossary_fingerprint(text: &str) -> GlossaryFingerprint {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in text.as_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    GlossaryFingerprint {
+        len: text.len(),
+        hash,
+    }
+}
+
 /// [`DerivedSnapshot`] 的失效键：**所有**会改变快照内容的输入都在这里。
 ///
 /// 与三个既有缓存（`subtitle_filter` / `glossary_bad_cache` / `low_confidence_cache`）
@@ -922,9 +957,10 @@ pub(crate) struct DerivedSnapshotKey {
     /// 的 `c < 阈值`。用 `to_bits` 与 `low_confidence_cache` 同法（浮点直接进键会
     /// 踩 `-0.0` / `NaN` 的比较语义）。
     pub(crate) low_confidence_bits: u64,
-    /// 术语表原文：`quality_report.glossary_violations` 的判据。按原文而不是解析后
-    /// 的条目比对：多算一次无所谓，漏算会出现「改了术语表、违规高亮不动」。
-    pub(crate) glossary: String,
+    /// 术语表原文的**内容指纹**：`quality_report.glossary_violations` 的判据。
+    /// 按原文而不是解析后的条目比对：多算一次无所谓，漏算会出现「改了术语表、
+    /// 违规高亮不动」。存指纹而非原文见 [`GlossaryFingerprint`]：取键零 clone。
+    pub(crate) glossary_fingerprint: GlossaryFingerprint,
     /// 样式里的单行字数上限：`stats` 的「单行长句」门槛。
     pub(crate) max_chars_per_line: u32,
     /// 统计用的媒体总时长（秒，取 [`stats_media_secs`]）的位模式。
@@ -1005,11 +1041,13 @@ pub(crate) fn cached_derived_snapshot(
     snapshot
 }
 
-/// 术语表违规下标缓存的键：`(术语表原文, segments_revision)`。
+/// 术语表违规下标缓存的键：`(术语表原文指纹, segments_revision)`。
 ///
-/// 键用**原文**而不是解析后的条目：用户改术语表的行为都会改这串文本，
-/// 而解析结果一旦因为上限截断等原因与原文不同步，就会出现「改了术语表、高亮不动」。
-pub(crate) type GlossaryBadKey = (String, u64);
+/// 键用**原文的指纹**而不是解析后的条目：用户改术语表的行为都会改这串文本，
+/// 而解析结果一旦因为上限截断等原因与原文不同步，就会出现「改了术语表、高亮不动」；
+/// 也不存原文本身——与 [`DerivedSnapshotKey`] 共用 [`GlossaryFingerprint`]，
+/// 命中与失效路径都不再 clone 术语表文本（与按原文相等等价的论证见指纹类型文档）。
+pub(crate) type GlossaryBadKey = (GlossaryFingerprint, u64);
 
 /// 术语表违规下标缓存：值存 `Arc<[usize]>`，命中时只克隆引用计数。
 pub(crate) type GlossaryBadCache = Option<(GlossaryBadKey, Arc<[usize]>)>;
@@ -1018,26 +1056,26 @@ pub(crate) type GlossaryBadCache = Option<(GlossaryBadKey, Arc<[usize]>)>;
 ///
 /// 抽成自由函数（不吃 `AppState`）是为了能在无 GUI 上下文的单测里钉死两条性质：
 /// 「同键命中不重算、复用同一个 `Arc`」与「术语表文本或 `segments_revision` 变了必重算」。
-/// 命中路径**不 clone 术语表文本**——原实现每帧都 `glossary.clone()` 去拼键，
-/// 等于每帧白拷一份可能上 KB 的字符串，只为了立刻做一次字符串比较。
+/// 键里存的是[内容指纹](GlossaryFingerprint)而不是原文：原实现每次调用都
+/// `glossary.clone()` 去拼键，等于白拷一份可能上 KB 的字符串，只为了做一次比较；
+/// 指纹按值进键，命中与失效路径都不碰堆。与按原文相等等价的论证见该类型文档。
 pub(crate) fn glossary_violations_cached(
     cache: &mut GlossaryBadCache,
     glossary: &str,
     segments_revision: u64,
     compute: impl FnOnce() -> Vec<usize>,
 ) -> Arc<[usize]> {
+    // 指纹无论命中与否都只算一次：命中路径也靠它判等，失效路径直接复用这个值。
+    let fingerprint = glossary_fingerprint(glossary);
     if let Some((cached_key, cached)) = cache.as_ref() {
-        // 键判定与改造前逐字等价：术语表原文 + `segments_revision` 都相同才命中。
-        if cached_key.1 == segments_revision && cached_key.0 == glossary {
+        // 键判定与改造前等价：术语表内容指纹 + `segments_revision` 都相同才命中。
+        if cached_key.1 == segments_revision && cached_key.0 == fingerprint {
             return Arc::clone(cached);
         }
     }
     let result: Arc<[usize]> = compute().into();
-    // 只有真的失效才把术语表原文拷进新键（每帧最多一次，而不是每次调用）。
-    *cache = Some((
-        (glossary.to_string(), segments_revision),
-        Arc::clone(&result),
-    ));
+    // 新键只存定长指纹，不 clone 术语表原文（每帧最多一次，现在连那一次也省了）。
+    *cache = Some(((fingerprint, segments_revision), Arc::clone(&result)));
     result
 }
 
@@ -1266,8 +1304,9 @@ impl MainWindow {
     /// 术语表为空时直接返回空（零开销）；否则每帧最多重算一次，而不是在虚拟列表的
     /// 逐行闭包里现算——那会对「可视行 × 术语条数」重复匹配，纯属浪费。
     ///
-    /// 返回 `Arc<[usize]>`：命中只克隆引用计数，术语表原文也只参与**按引用**比较
-    /// （原实现每次调用都 `glossary.clone()` 拼键 + `Vec::clone()` 深拷贝结果）。
+    /// 返回 `Arc<[usize]>`：命中只克隆引用计数；键里存的是术语表原文的内容指纹
+    /// （[`GlossaryFingerprint`]，与派生快照共用），不再像原实现那样每次调用都
+    /// `glossary.clone()` 拼键 + `Vec::clone()` 深拷贝结果。
     pub(crate) fn cached_glossary_violations_arc(&mut self) -> Arc<[usize]> {
         let state = &self.state;
         let glossary = state.config.translate.glossary.as_str();
@@ -1323,7 +1362,7 @@ impl MainWindow {
             segments_revision: self.state.segments_revision,
             target_lang: self.state.translate_target_lang.clone(),
             low_confidence_bits: self.state.config.pipeline.whisper_low_confidence.to_bits(),
-            glossary: self.state.config.translate.glossary.clone(),
+            glossary_fingerprint: glossary_fingerprint(&self.state.config.translate.glossary),
             max_chars_per_line: self.state.config.subtitle_style.max_chars_per_line,
             media_secs_bits: stats_media_secs(&self.state).to_bits(),
         };
@@ -2632,10 +2671,10 @@ fn should_ignore_delete_in_status(status: &ProcessStatus) -> bool {
 mod tests {
     use super::{
         build_derived_snapshot, cached_derived_snapshot, filter_cache_usable, filter_commands,
-        glossary_violations_cached, has_any_translation, has_distinct_translation,
-        insert_printable_key, move_palette_selection_row, should_ignore_delete_in_status,
-        translated_other_lang_count, DerivedSnapshot, DerivedSnapshotKey, GlossaryBadCache,
-        PALETTE_COMMANDS,
+        glossary_fingerprint, glossary_violations_cached, has_any_translation,
+        has_distinct_translation, insert_printable_key, move_palette_selection_row,
+        should_ignore_delete_in_status, translated_other_lang_count, DerivedSnapshot,
+        DerivedSnapshotKey, GlossaryBadCache, GlossaryFingerprint, PALETTE_COMMANDS,
     };
     use crate::subtitle::Segment;
     use std::cell::Cell;
@@ -3012,9 +3051,21 @@ mod tests {
             segments_revision: revision,
             target_lang: target.to_string(),
             low_confidence_bits: (-0.35f64).to_bits(),
-            glossary: String::new(),
+            glossary_fingerprint: glossary_fingerprint(""),
             max_chars_per_line: 20,
             media_secs_bits: 60.0f64.to_bits(),
+        }
+    }
+
+    /// 带指定的术语表原文构造测试用键：内部显式走一次指纹计算，测试里不出现原文克隆。
+    fn sample_derived_key_with_glossary(
+        revision: u64,
+        target: &str,
+        glossary: &str,
+    ) -> DerivedSnapshotKey {
+        DerivedSnapshotKey {
+            glossary_fingerprint: glossary_fingerprint(glossary),
+            ..sample_derived_key(revision, target)
         }
     }
 
@@ -3072,7 +3123,7 @@ mod tests {
                 ..base.clone()
             },
             DerivedSnapshotKey {
-                glossary: "苹果=Apple".to_string(),
+                glossary_fingerprint: glossary_fingerprint("苹果=Apple"),
                 ..base.clone()
             },
             DerivedSnapshotKey {
@@ -3098,6 +3149,117 @@ mod tests {
             assert_eq!(builds.get(), 2, "配置变化必须重算");
             assert!(!Arc::ptr_eq(&first, &second));
         }
+    }
+
+    /// 术语表**内容变了**必须重算：这里用长度不同的两份文本。
+    #[test]
+    fn derived_cache_recomputes_when_glossary_content_grows() {
+        let mut cache = None;
+        let builds = Cell::new(0usize);
+        let first = cached_derived_snapshot(
+            &mut cache,
+            sample_derived_key_with_glossary(7, "中文", "苹果=Apple"),
+            || {
+                builds.set(builds.get() + 1);
+                sample_derived_snapshot()
+            },
+        );
+        let second = cached_derived_snapshot(
+            &mut cache,
+            sample_derived_key_with_glossary(7, "中文", "苹果=Apple\n香蕉=Banana"),
+            || {
+                builds.set(builds.get() + 1);
+                sample_derived_snapshot()
+            },
+        );
+        assert_eq!(builds.get(), 2, "术语表内容变化（长度不同）必须重算");
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    /// 术语表**内容变了**必须重算：**字节长度相同**的情况。只把长度塞进键是不够的，
+    /// 等长替换（用户把某个词条改掉、长度恰好不变）必须能区分出来。
+    #[test]
+    fn derived_cache_recomputes_when_glossary_same_len_content_changes() {
+        assert_eq!(
+            "苹果=Apple".len(),
+            "苹果=Appla".len(),
+            "测试前提：两份文本字节长度相同"
+        );
+        assert_ne!(
+            glossary_fingerprint("苹果=Apple"),
+            glossary_fingerprint("苹果=Appla"),
+            "指纹必须区分等长的不同内容（否则键会漏判）"
+        );
+
+        let mut cache = None;
+        let builds = Cell::new(0usize);
+        let first = cached_derived_snapshot(
+            &mut cache,
+            sample_derived_key_with_glossary(7, "中文", "苹果=Apple"),
+            || {
+                builds.set(builds.get() + 1);
+                sample_derived_snapshot()
+            },
+        );
+        let second = cached_derived_snapshot(
+            &mut cache,
+            sample_derived_key_with_glossary(7, "中文", "苹果=Appla"),
+            || {
+                builds.set(builds.get() + 1);
+                sample_derived_snapshot()
+            },
+        );
+        assert_eq!(builds.get(), 2, "等长的术语表内容变化必须重算");
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    /// 术语表**内容不变**必须命中：两份独立算出的指纹（同一内容的两次取键）必须判等，
+    /// 否则会出现「什么都没改，快照却每帧重算」的回退。
+    #[test]
+    fn derived_cache_hits_when_glossary_content_unchanged() {
+        let mut cache = None;
+        let builds = Cell::new(0usize);
+        let first = cached_derived_snapshot(
+            &mut cache,
+            sample_derived_key_with_glossary(7, "中文", "生成器=engine"),
+            || {
+                builds.set(builds.get() + 1);
+                sample_derived_snapshot()
+            },
+        );
+        let second = cached_derived_snapshot(
+            &mut cache,
+            sample_derived_key_with_glossary(7, "中文", "生成器=engine"),
+            || {
+                builds.set(builds.get() + 1);
+                sample_derived_snapshot()
+            },
+        );
+        assert_eq!(builds.get(), 1, "术语表内容不变必须命中，不得重算");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// 指纹算法与 `src/utils/frame_cache.rs::stable_hash` 同源：空输入的哈希必须是
+    /// FNV-1a 的 offset basis，'a' 必须等于「basis ^ 'a' 再乘质数」——固定值钉死，
+    /// 防止以后被换成 `DefaultHasher`（那个跨进程不稳定，两处缓存键就再也对不上）。
+    #[test]
+    fn glossary_fingerprint_matches_fnv1a_reference() {
+        assert_eq!(
+            glossary_fingerprint(""),
+            GlossaryFingerprint {
+                len: 0,
+                hash: 0xcbf2_9ce4_8422_2325,
+            }
+        );
+        let expected_a = (0xcbf2_9ce4_8422_2325u64 ^ 0x61).wrapping_mul(0x0000_0100_0000_01b3);
+        assert_eq!(
+            glossary_fingerprint("a"),
+            GlossaryFingerprint {
+                len: 1,
+                hash: expected_a,
+            }
+        );
+        assert_eq!(glossary_fingerprint("中文").len, 6, "长度按 UTF-8 字节算");
     }
 
     /// 快照必须与「直接调用原函数」逐字段一致——纯性能重构的底线：只要有一个字段
