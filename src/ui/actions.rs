@@ -2050,52 +2050,66 @@ impl MainWindow {
                                     // 并逐条重抽波形。
                                     let in_batch = this.state.batch_running;
 
-                                    // 1. 存入数据库历史记录 (包含 5 阶段性能统计指标)
-                                    //    写库失败不能静默：否则这条转写结果不会出现在历史库里，
-                                    //    后续「保存字幕」也会因 active_task_id 为空而无处可写。
-                                    //    先把错误收在局部，等第 2 步的 flush 走完再挂到提示条上——
-                                    //    flush 成功时会把 db_write_error 清空，顺序反过来会把这里的错误吞掉。
-                                    let mut new_task_id: Option<i64> = None;
-                                    let mut db_insert_error: Option<String> = None;
-                                    if let Some(ref path) = file_path {
-                                        match this.state.db.insert_task(
-                                            &path.to_string_lossy(),
-                                            &filename,
-                                            total_dur,
-                                            "completed",
-                                            &segments,
-                                            Some(&metrics),
-                                        ) {
-                                            Ok(id) => new_task_id = Some(id),
-                                            Err(err) => {
-                                                tracing::warn!(error = %err, "转写结果写入历史库失败");
-                                                db_insert_error = Some(format!("历史记录保存失败：{err}"));
-                                            }
-                                        }
-                                        this.state.refresh_recent_tasks();
-                                        // 刚写入了新记录 → 让「0 秒命中」缓存失效，
-                                        // 否则再次选中同一文件会显示旧的命中状态
-                                        this.state.invalidate_cached_transcription();
-                                    }
+                                    // 1~2. 三件重活全部丢给后台：历史库写入（整份字幕 JSON 序列化 +
+                                    //      视频首尾采样指纹读盘）、最近任务列表刷新、上一个工程的
+                                    //      脏字幕落库。改前它们在渲染线程上一口气跑完，进度条刚
+                                    //      走到 100% 界面就僵住 0.3~1s，用户以为卡死。现在 UI
+                                    //      状态照旧立刻更新，只有「写库 / 读库 / 序列化」往后放。
+                                    //
+                                    //      后台任务内部顺序与改前逐条一致（刻意保证的语义）：
+                                    //      ① insert_task → ② 刷新最近任务 → ③ 用**旧**的
+                                    //      active_task_id 写回脏字幕。提示条的挂载顺序同理：
+                                    //      ③ 的结局先落地（成功会清空 db_write_error），① 的错误
+                                    //      最后补挂——反过来会被 flush 的成功顺手吞掉。
+                                    let old_task_id = this.state.active_task_id;
+                                    // ③ 的输入必须在替换 `segments` 之前抓下来：后台任务拿不到
+                                    // 即将被换掉的旧数组；脏标记也在这里就清掉，否则回写期间
+                                    // 用户任何一次落库都会把**新**工程的 segments 写进**旧**
+                                    // 工程的 id（静默数据损坏）。
+                                    let flush_payload = if this.state.segments_dirty {
+                                        this.state.segments_dirty = false;
+                                        Some(DirtySegmentFlush {
+                                            task_id: old_task_id,
+                                            segments: this.state.segments.clone(),
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                    // ① 的输入同理：`segments` 马上要交给状态，而 insert_task
+                                    // 只有后台任务用得到，提前克隆一份带过去。
+                                    let insert_payload = file_path.as_ref().map(|path| HistoryInsert {
+                                        file_path: path.to_string_lossy().to_string(),
+                                        file_name: filename.clone(),
+                                        duration: total_dur,
+                                        segments: segments.clone(),
+                                    });
+                                    let metrics_for_db = metrics.clone();
+                                    let db = this.state.db.clone();
+                                    // 派发时提示条上已有的写库错误（用户自己那次落库刚失败过）：
+                                    // 回写时只有它没被人改过，才允许按本次 flush 的结局清空它。
+                                    let db_error_at_spawn = this.state.db_write_error.clone();
 
                                     // 2. 将本次成果同步至剪辑校对工作台。
-                                    // 覆盖前先把上一个工程的未保存改动落库：批量连跑时
-                                    // 用户可能在上一支片子上改过字幕，不能默默丢掉。
-                                    // 注意顺序：这一步必须用**旧**的 active_task_id 写回，
-                                    // 所以新 id 要等 segments 换完之后才登记。
-                                    this.state.flush_segments_if_dirty();
-                                    // 第 1 步写历史库若失败，这里才补挂提示条：放在 flush 之后，
-                                    // 避免 flush 成功时把 db_write_error 清空、把这条错误顺手吞掉。
-                                    if let Some(msg) = db_insert_error {
-                                        // 与 flush 的错误并存时两条都留（flush 报的是上一个工程，本条报的是当前转写结果）。
-                                        this.state.record_db_write_error(msg);
-                                    }
+                                    //    覆盖前先把上一个工程的未保存改动落库（批量连跑时用户
+                                    //    可能在上一支片子上改过字幕，不能默默丢掉）——这件事
+                                    //    已随 ③ 一起进了后台队列。
+                                    //    注意顺序：③ 必须用**旧**的 active_task_id 写回，所以
+                                    //    新 id 要等这份结果在回写时确认仍属于当前文档才登记。
+                                    //    写库失败不能静默：否则这条转写结果不会出现在历史库里，
+                                    //    后续「保存字幕」也会因 active_task_id 为空而无处可写。
                                     if let Some(path) = file_path {
                                         this.state.selected_file = Some(path.clone());
                                         this.state.preview_source = Some(path);
                                     }
                                     this.state.segments = segments;
-                                    this.state.active_task_id = new_task_id;
+                                    // 登记 `active_task_id` 要用的 id 此刻还在后台，先记下这份
+                                    // 结果的「文档身份」：回写时若对不上，说明用户已经点开了别的
+                                    // 工程、或又开了一单转写，那就绝不能把这份 id 挂到当前的
+                                    // segments 上——后续「保存字幕」会写错行（静默数据损坏）。
+                                    let identity = DocumentIdentity {
+                                        active_task_id: old_task_id,
+                                        selected_file: this.state.selected_file.clone(),
+                                    };
                                     // 新一轮转写的结果替换了整份文档：撤销栈里还是上一支
                                     // 片子的快照，留着的话 Ctrl+Z 会把上一支的字幕灌进这一支，
                                     // 并按新的 active_task_id 落库覆盖刚写好的记录。
@@ -2111,6 +2125,73 @@ impl MainWindow {
                                     this.state.transcribe_file = None;
                                     this.state.transcribe_duration = 0.0;
 
+                                    // 4. 后台收尾的回写：写库结果按「最近任务 → 缓存失效 → 提示条
+                                    //    → 身份校验后登记 active_task_id」的顺序落地，与改前的
+                                    //    同步版逐条对应。
+                                    cx.spawn(async move |this, cx| {
+                                        let outcome = cx
+                                            .background_executor()
+                                            .spawn(async move {
+                                                finish_db_work(
+                                                    &db,
+                                                    insert_payload,
+                                                    Some(&metrics_for_db),
+                                                    flush_payload,
+                                                )
+                                            })
+                                            .await;
+                                        let _ = this.update(cx, |this, cx| {
+                                            // ② 最近任务列表：与改前一样只在查询成功时覆盖。
+                                            if let Some(tasks) = outcome.recent_tasks {
+                                                this.state.recent_tasks = tasks;
+                                            }
+                                            // 刚写入了新记录 → 让「0 秒命中」缓存失效，否则
+                                            // 再次选中同一文件会显示旧的命中状态（改前这一步
+                                            // 也只在有文件路径时做）。
+                                            if outcome.wrote_history {
+                                                this.state.invalidate_cached_transcription();
+                                            }
+                                            // ③ 的结局先落地（成功清空 db_write_error），① 的
+                                            // 错误最后补挂：反过来会被 flush 的成功顺手吞掉
+                                            // （改前注释解释过这一点）。
+                                            let applied_flush = flush_outcome_to_apply(
+                                                db_error_at_spawn.as_deref(),
+                                                this.state.db_write_error.as_deref(),
+                                                &outcome.flush,
+                                            );
+                                            this.state.db_write_error = finish_db_write_error(
+                                                this.state.db_write_error.take(),
+                                                &applied_flush,
+                                                outcome.insert_error,
+                                            );
+                                            // 主键与脏标记只在「这份结果仍属于当前文档」时登记：
+                                            // 后台这段时间里用户可能已经点开别的工程、或又开了
+                                            // 一单转写（判据与理由见 `still_same_document`）。
+                                            let current = DocumentIdentity {
+                                                active_task_id: this.state.active_task_id,
+                                                selected_file: this.state.selected_file.clone(),
+                                            };
+                                            if still_same_document(&identity, &current) {
+                                                if matches!(
+                                                    outcome.flush,
+                                                    SegmentFlushOutcome::Failed(_)
+                                                ) {
+                                                    // 与改前 flush 的失败语义一致：写失败要把
+                                                    // 脏标记置回，后续 flush 会重试，关窗守卫
+                                                    // 也仍会拦。
+                                                    this.state.segments_dirty = true;
+                                                }
+                                                this.state.active_task_id = outcome.new_task_id;
+                                            } else {
+                                                tracing::warn!(
+                                                    "收尾写库回写时当前文档已切换，跳过 active_task_id 登记（避免后续保存写到别的工程记录上）"
+                                                );
+                                            }
+                                            cx.notify();
+                                        });
+                                    })
+                                    .detach();
+
                                     if in_batch {
                                         // 批量模式：只结算这一条。波形提取与完成弹窗都留到
                                         // 队列跑完再一次性处理，否则每完成一条都要重抽一次
@@ -2119,7 +2200,7 @@ impl MainWindow {
                                     } else {
                                         this.ensure_waveform(cx);
 
-                                        // 4. 弹出全屏转写完成提醒弹窗 (包含性能基准看板)
+                                        // 5. 弹出全屏转写完成提醒弹窗 (包含性能基准看板)
                                         this.completion_dialog = Some(CompletionDialogInfo {
                                             file_name: filename,
                                             segment_count: seg_count,
@@ -2684,40 +2765,64 @@ impl MainWindow {
                     lock.is_none()
                 };
 
-                // 仅当当前抽取结果依然是最新位置时才提交 UI 渲染，杜绝旧帧闪现与滞后延迟感
-                if is_latest {
-                    if let Ok(frame_path) = frame_result {
-                        // 顺手把这一帧解码成 GPUI 能直接上传的纹理数据。
-                        // 解码放后台线程：960 宽的 JPG 解一次十几毫秒，丢给渲染线程
-                        // 就是每次换帧稳定掉一帧；解码失败返回 None，渲染侧回退到
-                        // 「按路径交给 GPUI 加载」的老行为，功能不受影响。
-                        let decode_path = frame_path.clone();
-                        let decoded = cx
-                            .background_executor()
-                            .spawn(async move {
-                                crate::ui::editor::render_image_from_frame_file(&decode_path)
-                            })
-                            .await;
-                        let _ = this.update(cx, |this, cx| {
-                            // 在这里判一次存在性：`get_or_extract` 正常返回的路径都已落盘，
-                            // 但磁盘帧目录会按「最近使用」裁剪——把存在性收敛到后台更新点，
-                            // 渲染路径就不必每帧对预览帧 `path.exists()`。
-                            this.state.preview_frame_path = if frame_path.exists() {
-                                Some(frame_path)
-                            } else {
-                                None
-                            };
-                            // 旧帧在这里只是「放下」（Arc 少一个引用），真正的纹理回收
-                            // 在渲染侧换图时做——只有那里拿得到 `&mut Window`，
-                            // 能调 `drop_image`（见 render_monitor_picture）。
-                            this.state.preview_frame_image =
-                                if this.state.preview_frame_path.is_some() {
-                                    decoded
+                match frame_result {
+                    Ok(frame_path) => {
+                        // 抽到帧就说明抽帧链路是通的：清零「连续失败」计数，下一次再连续
+                        // 失败会重新给一次提示（计数为什么放在进程级静态量里，见
+                        // `FRAME_FAILURE_STREAK`）。
+                        FRAME_FAILURE_STREAK.store(0, std::sync::atomic::Ordering::Relaxed);
+                        // 仅当当前抽取结果依然是最新位置时才提交 UI 渲染，杜绝旧帧闪现与滞后延迟感
+                        if is_latest {
+                            // 顺手把这一帧解码成 GPUI 能直接上传的纹理数据。
+                            // 解码放后台线程：960 宽的 JPG 解一次十几毫秒，丢给渲染线程
+                            // 就是每次换帧稳定掉一帧；解码失败返回 None，渲染侧回退到
+                            // 「按路径交给 GPUI 加载」的老行为，功能不受影响。
+                            let decode_path = frame_path.clone();
+                            let decoded = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    crate::ui::editor::render_image_from_frame_file(&decode_path)
+                                })
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                // 在这里判一次存在性：`get_or_extract` 正常返回的路径都已落盘，
+                                // 但磁盘帧目录会按「最近使用」裁剪——把存在性收敛到后台更新点，
+                                // 渲染路径就不必每帧对预览帧 `path.exists()`。
+                                this.state.preview_frame_path = if frame_path.exists() {
+                                    Some(frame_path)
                                 } else {
                                     None
                                 };
-                            cx.notify();
-                        });
+                                // 旧帧在这里只是「放下」（Arc 少一个引用），真正的纹理回收
+                                // 在渲染侧换图时做——只有那里拿得到 `&mut Window`，
+                                // 能调 `drop_image`（见 render_monitor_picture）。
+                                this.state.preview_frame_image =
+                                    if this.state.preview_frame_path.is_some() {
+                                        decoded
+                                    } else {
+                                        None
+                                    };
+                                cx.notify();
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        // 抽帧失败此前被 `if let Ok(...)` 整个吞掉：用户侧只看到「拖时间轴
+                        // 画面停在上一帧 / 空白」，没有任何解释。先保证日志，再在**连续**
+                        // 失败跨过阈值时给一次可见提示——每条失败都挂会刷屏（拖动一次
+                        // 时间轴就能触发几十次抽帧），所以只在阈值那一次提示。
+                        let streak = FRAME_FAILURE_STREAK
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            .saturating_add(1);
+                        tracing::warn!(error = %err, time_sec = time, streak, "画面预览抽帧失败");
+                        if let Some(msg) = frame_failure_notice(streak) {
+                            let _ = this.update(cx, |this, cx| {
+                                // 走中性提示条（notice）：取帧失败不影响转写与导出，
+                                // 不该染成 ProcessStatus::Failed 的错误态。
+                                this.notice = Some(msg.to_string());
+                                cx.notify();
+                            });
+                        }
                     }
                 }
             }
@@ -3528,11 +3633,229 @@ impl MainWindow {
     }
 }
 
+// ── 转写收尾（写库后台化）与画面预览抽帧的判定逻辑 ─────────────────────
+//
+// 下面这些是**纯函数 / 常量**，与 `MainWindow` 无关，所以能脱开 GPUI 单测：
+// 收尾流程本身要跑 sqlite + 后台线程，不适合硬造集成测试，可判定的部分都在这里。
+
+/// 画面预览抽帧的连续失败计数。
+///
+/// 为什么是进程级静态量、而不是抽帧 worker 里的局部变量：worker 在没有待处理请求
+/// 时会自行退出（见 `trigger_extract_frame`），下一次拖/点时间轴会另起一个 worker——
+/// 放在局部，用户「点一次失败一次、再点一次又失败」永远攒不到阈值，就只剩日志、
+/// 没有可见反馈。抽到一帧即清零，所以它是**连续**失败计数。
+static FRAME_FAILURE_STREAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 连续失败到这个次数才挂一次性提示（见 [`frame_failure_notice`]）。
+const FRAME_FAILURE_NOTICE_AFTER: u32 = 3;
+
+/// 抽帧连续失败时的一次性提示文案（**纯函数**）。
+///
+/// 只在「刚好跨过阈值」那一次返回文案：拖动时间轴一次能触发几十次抽帧，每条失败都
+/// 挂提示等于刷屏；`streak > 阈值` 返回 `None`，因为提示条上已经是同一条内容了。
+/// 一旦抽帧成功，计数清零（见调用点），下次再连续失败会重新提示一次。
+fn frame_failure_notice(streak: u32) -> Option<&'static str> {
+    (streak == FRAME_FAILURE_NOTICE_AFTER).then_some(
+        "画面预览取帧失败：可能是 ffmpeg 路径不正确、或视频文件被其它程序占用；字幕与导出不受影响",
+    )
+}
+
+/// 一次「脏字幕落库」（原 `flush_segments_if_dirty`）的结局。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SegmentFlushOutcome {
+    /// 没有脏数据：原逻辑里 flush 是零开销 no-op，不碰 `db_write_error`。
+    Skipped,
+    /// 写库成功（含「尚无主键、无需写库」）：原逻辑里 flush 会把 `db_write_error` 清空。
+    Saved,
+    /// 写库失败：原逻辑里 flush 会挂「字幕保存失败：…」并把脏标记置回。
+    Failed(String),
+}
+
+/// 把收尾里两处写库的结局折算成新的 `db_write_error`（**纯函数**）。
+///
+/// 顺序**必须**是「先 flush、后 insert」：反过来就会丢掉 insert 的错误——flush 成功
+/// 会把 `db_write_error` 清空，先挂上的那条会被顺手吞掉，用户再也看不到「这条转写
+/// 没进历史库」。拼接规则与 `AppState::record_db_write_error` 一致（「；」相连）。
+fn finish_db_write_error(
+    current: Option<String>,
+    flush: &SegmentFlushOutcome,
+    insert_error: Option<String>,
+) -> Option<String> {
+    let mut merged = match flush {
+        SegmentFlushOutcome::Skipped => current,
+        SegmentFlushOutcome::Saved => None,
+        SegmentFlushOutcome::Failed(err) => Some(append_db_write_error(
+            current,
+            format!("字幕保存失败：{err}"),
+        )),
+    };
+    if let Some(msg) = insert_error {
+        merged = Some(append_db_write_error(merged, msg));
+    }
+    merged
+}
+
+/// `AppState::record_db_write_error` 的同款拼接规则：已有提示时用「；」接上，不覆盖。
+fn append_db_write_error(current: Option<String>, msg: String) -> String {
+    match current {
+        Some(prev) => format!("{prev}；{msg}"),
+        None => msg,
+    }
+}
+
+/// 回写时该按哪个 flush 结局折算提示条（**纯函数**）。
+///
+/// 后台这段时间里用户自己的落库也可能失败、挂上**更新**的提示；那种情况下不能再用
+/// 本次 flush 的「成功」把它清掉——清掉等于告诉用户「都存好了」。所以只有状态里的
+/// 错误仍是派发时那一条，才原样采信 flush 的结局；否则只保留「本次 flush 也失败」
+/// 这一件新事实，其余不动。
+fn flush_outcome_to_apply(
+    spawned_with: Option<&str>,
+    current: Option<&str>,
+    flush: &SegmentFlushOutcome,
+) -> SegmentFlushOutcome {
+    if current == spawned_with {
+        return flush.clone();
+    }
+    if matches!(flush, SegmentFlushOutcome::Failed(_)) {
+        return flush.clone();
+    }
+    SegmentFlushOutcome::Skipped
+}
+
+/// 延后回写要用的「文档身份」快照。
+///
+/// 收尾的写库被挪到后台之后，回写时状态可能已经换人了：后台这段时间（JSON 序列化 +
+/// 视频指纹读盘 + 两次 SQLite 访问，几十到几百毫秒）里用户完全可能点开另一条历史
+/// 工程、或又开了一单转写。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DocumentIdentity {
+    /// 当前工程对应的历史库主键（本次转写的新 id 还没登记，这里记的仍是**旧**值）。
+    active_task_id: Option<i64>,
+    /// 当前工作台选中的媒体文件。
+    selected_file: Option<PathBuf>,
+}
+
+/// 延后回写落地前判一次：这份结果还属不属于当前文档（**纯函数**）。
+///
+/// 只比 `active_task_id` 与 `selected_file`：
+/// - 换工程（`load_task_with` / `load_from_cache`）两者都会变，换选片只变后者；
+/// - **不**比 `segments_revision`：用户随手编辑一句也会推进它，而那种情况下跳过登记
+///   会把后续「保存字幕」按旧 id 写回上一支片子——比不登记危险得多；
+/// - 也**不**用 `state.status`：批量模式下一条刚结束、下一条立刻开跑，状态是
+///   `Processing`，但这时登记 id 恰恰是对的（工作台就停在这条结果上）。
+fn still_same_document(expected: &DocumentIdentity, current: &DocumentIdentity) -> bool {
+    if current.active_task_id != expected.active_task_id {
+        return false;
+    }
+    if current.selected_file != expected.selected_file {
+        return false;
+    }
+    true
+}
+
+/// 「写历史库」这一步的全部输入（后台任务的入参，全是拥有所有权的数据）。
+struct HistoryInsert {
+    file_path: String,
+    file_name: String,
+    duration: f64,
+    segments: Vec<Segment>,
+}
+
+/// 上一个工程待回写的脏字幕（原 `flush_segments_if_dirty` 的输入）。
+struct DirtySegmentFlush {
+    /// **旧**工程的 `active_task_id`（`None` 表示尚未落库、无需写库）。
+    task_id: Option<i64>,
+    /// 当时内存里的整份字幕。
+    segments: Vec<Segment>,
+}
+
+/// 收尾后台任务的产出。
+struct DeferredFinishOutcome {
+    /// 本次是否有文件路径（决定要不要刷最近任务列表 / 失效「0 秒命中」缓存）。
+    wrote_history: bool,
+    /// 历史库写入失败提示（成功或没有路径时为 `None`）。
+    insert_error: Option<String>,
+    /// 待登记的 `active_task_id`（写入成功才有值；与改前一致，失败/无路径都落 `None`）。
+    new_task_id: Option<i64>,
+    /// 脏字幕落库的结局。
+    flush: SegmentFlushOutcome,
+    /// 最近任务列表（查询成功才有值，失败时保留旧列表）。
+    recent_tasks: Option<Vec<crate::storage::TaskRecord>>,
+}
+
+/// 收尾后台任务的干活部分：与改前同步版**逐条对齐**的三步。
+///
+/// 顺序是语义的一部分，不许重排：① 写历史库（含 segments JSON 序列化与视频指纹）
+/// → ② 查最近任务列表 → ③ 用**旧** `active_task_id` 回写上一个工程的脏字幕。
+/// 全是阻塞 IO，所以跑在后台线程上，返回值交给回写点落状态。
+fn finish_db_work(
+    db: &crate::storage::Database,
+    insert: Option<HistoryInsert>,
+    metrics: Option<&crate::core::PipelinePerformanceMetrics>,
+    flush: Option<DirtySegmentFlush>,
+) -> DeferredFinishOutcome {
+    // 改前这三件事都包在 `if let Some(path) = file_path` 里：没有文件路径时既不写库
+    // 也不刷列表，只剩 flush 可能要做。
+    let wrote_history = insert.is_some();
+    let mut new_task_id: Option<i64> = None;
+    let mut insert_error: Option<String> = None;
+    if let Some(payload) = insert {
+        match db.insert_task(
+            &payload.file_path,
+            &payload.file_name,
+            payload.duration,
+            "completed",
+            &payload.segments,
+            metrics,
+        ) {
+            Ok(id) => new_task_id = Some(id),
+            Err(err) => {
+                tracing::warn!(error = %err, "转写结果写入历史库失败");
+                insert_error = Some(format!("历史记录保存失败：{err}"));
+            }
+        }
+    }
+    // 与 `refresh_recent_tasks` 等价：只在查询成功时覆盖列表。
+    let recent_tasks = if wrote_history {
+        db.list_recent_tasks(50).ok()
+    } else {
+        None
+    };
+    // 与 `flush_segments_if_dirty` 等价。没有主键（尚未落库）时 `sync_segments_to_db`
+    // 直接返回 Ok，并且会清空 `db_write_error`——所以这里同样算「成功」。
+    let flush = match flush {
+        Some(payload) => match payload.task_id {
+            Some(id) => match db.update_task_segments(id, &payload.segments) {
+                Ok(()) => SegmentFlushOutcome::Saved,
+                Err(err) => {
+                    tracing::warn!(error = %err, "字幕写库失败，改动尚未持久化");
+                    SegmentFlushOutcome::Failed(err.to_string())
+                }
+            },
+            None => SegmentFlushOutcome::Saved,
+        },
+        None => SegmentFlushOutcome::Skipped,
+    };
+    DeferredFinishOutcome {
+        wrote_history,
+        insert_error,
+        new_task_id,
+        flush,
+        recent_tasks,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{editor_export_format_string, export_spec_for};
+    use super::{
+        editor_export_format_string, export_spec_for, finish_db_write_error,
+        flush_outcome_to_apply, frame_failure_notice, still_same_document, DocumentIdentity,
+        SegmentFlushOutcome,
+    };
     use crate::subtitle::Segment;
     use crate::ui::EditorExportFormat;
+    use std::path::PathBuf;
 
     /// 回归（重构护栏）：`perform_editor_export` 里原本内联着两份 match
     /// （枚举 -> 扩展名、枚举 -> 对话框过滤器名）。收敛成
@@ -3634,5 +3957,121 @@ mod tests {
             super::import_notice("a", 3, false, false),
             "已导入「a」3 句字幕"
         );
+    }
+
+    // ── 转写收尾（写库后台化）：提示条折算与延后回写判定 ──────────────────
+
+    /// 写历史库失败 + flush 成功：flush 成功会清空 `db_write_error`，insert 的错误必须
+    /// 仍然可见——这正是改前那段注释反复强调、也最容易被重排吞掉的一条。
+    #[test]
+    fn finish_db_write_error_keeps_insert_error_after_flush_clears_notice() {
+        let merged = finish_db_write_error(
+            Some("上一次的失败".to_string()),
+            &SegmentFlushOutcome::Saved,
+            Some("历史记录保存失败：库被锁".to_string()),
+        );
+        assert_eq!(merged.as_deref(), Some("历史记录保存失败：库被锁"));
+    }
+
+    /// 两处都失败：两条都要留（flush 报的是上一个工程，insert 报的是本次结果），
+    /// 顺序也必须是「先 flush、后 insert」，与改前的挂载顺序一致。
+    #[test]
+    fn finish_db_write_error_keeps_both_failures_in_order() {
+        let merged = finish_db_write_error(
+            None,
+            &SegmentFlushOutcome::Failed("磁盘已满".to_string()),
+            Some("历史记录保存失败：库被锁".to_string()),
+        );
+        assert_eq!(
+            merged.as_deref(),
+            Some("字幕保存失败：磁盘已满；历史记录保存失败：库被锁")
+        );
+    }
+
+    /// 没有任何落库动作（不脏 + 无文件路径）时不能碰已有提示：改前 flush 是 no-op。
+    #[test]
+    fn finish_db_write_error_does_not_touch_notice_when_nothing_wrote() {
+        let merged = finish_db_write_error(
+            Some("上一次的失败".to_string()),
+            &SegmentFlushOutcome::Skipped,
+            None,
+        );
+        assert_eq!(merged.as_deref(), Some("上一次的失败"));
+    }
+
+    /// 延后回写的落地判据：文档身份一致才登记主键；换工程或换片子都必须跳过，
+    /// 否则后台回写会把主键挂到别的文档上，后续「保存字幕」写错行。
+    #[test]
+    fn deferred_finish_lands_only_while_document_identity_matches() {
+        let expected = DocumentIdentity {
+            active_task_id: Some(7),
+            selected_file: Some(PathBuf::from("a.mp4")),
+        };
+        assert!(still_same_document(&expected, &expected.clone()));
+        // 用户点开了另一条历史工程
+        assert!(!still_same_document(
+            &expected,
+            &DocumentIdentity {
+                active_task_id: Some(9),
+                ..expected.clone()
+            }
+        ));
+        // 工作台换了一支片子（同一个 id 也可能：这条片子被重转过）
+        assert!(!still_same_document(
+            &expected,
+            &DocumentIdentity {
+                selected_file: Some(PathBuf::from("b.mp4")),
+                ..expected.clone()
+            }
+        ));
+    }
+
+    /// 回写期间用户自己的落库失败挂了**更新**的提示：不能被本次 flush 的「成功」
+    /// 顺手清掉（那等于告诉用户「都存好了」）。
+    #[test]
+    fn newer_write_error_survives_deferred_flush_success() {
+        // 状态没被别人动过 → 原样采信 flush 的结局
+        assert_eq!(
+            flush_outcome_to_apply(Some("旧错误"), Some("旧错误"), &SegmentFlushOutcome::Saved),
+            SegmentFlushOutcome::Saved
+        );
+        // 用户刚挂了新的错误 → 「成功」降级为「什么都不做」，那条新错误得以保留
+        assert_eq!(
+            flush_outcome_to_apply(
+                Some("旧错误"),
+                Some("字幕保存失败：磁盘已满"),
+                &SegmentFlushOutcome::Saved
+            ),
+            SegmentFlushOutcome::Skipped
+        );
+        // 本次 flush 也失败 → 两条错误都要留
+        assert_eq!(
+            flush_outcome_to_apply(
+                None,
+                Some("字幕保存失败：磁盘已满"),
+                &SegmentFlushOutcome::Failed("库被锁".to_string())
+            ),
+            SegmentFlushOutcome::Failed("库被锁".to_string())
+        );
+    }
+
+    /// 抽帧连续失败的提示必须在「跨过阈值那一次」给，且文案要指向可操作的原因；
+    /// 每条都挂等于刷屏，超过阈值还挂也等于刷屏。
+    #[test]
+    fn frame_failure_notice_fires_once_per_failure_streak() {
+        assert!(frame_failure_notice(0).is_none());
+        assert!(frame_failure_notice(1).is_none());
+        assert!(frame_failure_notice(2).is_none());
+        let msg = frame_failure_notice(3).expect("连续失败到阈值必须给一次提示");
+        assert!(
+            msg.contains("ffmpeg"),
+            "提示要说清可能是 ffmpeg 路径：{msg}"
+        );
+        assert!(msg.contains("占用"), "提示要提到文件被占用：{msg}");
+        assert!(
+            frame_failure_notice(4).is_none(),
+            "阈值之后不再重复提示，避免刷屏"
+        );
+        assert!(frame_failure_notice(50).is_none(), "长期失败也只提示一次");
     }
 }
