@@ -677,7 +677,13 @@ impl AppState {
         pipeline: Arc<TaskPipeline>,
         hardware: HardwareProfile,
     ) -> Self {
-        let recent_tasks = db.list_recent_tasks(50).unwrap_or_default();
+        // 读失败（库损坏自愈之后重建、外部工具占用等）不该带崩启动，但必须留日志：
+        // 这里的空列表直接决定首屏历史库内容，静默吞错会让「库读不出来」看起来
+        // 像「一条记录都没有」。
+        let recent_tasks = db.list_recent_tasks(50).unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "启动时读取历史库列表失败，先以空列表启动");
+            Vec::new()
+        });
         let lang = config.pipeline.language.clone();
         let fmt = config.pipeline.output_format.clone();
         let polish = config.pipeline.enable_polish;
@@ -1218,9 +1224,24 @@ impl AppState {
         self.selected_file = Some(path);
     }
 
+    /// 重新读取历史库列表并替换内存缓存。
+    ///
+    /// 仍然是同步入口：调用点散落在 `ui/actions.rs`、`ui/mod.rs`、
+    /// `ui/views/*.rs`、`ui/components/navigation.rs`，本轮改动范围碰不到它们。
+    /// 但阻塞 UI 的大头已在数据层消掉——`Database::list_recent_tasks` 现在是
+    /// 纯 SELECT 三个物化列，不再对每条工程的 `segments_json` 跑 json_each /
+    /// json_extract，50 条的代价从「解析几 MB JSON」降到「拷 50 行定长字段」。
+    ///
+    /// 若要彻底把查询挪出 UI 线程：`Database` 内部是 `Arc<Mutex<Connection>>`
+    /// （Send + Sync），调用点可以 clone 一份交给 `cx.background_executor()`，
+    /// 在后台跑 `list_recent_tasks(50)`，回到 UI 线程后把结果写回
+    /// `recent_tasks`。这一步必须与调用点（上面列出的文件）一起改：把
+    /// `refresh_recent_tasks()` 换成「异步发起 + 完成回调」，因此留到 UI 侧
+    /// 那一轮统一迁移，本轮先把查询本身变便宜、并保证失败不再静默。
     pub fn refresh_recent_tasks(&mut self) {
-        if let Ok(tasks) = self.db.list_recent_tasks(50) {
-            self.recent_tasks = tasks;
+        match self.db.list_recent_tasks(50) {
+            Ok(tasks) => self.recent_tasks = tasks,
+            Err(err) => tracing::warn!(error = %err, "刷新历史库列表失败，沿用上一次的列表"),
         }
     }
 

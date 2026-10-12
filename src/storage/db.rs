@@ -94,6 +94,36 @@ fn normalize_segment_blanks(segments: &mut [Segment]) {
     }
 }
 
+/// 从内存字幕算出历史列表的三个派生摘要（随 `segments_json` 一起物化进列）。
+///
+/// 为什么在这里算、而不是继续让 `list_recent_tasks` 的 SQL 现算：SQL 侧的
+/// `json_each` / `json_extract` 每次列表查询都要把每条工程的 `segments_json`
+/// 完整展开解析一遍——一个几百句的工程就是数百 KB，50 条就是几 MB，且这段
+/// 开销全在 UI 线程上。写入侧本来就拿着 `&[Segment]`，顺手算出来是零成本。
+///
+/// 口径必须与旧的 SQL 实现一致（那段 SQL 现在只保留在 v3→v4 的回填里）：
+/// - `sample_text`：首句 `polished` 去掉 **ASCII 空白**后非空则取 trim 结果，
+///   否则取首句 `text`；没有句子则为空串。不能图省事用 `display_text()`：
+///   它返回未 trim 的 `polished`，而旧 SQL 返回 trim 后的值，两端会漂移。
+/// - `has_translation`：复用 [`Segment::has_translation`]（全项目唯一的判定
+///   口径，与 `hydrate_task` 装载后的重算完全一致；纯空白译文不算）。
+/// - `segment_count`：句数。
+fn summarize_segments(segments: &[Segment]) -> (usize, String, bool) {
+    let sample_text = segments
+        .first()
+        .map(|seg| {
+            let polished = seg.polished.trim_matches(|c: char| c.is_ascii_whitespace());
+            if polished.is_empty() {
+                seg.text.clone()
+            } else {
+                polished.to_string()
+            }
+        })
+        .unwrap_or_default();
+    let has_translation = segments.iter().any(Segment::has_translation);
+    (segments.len(), sample_text, has_translation)
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskRecord {
     pub id: i64,
@@ -105,10 +135,11 @@ pub struct TaskRecord {
     ///
     /// 历史库列表查询（`list_recent_tasks`）**不**反序列化此字段：一个几百句的
     /// 工程动辄数百 KB JSON，启动时把 50 条全部解析会白白拖慢首屏。列表只用
-    /// `segment_count` / `sample_text` 两个由 SQLite 直接算出的摘要字段；真正需要
-    /// 字幕内容时（载入工程、导出）再按 `id` 调 `load_task_segments` 取。
+    /// `segment_count` / `sample_text` / `has_translation` 三个由写入侧随
+    /// `segments_json` 一起物化的摘要列；真正需要字幕内容时（载入工程、导出）
+    /// 再按 `id` 调 `load_task_segments` 取。
     pub segments: Vec<Segment>,
-    /// 该工程的字幕总句数（列表查询由 `json_array_length` 直接算出）
+    /// 该工程的字幕总句数（写入侧随 `segments_json` 物化，见 `summarize_segments`）
     pub segment_count: usize,
     /// 首句字幕摘录，供视频库卡片预览
     pub sample_text: String,
@@ -117,11 +148,11 @@ pub struct TaskRecord {
     /// 记录中是否**至少有一句带非空译文**（与 `Segment::has_translation` 同口径，
     /// 纯空白译文不算）。
     ///
-    /// **列表查询的空壳记录也带对这项**：`list_recent_tasks` 的 SQL 直接在
-    /// `segments_json` 上逐句判定（不反序列化正文）；逐句装载路径
-    /// （`row_to_task` / `hydrate_task`）则按内存字幕重算。视频库的
-    /// 「仅已翻译 / 仅未翻译」筛选据此工作，不会因正文未装载而退化成
-    /// 「恒空 / 恒全量」。
+    /// **列表查询的空壳记录也带对这项**：`insert_task` / `update_task_segments`
+    /// 用 `Segment::has_translation` 的口径把它物化进列（`summarize_segments`），
+    /// 列表记录直接读列；逐句装载路径（`row_to_task` / `hydrate_task`）则按
+    /// 内存字幕重算。视频库的「仅已翻译 / 仅未翻译」筛选据此工作，
+    /// 不会因正文未装载而退化成「恒空 / 恒全量」。
     pub has_translation: bool,
     pub created_at: String,
     /// 媒体内容的采样指纹（见 `utils::fingerprint`）。老记录或无法读取的文件为 `None`。
@@ -177,7 +208,7 @@ impl Database {
     /// 或未来某次迁移必须严格只跑一次）就无从下手——它只会在列已存在时静默跳过、
     /// 在真出问题时也静默失败（返回值被 `let _ =` 吞掉）。版本号把「当前库处在哪个
     /// schema 阶段」变成可读、可断言的状态。
-    pub const SCHEMA_VERSION: i32 = 3;
+    pub const SCHEMA_VERSION: i32 = 4;
 
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -289,7 +320,10 @@ impl Database {
                 segments_json TEXT NOT NULL,
                 content_hash TEXT,
                 metrics_json TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                segment_count INTEGER NOT NULL DEFAULT 0,
+                sample_text TEXT NOT NULL DEFAULT '',
+                has_translation INTEGER NOT NULL DEFAULT 0
             );
             "#,
             [],
@@ -424,6 +458,59 @@ impl Database {
             )
             .context("v2→v3：创建 idx_tasks_content_hash 失败")?;
         }
+        // v3 → v4：把历史列表页的三个派生字段物化成列，读侧不再解析 JSON。
+        //
+        // 旧的 `list_recent_tasks` 每次都用 `json_each` 把 `segments_json` 逐句
+        // 展开算「有没有译文」、用 `json_extract` 取首句字段——50 条几百句的
+        // 工程就是几 MB JSON，且全发生在 UI 线程。写入侧本来就拿着 `&[Segment]`，
+        // 把摘要顺手落列是零成本；读侧于是变成纯 SELECT。
+        //
+        // 下面这条 UPDATE 是这三个新列**唯一**允许解析 JSON 的地方（每个库只跑
+        // 一次，且在迁移事务里）：口径与旧 SQL 逐字一致——`polished` 判空必须
+        // 显式列出 ASCII 空白字符集，SQLite 默认的 `TRIM(X)` 只去半角空格，
+        // `"  \n "` 会被误当成有效润色稿。
+        //
+        // 不做「只更新默认值的行」之类的条件：这三列是 `segments_json` 的派生
+        // 数据，重算结果与旧口径一致，重跑迁移也不会造出不一致。
+        if from < 4 {
+            for (name, ddl) in [
+                (
+                    "segment_count",
+                    "ALTER TABLE tasks ADD COLUMN segment_count INTEGER NOT NULL DEFAULT 0",
+                ),
+                (
+                    "sample_text",
+                    "ALTER TABLE tasks ADD COLUMN sample_text TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "has_translation",
+                    "ALTER TABLE tasks ADD COLUMN has_translation INTEGER NOT NULL DEFAULT 0",
+                ),
+            ] {
+                if !Database::column_exists(&tx, name)? {
+                    tx.execute(ddl, [])
+                        .with_context(|| format!("v3→v4：补 {name} 列失败"))?;
+                }
+            }
+            tx.execute(
+                "UPDATE tasks SET
+                     segment_count = CASE WHEN json_valid(segments_json)
+                                          THEN COALESCE(json_array_length(segments_json), 0) ELSE 0 END,
+                     sample_text = CASE WHEN json_valid(segments_json)
+                                        THEN COALESCE(NULLIF(TRIM(json_extract(segments_json, '$[0].polished'),
+                                                                 ' ' || char(9) || char(10) || char(11) || char(12) || char(13)), ''),
+                                                     json_extract(segments_json, '$[0].text'), '') ELSE '' END,
+                     has_translation = CASE WHEN json_valid(segments_json)
+                                            THEN CASE WHEN EXISTS (
+                                                     SELECT 1 FROM json_each(segments_json) AS seg
+                                                     WHERE TRIM(COALESCE(json_extract(seg.value, '$.translation'), ''),
+                                                                ' ' || char(9) || char(10) || char(11) || char(12) || char(13)) <> ''
+                                                 ) THEN 1 ELSE 0 END
+                                            ELSE 0 END",
+                [],
+            )
+            .context("v3→v4：回填列表摘要列失败")?;
+        }
 
         // 版本号与上面的 DDL 在同一个事务里提交：要么一起生效，要么一起回滚。
         tx.pragma_update(None, "user_version", Self::SCHEMA_VERSION)
@@ -446,6 +533,10 @@ impl Database {
         let conn = self.lock_conn();
         let segments_json = serde_json::to_string(segments).context("序列化 segments 失败")?;
         let metrics_json = metrics.and_then(|m| serde_json::to_string(m).ok());
+        // 摘要列与 segments_json 在**同一条 INSERT**里落库：一旦拆成两次写，
+        // 中间崩溃/失败就会留下「列说 N 句、JSON 里却是别的句数」的永久错位，
+        // 而读侧（`list_recent_tasks`）已经不再回头解析 JSON。
+        let (segment_count, sample_text, has_translation) = summarize_segments(segments);
         // 落库时顺手算一次内容指纹（采样哈希，毫秒级）。失败（文件已删/不可读）
         // 就存 NULL，缓存回退到「只按路径」的老行为。
         let content_hash = crate::utils::fingerprint::media_fingerprint(file_path);
@@ -460,38 +551,29 @@ impl Database {
         let created_at = utc_now();
         with_busy_retry(|| {
             conn.execute(
-                "INSERT INTO tasks (file_path, file_name, duration, status, segments_json, metrics_json, content_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![file_path, file_name, duration, status, segments_json, metrics_json, content_hash, created_at],
+                "INSERT INTO tasks (file_path, file_name, duration, status, segments_json, metrics_json, content_hash, created_at, segment_count, sample_text, has_translation) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![file_path, file_name, duration, status, segments_json, metrics_json, content_hash, created_at, segment_count as i64, sample_text, has_translation],
             )
         })?;
 
         Ok(conn.last_insert_rowid())
     }
 
-    /// 列出最近任务（**不装载字幕正文**）。
+    /// 列出最近任务（**不装载字幕正文、不解析 JSON**）。
     ///
-    /// 句数与首句摘录交给 SQLite 的 JSON 函数直接算，避免把每条工程的
-    /// `segments_json` 全量反序列化——历史库越大，这一项越是启动瓶颈。
-    /// 摘录口径与 `Segment::display_text` 对齐：`polished` 只有在**去掉全部
-    /// ASCII 空白字符**后仍非空才算数（SQLite 的 `TRIM(X)` 默认只去半角空格、
-    /// 不去 `\n` / `\t`，所以 SQL 里显式列出空白字符集），否则回退到 `text`。
+    /// 句数 / 首句摘录 / 翻译状态在**写入侧**（`insert_task` /
+    /// `update_task_segments`）随 `segments_json` 一起物化进 `segment_count` /
+    /// `sample_text` / `has_translation` 三列，这里只做纯 SELECT：旧实现用
+    /// `json_each` 逐句展开 `segments_json`、用 `json_extract` 取首句字段，
+    /// 一条几百句的工程每次列表查询都要解析数百 KB JSON——库越大越明显，
+    /// 而且这段开销全在 UI 线程上。老库由 `apply_migrations` 的 v3→v4 段
+    /// 一次性回填，回填口径即旧的 SQL 口径（`polished` 需按 **ASCII 空白集**
+    /// 判空后取值，不能用 SQLite 默认只去半角空格的 `TRIM(X)`）。
     pub fn list_recent_tasks(&self, limit: usize) -> Result<Vec<TaskRecord>> {
         let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT id, file_path, file_name, duration, status, created_at, metrics_json, content_hash,
-                    CASE WHEN json_valid(segments_json)
-                         THEN COALESCE(json_array_length(segments_json), 0) ELSE 0 END,
-                    CASE WHEN json_valid(segments_json)
-                         THEN COALESCE(NULLIF(TRIM(json_extract(segments_json, '$[0].polished'),
-                                                  ' ' || char(9) || char(10) || char(11) || char(12) || char(13)), ''),
-                                       json_extract(segments_json, '$[0].text'), '') ELSE '' END,
-                    CASE WHEN json_valid(segments_json)
-                         THEN CASE WHEN EXISTS (
-                                  SELECT 1 FROM json_each(segments_json) AS seg
-                                  WHERE TRIM(COALESCE(json_extract(seg.value, '$.translation'), ''),
-                                             ' ' || char(9) || char(10) || char(11) || char(12) || char(13)) <> ''
-                              ) THEN 1 ELSE 0 END
-                         ELSE 0 END
+                    segment_count, sample_text, has_translation
              FROM tasks ORDER BY id DESC LIMIT ?1",
         )?;
 
@@ -518,9 +600,9 @@ impl Database {
                 segments: Vec::new(),
                 segment_count: row.get::<_, i64>(8).unwrap_or(0).max(0) as usize,
                 sample_text: row.get(9).unwrap_or_default(),
-                // 第 11 列：SQL 在 `segments_json` 上逐句判定「至少一句带非空
-                // 译文」。空壳记录也据此正确回答翻译状态（见字段说明）；读失败
-                // 按「未翻译」容错，一行坏数据不能拖垮整个列表。
+                // 第 11 列：写入侧物化的「至少一句带非空译文」标志（见字段
+                // 说明），空壳记录也据此正确回答翻译状态；读失败按「未翻译」
+                // 容错，一行坏数据不能拖垮整个列表。
                 has_translation: row.get::<_, i64>(10).unwrap_or(0) != 0,
                 content_hash: row.get(7).unwrap_or(None),
                 segments_loaded: false,
@@ -562,8 +644,8 @@ impl Database {
         out.segment_count = segments.len();
         out.segments = segments;
         out.segments_loaded = true;
-        // 正文刚装载回来：翻译状态按同一口径重算（列表空壳里的标志只是
-        // SQL 侧判定，装载后以内存字幕为准）。
+        // 正文刚装载回来：翻译状态按同一口径重算（列表空壳里的标志来自
+        // 写入侧物化的列，装载后以内存字幕为准）。
         out.has_translation = out.segments.iter().any(|segment| segment.has_translation());
         out
     }
@@ -579,6 +661,9 @@ impl Database {
         let conn = self.lock_conn();
         let segments_json = serde_json::to_string(segments).context("序列化 segments 失败")?;
         let total_dur = segments.last().map(|s| s.end).unwrap_or(0.0);
+        // 摘要列与 `segments_json` 在同一条 UPDATE 里刷新，理由同 `insert_task`：
+        // 两处一旦分开写，中途失败就会留下与正文不一致的摘要素材。
+        let (segment_count, sample_text, has_translation) = summarize_segments(segments);
         with_busy_retry(|| {
             conn.execute(
                 // `MAX(NULL, ?2)` 在 SQLite 里仍是 NULL（标量 max() 遇 NULL 即 NULL），
@@ -586,8 +671,17 @@ impl Database {
                 // COALESCE 把 NULL 当 0 参与取大：既保留「duration 只增不减」的既有
                 // 口径（见 `state.rs` 载入时的 `task.duration.max(timeline_end)`），
                 // 又让编辑能把坏行救回来。
-                "UPDATE tasks SET segments_json = ?1, duration = MAX(COALESCE(duration, 0.0), ?2) WHERE id = ?3",
-                params![segments_json, total_dur, id],
+                "UPDATE tasks SET segments_json = ?1, duration = MAX(COALESCE(duration, 0.0), ?2),
+                        segment_count = ?3, sample_text = ?4, has_translation = ?5
+                 WHERE id = ?6",
+                params![
+                    segments_json,
+                    total_dur,
+                    segment_count as i64,
+                    sample_text,
+                    has_translation,
+                    id
+                ],
             )
         })?;
         Ok(())
@@ -1242,6 +1336,12 @@ mod tests {
             Database::column_exists(&conn, "content_hash").unwrap(),
             "content_hash 应补齐"
         );
+        for col in ["segment_count", "sample_text", "has_translation"] {
+            assert!(
+                Database::column_exists(&conn, col).unwrap(),
+                "{col} 应补齐（v3→v4）"
+            );
+        }
         drop(conn);
         assert!(
             index_exists(&db, "idx_tasks_content_hash"),
@@ -1288,12 +1388,12 @@ mod tests {
                 t.created_at
             );
         }
-        // 列表查询不装载正文，摘要由 SQLite 的 JSON 函数算出（老行是空数组）
+        // 列表查询不装载正文，摘要由 v3→v4 回填的物化列给出（老行是空数组）
         assert!(
             listed
                 .iter()
-                .all(|t| t.segment_count == 0 && t.sample_text.is_empty()),
-            "老行的 segments_json 是 []，摘要应为空"
+                .all(|t| t.segment_count == 0 && t.sample_text.is_empty() && !t.has_translation),
+            "老行的 segments_json 是 []，摘要应为空且未翻译"
         );
         let blanks: i64 = db
             .lock_conn()
@@ -1381,6 +1481,7 @@ mod tests {
             newest.sample_text, "第一句",
             "摘录取首句原文（polished 为空）"
         );
+        assert!(newest.has_translation, "首句带译文，列表记录应报告已翻译");
         assert!(!newest.segments_loaded, "列表查询不装载正文");
 
         // 3) 按内容指纹命中：另一个路径、同一份内容
@@ -1597,7 +1698,7 @@ mod tests {
             )
             .unwrap();
         assert!(id > 0);
-        // 3) 列表查询（走 segments_json 的 JSON 函数路径）
+        // 3) 列表查询（读物化的三个摘要列）
         assert_eq!(db.list_recent_tasks(10).unwrap().len(), 2);
         // 4) 收尾维护（原先唯一处理 poison 的方法，现统一走 lock_conn）
         db.maintain_on_shutdown();
@@ -1614,7 +1715,14 @@ mod tests {
         let live = Database::open(":memory:").unwrap();
         {
             let conn = live.lock_conn();
-            for col in ["metrics_json", "content_hash", "created_at"] {
+            for col in [
+                "metrics_json",
+                "content_hash",
+                "created_at",
+                "segment_count",
+                "sample_text",
+                "has_translation",
+            ] {
                 assert!(Database::column_exists(&conn, col).unwrap(), "{col} 应存在");
             }
             assert!(!Database::column_exists(&conn, "definitely_not_a_column").unwrap());
@@ -1625,7 +1733,14 @@ mod tests {
         let path = dir.join("v0.db");
         create_v0_db(&path);
         let conn = Connection::open(&path).unwrap();
-        for col in ["metrics_json", "content_hash", "created_at"] {
+        for col in [
+            "metrics_json",
+            "content_hash",
+            "created_at",
+            "segment_count",
+            "sample_text",
+            "has_translation",
+        ] {
             assert!(
                 !Database::column_exists(&conn, col).unwrap(),
                 "v0 库不应有 {col}"
@@ -1885,5 +2000,294 @@ mod tests {
             flag(recent[0].id),
             "装载正文后的翻译状态必须与列表空壳一致"
         );
+    }
+
+    // ───────── 列表摘要物化列：写入侧维护 / 迁移回填 / 读侧纯 SELECT ─────────
+
+    /// 旧实现口径：三个派生字段直接用 SQLite 的 JSON 函数从 `segments_json` 现算。
+    /// 新实现把它们物化成列；测试拿这个参照物验证「物化值与旧口径等价」。
+    fn legacy_summary(db: &Database, id: i64) -> (i64, String, i64) {
+        db.lock_conn()
+            .query_row(
+                "SELECT CASE WHEN json_valid(segments_json)
+                             THEN COALESCE(json_array_length(segments_json), 0) ELSE 0 END,
+                        CASE WHEN json_valid(segments_json)
+                             THEN COALESCE(NULLIF(TRIM(json_extract(segments_json, '$[0].polished'),
+                                                      ' ' || char(9) || char(10) || char(11) || char(12) || char(13)), ''),
+                                           json_extract(segments_json, '$[0].text'), '') ELSE '' END,
+                        CASE WHEN json_valid(segments_json)
+                             THEN CASE WHEN EXISTS (
+                                      SELECT 1 FROM json_each(segments_json) AS seg
+                                      WHERE TRIM(COALESCE(json_extract(seg.value, '$.translation'), ''),
+                                                 ' ' || char(9) || char(10) || char(11) || char(12) || char(13)) <> ''
+                                  ) THEN 1 ELSE 0 END
+                             ELSE 0 END
+                 FROM tasks WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// 新实现读法：直接读 `insert_task` / `update_task_segments` / 迁移落下的物化列。
+    fn stored_summary(db: &Database, id: i64) -> (i64, String, i64) {
+        db.lock_conn()
+            .query_row(
+                "SELECT segment_count, sample_text, has_translation FROM tasks WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// v3 → v4 迁移必须把三个派生列回填到与 `segments_json` 一致，且口径与旧的
+    /// 「SQL 现算」逐行等价——空数组、有效润色、纯空白译文这些边界都不能漂。
+    #[test]
+    fn v3_db_backfills_derived_columns() {
+        let dir = tmp_dir("v3_to_v4");
+        let path = dir.join("legacy_v3.db");
+
+        let mut polished = Segment::new(1, 0.0, 1.0, "原始文本");
+        polished.polished = "  润色稿 \n".to_string();
+        let mut translated = polished.clone();
+        translated.translation = Some("\t译文 ".to_string());
+        let mut blank_tl = Segment::new(1, 0.0, 1.0, "空译文");
+        blank_tl.translation = Some("   ".to_string());
+        let rows: Vec<(&str, String)> = vec![
+            (
+                "empty.mp4",
+                serde_json::to_string(&Vec::<Segment>::new()).unwrap(),
+            ),
+            (
+                "plain.mp4",
+                serde_json::to_string(&seg("只有正文")).unwrap(),
+            ),
+            (
+                "polished.mp4",
+                serde_json::to_string(&vec![translated]).unwrap(),
+            ),
+            (
+                "blank_tl.mp4",
+                serde_json::to_string(&vec![blank_tl]).unwrap(),
+            ),
+            // 外部工具写坏的 JSON：旧实现按 `json_valid` 降级成 0 / '' / 0，
+            // 回填必须给同一答案，而不是让整段迁移失败。
+            ("broken.mp4", "not-json".to_string()),
+        ];
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     file_path TEXT NOT NULL,
+                     file_name TEXT NOT NULL,
+                     duration REAL DEFAULT 0.0,
+                     status TEXT NOT NULL,
+                     segments_json TEXT NOT NULL,
+                     metrics_json TEXT,
+                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                     content_hash TEXT
+                 );
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+            for (name, json) in &rows {
+                conn.execute(
+                    "INSERT INTO tasks (file_path, file_name, duration, status, segments_json, created_at)
+                     VALUES (?1, ?2, 1.0, 'completed', ?3, '2026-10-01 00:00:00')",
+                    params![format!("D:/v3/{name}"), name, json],
+                )
+                .unwrap();
+            }
+            for col in ["segment_count", "sample_text", "has_translation"] {
+                assert!(
+                    !Database::column_exists(&conn, col).unwrap(),
+                    "前置条件：v3 库不应有 {col} 列"
+                );
+            }
+        }
+
+        let db = Database::open(&path).expect("v3 库应能迁移后打开");
+        assert_eq!(
+            user_version(&db),
+            Database::SCHEMA_VERSION,
+            "版本应推进到 v4"
+        );
+        {
+            let conn = db.lock_conn();
+            for col in ["segment_count", "sample_text", "has_translation"] {
+                assert!(
+                    Database::column_exists(&conn, col).unwrap(),
+                    "v3→v4 应补齐 {col} 列"
+                );
+            }
+        }
+
+        // 回填口径 = 旧 SQL 口径：三列与 segments_json 逐行对齐
+        for id in 1..=rows.len() as i64 {
+            assert_eq!(
+                stored_summary(&db, id),
+                legacy_summary(&db, id),
+                "第 {id} 行的回填值必须与旧实现口径一致"
+            );
+        }
+        assert_eq!(
+            stored_summary(&db, 1),
+            (0, String::new(), 0),
+            "空数组应回填成 0 / 空串 / 0"
+        );
+        assert_eq!(
+            stored_summary(&db, 2),
+            (1, "只有正文".to_string(), 0),
+            "单句无译文：摘录取正文、未翻译"
+        );
+        assert_eq!(
+            stored_summary(&db, 3),
+            (1, "润色稿".to_string(), 1),
+            "有效润色稿应 trim 后作为摘录，译文应算已翻译"
+        );
+        assert_eq!(
+            stored_summary(&db, 4),
+            (1, "空译文".to_string(), 0),
+            "纯空白译文不算已翻译"
+        );
+        assert_eq!(
+            stored_summary(&db, 5),
+            (0, String::new(), 0),
+            "坏 JSON 应按旧口径降级为 0 / 空串 / 0"
+        );
+
+        // 列表查询直接读列：返回的三个字段必须与逐行回填值一致
+        let listed = db.list_recent_tasks(10).unwrap();
+        assert_eq!(listed.len(), rows.len());
+        for task in &listed {
+            assert_eq!(
+                (
+                    task.segment_count as i64,
+                    task.sample_text.clone(),
+                    i64::from(task.has_translation),
+                ),
+                stored_summary(&db, task.id),
+                "列表记录 {} 的派生字段应直接来自物化列",
+                task.file_name
+            );
+        }
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写入侧（`insert_task` / `update_task_segments`）必须让三个派生列与
+    /// `segments_json` 始终一致：空字幕、全空白译文、有效润色都要当场算对，
+    /// 更新后同步刷新——读侧已经不再解析 JSON 兜底。
+    #[test]
+    fn derived_columns_stay_in_sync_with_segments_json() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+
+        // 1) 空 segments：三列取零值
+        let empty = db
+            .insert_task("D:/d/empty.mp4", "empty.mp4", 0.0, "completed", &[], None)
+            .unwrap();
+        assert_eq!(stored_summary(&db, empty), (0, String::new(), 0));
+        assert_eq!(stored_summary(&db, empty), legacy_summary(&db, empty));
+
+        // 2) 首句带有效润色（含首尾空白）、次句纯空白译文：
+        //    摘录取 trim 后的润色稿，纯空白译文不算已翻译
+        let mut first = Segment::new(1, 0.0, 1.0, "原文");
+        first.polished = "  润色后  ".to_string();
+        let mut second = Segment::new(2, 1.0, 2.0, "第二句");
+        second.translation = Some("   ".to_string());
+        let id = db
+            .insert_task(
+                "D:/d/two.mp4",
+                "two.mp4",
+                2.0,
+                "completed",
+                &[first, second],
+                None,
+            )
+            .unwrap();
+        assert_eq!(stored_summary(&db, id), (2, "润色后".to_string(), 0));
+        assert_eq!(stored_summary(&db, id), legacy_summary(&db, id));
+
+        // 3) 更新为「一句 + 有效译文」：三列跟着刷新
+        let mut updated = Segment::new(1, 0.0, 3.0, "改过");
+        updated.translation = Some("Hello".to_string());
+        db.update_task_segments(id, &[updated]).unwrap();
+        assert_eq!(stored_summary(&db, id), (1, "改过".to_string(), 1));
+        assert_eq!(stored_summary(&db, id), legacy_summary(&db, id));
+
+        // 4) 再清空：不能残留上一轮的句数与译文标志
+        db.update_task_segments(id, &[]).unwrap();
+        assert_eq!(stored_summary(&db, id), (0, String::new(), 0));
+        assert_eq!(stored_summary(&db, id), legacy_summary(&db, id));
+    }
+
+    /// `list_recent_tasks` 的语义必须与旧的「SQL 现算」完全等价：它现在只 SELECT
+    /// 物化列，因此对同一批边界数据，返回的三个派生字段应与旧口径逐一相等。
+    #[test]
+    fn list_recent_tasks_matches_legacy_json_derivation() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+
+        let cases: Vec<Vec<Segment>> = vec![
+            vec![],
+            seg("没有译文"),
+            {
+                let mut s = Segment::new(1, 0.0, 1.0, "带译文");
+                s.translation = Some("Hello".to_string());
+                s.translation_lang = Some("English".to_string());
+                vec![s]
+            },
+            {
+                let mut s = Segment::new(1, 0.0, 1.0, "带润色但无译文");
+                s.polished = "  Polished  ".to_string();
+                vec![s]
+            },
+            {
+                let mut s = Segment::new(1, 0.0, 1.0, "多句首句");
+                s.polished = "  ".to_string();
+                let mut t = Segment::new(2, 1.0, 2.0, "多句次句");
+                t.translation = Some("\n".to_string());
+                vec![s, t]
+            },
+        ];
+        let ids: Vec<i64> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, segments)| {
+                db.insert_task(
+                    &format!("D:/l/{i}.mp4"),
+                    &format!("{i}.mp4"),
+                    1.0,
+                    "completed",
+                    segments,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let listed = db.list_recent_tasks(10).unwrap();
+        assert_eq!(listed.len(), ids.len());
+        assert!(listed
+            .iter()
+            .all(|t| !t.segments_loaded && t.segments.is_empty()));
+        for task in &listed {
+            assert_eq!(
+                (
+                    task.segment_count as i64,
+                    task.sample_text.clone(),
+                    i64::from(task.has_translation),
+                ),
+                legacy_summary(&db, task.id),
+                "记录 {} 的三个派生字段必须与旧实现口径等价",
+                task.file_name
+            );
+        }
+
+        // 抽查两个边界：有效润色稿应被 trim 后作为摘录；首句 polished 全是空白
+        // 时摘录回退到首句正文，次句的 "\n" 不算译文。
+        assert_eq!(stored_summary(&db, ids[3]), (1, "Polished".to_string(), 0));
+        assert_eq!(stored_summary(&db, ids[4]), (2, "多句首句".to_string(), 0));
     }
 }
