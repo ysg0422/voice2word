@@ -1180,7 +1180,10 @@ impl MainWindow {
                                         cx.listener(|this, _, _, cx| this.choose_batch_folder(cx)),
                                     ),
                             )
-                            .child(if is_processing {
+                            // 只有批量模式在跑时才显示「终止批量」：单文件转写也会置
+                            // `is_processing`，若按它判断，单文件转写时这里会误显示「终止批量」
+                            // （真正该用的「终止转写」在进度抽屉里）。用 `batch_running` 才准。
+                            .child(if batch_running {
                                 primitives::btn("终止批量", primitives::BtnSize::Sm, primitives::BtnVariant::Danger)
                                     .id("queue-cancel-btn")
                                     .on_click(
@@ -1203,9 +1206,14 @@ impl MainWindow {
                                         Theme::text_muted()
                                     })
                                     .when(can_start, |s| s.cursor_pointer().hover(|s| s.opacity(0.9)))
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.start_batch_queue(cx)),
-                                    )
+                                    // 禁用态（队列为空或已在转写）不能再挂 on_click：
+                                    // 否则点下去会走 start_batch_queue → 置 Failed 弹出全屏错误横幅，
+                                    // 与「按钮外观已禁用」自相矛盾。
+                                    .when(can_start, |s| {
+                                        s.on_click(
+                                            cx.listener(|this, _, _, cx| this.start_batch_queue(cx)),
+                                        )
+                                    })
                                     .into_any_element()
                             })
                             .child(
