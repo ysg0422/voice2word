@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 const STALE_AFTER: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// 明确属于本项目的文件名前缀。只清扫这些名字，绝不泛扫整个 TEMP。
-const NAME_PREFIXES: [&str; 3] = ["v2w_", "voice2word_", "test_v2w"];
+const NAME_PREFIXES: [&str; 2] = ["v2w_", "voice2word_"];
 
 /// 明确属于本项目的文件名后缀（这类名字没有项目前缀，例如 `片名_voice2word.wav`）。
 const NAME_SUFFIXES: [&str; 2] = ["_voice2word.wav", "_voice2word.srt"];
@@ -104,5 +104,9 @@ mod tests {
         assert!(!is_ours("tmp1234.tmp"));
         assert!(!is_ours("voice2word.db"));
         assert!(!is_ours("v2w_frames")); // 由 FrameCache 自己裁剪
+                                         // `test_v2w` 前缀不是本项目产物（subtitle::writer 的单测会用到），
+                                         // 当成临时文件清扫会误删用户/测试文件。
+        assert!(!is_ours("test_v2w.vtt"));
+        assert!(!is_ours("test_v2w_style.ass"));
     }
 }
