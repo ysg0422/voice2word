@@ -62,8 +62,9 @@ impl Vendor {
     /// 从适配器名模糊归类厂商。
     pub fn from_adapter_name(name: &str) -> Option<Self> {
         let n = name.to_ascii_lowercase();
-        // 先匹配 Intel 内核关键词，再匹配 "radeon"/"amd"，避免 "AMD Radeon
-        // Graphics" 这类核显名被 Intel 规则误伤——反过来不行，所以顺序有讲究。
+        // 顺序即归类优先级：先按 "radeon"/"amd" 归类 AMD，再依次 NVIDIA、Intel、
+        // Apple，命中即返回。同一适配器名可能命中多条关键词（如 "AMD Radeon(TM)
+        // Graphics" 同时含 "amd" 与 "radeon"），固定顺序才能保证归类唯一、可预期。
         if n.contains("radeon") || n.contains("amd") {
             return Some(Vendor::Amd);
         }
