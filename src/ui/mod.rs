@@ -2301,7 +2301,9 @@ mod tests {
     /// 却忘了接进 `any_input_focused`，这条测试会立刻报出漏掉的名字。
     #[test]
     fn any_input_focused_aggregates_every_text_input() {
-        let src = include_str!("mod.rs");
+        // 归一化换行：CI（windows-latest + autocrlf=true）检出的源文件是 CRLF，
+        // 而下面用 "\n" 字面量定位函数体与闭合花括号，不归一化会永远找不到。
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
         let start = src
             .find("fn any_input_focused")
             .expect("any_input_focused 必须存在");

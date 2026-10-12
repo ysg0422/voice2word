@@ -1,0 +1,17 @@
+# 统一文本文件的行尾为 LF（存储 + 检出）。
+# 背景：CI 跑在 windows-latest 上，默认 core.autocrlf=true 会把检出文件改成 CRLF，
+# 导致用 include_str! / 读源码做的「结构断言」类测试在本地（LF）通过、在 CI（CRLF）失败。
+* text=auto eol=lf
+
+# 二进制资源显式声明，避免被行尾转换误伤。
+*.png  binary
+*.ico  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.exe  binary
+*.dll  binary
+*.zip  binary
+*.onnx binary
+*.bin  binary
+*.safetensors binary
