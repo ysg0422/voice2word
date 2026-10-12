@@ -101,6 +101,21 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+/// 把 `--threads` 收敛到 `[2, 本机逻辑核数]`。
+///
+/// 命令行是唯一可以绕过设置页滑条量程的入口：传 `--threads 256` 时 whisper-cli 会真的
+/// 开出 256 个线程互相抢 CPU，转写反而更慢。收敛口径复用 GUI 的
+/// [`crate::app::AppState::clamp_threads_to_cores`]，保证两端上限只此一处、不会打架。
+/// 生效值与请求值不同时打印一行提示，方便用户理解实际用的是多少线程。
+fn bound_cli_threads(requested: u32) -> u32 {
+    let cores = crate::app::AppState::logical_cores();
+    let bounded = crate::app::AppState::clamp_threads_to_cores(requested, cores);
+    if bounded != requested {
+        eprintln!("提示: --threads {requested} 已收敛为 {bounded}（本机逻辑核心数 {cores}）");
+    }
+    bounded
+}
+
 /// 帮助文本。
 pub fn usage() -> String {
     format!(
@@ -118,7 +133,7 @@ transcribe 选项:
       --lang, --language <代码> 指定源语言（如 zh / en / ja / auto；默认取 config.toml）
       --translate <语言>       目标语言（当前仅记录，翻译阶段未接入）
       --model <路径>           覆盖 Whisper 模型文件
-      --threads <数量>         推理线程数（正整数，覆盖 config.toml）
+      --threads <数量>         推理线程数（正整数，覆盖 config.toml；超过本机逻辑核数会自动收敛）
       --polish                 强制开启润色/标点（默认沿用 config.toml）
       --resume                 复用阶段产物目录中已有的识别结果（断点续跑）
       --artifact-dir <路径>     指定阶段产物目录（默认 <输入目录>/.voice2word-stages/<文件名>）
@@ -365,7 +380,9 @@ fn transcribe(args: &TranscribeArgs) -> Result<()> {
         .clone()
         .or_else(|| Some(config.pipeline.language.clone()).filter(|l| l != "auto"));
     let format = args.format.clone();
-    let threads = args.threads;
+    // `--threads` 允许任意正整数，但推理线程数超过本机逻辑核数只会互相抢占 CPU，
+    // 反而拖慢转写，因此在这里按与 GUI 完全相同的口径收敛（见 `bound_cli_threads`）。
+    let threads = args.threads.map(bound_cli_threads);
     let model = args.model.clone();
     let rescue_logprob = config.pipeline.whisper_rescue_logprob;
 
@@ -793,6 +810,28 @@ mod tests {
         assert!(message.contains("大于 0"), "{message}");
         let message = parse_error(&["voice2word", "transcribe", "a.mp3", "--threads", "many"]);
         assert!(message.contains("正整数"), "{message}");
+    }
+
+    #[test]
+    fn cli_threads_override_is_bounded() {
+        // 上限：超过本机逻辑核数的一律收敛到核数（与 GUI 的滑条量程同口径），
+        // 免得 whisper-cli 开出上百个线程互相抢 CPU。
+        let cores = crate::app::AppState::logical_cores();
+        assert_eq!(
+            bound_cli_threads(cores + 128),
+            cores.max(2),
+            "超上限应收敛到核数"
+        );
+        assert_eq!(
+            bound_cli_threads(cores.max(2)),
+            cores.max(2),
+            "等于上限时保持原值"
+        );
+        // 下限：0 / 1 都抬到 2，whisper-cli 不接受 0 线程（解析期已挡 0，这里兜底）。
+        assert_eq!(bound_cli_threads(0), 2);
+        assert_eq!(bound_cli_threads(1), 2);
+        // 区间内原样保留，不能顺手改动用户显式给的合法值。
+        assert_eq!(bound_cli_threads(2), 2);
     }
 
     #[test]
