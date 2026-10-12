@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use crate::subtitle::Segment;
 
-use super::whisper::{take_live_pids, ChildEntry, ChildPidGuard};
+use super::whisper::{join_or_log, take_live_pids, ChildEntry, ChildPidGuard};
 
 /// SenseVoice 单会话线程数上限。
 ///
@@ -574,9 +574,19 @@ impl SenseVoiceEngine {
         // 就得记得再补一次」的维护陷阱（PID 的登记与注销由同一个栈变量负责）。
         let status = wait_result.with_context(|| "等待 SenseVoice 进程结束失败")?;
         if let Some(h) = stream_handle {
-            let _ = h.join();
+            // 泵送线程 panic 以前被 `let _ = h.join()` 静默吞掉：这里至少留一条日志
+            // （`join_or_log` 内部 error!），具体失败原因仍由 runner 退出码/stderr 兜底呈现。
+            let _ = join_or_log(h, "SenseVoice 音频流泵送线程");
         }
-        let stderr_str = stderr_handle.join().unwrap_or_default();
+        // stderr 读取线程 panic 以前被 `unwrap_or_default()` 吞成空串：用户看到的是
+        // 「退出码非 0 但无任何输出」的误导提示，真正原因（诊断通道坏了）完全不可见。
+        // 这里显式记录状态：空串保留「无可用数据」的既有语义，由下面的进程失败分支
+        // 给出带退出码的上下文报错；进程成功时仅降级诊断信息，不吃掉转写结果。
+        let (stderr_str, stderr_thread_panicked) =
+            match join_or_log(stderr_handle, "SenseVoice stderr 读取线程") {
+                Some(s) => (s, false),
+                None => (String::new(), true),
+            };
 
         // 兜底通道：runner 未回传 `provider` 事件（旧版脚本）时，从 stderr 特征串识别
         // 回落。`record_provider` 首次为准，故与事件通道同时命中也不会重复告警。
@@ -591,6 +601,14 @@ impl SenseVoiceEngine {
         }
 
         if !status.success() {
+            // stderr 读取线程 panic 时 stderr_str 必为空，继续走下面「无输出＝Python 解释器或
+            // 依赖未就位」的提示会把用户引向错误方向：真正的事实是诊断通道本身坏了。
+            if stderr_thread_panicked {
+                anyhow::bail!(
+                    "SenseVoice 识别失败：runner 退出码 {:?}，且读取 stderr 的线程异常退出（panic），无法获取具体错误详情。请确认 python 可执行后重试；若可复现请保留 logs/ 中的日志反馈。",
+                    status.code()
+                );
+            }
             warn!(
                 "SenseVoice 退出状态非 0: {:?}, 错误日志: {}",
                 status.code(),

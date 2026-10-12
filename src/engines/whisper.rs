@@ -529,11 +529,8 @@ impl WhisperEngine {
 
         // 线程保护机制：多处理器并行时，单处理器线程数等额下调，
         // 保证所有处理器的总 CPU 线程受控在配额内，防止 CPU 线程超售抢占桌面资源。
-        let effective_th = if processors > 1 {
-            (th / (processors as u32)).max(2)
-        } else {
-            th
-        };
+        // 单实例 ≤ 配额、下界仍为 2 的完整口径见 `effective_threads` 的文档与回归测试。
+        let effective_th = effective_threads(th, processors);
 
         // 优先使用运行时档位覆盖的模型路径，否则使用配置中的默认模型
         let effective_model: PathBuf = match model_path_override {
@@ -977,10 +974,26 @@ impl WhisperEngine {
         // 就得记得再补一次」的维护陷阱（PID 的登记与注销由同一个栈变量负责）。
         let output_status = wait_result.with_context(|| "等待 whisper-cli 进程结束失败")?;
         if let Some(h) = stream_pump_handle {
-            let _ = h.join();
+            // 泵送线程 panic（子进程提前退出导致写 stdin 失败等）也不能再无声吞掉：
+            // `join_or_log` 会留下 error! 日志，转写结果本身不依赖它。
+            let _ = join_or_log(h, "Whisper 音频流泵送线程");
         }
-        let stdout_str = stdout_handle.join().unwrap_or_default();
-        let (vad_sec, stderr_str) = stderr_handle.join().unwrap_or((0.0, String::new()));
+        // 子线程 panic 以前被 `unwrap_or_default()` 吞掉：stdout 只留空串、stderr 只留
+        // (0.0, "")，用户侧表现就是「空转写结果」或「空 stderr」，失败原因彻底不可见。
+        // 这里显式收口：
+        //   - stdout：仅当 JSON 也没产出可用结果时才是致命错误（见下面的兜底判定）；
+        //   - stderr：失败诊断与 VAD 统计的唯一来源，panic 时无数据可救——先记录状态，
+        //     进程失败分支据此给出带退出码的上下文报错，而不是误导成「缺少运行库」。
+        let (stdout_str, stdout_thread_panicked) =
+            match join_or_log(stdout_handle, "Whisper stdout 读取线程") {
+                Some(s) => (s, false),
+                None => (String::new(), true),
+            };
+        let (vad_sec, stderr_str, stderr_thread_panicked) =
+            match join_or_log(stderr_handle, "Whisper stderr 读取线程") {
+                Some((v, s)) => (v, s, false),
+                None => (0.0, String::new(), true),
+            };
 
         // 用户主动终止：被杀进程的退出码不重要，按空结果返回，由管线走取消收尾
         if self.cancel.load(Ordering::SeqCst) {
@@ -988,6 +1001,14 @@ impl WhisperEngine {
         }
 
         if !output_status.success() {
+            // stderr 读取线程 panic 时 stderr_str 必为空：若继续走下面的「无输出＝缺运行库」
+            // 分支，会把用户引向完全错误的方向——真正的事实是诊断通道本身坏了。
+            if stderr_thread_panicked {
+                anyhow::bail!(
+                    "Whisper 转写失败：whisper-cli 退出码 {:?}，且读取 stderr 的线程异常退出（panic），无法获取具体错误详情。请查看 logs/ 中的进程日志后重试。",
+                    output_status.code()
+                );
+            }
             error!(
                 "whisper-cli 运行报错 (退出码 {:?}): {}",
                 output_status.code(),
@@ -1011,6 +1032,9 @@ impl WhisperEngine {
         }
 
         let mut segments = Vec::new();
+        // JSON 是否解析成功（与「解出 0 句」区分）：stdout 兜底线程 panic 时，只有
+        // JSON 也没解析成功才意味着「已无任何文本来源」。
+        let mut json_parsed_ok = false;
 
         if json_file.exists() {
             let json_raw = std::fs::read(&json_file).unwrap_or_default();
@@ -1020,6 +1044,7 @@ impl WhisperEngine {
             json_guard.remove_now();
 
             if let Ok(data) = parsed {
+                json_parsed_ok = true;
                 let detected_lang = data.result.and_then(|r| r.language);
                 if let Some(trans) = data.transcription {
                     for (i, item) in trans.into_iter().enumerate() {
@@ -1053,6 +1078,15 @@ impl WhisperEngine {
         // 回退逻辑：如果 json 没产出，从捕获的 stdout 解析
         if segments.is_empty() && !stdout_str.is_empty() {
             segments = Self::parse_stdout_segments(&stdout_str);
+        }
+
+        // stdout 读取线程 panic，且 JSON 也没解析成功：此时空结果不代表「素材里没有语音」，
+        // 而是唯一的文本来源在收尾时坏掉了。必须带上下文返回错误，否则用户拿到的是一枚
+        // 没有任何解释的空字幕，日志里也无从追查。
+        if segments.is_empty() && stdout_thread_panicked && !json_parsed_ok {
+            anyhow::bail!(
+                "Whisper 转写结果不可用：stdout 读取线程异常退出（panic），且 --output-json 结果缺失或无法解析，已无任何文本来源。请重试；若可复现请保留 logs/ 中的日志反馈。"
+            );
         }
 
         // 智能优化时间轴：消除 100ms 重叠鬼影、消除时间重叠冲突、广播级短句延展平滑
@@ -1205,6 +1239,47 @@ impl WhisperEngine {
             [sec] => *sec,
             // 空串 / 乱码 / 段数异常：保持原行为返回 0.0，不 panic
             _ => 0.0,
+        }
+    }
+}
+
+/// 多处理器并行时，单个 whisper-cli 实例可用的线程数。
+///
+/// whisper-cli 的 `-p N` 会拉起 N 个并行实例、每个实例再按 `-t` 开线程推理，
+/// 因此**总线程数 = 本函数返回值 × processors**。两条硬约束：
+///   1) 单实例线程数不得超过用户总配额 `th`（`.min(th)`）——旧写法 `(th / p).max(2)`
+///      在 `th = 1` 时会顶到 2，单实例一项即已超配额，再乘并行数放大更甚；
+///   2) 单实例下界仍为 2（`.max(2)`），避免把 `-t 1` 这种退化配置喂给 whisper.cpp。
+///
+/// 配额过紧（`th < 2 × processors`）时下界 2 与「总量 ≤ 配额」不可兼得：此时
+/// 以「单实例不超配额」优先，总量上界为 `max(th, 2 × processors)`；配额充足
+/// （`th ≥ 2 × processors`）时总量严格 ≤ 配额，不产生超售。回归测试见
+/// `tests::effective_threads_never_exceed_quota_when_processors_gt_one`。
+fn effective_threads(th: u32, processors: usize) -> u32 {
+    if processors > 1 {
+        (th / (processors as u32)).max(2).min(th)
+    } else {
+        th
+    }
+}
+
+/// 收尾子线程：把 `JoinHandle::join()` 的 panic 显式记录成日志，而不是用
+/// `unwrap_or_default()` 静默吞掉。
+///
+/// 背景：stdout/stderr 读取线程一旦 panic，旧写法只会留下「空转写结果」或
+/// 「空 stderr」——用户与日志都看不到失败原因。这里返回 `Option<T>`，调用方
+/// 必须显式决定降级语义：
+///   - 关键通道（stderr 诊断、stdout 兜底解析）：记录状态，必要时带上下文返回错误；
+///   - 非关键通道（音频泵送）：留一条日志后按既有降级路径继续。
+pub(super) fn join_or_log<T>(handle: std::thread::JoinHandle<T>, what: &str) -> Option<T> {
+    match handle.join() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            error!(
+                "{} 异常退出（panic）：该通道数据不可用，调用方将按降级语义继续",
+                what
+            );
+            None
         }
     }
 }
@@ -1871,6 +1946,136 @@ mod tests {
         assert!(
             msg.contains("Whisper 推理程序未就位"),
             "错误应来自 spawn 失败这条路径，实际: {msg}"
+        );
+    }
+
+    // ---- 缺陷 1 回归：多处理器并行时的线程配额 ----
+    //
+    // 旧口径 `(th / processors).max(2)` 在 `th = 2, processors = 2` 时给出单实例 2 线程，
+    // 两个并行实例合计 4 线程 > 配额 2：并行度一高，超售成倍放大，这正是「多处理器并行
+    // 抢占桌面资源」的根源。下面对「单实例 ≤ 配额」做硬断言，并在配额足以容纳下界 2 时
+    // 把「单实例 × 并行数 ≤ 配额」也钉住。
+
+    /// 覆盖缺陷 1 的最小反例与常见档位：`(th=2, p=2)`、`(th=3, p=2)`、`(th=8, p=4)` 等。
+    ///
+    /// 三条断言口径（任何组合都必须同时成立）：
+    ///   1) 单实例线程数 ≥ 1——`-t 0` 是非法参数；
+    ///   2) 单实例线程数 ≤ 用户配额 `th`——旧写法在 `th=2, p=2` 时违反的正是这条；
+    ///   3) 配额充足（`th ≥ 2 × processors`）时 `单实例 × processors ≤ th`，即真正不超售。
+    ///
+    /// `th < 2 × processors` 时下界 2 与总量上界不可兼得（取舍见 `effective_threads`
+    /// 文档），故第 3 条只在配额充足的区间断言。
+    #[test]
+    fn effective_threads_never_exceed_quota_when_processors_gt_one() {
+        // (用户配额 th, 并行实例数 processors)
+        let cases: [(u32, usize); 8] = [
+            (2, 2), // 缺陷 1 的最小反例：旧写法单实例 2 → 总量 4 > 配额 2
+            (3, 2), // 3/2=1 抬到下界 2：单实例等于配额；总量 4（配额不足以容纳下界，允许超出）
+            (4, 2), // 4/2=2：单实例 2、总量 4，恰好用满配额
+            (5, 2), // 5/2=2：总量 4 < 5，不再顶格
+            (8, 4), // 8/4=2：单实例 2、总量 8，恰好用满配额
+            (16, 4),
+            (12, 6),
+            (64, 8),
+        ];
+        for (th, processors) in cases {
+            let per = effective_threads(th, processors);
+            assert!(
+                per >= 1,
+                "th={th}, processors={processors}: 单实例线程数 {per} 非法（-t 0 会直接报错）"
+            );
+            assert!(
+                per <= th,
+                "th={th}, processors={processors}: 单实例 {per} 线程超过用户配额 {th}（缺陷 1 回归）"
+            );
+            if th >= 2 * processors as u32 {
+                let total = per as u64 * processors as u64;
+                assert!(
+                    total <= th as u64,
+                    "th={th}, processors={processors}: 单实例 {per} × 并行 {processors} = {total} 超过配额 {th}，线程超售仍存在"
+                );
+            }
+        }
+
+        // 穷举小范围组合：不变量必须对每一条 (th, processors) 都成立，
+        // 而不是只在上面挑出来的样例上成立。
+        for processors in 1usize..=16 {
+            for th in 1u32..=64 {
+                let per = effective_threads(th, processors);
+                assert!(
+                    per >= 1,
+                    "th={th}, processors={processors}: 单实例线程数不得为 0"
+                );
+                assert!(
+                    per <= th,
+                    "th={th}, processors={processors}: 单实例 {per} 超过配额 {th}"
+                );
+                if th >= 2 * processors as u32 {
+                    assert!(
+                        (per as usize) * processors <= th as usize,
+                        "th={th}, processors={processors}: 单实例 {per} × 并行 {processors} 超过配额 {th}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 边界补充：`processors ≤ 1` 维持原样透传（不做二次缩放），并覆盖 `th = 1` 的退化档位。
+    #[test]
+    fn effective_threads_passthrough_when_single_processor_and_one_thread_boundary() {
+        assert_eq!(effective_threads(16, 1), 16, "单处理器必须原样透传用户配额");
+        assert_eq!(
+            effective_threads(4, 0),
+            4,
+            "processors=0 视同单处理器：必须透传，且不得做除法（除零会 panic）"
+        );
+        assert_eq!(
+            effective_threads(1, 1),
+            1,
+            "th=1 单处理器：保持 1，不 panic"
+        );
+        // 旧写法在 th=1 时顶到 2：单实例一项即已超配额，这里收窄到配额本身。
+        assert_eq!(effective_threads(1, 2), 1, "th=1 时单实例不得顶到 2");
+        assert_eq!(
+            effective_threads(1, 8),
+            1,
+            "th=1 时并行度再高也不得突破配额"
+        );
+        // 配额不足以容纳下界 2：按文档取「单实例 ≤ 配额」优先。
+        assert_eq!(
+            effective_threads(3, 2),
+            2,
+            "配额不足时优先保「单实例 ≤ 配额」"
+        );
+    }
+
+    // ---- 缺陷 2 回归：收尾子线程 panic 必须显式收口 ----
+    //
+    // 旧写法 `handle.join().unwrap_or_default()` 把 panic 静默换成空串 / (0.0, "")，
+    // 用户侧表现为「空转写结果」与「空 stderr」，失败原因对用户和日志都不可见。
+    // `join_or_log` 是 whisper 与 SenseVoice 共用的收口点，这里把它的契约钉住。
+
+    /// 正常结束的子线程：原样送回返回值，不改变既有语义。
+    #[test]
+    fn join_or_log_returns_value_for_normal_thread() {
+        let handle = std::thread::spawn(|| String::from("正常输出"));
+        assert_eq!(
+            join_or_log(handle, "测试用正常线程"),
+            Some(String::from("正常输出")),
+            "正常结束的线程必须原样返回数据，不能被降级成 None"
+        );
+    }
+
+    /// panic 的子线程：返回 None 并留下 error! 日志，让调用方显式选择「带上下文报错」
+    /// 或「带状态降级」，而不是静默拿到默认值。
+    #[test]
+    fn join_or_log_returns_none_when_thread_panics() {
+        let handle =
+            std::thread::spawn(|| -> String { panic!("模拟 stdout 读取线程内部 panic") });
+        assert_eq!(
+            join_or_log(handle, "测试用 panic 线程"),
+            None,
+            "子线程 panic 时不得再静默返回默认值，调用方必须能拿到 None 这一分支"
         );
     }
 }
