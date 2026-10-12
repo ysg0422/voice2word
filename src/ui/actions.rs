@@ -3506,7 +3506,7 @@ impl MainWindow {
                         // 重新扫描：新文件就位后界面上的「缺失」标记要立即消失
                         this.state.refresh_model_presence();
                         // 模型换了，硬件档案里的推荐配置与预览代理可能要重算
-                        this.state.refresh_hardware_detection();
+                        this.state.refresh_hardware_recommendation();
                     }
                     Err(err) => {
                         let msg = err.to_string();
@@ -3618,7 +3618,7 @@ impl MainWindow {
                 this.state.download_done_bytes = 0;
                 this.state.download_total_bytes = 0;
                 this.state.refresh_model_presence();
-                this.state.refresh_hardware_detection();
+                this.state.refresh_hardware_recommendation();
                 this.state.download_status_msg = if !last_msg.is_empty() {
                     last_msg
                 } else if failed.is_empty() {

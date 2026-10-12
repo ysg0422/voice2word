@@ -307,7 +307,10 @@ impl HardwareInfo {
 }
 
 /// 统一推荐推理配置（与具体引擎解耦）
-#[derive(Debug, Clone)]
+///
+/// 字段全部是「档位 + 数字 + 文案」，PartialEq 只服务于单测里「换一套档案后推荐
+/// 确实变了」这类断言，没有任何运行时语义。
+#[derive(Debug, Clone, PartialEq)]
 pub struct InferenceProfile {
     pub whisper_tier: WhisperModelTier,
     pub whisper_model_name: &'static str,

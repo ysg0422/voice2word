@@ -836,9 +836,19 @@ impl AppState {
         );
     }
 
-    /// 重新检测硬件并重新评估
-    pub fn refresh_hardware_detection(&mut self) {
-        self.hardware_info = crate::core::HardwareInfo::detect();
+    /// 按**当前**硬件档案重算性能档位与推荐配置（不重新探测硬件）。
+    ///
+    /// # 为什么不在这里重新探测
+    ///
+    /// 这个函数的两个调用点都在「模型下载完成」之后（单个下载与批量下载各一处），
+    /// 而下载模型不可能改变 CPU / 内存 / 显卡。`HardwareInfo::detect()` 却要新建一个
+    /// wgpu Instance 并把所有 adapter 枚举一遍（启动注释里实测约 2.7s），而且它是跑在
+    /// 渲染线程上的——用户侧看到的就是「下载完成那一刻界面僵住两三秒」。
+    ///
+    /// 真正的硬件探测入口只有启动时的 [`AppState::with_hardware`]：它走
+    /// `HardwareInfo::detect_with_media_profile`，复用媒体管线选中的 adapter，
+    /// 不额外枚举。要再探一次硬件，应该走那条路，而不是每次下载完都探。
+    pub fn refresh_hardware_recommendation(&mut self) {
         self.performance_level = self.hardware_info.evaluate_performance();
         self.recommended_profile = crate::core::InferenceProfile::decide(
             self.performance_level,
@@ -2499,6 +2509,42 @@ mod tests {
         );
         state.segments = segments;
         state
+    }
+
+    /// 下载完模型后的「重算推荐」不许重新探测硬件。
+    ///
+    /// 回归护栏：这里以前调 `HardwareInfo::detect()`——那会新建 wgpu Instance 枚举一遍
+    /// 适配器（实测 ~2.7s）且跑在渲染线程上，用户看到的是「下载完成卡两三秒」。
+    /// 现在只按已有档案重算，硬件档案本身必须**原样不动**。
+    #[test]
+    fn refresh_hardware_recommendation_reuses_existing_probe() {
+        let mut state = test_state(vec![]);
+        let before_gpus = state.hardware_info.gpus.len();
+        let before_threads = state.hardware_info.logical_threads;
+        let before_brand = state.hardware_info.cpu_brand.clone();
+        // 先把派生值弄成明显不对的状态，证明函数确实重算过
+        state.performance_level = crate::core::PerformanceLevel::Low;
+        state.user_strategy = crate::core::UserStrategy::Balanced;
+
+        state.refresh_hardware_recommendation();
+
+        assert_eq!(state.hardware_info.gpus.len(), before_gpus, "不许重探显卡");
+        assert_eq!(state.hardware_info.logical_threads, before_threads);
+        assert_eq!(state.hardware_info.cpu_brand, before_brand);
+        let expected_level = state.hardware_info.evaluate_performance();
+        assert_eq!(
+            state.performance_level, expected_level,
+            "档位必须按档案重算"
+        );
+        assert_eq!(
+            state.recommended_profile,
+            crate::core::InferenceProfile::decide(
+                expected_level,
+                state.user_strategy,
+                &state.hardware_info
+            ),
+            "推荐配置必须按档案重算"
+        );
     }
 
     /// 润色「档位 → 配置字符串 → 档位」必须往返一致，且「关闭」只关总开关。
