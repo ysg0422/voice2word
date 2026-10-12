@@ -4695,8 +4695,10 @@ impl MainWindow {
                                                 as f32)
                                                 .max(0.02);
                                             let is_selected = sel_idx == Some(seg_idx);
+                                            // 与列表高亮、AppState::get_active_segment() 共用半开
+                                            // 区间 [start, end)：共享边界属于下一句（见 is_playing_at）。
                                             let is_active =
-                                                cur_time >= seg.start && cur_time <= seg.end;
+                                                is_playing_at(seg.start, seg.end, cur_time);
                                             div()
                                                 .id(("timeline-clip", seg_idx))
                                                 .absolute()
@@ -5753,5 +5755,19 @@ mod tests {
         assert!(is_playing_at(5.0, 9.0, 5.0), "共享边界处由后句高亮");
         assert!(!is_playing_at(5.0, 9.0, 9.0), "末句结束后不再高亮");
         assert!(!is_playing_at(0.0, 5.0, -0.1), "区间之外不得高亮");
+    }
+
+    /// 回归：多轨时间轴的片段「激活」判据必须与列表高亮同源（半开区间）。
+    /// 修前这里写的是闭区间 `cur_time <= seg.end`，相邻两句在共享边界处会
+    /// **同时**被点亮，而监视器只显示后一句——时间轴与画面/列表三者不一致。
+    #[test]
+    fn timeline_clip_active_matches_playing_judgement() {
+        // 复用权威判据：直接断言半开区间在边界两侧的归属。
+        assert!(is_playing_at(0.0, 5.0, 0.0), "起点归属前句");
+        assert!(!is_playing_at(0.0, 5.0, 5.0), "共享边界不归属前句");
+        assert!(is_playing_at(5.0, 9.0, 5.0), "共享边界归属后句");
+        // 零长片段（start == end）半开区间恒为 false：既不会同时点亮相邻两句，
+        // 也不存在「点不亮」之外的第三种状态。
+        assert!(!is_playing_at(3.0, 3.0, 3.0), "零长片段不得激活");
     }
 }
