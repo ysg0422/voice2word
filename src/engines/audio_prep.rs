@@ -306,6 +306,14 @@ fn estimate_noise_floor(dbs: &[f64], percentile: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+/// 毫秒 → 帧数，向上取整。
+///
+/// 必须向上取整：按截断算，150 ms 退出保持 / 20 ms 帧长会退化成 7 帧（140 ms），
+/// 静音尾巴少 10 ms，尾音更容易被削；帧长 16 ms 时只剩 9 帧（144 ms）。
+fn ms_to_frames(ms: u32, frame_ms: u32) -> usize {
+    ms.div_ceil(frame_ms.max(1)) as usize
+}
+
 /// 能量 VAD + 停顿压实规划。
 ///
 /// 算法：
@@ -330,9 +338,9 @@ pub fn plan_compaction(pcm: &[i16], rate: u32, cfg: &CompactionConfig) -> Compac
     let enter_db = (noise_floor + cfg.speech_margin_db).max(cfg.abs_floor_db);
     let exit_db = enter_db - 3.0;
 
-    let exit_hold = ((150 / cfg.frame_ms.max(1)) as usize).max(1);
-    let min_speech = ((cfg.min_speech_ms / cfg.frame_ms.max(1)) as usize).max(1);
-    let min_gap = (cfg.min_gap_ms / cfg.frame_ms.max(1)) as usize;
+    let exit_hold = ms_to_frames(150, cfg.frame_ms).max(1);
+    let min_speech = ms_to_frames(cfg.min_speech_ms, cfg.frame_ms).max(1);
+    let min_gap = ms_to_frames(cfg.min_gap_ms, cfg.frame_ms);
     let pad = ((cfg.pad_ms as u64 * rate as u64) / 1000) as usize;
     let keep_gap = ((cfg.keep_gap_ms as u64 * rate as u64) / 1000) as usize;
 
@@ -436,27 +444,48 @@ pub fn plan_compaction(pcm: &[i16], rate: u32, cfg: &CompactionConfig) -> Compac
 
 // ───────────────────────── WAV 输出 ─────────────────────────
 
-/// 写出 16 位单声道 PCM WAV（44 字节标准头）。
-pub fn write_wav_mono16<P: AsRef<Path>>(path: P, samples: &[i16], rate: u32) -> Result<()> {
-    let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let data_len = (samples.len() * 2) as u32;
-    let mut buf = Vec::with_capacity(44 + data_len as usize);
+/// 组装 16 位单声道 PCM 的 44 字节标准 WAV 头。
+///
+/// 单独成函数是为了让「样本数超 4 GiB」能在不开 4 GiB 缓冲的前提下被测到：
+/// 原实现直接 `(samples.len() * 2) as u32`，超 4 GiB 会静默回绕，写出的头长与
+/// 真实数据不符，播放器按头截断，尾部样本被整段丢弃。
+fn wav_header_mono16(sample_count: usize, rate: u32) -> Result<Vec<u8>> {
+    let data_len = u32::try_from(sample_count.checked_mul(2).context("WAV 数据长度溢出")?)
+        .context("WAV 数据超过 4 GiB，超出标准 WAV 头可表示范围")?;
+    let riff_len = 36u32
+        .checked_add(data_len)
+        .context("WAV RIFF 块大小溢出（36 + data 长度超出 u32）")?;
+    let byte_rate = rate
+        .checked_mul(2)
+        .context("WAV 字节率溢出（rate * 2 超出 u32）")?;
+
+    let mut buf = Vec::with_capacity(44);
     buf.extend_from_slice(b"RIFF");
-    buf.extend_from_slice(&(36 + data_len).to_le_bytes());
+    buf.extend_from_slice(&riff_len.to_le_bytes());
     buf.extend_from_slice(b"WAVE");
     buf.extend_from_slice(b"fmt ");
     buf.extend_from_slice(&16u32.to_le_bytes());
     buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
     buf.extend_from_slice(&1u16.to_le_bytes()); // 单声道
     buf.extend_from_slice(&rate.to_le_bytes());
-    buf.extend_from_slice(&(rate * 2).to_le_bytes()); // 字节率
+    buf.extend_from_slice(&byte_rate.to_le_bytes()); // 字节率
     buf.extend_from_slice(&2u16.to_le_bytes()); // 块对齐
     buf.extend_from_slice(&16u16.to_le_bytes()); // 位深
     buf.extend_from_slice(b"data");
     buf.extend_from_slice(&data_len.to_le_bytes());
+    Ok(buf)
+}
+
+/// 写出 16 位单声道 PCM WAV（44 字节标准头）。
+pub fn write_wav_mono16<P: AsRef<Path>>(path: P, samples: &[i16], rate: u32) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建 WAV 输出目录失败: {parent:?}"))?;
+    }
+    let header = wav_header_mono16(samples.len(), rate)?;
+    let mut buf = Vec::with_capacity(header.len() + samples.len() * 2);
+    buf.extend_from_slice(&header);
     for s in samples {
         buf.extend_from_slice(&s.to_le_bytes());
     }
@@ -748,5 +777,44 @@ mod tests {
         );
         assert_eq!(u16::from_le_bytes([raw[22], raw[23]]), 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 150 ms 退出保持按帧长向上取整：20 ms 帧长必须得 8 帧（160 ms 覆盖），
+    /// 而不是截断得到的 7 帧（140 ms，少 10 ms 静音尾巴，尾音更容易被削）。
+    #[test]
+    fn exit_hold_rounds_up_to_full_150ms() {
+        assert_eq!(ms_to_frames(150, 20), 8, "150/20 必须向上取整到 8 帧");
+        assert_eq!(
+            ms_to_frames(150, 16),
+            10,
+            "150/16=9.375 必须向上取整到 10 帧"
+        );
+        assert_eq!(ms_to_frames(200, 20), 10, "整除时不得多留一帧");
+        assert_eq!(ms_to_frames(300, 20), 15, "整除时不得多留一帧");
+        assert_eq!(ms_to_frames(30, 0), 30, "帧长 0 按 1 ms 兜底，避免除零");
+    }
+
+    /// 超 4 GiB 的样本数必须报错而不是把长度静默回绕；输出目录建不出来时必须带
+    /// 上下文冒泡，而不是 `.ok()` 吞掉后在别处报一个看不懂的写盘错误。
+    #[test]
+    fn write_wav_rejects_oversize_and_reports_dir_creation_failure() {
+        let oversize = (u32::MAX as usize / 2) + 1;
+        let err = wav_header_mono16(oversize, 16_000).expect_err("超 4 GiB 必须报错");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("4 GiB"), "错误必须点明 4 GiB 上限: {msg}");
+
+        let dir = std::env::temp_dir().join("v2w_audio_prep_wav_dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "占位").unwrap();
+        let bad_path = blocker.join("sub").join("out.wav");
+        let err =
+            write_wav_mono16(&bad_path, &[0i16; 4], 16_000).expect_err("父路径被文件占住必须报错");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("创建 WAV 输出目录失败"),
+            "错误必须点明目录创建失败: {msg}"
+        );
+        let _ = std::fs::remove_file(&blocker);
     }
 }

@@ -17,6 +17,25 @@ use crate::subtitle::Segment;
 // 「SenseVoice 说回落、标点说正常」会自相矛盾。
 use super::sensevoice::{provider_fallback_notice, stderr_provider_fallback, ProviderStatus};
 
+// ───────────────────────── 线程数夹取 ─────────────────────────
+
+/// CT-Transformer 标点恢复单会话线程数上限。
+///
+/// 与 SenseVoice 同源结论：16 核机器实测单会话在 8 线程附近已饱和，线程越多反而
+/// 越慢（解码是 batch=1 的串行延迟链，多线程只加同步开销）。而 `whisper_threads`
+/// 是全局共享项（16 核机器上可配到 16），CLI/GUI 都原样透传给本引擎；不夹的话，
+/// 用户配 16 线程会真的以 16 线程起 runner，造成「改了没效果 / 越改越慢」的观感。
+const MAX_THREADS: u32 = 8;
+
+/// CT-Transformer 单会话线程数下限：1 线程在长文本上明显掉速，
+/// 与设置页滑条最左档保持一致取 2。
+const MIN_THREADS: u32 = 2;
+
+/// 把线程数夹到本引擎自述的有效区间 [`MIN_THREADS`, `MAX_THREADS`]。
+fn clamp_threads(threads: u32) -> u32 {
+    threads.clamp(MIN_THREADS, MAX_THREADS)
+}
+
 /// RAII 守卫：持有「已 `spawn()` 但尚未 `wait()`」的子进程，守卫离开作用域时若句柄仍在，
 /// 就 `kill()` + `wait()` 回收它。
 ///
@@ -107,7 +126,7 @@ impl PunctuationEngine {
         Self {
             runner_script: runner_script.as_ref().to_path_buf(),
             model_path: model_path.as_ref().to_path_buf(),
-            threads,
+            threads: clamp_threads(threads),
             python_path: python_path.as_ref().to_path_buf(),
             provider,
             provider_status: Arc::new(Mutex::new(None)),
@@ -129,13 +148,18 @@ impl PunctuationEngine {
             .provider_status
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if slot.is_none() {
+        let first = slot.is_none();
+        if first {
             *slot = Some(status.clone());
         }
         drop(slot);
-        if let Some(notice) = provider_fallback_notice(&status.requested, &status.actual) {
-            if !self.fallback_reported.swap(true, Ordering::SeqCst) {
-                warn!("{notice}");
+        // 只对「首次落盘的那次回报」告警：首个回报为准的口径下，后续回报即便
+        // 与首个矛盾也不得覆盖状态，更不该借此重复刷告警。
+        if first {
+            if let Some(notice) = provider_fallback_notice(&status.requested, &status.actual) {
+                if !self.fallback_reported.swap(true, Ordering::SeqCst) {
+                    warn!("{notice}");
+                }
             }
         }
     }
@@ -192,7 +216,7 @@ impl PunctuationEngine {
             .arg("--model")
             .arg(&self.model_path)
             .arg("--threads")
-            .arg(self.threads.to_string())
+            .arg(clamp_threads(self.threads).to_string())
             .arg("--provider")
             .arg(&self.provider)
             .stdin(Stdio::piped())
@@ -209,8 +233,10 @@ impl PunctuationEngine {
         let mut reaper = ChildReaper::new(child);
 
         if let Some(mut stdin) = reaper.child_mut().stdin.take() {
-            stdin.write_all(&input_json)?;
-            stdin.flush()?;
+            stdin
+                .write_all(&input_json)
+                .context("向标点子进程 stdin 写入输入 JSON 失败")?;
+            stdin.flush().context("刷新标点子进程 stdin 失败")?;
         }
 
         if let Some(ref cb) = progress_cb {
@@ -299,7 +325,6 @@ impl PunctuationEngine {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "windows")]
     use super::*;
     #[cfg(target_os = "windows")]
     use std::time::{Duration, Instant};
@@ -398,5 +423,26 @@ mod tests {
             "cpu",
             "首个回报为准，后续重复不得覆盖"
         );
+    }
+
+    /// 构造器必须把线程数夹到 runner 的有效区间：`whisper_threads` 是全局共享项
+    /// （16 核可配到 16），原样透传会让 runner 真的以 16 线程启动，与
+    /// 「8 线程已饱和」的实测结论相悖。
+    #[test]
+    fn constructor_clamps_threads_to_runner_range() {
+        let threads_of = |threads: u32| {
+            PunctuationEngine::with_python_and_provider(
+                "runner.py",
+                "model.onnx",
+                threads,
+                "python",
+                "cpu",
+            )
+            .threads
+        };
+        assert_eq!(threads_of(0), MIN_THREADS, "0 必须抬到下限");
+        assert_eq!(threads_of(1), MIN_THREADS, "1 低于下限，抬到 MIN_THREADS");
+        assert_eq!(threads_of(64), MAX_THREADS, "64 超上限，夹到 MAX_THREADS");
+        assert_eq!(threads_of(4), 4, "区间内必须原样保留");
     }
 }
