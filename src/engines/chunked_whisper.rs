@@ -15,6 +15,9 @@ use crate::utils::TempPathGuard;
 const CHUNK_SEC: f64 = 360.0;
 const OVERLAP_SEC: f64 = 1.5;
 const MIN_CHUNK_SEC: f64 = 45.0;
+/// `ceil` 前的容差：抵消 `total / (total / n)` 的 f64 舍入，见 [`plan_chunks_target`]。
+/// 远大于该处舍入误差（约 1e-15 相对量级），又远小于任何真实块长，不会改变正常分块。
+const CHUNK_COUNT_EPS: f64 = 1e-9;
 /// 末段兜底延展的硬上限（秒）。见 [`stitch_chunks`] 末尾。
 ///
 /// 依据：兜底本意是「补回最后一句被重叠判定误丢的收尾语音」，真实漏删只有几秒；
@@ -71,7 +74,12 @@ pub fn plan_chunks_target(total_duration: f64, target_sec: f64) -> Vec<AudioChun
     // Keep the historical six-minute target for the chunk count, but divide
     // the media evenly. A fixed step leaves a short tail chunk, making the
     // final parallel round wait on one long worker while the other is idle.
-    let chunk_count = (total_duration / target).ceil().max(2.0) as usize;
+    // 调用方（`transcribe_chunked_sensevoice`）常以 `total/chunk_count` 作 target：
+    // 数学上 `total / target` 恰为该整数，但 f64 除法会把它舍入到略大于该整数
+    // （如 `4324.0 / (4324.0 / 14.0) == 14.000000000000002`），直接 `ceil` 就凭空
+    // 多切一块，末轮只剩一个 worker 在跑、其余空转——正是调用方要避免的场景。
+    // `ceil` 前减去 `CHUNK_COUNT_EPS`，把「本应为整数的商」还原成该整数。
+    let chunk_count = (total_duration / target - CHUNK_COUNT_EPS).ceil().max(2.0) as usize;
     let nominal = total_duration / chunk_count as f64;
     let half_overlap = OVERLAP_SEC * 0.5;
     (0..chunk_count)
@@ -797,6 +805,79 @@ mod tests {
                 "相邻块必须重叠，否则边界语音会被切断"
             );
         }
+    }
+
+    /// 回归：调用方以 `target = total/chunk_count` 求切块时，块数必须还原成该整数。
+    ///
+    /// `transcribe_chunked_sensevoice` 先用整数运算算出 worker 整数倍的块数，再以
+    /// `total/块数` 作目标块长。数学上 `total / (total / n) == n`，但 f64 除法会把它
+    /// 舍入到略大于 `n`（如 `4324.0 / (4324.0 / 14.0) == 14.000000000000002`），
+    /// 直接 `ceil` 就凭空多切一块：末轮只剩一个 worker 在跑、其余空转。
+    #[test]
+    fn plan_chunks_target_restores_integer_count_from_float_roundoff() {
+        let total = 4324.0f64;
+        let count = 14usize;
+        let chunks = plan_chunks_target(total, total / count as f64);
+        assert_eq!(
+            chunks.len(),
+            count,
+            "target = total/{count} 时块数必须仍为 {count}，浮点 ceil 不得多切一块"
+        );
+        let last = chunks.last().unwrap();
+        assert!(
+            (last.start + last.duration - total).abs() < 0.05,
+            "还原块数后的末块仍须贴住片尾: {last:?}"
+        );
+    }
+
+    /// 反例保护：上面的容差只应抵消浮点舍入，不能把「恰为整数倍」的商少算一块
+    /// （少切一块会让末块变长，覆盖面从另一头被削减）。
+    #[test]
+    fn plan_chunks_target_keeps_exact_multiples_intact() {
+        assert_eq!(plan_chunks_target(720.0, 360.0).len(), 2);
+        assert_eq!(plan_chunks_target(2.0 * 720.0, 360.0).len(), 4);
+        // 4 小时 / 45s = 320 块，恰好整除
+        assert_eq!(plan_chunks_target(4.0 * 3600.0, 45.0).len(), 320);
+    }
+
+    /// SenseVoice 并行路径的核心不变量：`transcribe_chunked_sensevoice` 按 worker
+    /// 整数倍算出块数 `cc`、再以 `total/cc` 作目标块长；只要目标块长不被
+    /// `MIN_CHUNK_SEC` 抬高、也不落进「整段更划算」的单块区间，
+    /// `plan_chunks_target` 就必须还原出恰好 `cc` 块——多切则末轮有 worker 空转，
+    /// 少切则每块被拉长、并行度下降。
+    #[test]
+    fn sensevoice_chunk_count_is_worker_multiple() {
+        // 与 `transcribe_chunked_sensevoice` 中整数块数推导同一套表达式。
+        let sv_count = |total: f64, w: usize| {
+            let mut cc = w;
+            while total / cc as f64 > CHUNK_SEC {
+                cc += w;
+            }
+            cc
+        };
+        let mut checked = 0usize;
+        for w in 2..=MAX_SV_WORKERS {
+            for i in 0..10_300usize {
+                let total = 200.0 + i as f64 * 0.37;
+                if total > 4000.0 {
+                    break;
+                }
+                let cc = sv_count(total, w);
+                let target = total / cc as f64;
+                // 两条有意为之的偏差（不属本不变量，见 `plan_chunks_target` 注释）：
+                // 音频短到只值一整段；目标块长低于下限而被抬高。
+                let lower = target.max(MIN_CHUNK_SEC);
+                if total > lower + MIN_CHUNK_SEC && target >= MIN_CHUNK_SEC {
+                    let got = plan_chunks_target(total, target).len();
+                    assert_eq!(
+                        got, cc,
+                        "total={total} workers={w}: 期望 {cc} 块（worker 整数倍），实得 {got}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 10_000, "覆盖面过窄：只检查了 {checked} 组");
     }
 
     /// 拼接结果里不得残留相邻的「时间几乎重叠」字幕：这是块边界被同一句切两半时

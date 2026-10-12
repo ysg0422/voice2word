@@ -24,6 +24,16 @@ pub const MAX_THREADS: u32 = 8;
 /// SenseVoice 单会话线程数下限（与设置页滑条最左档一致）。
 pub const MIN_THREADS: u32 = 2;
 
+/// 把线程数夹到引擎自述的有效区间 [`MIN_THREADS`, `MAX_THREADS`]。
+///
+/// 设置页滑条量程即由这两个常量推导，而 `whisper_threads` 是全局共享项
+/// （16 核机器上可配到 16），CLI/GUI 都把它原样透传给本引擎。不夹的话，
+/// 用户配 16 线程会真的以 16 线程起 runner——既违反本文件的实测结论
+/// （8 线程已饱和、更多反而更慢），又造成「改了没效果 / 越改越慢」的观感。
+fn clamp_threads(threads: u32) -> u32 {
+    threads.clamp(MIN_THREADS, MAX_THREADS)
+}
+
 /// 跨平台强杀指定进程及其子进程树（用于用户「终止转写」即时生效）
 fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
@@ -210,7 +220,7 @@ impl SenseVoiceEngine {
             model_path: model_path.as_ref().to_path_buf(),
             tokens_path: tokens_path.as_ref().to_path_buf(),
             vad_model_path: vad_model_path.as_ref().to_path_buf(),
-            threads: threads.max(1),
+            threads: clamp_threads(threads),
             python_path: python_path.as_ref().to_path_buf(),
             provider,
             provider_status: Arc::new(Mutex::new(None)),
@@ -317,7 +327,7 @@ impl SenseVoiceEngine {
             "SenseVoice 启动极速非自回归转写: {:?}, 语言: {:?}, 线程: {}",
             audio_path,
             language,
-            threads.unwrap_or(self.threads)
+            clamp_threads(threads.unwrap_or(self.threads))
         );
 
         let mut cmd = Command::new(&self.python_path);
@@ -325,7 +335,7 @@ impl SenseVoiceEngine {
         // 多进程并行会吃满 CPU。只设 CREATE_NO_WINDOW 等于忽略用户的让路开关。
         super::media_pipeline::apply_default_child_flags(&mut cmd);
 
-        let th = threads.unwrap_or(self.threads);
+        let th = clamp_threads(threads.unwrap_or(self.threads));
         cmd.arg(&self.runner_path)
             .arg("--model")
             .arg(&self.model_path)
@@ -371,7 +381,7 @@ impl SenseVoiceEngine {
         // 多进程并行会吃满 CPU。只设 CREATE_NO_WINDOW 等于忽略用户的让路开关。
         super::media_pipeline::apply_default_child_flags(&mut cmd);
 
-        let th = threads.unwrap_or(self.threads);
+        let th = clamp_threads(threads.unwrap_or(self.threads));
         cmd.arg(&self.runner_path)
             .arg("--model")
             .arg(&self.model_path)
@@ -1098,5 +1108,42 @@ mod tests {
         engine.record_provider("dml", "cpu");
         engine.record_provider("dml", "cpu");
         assert_eq!(engine.provider_status().unwrap().actual, "cpu");
+    }
+
+    // ---- 单会话线程数夹取：必须与文档/设置页量程一致 ----
+    //
+    // 文档（MAX_THREADS 注释）写明「单会话与切块回退路径都夹到 8」，设置页滑条
+    // 量程也由 MIN_THREADS/MAX_THREADS 推导；但 `whisper_threads` 是全局共享项
+    // （16 核机器可设到 16），CLI/GUI 原样透传。过去只有 `threads.max(1)`，
+    // 于是配 9~16 会真的以 9~16 线程起 runner，越配越慢。
+
+    #[test]
+    fn clamp_threads_holds_documented_range() {
+        assert_eq!(clamp_threads(0), MIN_THREADS, "0 必须抬到下限");
+        assert_eq!(
+            clamp_threads(1),
+            MIN_THREADS,
+            "1 低于下限，抬到 MIN_THREADS"
+        );
+        assert_eq!(clamp_threads(MIN_THREADS), MIN_THREADS, "下限本身不变");
+        assert_eq!(clamp_threads(MAX_THREADS), MAX_THREADS, "上限本身不变");
+        assert_eq!(clamp_threads(9), MAX_THREADS, "9 超上限，夹到 MAX_THREADS");
+        assert_eq!(
+            clamp_threads(16),
+            MAX_THREADS,
+            "16 超上限，夹到 MAX_THREADS"
+        );
+    }
+
+    /// 构造器必须把入参夹到有效区间，而不是只夹下界（旧实现为 `threads.max(1)`）。
+    #[test]
+    fn constructor_clamps_threads_to_documented_range() {
+        let hi = SenseVoiceEngine::new("r.py", "m.onnx", "t.txt", "v.onnx", 16);
+        assert_eq!(
+            hi.threads, MAX_THREADS,
+            "构造器必须把 16 夹到 MAX_THREADS，否则真的会以 16 线程起 runner"
+        );
+        let lo = SenseVoiceEngine::new("r.py", "m.onnx", "t.txt", "v.onnx", 0);
+        assert_eq!(lo.threads, MIN_THREADS, "构造器必须把 0 抬到 MIN_THREADS");
     }
 }

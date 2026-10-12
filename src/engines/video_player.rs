@@ -208,6 +208,14 @@ impl VideoPlayerEngine {
         }
     }
 
+    /// 播放起点钳制：`-ss` 只接受非负起点，而 [`Self::current_play_time`] 把基线
+    /// 原样当播放位置返回，两者必须同源。负起点会让「画面/音频从 0 秒起」与
+    /// 「时钟停在负数」分叉：起点 -3.0 时 `-ss` 被钳成 0.000，时钟却从 -3.0 读秒。
+    /// `f64::max` 在任一参数为 NaN 时返回另一个参数，顺带把 NaN 归一为 0。
+    fn clamp_start_seconds(start_seconds: f64) -> f64 {
+        start_seconds.max(0.0)
+    }
+
     pub fn play<P: AsRef<Path>>(&self, video_path: P, start_seconds: f64) {
         self.stop();
 
@@ -217,8 +225,14 @@ impl VideoPlayerEngine {
             return;
         }
 
+        // 起点由上游播放头（`AppState::current_time`）传入，而它有一条**未钳制**的
+        // 写入路径：`select_segment` 直接取 `seg.start`，导入的 JSON 字幕若带负时间轴
+        // （`json_timestamp` 接受负的 JSON 数字，只拦 `end < start`）就会把播放头带成
+        // 负数；而「上一句/下一句」「统计卡跳句」等入口不会再补一次 `seek_to` 的钳制。
+        // 这里在引擎边界统一钳回非负，并与下面的 `-ss` 复用同一个值，杜绝两条路径分叉。
+        let start_seconds = Self::clamp_start_seconds(start_seconds);
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let start_sec_str = format!("{:.3}", start_seconds.max(0.0));
+        let start_sec_str = format!("{:.3}", start_seconds);
         *self
             .play_start_seconds
             .lock()
@@ -598,5 +612,20 @@ mod tests {
         );
 
         engine.stop();
+    }
+
+    /// 播放起点必须非负，且 `-ss` 与时钟基线同源。
+    ///
+    /// 回归路径：导入带负时间轴的 JSON 字幕后 `select_segment` 把播放头设成负的
+    /// `seg.start`，而「上一句/下一句」等入口不补 `seek_to` 的钳制 → 播放时旧实现
+    /// 给 `-ss` 传 0 秒、却把负值原样存进基线，时钟与音频从一开始就错开。
+    #[test]
+    fn play_start_seconds_is_clamped_to_non_negative() {
+        assert_eq!(VideoPlayerEngine::clamp_start_seconds(-3.0), 0.0);
+        assert_eq!(VideoPlayerEngine::clamp_start_seconds(-1e-9), 0.0);
+        assert_eq!(VideoPlayerEngine::clamp_start_seconds(0.0), 0.0);
+        assert_eq!(VideoPlayerEngine::clamp_start_seconds(12.5), 12.5);
+        // NaN 若漏进基线，时间读数与一切比较都会变成 NaN。
+        assert_eq!(VideoPlayerEngine::clamp_start_seconds(f64::NAN), 0.0);
     }
 }
