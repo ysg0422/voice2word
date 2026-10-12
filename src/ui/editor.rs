@@ -5,7 +5,6 @@
 //! 3. 字幕属性检查器 (支持实时修改错字、增删标点、时间微调、拆分与合并)
 //! 4. 专业多轨时间轴 (时间刻度标尺、红/青色垂直指针游标、视频轨与字幕胶囊块)
 
-use super::actions::translated_out_count;
 use super::primitives;
 use super::theme::Theme;
 use super::{apply_line_edit, EditorExportFormat, EditorSubtitlePanel, MainWindow, StyleField};
@@ -594,7 +593,14 @@ impl MainWindow {
     ) -> impl IntoElement {
         let cur_time = self.state.current_time;
         let tot_time = self.state.total_duration.max(1.0);
-        let active_seg = self.state.get_active_segment().cloned();
+        // 命中句定位走 MainWindow 侧的缓存（上一帧命中的下标 + 半开区间判据）：
+        // 播放时每 40ms 重绘一帧，对几千句逐帧线性扫描纯属浪费；只有跨句的那一帧
+        // 才回落 `AppState::get_active_segment()` 重新定位（见
+        // `cached_active_segment_index`）。这里仍然克隆整条 `Segment`：下面
+        // `render_monitor_picture` 要用可变借用 `self`，这个引用活不到那里。
+        let active_seg = self
+            .cached_active_segment_index()
+            .and_then(|idx| self.state.segments.get(idx).cloned());
         let is_playing = self.state.is_playing;
 
         div()
@@ -975,18 +981,51 @@ impl MainWindow {
                         .object_fit(ObjectFit::Contain),
                 )
         } else if let Some(ref frame_path) = self.state.preview_frame_path {
-            // 解码失败时的兜底：仍交给 GPUI 的资源加载器按路径读。
-            // 只影响这一帧，下一帧解码成功就又回到上面的分支。
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    img(frame_path.clone())
-                        .size_full()
-                        .object_fit(ObjectFit::Contain),
+            // 解码失败时的兜底：**不再**把路径交给 GPUI 的资源加载器。
+            // `img(路径)` 会在 `App::loading_assets` 里按资源哈希永久留一张解码结果
+            // （只增不删，见上面的分支说明），而拖动时间轴是「每 0.1s 一个新路径」，
+            // 于是内存随时间线性上涨——这条兜底路正是那个口子最后一个入口。
+            // 这里改用同一个解码入口再试一次，成败都按路径记进
+            // `cached_fallback_frame`，同一路径不会逐帧重解（兜底跑在渲染线程上，
+            // 每帧重试一次失败解码同样是白付 IO 与解码头）。解不出来就显示同步
+            // 占位，等下一帧解码成功自然回到上面的分支。
+            let fallback_image = match self.cached_fallback_frame.as_ref() {
+                Some((path, decoded)) if path == frame_path => decoded.clone(),
+                _ => {
+                    let decoded = render_image_from_frame_file(frame_path);
+                    self.cached_fallback_frame = Some((frame_path.clone(), decoded.clone()));
+                    decoded
+                }
+            };
+            if let Some(fallback_image) = fallback_image {
+                // 与上面那条分支共用同一个「只留一张」的回收槽：GPUI 的精灵图集
+                // 只认 `drop_image`，换图时必须把上一张显式交还。
+                if !matches!(
+                    self.cached_static_image.as_ref(),
+                    Some(old) if Arc::ptr_eq(old, &fallback_image)
+                ) {
+                    if let Some(old) = self.cached_static_image.replace(fallback_image.clone()) {
+                        cx.drop_image(old, Some(window));
+                    }
+                }
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        img(ImageSource::Render(fallback_image))
+                            .size_full()
+                            .object_fit(ObjectFit::Contain),
+                    )
+            } else {
+                div().flex().flex_col().items_center().gap_1p5().child(
+                    div()
+                        .text_size(px(Theme::TEXT_BODY))
+                        .text_color(Theme::accent_on_media())
+                        .child("正在同步视频画面..."),
                 )
+            }
         } else if self.state.selected_file.is_some() {
             div().flex().flex_col().items_center().gap_1p5().child(
                 div()
@@ -2307,14 +2346,12 @@ impl MainWindow {
                             .children(self.render_replace_bar(cx))
                             // 列表信息子标头
                             .child({
-                                let has_any_trans = self.state.segments.iter().any(|s| s.has_translation());
-                                let has_distinct_trans = self.state.segments.iter().any(|s| {
-                                    if let Some(t) = &s.translation {
-                                        !t.trim().is_empty() && t.trim() != s.display_text().trim()
-                                    } else {
-                                        false
-                                    }
-                                });
+                                // 双语判定与「有没有译文」都取自派生快照：以前这两条与下面
+                                // 的行高计算、翻译卡里的同名判定各算一遍（同一件事每帧
+                                // 三遍 O(n)），现在一次算完、按 revision 缓存。
+                                let snapshot = self.derived_snapshot();
+                                let has_any_trans = snapshot.has_any_translation;
+                                let has_distinct_trans = snapshot.has_distinct_translation;
                                 div()
                                     .w_full()
                                     .h(px(26.0))
@@ -2371,13 +2408,10 @@ impl MainWindow {
                                 }
 
                                 let row_count = self.subtitle_filter.len();
-                                let has_distinct_trans = self.state.segments.iter().any(|s| {
-                                    if let Some(t) = &s.translation {
-                                        !t.trim().is_empty() && t.trim() != s.display_text().trim()
-                                    } else {
-                                        false
-                                    }
-                                });
+                                // 行高与上面子标头必须用同一个布尔，否则会出现
+                                // 「标题写双语、行高是单语」。都取快照。
+                                let has_distinct_trans =
+                                    self.derived_snapshot().has_distinct_translation;
                                 let row_h = if has_distinct_trans {
                                     SUBTITLE_ROW_H_BILINGUAL
                                 } else {
@@ -3282,19 +3316,13 @@ impl MainWindow {
     /// 阈值会把中文全判成「过快」或把英文全判成「舒适」，两头都不准。分档逻辑在
     /// `subtitle::stats::ReadingSpeed::classify`（纯函数、有单测），这里只负责展示。
     fn render_subtitle_stats_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::subtitle::stats::{compute, ReadingSpeed};
+        use crate::subtitle::stats::ReadingSpeed;
         let style = self.state.config.subtitle_style.clone();
-        // 媒体总时长：优先用工程里记录的（`total_duration`），没有则退回探测值。
-        // 两者都为 0 时 `spoken_ratio` 会返回 0，界面照常显示而不出 NaN。
-        let media_secs = if self.state.total_duration > 0.0 {
-            self.state.total_duration
-        } else {
-            self.state.transcribe_duration
-        };
-        // `max_chars_per_line` 是 u32（样式配置），stats 收 usize——显式转换，
-        // 不用 `as`（u32→usize 在 32 位平台也是无损的，但 `try_into` 更直白）。
-        let max_chars = usize::try_from(style.max_chars_per_line).unwrap_or(usize::MAX);
-        let stats = compute(&self.state.segments, media_secs, max_chars);
+        // 统计走派生快照：`compute` 每帧都要逐句 `count_visible` 扫全文（几千句时
+        // 是这块里最贵的一笔），而结果只随字幕内容 / 媒体总时长 / 单行字数上限变，
+        // 这三样都在快照的失效键里（媒体时长的取法与缓存键同源，见
+        // `stats_media_secs`）。
+        let stats = self.derived_snapshot().stats.clone();
         let max_cps_idx = stats.max_cps_index;
         let longest_idx = stats.longest_index;
         let too_fast = stats.too_fast_count;
@@ -4163,13 +4191,16 @@ impl MainWindow {
         let is_translating = self.state.is_translating;
         let progress = self.state.translate_progress.clamp(0.0, 1.0);
         let status = self.state.translate_status_msg.clone();
+        // 下面五项（译出 / 分母 / 其他语言 / 有无译文 / 是否双语）都从派生快照取：
+        // 它们过去各自遍历一遍全表，而播放时每 40ms 就要重绘一次。
+        let snapshot = self.derived_snapshot();
         // 「已完成」只认**实际译出**：`has_translation()` 要求译文非空（忽略空串/纯空白），
         // 再叠加目标语言匹配。只要还有译文为空/纯空白（哪怕引擎给它打了
         // `translation_lang`），这里就不会凑满 total，界面绝不会显示「已全部翻译」。
-        let done = translated_out_count(&self.state.segments, &target);
+        let done = snapshot.translated_out;
         // 分母只算**源文非空**的句子（与引擎的可译口径、与收尾文案一致）：
         // 空源句（静音段/纯空白行）永远不会有译文，计进分母就会永远差几句。
-        let expected = super::actions::expected_translation_count(&self.state.segments);
+        let expected = snapshot.expected_translation;
         let total = self.state.segments.len();
         // 可点的前提是**有可翻译的文本**：整片都是空源句时点下去只会
         // 得到「没有可翻译的文本」，不如直接置灰。
@@ -4178,20 +4209,9 @@ impl MainWindow {
         // 有了它才能解释「为什么按钮不是『重新翻译』」：用户切换目标语言后
         // 旧译文仍然在，但当前语言一句都没有——不提示的话，界面看起来像
         // 「翻译记录丢了」，用户会以为程序把之前的成果清空了。
-        let other_lang = self
-            .state
-            .segments
-            .iter()
-            .filter(|s| s.has_translation() && !s.translation_matches(&target))
-            .count();
-        let has_any_trans_overall = self.state.segments.iter().any(|s| s.has_translation());
-        let has_distinct_trans = self.state.segments.iter().any(|s| {
-            if let Some(t) = &s.translation {
-                !t.trim().is_empty() && t.trim() != s.display_text().trim()
-            } else {
-                false
-            }
-        });
+        let other_lang = snapshot.other_lang_translated;
+        let has_any_trans_overall = snapshot.has_any_translation;
+        let has_distinct_trans = snapshot.has_distinct_translation;
 
         // 引擎档位：本地 Qwen 免费离线，在线 API 更快更好但需要密钥
         let mode_row = div()
@@ -4398,7 +4418,13 @@ impl MainWindow {
                 )
                 .id("btn-translate-clear-all")
                 .on_click(cx.listener(|this, _, _, cx| {
+                    // `clear_all_translations` 会清掉全表译文（改掉
+                    // `has_distinct_translation` / 译出句数 / 质检的「未翻译」），
+                    // 而它自己只置脏落库、不递增修订号。派生统计快照与术语表高亮都按
+                    // `segments_revision` 失效，这里替它补一次——否则清空译文后列表
+                    // 仍按双语行高渲染、翻译卡仍说「已全部翻译」。
                     this.clear_all_translations(cx);
+                    this.state.bump_segments_revision();
                 }))
                 .into_any_element()
             } else {
@@ -5304,6 +5330,12 @@ impl MainWindow {
         }
         self.inline_edit_buffer.clear();
         self.inline_edit_cursor = 0;
+        // 就地编辑改的是 `segments` 的正文/译文，必须递增修订号：剪辑台的字幕清单
+        // 搜索、术语表高亮与本文件的派生统计快照都按 `segments_revision` 失效。
+        // 这里此前只置脏落库、不递增，于是「就地改一句原文」之后，按 revision 缓存
+        // 的那几处会一直停在旧值（缓存范式的前提就是「任何改 `segments` 的入口都
+        // 递增它」，见 `AppState::bump_segments_revision` 的文档）。
+        self.state.bump_segments_revision();
         self.state.segments_dirty = true;
         self.state.flush_segments_if_dirty();
         cx.notify();
@@ -5809,7 +5841,6 @@ impl MainWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::translated_out_count;
     use super::{
         click_seek_target, fit_video_size, is_playing_at, karaoke_mark_style, karaoke_word_marks,
         monitor_screen_size, raw_line_byte_start, render_image_from_frame_file, WordMark,
@@ -5817,6 +5848,7 @@ mod tests {
     };
     use crate::subtitle::segment::WordTiming;
     use crate::subtitle::{ExportMode, Segment};
+    use crate::ui::actions::translated_out_count;
     use crate::ui::primitives::should_consume_scroll;
     use crate::ui::theme::Theme;
     use gpui::FontWeight;

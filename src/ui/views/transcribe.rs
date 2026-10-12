@@ -10,9 +10,10 @@ use super::super::MainWindow;
 use crate::app::state::{ProcessStatus, QueueState, WorkspaceTab};
 use crate::ui::format_mm_ss;
 // 质检报告是 `segment.rs` 里的纯逻辑：这里只把结果画出来，不在界面层重算判据。
-use crate::subtitle::segment::{quality_report, QualityCategory, QualityReport};
+use crate::subtitle::segment::{QualityCategory, QualityReport};
 use crate::subtitle::Segment;
 use crate::utils::time::format_duration_short;
+use std::sync::Arc;
 
 impl MainWindow {
     /// 渲染智能生成模式主体布局 (中间是工作区，右侧是配置和选项)
@@ -776,26 +777,19 @@ impl MainWindow {
 
     /// 当前工程的质检报告；没有字幕时返回 `None`（此时不该渲染质检块）。
     ///
-    /// 术语违规一栏取 `cached_glossary_violations` 而不是就地重算：那份缓存按
-    /// 「术语表文本 + `segments_revision`」失效，剪辑台的字幕清单用的也是它，
-    /// 于是同一份数据在两个页面给出同一个数字（不会「这页 3 句、那页 5 句」），
-    /// 渲染开销也只在术语表或字幕真的变了时付一次。
-    fn quality_report_snapshot(&mut self) -> Option<QualityReport> {
+    /// 报告本身走 [`MainWindow::derived_snapshot`]：那份快照按
+    /// 「`segments_revision` + 低置信阈值 + 术语表 + 目标语言 + 样式 / 时长」失效，
+    /// 术语违规由同一份条目现算——剪辑台的高亮用的也是这条判据，于是同一份数据在
+    /// 两个页面给出同一个数字（不会「这页 3 句、那页 5 句」），而这次 `O(n)`
+    /// 遍历只在字幕、术语表或阈值真的变了时付一次（原先每帧一次）。
+    ///
+    /// 返回 `Arc` 而不是克隆整份报告：`QualityReport` 里是四个 `Vec`，逐帧深拷贝
+    /// 等于把省下的遍历又还回去。
+    fn quality_report_snapshot(&mut self) -> Option<Arc<QualityReport>> {
         if self.state.segments.is_empty() {
             return None;
         }
-        // 「未翻译」只在用户已经翻译过时才算缺陷：整篇没译文是「还没开始翻译」，
-        // 不是漏译。用「已有多少句带译文」当开关。
-        let check_untranslated = self.state.translated_count() > 0;
-        // 先按「无术语表」跑一遍拿到其余三项判据（术语表为空时 `glossary_violations`
-        // 会立刻返回），再把上面那份缓存里的违规下标填进同一结构——
-        // 计数与一键定位因此与剪辑台的高亮严格同源。
-        // 阈值来自配置（`pipeline.whisper_low_confidence`，默认 -0.35），与常量同值；
-        // 常量仅作为缺省来源，两者由 config.rs 的单测锁死同值。
-        let threshold = self.state.config.pipeline.whisper_low_confidence;
-        let mut report = quality_report(&self.state.segments, &[], threshold, check_untranslated);
-        report.glossary_violations = self.cached_glossary_violations();
-        Some(report)
+        Some(self.derived_snapshot().quality_report.clone())
     }
 
     /// 「下一处」的落点：当前选中句之后的第一处待复核；已是最后一处则回卷到第一处。

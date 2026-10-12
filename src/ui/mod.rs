@@ -21,7 +21,10 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::app::state::{AppState, ProcessStatus, WorkspaceTab};
-use crate::subtitle::{indices_cover_segments, matched_indices, ExportMode};
+use crate::subtitle::segment::QualityReport;
+use crate::subtitle::stats::SubtitleStats;
+use crate::subtitle::{indices_cover_segments, matched_indices, ExportMode, Segment};
+use crate::ui::actions::{expected_translation_count, translated_out_count};
 use theme::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorExportFormat {
@@ -428,6 +431,14 @@ pub struct MainWindow {
     /// 就等于每帧常驻一张 GPU 纹理（拖动时间轴每 40ms 换一帧）。换帧时用这里的
     /// 旧引用把上一张交还，显存占用恒定在「一帧」。见 `render_monitor_picture`。
     pub(crate) cached_static_image: Option<Arc<RenderImage>>,
+    /// 监视器「静态帧解码失败」兜底路径的已试结果：`(帧路径, 解码结果)`。
+    ///
+    /// `Some((path, None))` 表示这条路径已经试过、解不出来——渲染层据此显示同步
+    /// 占位，而不是每帧重试一次失败解码（拖动时间轴每 0.1s 就是一个新路径）。
+    /// 解出来的那一张会转交给 `cached_static_image` 走同样的换帧回收，本缓存只
+    /// 负责「同一路径不重解」。为什么不把路径直接交给 GPUI 见
+    /// `render_monitor_picture` 里那段说明。只保留最新一条即可：路径单调推进。
+    pub(crate) cached_fallback_frame: Option<(PathBuf, Option<Arc<RenderImage>>)>,
     /// 字幕清单虚拟列表的滚动位置句柄（uniform_list 仅渲染可视行）
     pub(crate) subtitle_list_scroll: UniformListScrollHandle,
     /// 批量转写队列清单的滚动句柄。
@@ -503,6 +514,14 @@ pub struct MainWindow {
     /// 与 `subtitle_filter` 同理——播放时每 40ms 重绘一次，逐帧对上千句 × 术语条数
     /// 跑子串匹配会白白掉帧。
     pub(crate) glossary_bad_cache: Option<((String, u64), Vec<usize>)>,
+    /// 剪辑台渲染用的「派生统计快照」缓存：键为 [`DerivedSnapshotKey`]。
+    ///
+    /// 与上面三个缓存同一范式（`segments_revision` + 会改动结果的配置项），
+    /// 只是把原先散在渲染路径上、各自 O(n) 的量收成一份，见 [`DerivedSnapshot`]。
+    pub(crate) derived_snapshot_cache: Option<(DerivedSnapshotKey, Arc<DerivedSnapshot>)>,
+    /// 播放命中句的缓存（上次命中的片段表下标 + 失效依据），
+    /// 见 [`MainWindow::cached_active_segment_index`]。
+    pub(crate) active_segment_cache: Option<ActiveSegmentCache>,
     /// 就地编辑状态：`Some((段落index, 是否为译文))`
     pub(crate) inline_edit_target: Option<(usize, bool)>,
     /// 就地编辑缓冲区文本
@@ -619,6 +638,52 @@ pub(crate) fn low_confidence_indices(
         .collect()
 }
 
+/// 是否存在「译文与原文不同」的句子——字幕清单双语布局与翻译卡收尾文案的同一判据。
+///
+/// 口径与改造前散在渲染路径上的三处内联实现**逐字一致**：译文去掉首尾空白后非空，
+/// 且不等于 `display_text().trim()`。两侧都必须 `trim()`：机翻常把原文原样回填、
+/// 只在首尾多几个空格或换行；不 trim 就会把它当成独立译文，清单每行白白高一截，
+/// 用户还会看到上下两行一模一样的字。
+///
+/// 抽成纯函数是为了让派生快照与渲染路径共用同一份判定，且能在单测里钉死 trim 口径
+/// （见 `mod tests`）。
+pub(crate) fn has_distinct_translation(segments: &[Segment]) -> bool {
+    segments.iter().any(|s| {
+        if let Some(t) = &s.translation {
+            !t.trim().is_empty() && t.trim() != s.display_text().trim()
+        } else {
+            false
+        }
+    })
+}
+
+/// 是否存在非空译文（不论目标语言）。与 `AppState::translated_count() > 0` 同义
+/// （计数 > 0 等价于至少一句 `has_translation`）；质检报告的「未翻译」开关取它。
+pub(crate) fn has_any_translation(segments: &[Segment]) -> bool {
+    segments.iter().any(|s| s.has_translation())
+}
+
+/// 已带译文、但**不是**当前目标语言的句数（切换目标语言后的提示文案用）。
+pub(crate) fn translated_other_lang_count(segments: &[Segment], target_lang: &str) -> usize {
+    segments
+        .iter()
+        .filter(|s| s.has_translation() && !s.translation_matches(target_lang))
+        .count()
+}
+
+/// 统计用的媒体总时长（秒）：优先工程记录值（`total_duration`），没有则退回转写
+/// 探测值（`transcribe_duration`）；两者都为 0 时 `spoken_ratio()` 返回 0，界面照常
+/// 显示而不出 NaN。
+///
+/// 抽成单一入口是为了让**缓存键**与**统计口径**用同一个输入：两处各写一遍
+/// 「谁优先」，迟早出现「缓存按 A 判失效、统计卡按 B 算数字」的错位。
+fn stats_media_secs(state: &AppState) -> f64 {
+    if state.total_duration > 0.0 {
+        state.total_duration
+    } else {
+        state.transcribe_duration
+    }
+}
 /// 秒 → `(分, 秒)` 的整数拆分（状态栏 / 转写页进度显示的**唯一**换算口径）。
 ///
 /// 抽出来是因为同一条换算原本在 `components/status_bar.rs` 与 `views/transcribe.rs`
@@ -796,6 +861,144 @@ pub fn install_window_close_guard(window: &Window, root: &Entity<MainWindow>, cx
     });
 }
 
+/// 剪辑台渲染所需的「派生统计快照」：一次遍历算完所有逐帧只读的派生量。
+///
+/// # 为什么要有它
+///
+/// 剪辑台渲染路径上有一批「按字幕条数 O(n)、每帧都要算、结果只随数据或配置变」的
+/// 量：双语判定（原先在三个地方各算一遍）、整篇统计（每句还要逐字符扫全文）、
+/// 翻译进度、质检报告。三千到三万句时它们加起来是每帧 10~20ms，而播放时每 40ms
+/// 就要重绘一次全窗——不缓存就是一路掉帧。这里把所有量收进一份快照，按
+/// [`DerivedSnapshotKey`] 失效，渲染路径只读。
+///
+/// # 语义来源
+///
+/// 每个字段都由对应模块的既有纯函数现算（见 [`build_derived_snapshot`]），界面层
+/// 不再内联任何判据；单测把快照与这些函数**逐字段**比对，语义不会因为「换了份
+/// 实现」而漂移（见 `mod tests` 的 `derived_snapshot_matches_direct_calls`）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DerivedSnapshot {
+    /// 是否存在「译文与原文不同」的句子，见 [`has_distinct_translation`]。
+    ///
+    /// 字幕清单「上下并列显示 / 双语显示」的标题与行高、翻译卡收尾文案都取它：
+    /// 只有真有独立译文时才把清单切成双语行高，否则机翻回填的「译文 == 原文」
+    /// 会让每行白白高一截。
+    pub(crate) has_distinct_translation: bool,
+    /// 是否存在非空译文（任意语言），见 [`has_any_translation`]。
+    /// 质检的「未翻译」开关与清单子标头的「单语显示 (译文同原文)」取它。
+    pub(crate) has_any_translation: bool,
+    /// 当前目标语言下实际译出的句数（`actions::translated_out_count`）。
+    pub(crate) translated_out: usize,
+    /// 应有译文的句数（源文非空的句数，`actions::expected_translation_count`）。
+    pub(crate) expected_translation: usize,
+    /// 已带译文但**不是**当前目标语言的句数（切换目标语言后的提示用）。
+    pub(crate) other_lang_translated: usize,
+    /// 整篇统计（`subtitle::stats::compute`）。
+    pub(crate) stats: SubtitleStats,
+    /// 转写质检报告（`subtitle::segment::quality_report`，术语违规已填）。
+    /// 存 `Arc` 是为了「按帧取用」不必深拷贝它内部的四个 `Vec`。
+    pub(crate) quality_report: Arc<QualityReport>,
+}
+
+/// [`DerivedSnapshot`] 的失效键：**所有**会改变快照内容的输入都在这里。
+///
+/// 与三个既有缓存（`subtitle_filter` / `glossary_bad_cache` / `low_confidence_cache`）
+/// 同一范式：逐句内容只认 `segments_revision`（任何改 `segments` 的入口都必须递增
+/// 它，见 `AppState::bump_segments_revision`），其余是「不随 revision 变化的配置 /
+/// 探测输入」。逐帧只做一次结构体比较，比重新遍历字幕表便宜几个数量级。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DerivedSnapshotKey {
+    /// 字幕内容的修订号（内容或长度变化的唯一失效依据）。
+    pub(crate) segments_revision: u64,
+    /// 翻译目标语言：`translated_out` / `other_lang_translated` 的判据。
+    pub(crate) target_lang: String,
+    /// 低置信阈值（`pipeline.whisper_low_confidence`）的位模式：`quality_report`
+    /// 的 `c < 阈值`。用 `to_bits` 与 `low_confidence_cache` 同法（浮点直接进键会
+    /// 踩 `-0.0` / `NaN` 的比较语义）。
+    pub(crate) low_confidence_bits: u64,
+    /// 术语表原文：`quality_report.glossary_violations` 的判据。按原文而不是解析后
+    /// 的条目比对：多算一次无所谓，漏算会出现「改了术语表、违规高亮不动」。
+    pub(crate) glossary: String,
+    /// 样式里的单行字数上限：`stats` 的「单行长句」门槛。
+    pub(crate) max_chars_per_line: u32,
+    /// 统计用的媒体总时长（秒，取 [`stats_media_secs`]）的位模式。
+    ///
+    /// 这条**不能**省：它来自时长探测 / 工程记录，探测完成时 `segments` 一行没动
+    /// （revision 不变），但「有语音时长占比」等数字必须立刻跟着变。
+    pub(crate) media_secs_bits: u64,
+}
+
+/// 播放命中句的缓存：上次命中的**片段表下标**与失效依据。
+///
+/// 为什么只缓存一条、不做二分，见
+/// [`MainWindow::cached_active_segment_index`]。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActiveSegmentCache {
+    /// 建缓存时的 `segments_revision`：内容一变即整体失效。
+    revision: u64,
+    /// 上一帧命中的片段在 `segments` 里的下标。
+    index: usize,
+}
+
+/// 一次算完剪辑台渲染需要的全部派生量。
+///
+/// **口径全部照抄原调用点**，这里只做「把既有函数收拢到一处」的重排：统计走
+/// `stats::compute`、质检走 `quality_report`（术语违规由同一份条目现算，与
+/// `cached_glossary_violations` 同源）、翻译进度走 `actions` 的两个计数函数、
+/// 双语判定走 [`has_distinct_translation`]。
+///
+/// 「未翻译」开关取「整篇有任意非空译文」（与 `AppState::translated_count() > 0`
+/// 同义）：整篇没译文是「还没开始翻译」，不是漏译——与转写页质检卡的原判据一致。
+///
+/// 抽成自由函数（不吃 `AppState`）是为了能在无 GUI 上下文的单测里逐字段对照结果：
+/// `MainWindow` 在 lib 单测里构造不出来。
+pub(crate) fn build_derived_snapshot(
+    segments: &[Segment],
+    media_secs: f64,
+    max_chars_per_line: usize,
+    target_lang: &str,
+    low_confidence_threshold: f64,
+    glossary_entries: &[(String, String)],
+) -> DerivedSnapshot {
+    // 质检的「未翻译」开关：整篇只要有一句非空译文就算「已经翻译过」，
+    // 与 `AppState::translated_count() > 0` 完全同义。
+    let check_untranslated = has_any_translation(segments);
+    DerivedSnapshot {
+        has_distinct_translation: has_distinct_translation(segments),
+        has_any_translation: check_untranslated,
+        translated_out: translated_out_count(segments, target_lang),
+        expected_translation: expected_translation_count(segments),
+        other_lang_translated: translated_other_lang_count(segments, target_lang),
+        stats: crate::subtitle::stats::compute(segments, media_secs, max_chars_per_line),
+        quality_report: Arc::new(crate::subtitle::segment::quality_report(
+            segments,
+            glossary_entries,
+            low_confidence_threshold,
+            check_untranslated,
+        )),
+    }
+}
+
+/// 派生快照的缓存命中判定：键一致直接复用上次那份 `Arc`，否则现算并换入。
+///
+/// 抽成自由函数（而不是内联在 `MainWindow` 方法里）是为了能在无 GUI 上下文的
+/// 单测里钉死「同键不重算、换键必重算」两条性质——`MainWindow` 在 lib 单测里
+/// 构造不出来。
+pub(crate) fn cached_derived_snapshot(
+    cache: &mut Option<(DerivedSnapshotKey, Arc<DerivedSnapshot>)>,
+    key: DerivedSnapshotKey,
+    build: impl FnOnce() -> DerivedSnapshot,
+) -> Arc<DerivedSnapshot> {
+    if let Some((cached_key, snapshot)) = cache.as_ref() {
+        if cached_key == &key {
+            return snapshot.clone();
+        }
+    }
+    let snapshot = Arc::new(build());
+    *cache = Some((key, snapshot.clone()));
+    snapshot
+}
+
 impl MainWindow {
     pub fn new(state: AppState, cx: &mut Context<Self>) -> Self {
         let metrics_rx = crate::utils::SystemMonitor::spawn_background_monitor();
@@ -859,6 +1062,7 @@ impl MainWindow {
             text_cursor_pos: 0,
             cached_live_image: None,
             cached_static_image: None,
+            cached_fallback_frame: None,
             subtitle_list_scroll: UniformListScrollHandle::new(),
             batch_queue_scroll: ScrollHandle::new(),
             subtitle_list_followed_sel: None,
@@ -890,6 +1094,8 @@ impl MainWindow {
             subtitle_filter_key: None,
             glossary_bad_cache: None,
             low_confidence_cache: None,
+            derived_snapshot_cache: None,
+            active_segment_cache: None,
             inline_edit_target: None,
             inline_edit_buffer: String::new(),
             inline_edit_cursor: 0,
@@ -1051,6 +1257,81 @@ impl MainWindow {
         let result = low_confidence_indices(&self.state.segments, threshold);
         self.low_confidence_cache = Some((key, result.clone()));
         result
+    }
+
+    /// 剪辑台渲染所需的派生统计快照（按 [`DerivedSnapshotKey`] 失效）。
+    ///
+    /// 渲染路径上所有「按字幕条数 O(n)、每帧重算、结果只随数据或配置变」的量都从
+    /// 这里取：命中时只付一次键比较 + `Arc` 克隆（不是深拷贝——`QualityReport`
+    /// 里是四个 `Vec`，逐帧克隆等于把省下的遍历又还回去）；未命中才扫一遍字幕表。
+    pub(crate) fn derived_snapshot(&mut self) -> Arc<DerivedSnapshot> {
+        // `max_chars_per_line` 是 u32、`stats::compute` 收 usize：显式转换，不用
+        // `as`——虽然 u32→usize 在支持的目标平台上无损，但没必要留这个坑。
+        let max_chars = usize::try_from(self.state.config.subtitle_style.max_chars_per_line)
+            .unwrap_or(usize::MAX);
+        let key = DerivedSnapshotKey {
+            segments_revision: self.state.segments_revision,
+            target_lang: self.state.translate_target_lang.clone(),
+            low_confidence_bits: self.state.config.pipeline.whisper_low_confidence.to_bits(),
+            glossary: self.state.config.translate.glossary.clone(),
+            max_chars_per_line: self.state.config.subtitle_style.max_chars_per_line,
+            media_secs_bits: stats_media_secs(&self.state).to_bits(),
+        };
+        let state = &self.state;
+        cached_derived_snapshot(&mut self.derived_snapshot_cache, key, || {
+            // 术语表条目只在真正重算时才解析：逐帧解析一遍等于又添一处固定开销，
+            // 而它只在这条失效路径上被需要。
+            let entries = state.config.translate.glossary_entries();
+            build_derived_snapshot(
+                &state.segments,
+                stats_media_secs(state),
+                max_chars,
+                &state.translate_target_lang,
+                state.config.pipeline.whisper_low_confidence,
+                &entries,
+            )
+        })
+    }
+
+    /// 当前播放时间命中的片段表下标（带缓存，见 [`ActiveSegmentCache`]）。
+    ///
+    /// 命中：上次那一条仍处在同一 `segments_revision` 下、且 `current_time` 仍落在
+    /// 它的半开区间 `[start, end)` 内 → 一次区间比较，零扫描。播放时每 40ms 重绘
+    /// 一帧，而时间基本都停在同一句里，命中率接近 100%。
+    ///
+    /// 未命中（跨句 / 跳转 / 时间轴被改）：回落 `AppState::get_active_segment()`
+    /// 重新定位——判据的单一事实来源仍然是 `AppState`，这里只负责把它记住。回落
+    /// 用**指针同一性**反查下标：`get_active_segment` 返回的就是 `segments` 里某个
+    /// 元素的引用，`position(<同一指针>)` 必然命中，不必把它的 `find` 条件再抄一遍
+    /// （抄一遍就多了一处会与 `AppState` 漂移的判据）。代价是跨句那一帧多扫一次表，
+    /// 播放时每句只付一次。
+    ///
+    /// 这里**不**假设 `segments` 按 `start` 有序、也不做二分：拆句 / 合句 / 整轨
+    /// 重定时 / 手动微调都会改相邻句的时间，`plan_time_edit` 只把区间夹在**它当时
+    /// 认定的邻居**之间，顺序本身没有任何地方强制。缓存只回答「上一帧命中的那一条
+    /// 是否仍覆盖当前时刻」，任何依赖顺序的推断都会在编辑后选错句。
+    pub(crate) fn cached_active_segment_index(&mut self) -> Option<usize> {
+        let t = self.state.current_time;
+        if let Some(cache) = self.active_segment_cache {
+            if cache.revision == self.state.segments_revision {
+                if let Some(seg) = self.state.segments.get(cache.index) {
+                    if editor::is_playing_at(seg.start, seg.end, t) {
+                        return Some(cache.index);
+                    }
+                }
+            }
+        }
+        let seg = self.state.get_active_segment()?;
+        let index = self
+            .state
+            .segments
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, seg))?;
+        self.active_segment_cache = Some(ActiveSegmentCache {
+            revision: self.state.segments_revision,
+            index,
+        });
+        Some(index)
     }
 
     /// 把配置输入框的编辑缓冲写回 `config.toml`（在线接口三项 + 本地模型路径）。
@@ -2260,9 +2541,14 @@ fn should_ignore_delete_in_status(status: &ProcessStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_cache_usable, filter_commands, insert_printable_key, move_palette_selection_row,
-        should_ignore_delete_in_status, PALETTE_COMMANDS,
+        build_derived_snapshot, cached_derived_snapshot, filter_cache_usable, filter_commands,
+        has_any_translation, has_distinct_translation, insert_printable_key,
+        move_palette_selection_row, should_ignore_delete_in_status, translated_other_lang_count,
+        DerivedSnapshot, DerivedSnapshotKey, PALETTE_COMMANDS,
     };
+    use crate::subtitle::Segment;
+    use std::cell::Cell;
+    use std::sync::Arc;
 
     /// 不过滤状态下缓存的是 `0..len` 全集：只要没越界就复用（播放期间逐帧重绘
     /// 时零成本命中）。
@@ -2627,5 +2913,205 @@ mod tests {
         assert!(!insert_printable_key(&mut buf, &mut cursor, "\u{1}"));
         assert_eq!(buf, "ab");
         assert_eq!(cursor, 1);
+    }
+
+    /// 派生快照的测试用键：字段与生产代码一致，值只为验证失效行为。
+    fn sample_derived_key(revision: u64, target: &str) -> DerivedSnapshotKey {
+        DerivedSnapshotKey {
+            segments_revision: revision,
+            target_lang: target.to_string(),
+            low_confidence_bits: (-0.35f64).to_bits(),
+            glossary: String::new(),
+            max_chars_per_line: 20,
+            media_secs_bits: 60.0f64.to_bits(),
+        }
+    }
+
+    /// 测试用快照：内容不重要，重要的是「取回来的是不是上一次那一份」。
+    fn sample_derived_snapshot() -> DerivedSnapshot {
+        build_derived_snapshot(&[], 60.0, 20, "中文", -0.35, &[])
+    }
+
+    /// 同键连续取两次：第二次必须直接复用上一次算好的快照，不得重算。
+    #[test]
+    fn derived_cache_reuses_same_key_without_recompute() {
+        let builds = Cell::new(0usize);
+        let mut cache = None;
+        let first = cached_derived_snapshot(&mut cache, sample_derived_key(7, "中文"), || {
+            builds.set(builds.get() + 1);
+            sample_derived_snapshot()
+        });
+        let second = cached_derived_snapshot(&mut cache, sample_derived_key(7, "中文"), || {
+            builds.set(builds.get() + 1);
+            sample_derived_snapshot()
+        });
+        assert_eq!(builds.get(), 1, "同键的第二次调用不得重算");
+        assert!(Arc::ptr_eq(&first, &second), "同键必须返回同一份快照");
+    }
+
+    /// `segments_revision` 变了（任何改字幕的入口都会递增它）必须重算。
+    #[test]
+    fn derived_cache_recomputes_after_revision_bump() {
+        let builds = Cell::new(0usize);
+        let mut cache = None;
+        let first = cached_derived_snapshot(&mut cache, sample_derived_key(7, "中文"), || {
+            builds.set(builds.get() + 1);
+            sample_derived_snapshot()
+        });
+        let second = cached_derived_snapshot(&mut cache, sample_derived_key(8, "中文"), || {
+            builds.set(builds.get() + 1);
+            sample_derived_snapshot()
+        });
+        assert_eq!(builds.get(), 2, "revision 变化必须重算");
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    /// 不进 `segments_revision` 的配置输入各自都必须入键：漏一项就是「改了设置，
+    /// 界面数字不动」。
+    #[test]
+    fn derived_cache_recomputes_when_config_inputs_change() {
+        let base = sample_derived_key(7, "中文");
+        let variants = [
+            DerivedSnapshotKey {
+                target_lang: "English".to_string(),
+                ..base.clone()
+            },
+            DerivedSnapshotKey {
+                low_confidence_bits: (-0.5f64).to_bits(),
+                ..base.clone()
+            },
+            DerivedSnapshotKey {
+                glossary: "苹果=Apple".to_string(),
+                ..base.clone()
+            },
+            DerivedSnapshotKey {
+                max_chars_per_line: 30,
+                ..base.clone()
+            },
+            DerivedSnapshotKey {
+                media_secs_bits: 61.0f64.to_bits(),
+                ..base.clone()
+            },
+        ];
+        for variant in variants {
+            let builds = Cell::new(0usize);
+            let mut cache = None;
+            let first = cached_derived_snapshot(&mut cache, base.clone(), || {
+                builds.set(builds.get() + 1);
+                sample_derived_snapshot()
+            });
+            let second = cached_derived_snapshot(&mut cache, variant, || {
+                builds.set(builds.get() + 1);
+                sample_derived_snapshot()
+            });
+            assert_eq!(builds.get(), 2, "配置变化必须重算");
+            assert!(!Arc::ptr_eq(&first, &second));
+        }
+    }
+
+    /// 快照必须与「直接调用原函数」逐字段一致——纯性能重构的底线：只要有一个字段
+    /// 的口径漂了，界面上的数字就会与改造前不同。
+    #[test]
+    fn derived_snapshot_matches_direct_calls() {
+        let mut a = Segment::new(1, 0.0, 2.0, "你好世界");
+        a.translation = Some("Hi there".to_string());
+        a.translation_lang = Some("English".to_string());
+        a.confidence = Some(-0.5);
+        // 译文与原文 trim 后相同：不算「独立译文」，但仍算「有译文」
+        let mut b = Segment::new(2, 2.0, 4.0, "中");
+        b.translation = Some("  中  ".to_string());
+        b.translation_lang = Some("English".to_string());
+        let mut c = Segment::new(3, 4.0, 6.0, "第二句有内容");
+        c.translation = Some("Second".to_string());
+        c.translation_lang = Some("Français".to_string());
+        c.confidence = Some(-0.1);
+        // 纯空白译文：既不算「有译文」，也不算「独立译文」
+        let mut d = Segment::new(4, 6.0, 7.0, "   ");
+        d.translation = Some("   ".to_string());
+        // 有内容、没译文：质检的「未翻译」应当命中它
+        let e = Segment::new(5, 8.0, 9.0, "第五句没有译文");
+        let segments = vec![a, b, c, d, e];
+        let media_secs = 60.0;
+        let max_chars = 20usize;
+        let target = "English";
+        let threshold = -0.35f64;
+        let entries = vec![("你好".to_string(), "Hello".to_string())];
+
+        let snap = build_derived_snapshot(
+            &segments, media_secs, max_chars, target, threshold, &entries,
+        );
+
+        assert_eq!(
+            snap.stats,
+            crate::subtitle::stats::compute(&segments, media_secs, max_chars)
+        );
+        assert_eq!(
+            snap.translated_out,
+            crate::ui::actions::translated_out_count(&segments, target)
+        );
+        assert_eq!(
+            snap.expected_translation,
+            crate::ui::actions::expected_translation_count(&segments)
+        );
+        assert_eq!(
+            snap.other_lang_translated,
+            translated_other_lang_count(&segments, target)
+        );
+        let translated_count = segments.iter().filter(|s| s.has_translation()).count();
+        assert_eq!(snap.has_any_translation, translated_count > 0);
+        // 双语判据：与改造前编辑器里内联的那段（三处同文）逐字对照
+        let inline_reference = segments.iter().any(|s| {
+            if let Some(t) = &s.translation {
+                !t.trim().is_empty() && t.trim() != s.display_text().trim()
+            } else {
+                false
+            }
+        });
+        assert_eq!(snap.has_distinct_translation, inline_reference);
+        assert_eq!(
+            snap.has_distinct_translation,
+            has_distinct_translation(&segments)
+        );
+        // 质检报告：改造前转写页是「按空术语表算一遍、再用缓存的违规下标填进去」，
+        // 与这里「直接带条目算」必须是同一份报告
+        let mut expected = crate::subtitle::segment::quality_report(
+            &segments,
+            &[],
+            threshold,
+            translated_count > 0,
+        );
+        expected.glossary_violations =
+            crate::subtitle::segment::glossary_violations(&segments, &entries);
+        assert_eq!(*snap.quality_report, expected);
+
+        // 具体数字也钉一遍，防止「两边一起错」：5 句、3 句有非空译文（含一条与原文
+        // 相同的）、当前目标语言实际译出 2 句、另有 1 句法语译文、1 句未翻译。
+        assert_eq!(snap.stats.segment_count, 5);
+        assert_eq!(snap.stats.translated_count, 3);
+        assert_eq!(snap.translated_out, 2);
+        assert_eq!(snap.expected_translation, 4);
+        assert_eq!(snap.other_lang_translated, 1);
+        assert!(snap.has_any_translation);
+        assert!(snap.has_distinct_translation);
+        assert_eq!(snap.quality_report.low_confidence, vec![1]);
+        assert_eq!(snap.quality_report.empty_or_short, vec![2, 4]);
+        assert_eq!(snap.quality_report.untranslated, vec![5]);
+        assert_eq!(snap.quality_report.glossary_violations, vec![1]);
+    }
+
+    /// 双语判据的 trim 口径：只在首尾空白上不同的译文**不算**独立译文；
+    /// 纯空白译文连「有译文」都不是。
+    #[test]
+    fn distinct_translation_ignores_whitespace_only_differences() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "同一句话");
+        assert!(!has_distinct_translation(std::slice::from_ref(&seg)));
+        seg.translation = Some("同一句话\n".to_string());
+        assert!(!has_distinct_translation(std::slice::from_ref(&seg)));
+        seg.translation = Some("   ".to_string());
+        assert!(!has_distinct_translation(std::slice::from_ref(&seg)));
+        assert!(!has_any_translation(std::slice::from_ref(&seg)));
+        seg.translation = Some("另一句话".to_string());
+        assert!(has_distinct_translation(std::slice::from_ref(&seg)));
+        assert!(has_any_translation(std::slice::from_ref(&seg)));
     }
 }
