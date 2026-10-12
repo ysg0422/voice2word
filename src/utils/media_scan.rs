@@ -102,6 +102,70 @@ pub fn collect_media_files(
     state.out
 }
 
+/// 拖入项按扩展名分成的三类。
+///
+/// 这是**纯扩展名判定**，不碰文件系统：真正读盘失败的路径交给各自的导入内核报错
+/// （媒体走 ffmpeg 探测、字幕走 `read_subtitle_file`），比在这里静默丢掉一个
+/// 路径要有用得多——用户点名了一个文件却什么反馈都没有，是最难排查的那种体验。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DroppedKind {
+    /// 命中媒体扩展名 —— 走转写队列
+    Media,
+    /// 命中字幕扩展名 —— 走「导入字幕」链路
+    Subtitle,
+    /// 两者都不命中 —— 既有的「非媒体文件」提示
+    Other,
+}
+
+/// 判定一个用户**直接点名**的路径属于哪一类（媒体 / 字幕 / 其它）。
+///
+/// 两个清单都由调用方传入，本模块不硬编码任何格式（理由见模块头）。扩展名判定
+/// 不区分大小写、并容忍清单里带前导点（`.SRT` 同样命中）。两个清单同时命中时
+/// **媒体优先**：媒体清单是「进转写队列」的既有契约，字幕只是新增的旁路，不能让
+/// 新旁路抢走本来会排队转写的文件。
+///
+/// 只按扩展名判定，**不读盘**：路径不存在、或是目录，都不改变这里的结论——真正的
+/// 读盘失败由各自的导入内核给出明确报错。
+pub fn classify_dropped_path(
+    path: &Path,
+    media_exts: &[&str],
+    subtitle_exts: &[&str],
+) -> DroppedKind {
+    let media = normalize_exts(media_exts);
+    let subtitle = normalize_exts(subtitle_exts);
+    if ext_matches(path, &media) {
+        DroppedKind::Media
+    } else if ext_matches(path, &subtitle) {
+        DroppedKind::Subtitle
+    } else {
+        DroppedKind::Other
+    }
+}
+
+/// 从用户拖入 / 选中的路径里挑出**字幕文件**。
+///
+/// 与 [`collect_media_files`] 最大的区别是：**不递归目录**。一个课程文件夹里混着
+/// JSON 元数据、歌词、笔记是常态，把目录里的 `.json` 认成字幕自动导入，会直接把
+/// 用户当前的工程顶掉——这种破坏性动作必须由用户点名，不能靠扫目录猜。目录里是否
+/// 藏着字幕，交给用户打开目录、把单个文件拖进来。
+///
+/// 也不检查路径是否存在（判定纯按扩展名），读盘失败由导入内核给出明确报错。结果按
+/// **输入顺序**去重：同一路径大小写不同只保留首次出现的写法，保持稳定顺序便于测试。
+pub fn collect_subtitle_files(inputs: &[PathBuf], exts: &[&str]) -> Vec<PathBuf> {
+    let norm = normalize_exts(exts);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for input in inputs {
+        if !ext_matches(input, &norm) {
+            continue;
+        }
+        if seen.insert(dedup_key(input)) {
+            out.push(input.clone());
+        }
+    }
+    out
+}
+
 /// 扫描过程中累积的全部状态。
 ///
 /// 单独抽成结构体而不是一路透传 `&mut` 参数：递归函数已经有 4 个可变状态
@@ -464,5 +528,112 @@ mod tests {
         assert_eq!(out.files, vec![dir.join("MOVIE.MP4")]);
         assert!(out.skipped.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 拖拽分类（P1-A11）：字幕文件不再被静默忽略 ──────────────────────
+
+    /// 媒体 / 字幕 / 其它三类由扩展名决定，且大小写不敏感、清单里带点也认。
+    #[test]
+    fn dropped_kind_is_extension_based_and_case_insensitive() {
+        let media = ["mp4", "mp3"];
+        let subs = [".SRT", "vtt", "json"];
+
+        assert_eq!(
+            classify_dropped_path(Path::new(r"A:\a\clip.MP4"), &media, &subs),
+            DroppedKind::Media
+        );
+        assert_eq!(
+            classify_dropped_path(Path::new("b.srt"), &media, &subs),
+            DroppedKind::Subtitle
+        );
+        assert_eq!(
+            classify_dropped_path(Path::new("c.VTT"), &media, &subs),
+            DroppedKind::Subtitle
+        );
+        assert_eq!(
+            classify_dropped_path(Path::new("notes.txt"), &media, &subs),
+            DroppedKind::Other
+        );
+        // 没有扩展名一律不算命中
+        assert_eq!(
+            classify_dropped_path(Path::new("noext"), &media, &subs),
+            DroppedKind::Other
+        );
+    }
+
+    /// 两个清单同时命中时媒体优先：新加的字幕旁路不许抢走本该进转写队列的文件。
+    #[test]
+    fn media_list_wins_when_both_lists_match() {
+        assert_eq!(
+            classify_dropped_path(Path::new("x.mp4"), &["mp4"], &["mp4"]),
+            DroppedKind::Media
+        );
+    }
+
+    /// 只收「点名的那个路径」，媒体与非字幕文件都留在外面，且保持输入顺序。
+    #[test]
+    fn collect_subtitle_files_keeps_only_named_subtitles_in_input_order() {
+        let inputs = vec![
+            PathBuf::from("b.srt"),
+            PathBuf::from("clip.mp4"),
+            PathBuf::from("a.SSA"),
+            PathBuf::from("notes.txt"),
+            PathBuf::from("sub"),
+            PathBuf::from("c.TTML"),
+        ];
+
+        let got = collect_subtitle_files(&inputs, &["srt", "ssa", "ttml", "json"]);
+
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("b.srt"),
+                PathBuf::from("a.SSA"),
+                PathBuf::from("c.TTML"),
+            ]
+        );
+    }
+
+    /// 目录**不递归**：即使里面躺着字幕，拖目录进来也不会把它当成一次字幕导入。
+    #[test]
+    fn collect_subtitle_files_does_not_recurse_directories() {
+        let dir = temp_dir("subtitle_no_recurse");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("inside.srt"),
+            b"1\n00:00:00,000 --> 00:00:01,000\nhi\n",
+        )
+        .unwrap();
+
+        let got = collect_subtitle_files(std::slice::from_ref(&dir), &["srt"]);
+
+        assert!(got.is_empty(), "拖目录不该扫出里面的字幕：{got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同一路径（含大小写不同的写法）只留一条，首次出现的写法胜出。
+    #[test]
+    fn collect_subtitle_files_dedupes_case_insensitively() {
+        let inputs = vec![
+            PathBuf::from("a.srt"),
+            PathBuf::from("A.SRT"),
+            PathBuf::from("a.srt"),
+        ];
+
+        let got = collect_subtitle_files(&inputs, &["srt"]);
+
+        assert_eq!(got, vec![PathBuf::from("a.srt")]);
+    }
+
+    /// 用户点名了一个不存在 / 不可读的字幕路径：收集阶段照样点名它，读盘失败由
+    /// 导入内核报错——在这里悄悄丢掉会让用户以为程序没收到他的拖拽。
+    #[test]
+    fn collect_subtitle_files_keeps_missing_paths_for_the_import_kernel() {
+        let missing = temp_dir("subtitle_missing").join("nope.srt");
+
+        let got = collect_subtitle_files(std::slice::from_ref(&missing), &["srt"]);
+
+        assert_eq!(got, vec![missing]);
     }
 }

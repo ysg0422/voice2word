@@ -1,7 +1,7 @@
 //! MainWindow 异步与后台业务动作逻辑
 
 use gpui::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -13,11 +13,11 @@ use crate::subtitle::writer::export_spec_for;
 use crate::subtitle::Segment;
 use crate::subtitle::SubtitleWriter;
 
-/// 导入字幕成功后的提示文案。
+/// 导入字幕成功后的提示文案（**纯函数**，便于单测）。
 ///
-/// 抽成自由函数而不是闭包里的内联代码：`this.update(...)` 的闭包已经可变借用了
-/// `MainWindow`，在其中再调 `self.` 的方法会借用冲突；把「纯字符串拼装」拎出来
-/// 就没有这个问题，也顺带让这段文案可读。
+/// 返回字符串而不是直接写 `this.notice`：混合拖入时调用方要在前面拼上「媒体已
+/// 入队」的摘要，拿到文案才谈得上组合；纯函数也让三条分支能脱开 `MainWindow`
+/// 单测。
 ///
 /// TXT 分支必须显式提醒时间轴是合成的——用户很可能接着导出 SRT，而那份时间
 /// 完全不是真的。
@@ -26,8 +26,8 @@ use crate::subtitle::SubtitleWriter;
 /// 「下一行的起点」补齐中间各句的终点，只有**最后一句**的终点是按字数估算的。
 /// 也就是说除末句外的时间轴都来自文件里的真实标注，唯独末句是猜的，所以文案
 /// 只把末句点出来，不必像 TXT 那样否定整条时间轴。
-fn self_notice_import(this: &mut MainWindow, stem: &str, count: usize, is_txt: bool, is_lrc: bool) {
-    this.notice = Some(if is_txt {
+fn import_notice(stem: &str, count: usize, is_txt: bool, is_lrc: bool) -> String {
+    if is_txt {
         format!(
             "已导入「{stem}」{count} 句；纯文本没有时间信息，已按字数合成占位时间轴，导出前请核对"
         )
@@ -35,7 +35,7 @@ fn self_notice_import(this: &mut MainWindow, stem: &str, count: usize, is_txt: b
         format!("已导入「{stem}」{count} 句；最后一句的结束时间为按字数估算，导出前请核对")
     } else {
         format!("已导入「{stem}」{count} 句字幕")
-    });
+    }
 }
 
 /// `EditorExportFormat`（剪辑台的状态枚举）与配置字符串（`state.output_format`）
@@ -80,6 +80,65 @@ fn editor_export_format_string(fmt: EditorExportFormat) -> &'static str {
 pub(crate) const MEDIA_EXTS: [&str; 10] = [
     "mp4", "mkv", "mov", "avi", "flv", "webm", "mp3", "wav", "flac", "m4a",
 ];
+
+/// 支持**拖拽导入**的字幕扩展名（P1-A11）。
+///
+/// 刻意与拖拽的媒体清单一样由 UI 层集中定义：拖放判定是「按扩展名自动路由」，
+/// 清单必须和 [`MainWindow::handle_dropped_files`] 的提示文案一一对应，散在
+/// 两处迟早对不上。
+///
+/// 它比「导入字幕」对话框的过滤器少了 `txt`：`.txt` 在拖放语境里意图太不确定，
+/// 随手拖进来的备忘、脚本、日志都会被当成字幕并**直接顶掉当前工程**；而在对话框
+/// 里点选文件名时用户意图明确，那边才保留 txt。
+pub(crate) const SUBTITLE_EXTS: [&str; 9] = [
+    "srt", "vtt", "json", "lrc", "ass", "ssa", "ttml", "dfxp", "ttal",
+];
+
+/// 一次拖拽进来的内容该怎么走。
+///
+/// 决策只由两个**计数**决定（已有清单长度），因此可以抽成纯函数单测；真正改状态
+/// 的那几段分别要入队、探测时长、spawn 后台读盘，没法在单测里跑。把决策和执行
+/// 分开，「几号媒体、几号字幕走哪条路」这条规则才能被测试钉死。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropRoute {
+    /// 一个媒体一个字幕都没认出来
+    Nothing,
+    /// 只有媒体：沿用既有的单文件选中 / 多文件入队
+    MediaOnly,
+    /// 只有字幕且正好一个：直接导入
+    SubtitleOnly,
+    /// 只有字幕但有多个：明确提示，不猜、不静默
+    TooManySubtitles,
+    /// 媒体 + 一个字幕：媒体入队，同时导入字幕
+    MediaAndSubtitle,
+    /// 媒体 + 多个字幕：媒体入队，字幕只提示
+    MediaAndTooManySubtitles,
+}
+
+/// 拖拽路由决策：`media` / `subtitle` 是**已展开**的清单长度（媒体含目录递归的
+/// 结果，字幕只含用户点名的文件，见 `media_scan::collect_subtitle_files`）。
+///
+/// 规则：媒体怎么处理不受字幕影响（进队列的照样进队列），字幕则是「一个才导入、
+/// 多了只提示」——一次导入多个字幕没有合理的合并语义（时间轴互相覆盖），猜一个
+/// 等于替用户做破坏性选择。
+fn drop_route(media: usize, subtitle: usize) -> DropRoute {
+    match (media, subtitle) {
+        (0, 0) => DropRoute::Nothing,
+        (0, 1) => DropRoute::SubtitleOnly,
+        (0, _) => DropRoute::TooManySubtitles,
+        (_, 0) => DropRoute::MediaOnly,
+        (_, 1) => DropRoute::MediaAndSubtitle,
+        (_, _) => DropRoute::MediaAndTooManySubtitles,
+    }
+}
+
+/// 一次拖入多个字幕文件时的提示（纯函数，便于单测）。
+///
+/// 措辞必须给出**下一步动作**：用户拖了 3 份字幕，只说「不支持」等于让他自己猜
+/// 该怎么办；说清「一次只导入一个、请分开拖入」，他立刻知道怎么继续。
+fn too_many_subtitles_notice(count: usize) -> String {
+    format!("检测到 {count} 个字幕文件；一次只导入一个字幕文件，请分开拖入")
+}
 
 /// 应有译文的句数：**源文非空**的句子。
 ///
@@ -954,85 +1013,140 @@ impl MainWindow {
                 .await;
             let Some(handle) = handle else { return };
             let path = handle.path().to_path_buf();
+            // 落状态 / 清撤销栈 / 提示全部交给共用内核：这条路径与「把字幕拖进
+            // 窗口」必须逐字一致，否则同一个文件两种入口会有两套收尾逻辑，
+            // 迟早漂移（对话框多了个「重新编号」而拖拽少了，就是静默数据差异）。
+            let _ = this.update(cx, |this, cx| this.import_subtitle_path(path, cx));
+        })
+        .detach();
+    }
+
+    /// 「给定一个路径，直接导入成当前工程」的内核——文件对话框与拖拽共用。
+    ///
+    /// 读盘放到后台执行器（大 JSON 字幕的解析不便宜），回到实体线程后交给
+    /// [`MainWindow::apply_imported_subtitle`] 落状态。`queue_note` 是混合拖入时
+    /// 「媒体已入队」的摘要：导入提示会把它拼在前面，免得导入提示把队列信息盖掉。
+    pub(crate) fn import_subtitle_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.import_subtitle_path_with_note(path, None, cx);
+    }
+
+    /// [`MainWindow::import_subtitle_path`] 的带摘要版本（`queue_note` 见其说明）。
+    pub(crate) fn import_subtitle_path_with_note(
+        &mut self,
+        path: PathBuf,
+        queue_note: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let read_path = path.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    let segs = crate::subtitle::reader::read_subtitle_file(&path)?;
-                    Ok::<_, anyhow::Error>((path, segs))
-                })
+                .spawn(async move { crate::subtitle::reader::read_subtitle_file(&read_path) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok((path, mut segs)) => {
-                        if segs.is_empty() {
-                            this.state.status =
-                                ProcessStatus::Failed("字幕文件里没有可用的字幕行".to_string());
-                            cx.notify();
-                            return;
+                    Ok(segs) => match this.apply_imported_subtitle(&path, segs) {
+                        // 成功：导入提示拼在队列摘要后面，两条信息都不丢
+                        Some(notice) => {
+                            this.notice = Some(match queue_note {
+                                Some(q) => format!("{q}；{notice}"),
+                                None => notice,
+                            });
                         }
-                        // 句序号重新按输出顺序编号：外部文件的序号常常是错的或重复的，
-                        // 而下游（选中、质检、落库）全部按 `index` 索引。
-                        for (i, seg) in segs.iter_mut().enumerate() {
-                            seg.index = i + 1;
-                        }
-                        let count = segs.len();
-                        // 扩展名只取一次并统一成小写：`is_txt` / `is_lrc` 两处判断共用它，
-                        // 避免两份 `extension()` 拷贝各改各的而漂移。
-                        let ext = path
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .map(|e| e.to_ascii_lowercase())
-                            .unwrap_or_default();
-                        let is_txt = ext == "txt";
-                        let is_lrc = ext == "lrc";
-                        let stem = path
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "导入的字幕".to_string());
-
-                        this.state.segments = segs;
-                        // 导入的字幕不属于历史库里的任何一条记录：置空避免把编辑
-                        // 写回到别的工程的库行上（那是静默数据损坏）。
-                        this.state.active_task_id = None;
-                        this.state.selected_file = Some(path.clone());
-                        this.state.reset_edit_history();
-                        this.state.bump_segments_revision();
-                        this.state.clear_streaming();
-                        this.state.status = ProcessStatus::Idle;
-                        if let Some(first) = this.state.segments.first() {
-                            this.state.select_segment(first.index);
-                        }
-                        // 导入的是别人的字幕：波形/首帧都对不上，先清掉旧工程的缓存，
-                        // 免得监视器还显示上一支片子的画面。
-                        this.state.preview_source = None;
-                        this.state.waveform = None;
-                        this.state.active_tab = WorkspaceTab::Editor;
-                        this.subtitle_list_followed_sel = None;
-
-                        self_notice_import(this, &stem, count, is_txt, is_lrc);
-                        cx.notify();
-                    }
+                        // 字幕是空文件：红色状态已经写明原因，队列摘要仍要交代
+                        None => this.notice = queue_note,
+                    },
                     Err(e) => {
                         this.state.status = ProcessStatus::Failed(format!("导入字幕失败：{e}"));
-                        cx.notify();
+                        this.notice = queue_note;
                     }
                 }
+                cx.notify();
             });
         })
         .detach();
     }
 
+    /// 把读好的字幕句灌进当前工程，返回给用户看的提示文案；`segs` 为空时置红色
+    /// 状态并返回 `None`。
+    ///
+    /// 抽成**同步**函数（不 spawn、不碰对话框）是这次改动的关键：两条入口只差
+    /// 「路径从哪来」，剩下的重新编号、清撤销栈、清预览缓存、选首句、文案拼装
+    /// 必须逐字一致。
+    fn apply_imported_subtitle(&mut self, path: &Path, mut segs: Vec<Segment>) -> Option<String> {
+        if segs.is_empty() {
+            self.state.status = ProcessStatus::Failed("字幕文件里没有可用的字幕行".to_string());
+            return None;
+        }
+        // 句序号重新按输出顺序编号：外部文件的序号常常是错的或重复的，
+        // 而下游（选中、质检、落库）全部按 `index` 索引。
+        for (i, seg) in segs.iter_mut().enumerate() {
+            seg.index = i + 1;
+        }
+        let count = segs.len();
+        // 扩展名只取一次并统一成小写：`is_txt` / `is_lrc` 两处判断共用它，
+        // 避免两份 `extension()` 拷贝各改各的而漂移。
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "导入的字幕".to_string());
+
+        self.state.segments = segs;
+        // 导入的字幕不属于历史库里的任何一条记录：置空避免把编辑
+        // 写回到别的工程的库行上（那是静默数据损坏）。
+        self.state.active_task_id = None;
+        self.state.selected_file = Some(path.to_path_buf());
+        self.state.reset_edit_history();
+        self.state.bump_segments_revision();
+        self.state.clear_streaming();
+        self.state.status = ProcessStatus::Idle;
+        if let Some(first) = self.state.segments.first() {
+            self.state.select_segment(first.index);
+        }
+        // 导入的是别人的字幕：波形/首帧都对不上，先清掉旧工程的缓存，
+        // 免得监视器还显示上一支片子的画面。
+        self.state.preview_source = None;
+        self.state.waveform = None;
+        self.state.active_tab = WorkspaceTab::Editor;
+        self.subtitle_list_followed_sel = None;
+
+        Some(import_notice(&stem, count, ext == "txt", ext == "lrc"))
+    }
+
     /// 处理从操作系统拖入窗口的文件（GPUI 把外部文件拖放包装成一次内部 drag/drop）。
     ///
-    /// 拖入多个文件时全部进入批量队列 (F-012)：先入队并统一探测时长，再等用户
-    /// 点「开始全部」。单个文件仍走原有的「选中 + 探测时长」路径，保持单文件
+    /// 拖入多个**媒体**时全部进入批量队列 (F-012)：先入队并统一探测时长，再等用户
+    /// 点「开始全部」。单个媒体文件仍走原有的「选中 + 探测时长」路径，保持单文件
     /// 交互手感不变。全部扩展名都不支持时给出明确提示，而不是静默无反应。
+    ///
+    /// # 字幕（P1-A11）
+    ///
+    /// 拖入的字幕文件此前被 `collect_media_files` 当成「非媒体文件」丢掉，用户完全
+    /// 没有反馈。现在把拖入项分成两条清单：
+    ///
+    /// - **媒体**照旧交给 `media_scan` 递归展开（文件夹直接支持、去重、跳过原因
+    ///   结构化返回）；
+    /// - **字幕**只认「用户点名的那个文件」，不扫目录（理由见
+    ///   `media_scan::collect_subtitle_files`：课程文件夹里的 `.json` 不是字幕，
+    ///   把它自动导入会顶掉用户当前工程）。数量为 1 时走与「导入字幕」对话框**完全
+    ///   相同**的内核；多于 1 个时明确说「一次只导入一个」，既不挑一个猜、也不静默。
+    ///
+    /// 媒体与字幕一起拖入时媒体照常入队、字幕照常导入，导入提示会带上前面的队列摘要。
     pub(crate) fn handle_dropped_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
         // 拖进来的可能是**目录**（把一门课的文件夹整个拖进来是最自然的动作）。
         // 此前只按扩展名筛文件、目录被静默丢弃，用户拖了个文件夹进去看到的是
         // 「不是支持的音视频格式」——既没告诉他目录其实支持，也没说清一个文件都
         // 没找到。现在统一交给 `media_scan` 展开：目录递归、文件直收、去重、
         // 跳过原因结构化返回，好让这里的提示是有信息量的。
+        //
+        // 字幕单独收集一次（只看用户点名的文件，不递归目录）；两条清单互不干扰：
+        // `.json` / `.srt` 不在媒体清单里，`.mp4` 也不会被当成字幕。
+        let subtitles = crate::utils::media_scan::collect_subtitle_files(paths, &SUBTITLE_EXTS);
         let outcome = crate::utils::media_scan::collect_media_files(
             paths,
             &MEDIA_EXTS,
@@ -1040,46 +1154,98 @@ impl MainWindow {
         );
         // 只借用 `files`，不把它 move 出去——后面 `outcome` 还要用来算提示摘要
         // （收了几个、跳过什么）。`files.len()` 先存下来，避免与借用打架。
-        let media = &outcome.files;
-        let found = media.len();
+        let found = outcome.files.len();
 
-        match found {
-            0 => {
+        // 「几号媒体、几号字幕走哪条路」的决策被拎成纯函数 `drop_route`，单测不用
+        // 构造 `MainWindow` 就能把规则钉死；这里只负责执行它选中的分支。
+        match drop_route(found, subtitles.len()) {
+            DropRoute::Nothing => {
                 self.state.status = ProcessStatus::Failed(self.drop_failure_message(&outcome));
                 cx.notify();
             }
-            1 => {
-                // 单个文件仍走「选中 + 探测时长」的原路径，保持单文件手感不变。
-                // 但从目录里扫出来的这一个文件**不该**变成「当前文件」——用户拖的是
-                // 一个文件夹，期待的是队列，不是把里面第一个文件当成当前工程。
-                if outcome.dirs_scanned > 0 || paths.iter().any(|p| p.is_dir()) {
-                    let added = self.state.enqueue_files(media.clone());
-                    self.state.active_tab = WorkspaceTab::Generate;
-                    self.probe_queue_durations(cx);
-                    self.notice = Some(format!("已从文件夹加入 {added} 个文件到批量队列"));
-                    cx.notify();
-                } else {
-                    self.adopt_media_file(media[0].clone(), cx)
-                }
+            DropRoute::SubtitleOnly => self.import_subtitle_path(subtitles[0].clone(), cx),
+            DropRoute::TooManySubtitles => {
+                self.notice = Some(too_many_subtitles_notice(subtitles.len()));
+                cx.notify();
             }
-            _ => {
-                let added = self.state.enqueue_files(media.clone());
-                if added == 0 {
-                    self.state.status =
-                        ProcessStatus::Failed("这些文件已经在批量队列里，未重复添加".to_string());
-                    cx.notify();
-                    return;
-                }
-                info!("批量队列新增 {} 个文件", added);
-                // 队列面板在转写页，切过去用户才看得见刚入队的东西
-                self.state.active_tab = WorkspaceTab::Generate;
-                self.probe_queue_durations(cx);
-                // 拖了目录、里面有一堆非媒体文件是常态：必须交代「收了多少、跳过了
-                // 什么」，否则用户会以为漏扫了。
-                self.notice = Some(Self::ingest_summary(added, &outcome));
+            DropRoute::MediaOnly => self.route_media_only(paths, outcome, cx),
+            DropRoute::MediaAndSubtitle => {
+                let queue_note = self.enqueue_dropped_media(&outcome, cx);
+                self.import_subtitle_path_with_note(subtitles[0].clone(), queue_note, cx);
+            }
+            DropRoute::MediaAndTooManySubtitles => {
+                let queue_note = self.enqueue_dropped_media(&outcome, cx);
+                let sub_note = too_many_subtitles_notice(subtitles.len());
+                self.notice = Some(match queue_note {
+                    Some(q) => format!("{q}；{sub_note}"),
+                    None => sub_note,
+                });
                 cx.notify();
             }
         }
+    }
+
+    /// 这次拖入只有媒体时的既有分流：单个文件走「选中 + 探测时长」，从文件夹扫出来
+    /// 的、以及多个文件全部入队。
+    ///
+    /// 单独抽出来只为让 [`MainWindow::handle_dropped_files`] 的分支一眼能看完；
+    /// 内部逻辑与改动前逐字一致。
+    fn route_media_only(
+        &mut self,
+        paths: &[PathBuf],
+        outcome: crate::utils::media_scan::ScanOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        let media = &outcome.files;
+        if media.len() == 1 {
+            // 单个文件仍走「选中 + 探测时长」的原路径，保持单文件手感不变。
+            // 但从目录里扫出来的这一个文件**不该**变成「当前文件」——用户拖的是
+            // 一个文件夹，期待的是队列，不是把里面第一个文件当成当前工程。
+            if outcome.dirs_scanned > 0 || paths.iter().any(|p| p.is_dir()) {
+                let added = self.state.enqueue_files(media.clone());
+                self.state.active_tab = WorkspaceTab::Generate;
+                self.probe_queue_durations(cx);
+                self.notice = Some(format!("已从文件夹加入 {added} 个文件到批量队列"));
+                cx.notify();
+            } else {
+                self.adopt_media_file(media[0].clone(), cx)
+            }
+            return;
+        }
+        let added = self.state.enqueue_files(media.clone());
+        if added == 0 {
+            self.state.status =
+                ProcessStatus::Failed("这些文件已经在批量队列里，未重复添加".to_string());
+            cx.notify();
+            return;
+        }
+        info!("批量队列新增 {} 个文件", added);
+        // 队列面板在转写页，切过去用户才看得见刚入队的东西
+        self.state.active_tab = WorkspaceTab::Generate;
+        self.probe_queue_durations(cx);
+        // 拖了目录、里面有一堆非媒体文件是常态：必须交代「收了多少、跳过了
+        // 什么」，否则用户会以为漏扫了。
+        self.notice = Some(Self::ingest_summary(added, &outcome));
+        cx.notify();
+    }
+
+    /// 混合拖入（媒体 + 字幕）时把媒体部分入队，返回给用户看的入队摘要。
+    ///
+    /// 返回 `None` 表示一个都没新增（全都在队列里了）——此时不该报「已加入 0 个」，
+    /// 让调用方的字幕提示单独说明即可。
+    fn enqueue_dropped_media(
+        &mut self,
+        outcome: &crate::utils::media_scan::ScanOutcome,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let added = self.state.enqueue_files(outcome.files.clone());
+        if added == 0 {
+            return None;
+        }
+        info!("批量队列新增 {} 个文件", added);
+        self.state.active_tab = WorkspaceTab::Generate;
+        self.probe_queue_durations(cx);
+        Some(Self::ingest_summary(added, outcome))
     }
 
     /// 一个文件都没收到时，把「为什么」拼成可操作的中文提示。
@@ -1089,10 +1255,13 @@ impl MainWindow {
     /// 就能定位问题）；③ 目录太深——这是唯一「改个设置就能救」的情形，单独点出来。
     fn drop_failure_message(&self, outcome: &crate::utils::media_scan::ScanOutcome) -> String {
         const SUPPORTED: &str = "mp4/mkv/mov/avi/flv/webm/mp3/wav/flac/m4a";
+        // 字幕是拖拽新增的旁路：用户很可能正好拖了一份字幕却看到「没有音视频文件」，
+        // 所以失败提示必须把「字幕也能拖、但一次一个」讲出来，并指明 txt 的入口。
+        const SUBTITLE_HINT: &str =
+            "字幕文件（srt/vtt/json/lrc/ass/ssa/ttml）也可直接拖入，一次一个；纯文本 .txt 请用「导入字幕」对话框。";
         if outcome.skipped.is_empty() {
             return format!(
-                "没有找到可处理的音视频文件（支持 {SUPPORTED}）。\
-                 若拖入的是文件夹，请确认里面有这些格式的文件。"
+                "没有找到可处理的音视频文件（支持 {SUPPORTED}）。若拖入的是文件夹，请确认里面有这些格式的文件。{SUBTITLE_HINT}"
             );
         }
         // 按原因归类计数，并把每类的首个样例路径带上
@@ -1118,7 +1287,7 @@ impl MainWindow {
             })
             .collect::<Vec<_>>()
             .join("；");
-        format!("没有扫描到可处理的音视频文件：{detail}。支持 {SUPPORTED}。")
+        format!("没有扫描到可处理的音视频文件：{detail}。支持 {SUPPORTED}。{SUBTITLE_HINT}")
     }
 
     /// 成功导入多个文件时的一行摘要（收了几个、跳过了什么）。
@@ -3274,5 +3443,45 @@ mod tests {
         // 换目标语言：旧译文不能算成本轮成果（否则又会出现「换语言后显示已译出」）
         assert_eq!(super::translation_coverage(&segs, "日本語"), (0, 3));
         assert_eq!(super::translated_out_count(&segs, "English"), 1);
+    }
+
+    // ── 拖拽导入字幕（P1-A11）：路由规则与文案都要可测 ──────────────────
+
+    /// 拖拽路由的完整真值表：媒体 / 字幕的组合各自走哪条路。
+    ///
+    /// 这张表就是「拖入行为」的规格说明书——媒体照旧（不影响既有队列语义），字幕
+    /// 只在「恰好一个」时才导入，多了只提示、既不会静默也不会替用户挑一个。
+    #[test]
+    fn drop_route_covers_media_and_subtitle_combinations() {
+        use super::{drop_route, DropRoute};
+        assert_eq!(drop_route(0, 0), DropRoute::Nothing);
+        assert_eq!(drop_route(0, 1), DropRoute::SubtitleOnly);
+        assert_eq!(drop_route(0, 2), DropRoute::TooManySubtitles);
+        assert_eq!(drop_route(1, 0), DropRoute::MediaOnly);
+        assert_eq!(drop_route(7, 0), DropRoute::MediaOnly);
+        assert_eq!(drop_route(3, 1), DropRoute::MediaAndSubtitle);
+        assert_eq!(drop_route(3, 2), DropRoute::MediaAndTooManySubtitles);
+    }
+
+    /// 多个字幕的提示要说清数量和「一次一个」——只说「不支持」用户没有下一步。
+    #[test]
+    fn too_many_subtitles_notice_states_the_one_at_a_time_rule() {
+        let msg = super::too_many_subtitles_notice(3);
+        assert!(msg.contains('3'), "提示里要带上数量：{msg}");
+        assert!(
+            msg.contains("一次只导入一个"),
+            "提示要给出下一步动作：{msg}"
+        );
+    }
+
+    /// 导入提示必须把「估算出来的时间轴」说清楚：TXT 整条是合成的，LRC 只错末句。
+    #[test]
+    fn import_notice_flags_estimated_timelines() {
+        assert!(super::import_notice("a", 3, true, false).contains("占位时间轴"));
+        assert!(super::import_notice("a", 3, false, true).contains("最后一句"));
+        assert_eq!(
+            super::import_notice("a", 3, false, false),
+            "已导入「a」3 句字幕"
+        );
     }
 }
