@@ -165,8 +165,18 @@ pub fn read_subtitle_file(path: &Path) -> Result<Vec<Segment>> {
     parse(&text, format)
 }
 
-/// 编码兜底：先当 UTF-8 解，失败再当 GBK 解，两条都失败才报错。
+/// 编码兜底：先按 BOM 嗅探 UTF-16，再当 UTF-8 解，失败再当 GBK 解，都失败才报错。
+///
+/// Windows 记事本「Unicode」另存出来的字幕是 UTF-16LE/BE 带 BOM：UTF-8 解码必然
+/// 失败，落到 GBK 分支又几乎必然 `had_errors`，于是报出「既不是 UTF-8 也不是 GBK」
+/// 这种和实际不符的错误。先认 BOM 才能把这类文件正确读回。
 fn decode_subtitle_bytes(bytes: &[u8]) -> Result<String> {
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16(rest, u16::from_be_bytes);
+    }
     if let Ok(text) = std::str::from_utf8(bytes) {
         return Ok(text.to_string());
     }
@@ -175,6 +185,21 @@ fn decode_subtitle_bytes(bytes: &[u8]) -> Result<String> {
         bail!("字幕文件既不是 UTF-8 也不是 GBK 编码，无法解码");
     }
     Ok(text.into_owned())
+}
+
+/// 把去掉 BOM 的 UTF-16 负载按给定字节序解成字符串。
+///
+/// 奇数尾字节由 `as_chunks` 丢弃；孤立代理项会让 `from_utf16` 返回 `Err`，此时用
+/// `from_utf16_lossy` 兜底成 U+FFFD，而不是 panic 或让整份字幕报错——个别坏字符不该
+/// 毁掉整块内容。
+fn decode_utf16(rest: &[u8], from_bytes: fn([u8; 2]) -> u16) -> Result<String> {
+    let units: Vec<u16> = rest
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| from_bytes(*pair))
+        .collect();
+    Ok(String::from_utf16(&units).unwrap_or_else(|_| String::from_utf16_lossy(&units)))
 }
 
 /// 去掉 UTF-8 BOM。
@@ -657,6 +682,43 @@ cue-1
         let path = dir.join("utf8.srt");
         let content = "1\n00:00:01,000 --> 00:00:02,000\n你好世界\n";
         std::fs::write(&path, content).unwrap();
+
+        let segs = read_subtitle_file(&path).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "你好世界");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UTF-16LE（记事本「Unicode」另存，BOM `FF FE`）：不能因为 UTF-8 解码失败就掉进
+    /// GBK 分支报误导错误，必须先认 BOM 再按小端解回中文。
+    #[test]
+    fn read_subtitle_file_decodes_utf16le_bom() {
+        let dir = temp_dir("utf16le");
+        let path = dir.join("utf16le.srt");
+        let content = "1\n00:00:01,000 --> 00:00:02,000\n你好世界\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in content.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let segs = read_subtitle_file(&path).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "你好世界");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UTF-16BE（BOM `FE FF`）：大端序同样要先认 BOM 再解，字节序不能搞反。
+    #[test]
+    fn read_subtitle_file_decodes_utf16be_bom() {
+        let dir = temp_dir("utf16be");
+        let path = dir.join("utf16be.srt");
+        let content = "1\n00:00:01,000 --> 00:00:02,000\n你好世界\n";
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in content.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
 
         let segs = read_subtitle_file(&path).unwrap();
         assert_eq!(segs.len(), 1);
