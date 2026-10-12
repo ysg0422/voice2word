@@ -689,7 +689,10 @@ impl AppState {
         // 只能由这里在构造时把首份快照写进去（后续变更见 `save_subtitle_style`）。
         pipeline.set_subtitle_style(config.subtitle_style.clone());
         let ffmpeg_path = AppConfig::resolve_path(&config.paths.ffmpeg);
-        let proxy_manager = Arc::new(ProxyManager::new(&ffmpeg_path));
+        // 硬解后端必须在这里接进代理链路：`with_profile` 会按厂商把
+        // `hardware.hwaccel_backend()` 的结果固化进 `ProxyManager`；若用 `new`
+        // 则代理永远纯软解，设置页的 `gpu.hwaccel_decode` 无法生效。
+        let proxy_manager = Arc::new(ProxyManager::with_profile(&ffmpeg_path, &hardware));
         let proxy_enabled = hardware.force_proxy;
         // GPU 占用策略按硬件能力归一：无 GPU 适配器时无论配置如何实际都是纯 CPU
         let gpu_mode = if hardware.use_gpu_pipeline() {
@@ -3998,6 +4001,30 @@ mod tests {
         state.seek_to(2.0);
         assert_eq!(state.selected_segment_index, Some(2));
         assert_eq!(state.editing_text, "第二句");
+    }
+
+    /// 点击字幕清单某行 = 选中该句并把播放位置归位到该句起点（校对台的鼠标点击契约）。
+    /// 与键盘「上/下句」一致：`current_time` 必须落在被点句的 `start`，且编辑缓冲同步。
+    #[test]
+    fn click_row_selects_and_seeks_to_segment_start() {
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 2.0, "第一句"),
+            Segment::new(2, 3.5, 5.0, "第二句"),
+        ]);
+        // 播放停在别处（第 2 句范围内），点击第 2 行应把位置拉回该句起点
+        state.current_time = 4.8;
+        state.select_segment(2);
+        state.seek_to(3.5);
+        assert_eq!(state.selected_segment_index, Some(2));
+        assert_eq!(state.current_time, 3.5);
+        assert_eq!(state.editing_text, "第二句");
+
+        // 点击第 1 行同理：位置归位到 0.0
+        state.select_segment(1);
+        state.seek_to(0.0);
+        assert_eq!(state.selected_segment_index, Some(1));
+        assert_eq!(state.current_time, 0.0);
+        assert_eq!(state.editing_text, "第一句");
     }
 
     /// 回归：线程数收敛到 `[2, cores]` 时，单核机器（cores == 1）不得 panic。

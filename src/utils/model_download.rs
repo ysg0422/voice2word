@@ -46,15 +46,16 @@
 //! （截断重写），不会因此把该源判死。若 `.part` 已不小于期望大小（上次下完但
 //! 没来得及 rename），则跳过网络直接进入校验。
 //!
-//! 注意：启动时的 `sweep_stale_parts` 仍会清掉残留的 `.part`，因此续传的收益
-//! 主要在**同一次运行内**（换源重试、网络抖动后重试）。
+//! 注意：启动时的 `sweep_stale_parts` 只清理**过期**（默认 7 天未更新）的
+//! `.part`；近期残留会保留，因此断点续传在**跨进程**（崩溃 / 强杀后重启）场景
+//! 也能真正生效，而不只是同一次运行内的换源重试。
 
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -529,14 +530,57 @@ fn is_present_with(item: &DownloadItem, cfg: &Option<AppConfig>) -> bool {
     if meta.len() == 0 {
         return false;
     }
-    let floor = min_acceptable_size(item);
     if companion_missing(&path, item, meta.len()) {
         return false;
+    }
+    // 压缩包类条目的 `sha256` 是**下载物（zip）**的哈希，而不是解压后入口
+    // 文件的哈希；对 `dest`（解压出来的 exe）重算必然不匹配。这类条目的
+    // 完整性由 `companion` 把关，哈希只在下载 `.part` 时校验一次。
+    let expected_sha256 = if item.is_archive { None } else { item.sha256 };
+    present_by_content(
+        &path,
+        meta.len(),
+        expected_sha256,
+        min_acceptable_size(item),
+    )
+}
+
+/// 「已存在的文件是否算就位」的内容级判定（可单测，不联网）。
+///
+/// # 为什么要在已存在文件上复核哈希
+///
+/// 只比体积会让「大小对、内容损坏」的文件被**永久**判为已就位：界面一直
+/// 显示「已就位」，用户也就永远没有机会重下，直到真正加载时才炸。因此凡
+/// 声明了 `sha256` 的条目，这里必须重算哈希并逐字比对，不匹配即视为**未就位**，
+/// 让上层走重下流程。
+///
+/// # 为什么未声明哈希时退回体积下限
+///
+/// 大模型动辄数百 MB（Turbo Q8 有 833 MB），每次启动 / 刷新都全量哈希会让
+/// 首屏明显卡顿。未声明哈希的条目内容可能随上游变化，本就无法强校验，因此
+/// 退回**体积下限**的快速判定（下限只负责拦住截断下载）。
+///
+/// `floor == 0` 表示既无 `min_size` 也无 `size`，此时只要求文件非空
+/// （调用方已保证 `len > 0`）。
+fn present_by_content(path: &Path, len: u64, expected_sha256: Option<&str>, floor: u64) -> bool {
+    if let Some(expected) = expected_sha256 {
+        return match sha256_file(path) {
+            // 十六进制大小写不敏感，避免上游登记时大小写不一致造成误判。
+            Ok(actual) => actual.eq_ignore_ascii_case(expected),
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "重算已存在文件的 sha256 失败，判定为未就位"
+                );
+                false
+            }
+        };
     }
     if floor == 0 {
         return true;
     }
-    meta.len() >= floor
+    len >= floor
 }
 
 /// 「自包含入口」的体积下限：达到这个体积的单文件视为静态链接构建，
@@ -1123,7 +1167,11 @@ fn unpack_archive(item: &DownloadItem, part: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 清扫上次运行残留的 `<目标>.part` 下载中间文件。
+/// `.part` 残留超过这个时长（自最后修改起）才被视为过期并可清理。
+/// 7 天足够覆盖「跨天的大文件续传」，又不会让垃圾无限累积。
+const STALE_PART_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// 清扫**过期**的 `<目标>.part` 下载中间文件。
 ///
 /// # 为什么需要
 ///
@@ -1133,6 +1181,13 @@ fn unpack_archive(item: &DownloadItem, part: &Path, dest: &Path) -> Result<()> {
 ///
 /// 这些文件落在 `models/` 与 `tools/` 下（不是 `%TEMP%`），
 /// 因此 `temp_cleanup` 的启动清扫覆盖不到，必须在这里单独扫。
+///
+/// # 为什么只删「过期」而不是全部
+///
+/// `.part` 是断点续传的载体：留着它，下次启动就能带 `Range` 接着下。早先
+/// 版本在每次启动时清光所有 `.part`，等于把跨进程续传彻底废掉（刚下到 700 MB
+/// 被强杀，重启后从 0 再来）。现在改为**按修改时间过期**：只有超过
+/// `STALE_PART_MAX_AGE` 未更新的残留才清理，近期残留一律保留。
 ///
 /// 只删「正好是某个条目的 `<dest>.part`」的文件，不做泛扫——
 /// 用户自己的文件绝不能被误删。
@@ -1153,20 +1208,49 @@ pub fn sweep_stale_parts() -> usize {
 /// （尤其是「已就位」判定）互相干扰，制造出难以复现的偶发失败。
 /// 这里接受任意路径列表，测试用临时目录即可完全隔离。
 pub fn sweep_parts_for(dests: &[PathBuf]) -> usize {
+    sweep_parts_for_at(dests, SystemTime::now())
+}
+
+/// `.part` 残留「过期」的判定（纯函数，便于单测）。
+///
+/// 只有**最后修改时间早于** `now - STALE_PART_MAX_AGE` 的残留才算过期；
+/// 近期残留必须保留，否则刚下到一半崩溃、下次启动就被删掉，跨进程续传无从谈起。
+///
+/// 系统时钟回拨（`now` 早于 `mtime`）时 `duration_since` 返回 `Err`，此时
+/// 保守地判为**未过期**（保留），绝不因为时间异常误删可续传的中间文件。
+fn is_stale_part(mtime: SystemTime, now: SystemTime) -> bool {
+    match now.duration_since(mtime) {
+        Ok(age) => age >= STALE_PART_MAX_AGE,
+        Err(_) => false,
+    }
+}
+
+/// 带显式 `now` 的清扫实现，便于单测在不依赖真实时钟的情况下验证过期逻辑。
+fn sweep_parts_for_at(dests: &[PathBuf], now: SystemTime) -> usize {
     let mut removed = 0usize;
     for dest in dests {
         let Some(part) = part_path_for(dest) else {
             continue;
         };
-        if !part.exists() {
+        let Ok(meta) = fs::metadata(&part) else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            // 读不到修改时间就无法判断新旧；宁可留着（下次再判），也不要误删
+            // 一个可能还能续传的中间文件。
+            warn!(path = %part.display(), "无法读取 .part 的修改时间，跳过清理");
+            continue;
+        };
+        if !is_stale_part(mtime, now) {
+            // 近期残留：可能是可续传的半成品，保留。
             continue;
         }
         match fs::remove_file(&part) {
             Ok(()) => {
-                info!(path = %part.display(), "已清理上次残留的下载中间文件");
+                info!(path = %part.display(), "已清理过期残留的下载中间文件");
                 removed += 1;
             }
-            // 删不掉（被占用/权限）不算错误：下次启动再试
+            // 删不掉（被占用 / 权限）不算错误：下次启动再试
             Err(err) => warn!(path = %part.display(), error = %err, "清理下载中间文件失败"),
         }
     }
@@ -1209,6 +1293,16 @@ fn resume_offset(part_len: u64, expected: u64) -> Option<u64> {
 /// 构造 HTTP `Range` 请求头：从 `offset` 一直取到文件末尾。
 fn range_header(offset: u64) -> String {
     format!("bytes={offset}-")
+}
+
+/// 从 `Content-Range` 响应头里解析本次响应的**起始字节偏移**。
+///
+/// 形如 `bytes 500-999/1000` 或 `bytes 500-/1000`，返回 `Some(500)`；
+/// 格式不认识时返回 `None`。抽成纯函数便于单测（真正的 206 响应要联网才有）。
+fn content_range_start(value: &str) -> Option<u64> {
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let start = rest.split('/').next()?.split('-').next()?;
+    start.trim().parse::<u64>().ok()
 }
 
 /// 计算文件的 sha256，返回 64 位十六进制小写字符串。
@@ -1309,10 +1403,33 @@ fn fetch_to_file(
         return Ok(());
     }
 
-    let resume = resume_offset(existing, expected_size);
+    let requested_resume = resume_offset(existing, expected_size);
 
     // 发请求；若 Range 被服务端拒绝，`send_get` 内部已回退为整文件请求。
-    let resp = send_get(&agent, url, item_id, resume)?;
+    let mut resp = send_get(&agent, url, item_id, requested_resume)?;
+    let mut resume = requested_resume;
+
+    // 服务端回 206 只说明「我按 Range 给了部分内容」，并不保证起点就是我们要的
+    // 偏移——有的镜像 / 代理会忽略或错解 `Range`，若直接把 body 追加进 `.part`，
+    // 会把两段错位的字节拼成一个「大小对、内容错」的文件（哈希校验才拦得住，
+    // 未登记哈希的条目则会被静默损坏）。这里核对 `Content-Range` 的起点：
+    // 对不上（或拿不到该头）就丢弃这个响应，改发一次**不带 Range** 的整文件请求。
+    if resp.status() == 206 {
+        match resp.header("Content-Range").and_then(content_range_start) {
+            Some(start) if Some(start) == resume => {}
+            got => {
+                warn!(
+                    item = item_id,
+                    url,
+                    got = ?got,
+                    requested = ?resume,
+                    "206 响应的 Content-Range 起点与续传偏移不符，放弃续传、改为整文件重下"
+                );
+                resp = send_get(&agent, url, item_id, None)?;
+                resume = None;
+            }
+        }
+    }
 
     let status = resp.status();
     // 只有「发了 Range 且服务端明确回 206」才续写；其余（含 200）一律截断重下，
@@ -2221,7 +2338,16 @@ mod tests {
         (dir.clone(), dir.join("model.bin"))
     }
 
-    /// 清扫必须删掉 `.part`，且**不碰**旁边的正式文件。
+    /// 把文件的最后修改时间回拨 `age`，用来模拟「很久以前留下的 `.part`」。
+    ///
+    /// 过期判定依赖 mtime，测试又等不起 7 天，只能显式改时间戳。
+    /// 改时间戳需要带写权限的句柄，故用 `write(true)` 打开。
+    fn backdate_mtime(path: &Path, age: Duration) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    /// 过期的 `.part` 必须被清掉，且**不碰**旁边的正式文件。
     ///
     /// 用临时目录而不是真实模型路径：早先版本直接往 `models/` 写假文件，
     /// 结果与「已就位」判定类测试并行时互相干扰，出现偶发失败。
@@ -2232,6 +2358,8 @@ mod tests {
 
         fs::write(&dest, b"complete model").unwrap();
         fs::write(&part, b"incomplete").unwrap();
+        // 回拨 8 天，越过 STALE_PART_MAX_AGE（7 天）这条线。
+        backdate_mtime(&part, Duration::from_secs(8 * 24 * 3600));
 
         let removed = sweep_parts_for(std::slice::from_ref(&dest));
 
@@ -2239,6 +2367,20 @@ mod tests {
         assert!(!part.exists(), ".part 必须被清掉");
         assert!(dest.exists(), "正式文件绝不能被误删");
         assert_eq!(fs::read(&dest).unwrap(), b"complete model");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 近期残留（可能是可续传的半成品）必须保留，否则跨进程续传被废掉。
+    #[test]
+    fn sweep_preserves_fresh_parts_for_resume() {
+        let (dir, dest) = isolated_dest("fresh");
+        let part = part_path_for(&dest).unwrap();
+        fs::write(&part, b"half downloaded").unwrap();
+
+        // 刚写入，mtime 就是「现在」，未过期 → 不删。
+        assert_eq!(sweep_parts_for(std::slice::from_ref(&dest)), 0);
+        assert!(part.exists(), "近期 .part 必须保留以供续传");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2258,6 +2400,100 @@ mod tests {
         let (dir, dest) = isolated_dest("missing");
         assert_eq!(sweep_parts_for(std::slice::from_ref(&dest)), 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 声明了 sha256 时必须逐字比对（十六进制大小写不敏感），对不上判未就位。
+    #[test]
+    fn present_by_content_honors_sha256() {
+        let dir = std::env::temp_dir().join(format!("v2w_present_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("abc.bin");
+        fs::write(&file, b"abc").unwrap();
+        let len = fs::metadata(&file).unwrap().len();
+
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(present_by_content(&file, len, Some(digest), 0));
+        // 大写摘要同样通过（上游登记大小写不一定一致）。
+        assert!(present_by_content(
+            &file,
+            len,
+            Some(&digest.to_ascii_uppercase()),
+            0
+        ));
+        // 内容对不上：即使体积满足下限也必须判未就位，让上层重下。
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(!present_by_content(&file, len, Some(wrong), 1));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 未声明 sha256 时退回体积下限：达到下限算就位，不足则未就位。
+    #[test]
+    fn present_by_content_falls_back_to_size_floor() {
+        let dir = std::env::temp_dir().join(format!("v2w_present_floor_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("blob.bin");
+        fs::write(&file, vec![7u8; 100]).unwrap();
+        let len = fs::metadata(&file).unwrap().len();
+
+        assert!(present_by_content(&file, len, None, 50), "超过下限算就位");
+        assert!(
+            !present_by_content(&file, len, None, 200),
+            "低于下限算未就位"
+        );
+        assert!(
+            present_by_content(&file, len, None, 0),
+            "无下限时非空即算就位"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 声明了 sha256 但文件不存在时返回 false，绝不 panic（调用方靠这个换源重下）。
+    #[test]
+    fn present_by_content_missing_file_is_absent() {
+        let missing =
+            std::env::temp_dir().join(format!("v2w_present_missing_{}.bin", std::process::id()));
+        let _ = fs::remove_file(&missing);
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(!present_by_content(&missing, 0, Some(digest), 0));
+    }
+
+    /// 过期判定边界：恰好到 STALE_PART_MAX_AGE 才算过期，时钟回拨一律保留。
+    #[test]
+    fn stale_part_expiry_rules() {
+        let now = SystemTime::now();
+        // 刚刚写入：不过期
+        assert!(!is_stale_part(now, now));
+        // 差 1 秒到期：保留
+        assert!(!is_stale_part(
+            now - (STALE_PART_MAX_AGE - Duration::from_secs(1)),
+            now
+        ));
+        // 恰好到期：清理
+        assert!(is_stale_part(now - STALE_PART_MAX_AGE, now));
+        // 超过 8 天：清理
+        assert!(is_stale_part(now - Duration::from_secs(8 * 24 * 3600), now));
+        // mtime 在未来（时钟回拨）：保守保留
+        assert!(!is_stale_part(now + Duration::from_secs(3600), now));
+    }
+
+    /// Content-Range 起点解析：识别合法写法，非法一律 None（交给调用方重下整文件）。
+    #[test]
+    fn content_range_start_parses_offset() {
+        assert_eq!(content_range_start("bytes 500-999/1000"), Some(500));
+        assert_eq!(content_range_start("bytes 0-99/100"), Some(0));
+        assert_eq!(
+            content_range_start("bytes 4078768-/4078768"),
+            Some(4_078_768)
+        );
+        assert_eq!(content_range_start("  bytes 1-2/3  "), Some(1));
+        assert_eq!(content_range_start("items 500-999/1000"), None);
+        assert_eq!(content_range_start("bytes abc-1/2"), None);
+        assert_eq!(content_range_start("bytes"), None);
+        assert_eq!(content_range_start(""), None);
     }
 
     /// `sha256_file` 对已知内容必须给出标准摘要（"abc" 的经典向量）。

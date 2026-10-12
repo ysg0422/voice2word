@@ -4,7 +4,7 @@
 //!
 //! 主界面的字幕搜索框、在线翻译配置框都是 GPUI 自绘输入（见 `apply_line_edit`），
 //! 靠 `on_key_down` 直接插入字符。键位表是全局的，命中动作后字符就不再进入输入框，
-//! 因此裸键绑定（空格 = 播放/暂停、Delete = 删除当前句）与打字天然冲突。这里的折中是：
+//! 因此裸键绑定（空格 = 播放/暂停、Delete / Backspace = 删除当前句）与打字天然冲突。这里的折中是：
 //! 裸键只保留 `BARE_KEYS` 这一小撮高频动作，**是否真的生效由各视图的 `.on_action(...)`
 //! 自己按焦点判断**——本模块只做动作定义与键位注册，不碰 `MainWindow`。其余动作仍全部
 //! 走修饰键组合，不会出现在正常打字路径上，可以全局安全生效。
@@ -51,7 +51,7 @@ actions!(
         OpenReplacePanel,
         /// 裸空格（焦点不在输入框时）：播放 / 暂停当前预览
         TogglePlaybackBare,
-        /// 裸 Delete（焦点不在输入框时）：删除当前选中的字幕片段
+        /// 裸 Delete / Backspace（焦点不在输入框时）：删除当前选中的字幕片段
         DeleteActiveSegment,
     ]
 );
@@ -76,11 +76,11 @@ pub struct ShortcutSpec {
 /// 这些键位落在正常打字路径上，只有在焦点不在任何输入框时才该生效；真正的门控写在
 /// 各视图的 `.on_action(...)` 里（本模块只负责注册键位）。集中成一张表是为了让测试
 /// 能一眼看清「哪些裸键被占用了」，避免以后又悄悄绑一个裸字符键。
-pub const BARE_KEYS: [&str; 2] = ["space", "delete"];
+pub const BARE_KEYS: [&str; 3] = ["space", "delete", "backspace"];
 
 /// [`SHORTCUT_SPECS`] 的条目数：定长数组与测试共用同一个常量，
 /// 以后加绑定只改这一处，不会再出现「表里加了、长度常量忘了改」。
-pub const SPEC_COUNT: usize = 16;
+pub const SPEC_COUNT: usize = 17;
 
 /// 默认键位表的唯一事实来源：启动时按此注册，速查表也按此校验。
 pub const SHORTCUT_SPECS: [ShortcutSpec; SPEC_COUNT] = [
@@ -172,6 +172,13 @@ pub const SHORTCUT_SPECS: [ShortcutSpec; SPEC_COUNT] = [
         hint_key: "Delete",
         hint: "删除当前句(裸键)",
     },
+    // Backspace 与 Delete 同源：没有独立 Delete 键的键盘上，退格才是唯一顺手的删除键。
+    // 两条裸键绑定同一个动作（`DeleteActiveSegment`），焦点在输入框时都由 `.on_action` 放行。
+    ShortcutSpec {
+        key: "backspace",
+        hint_key: "Backspace",
+        hint: "删除当前句(裸键)",
+    },
 ];
 
 /// 把一条键位描述解析成具体的 [`KeyBinding`]。
@@ -198,6 +205,8 @@ fn binding_for(key: &str) -> KeyBinding {
         // 裸键：与上面的修饰键组合是两条独立绑定，键位描述不会互相覆盖。
         "space" => KeyBinding::new(key, TogglePlaybackBare, None),
         "delete" => KeyBinding::new(key, DeleteActiveSegment, None),
+        // Backspace 与 Delete 同源：键位描述不同，动作相同。
+        "backspace" => KeyBinding::new(key, DeleteActiveSegment, None),
         other => panic!("SHORTCUT_SPECS 里有未登记的键位描述: {other}"),
     }
 }
@@ -212,7 +221,7 @@ pub fn bind_default_keys(cx: &mut gpui::App) {
 /// 与 [`SHORTCUT_SPECS`]（真正的绑定表）同一份动作清单，逐条对齐由本文件末尾的
 /// 测试守着——补了绑定却忘了写速查表、或速查表里留着已经删掉的键位，都会先在这里
 /// 失败，而不是让用户对着界面上写错的键位按半天。
-pub const SHORTCUT_HINTS: [(&str, &str); 14] = [
+pub const SHORTCUT_HINTS: [(&str, &str); 15] = [
     ("Ctrl+Space", "播放/暂停"),
     ("Alt+↑↓", "上/下句"),
     ("Alt+←→", "±1 秒"),
@@ -227,11 +236,15 @@ pub const SHORTCUT_HINTS: [(&str, &str); 14] = [
     ("Ctrl+H", "查找替换"),
     ("Space", "播放/暂停(裸键)"),
     ("Delete", "删除当前句(裸键)"),
+    ("Backspace", "删除当前句(裸键)"),
 ];
 
 #[cfg(test)]
 mod tests {
-    use super::{binding_for, BARE_KEYS, SHORTCUT_HINTS, SHORTCUT_SPECS, SPEC_COUNT};
+    use super::{
+        binding_for, DeleteActiveSegment, TogglePlaybackBare, BARE_KEYS, SHORTCUT_HINTS,
+        SHORTCUT_SPECS, SPEC_COUNT,
+    };
 
     /// 速查表必须覆盖每一条实际绑定：漏掉 Ctrl+Y 这类键位时，用户永远不知道
     /// 它存在（历史上正是这么漏过一次）。
@@ -290,6 +303,7 @@ mod tests {
     fn bare_keys_are_registered_with_expected_names() {
         assert!(BARE_KEYS.contains(&"space"), "裸键表里应有 space");
         assert!(BARE_KEYS.contains(&"delete"), "裸键表里应有 delete");
+        assert!(BARE_KEYS.contains(&"backspace"), "裸键表里应有 backspace");
         for key in BARE_KEYS {
             assert!(
                 SHORTCUT_SPECS.iter().any(|spec| spec.key == key),
@@ -301,6 +315,7 @@ mod tests {
         // 速查表也要能看到裸键，否则用户永远不知道空格 / Delete 能用。
         assert!(SHORTCUT_HINTS.iter().any(|(key, _)| *key == "Space"));
         assert!(SHORTCUT_HINTS.iter().any(|(key, _)| *key == "Delete"));
+        assert!(SHORTCUT_HINTS.iter().any(|(key, _)| *key == "Backspace"));
     }
 
     /// 裸键不能带修饰键（写成 `ctrl-space` 就退回组合键了），
@@ -321,6 +336,36 @@ mod tests {
         assert!(seen.contains("space"), "裸 space 绑定丢了");
         assert!(seen.contains("ctrl-space"), "原有 Ctrl+Space 绑定丢了");
         assert!(seen.contains("delete"), "裸 delete 绑定丢了");
+        assert!(seen.contains("backspace"), "裸 backspace 绑定丢了");
+    }
+
+    /// 每条裸键都必须落在预期的动作上：空格 = 播放/暂停，Delete 与 Backspace 同源 = 删除当前句。
+    /// 只断言「能解析」不够——把 backspace 误接到 `TogglePlaybackBare` 上同样能解析通过，
+    /// 这里按动作名逐条对齐，改错接线会立刻失败。
+    #[test]
+    fn bare_keys_map_to_expected_actions() {
+        use gpui::Action as _;
+
+        let space = binding_for("space").action().name();
+        let delete = binding_for("delete").action().name();
+        let backspace = binding_for("backspace").action().name();
+
+        assert_eq!(
+            space,
+            TogglePlaybackBare::name_for_type(),
+            "裸空格应绑定「播放/暂停」"
+        );
+        assert_eq!(
+            delete,
+            DeleteActiveSegment::name_for_type(),
+            "裸 Delete 应绑定「删除当前句」"
+        );
+        assert_eq!(
+            backspace,
+            DeleteActiveSegment::name_for_type(),
+            "裸 Backspace 应与 Delete 同源（删除当前句）"
+        );
+        assert_ne!(space, delete, "空格与删除键不应落到同一个动作上");
     }
 
     /// 定长数组的 N 与常量必须一致：改了表却忘了改 N 时，这里会先失败
@@ -328,7 +373,7 @@ mod tests {
     #[test]
     fn spec_count_matches_array_length() {
         assert_eq!(SHORTCUT_SPECS.len(), SPEC_COUNT);
-        assert_eq!(SPEC_COUNT, 16, "新增绑定后请同步更新 SPEC_COUNT");
+        assert_eq!(SPEC_COUNT, 17, "新增绑定后请同步更新 SPEC_COUNT");
         // 每条裸键都恰好出现一次，不多不少。
         for key in BARE_KEYS {
             let count = SHORTCUT_SPECS.iter().filter(|spec| spec.key == key).count();

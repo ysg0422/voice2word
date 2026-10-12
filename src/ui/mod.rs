@@ -1708,6 +1708,9 @@ impl MainWindow {
             || self.api_model_focus.contains_focused(window, cx)
             || self.api_key_focus.contains_focused(window, cx)
             || self.local_model_focus.contains_focused(window, cx)
+            // 视频库「筛选关键字」输入框：与字幕搜索同法。若漏掉它，用户在库里敲空格/
+            // Delete 会被裸键动作（播放/暂停、删当前句）吃掉，既打不出空格又误触发操作。
+            || self.library_search_focus.contains_focused(window, cx)
     }
 }
 
@@ -2285,5 +2288,48 @@ mod tests {
         );
         // 空表不出错
         assert!(super::low_confidence_indices(&[], 0.0).is_empty());
+    }
+
+    /// 裸键（Space / Delete）门控的接线护栏。
+    ///
+    /// `any_input_focused` 聚合所有「已真实接线」的输入焦点句柄，只有它返回 `false`
+    /// 时裸键动作才生效。此前漏掉了视频库的「筛选关键字」输入框（`library_search_focus`），
+    /// 于是用户在库里敲空格打不出空格、敲 Delete 反而删掉当前句。
+    ///
+    /// 该函数依赖 `Window` / `App`，纯单测里无法构造焦点，因此这里退化为对源码文本的
+    /// 结构断言：逐个确认每个输入焦点句柄都被 `contains_focused` 聚合进去。将来新增输入框
+    /// 却忘了接进 `any_input_focused`，这条测试会立刻报出漏掉的名字。
+    #[test]
+    fn any_input_focused_aggregates_every_text_input() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("fn any_input_focused")
+            .expect("any_input_focused 必须存在");
+        let body = &src[start..];
+        let end = body
+            .find("\n    }\n")
+            .expect("any_input_focused 必须有闭合花括号");
+        let body = &body[..end];
+
+        // 所有「已真实接线」的输入焦点句柄；漏掉任何一个，裸键都会在对应输入框里误触发。
+        for field in [
+            "text_focus",
+            "subtitle_search_focus",
+            "replace_find_focus",
+            "replace_with_focus",
+            "export_template_focus",
+            "style_field_focus",
+            "inline_edit_focus",
+            "api_base_focus",
+            "api_model_focus",
+            "api_key_focus",
+            "local_model_focus",
+            "library_search_focus",
+        ] {
+            assert!(
+                body.contains(&format!("self.{field}.contains_focused")),
+                "any_input_focused 漏掉输入焦点句柄: {field}（裸键 Space/Delete 会在该输入框里被误触发）"
+            );
+        }
     }
 }

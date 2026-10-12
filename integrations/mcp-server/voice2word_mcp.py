@@ -253,6 +253,19 @@ def tool_transcribe(arguments):
         if polish:
             args.append("--polish")
 
+    resume = arguments.get("resume")
+    if resume is not None:
+        if not isinstance(resume, bool):
+            raise RpcError(INVALID_PARAMS, "resume 必须是布尔值")
+        if resume:
+            args.append("--resume")
+
+    artifact_dir = arguments.get("artifact_dir")
+    if artifact_dir is not None:
+        if not isinstance(artifact_dir, str) or not artifact_dir.strip():
+            raise RpcError(INVALID_PARAMS, "artifact_dir 必须是非空字符串")
+        args += ["--artifact-dir", artifact_dir]
+
     try:
         exe, proc = run_cli(args)
     except _CLI_ERRORS as exc:
@@ -336,6 +349,14 @@ TOOLS = [
                 "polish": {
                     "type": "boolean",
                     "description": "强制开启润色/标点，对应 CLI --polish",
+                },
+                "resume": {
+                    "type": "boolean",
+                    "description": "复用阶段产物目录中已有的识别结果（断点续跑），对应 CLI --resume",
+                },
+                "artifact_dir": {
+                    "type": "string",
+                    "description": "阶段产物目录，对应 CLI --artifact-dir（默认 <输入目录>/.voice2word-stages/<文件名>）",
                 },
             },
             "required": ["input"],

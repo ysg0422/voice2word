@@ -47,6 +47,15 @@
 .PARAMETER Polish
     Optional switch. Force the polish / punctuation stage on.
 
+.PARAMETER Resume
+    Optional switch. Reuse existing stage artifacts for a resumable run
+    (CLI --resume). When set without -ArtifactDir, the CLI derives the default
+    <input dir>/.voice2word-stages/<file name>.
+
+.PARAMETER ArtifactDir
+    Optional. Directory holding the per-stage artifacts (CLI --artifact-dir).
+    Also accepted on its own to pin the directory without -Resume.
+
 .PARAMETER Exe
     Optional. Explicit path to voice2word.exe; highest priority.
 
@@ -58,6 +67,9 @@
 
 .EXAMPLE
     .\transcribe.ps1 -Input talk.mp4 -Format vtt -Model models\whisper\ggml-base.bin
+
+.EXAMPLE
+    .\transcribe.ps1 -Input talk.mp4 -Resume -ArtifactDir .\.voice2word-stages\talk
 
 .EXAMPLE
     .\transcribe.ps1 -Input talk.mp4 -Exe ..\..\..\target\release\voice2word.exe
@@ -74,6 +86,8 @@ param(
     [string]$Translate,
     [string]$Threads,
     [switch]$Polish,
+    [switch]$Resume,
+    [string]$ArtifactDir,
     [string]$Exe
 )
 
@@ -247,6 +261,13 @@ if ($null -ne $threadsValue) {
 }
 if ($Polish) {
     $cliArgs.Add('--polish')
+}
+if ($Resume) {
+    $cliArgs.Add('--resume')
+}
+if (-not [string]::IsNullOrWhiteSpace($ArtifactDir)) {
+    $cliArgs.Add('--artifact-dir')
+    $cliArgs.Add($ArtifactDir)
 }
 
 Write-Verbose ("executable: " + $exePath)

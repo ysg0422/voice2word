@@ -143,6 +143,25 @@ pub struct StageArtifacts {
     root: PathBuf,
 }
 
+/// `ExtractAudio` 阶段的产物记录：原始媒体路径与探测到的时长。
+///
+/// 时长是「是否切块 / 是否并行 / 进度换算」的输入；落盘后断点续跑可直接复用，
+/// 省掉一次 ffprobe 探测。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ExtractAudioRecord {
+    pub input: String,
+    pub duration_sec: f64,
+}
+
+/// 通用「信息型」阶段留痕：只记录一段可读说明（如预处理实际生效的滤镜链）。
+///
+/// 这类阶段不产出可复用的数据结构，落盘的意义是让 `02_*` 等阶段文件可被人工排查，
+/// 并保持「一阶段一文件」的命名约定完整；它**不参与** resume 短路。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct StageRecord {
+    pub detail: String,
+}
+
 impl StageArtifacts {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -157,29 +176,45 @@ impl StageArtifacts {
     }
 
     /// 原子写：先写 `<file>.part` 再改名，失败不 panic（best-effort）。
-    pub fn write_segments(&self, stage: Stage, segments: &[Segment]) -> Result<()> {
+    fn write_bytes(&self, stage: Stage, bytes: &[u8]) -> Result<()> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("创建阶段产物目录失败: {}", self.root.display()))?;
         let path = self.path(stage);
         let tmp = path.with_extension("json.part");
-        let data = serde_json::to_vec_pretty(segments).context("序列化阶段片段失败")?;
-        std::fs::write(&tmp, &data)
+        std::fs::write(&tmp, bytes)
             .with_context(|| format!("写入阶段产物失败: {}", tmp.display()))?;
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("替换阶段产物失败: {}", path.display()))?;
         Ok(())
     }
 
-    pub fn read_segments(&self, stage: Stage) -> Result<Option<Vec<Segment>>> {
+    pub fn write_segments(&self, stage: Stage, segments: &[Segment]) -> Result<()> {
+        let data = serde_json::to_vec_pretty(segments).context("序列化阶段片段失败")?;
+        self.write_bytes(stage, &data)
+    }
+
+    /// 泛型 JSON 落盘（与 [`Self::write_segments`] 共用同一套原子写语义）。
+    pub fn write_json<T: serde::Serialize>(&self, stage: Stage, value: &T) -> Result<()> {
+        let data = serde_json::to_vec_pretty(value).context("序列化阶段产物失败")?;
+        self.write_bytes(stage, &data)
+    }
+
+    /// 泛型 JSON 读取：文件不存在返回 `Ok(None)`，解析失败返回 `Err`
+    /// （与 [`Self::read_segments`] 的容错边界一致）。
+    pub fn read_json<T: serde::de::DeserializeOwned>(&self, stage: Stage) -> Result<Option<T>> {
         let path = self.path(stage);
         if !path.is_file() {
             return Ok(None);
         }
         let data = std::fs::read(&path)
             .with_context(|| format!("读取阶段产物失败: {}", path.display()))?;
-        let segments: Vec<Segment> = serde_json::from_slice(&data)
+        let value: T = serde_json::from_slice(&data)
             .with_context(|| format!("解析阶段产物失败: {}", path.display()))?;
-        Ok(Some(segments))
+        Ok(Some(value))
+    }
+
+    pub fn read_segments(&self, stage: Stage) -> Result<Option<Vec<Segment>>> {
+        self.read_json(stage)
     }
 }
 
@@ -291,6 +326,15 @@ impl TimelineRestorer {
         let end = self.to_original(seg.end).max(start);
         seg.start = start;
         seg.end = end;
+        // 词级时间戳与段同属一条时间轴：段边界映射回真实媒体时间后，词时间必须
+        // 做同一映射。否则「段在真实时间、词在模型时间」两套坐标混用，逐词高亮 /
+        // 卡拉OK 滚动会整体错位。	o_original 单调不减，因此映射后仍落在段区间内。
+        for w in seg.words.iter_mut() {
+            let ws = self.to_original(w.start);
+            let we = self.to_original(w.end).max(ws);
+            w.start = ws;
+            w.end = we;
+        }
     }
 
     fn restore_all(&self, segments: &mut [Segment]) {
@@ -553,6 +597,21 @@ impl TaskPipeline {
         // 阶段产物落盘句柄：None = 历史行为（不写不读）。
         let artifacts = self.artifact_dir().map(StageArtifacts::new);
 
+        // 断点续跑检测必须早于「音频预处理」决策：命中续跑产物时要整段跳过解码 / 压实。
+        // 优先复用「走完全流程」的最终产物（Stage::Write），命中即跳过 ASR + 救场 +
+        // 标点/润色 + 说话人分离，直接写字幕（输出文件会被幂等重写）；退而求其次复用
+        // 「已还原到原始媒体时间轴」的识别结果（Stage::Transcribe），此时仍需跑完后续阶段。
+        // 两者落盘的都是最终时间轴，故下方必须跳过二次还原。
+        let resumed_final = artifacts
+            .as_ref()
+            .and_then(|a| a.read_segments(Stage::Write).ok().flatten());
+        let resumed_asr = artifacts
+            .as_ref()
+            .and_then(|a| a.read_segments(Stage::Transcribe).ok().flatten());
+        let skip_post = resumed_final.is_some();
+        let resumed_segments = resumed_final.or(resumed_asr);
+        let resumed = resumed_segments.is_some();
+
         let out_path = output_file.unwrap_or_else(|| {
             let stem = input_file
                 .file_stem()
@@ -578,20 +637,48 @@ impl TaskPipeline {
             detail: "正在探测媒体时长并准备音频通道...".into(),
         });
 
-        let ffmpeg_for_dur = self.ffmpeg.clone();
-        let in_file_for_dur = input_file.clone();
-        let total_dur = tokio::task::spawn_blocking(move || {
-            let d = ffmpeg_for_dur.get_duration(&in_file_for_dur);
-            if d > 0.0 {
-                Some(d)
-            } else {
-                None
-            }
-        })
-        .await
-        .unwrap_or(None);
+        // 断点续跑：阶段 1 的时长探测若已有落盘记录，直接复用并跳过 ffprobe。
+        let cached_duration = artifacts
+            .as_ref()
+            .and_then(|a| {
+                a.read_json::<ExtractAudioRecord>(Stage::ExtractAudio)
+                    .ok()
+                    .flatten()
+            })
+            .map(|r| r.duration_sec)
+            .filter(|d| *d > 0.0);
+        let total_dur = if let Some(d) = cached_duration {
+            info!("断点续跑：复用已落盘的媒体时长（{:.1}s），跳过探测", d);
+            Some(d)
+        } else {
+            let ffmpeg_for_dur = self.ffmpeg.clone();
+            let in_file_for_dur = input_file.clone();
+            tokio::task::spawn_blocking(move || {
+                let d = ffmpeg_for_dur.get_duration(&in_file_for_dur);
+                if d > 0.0 {
+                    Some(d)
+                } else {
+                    None
+                }
+            })
+            .await
+            .unwrap_or(None)
+        };
 
         let duration_for_chunks = total_dur.unwrap_or(0.0);
+
+        // best-effort 落盘阶段 1 产物（仅在未命中缓存时写；写失败只告警，不中断）。
+        if cached_duration.is_none() {
+            if let Some(a) = artifacts.as_ref() {
+                let record = ExtractAudioRecord {
+                    input: input_file.display().to_string(),
+                    duration_sec: duration_for_chunks,
+                };
+                if let Err(e) = a.write_json(Stage::ExtractAudio, &record) {
+                    warn!("提取音频产物落盘失败: {e:#}");
+                }
+            }
+        }
         let whisper = self.whisper.clone();
         let ffmpeg = self.ffmpeg.clone();
         let use_gpu = whisper.uses_gpu();
@@ -663,7 +750,7 @@ impl TaskPipeline {
             None
         };
 
-        if preprocess.enabled && !is_sensevoice && duration_for_chunks > 0.0 {
+        if preprocess.enabled && !is_sensevoice && duration_for_chunks > 0.0 && !resumed {
             let chain = preprocess.filters.chain_with_speed(audio_speed);
 
             if !preprocess.compact {
@@ -796,6 +883,16 @@ impl TaskPipeline {
             }
         }
 
+        // best-effort 留痕：记录预处理阶段实际生效的说明（信息型产物，不参与 resume）。
+        if let Some(a) = artifacts.as_ref() {
+            let record = StageRecord {
+                detail: preprocess_note.clone().unwrap_or_default(),
+            };
+            if let Err(e) = a.write_json(Stage::Preprocess, &record) {
+                warn!("预处理产物落盘失败: {e:#}");
+            }
+        }
+
         if temp_wav_path.is_none() {
             if can_stream {
                 info!(
@@ -882,12 +979,6 @@ impl TaskPipeline {
             .set_need_token_probs_for_quality(!is_sensevoice);
 
         let transcription_started = Instant::now();
-        // 断点续跑：开启产物落盘且上一次已留下识别结果时直接复用。
-        // 落盘的是「已还原到原始媒体时间轴」的最终片段，因此下方必须跳过二次还原。
-        let resumed_segments = artifacts
-            .as_ref()
-            .and_then(|a| a.read_segments(Stage::Transcribe).ok().flatten());
-        let resumed = resumed_segments.is_some();
         let (mut segments, vad_sec, pure_whisper_sec) = if let Some(segs) = resumed_segments {
             info!("断点续跑：复用已落盘的识别结果（{} 段）", segs.len());
             (segs, 0.0, 0.0)
@@ -1105,6 +1196,8 @@ impl TaskPipeline {
         drop(temp_wav_path.take());
 
         // best-effort 落盘转写产物（写失败只告警，绝不中断流水线）。
+        // 只有真正跑了转写（未命中任一续跑产物）才需要写：命中时 `resumed` 为真，
+        // 落盘的识别结果已是最终时间轴，无需覆盖。
         if !resumed {
             if let Some(a) = artifacts.as_ref() {
                 if let Err(e) = a.write_segments(Stage::Transcribe, &segments) {
@@ -1130,7 +1223,7 @@ impl TaskPipeline {
             && !is_sensevoice
             && segments.iter().any(|s| s.confidence.is_some());
 
-        if rescue_enabled {
+        if rescue_enabled && !skip_post {
             let spans = plan_rescue_spans(&segments, rescue_logprob);
             let total_span_sec: f64 = spans.iter().map(|(s, e)| e - s).sum();
             let media_sec = if duration_for_chunks > 0.0 {
@@ -1251,10 +1344,19 @@ impl TaskPipeline {
         }
         let rescue_sec = rescue_started.elapsed().as_secs_f64();
 
+        // best-effort 落盘救场后的片段快照（进入标点/润色阶段前；写失败只告警）。
+        if !skip_post {
+            if let Some(a) = artifacts.as_ref() {
+                if let Err(e) = a.write_segments(Stage::Rescue, &segments) {
+                    warn!("救场产物落盘失败: {e:#}");
+                }
+            }
+        }
+
         // ── 阶段 3: 标点与语法润色（可跳过）──
         let mut qwen_sec = 0.0;
         let mut polish_engine_name = None;
-        if enable_polish && !segments.is_empty() {
+        if enable_polish && !segments.is_empty() && !skip_post {
             let mode = polish_mode.unwrap_or_else(|| "punc".to_string());
             let use_punc = (mode == "punc")
                 && self
@@ -1303,6 +1405,13 @@ impl TaskPipeline {
                         segments = polished;
                         qwen_sec = punc_started.elapsed().as_secs_f64();
                         info!(elapsed = ?punc_started.elapsed(), segments = segments.len(), "CT-Punc 极速标点完成");
+                        if !skip_post {
+                            if let Some(a) = artifacts.as_ref() {
+                                if let Err(e) = a.write_segments(Stage::Punctuate, &segments) {
+                                    warn!("标点产物落盘失败: {e:#}");
+                                }
+                            }
+                        }
                     }
                     Ok(Err(err)) => {
                         warn!(error = %err, "极速标点失败，保留识别原文并继续收尾");
@@ -1372,6 +1481,15 @@ impl TaskPipeline {
             info!("已跳过标点润色");
         }
 
+        // best-effort 落盘润色完成后的快照（无论走标点 / 润色 / 被关闭；写失败只告警）。
+        if !skip_post {
+            if let Some(a) = artifacts.as_ref() {
+                if let Err(e) = a.write_segments(Stage::Polish, &segments) {
+                    warn!("润色产物落盘失败: {e:#}");
+                }
+            }
+        }
+
         if self.is_cancelled() {
             let _ = tx.send(PipelineEvent::Finished(
                 segments.clone(),
@@ -1384,7 +1502,7 @@ impl TaskPipeline {
         // 放在润色之后：分离只读时间轴与音频、不改文本，最后一步做最省事，
         // 也让「导出带说话人前缀」与「界面标签」用的是同一份结果。
         let mut diarization_sec = 0.0;
-        if diarization.enabled && !segments.is_empty() {
+        if diarization.enabled && !segments.is_empty() && !skip_post {
             let _ = tx.send(PipelineEvent::StageChanged("说话人分离".into()));
             let _ = tx.send(PipelineEvent::Progress {
                 stage: "说话人分离".into(),
@@ -1443,6 +1561,23 @@ impl TaskPipeline {
         // ── 阶段 4: 输出字幕文件（失败也不阻塞 Finished，避免界面一直转圈）──
         let _ = tx.send(PipelineEvent::StageChanged(Stage::Write.label().into()));
         crate::subtitle::optimize_segments(&mut segments);
+        // 断点续跑命中最终产物时，后续阶段全被短路，这里补发一次进度让 UI 有可见反馈。
+        if skip_post {
+            let _ = tx.send(PipelineEvent::Progress {
+                stage: "生成字幕".into(),
+                progress: 0.99,
+                detail: "断点续跑：复用已完成的全流程产物".into(),
+            });
+        }
+        // best-effort 落盘最终产物：这是「走完全流程」的最终快照（含说话人标签），
+        // 下次续跑命中它即可整段短路。写失败只告警。
+        if !skip_post {
+            if let Some(a) = artifacts.as_ref() {
+                if let Err(e) = a.write_segments(Stage::Write, &segments) {
+                    warn!("最终字幕产物落盘失败: {e:#}");
+                }
+            }
+        }
         let writing_started = Instant::now();
         // 样式在收尾读出（`AppState` 写入；从未写入时为 `None`）。`None` → 走无样式
         // 入口，逐字节等同历史输出；`max_chars_per_line == 0` 时同样不折行（writer 侧
@@ -1731,6 +1866,7 @@ fn shift_window_to_media_timeline(segments: &mut [Segment], window_start: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subtitle::segment::WordTiming;
     use crate::subtitle::Segment;
 
     #[test]
@@ -1786,6 +1922,41 @@ mod tests {
             segs[0].start
         );
         assert!((segs[0].end - 44.0).abs() < 1e-9);
+    }
+
+    /// 词级时间戳必须与段一起还原到原始时间轴：段被缩放、词不缩放 = 逐词高亮错位。
+    #[test]
+    fn restore_remaps_word_timings_to_original_timeline() {
+        let restorer = TimelineRestorer {
+            plan: None,
+            speed: 1.25,
+            original_duration: 600.0,
+        };
+        let mut seg = Segment::new(1, 10.0, 12.0, "测试");
+        seg.words = vec![
+            WordTiming {
+                word: "测".to_string(),
+                start: 10.0,
+                end: 11.0,
+            },
+            WordTiming {
+                word: "试".to_string(),
+                start: 11.0,
+                end: 12.0,
+            },
+        ];
+        restorer.restore(&mut seg);
+        assert!((seg.start - 12.5).abs() < 1e-9, "实得 {}", seg.start);
+        assert!((seg.end - 15.0).abs() < 1e-9, "实得 {}", seg.end);
+        assert_eq!(seg.words.len(), 2, "词不得在还原时丢失");
+        assert!((seg.words[0].start - 12.5).abs() < 1e-9);
+        assert!((seg.words[0].end - 13.75).abs() < 1e-9);
+        assert!((seg.words[1].start - 13.75).abs() < 1e-9);
+        assert!((seg.words[1].end - 15.0).abs() < 1e-9);
+        for w in &seg.words {
+            assert!(w.start <= w.end);
+            assert!(w.start >= seg.start - 1e-9 && w.end <= seg.end + 1e-9);
+        }
     }
 
     #[test]
@@ -2268,6 +2439,64 @@ mod tests {
         // 解析失败必须是 Err（调用方自行决定容错），而不是 panic / Ok(None)
         std::fs::write(artifacts.path(Stage::Transcribe), b"{ not json").unwrap();
         assert!(artifacts.read_segments(Stage::Transcribe).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 泛型 JSON 落盘 / 读取：往返相等；文件不存在返回 `Ok(None)`；坏 JSON 返回 `Err`；不留 `.part`。
+    #[test]
+    fn stage_artifacts_json_round_trip() {
+        let dir = tmp_dir("stage_json");
+        let artifacts = StageArtifacts::new(dir.clone());
+
+        // 文件不存在 → Ok(None)
+        let missing: Option<StageRecord> = artifacts.read_json(Stage::Preprocess).unwrap();
+        assert!(missing.is_none(), "文件不存在必须返回 Ok(None)");
+
+        let record = StageRecord {
+            detail: "语音增强 + 停顿压实".to_string(),
+        };
+        artifacts.write_json(Stage::Preprocess, &record).unwrap();
+        assert!(artifacts.exists(Stage::Preprocess));
+        assert!(
+            !artifacts
+                .path(Stage::Preprocess)
+                .with_extension("json.part")
+                .exists(),
+            "泛型 JSON 原子写不应留下 .part 残留"
+        );
+        let back: StageRecord = artifacts.read_json(Stage::Preprocess).unwrap().unwrap();
+        assert_eq!(back, record, "write_json/read_json 必须往返相等");
+
+        // 坏 JSON → Err（不是 panic / Ok(None)）
+        std::fs::write(artifacts.path(Stage::Preprocess), b"{ not json").unwrap();
+        let bad = artifacts.read_json::<StageRecord>(Stage::Preprocess);
+        assert!(bad.is_err(), "坏 JSON 必须返回 Err");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两个阶段记录结构都能 JSON 往返。
+    #[test]
+    fn stage_record_types_round_trip() {
+        let dir = tmp_dir("stage_records");
+        let artifacts = StageArtifacts::new(dir.clone());
+
+        let audio = ExtractAudioRecord {
+            input: "C:/media/demo.mp4".to_string(),
+            duration_sec: 123.456,
+        };
+        artifacts.write_json(Stage::ExtractAudio, &audio).unwrap();
+        let audio_back: ExtractAudioRecord =
+            artifacts.read_json(Stage::ExtractAudio).unwrap().unwrap();
+        assert_eq!(audio_back, audio, "ExtractAudioRecord 必须往返相等");
+
+        let note = StageRecord {
+            detail: "语音增强（降噪 / 电平归一，在音频通道就地生效）".to_string(),
+        };
+        artifacts.write_json(Stage::Preprocess, &note).unwrap();
+        let note_back: StageRecord = artifacts.read_json(Stage::Preprocess).unwrap().unwrap();
+        assert_eq!(note_back, note, "StageRecord 必须往返相等");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

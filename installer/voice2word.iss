@@ -3,7 +3,7 @@
 ; =============================================================================
 
 #define MyAppName "Voice2Word"
-#define MyAppVersion "0.1.8"
+#define MyAppVersion "0.1.9"
 #define MyAppPublisher "Voice2Word"
 #define MyAppURL "https://github.com/ygs0422/Voice2Word"
 #define MyAppExeName "voice2word.exe"

@@ -24,7 +24,7 @@ $exe = if (Test-Path .\target\release\voice2word.exe) { '.\target\release\voice2
 voice2word [--gui]
 voice2word transcribe <输入文件> [-o <输出>] [--format srt|ass|vtt|json|txt|ttml|ttal]
                           [--lang <代码>] [--translate <语言>] [--model <路径>]
-                          [--threads N] [--polish]
+                          [--threads N] [--polish] [--resume] [--artifact-dir <路径>]
 voice2word --help | -h
 voice2word --version | -V
 ```
@@ -45,6 +45,8 @@ voice2word --version | -V
 | `--model` | 路径 | 覆盖 Whisper 模型文件 | 取 `config.toml` |
 | `--threads` | 正整数 | 推理线程数 | 取 `config.toml` |
 | `--polish` | 布尔（不接受取值） | 强制开启润色/标点 | 取 `config.toml` |
+| `--resume` | 布尔（不接受取值） | 复用阶段产物目录中已有的识别结果（断点续跑） | 关闭 |
+| `--artifact-dir` | 路径 | 指定阶段产物目录 | 仅 `--resume` 时回落 `<输入目录>/.voice2word-stages/<文件名>`；否则不落盘 |
 | `-h`, `--help` | — | 显示帮助 | — |
 | `-V`, `--version` | — | 显示版本号 | — |
 
@@ -85,6 +87,12 @@ voice2word transcribe talk.mp4 -o out\talk.vtt --format vtt
 # 指定源语言与线程数并开启润色
 voice2word transcribe talk.mp4 --lang zh --threads 8 --polish
 
+# 断点续跑：复用已有阶段产物
+voice2word transcribe talk.mp4 --resume
+
+# 指定阶段产物目录（配合 --resume 使用）
+voice2word transcribe talk.mp4 --resume --artifact-dir .\.voice2word-stages\talk
+
 # 查看帮助 / 版本
 voice2word --help
 voice2word --version
@@ -118,6 +126,9 @@ Copy-Item -Recurse -Force .\integrations\voice2word-skill\* $dst
 
 ```powershell
 .\integrations\voice2word-skill\scripts\transcribe.ps1 -Input talk.mp4 -Format vtt -Language zh -Threads 8
+
+# 断点续跑并指定阶段产物目录
+.\integrations\voice2word-skill\scripts\transcribe.ps1 -Input talk.mp4 -Resume -ArtifactDir .\.voice2word-stages\talk
 ```
 
 脚本会校验输入文件、格式与线程数，自动定位 `voice2word.exe`，把进度（stderr）透传，并打印结果路径；退出码与 CLI 一致（0/1/2）。
@@ -137,7 +148,7 @@ integrations/mcp-server/
 
 | 工具 | 说明 | 主要入参 |
 | --- | --- | --- |
-| `transcribe` | 调用 `voice2word transcribe ...` 并返回结果 | `input`（必填）、`output`、`format`、`language`、`threads`、`polish` |
+| `transcribe` | 调用 `voice2word transcribe ...` 并返回结果 | `input`（必填）、`output`、`format`、`language`、`threads`、`polish`、`resume`、`artifact_dir` |
 | `probe` | 探测 `ffprobe`/`ffmpeg` 是否可用 | 无 |
 | `version` | 返回 `voice2word` 版本号 | 无 |
 

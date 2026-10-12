@@ -168,7 +168,16 @@ class McpProtocolTests(unittest.TestCase):
             self.assertEqual(schema.get("type"), "object")
         transcribe = next(tool for tool in tools if tool["name"] == "transcribe")
         props = transcribe["inputSchema"]["properties"]
-        for key in ("input", "output", "format", "language", "threads", "polish"):
+        for key in (
+            "input",
+            "output",
+            "format",
+            "language",
+            "threads",
+            "polish",
+            "resume",
+            "artifact_dir",
+        ):
             self.assertIn(key, props)
         self.assertEqual(transcribe["inputSchema"].get("required"), ["input"])
         self.assertEqual(

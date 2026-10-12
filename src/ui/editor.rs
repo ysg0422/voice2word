@@ -10,7 +10,7 @@ use super::primitives;
 use super::theme::Theme;
 use super::{apply_line_edit, EditorExportFormat, EditorSubtitlePanel, MainWindow, StyleField};
 use crate::app::state::{ProcessStatus, WorkspaceTab};
-use crate::subtitle::ExportMode;
+use crate::subtitle::{ExportMode, Segment};
 use crate::utils::time::{format_duration_short, seconds_to_hms, seconds_to_timestamp_short};
 use gpui::prelude::*;
 use gpui::*;
@@ -154,6 +154,15 @@ fn fit_video_size(aspect: f32, avail_w: f32, avail_h: f32) -> (f32, f32) {
     } else {
         (avail_h * aspect, avail_h)
     }
+}
+
+/// 点击字幕清单某一行的跳播目标时间：取该句起点（秒）。
+///
+/// 输入为**段列表 + 被点击行的 `Segment::index`**；找不到（该行已被删除或索引
+/// 越界）时返回 `None`，调用方据此跳过 seek——与列表行的容错口径一致，绝不 panic。
+/// 抽成纯函数以便在无 GUI 下单测（见文件末尾 `mod tests`）。
+pub(crate) fn click_seek_target(segments: &[Segment], index: usize) -> Option<f64> {
+    segments.iter().find(|s| s.index == index).map(|s| s.start)
 }
 
 /// 监视器「视口内屏」（画面可用的那块黑底区域）的像素尺寸估算。
@@ -2190,7 +2199,19 @@ impl MainWindow {
                                                     })
                                                     .hover(|s| s.bg(if is_selected { Theme::tint_mint_badge() } else { Theme::bg_hover() }))
                                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                                        // 点击某行 = 跳播到该句起点。先停掉正在进行的实时播放：
+                                                        // 否则播放时钟会在下一帧把 current_time 拉回旧位置、音频也
+                                                        // 继续从旧处播放，点击等于没生效（与键盘「上/下句」
+                                                        // `jump_prev/next_segment` 同一套「先停再选」语义）。
+                                                        this.halt_preview_playback();
                                                         this.state.select_segment(seg_idx);
+                                                        // 选中即把播放位置归位到该句起点；再显式 seek 一次做边界钳制，
+                                                        // 随后 `trigger_extract_frame` 抽帧，画面即落到这一句。
+                                                        if let Some(target) =
+                                                            click_seek_target(&this.state.segments, seg_idx)
+                                                        {
+                                                            this.state.seek_to(target);
+                                                        }
                                                         this.trigger_extract_frame(cx);
                                                         cx.notify();
                                                     }))
@@ -5536,7 +5557,8 @@ impl MainWindow {
 mod tests {
     use super::translated_out_count;
     use super::{
-        fit_video_size, monitor_screen_size, EDITOR_STACK_MONITOR_H, MONITOR_VIDEO_FIT_FRAC,
+        click_seek_target, fit_video_size, monitor_screen_size, EDITOR_STACK_MONITOR_H,
+        MONITOR_VIDEO_FIT_FRAC,
     };
     use crate::subtitle::Segment;
     use crate::ui::primitives::should_consume_scroll;
@@ -5562,6 +5584,21 @@ mod tests {
         assert_eq!(translated_out_count(&segs, "English"), 1);
         assert_eq!(translated_out_count(&segs, "Français"), 1);
         assert_eq!(translated_out_count(&segs, "日本語"), 0);
+    }
+
+    /// 点击字幕清单某行的跳播目标时间：取该句 start。
+    /// 该行已被删除 / 索引越界时返回 None（调用方据此跳过 seek），不得 panic。
+    #[test]
+    fn click_seek_target_maps_row_to_segment_start() {
+        let segs = vec![
+            Segment::new(1, 0.0, 2.0, "第一句"),
+            Segment::new(2, 3.5, 5.0, "第二句"),
+        ];
+        assert_eq!(click_seek_target(&segs, 1), Some(0.0));
+        assert_eq!(click_seek_target(&segs, 2), Some(3.5));
+        // 越界 / 已删除的行：返回 None 而不是 panic
+        assert_eq!(click_seek_target(&segs, 99), None);
+        assert_eq!(click_seek_target(&[], 1), None);
     }
 
     /// 内嵌清单滚轮判据：有余量就吃掉（阻止冒泡），到边界才放行给外层。

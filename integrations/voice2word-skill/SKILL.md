@@ -78,6 +78,12 @@ voice2word transcribe .\samples\meeting.mp4 --threads 4
 # 开启润色
 voice2word transcribe .\samples\meeting.mp4 --polish
 
+# 断点续跑：复用阶段产物目录中已有的识别结果
+voice2word transcribe .\samples\meeting.mp4 --resume
+
+# 指定阶段产物目录（配合 --resume 使用）
+voice2word transcribe .\samples\meeting.mp4 --resume --artifact-dir .\.voice2word-stages\meeting
+
 # 查看帮助 / 版本
 voice2word --help
 voice2word --version
@@ -101,6 +107,8 @@ voice2word --version
 | `--model` | 模型文件路径 | 覆盖默认 Whisper 模型文件 | 配置文件中的默认模型 |
 | `--threads` | 正整数 | 推理线程数 | 取 `config.toml` 的 `pipeline.whisper_threads` |
 | `--polish` | 布尔标志，不取值 | 强制开启润色/标点 | 取 `config.toml` 的 `pipeline.enable_polish`（示例配置为 `false`） |
+| `--resume` | 布尔标志，不取值 | 复用阶段产物目录中已有的识别结果（断点续跑） | 关闭 |
+| `--artifact-dir` | 路径 | 指定阶段产物目录 | 仅 `--resume` 时回落 `<输入目录>/.voice2word-stages/<文件名>`；否则不落盘 |
 | `--gui` | 布尔标志 | 启动图形界面 | 关闭 |
 | `-h` / `--help` | 布尔标志 | 打印用法 | — |
 | `-V` / `--version` | 布尔标志 | 打印版本 | — |
@@ -169,9 +177,12 @@ if ($LASTEXITCODE -eq 0) { Write-Host "OK: $last" } else { Write-Host "失败，
 
 # 覆盖模型文件（config.toml 的 whisper_model 不可用时）
 .\integrations\voice2word-skill\scripts\transcribe.ps1 -Input .\samples\meeting.mp4 -Format vtt -Model .\models\whisper\ggml-base.bin
+
+# 断点续跑并指定阶段产物目录
+.\integrations\voice2word-skill\scripts\transcribe.ps1 -Input .\samples\meeting.mp4 -Resume -ArtifactDir .\.voice2word-stages\meeting
 ```
 
-- 封装脚本参数：`-Input`（必填，位置 0）、`-Output`、`-Format`、`-Language`、`-Model`、`-Translate`、`-Threads`、`-Polish`、`-Exe`。
+- 封装脚本参数：`-Input`（必填，位置 0）、`-Output`、`-Format`、`-Language`、`-Model`、`-Translate`、`-Threads`、`-Polish`、`-Resume`、`-ArtifactDir`、`-Exe`。
 - 封装脚本的退出码与 CLI 保持一致：0 成功 / 1 运行期失败 / 2 参数错误；本地参数校验（输入不存在、`-Format` 非法、`-Threads` 非正整数、`-Model`/`-Exe` 指向不存在的文件）不通过时同样返回 2。
 - 特例：CLI 返回 0 却没有输出成功行时，脚本以退出码 1 报错（原因与处理见第 7 节），不会静默假成功。
 - 成功时脚本在回显 stdout 之后追加一行 `Result path: <路径>`，便于直接抓取结果路径。

@@ -671,12 +671,36 @@ pub fn optimize_segments(segments: &mut Vec<Segment>) {
         }
     }
 
-    // 7. 重新编排序号
+    // 7. 重新编排序号，并把词级时间戳收敛回本段区间。
+    //
+    // 第 3/6 步只调边界、不重算 words：消重叠会把前句 nd 收短、极短句平滑会把
+    // nd 提前，而词时间仍停在更远处。词级时间戳是一等数据结构，必须与段边界自洽，
+    // 否则下游做逐词高亮 / 对齐时会读到段外的时刻。这里统一收口。
     for (idx, seg) in filtered.iter_mut().enumerate() {
         seg.index = idx + 1;
+        clamp_words_to_segment(seg);
     }
 
     *segments = filtered;
+}
+
+/// 把 seg.words 收敛到 [seg.start, seg.end]：与段区间无交集的词丢弃，部分越界的裁剪。
+///
+/// [optimize_segments] 的边界调整不重算词时间，这里统一收口，保证「段 → 词」自洽。
+fn clamp_words_to_segment(seg: &mut Segment) {
+    if seg.words.is_empty() {
+        return;
+    }
+    let (start, end) = (seg.start, seg.end);
+    seg.words.retain_mut(|w| {
+        // 整词落在段区间之外（含边界相接）：丢弃，避免出现 start == end 的空词。
+        if w.end <= start || w.start >= end {
+            return false;
+        }
+        w.start = w.start.clamp(start, end);
+        w.end = w.end.clamp(start, end);
+        true
+    });
 }
 
 /// 「无效或鬼影」判据：单条片段是否应在筛除阶段丢弃。
@@ -785,6 +809,25 @@ pub(crate) fn split_following(text: &str, ratio: f64) -> (String, Option<String>
     (left, Some(right))
 }
 
+/// 按切点时间把词级时间戳分成前后两组：词中点落在切点之前的归左，其余归右。
+///
+/// 拆分长句时若把 words 直接置空，Whisper 拿到的词级 offsets 会在这一步整体丢失，
+/// 下游的逐词高亮 / 对齐就再也取不到数据。这里按「词中点相对切点」二分，保证每个词
+/// 只属于一侧且两侧各自保持时间单调；跨切点的词按中点归属，随后由
+/// [clamp_words_to_segment] 收口到各自子段区间内，不会越界。
+fn split_words_at(words: &[WordTiming], split_t: f64) -> (Vec<WordTiming>, Vec<WordTiming>) {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for w in words {
+        if (w.start + w.end) / 2.0 < split_t {
+            left.push(w.clone());
+        } else {
+            right.push(w.clone());
+        }
+    }
+    (left, right)
+}
+
 /// 递归拆分单条长句：按标点就近均分文本，时间按字数比例分配；
 /// 翻译与润色文本按同比例就近标点跟随拆分。无合理标点切点时保留原句。
 fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
@@ -821,7 +864,9 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         (l, r.unwrap_or_default())
     };
 
-    let left = Segment {
+    let (left_words, right_words) = split_words_at(&seg.words, split_t);
+
+    let mut left = Segment {
         index: 0,
         start: seg.start,
         end: split_t,
@@ -832,9 +877,9 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         language: seg.language.clone(),
         confidence: seg.confidence,
         speaker: seg.speaker,
-        words: Vec::new(),
+        words: left_words,
     };
-    let right = Segment {
+    let mut right = Segment {
         index: 0,
         start: split_t,
         end: seg.end,
@@ -845,8 +890,11 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         language: seg.language,
         confidence: seg.confidence,
         speaker: seg.speaker,
-        words: Vec::new(),
+        words: right_words,
     };
+    // 收敛到各自子段区间（含边界），与 optimize_segments 的收口口径一致。
+    clamp_words_to_segment(&mut left);
+    clamp_words_to_segment(&mut right);
     split_segment_recursive(left, out);
     split_segment_recursive(right, out);
 }
@@ -1331,6 +1379,57 @@ mod tests {
         // 无丢字
         let joined: String = out.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(joined, text);
+    }
+
+    /// 拆分长句时词级时间戳必须随文本一起切分，而不是被清空：逐词高亮 / 对齐依赖它，
+    /// 超长句一旦被拆就丢词级数据等于功能整体失效。
+    #[test]
+    fn split_long_segments_preserves_and_partitions_word_timings() {
+        let text = "那么第二个我们再来看一下,就是PA加B小于等于PA加B加C,这个是显然的,因为B加C包含了B,对不对,所以概率就更大,那么我们再来看第三个,就是PAB大于等于PABC。";
+        let (start, end) = (1160.14_f64, 1192.31_f64);
+        let mut seg = Segment::new(1, start, end, text);
+        // 构造 12 个等分词，覆盖整段区间
+        let n = 12usize;
+        let step = (end - start) / n as f64;
+        seg.words = (0..n)
+            .map(|i| WordTiming {
+                word: format!("w{i}"),
+                start: start + step * i as f64,
+                end: start + step * (i as f64 + 1.0),
+            })
+            .collect();
+
+        let out = split_long_segments(vec![seg]);
+        assert!(out.len() >= 2, "前提：该段应被拆成多条，实际 {}", out.len());
+
+        // 词总数守恒（不丢、不重复）
+        let total: usize = out.iter().map(|s| s.words.len()).sum();
+        assert_eq!(total, n, "拆分后词级时间戳总数必须守恒");
+
+        // 每个词都落在所属子段区间内，且自身 start <= end
+        for s in &out {
+            for w in &s.words {
+                assert!(w.start <= w.end, "词时间必须单调: {w:?}");
+                assert!(
+                    w.start >= s.start - 1e-9 && w.end <= s.end + 1e-9,
+                    "词 {w:?} 越出段区间 [{}, {}]",
+                    s.start,
+                    s.end
+                );
+            }
+        }
+
+        // 顺序保持：展平后的词序与原始一致
+        let flat: Vec<&str> = out
+            .iter()
+            .flat_map(|s| s.words.iter())
+            .map(|w| w.word.as_str())
+            .collect();
+        let expected: Vec<String> = (0..n).map(|i| format!("w{i}")).collect();
+        assert_eq!(
+            flat,
+            expected.iter().map(|x| x.as_str()).collect::<Vec<_>>()
+        );
     }
 
     /// 终点往右加：越界时把下一句的头往后挪。

@@ -2549,6 +2549,9 @@ impl MainWindow {
                         burn_temp_seq()
                     ));
                     let _ = std::fs::remove_file(&sub_path);
+                    // 临时字幕交给 RAII 守卫：即便 write_ass_with_style 中途 `?`
+                    // 提前返回，守卫的 `Drop` 也会删掉半截 `.ass`，不在 %TEMP% 累积。
+                    let sub_guard = crate::utils::TempPathGuard::file(&sub_path);
                     SubtitleWriter::write_ass_with_style(&segments, &sub_path, mode, &style)?;
                     let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
                     let result = ffmpeg.burn_subtitles(
@@ -2558,7 +2561,7 @@ impl MainWindow {
                         &crate::engines::ffmpeg::BurnOptions::default(),
                     );
                     // 无论成败都清掉临时字幕，避免在 %TEMP% 里累积
-                    let _ = std::fs::remove_file(&sub_path);
+                    drop(sub_guard);
                     result
                 })
                 .await;

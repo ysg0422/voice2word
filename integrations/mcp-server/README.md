@@ -170,7 +170,7 @@ $lines | python integrations\mcp-server\voice2word_mcp.py
 **`tools/list`**（恰好 3 个工具）
 
 ```json
-{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"transcribe","description":"...","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"output":{"type":"string"},"format":{"type":"string","enum":["srt","ass","vtt","json","txt","ttml","ttal"]},"language":{"type":"string"},"threads":{"type":"integer","minimum":1},"polish":{"type":"boolean"}},"required":["input"]}},{"name":"probe","description":"...","inputSchema":{"type":"object","properties":{}}},{"name":"version","description":"...","inputSchema":{"type":"object","properties":{}}}]}}
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"transcribe","description":"...","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"output":{"type":"string"},"format":{"type":"string","enum":["srt","ass","vtt","json","txt","ttml","ttal"]},"language":{"type":"string"},"threads":{"type":"integer","minimum":1},"polish":{"type":"boolean"},"resume":{"type":"boolean"},"artifact_dir":{"type":"string"}},"required":["input"]}},{"name":"probe","description":"...","inputSchema":{"type":"object","properties":{}}},{"name":"version","description":"...","inputSchema":{"type":"object","properties":{}}}]}}
 ```
 
 **`tools/call` → `probe`**
@@ -225,6 +225,8 @@ $lines | python integrations\mcp-server\voice2word_mcp.py
 | `language` | string | 否 | 源语言代码（如 `zh` / `en` / `ja` / `auto`），默认取 `config.toml` | `--lang` / `--language` |
 | `threads` | integer（最小值 1） | 否 | 推理线程数，覆盖 `config.toml` | `--threads` |
 | `polish` | boolean | 否 | 强制开启润色 / 标点，默认沿用 `config.toml` | `--polish` |
+| `resume` | boolean | 否 | 复用阶段产物目录中已有的识别结果（断点续跑） | `--resume` |
+| `artifact_dir` | string | 否 | 阶段产物目录；缺省时仅在 `resume` 为真时回落到 `<输入目录>/.voice2word-stages/<文件名>` | `--artifact-dir` |
 
 `inputSchema` 要点：`type = "object"`，`required = ["input"]`，`threads` 带 `minimum: 1`，
 `format` 带 `enum` 白名单。
@@ -258,7 +260,7 @@ $lines | python integrations\mcp-server\voice2word_mcp.py
 
 ### 4.3 `version`
 
-无参数。运行 `voice2word --version`，把版本字符串原样返回，形如 `voice2word 0.1.7`。
+无参数。运行 `voice2word --version`，把版本字符串原样返回，形如 `voice2word 0.1.9`。
 
 | 参数 | 类型 | 必填 | 说明 | 对应 CLI 选项 |
 | --- | --- | --- | --- | --- |
@@ -278,7 +280,7 @@ $lines | python integrations\mcp-server\voice2word_mcp.py
 | --- | --- | --- |
 | `-32700` | 解析失败（Parse error） | 某行不是合法 JSON |
 | `-32601` | 未知方法（Method not found） | `method` 不在上表 |
-| `-32602` | 参数非法（Invalid params） | `tools/call` 缺少 `name`、工具名未知、`transcribe` 的 `arguments` 不是对象或缺少必填 `input`，以及 `output`/`format`/`language`/`threads`/`polish` 类型或取值非法 |
+| `-32602` | 参数非法（Invalid params） | `tools/call` 缺少 `name`、工具名未知、`transcribe` 的 `arguments` 不是对象或缺少必填 `input`，以及 `output`/`format`/`language`/`threads`/`polish`/`resume`/`artifact_dir` 类型或取值非法 |
 
 > `probe` 与 `version` 不接受参数：它们会忽略传入的 `arguments`，不会因为多余字段返回 `-32602`。
 
@@ -335,7 +337,7 @@ python integrations\mcp-server\voice2word_mcp.py
 MCP 工具最终调用的是 Voice2Word 的无头模式：
 
 ```text
-voice2word transcribe <输入文件> [-o <输出>] [--format ...] [--lang <代码>] [--threads N] [--polish]
+voice2word transcribe <输入文件> [-o <输出>] [--format ...] [--lang <代码>] [--threads N] [--polish] [--resume] [--artifact-dir <路径>]
 
 # 顶层形式：voice2word [--gui] | --help/-h | --version/-V（另接受裸子命令 help / version）
 ```
