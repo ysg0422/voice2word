@@ -76,6 +76,10 @@ impl MainWindow {
                                         this.state.refresh_recent_tasks();
                                         // 列表可能因刷新而变短，顺带裁掉查不到的缓存
                                         this.prune_library_caches();
+                                        // 刷新可能只改了一条记录的翻译状态（长度与首条
+                                        // id 都没变），而查询缓存的键侦测不到这种变化：
+                                        // 不整体作废，筛选结果会继续用旧 id 列表。
+                                        this.library_query_cache = None;
                                         cx.notify();
                                     },
                                 )),

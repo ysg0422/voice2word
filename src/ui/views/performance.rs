@@ -835,6 +835,13 @@ impl MainWindow {
         let apply_profile = move |this: &mut Self, cx: &mut Context<Self>, option: UserStrategy| {
             this.state.set_user_strategy(option);
             this.state.apply_recommended_profile();
+            // 推荐里的 `gpu_offload` 以前是死字段：矩阵建议开 GPU 转写，套用后
+            // config.gpu.whisper_offload 仍是旧值。这里接上唯一消费点——推荐为真
+            // 才写开关；推荐为假（只说明没检测到独显）不动用户正在用的核显加速。
+            crate::core::performance::consume_gpu_offload_recommendation(
+                &mut this.state.config.gpu,
+                &this.state.recommended_profile,
+            );
             // 推荐档位可能改写 config.paths.whisper_model，下方「模型与组件」卡的
             // 就位徽标缓存要跟着重算，否则会显示成上一档位的结论。
             this.state.refresh_model_presence();
@@ -867,9 +874,18 @@ impl MainWindow {
         let drifted = self.state.whisper_model_tier != profile.whisper_tier
             || self.state.whisper_threads != profile.whisper_threads
             || self.state.config.pipeline.llm_threads != profile.llm_threads
-            || self.state.config.pipeline.parallel_workers != 0;
+            || self.state.config.pipeline.parallel_workers != 0
+            // GPU 开关也纳入比对：推荐要开而当前关着时，套用会把它打开。
+            || (profile.gpu_offload && !self.state.config.gpu.whisper_offload);
+        // GPU 转写说明：推荐为真时套用会打开 config.gpu.whisper_offload（下次启动
+        // 生效）；推荐为假只代表没检测到独显（核显不算），套用保持当前开关不动。
+        let gpu_hint = if profile.gpu_offload {
+            "GPU 转写：开（下次启动生效）"
+        } else {
+            "GPU 转写：保持当前开关（未检测到独显）"
+        };
         let summary = format!(
-            "{}：{} · {} 线程 · 并发 {}（{}）",
+            "{}：{} · {} 线程 · 并发 {} · {}（{}）",
             if drifted {
                 "当前已偏离推荐"
             } else {
@@ -878,6 +894,7 @@ impl MainWindow {
             profile.whisper_model_name,
             profile.whisper_threads,
             profile.max_concurrency,
+            gpu_hint,
             strategy.label(),
         );
 
@@ -929,7 +946,7 @@ impl MainWindow {
                     .pb(px(Theme::SPACE_2))
                     .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(Theme::text_muted())
-                    .child("套用会把推荐档位 / 线程数 / 并行进程数 / VAD 开关写进 config.toml，覆盖你在下方手动调整的取值（对下一次转写生效）。"),
+                    .child("套用会把推荐档位 / 线程数 / 并行进程数 / VAD 开关写进 config.toml，覆盖你在下方手动调整的取值（对下一次转写生效）；推荐要求开 GPU 转写时会同时打开 config.gpu.whisper_offload（对下一次启动生效，硬件不支持时引擎自动回退纯 CPU）。"),
             )
     }
 

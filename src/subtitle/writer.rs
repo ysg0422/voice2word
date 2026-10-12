@@ -423,11 +423,12 @@ Timer: 100.0000
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bold_flag},0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow},{alignment},20,20,{margin_v},1
+Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bold_flag},0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow},{alignment},{margin_lr},{margin_lr},{margin_v},1
 "#,
             size = style.font_size,
             spacing = style.letter_spacing,
             margin_v = style.bottom_margin,
+            margin_lr = style.margin_lr,
         );
         write!(file, "{}", header)?;
 
@@ -449,10 +450,11 @@ Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bol
                 let color = speaker_ass_color(idx);
                 writeln!(
                     file,
-                    "Style: {name},Microsoft YaHei,{size},{color},&H000000FF,{outline},{back},{bold_flag},0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow},{alignment},20,20,{margin_v},1",
+                    "Style: {name},Microsoft YaHei,{size},{color},&H000000FF,{outline},{back},{bold_flag},0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow},{alignment},{margin_lr},{margin_lr},{margin_v},1",
                     size = style.font_size,
                     spacing = style.letter_spacing,
                     margin_v = style.bottom_margin,
+                    margin_lr = style.margin_lr,
                 )?;
             }
         }
@@ -880,6 +882,61 @@ mod tests {
             "字间距 / 描边 / 底边距未写入 ASS: {content}"
         );
         assert!(content.contains("测试字幕"), "对白文本缺失: {content}");
+
+        let _ = std::fs::remove_file(temp);
+    }
+
+    /// 回归：左右安全边距（MarginL/MarginR）跟随配置，头部与说话人样式行都要落值。
+    #[test]
+    fn ass_margin_lr_written_to_both_style_lines() {
+        let mut a = Segment::new(1, 0.0, 1.0, "甲");
+        a.speaker = Some(0);
+        let mut b = Segment::new(2, 1.0, 2.0, "乙");
+        b.speaker = Some(1);
+        let segs = vec![a, b];
+        let temp = std::env::temp_dir().join("test_v2w_margin_lr.ass");
+
+        // 0 是最容易被「if > 0 才写」这类逻辑吞掉的边界值
+        let zero = SubtitleStyleConfig {
+            margin_lr: 0,
+            bottom_margin: 40,
+            ..SubtitleStyleConfig::default()
+        };
+        SubtitleWriter::write_ass_with_style(&segs, &temp, ExportMode::RawOnly, &zero).unwrap();
+        let content = std::fs::read_to_string(&temp).unwrap();
+
+        let head = content
+            .lines()
+            .find(|l| l.starts_with("Style: Default,"))
+            .expect("缺 Default 样式行");
+        assert!(
+            head.ends_with(",2,0,0,40,1"),
+            "Default 样式左右边距未写入 ASS: {head}"
+        );
+        let speaker_lines: Vec<&str> = content
+            .lines()
+            .filter(|l| l.starts_with("Style: Speaker"))
+            .collect();
+        assert_eq!(speaker_lines.len(), 2, "应有两个说话人样式行: {content}");
+        for line in speaker_lines {
+            assert!(
+                line.ends_with(",2,0,0,40,1"),
+                "说话人样式左右边距未同步: {line}"
+            );
+        }
+
+        // 非默认值同样生效（防止写成常量）
+        let wide = SubtitleStyleConfig {
+            margin_lr: 123,
+            bottom_margin: 40,
+            ..SubtitleStyleConfig::default()
+        };
+        SubtitleWriter::write_ass_with_style(&segs, &temp, ExportMode::RawOnly, &wide).unwrap();
+        let content = std::fs::read_to_string(&temp).unwrap();
+        assert!(
+            content.contains(",2,123,123,40,1"),
+            "自定义左右边距未写入 ASS: {content}"
+        );
 
         let _ = std::fs::remove_file(temp);
     }

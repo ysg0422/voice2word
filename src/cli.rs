@@ -185,9 +185,25 @@ fn parse_transcribe(args: &[String]) -> std::result::Result<CliAction, CliError>
     let mut resume = false;
     let mut artifact_dir: Option<PathBuf> = None;
 
+    // `--` 之后一律按位置参数处理（文件名以 '-' 开头时的标准转义手段）。
+    let mut positional_only = false;
+
     let mut i = 0usize;
     while i < args.len() {
         let arg = args[i].as_str();
+        if positional_only {
+            if input.is_some() {
+                return Err(CliError::new(format!("多余的参数: {arg}")));
+            }
+            input = Some(PathBuf::from(arg));
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            i += 1;
+            continue;
+        }
         if arg == "-h" || arg == "--help" {
             return Ok(CliAction::Help);
         }
@@ -290,9 +306,17 @@ fn take_value(
         return Ok(value.to_string());
     }
     *i += 1;
-    args.get(*i)
+    let value = args
+        .get(*i)
         .cloned()
-        .ok_or_else(|| CliError::new(format!("选项 {flag} 缺少取值")))
+        .ok_or_else(|| CliError::new(format!("选项 {flag} 缺少取值")))?;
+    // 裸 `-` 是「标准输入 / 标准输出」的约定（如 `-o -`），不算选项前缀。
+    if value != "-" && value.starts_with('-') {
+        return Err(CliError::new(format!(
+            "选项 {flag} 缺少取值：下一个参数“{value}”看起来是另一个选项（若取值本身以 '-' 开头，请写成 {flag}={value}）"
+        )));
+    }
+    Ok(value)
 }
 
 /// CLI 入口。返回 `None` 表示应继续启动图形界面；`Some(code)` 表示以该退出码结束进程。
@@ -932,5 +956,32 @@ mod tests {
         for format in SUPPORTED_FORMATS {
             assert_eq!(format, format.to_ascii_lowercase(), "{format}");
         }
+    }
+
+    /// 取值位置的下一个参数看起来是另一个选项时，必须报「缺少取值」，
+    /// 而不是把它吞成取值：修前 `--lang --polish` 会把 "--polish" 当语言，
+    /// 用户既没得到语言、也没得到润色，还毫无提示。
+    #[test]
+    fn option_value_starting_with_dash_is_rejected() {
+        let message = parse_error(&["voice2word", "transcribe", "a.mp4", "--lang", "--polish"]);
+        assert!(message.contains("缺少取值"), "{message}");
+
+        // 取值本身确实以 '-' 开头（合法但罕见）时，`=value` 形式仍可用。
+        let args = transcribe_args(&["voice2word", "transcribe", "a.mp4", "--lang=--weird"]);
+        assert_eq!(args.language.as_deref(), Some("--weird"));
+
+        // 裸 '-' 是标准输入/输出约定（`-o -`），不能当成选项拦截。
+        let args = transcribe_args(&["voice2word", "transcribe", "a.mp4", "-o", "-"]);
+        assert_eq!(args.output, Some(PathBuf::from("-")));
+    }
+
+    /// `--` 之后停止解析选项：文件名以 '-' 开头时也能当输入传入。
+    #[test]
+    fn double_dash_terminates_option_parsing() {
+        let args = transcribe_args(&["voice2word", "transcribe", "--", "-h"]);
+        assert_eq!(args.input, PathBuf::from("-h"));
+
+        let message = parse_error(&["voice2word", "transcribe", "a.mp3", "--", "b.mp3"]);
+        assert!(message.contains("多余的参数"), "{message}");
     }
 }

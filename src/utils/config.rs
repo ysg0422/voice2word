@@ -585,7 +585,7 @@ pub fn online_error_hint(msg: &str) -> Option<String> {
 
 /// 字幕全局样式与排版配置。
 ///
-/// `font_size` / `letter_spacing` / `bottom_margin` 均以 **1080p 画面**为基准：
+/// `font_size` / `letter_spacing` / `bottom_margin` / `margin_lr` 均以 **1080p 画面**为基准：
 /// - 导出 ASS 时直接写入 PlayResY=1080 的样式表（1:1）；
 /// - 预览时按 `PREVIEW_SCALE` 等比映射到监视器画面。
 ///
@@ -602,6 +602,9 @@ pub struct SubtitleStyleConfig {
     pub max_chars_per_line: u32,
     /// 画面底边距 px @1080p
     pub bottom_margin: u32,
+    /// 左右安全边距 px @1080p（导出 ASS 时写入 MarginL / MarginR，0 = 贴边）
+    #[serde(default = "default_margin_lr")]
+    pub margin_lr: u32,
     /// 预设名称："白字黑影" / "黄字黑边" / "半透明黑框" / "电影沉浸" / "霓虹极光" / "活力暖橙"
     pub preset_name: String,
     /// 预览框的手动宽度（px）。
@@ -629,6 +632,11 @@ pub struct SubtitleStyleConfig {
     /// 水平对齐方式："left" | "center" | "right"
     #[serde(default = "default_alignment")]
     pub alignment: String,
+    /// 用户自定义样式预设（命名保存 / 删除 / 导入导出 JSON，见 [`NamedStylePreset`]）。
+    ///
+    /// 单条坏数据（缺字段 / 类型不对）只丢这一条，不能让整份配置读不进来。
+    #[serde(default, deserialize_with = "deserialize_custom_presets_lenient")]
+    pub custom_presets: Vec<NamedStylePreset>,
 }
 
 fn default_primary_color() -> String {
@@ -652,6 +660,29 @@ fn default_is_bold() -> bool {
 fn default_alignment() -> String {
     "center".to_string()
 }
+/// 左右安全边距默认值（px @1080p）：与旧版硬编码在 ASS 里的 `20,20` 一致，
+/// 老用户升级后画面对齐不会突然变化。
+fn default_margin_lr() -> u32 {
+    20
+}
+
+/// 水平安全边距上限（px @1080p）。
+///
+/// ASS 的 MarginL / MarginR 本身不限幅，这里封顶只是防止手改配置 / 外部预设
+/// 塞进离谱数值把画面挤成一条缝。
+pub const SUBTITLE_MARGIN_LR_MAX: u32 = 500;
+
+/// 浮点限幅：NaN / Inf 一律回落默认值。
+///
+/// 外部 JSON 里的 `1e400` 会解析成 `inf`，直接 `clamp` 之后会让布局算出 NaN
+/// （预览框高度、字号都跟着废），所以先判有限值再限幅。
+fn clamp_finite(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
 
 impl Default for SubtitleStyleConfig {
     fn default() -> Self {
@@ -661,6 +692,7 @@ impl Default for SubtitleStyleConfig {
             line_spacing: 1.2,
             max_chars_per_line: 16,
             bottom_margin: 40,
+            margin_lr: default_margin_lr(),
             preset_name: "白字黑影".to_string(),
             preview_box_w: None,
             primary_color: default_primary_color(),
@@ -670,8 +702,57 @@ impl Default for SubtitleStyleConfig {
             bg_opacity: default_bg_opacity(),
             is_bold: default_is_bold(),
             alignment: default_alignment(),
+            custom_presets: Vec::new(),
         }
     }
+}
+
+/// 用户自定义样式预设：一个名字 + 一份样式参数快照。
+///
+/// 为什么用 `Box<SubtitleStyleConfig>` 而不是另抽一个 `StyleParams`：
+/// 1. 样式配置里要存 `Vec<NamedStylePreset>`，预设里再按值嵌一份
+///    `SubtitleStyleConfig` 就是互相包含的类型递归；`Box`（堆指针）一步打断递归，
+///    类型大小立刻可算。
+/// 2. 抽 `StyleParams` + `#[serde(flatten)]` 会让 `style.font_size` 这类字段访问
+///    全部失效（几十处调用点都要改），旧配置的 JSON 形状也跟着变。
+///    这里选改动最小、serde 兼容最好的方案。
+///
+/// 快照里内嵌的 `custom_presets` 一律清空（导出时清、导入时也清），
+/// 否则「预设套预设」会让文件体积随预设数量平方级膨胀。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NamedStylePreset {
+    /// 预设名（去首尾空白后 1 ~ 24 个字符，不允许与内置预设重名）
+    pub name: String,
+    /// 样式参数快照；字段缺失时回落默认值，保证旧 JSON 也能读
+    #[serde(default)]
+    pub style: Box<SubtitleStyleConfig>,
+}
+
+/// `custom_presets` 的宽松反序列化：一条坏数据只丢这一条。
+///
+/// 预设里内嵌的 `SubtitleStyleConfig` 有 6 个「老必填」字段（`font_size` 等），
+/// 手抄/精简过的 JSON 一缺字段就会让**整份** config.toml 读不进来。这里按
+/// 「默认样式打底 + 实际出现的字段覆盖」来合并，再把仍然解析失败的条目跳过。
+fn deserialize_custom_presets_lenient<'de, D>(de: D) -> Result<Vec<NamedStylePreset>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // toml / json 都是自描述格式，`Value` 能把两种来源统一成同一套「打底 + 覆盖」。
+    let raw = <Vec<serde_json::Value> as Deserialize>::deserialize(de).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "自定义预设列表格式不对，已按空列表处理");
+        Vec::new()
+    });
+    Ok(raw
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("name")?.as_str()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let style = SubtitleStyleConfig::style_from_partial_json(entry.get("style"))?;
+            Some(NamedStylePreset { name, style })
+        })
+        .collect())
 }
 
 /// 可选预设列表（UI 与 `apply_preset` 共用同一份清单）
@@ -704,9 +785,52 @@ pub const SUBTITLE_OUTLINE_OPTIONS: [(&str, f32); 4] = [
 ];
 
 impl SubtitleStyleConfig {
-    /// 应用预设：预设同时套用一组完整排版与色彩参数
+    /// 自定义预设名的长度上限（按**字符**计数，中文名不吃亏）
+    const PRESET_NAME_MAX_CHARS: usize = 24;
+
+    /// 自定义预设条数上限：预设是内联进配置文件的，没上限会被手改配置写爆
+    const PRESET_COUNT_MAX: usize = 64;
+
+    /// 是否为内置预设名（内置名不允许被自定义预设占用）
+    pub fn is_builtin_preset(name: &str) -> bool {
+        SUBTITLE_PRESETS.contains(&name)
+    }
+
+    /// 单条预设的宽松解析：默认样式打底，再用 JSON 里**实际出现**的字段覆盖。
+    ///
+    /// 返回 `None` 表示这条彻底没法用（`style` 不是对象 / 字段类型不对），
+    /// 调用方跳过这一条即可，不该因为一条坏数据放弃整批。
+    fn style_from_partial_json(
+        value: Option<&serde_json::Value>,
+    ) -> Option<Box<SubtitleStyleConfig>> {
+        let mut merged = serde_json::to_value(SubtitleStyleConfig::default()).ok()?;
+        if let Some(user) = value {
+            let user_map = user.as_object()?;
+            let base_map = merged.as_object_mut()?;
+            for (key, val) in user_map {
+                // 未知字段照插不误：SubtitleStyleConfig 没有 deny_unknown_fields，
+                // 反序列化时会自动忽略，不用在这里维护白名单。
+                base_map.insert(key.clone(), val.clone());
+            }
+        }
+        serde_json::from_value::<SubtitleStyleConfig>(merged)
+            .ok()
+            .map(Box::new)
+    }
+
+    /// 应用预设：预设同时套用一组完整排版与色彩参数。
+    ///
+    /// 顺序：自定义预设优先于内置重名项——手改配置塞进来一个叫「黄字黑边」的
+    /// 自定义项时仍按内置语义走，保证导出时颜色查表结果可预期。
     pub fn apply_preset(&mut self, preset: &str) {
         self.preset_name = preset.to_string();
+        if !Self::is_builtin_preset(preset) {
+            if let Some(found) = self.custom_presets.iter().find(|p| p.name == preset) {
+                let snapshot = found.style.clone();
+                self.adopt_params(&snapshot);
+                return;
+            }
+        }
         match preset {
             "黄字黑边" => {
                 self.font_size = 44;
@@ -787,6 +911,178 @@ impl SubtitleStyleConfig {
                 self.bg_opacity = 0.5;
                 self.is_bold = true;
             }
+        }
+    }
+
+    /// 把 `src` 的样式**参数**搬进自己（不含 `preset_name`、`preview_box_w`
+    /// 与预设库本身）：应用自定义预设时用，避免顺手把「谁的名字」也覆盖掉。
+    fn adopt_params(&mut self, src: &SubtitleStyleConfig) {
+        self.font_size = src.font_size;
+        self.letter_spacing = src.letter_spacing;
+        self.line_spacing = src.line_spacing;
+        self.max_chars_per_line = src.max_chars_per_line;
+        self.bottom_margin = src.bottom_margin;
+        self.margin_lr = src.margin_lr;
+        self.primary_color = src.primary_color.clone();
+        self.outline_width = src.outline_width;
+        self.outline_color = src.outline_color.clone();
+        self.bg_style = src.bg_style.clone();
+        self.bg_opacity = src.bg_opacity;
+        self.is_bold = src.is_bold;
+        self.alignment = src.alignment.clone();
+    }
+
+    /// 取一份「样式参数快照」：清掉预设库与预览框宽度，避免预设里再套预设。
+    fn style_snapshot(&self) -> SubtitleStyleConfig {
+        let mut snap = self.clone();
+        snap.custom_presets = Vec::new();
+        // 预览框宽度是这次预览的临时 UI 状态，不属于「观感预设」。
+        snap.preview_box_w = None;
+        snap
+    }
+
+    /// 把当前样式存成自定义预设。`true` = 已保存（同名覆盖也算成功）。
+    ///
+    /// - 名字去首尾空白、按**字符**计数（最多 24 字，中文名不吃亏）；
+    /// - 空名 / 超长 / 与内置预设重名 → `false`：不静默改名，否则用户以为
+    ///   「存上了」，实际存的是另一个名字；
+    /// - 存储上限 [`Self::PRESET_COUNT_MAX`]，满了再存**新名字**返回 `false`，
+    ///   覆盖已有名字仍然可以。
+    pub fn save_custom_preset(&mut self, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > Self::PRESET_NAME_MAX_CHARS {
+            return false;
+        }
+        if Self::is_builtin_preset(name) {
+            return false;
+        }
+        let snapshot = Box::new(self.style_snapshot());
+        if let Some(slot) = self.custom_presets.iter_mut().find(|p| p.name == name) {
+            slot.style = snapshot;
+            return true;
+        }
+        if self.custom_presets.len() >= Self::PRESET_COUNT_MAX {
+            return false;
+        }
+        self.custom_presets.push(NamedStylePreset {
+            name: name.to_string(),
+            style: snapshot,
+        });
+        true
+    }
+
+    /// 删除自定义预设（名字精确匹配，含首尾空白时不匹配）。
+    ///
+    /// `true` = 真删掉了一条。当前 `preset_name` 若正好是被删的名字，这里**不**
+    /// 改名：参数还留在配置里，UI 显示成「未保存的自定义样式」比伪造一个名字诚实。
+    pub fn delete_custom_preset(&mut self, name: &str) -> bool {
+        let before = self.custom_presets.len();
+        self.custom_presets.retain(|p| p.name != name);
+        self.custom_presets.len() != before
+    }
+
+    /// 预设清单：6 个内置在前，自定义在后（顺序稳定，UI 照着画即可）。
+    ///
+    /// 手改配置造成的重名在这里去重（内置优先），免得下拉框出现两个同名项。
+    pub fn preset_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = SUBTITLE_PRESETS.iter().map(|s| (*s).to_string()).collect();
+        for p in &self.custom_presets {
+            if !names.iter().any(|n| n == &p.name) {
+                names.push(p.name.clone());
+            }
+        }
+        names
+    }
+
+    /// 导出自定义预设为 JSON（可直接拷给别的机器 / 别的用户导入）。
+    ///
+    /// 导出前把每个预设里内嵌的预设库清空，保证文件是「扁平列表」而不是套娃。
+    pub fn export_custom_presets_json(&self) -> String {
+        let flat: Vec<NamedStylePreset> = self
+            .custom_presets
+            .iter()
+            .map(|p| NamedStylePreset {
+                name: p.name.clone(),
+                style: Box::new(p.style.style_snapshot()),
+            })
+            .collect();
+        // 序列化 Vec<NamedStylePreset> 本身不会失败；这里的兜底只是让签名保持简单。
+        serde_json::to_string_pretty(&flat).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// 导入自定义预设 JSON，返回成功条数；整份文件读不进来时返回中文错误文案。
+    ///
+    /// 逐条校验、能救则救：
+    /// - 不是合法 JSON / 顶层不是数组 → `Err`（提示用户看文件来源）；
+    /// - 单条名字非法（空 / 超 24 字 / 与内置重名）→ 跳过这一条，不整批失败；
+    /// - 缺字段按默认值补齐、未知字段忽略、越界数值**限幅**而不是丢弃；
+    /// - 同名覆盖已有自定义项，总条数封顶 `PRESET_COUNT_MAX`。
+    pub fn import_custom_presets_json(&mut self, raw: &str) -> Result<usize, String> {
+        let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+            format!("预设文件解析失败：{e}。请使用本工具「导出预设」得到的 JSON 文件。")
+        })?;
+        let array = parsed
+            .as_array()
+            .ok_or_else(|| "预设文件格式不对：顶层应该是 JSON 数组（[]）。".to_string())?;
+        let mut imported = 0usize;
+        for entry in array {
+            let name = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if name.is_empty()
+                || name.chars().count() > Self::PRESET_NAME_MAX_CHARS
+                || Self::is_builtin_preset(&name)
+            {
+                continue;
+            }
+            let already_there = self.custom_presets.iter().any(|p| p.name == name);
+            if !already_there && self.custom_presets.len() >= Self::PRESET_COUNT_MAX {
+                break;
+            }
+            let Some(mut style) = Self::style_from_partial_json(entry.get("style")) else {
+                continue;
+            };
+            // 预设里不允许再套预设 / 带临时预览宽度；限幅 + 颜色净化后入库。
+            style.custom_presets.clear();
+            style.preview_box_w = None;
+            style.clamp_params();
+            style.sanitize_colors();
+            let entry = NamedStylePreset { name, style };
+            match self
+                .custom_presets
+                .iter_mut()
+                .find(|p| p.name == entry.name)
+            {
+                Some(slot) => *slot = entry,
+                None => self.custom_presets.push(entry),
+            }
+            imported += 1;
+        }
+        Ok(imported)
+    }
+
+    /// 把样式数值收进可用范围。
+    ///
+    /// 只用于**导入外部预设**：本地配置是用户自己一格格调出来的，改他的值属于
+    /// 行为变更，不在这里动。
+    fn clamp_params(&mut self) {
+        self.font_size = self.font_size.clamp(6, 200);
+        self.letter_spacing = self.letter_spacing.min(50);
+        self.line_spacing = clamp_finite(self.line_spacing, 0.8, 3.0, 1.2);
+        // 0 是「不折行」的合法取值，所以这里只封上限。
+        self.max_chars_per_line = self.max_chars_per_line.min(120);
+        self.bottom_margin = self.bottom_margin.min(540);
+        self.margin_lr = self.margin_lr.min(SUBTITLE_MARGIN_LR_MAX);
+        self.outline_width = clamp_finite(self.outline_width, 0.0, 20.0, 2.0);
+        self.bg_opacity = clamp_finite(self.bg_opacity, 0.0, 1.0, 0.6);
+        if !matches!(self.bg_style.as_str(), "shadow" | "box" | "none" | "pill") {
+            self.bg_style = default_bg_style();
+        }
+        if !matches!(self.alignment.as_str(), "left" | "center" | "right") {
+            self.alignment = default_alignment();
         }
     }
 
@@ -1425,6 +1721,42 @@ impl LocalOverride {
         touched
     }
 }
+/// 共享配置 `config.toml` 认识的顶层段（与 [`AppConfig`] 的反序列化字段一一对应）。
+///
+/// 用于「未知段显式告警」：serde 默认忽略不认识的键，段名写错 / 版本回退时
+/// 整段参数会被静默丢弃，用户只会看到「配置没生效」。这里列一份白名单，
+/// 只做日志提示，**不**改成硬错误——前向兼容（新版本写的段被旧版本读到）
+/// 仍然要能启动。
+const SHARED_CONFIG_SECTIONS: [&str; 6] = [
+    "paths",
+    "pipeline",
+    "gpu",
+    "subtitle_style",
+    "translate",
+    "ui",
+];
+
+/// 解析 `config.toml` 里不认识的顶层键（段名），供忽略前的显式告警。
+///
+/// 返回排序去重后的键名。解析失败返回空：坏文件由调用方的反序列化负责报错，
+/// 这里不重复报错、也不会 panic。
+fn unknown_shared_config_keys(raw: &str) -> Vec<String> {
+    let Ok(value) = toml::from_str::<toml::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(table) = value.as_table() else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<String> = table
+        .keys()
+        .filter(|key| !SHARED_CONFIG_SECTIONS.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown.dedup();
+    unknown
+}
+
 impl AppConfig {
     /// 机器本地覆盖文件名（与 config.toml 同目录，不进版本库）。
     pub const LOCAL_OVERRIDE: &'static str = "config.local.toml";
@@ -1455,7 +1787,18 @@ impl AppConfig {
         let mut cfg = if full_path.exists() {
             let content = std::fs::read_to_string(&full_path)
                 .with_context(|| format!("读取配置文件失败: {:?}", full_path))?;
-            toml::from_str(&content).with_context(|| "反序列化 config.toml 失败")?
+            let parsed: Self =
+                toml::from_str(&content).with_context(|| "反序列化 config.toml 失败")?;
+            // 不认识的顶层段不阻断启动（向前/向后兼容），但不能静默：段名写错
+            // 会被整段忽略，用户只会看到「配置没生效」，这里至少留下日志线索。
+            for key in unknown_shared_config_keys(&content) {
+                tracing::warn!(
+                    file = %full_path.display(),
+                    key = %key,
+                    "共享配置存在未知字段，已忽略"
+                );
+            }
+            parsed
         } else {
             let default_cfg = Self::default();
             default_cfg.save_to_file(&full_path)?;
@@ -3274,5 +3617,178 @@ gpu_limit_percent = 60
         assert_eq!(back.subtitle_style.outline_color, "#000000");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 共享配置里不认识的段必须被「报告并忽略」：既不能静默丢弃（用户看不到
+    /// 配置为何没生效），也不能变成启动失败（前向兼容）。
+    #[test]
+    fn unknown_key_in_shared_config_is_reported() {
+        let raw = r#"
+[nonsense]
+foo = 1
+
+[nonsense_more]
+bar = "x"
+
+[paths]
+"#;
+        assert_eq!(
+            super::unknown_shared_config_keys(raw),
+            vec!["nonsense".to_string(), "nonsense_more".to_string()]
+        );
+
+        // 六个认识段各出现一次时不应有任何告警。
+        let clean = r#"
+[paths]
+
+[pipeline]
+
+[gpu]
+
+[subtitle_style]
+
+[translate]
+
+[ui]
+"#;
+        assert!(
+            super::unknown_shared_config_keys(clean).is_empty(),
+            "认识段不应被报为未知"
+        );
+
+        // 坏文件交给反序列化报错；探测未知键本身不能 panic。
+        assert!(super::unknown_shared_config_keys("= = =").is_empty());
+    }
+
+    // ─────────── 自定义样式预设 ───────────
+
+    /// 自定义预设：保存 → 套用 → 删除走一整圈，套用后参数应来自预设快照。
+    #[test]
+    fn custom_preset_save_apply_delete_roundtrip() {
+        let mut cfg = SubtitleStyleConfig {
+            font_size: 67,
+            margin_lr: 123,
+            primary_color: "#FF0080".to_string(),
+            ..SubtitleStyleConfig::default()
+        };
+        assert!(cfg.save_custom_preset("我的样式"), "保存自定义预设应成功");
+        assert!(
+            cfg.preset_names().iter().any(|n| n == "我的样式"),
+            "保存后应出现在预设清单里"
+        );
+
+        // 先切到内置预设把参数改掉，再切回来验证确实是预设快照在起作用
+        cfg.apply_preset(super::SUBTITLE_PRESETS[1]);
+        assert_ne!(cfg.font_size, 67, "切到内置预设后应被内置参数覆盖");
+        cfg.apply_preset("我的样式");
+        assert_eq!(cfg.font_size, 67, "自定义预设应还原字号");
+        assert_eq!(cfg.margin_lr, 123, "自定义预设应还原左右边距");
+        assert_eq!(cfg.primary_color, "#FF0080");
+        assert_eq!(cfg.preset_name, "我的样式");
+
+        assert!(cfg.delete_custom_preset("我的样式"), "删除应成功");
+        assert!(!cfg.preset_names().iter().any(|n| n == "我的样式"));
+        assert!(!cfg.delete_custom_preset("我的样式"), "重复删除返回 false");
+    }
+
+    /// 名字校验：空名 / 纯空白 / 超 24 字 / 与内置重名都拒绝，且不留脏数据。
+    #[test]
+    fn custom_preset_rejects_invalid_names() {
+        let mut cfg = SubtitleStyleConfig::default();
+        assert!(!cfg.save_custom_preset(""), "空名应拒绝");
+        assert!(!cfg.save_custom_preset("   "), "纯空白名应拒绝");
+        assert!(!cfg.save_custom_preset(&"烫".repeat(25)), "超 24 字应拒绝");
+        assert!(
+            !cfg.save_custom_preset(super::SUBTITLE_PRESETS[1]),
+            "内置预设名应拒绝"
+        );
+        assert!(cfg.custom_presets.is_empty(), "被拒绝的名字不该留下记录");
+
+        // 24 个字符是允许的边界，首尾空白会被去掉
+        let last_ok = format!("  {}  ", "烫".repeat(24));
+        assert!(cfg.save_custom_preset(&last_ok), "24 字边界应允许");
+        assert_eq!(cfg.custom_presets[0].name, "烫".repeat(24));
+    }
+
+    /// 导出 → 清空 → 导入，参数要一模一样（导出的是扁平列表，不套娃）。
+    #[test]
+    fn custom_preset_export_import_roundtrip() {
+        let mut src = SubtitleStyleConfig {
+            font_size: 66,
+            ..SubtitleStyleConfig::default()
+        };
+        assert!(src.save_custom_preset("夜间小字"));
+        src.margin_lr = 88;
+        assert!(src.save_custom_preset("宽边距"));
+        let json = src.export_custom_presets_json();
+
+        let mut dst = SubtitleStyleConfig::default();
+        let imported = dst.import_custom_presets_json(&json).expect("导入应成功");
+        assert_eq!(imported, 2);
+        assert_eq!(
+            dst.preset_names().len(),
+            super::SUBTITLE_PRESETS.len() + 2,
+            "应包含全部内置预设 + 2 条自定义"
+        );
+
+        dst.apply_preset("宽边距");
+        assert_eq!(dst.margin_lr, 88, "导入的预设应带来原来的边距");
+        assert_eq!(dst.font_size, 66, "导入的预设应带来原来的字号");
+
+        let again = dst.export_custom_presets_json();
+        let a: serde_json::Value = serde_json::from_str(&json).expect("导出应是合法 JSON");
+        let b: serde_json::Value = serde_json::from_str(&again).expect("二次导出应是合法 JSON");
+        assert_eq!(a, b, "导出→导入→再导出应完全一致");
+    }
+
+    /// 坏文件要报错、坏条目只丢自己：一整份文件读不进来才给用户提示。
+    #[test]
+    fn custom_preset_import_survives_bad_entries() {
+        let mut cfg = SubtitleStyleConfig::default();
+        assert!(cfg.import_custom_presets_json("这不是 JSON").is_err());
+        assert!(
+            cfg.import_custom_presets_json("{\"name\":\"x\"}").is_err(),
+            "顶层不是数组应报错"
+        );
+        assert!(cfg.custom_presets.is_empty(), "报错时不该有半边数据入库");
+
+        // 中间两条（空名 / 与内置重名）跳过，其余照收
+        let mixed = format!(
+            r#"[{{"name":"好预设","style":{{"margin_lr":77,"font_size":30}}}},
+                 {{"name":"","style":{{}}}},
+                 {{"name":"{}","style":{{}}}}]"#,
+            super::SUBTITLE_PRESETS[1]
+        );
+        assert_eq!(cfg.import_custom_presets_json(&mixed).unwrap(), 1);
+        cfg.apply_preset("好预设");
+        assert_eq!(cfg.margin_lr, 77);
+        assert_eq!(cfg.font_size, 30);
+    }
+
+    /// 旧配置 JSON 没有 margin_lr / custom_presets 也要能读，且回落旧版硬编码值 20。
+    #[test]
+    fn legacy_style_json_without_new_fields_still_loads() {
+        let legacy = r#"{"font_size":42,"letter_spacing":2,"line_spacing":1.3,
+                         "max_chars_per_line":18,"bottom_margin":52,"preset_name":"黄字黑边"}"#;
+        let cfg: SubtitleStyleConfig = serde_json::from_str(legacy).expect("旧格式应能读");
+        assert_eq!(cfg.font_size, 42);
+        assert_eq!(cfg.margin_lr, 20, "缺字段应回落旧版硬编码的 20");
+        assert!(cfg.custom_presets.is_empty());
+    }
+
+    /// 导入外部预设要限幅：越界数值改到边界而不是让画面炸掉。
+    #[test]
+    fn custom_preset_import_clamps_out_of_range() {
+        let mut cfg = SubtitleStyleConfig::default();
+        let raw = r#"[{"name":"越界","style":{"margin_lr":99999,"font_size":9999,
+                        "line_spacing":9.5,"bg_style":"怪东西","alignment":"mid","bg_opacity":-3}}]"#;
+        assert_eq!(cfg.import_custom_presets_json(raw).unwrap(), 1);
+        let style = &cfg.custom_presets[0].style;
+        assert_eq!(style.margin_lr, super::SUBTITLE_MARGIN_LR_MAX);
+        assert_eq!(style.font_size, 200);
+        assert_eq!(style.line_spacing, 3.0);
+        assert_eq!(style.bg_style, "shadow");
+        assert_eq!(style.alignment, "center");
+        assert_eq!(style.bg_opacity, 0.0);
     }
 }

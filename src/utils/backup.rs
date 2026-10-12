@@ -43,6 +43,7 @@
 //! 重命名旧文件，不能由一次误点触发。宁可让用户多走一步，也不让一次误操作
 //! 变成不可逆的数据丢失。
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -75,12 +76,55 @@ pub struct RestoreOutcome {
 ///
 /// - `root`：项目根（文件从 `root` 下按 [`BACKUP_ENTRIES`] 取）。
 /// - `dest`：归档落点（例如 `root/backups/voice2word-backup-<时间戳>.zip`）；
-///   父目录不存在会自动创建。
+///   父目录不存在会自动创建。**同秒重名不覆盖**：若 `dest` 已存在（连点两次
+///   备份、或两个窗口同时备份），自动改用 `-1` / `-2`… 后缀的派生文件名，
+///   并把它作为 [`BackupOutcome::archive`] 返回（调用方据此展示真实落点）。
 /// - 不存在的条目**跳过并记日志**，不算失败（瘦包里可能还没有 `config.local.toml`）；
 ///   但**一个都没有**时返回 `Err`（空归档没有任何意义，静默产出一个 0 条目的 zip
 ///   会让用户以为备份成功了）。
 /// - 同一路径的 `-wal` / `-shm` 若存在也一并打进归档：SQLite 的 WAL 模式下
 ///   主库文件可能还没吸收最近的写入，只备份 `.db` 会丢最后几次编辑。
+///
+/// 以排他方式在 `dest`（或其派生别名）上创建一个新归档文件。
+///
+/// 返回实际落盘路径与已打开的句柄。`dest` 已被占用时依次尝试
+/// `stem-1.ext`、`stem-2.ext`…（最多 1000 个），保证同一秒内的第二次备份
+/// 不会覆盖第一份。用 `create_new` 而不是「先 `exists` 再 `write`」：存在性
+/// 检查与创建必须是**一个原子操作**，否则两个进程同时备份仍会互相覆盖。
+fn create_unique_archive_file(dest: &Path) -> Result<(PathBuf, std::fs::File)> {
+    for attempt in 0..=1000u32 {
+        let candidate = if attempt == 0 {
+            dest.to_path_buf()
+        } else {
+            let stem = dest
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("voice2word-backup");
+            let name = match dest.extension().and_then(|ext| ext.to_str()) {
+                Some(ext) => format!("{stem}-{attempt}.{ext}"),
+                None => format!("{stem}-{attempt}"),
+            };
+            dest.with_file_name(name)
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("创建归档文件失败: {}", candidate.display()));
+            }
+        }
+    }
+    bail!(
+        "备份归档重名过多，写入失败: {}（同秒内的同名文件超过 1000 个）",
+        dest.display()
+    );
+}
+
 pub fn create_backup(root: &Path, dest: &Path) -> Result<BackupOutcome> {
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
@@ -130,7 +174,10 @@ pub fn create_backup(root: &Path, dest: &Path) -> Result<BackupOutcome> {
     }
 
     let bytes = build_stored_zip(&entries)?;
-    std::fs::write(dest, &bytes).with_context(|| format!("写入归档失败: {}", dest.display()))?;
+    // 同名归档可能已经在同秒里落盘：覆盖会静默毁掉前一份，改走派生文件名。
+    let (dest, mut file) = create_unique_archive_file(dest)?;
+    file.write_all(&bytes)
+        .with_context(|| format!("写入归档失败: {}", dest.display()))?;
 
     info!(
         archive = %dest.display(),
@@ -191,7 +238,10 @@ pub fn restore_backup(archive: &Path, root: &Path) -> Result<RestoreOutcome> {
 }
 
 /// 备份文件名：`voice2word-backup-YYYYMMDD-HHMMSS.zip`（本地时间）。
-/// 抽成纯函数便于单测（不依赖时钟）。
+///
+/// 抽成纯函数便于单测（不依赖时钟）。同秒第二次备份的重名由
+/// [`create_backup`] 自动加 `-1`/`-2`… 后缀消解——重名探测涉及文件系统，
+/// 刻意不放进这个纯函数，保证它永远只由时间决定。
 pub fn backup_file_name(now: chrono::DateTime<chrono::Local>) -> String {
     now.format("voice2word-backup-%Y%m%d-%H%M%S.zip")
         .to_string()
@@ -631,5 +681,47 @@ mod tests {
             crc32(b"The quick brown fox jumps over the lazy dog"),
             0x414F_A339
         );
+    }
+
+    /// 同一秒内的第二次备份绝不能覆盖第一份：第二份自动用 `-1` 后缀另存，
+    /// 两份归档都要在、且各自装着备份当时的库内容（修前第二次会静默覆盖第一次，
+    /// 用户以为有两份快照、实际只剩一份）。
+    #[test]
+    fn same_second_backup_does_not_overwrite_existing_archive() {
+        let dir = tmp_dir("collision");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // 固定时间戳：模拟「同一秒里连点两次备份」产生的同名 dest。
+        let fixed = chrono::Local
+            .with_ymd_and_hms(2026, 10, 9, 8, 7, 6)
+            .unwrap();
+        let dest = dir.join("backups").join(backup_file_name(fixed));
+
+        std::fs::write(root.join("voice2word.db"), b"first").unwrap();
+        let first = create_backup(&root, &dest).unwrap();
+        assert_eq!(first.archive, dest);
+
+        std::fs::write(root.join("voice2word.db"), b"second").unwrap();
+        let second = create_backup(&root, &dest).unwrap();
+        assert_ne!(
+            second.archive, dest,
+            "同名归档必须改用派生文件名，不能原地覆盖"
+        );
+        assert!(dest.exists(), "第一份归档必须原样保留");
+        assert!(second.archive.exists(), "第二份归档必须落盘");
+
+        let db_bytes = |archive: &std::path::Path| {
+            read_stored_zip(&std::fs::read(archive).unwrap())
+                .unwrap()
+                .into_iter()
+                .find(|(name, _)| name == "voice2word.db")
+                .map(|(_, data)| data)
+                .expect("归档里应有 voice2word.db")
+        };
+        assert_eq!(db_bytes(&dest), b"first".to_vec());
+        assert_eq!(db_bytes(&second.archive), b"second".to_vec());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

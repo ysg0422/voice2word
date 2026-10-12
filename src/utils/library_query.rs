@@ -149,25 +149,12 @@ impl LibraryRecord for TaskRecord {
 
     /// 是否已有译文。
     ///
-    /// `TaskRecord` 本身**没有**翻译状态字段，唯一的真实信号在 `segments` 里
-    /// （逐句 [`crate::subtitle::Segment::has_translation`]）。这里用「任一句有译文」
-    /// 判定，也就是与 `AppState::translated_count > 0` 同一口径。
-    ///
-    /// # 已知边界：列表查询的记录没有正文
-    ///
-    /// `list_recent_tasks` 刻意**不反序列化** `segments`（见 `storage::db` 的说明），
-    /// 所以列表记录的空壳永远返回 `false`。这带来两个后果，都在这里明说、不假装没有：
-    /// - 「只看未翻译」在列表记录上恒等于「全部」；
-    /// - 「只看已翻译」在列表记录上会得到空列表。
-    ///
-    /// 想要精确结果，调用方要么用带正文的记录（`segments_loaded == true`），要么给
-    /// 自己的包装类型实现 [`LibraryRecord`] 并从别处（例如另查一次译文计数）取状态。
-    /// 之所以不在这里偷偷「猜」（比如看 `sample_text`），是因为**猜错的状态会让筛选
-    /// 结果静默丢记录**，比明确地按「未知即未翻译」处理更难排查。
+    /// 直接读记录自带的 `TaskRecord::has_translation`：列表查询的空壳记录由 SQL
+    /// 逐句判定，装载路径（`row_to_task` / `hydrate_task`）按内存字幕重算，两条
+    /// 来源同一口径（任一句非空译文即 `true`；纯空白不算）。这样「仅已翻译 /
+    /// 仅未翻译」在正文尚未装载的列表上也能给出精确结果。
     fn has_translation(&self) -> bool {
-        self.segments
-            .iter()
-            .any(|segment| segment.has_translation())
+        self.has_translation
     }
 
     fn segment_count(&self) -> usize {

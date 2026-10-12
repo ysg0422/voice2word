@@ -519,6 +519,34 @@ impl InferenceProfile {
     }
 }
 
+/// 把推荐配置里的 GPU 开关消费进引擎配置（`GpuConfig::whisper_offload`）。
+///
+/// 这是 [`InferenceProfile::gpu_offload`] 的**唯一消费点**：决策矩阵只负责
+/// 「建不建议开 GPU 转写」，真正被引擎读取的开关是 `config.gpu.whisper_offload`
+/// （启动时 `main.rs` / `cli.rs` 把它与硬件能力相与后传给 `WhisperEngine`）。
+/// 在此之前矩阵算出的 `gpu_offload` 没有任何读取方：推荐说「开 GPU」，
+/// 「套用推荐配置」之后开关仍是旧值，属于假装生效。
+///
+/// 语义刻意只做单向提升（用 `Option<bool>` 区分两种结果）：
+/// - 推荐 `true`（检测到独显，或 Ultra 旗舰档）→ 打开 `whisper_offload`，
+///   返回 `Some(true)`。无 GPU 机器不会被它误开：引擎侧还会与
+///   `HardwareProfile::use_gpu_pipeline()` 相与（`main.rs:101` 一带），
+///   纯 CPU 机器上该值为 `false`。
+/// - 推荐 `false`（在矩阵里只代表**没检测到独显**，核显不算）→ 不改动用户
+///   当前开关，返回 `None`。若在这里强制关闭，正在用核显（如 Radeon 680M）
+///   跑 Vulkan 转写的用户会被静默降级回纯 CPU。
+pub fn consume_gpu_offload_recommendation(
+    config: &mut crate::utils::config::GpuConfig,
+    profile: &InferenceProfile,
+) -> Option<bool> {
+    if profile.gpu_offload {
+        config.whisper_offload = true;
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// 基准测试结果
 #[derive(Debug, Clone)]
 pub struct BenchmarkResult {
@@ -583,5 +611,116 @@ pub fn run_cpu_benchmark() -> BenchmarkResult {
         score,
         gflops_estimate: gflops,
         throughput_rating,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::config::GpuConfig;
+
+    /// 造一个可控的硬件快照：`decide()` 只读逻辑线程数与 GPU 列表。
+    fn fixture_hardware(logical_threads: usize, gpus: Vec<GpuInfo>) -> HardwareInfo {
+        HardwareInfo {
+            cpu_brand: "Fixture CPU".into(),
+            physical_cores: logical_threads,
+            logical_threads,
+            cpu_frequency_mhz: 3200,
+            total_memory_bytes: 32 * 1024 * 1024 * 1024,
+            available_memory_bytes: 16 * 1024 * 1024 * 1024,
+            gpus,
+            inference_mode: InferenceMode::CpuHighPerformance,
+        }
+    }
+
+    fn discrete_gpu() -> GpuInfo {
+        GpuInfo {
+            name: "Fixture RTX 4070".into(),
+            backend: "Vulkan".into(),
+            is_discrete: true,
+            vram_mb: Some(12 * 1024),
+        }
+    }
+
+    fn integrated_gpu() -> GpuInfo {
+        GpuInfo {
+            name: "Fixture Radeon 680M".into(),
+            backend: "Vulkan".into(),
+            is_discrete: false,
+            vram_mb: None,
+        }
+    }
+
+    /// `gpu_offload` 不是死字段：矩阵给出的推荐值必须能落进
+    /// `GpuConfig::whisper_offload`（引擎真正读取的开关）。
+    #[test]
+    fn gpu_offload_recommendation_is_consumed() {
+        let levels = [
+            PerformanceLevel::Low,
+            PerformanceLevel::Medium,
+            PerformanceLevel::High,
+            PerformanceLevel::Ultra,
+        ];
+        let strategies = [
+            UserStrategy::Speed,
+            UserStrategy::Balanced,
+            UserStrategy::Quality,
+        ];
+
+        // 独显机器：四档 × 三策略全部推荐开启；消费后开关必须真的变成 true。
+        // （修复前 `consume_gpu_offload_recommendation` 不存在，本用例编译即失败。）
+        let with_discrete = fixture_hardware(16, vec![discrete_gpu()]);
+        for level in levels {
+            for strategy in strategies {
+                let profile = InferenceProfile::decide(level, strategy, &with_discrete);
+                assert!(
+                    profile.gpu_offload,
+                    "{level:?} / {strategy:?}：检测到独显时应推荐 GPU 转写"
+                );
+                let mut gpu = GpuConfig::default();
+                assert_eq!(
+                    consume_gpu_offload_recommendation(&mut gpu, &profile),
+                    Some(true)
+                );
+                assert!(gpu.whisper_offload, "推荐为真时必须写进 config.gpu");
+            }
+        }
+
+        // 核显机器：矩阵按「无独显」计算（false），消费端只做单向提升——
+        // 不得把用户正在使用的核显 Vulkan 加速悄悄关掉。
+        let integrated = fixture_hardware(8, vec![integrated_gpu()]);
+        for level in [
+            PerformanceLevel::Low,
+            PerformanceLevel::Medium,
+            PerformanceLevel::High,
+        ] {
+            for strategy in strategies {
+                let profile = InferenceProfile::decide(level, strategy, &integrated);
+                assert!(!profile.gpu_offload);
+                let mut gpu = GpuConfig::from_mode("balanced");
+                assert!(
+                    gpu.whisper_offload,
+                    "fixture 前置：balanced 档开着 GPU 转写"
+                );
+                assert_eq!(consume_gpu_offload_recommendation(&mut gpu, &profile), None);
+                assert!(
+                    gpu.whisper_offload,
+                    "推荐 false 只代表没独显，不能顺手关掉核显用户的开关"
+                );
+            }
+        }
+
+        // Ultra 档在无独显时也硬编码推荐 true；写入开关是安全的：
+        // 引擎侧与 `use_gpu_pipeline()` 相与，无 GPU 机器不会真的跑 GPU。
+        let ultra_soft = fixture_hardware(24, Vec::new());
+        let profile =
+            InferenceProfile::decide(PerformanceLevel::Ultra, UserStrategy::Balanced, &ultra_soft);
+        assert!(profile.gpu_offload);
+        let mut gpu = GpuConfig::default();
+        assert_eq!(
+            consume_gpu_offload_recommendation(&mut gpu, &profile),
+            Some(true)
+        );
+        assert!(gpu.whisper_offload);
     }
 }

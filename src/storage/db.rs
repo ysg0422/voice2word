@@ -114,6 +114,15 @@ pub struct TaskRecord {
     pub sample_text: String,
     /// `segments` 是否已装载。为 `false` 时表示来自列表查询，内容为空壳。
     pub segments_loaded: bool,
+    /// 记录中是否**至少有一句带非空译文**（与 `Segment::has_translation` 同口径，
+    /// 纯空白译文不算）。
+    ///
+    /// **列表查询的空壳记录也带对这项**：`list_recent_tasks` 的 SQL 直接在
+    /// `segments_json` 上逐句判定（不反序列化正文）；逐句装载路径
+    /// （`row_to_task` / `hydrate_task`）则按内存字幕重算。视频库的
+    /// 「仅已翻译 / 仅未翻译」筛选据此工作，不会因正文未装载而退化成
+    /// 「恒空 / 恒全量」。
+    pub has_translation: bool,
     pub created_at: String,
     /// 媒体内容的采样指纹（见 `utils::fingerprint`）。老记录或无法读取的文件为 `None`。
     /// 缓存的**主键**是它，而不是 `file_path`——同内容改名/复制能命中，同路径换内容
@@ -475,7 +484,14 @@ impl Database {
                     CASE WHEN json_valid(segments_json)
                          THEN COALESCE(NULLIF(TRIM(json_extract(segments_json, '$[0].polished'),
                                                   ' ' || char(9) || char(10) || char(11) || char(12) || char(13)), ''),
-                                       json_extract(segments_json, '$[0].text'), '') ELSE '' END
+                                       json_extract(segments_json, '$[0].text'), '') ELSE '' END,
+                    CASE WHEN json_valid(segments_json)
+                         THEN CASE WHEN EXISTS (
+                                  SELECT 1 FROM json_each(segments_json) AS seg
+                                  WHERE TRIM(COALESCE(json_extract(seg.value, '$.translation'), ''),
+                                             ' ' || char(9) || char(10) || char(11) || char(12) || char(13)) <> ''
+                              ) THEN 1 ELSE 0 END
+                         ELSE 0 END
              FROM tasks ORDER BY id DESC LIMIT ?1",
         )?;
 
@@ -502,6 +518,10 @@ impl Database {
                 segments: Vec::new(),
                 segment_count: row.get::<_, i64>(8).unwrap_or(0).max(0) as usize,
                 sample_text: row.get(9).unwrap_or_default(),
+                // 第 11 列：SQL 在 `segments_json` 上逐句判定「至少一句带非空
+                // 译文」。空壳记录也据此正确回答翻译状态（见字段说明）；读失败
+                // 按「未翻译」容错，一行坏数据不能拖垮整个列表。
+                has_translation: row.get::<_, i64>(10).unwrap_or(0) != 0,
                 content_hash: row.get(7).unwrap_or(None),
                 segments_loaded: false,
             })
@@ -542,6 +562,9 @@ impl Database {
         out.segment_count = segments.len();
         out.segments = segments;
         out.segments_loaded = true;
+        // 正文刚装载回来：翻译状态按同一口径重算（列表空壳里的标志只是
+        // SQL 侧判定，装载后以内存字幕为准）。
+        out.has_translation = out.segments.iter().any(|segment| segment.has_translation());
         out
     }
 
@@ -641,6 +664,9 @@ impl Database {
             .first()
             .map(|s| s.display_text().to_string())
             .unwrap_or_default();
+        // 与 `list_recent_tasks` 第 11 列同一口径：任一句带非空译文即 true。
+        // 必须在 `segments` 被 move 进结构体之前算好。
+        let has_translation = segments.iter().any(|s| s.has_translation());
         Ok(TaskRecord {
             id: row.get(0)?,
             file_path: row.get(1)?,
@@ -653,6 +679,7 @@ impl Database {
             segment_count: segments.len(),
             sample_text,
             segments_loaded: true,
+            has_translation,
             segments,
             created_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
             content_hash: row.get(8).unwrap_or(None),
@@ -1775,6 +1802,88 @@ mod tests {
         assert_eq!(
             recent[0].sample_text, "正文",
             "列表摘要应穿透全空白 polished 取正文"
+        );
+    }
+    /// 视频库「仅已翻译 / 仅未翻译」筛选依赖列表记录自带的翻译状态：
+    /// `list_recent_tasks` 不装载正文，此前空壳记录的 `has_translation()` 恒为
+    /// false，「仅已翻译」永远空、「仅未翻译」恒等于全部。现在 SQL 逐句判定并把
+    /// 结果带进记录，筛选必须与装载后的口径一致（纯空白译文不算「有译文」）。
+    #[test]
+    fn library_translated_filter_uses_loaded_records() {
+        use crate::utils::library_query::{query, LibraryFilter, LibrarySort};
+
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+
+        let mut translated = Segment::new(1, 0.0, 1.0, "你好");
+        translated.translation = Some("Hello".to_string());
+        let translated_id = db
+            .insert_task("D:/v/a.mp4", "a.mp4", 1.0, "completed", &[translated], None)
+            .unwrap();
+
+        let plain_id = db
+            .insert_task(
+                "D:/v/b.mp4",
+                "b.mp4",
+                1.0,
+                "completed",
+                &seg("没翻译"),
+                None,
+            )
+            .unwrap();
+
+        let mut blank = Segment::new(1, 0.0, 1.0, "空译文");
+        blank.translation = Some("   ".to_string());
+        let blank_id = db
+            .insert_task("D:/v/c.mp4", "c.mp4", 1.0, "completed", &[blank], None)
+            .unwrap();
+
+        let recent = db.list_recent_tasks(10).unwrap();
+        assert_eq!(recent.len(), 3);
+        // 前置条件：列表记录仍是空壳（不装载正文），翻译状态必须来自 SQL。
+        assert!(recent.iter().all(|t| !t.segments_loaded));
+        assert!(recent.iter().all(|t| t.segments.is_empty()));
+        let flag = |id: i64| {
+            recent
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.has_translation)
+                .unwrap()
+        };
+        assert!(flag(translated_id), "有非空译文的记录应为已翻译");
+        assert!(!flag(plain_id), "没有任何译文的记录应为未翻译");
+        assert!(
+            !flag(blank_id),
+            "纯空白译文与 Segment::has_translation 同口径，不算已翻译"
+        );
+
+        let translated_only = LibraryFilter {
+            translated_only: true,
+            ..LibraryFilter::default()
+        };
+        assert_eq!(
+            query(&recent, &translated_only, LibrarySort::NewestFirst),
+            vec![translated_id],
+            "「仅已翻译」应只留下真正带译文的记录"
+        );
+
+        let untranslated_only = LibraryFilter {
+            untranslated_only: true,
+            ..LibraryFilter::default()
+        };
+        // 列表按 id DESC（最新在前），未翻译的两条即 blank_id → plain_id。
+        assert_eq!(
+            query(&recent, &untranslated_only, LibrarySort::NewestFirst),
+            vec![blank_id, plain_id],
+            "「仅未翻译」应留下没译文与纯空白译文的记录"
+        );
+
+        // 装载正文后的记录也必须给出相同答案（hydrate 路径重算标志）。
+        let hydrated = db.hydrate_task(&recent[0]);
+        assert!(hydrated.segments_loaded);
+        assert_eq!(
+            hydrated.has_translation,
+            flag(recent[0].id),
+            "装载正文后的翻译状态必须与列表空壳一致"
         );
     }
 }
