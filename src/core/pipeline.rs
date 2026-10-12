@@ -84,6 +84,79 @@ impl EngineCapabilities {
             sensevoice_threads,
         }
     }
+
+    /// 识别引擎展示名（转写阶段日志用）。
+    fn asr_engine_name(&self) -> &'static str {
+        if self.sensevoice() {
+            "SenseVoice 极速转写"
+        } else {
+            "Whisper 神经转写"
+        }
+    }
+
+    /// 转写进度文案：按通道区分 SenseVoice 推流 / Whisper 推流 / Whisper 切块。
+    fn transcribe_detail(&self) -> &'static str {
+        if self.sensevoice() {
+            "SenseVoice 正在通过纯内存管道极速转写语音..."
+        } else if self.can_stream() {
+            "Whisper 正在通过纯内存管道流式转写语音..."
+        } else {
+            "Whisper 模型正在转写语音..."
+        }
+    }
+
+    /// 音频通道展示名：预处理说明优先，其次按是否纯内存推流区分。
+    fn audio_process_name(&self, preprocess_note: Option<&str>) -> String {
+        if let Some(note) = preprocess_note {
+            format!("FFmpeg 单遍解码 + {note}")
+        } else if self.can_stream() {
+            "纯内存 PCM 匿名管道推流 (0 物理磁盘 I/O)".to_string()
+        } else {
+            "FFmpeg 抽取临时 WAV 文件".to_string()
+        }
+    }
+
+    /// VAD 展示名。
+    fn vad_engine_name(&self, vad_sec: f64) -> &'static str {
+        if self.sensevoice() {
+            "SenseVoice 融合流式 VAD"
+        } else if vad_sec > 0.0 {
+            "Silero VAD 毫秒级语音切片压实"
+        } else {
+            "无独立 VAD (全音频直接输入)"
+        }
+    }
+
+    /// 识别引擎明细展示名：SenseVoice 区分并行 / 单会话线程，Whisper 带上模型与设备。
+    fn asr_detail_name(
+        &self,
+        cores: u32,
+        model_override: Option<&Path>,
+        use_gpu: bool,
+        threads: Option<u32>,
+    ) -> String {
+        if self.sensevoice() {
+            if self.parallel() {
+                let workers = crate::engines::sensevoice_worker_count(cores);
+                format!("SenseVoice-Small INT8 (多进程切块并行 · {workers} 进程 × 2 线程)")
+            } else {
+                format!(
+                    "SenseVoice-Small INT8 (非自回归单次前向 · {}线程)",
+                    self.sensevoice_threads
+                )
+            }
+        } else {
+            let model_name = model_override
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("ggml-model.bin");
+            let dev_str = if use_gpu { "GPU加速" } else { "CPU" };
+            format!(
+                "Whisper {model_name} ({dev_str} · {}线程)",
+                threads.unwrap_or(8)
+            )
+        }
+    }
 }
 
 /// 引擎能力查询的收敛点：管线只经此 trait 询问能力，
@@ -95,6 +168,22 @@ trait EngineProfile {
     fn can_stream(&self) -> bool;
     /// SenseVoice 切块并行（多进程）
     fn parallel(&self) -> bool;
+    /// 本次转写通道：结合「SenseVoice 引擎是否就绪」一次性求解，
+    /// 判定顺序与收敛前的 `is_sensevoice / can_stream / sv_parallel` 三段式链逐条等价。
+    fn transcribe_route(&self, sensevoice_ready: bool) -> TranscribeRoute;
+}
+
+/// 转写通道：`is_sensevoice / can_stream / sv_parallel` 三段式分支的收敛结果。
+/// 新增引擎 / 新通道时只需扩展 [`EngineProfile::transcribe_route`]，
+/// 管线侧不再各自复算布尔量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscribeRoute {
+    /// SenseVoice 单会话纯内存推流（不增强、不变速，模型时间轴即原始时间轴）
+    SenseVoiceStream,
+    /// Whisper 纯内存 PCM 管道流式转写
+    WhisperStream,
+    /// 临时 WAV 随机访问切块；`parallel` 为真时走 SenseVoice 多进程切块
+    Chunked { parallel: bool },
 }
 
 impl EngineProfile for EngineCapabilities {
@@ -108,6 +197,21 @@ impl EngineProfile for EngineCapabilities {
 
     fn parallel(&self) -> bool {
         self.parallel_chunks
+    }
+
+    fn transcribe_route(&self, sensevoice_ready: bool) -> TranscribeRoute {
+        if self.sensevoice() && sensevoice_ready {
+            TranscribeRoute::SenseVoiceStream
+        } else if self.can_stream() {
+            TranscribeRoute::WhisperStream
+        } else {
+            // 收敛前的内层判断原样保留：走到切块分支时，SenseVoice 推流已被上一条
+            // 分支拦截（并行切块本身要求 SenseVoice 已就绪），故 `parallel` 恒为
+            // false。此处只做等价改写、不改行为，可达性留给后续单独修复。
+            TranscribeRoute::Chunked {
+                parallel: self.parallel(),
+            }
+        }
     }
 }
 
@@ -723,8 +827,8 @@ impl TaskPipeline {
             .map(|n| n.get())
             .unwrap_or(4) as u32;
         // 引擎能力一次性求解：并行切块 / 纯内存推流 / 单会话线程数的判定公式
-        // 集中在 [`EngineCapabilities::plan`]，此处只读结果，下游局部变量名保持不变。
-        let caps = EngineCapabilities::plan(
+        // 集中在 [`EngineCapabilities::plan`]，此处只读结果，下游统一经 [`EngineProfile`] 取用。
+        let mut caps = EngineCapabilities::plan(
             sensevoice_selected,
             self.sensevoice.is_some(),
             use_gpu,
@@ -734,20 +838,17 @@ impl TaskPipeline {
             threads,
             crate::engines::chunk_threshold_secs(),
         );
-        let is_sensevoice = caps.sensevoice();
-        let sv_parallel = caps.parallel();
         // SenseVoice 单会话在 8 线程附近已饱和，继续加线程反而更慢
-        // （实测 16 线程 41.6s vs 8 线程 32.6s），故对单会话线程数设上限。
-        let sv_threads = caps.sensevoice_threads;
+        // （实测 16 线程 41.6s vs 8 线程 32.6s），故单会话线程数统一在
+        // [`EngineCapabilities::plan`] 内 clamp 到上限（`sensevoice_threads`）。
         // 并行进程数：0 = 自动（沿用引擎内按核数推导的调优默认值）
         let workers_override = match self.parallel_workers.load(Ordering::Relaxed) {
             0 => None,
             n => Some(n),
         };
 
-        // 判断是否启用纯内存管道推流 (In-Memory PCM Streaming Pipe):
-        // 当使用 SenseVoice、启用 GPU 推理，或音频时长无需多进程切块时，直接以 0 磁盘 I/O 管道推流
-        let mut can_stream = caps.can_stream();
+        // 是否启用纯内存管道推流 (In-Memory PCM Streaming Pipe) 由
+        // [`EngineCapabilities::plan`] 统一求解；停顿压实后由下方 `caps.stream = false` 就地关断。
 
         let mut ffmpeg_audio_sec = 0.0;
         // 临时 WAV 用守卫持有：本函数后续有多个 `?` / 取消提前返回点，
@@ -778,7 +879,7 @@ impl TaskPipeline {
             None
         };
 
-        if preprocess.enabled && !is_sensevoice && duration_for_chunks > 0.0 && !resumed {
+        if preprocess.enabled && !caps.sensevoice() && duration_for_chunks > 0.0 && !resumed {
             let chain = preprocess.filters.chain_with_speed(audio_speed);
 
             if !preprocess.compact {
@@ -867,7 +968,7 @@ impl TaskPipeline {
                         match plan.as_ref() {
                             Some(_) => {
                                 // 确实压实了：时间轴不再连续，必须走临时 WAV 随机访问通道
-                                can_stream = false;
+                                caps.stream = false;
                                 preprocess_note = Some(format!(
                                     "语音增强 + 停顿压实 ({:.1}s → {:.1}s，切除 {:.0}% 静音)",
                                     decoded_sec,
@@ -922,7 +1023,7 @@ impl TaskPipeline {
         }
 
         if temp_wav_path.is_none() {
-            if can_stream {
+            if caps.can_stream() {
                 info!(
                     "音频通道就绪：启用纯内存管道推流 (In-Memory PCM Streaming Pipe，0 磁盘 I/O)"
                 );
@@ -971,11 +1072,7 @@ impl TaskPipeline {
             return Ok(Vec::new());
         }
 
-        let asr_engine_name = if is_sensevoice {
-            "SenseVoice 极速转写".to_string()
-        } else {
-            "Whisper 神经转写".to_string()
-        };
+        let asr_engine_name = caps.asr_engine_name();
 
         let _ = tx.send(PipelineEvent::StageChanged(
             Stage::Transcribe.label().into(),
@@ -983,13 +1080,7 @@ impl TaskPipeline {
         let _ = tx.send(PipelineEvent::Progress {
             stage: "语音识别".into(),
             progress: 0.15,
-            detail: if is_sensevoice {
-                "SenseVoice 正在通过纯内存管道极速转写语音...".into()
-            } else if can_stream {
-                "Whisper 正在通过纯内存管道流式转写语音...".into()
-            } else {
-                "Whisper 模型正在转写语音...".into()
-            },
+            detail: caps.transcribe_detail().into(),
         });
 
         let lang_clone = language.clone();
@@ -1000,196 +1091,209 @@ impl TaskPipeline {
         // JSON 体积开关：救场开启（阈值<0 且非 SenseVoice）才需要 -ojf 全量 token 概率，
         // 救场关闭时降级轻量 -oj，省掉全量 JSON 体积与解析成本
         self.whisper
-            .set_need_token_probs(rescue_logprob < 0.0 && !is_sensevoice);
+            .set_need_token_probs(rescue_logprob < 0.0 && !caps.sensevoice());
         // 质检（低置信复核）需要逐句置信度，因此即使不做救场也要让 whisper 输出 token
         // 概率。与救场标志**分开**存放：本行是显式决策点，不会与上一行的 `false` 互相覆盖。
         self.whisper
-            .set_need_token_probs_for_quality(!is_sensevoice);
+            .set_need_token_probs_for_quality(!caps.sensevoice());
 
         let transcription_started = Instant::now();
         let (mut segments, vad_sec, pure_whisper_sec) = if let Some(segs) = resumed_segments {
             info!("断点续跑：复用已落盘的识别结果（{} 段）", segs.len());
             (segs, 0.0, 0.0)
-        } else if let (true, Some(sv)) = (is_sensevoice, self.sensevoice.as_ref()) {
-            let sv_engine = sv.clone();
-            let in_file_stream = input_file.clone();
-            let ffmpeg_stream = ffmpeg.clone();
-            let tx_sv = tx.clone();
-            let lang_sv = lang_clone.clone();
-
-            let (segs, elapsed) =
-                tokio::task::spawn_blocking(move || -> Result<(Vec<Segment>, f64)> {
-                    let mut ffmpeg_child = ffmpeg_stream.spawn_audio_stream(&in_file_stream)?;
-                    let ffmpeg_stdout = ffmpeg_child
-                        .stdout
-                        .take()
-                        .context("获取 FFmpeg 内存管道输出失败")?;
-
-                    struct ChildReaper(std::process::Child);
-                    impl Drop for ChildReaper {
-                        fn drop(&mut self) {
-                            let _ = self.0.kill();
-                            let _ = self.0.wait();
-                        }
-                    }
-                    let mut reaper = ChildReaper(ffmpeg_child);
-
-                    let tx_cb = tx_sv.clone();
-                    let res = sv_engine.transcribe_stream(
-                        Box::new(ffmpeg_stdout),
-                        lang_sv.as_deref(),
-                        Some(sv_threads),
-                        if duration_for_chunks > 0.0 {
-                            Some(duration_for_chunks)
-                        } else {
-                            None
-                        },
-                        Some(Box::new(move |p, info, opt_seg| {
-                            if let Some(seg) = opt_seg {
-                                let _ = tx_cb.send(PipelineEvent::SegmentStream(seg));
-                            }
-                            let _ = tx_cb.send(PipelineEvent::Progress {
-                                stage: "语音识别".into(),
-                                progress: 0.15 + p * whisper_span,
-                                detail: info.to_string(),
-                            });
-                        })),
-                    );
-                    let _ = reaper.0.wait();
-                    res
-                })
-                .await??;
-            (segs, 0.0, elapsed)
-        } else if can_stream {
-            let in_file_stream = input_file.clone();
-            let ffmpeg_stream = ffmpeg.clone();
-            let whisper_engine = whisper.clone();
-            let model_override_stream = model_override.clone();
-            // 语音增强链在这里就地生效；`chain_with_speed` 已含 atempo，
-            // 因此它同时取代了原先单独的变速推流，输出时长仍为 dur / speed。
-            let chain_stream = enhance_chain.clone();
-
-            let (segs, v_sec) =
-                tokio::task::spawn_blocking(move || -> Result<(Vec<Segment>, f64)> {
-                    let mut ffmpeg_child = ffmpeg_stream.spawn_audio_stream_filtered(
-                        &in_file_stream,
-                        None,
-                        None,
-                        chain_stream.as_deref(),
-                    )?;
-                    let ffmpeg_stdout = ffmpeg_child
-                        .stdout
-                        .take()
-                        .context("获取 FFmpeg 内存管道输出失败")?;
-
-                    struct ChildReaper(std::process::Child);
-                    impl Drop for ChildReaper {
-                        fn drop(&mut self) {
-                            let _ = self.0.kill();
-                            let _ = self.0.wait();
-                        }
-                    }
-                    let mut reaper = ChildReaper(ffmpeg_child);
-
-                    let tx_cb = tx_whisper.clone();
-                    let res = whisper_engine.transcribe_stream(
-                        Box::new(ffmpeg_stdout),
-                        lang_clone.as_deref(),
-                        threads,
-                        if duration_for_chunks > 0.0 {
-                            Some(duration_for_chunks / audio_speed)
-                        } else {
-                            None
-                        },
-                        model_override_stream.as_deref(),
-                        Some(Box::new(move |p, info, opt_seg| {
-                            if let Some(mut seg) = opt_seg {
-                                scale_segment_to_original_time(
-                                    &mut seg,
-                                    audio_speed,
-                                    duration_for_chunks,
-                                );
-                                let _ = tx_cb.send(PipelineEvent::SegmentStream(seg));
-                            }
-                            let _ = tx_cb.send(PipelineEvent::Progress {
-                                stage: "语音识别".into(),
-                                progress: 0.15 + p * whisper_span,
-                                detail: if audio_speed > 1.0 {
-                                    format!("音频 {audio_speed:.2}x 加速识别：{:.0}%", p * 100.0)
-                                } else {
-                                    info.to_string()
-                                },
-                            });
-                        })),
-                    );
-                    let _ = reaper.0.wait();
-                    let (segments, vad_sec) = res?;
-                    // 返回的最终片段保持「变速后」时间轴，统一交给下方唯一入口还原。
-                    // 这里若再自行 scale 一次，就会与统一还原叠加成二次缩放。
-                    Ok((segments, vad_sec))
-                })
-                .await??;
-            let total_elapsed = transcription_started.elapsed().as_secs_f64();
-            let pure_sec = (total_elapsed - v_sec).max(0.0);
-            (segs, v_sec, pure_sec)
         } else {
-            let wav_path = temp_wav_path.as_ref().unwrap().path().to_path_buf();
-            let ffmpeg_chunks = ffmpeg.clone();
-            let whisper_engine = whisper.clone();
-            let sv_engine = self.sensevoice.clone();
-            let model_override_clone = model_override.clone();
-            let chunk_threads = threads.unwrap_or(8);
-            // 压实后音频变短，切块与进度都必须按压实后的时长规划，
-            // 否则会把短音频误判成长音频、切出一堆无语音的碎块。
-            let plan_duration = asr_duration;
-            let cb_restorer = restorer.clone();
+            // 转写通道一次性求解：原先散落的 `is_sensevoice / can_stream / sv_parallel`
+            // 三段式 if-else 链收敛到 [`EngineProfile::transcribe_route`]，此处只读结果。
+            match caps.transcribe_route(self.sensevoice.is_some()) {
+                TranscribeRoute::SenseVoiceStream => {
+                    let sv_engine = self.sensevoice.clone().context("SenseVoice 引擎未就绪")?;
+                    let in_file_stream = input_file.clone();
+                    let ffmpeg_stream = ffmpeg.clone();
+                    let tx_sv = tx.clone();
+                    let lang_sv = lang_clone.clone();
 
-            let (segs, v_sec) = tokio::task::spawn_blocking(move || {
-                let cb: Option<crate::engines::SegmentProgressCb> =
-                    Some(Box::new(move |p, info, opt_seg| {
-                        if let Some(mut seg) = opt_seg {
-                            // 流式预览也必须回映射，否则界面上会看到压实时间轴上的错位时间
-                            cb_restorer.restore(&mut seg);
-                            let _ = tx_whisper.send(PipelineEvent::SegmentStream(seg));
-                        }
-                        let _ = tx_whisper.send(PipelineEvent::Progress {
-                            stage: "语音识别".into(),
-                            progress: 0.15 + p * whisper_span,
-                            detail: info.to_string(),
-                        });
-                    }));
+                    let (segs, elapsed) =
+                        tokio::task::spawn_blocking(move || -> Result<(Vec<Segment>, f64)> {
+                            let mut ffmpeg_child =
+                                ffmpeg_stream.spawn_audio_stream(&in_file_stream)?;
+                            let ffmpeg_stdout = ffmpeg_child
+                                .stdout
+                                .take()
+                                .context("获取 FFmpeg 内存管道输出失败")?;
 
-                if sv_parallel {
-                    let sv = sv_engine.context("SenseVoice 引擎未就绪，无法执行切块并行")?;
-                    transcribe_chunked_sensevoice(
-                        ffmpeg_chunks.as_ref(),
-                        sv.as_ref(),
-                        &wav_path,
-                        plan_duration,
-                        lang_clone.as_deref(),
-                        chunk_threads,
-                        workers_override,
-                        cb,
-                    )
-                } else {
-                    transcribe_chunked(
-                        ffmpeg_chunks.as_ref(),
-                        whisper_engine.as_ref(),
-                        &wav_path,
-                        plan_duration,
-                        lang_clone.as_deref(),
-                        threads,
-                        model_override_clone.as_deref(),
-                        use_gpu,
-                        workers_override,
-                        cb,
-                    )
+                            struct ChildReaper(std::process::Child);
+                            impl Drop for ChildReaper {
+                                fn drop(&mut self) {
+                                    let _ = self.0.kill();
+                                    let _ = self.0.wait();
+                                }
+                            }
+                            let mut reaper = ChildReaper(ffmpeg_child);
+
+                            let tx_cb = tx_sv.clone();
+                            let res = sv_engine.transcribe_stream(
+                                Box::new(ffmpeg_stdout),
+                                lang_sv.as_deref(),
+                                Some(caps.sensevoice_threads),
+                                if duration_for_chunks > 0.0 {
+                                    Some(duration_for_chunks)
+                                } else {
+                                    None
+                                },
+                                Some(Box::new(move |p, info, opt_seg| {
+                                    if let Some(seg) = opt_seg {
+                                        let _ = tx_cb.send(PipelineEvent::SegmentStream(seg));
+                                    }
+                                    let _ = tx_cb.send(PipelineEvent::Progress {
+                                        stage: "语音识别".into(),
+                                        progress: 0.15 + p * whisper_span,
+                                        detail: info.to_string(),
+                                    });
+                                })),
+                            );
+                            let _ = reaper.0.wait();
+                            res
+                        })
+                        .await??;
+                    (segs, 0.0, elapsed)
                 }
-            })
-            .await??;
-            let total_elapsed = transcription_started.elapsed().as_secs_f64();
-            let pure_sec = (total_elapsed - v_sec).max(0.0);
-            (segs, v_sec, pure_sec)
+                TranscribeRoute::WhisperStream => {
+                    let in_file_stream = input_file.clone();
+                    let ffmpeg_stream = ffmpeg.clone();
+                    let whisper_engine = whisper.clone();
+                    let model_override_stream = model_override.clone();
+                    // 语音增强链在这里就地生效；`chain_with_speed` 已含 atempo，
+                    // 因此它同时取代了原先单独的变速推流，输出时长仍为 dur / speed。
+                    let chain_stream = enhance_chain.clone();
+
+                    let (segs, v_sec) =
+                        tokio::task::spawn_blocking(move || -> Result<(Vec<Segment>, f64)> {
+                            let mut ffmpeg_child = ffmpeg_stream.spawn_audio_stream_filtered(
+                                &in_file_stream,
+                                None,
+                                None,
+                                chain_stream.as_deref(),
+                            )?;
+                            let ffmpeg_stdout = ffmpeg_child
+                                .stdout
+                                .take()
+                                .context("获取 FFmpeg 内存管道输出失败")?;
+
+                            struct ChildReaper(std::process::Child);
+                            impl Drop for ChildReaper {
+                                fn drop(&mut self) {
+                                    let _ = self.0.kill();
+                                    let _ = self.0.wait();
+                                }
+                            }
+                            let mut reaper = ChildReaper(ffmpeg_child);
+
+                            let tx_cb = tx_whisper.clone();
+                            let res = whisper_engine.transcribe_stream(
+                                Box::new(ffmpeg_stdout),
+                                lang_clone.as_deref(),
+                                threads,
+                                if duration_for_chunks > 0.0 {
+                                    Some(duration_for_chunks / audio_speed)
+                                } else {
+                                    None
+                                },
+                                model_override_stream.as_deref(),
+                                Some(Box::new(move |p, info, opt_seg| {
+                                    if let Some(mut seg) = opt_seg {
+                                        scale_segment_to_original_time(
+                                            &mut seg,
+                                            audio_speed,
+                                            duration_for_chunks,
+                                        );
+                                        let _ = tx_cb.send(PipelineEvent::SegmentStream(seg));
+                                    }
+                                    let _ = tx_cb.send(PipelineEvent::Progress {
+                                        stage: "语音识别".into(),
+                                        progress: 0.15 + p * whisper_span,
+                                        detail: if audio_speed > 1.0 {
+                                            format!(
+                                                "音频 {audio_speed:.2}x 加速识别：{:.0}%",
+                                                p * 100.0
+                                            )
+                                        } else {
+                                            info.to_string()
+                                        },
+                                    });
+                                })),
+                            );
+                            let _ = reaper.0.wait();
+                            let (segments, vad_sec) = res?;
+                            // 返回的最终片段保持「变速后」时间轴，统一交给下方唯一入口还原。
+                            // 这里若再自行 scale 一次，就会与统一还原叠加成二次缩放。
+                            Ok((segments, vad_sec))
+                        })
+                        .await??;
+                    let total_elapsed = transcription_started.elapsed().as_secs_f64();
+                    let pure_sec = (total_elapsed - v_sec).max(0.0);
+                    (segs, v_sec, pure_sec)
+                }
+                TranscribeRoute::Chunked { parallel } => {
+                    let wav_path = temp_wav_path.as_ref().unwrap().path().to_path_buf();
+                    let ffmpeg_chunks = ffmpeg.clone();
+                    let whisper_engine = whisper.clone();
+                    let sv_engine = self.sensevoice.clone();
+                    let model_override_clone = model_override.clone();
+                    let chunk_threads = threads.unwrap_or(8);
+                    // 压实后音频变短，切块与进度都必须按压实后的时长规划，
+                    // 否则会把短音频误判成长音频、切出一堆无语音的碎块。
+                    let plan_duration = asr_duration;
+                    let cb_restorer = restorer.clone();
+
+                    let (segs, v_sec) = tokio::task::spawn_blocking(move || {
+                        let cb: Option<crate::engines::SegmentProgressCb> =
+                            Some(Box::new(move |p, info, opt_seg| {
+                                if let Some(mut seg) = opt_seg {
+                                    // 流式预览也必须回映射，否则界面上会看到压实时间轴上的错位时间
+                                    cb_restorer.restore(&mut seg);
+                                    let _ = tx_whisper.send(PipelineEvent::SegmentStream(seg));
+                                }
+                                let _ = tx_whisper.send(PipelineEvent::Progress {
+                                    stage: "语音识别".into(),
+                                    progress: 0.15 + p * whisper_span,
+                                    detail: info.to_string(),
+                                });
+                            }));
+
+                        if parallel {
+                            let sv =
+                                sv_engine.context("SenseVoice 引擎未就绪，无法执行切块并行")?;
+                            transcribe_chunked_sensevoice(
+                                ffmpeg_chunks.as_ref(),
+                                sv.as_ref(),
+                                &wav_path,
+                                plan_duration,
+                                lang_clone.as_deref(),
+                                chunk_threads,
+                                workers_override,
+                                cb,
+                            )
+                        } else {
+                            transcribe_chunked(
+                                ffmpeg_chunks.as_ref(),
+                                whisper_engine.as_ref(),
+                                &wav_path,
+                                plan_duration,
+                                lang_clone.as_deref(),
+                                threads,
+                                model_override_clone.as_deref(),
+                                use_gpu,
+                                workers_override,
+                                cb,
+                            )
+                        }
+                    })
+                    .await??;
+                    let total_elapsed = transcription_started.elapsed().as_secs_f64();
+                    let pure_sec = (total_elapsed - v_sec).max(0.0);
+                    (segs, v_sec, pure_sec)
+                }
+            }
         };
 
         info!(
@@ -1208,7 +1312,7 @@ impl TaskPipeline {
         // 分支内部不得再对返回片段自行还原（详见 `restore_final_timeline`）。
         // 断点续跑时落盘的已是最终时间轴，重复还原会二次缩放，故整段跳过。
         if !resumed {
-            restore_final_timeline(&mut segments, &restorer, is_sensevoice);
+            restore_final_timeline(&mut segments, &restorer, &caps);
             if prep_active {
                 crate::subtitle::optimize_segments(&mut segments);
                 info!(
@@ -1248,7 +1352,7 @@ impl TaskPipeline {
         let rescue_started = Instant::now();
         let mut rescue_span_count = 0usize;
         let rescue_enabled = rescue_logprob < 0.0
-            && !is_sensevoice
+            && !caps.sensevoice()
             && segments.iter().any(|s| s.confidence.is_some());
 
         if rescue_enabled && !skip_post {
@@ -1432,7 +1536,7 @@ impl TaskPipeline {
                     .map(|p| p.is_available())
                     .unwrap_or(false);
 
-            if is_sensevoice && mode == "punc" {
+            if caps.sensevoice() && mode == "punc" {
                 polish_engine_name = Some("SenseVoice 原生标点".to_string());
                 info!("SenseVoice 原生自带高精度标点与数字规范化(ITN)，跳过 CT-Punc 阶段以实现极致速度");
                 let _ = tx.send(PipelineEvent::Progress {
@@ -1682,41 +1786,12 @@ impl TaskPipeline {
         // 由字幕时间区间求并集，得到有声覆盖时长；不能使用 vad_sec，后者只是 VAD 算法耗时。
         let voiced_duration_sec = covered_duration(&segments);
 
-        let audio_process_name = if let Some(note) = preprocess_note.as_deref() {
-            format!("FFmpeg 单遍解码 + {note}")
-        } else if can_stream {
-            "纯内存 PCM 匿名管道推流 (0 物理磁盘 I/O)".to_string()
-        } else {
-            "FFmpeg 抽取临时 WAV 文件".to_string()
-        };
+        let audio_process_name = caps.audio_process_name(preprocess_note.as_deref());
 
-        let vad_engine_name = if is_sensevoice {
-            "SenseVoice 融合流式 VAD".to_string()
-        } else if vad_sec > 0.0 {
-            "Silero VAD 毫秒级语音切片压实".to_string()
-        } else {
-            "无独立 VAD (全音频直接输入)".to_string()
-        };
+        let vad_engine_name = caps.vad_engine_name(vad_sec);
 
-        let asr_detail_name = if is_sensevoice {
-            if sv_parallel {
-                let workers = crate::engines::sensevoice_worker_count(cores);
-                format!("SenseVoice-Small INT8 (多进程切块并行 · {workers} 进程 × 2 线程)")
-            } else {
-                format!("SenseVoice-Small INT8 (非自回归单次前向 · {sv_threads}线程)")
-            }
-        } else {
-            let model_name = model_override
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("ggml-model.bin");
-            let dev_str = if use_gpu { "GPU加速" } else { "CPU" };
-            format!(
-                "Whisper {model_name} ({dev_str} · {}线程)",
-                threads.unwrap_or(8)
-            )
-        };
+        let asr_detail_name =
+            caps.asr_detail_name(cores, model_override.as_deref(), use_gpu, threads);
 
         let export_name = format!("{} 标准字幕格式写出", output_format.to_uppercase());
 
@@ -1726,7 +1801,7 @@ impl TaskPipeline {
             ffmpeg_audio_sec: ffmpeg_audio_sec + preprocess_sec,
             audio_process_name: Some(audio_process_name),
             vad_sec,
-            vad_engine_name: Some(vad_engine_name),
+            vad_engine_name: Some(vad_engine_name.to_string()),
             whisper_sec: pure_whisper_sec,
             rescue_sec,
             rescue_span_count,
@@ -1835,9 +1910,9 @@ fn scale_segment_to_original_time(segment: &mut Segment, speed: f64, original_du
 fn restore_final_timeline(
     segments: &mut [Segment],
     restorer: &TimelineRestorer,
-    is_sensevoice: bool,
+    caps: &EngineCapabilities,
 ) {
-    if is_sensevoice {
+    if caps.sensevoice() {
         return;
     }
     restorer.restore_all(segments);
@@ -2001,7 +2076,7 @@ mod tests {
             original_duration: 600.0,
         };
         let mut segs = vec![Segment::new(1, 40.0, 44.0, "测试")];
-        restore_final_timeline(&mut segs, &restorer, false);
+        restore_final_timeline(&mut segs, &restorer, &caps_fixture(false, true, false));
         assert!(
             (segs[0].start - 50.0).abs() < 1e-9,
             "40s 应还原为 50s，实得 {}",
@@ -2024,7 +2099,7 @@ mod tests {
             original_duration: 600.0,
         };
         let mut segs = vec![Segment::new(1, 40.0, 44.0, "测试")];
-        restore_final_timeline(&mut segs, &restorer, true);
+        restore_final_timeline(&mut segs, &restorer, &caps_fixture(true, true, false));
         assert!(
             (segs[0].start - 40.0).abs() < 1e-9,
             "SenseVoice 不应被缩放: {}",
@@ -2410,7 +2485,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── 引擎能力抽象：真值表与线程数 clamp ──
+    // ── 引擎能力抽象：真值表、通道判定与线程数 clamp ──
+
+    /// 构造能力夹具：只关心判定字段，单会话线程数固定 8（不参与通道判定）。
+    fn caps_fixture(sensevoice: bool, stream: bool, parallel_chunks: bool) -> EngineCapabilities {
+        EngineCapabilities {
+            sensevoice,
+            stream,
+            parallel_chunks,
+            sensevoice_threads: 8,
+        }
+    }
 
     /// 纯 CPU、≥4 核、≥180s、1.0x 的 SenseVoice：切块并行，并放弃纯内存推流。
     #[test]
@@ -2481,6 +2566,91 @@ mod tests {
         assert_eq!(
             high.sensevoice_threads, max,
             "上界应被 clamp 到 MAX_THREADS"
+        );
+    }
+
+    /// 转写通道的判定顺序必须与收敛前的 if-else 链逐条一致：
+    /// SenseVoice 推流 → Whisper 推流 → 临时 WAV 切块。
+    #[test]
+    fn transcribe_route_matches_legacy_branch_order() {
+        // SenseVoice 已就绪：优先走 SenseVoice 推流分支，即便能力位同时指向并行切块
+        // （收敛前 `is_sensevoice && sensevoice.is_some()` 同样先于切块分支命中）。
+        assert_eq!(
+            caps_fixture(true, true, false).transcribe_route(true),
+            TranscribeRoute::SenseVoiceStream
+        );
+        assert_eq!(
+            caps_fixture(true, false, true).transcribe_route(true),
+            TranscribeRoute::SenseVoiceStream
+        );
+        // 未选 SenseVoice 且可推流：走 Whisper 推流。
+        assert_eq!(
+            caps_fixture(false, true, false).transcribe_route(false),
+            TranscribeRoute::WhisperStream
+        );
+        // 两条推流通道都不成立：落到临时 WAV 切块，`parallel` 沿用并行能力位。
+        assert_eq!(
+            caps_fixture(false, false, false).transcribe_route(false),
+            TranscribeRoute::Chunked { parallel: false }
+        );
+        assert_eq!(
+            caps_fixture(false, false, true).transcribe_route(false),
+            TranscribeRoute::Chunked { parallel: true }
+        );
+    }
+
+    /// 引擎展示名必须与收敛前的字符串字面量逐字一致（性能面板 / 界面直接展示）。
+    #[test]
+    fn engine_display_names_are_verbatim() {
+        let sv = caps_fixture(true, true, false);
+        let whisper_stream = caps_fixture(false, true, false);
+        let whisper_chunked = caps_fixture(false, false, false);
+
+        assert_eq!(sv.asr_engine_name(), "SenseVoice 极速转写");
+        assert_eq!(whisper_stream.asr_engine_name(), "Whisper 神经转写");
+        assert_eq!(
+            sv.transcribe_detail(),
+            "SenseVoice 正在通过纯内存管道极速转写语音..."
+        );
+        assert_eq!(
+            whisper_stream.transcribe_detail(),
+            "Whisper 正在通过纯内存管道流式转写语音..."
+        );
+        assert_eq!(
+            whisper_chunked.transcribe_detail(),
+            "Whisper 模型正在转写语音..."
+        );
+
+        assert_eq!(sv.vad_engine_name(1.0), "SenseVoice 融合流式 VAD");
+        assert_eq!(
+            whisper_stream.vad_engine_name(2.0),
+            "Silero VAD 毫秒级语音切片压实"
+        );
+        assert_eq!(
+            whisper_stream.vad_engine_name(0.0),
+            "无独立 VAD (全音频直接输入)"
+        );
+
+        assert_eq!(
+            whisper_stream.audio_process_name(Some("语音增强")),
+            "FFmpeg 单遍解码 + 语音增强"
+        );
+        assert_eq!(
+            whisper_stream.audio_process_name(None),
+            "纯内存 PCM 匿名管道推流 (0 物理磁盘 I/O)"
+        );
+        assert_eq!(
+            whisper_chunked.audio_process_name(None),
+            "FFmpeg 抽取临时 WAV 文件"
+        );
+
+        assert_eq!(
+            sv.asr_detail_name(8, None, false, None),
+            "SenseVoice-Small INT8 (非自回归单次前向 · 8线程)"
+        );
+        assert_eq!(
+            whisper_stream.asr_detail_name(8, None, true, Some(4)),
+            "Whisper ggml-model.bin (GPU加速 · 4线程)"
         );
     }
 
