@@ -768,15 +768,8 @@ impl TaskPipeline {
         });
 
         // 断点续跑：阶段 1 的时长探测若已有落盘记录，直接复用并跳过 ffprobe。
-        let cached_duration = artifacts
-            .as_ref()
-            .and_then(|a| {
-                a.read_json::<ExtractAudioRecord>(Stage::ExtractAudio)
-                    .ok()
-                    .flatten()
-            })
-            .map(|r| r.duration_sec)
-            .filter(|d| *d > 0.0);
+        let cached_duration =
+            cached_extract_audio_duration(artifacts.as_ref(), &input_file.display().to_string());
         let total_dur = if let Some(d) = cached_duration {
             info!("断点续跑：复用已落盘的媒体时长（{:.1}s），跳过探测", d);
             Some(d)
@@ -1355,7 +1348,15 @@ impl TaskPipeline {
             && !caps.sensevoice()
             && segments.iter().any(|s| s.confidence.is_some());
 
-        if rescue_enabled && !skip_post {
+        // Resume: read the persisted rescue artifact BEFORE computing; a hit skips the compute.
+        let rescue_resumed = resume_rescue_segments(artifacts.as_ref(), rescue_enabled, skip_post);
+        let rescue_ran = rescue_enabled && !skip_post && rescue_resumed.is_none();
+        if let Some(segs) = rescue_resumed {
+            info!("断点续跑：复用已落盘的救场结果（{} 段）", segs.len());
+            segments = segs;
+        }
+
+        if rescue_ran {
             let spans = plan_rescue_spans(&segments, rescue_logprob);
             let total_span_sec: f64 = spans.iter().map(|(s, e)| e - s).sum();
             let media_sec = if duration_for_chunks > 0.0 {
@@ -1476,23 +1477,7 @@ impl TaskPipeline {
         }
         let rescue_sec = rescue_started.elapsed().as_secs_f64();
 
-        // 断点续跑：命中已落盘的救场结果则直接读回，跳过二次解码。
-        // 仅在「不跳过后续阶段」时读回——跳过后续阶段时 `segments` 已是最终产物，
-        // 覆盖它会把说话人标签等下游信息一并抹掉。
-        let resumed_rescue = if !skip_post {
-            artifacts
-                .as_ref()
-                .and_then(|a| a.read_segments(Stage::Rescue).ok().flatten())
-        } else {
-            None
-        };
-        if let Some(segs) = resumed_rescue {
-            info!("断点续跑：复用已落盘的救场结果（{} 段）", segs.len());
-            segments = segs;
-        }
-
-        // best-effort 落盘救场后的片段快照（进入标点/润色阶段前；写失败只告警）。
-        if !skip_post {
+        if rescue_ran {
             if let Some(a) = artifacts.as_ref() {
                 if let Err(e) = a.write_segments(Stage::Rescue, &segments) {
                     warn!("救场产物落盘失败: {e:#}");
@@ -1503,19 +1488,11 @@ impl TaskPipeline {
         // ── 阶段 3: 标点与语法润色（可跳过）──
         let mut qwen_sec = 0.0;
         let mut polish_engine_name = None;
-        // 断点续跑：命中已落盘的标点 / 润色结果则直接读回，跳过二次推理。
-        // 同样只在「不跳过后续阶段」时读回，避免覆盖已完成的全流程产物。
+        // Resume: only an enabled polish stage may reuse a persisted artifact;
+        // a disabled run keeps its fresh segments and ignores stale files.
         let mut polish_resumed = false;
-        if !skip_post {
-            if let Some(segs) = artifacts
-                .as_ref()
-                .and_then(|a| a.read_segments(Stage::Polish).ok().flatten())
-                .or_else(|| {
-                    artifacts
-                        .as_ref()
-                        .and_then(|a| a.read_segments(Stage::Punctuate).ok().flatten())
-                })
-            {
+        if enable_polish && !skip_post {
+            if let Some(segs) = resume_polish_segments(artifacts.as_ref()) {
                 info!("断点续跑：复用已落盘的标点/润色结果（{} 段）", segs.len());
                 segments = segs;
                 polish_engine_name = Some("断点续跑：复用已落盘的标点/润色结果".to_string());
@@ -1652,8 +1629,9 @@ impl TaskPipeline {
             info!("已跳过标点润色");
         }
 
-        // best-effort 落盘润色完成后的快照（无论走标点 / 润色 / 被关闭；写失败只告警）。
-        if !skip_post {
+        // Persist only when this run actually ran punctuation/polish.
+        let polish_ran = !polish_resumed && enable_polish && !segments.is_empty() && !skip_post;
+        if polish_ran {
             if let Some(a) = artifacts.as_ref() {
                 if let Err(e) = a.write_segments(Stage::Polish, &segments) {
                     warn!("润色产物落盘失败: {e:#}");
@@ -2014,7 +1992,79 @@ fn shift_window_to_media_timeline(segments: &mut [Segment], window_start: f64) {
     for seg in segments.iter_mut() {
         seg.start += window_start;
         seg.end += window_start;
+        shift_and_clamp_words_to_segment(seg, window_start);
     }
+}
+
+/// Shift word timings with the segment and clamp them into the shifted bounds.
+///
+/// `shift_window_to_media_timeline` only moved segment boundaries; words must
+/// follow the same shift, otherwise preview and export read out-of-segment
+/// word times (the same invariant `clamp_words_to_segment` gives elsewhere).
+fn shift_and_clamp_words_to_segment(seg: &mut Segment, window_start: f64) {
+    if seg.words.is_empty() {
+        return;
+    }
+    let (start, end) = (seg.start, seg.end);
+    seg.words.retain_mut(|w| {
+        w.start += window_start;
+        w.end += window_start;
+        w.end = w.end.max(w.start);
+        if w.end <= start || w.start >= end {
+            return false;
+        }
+        w.start = w.start.clamp(start, end);
+        w.end = w.end.clamp(start, end);
+        true
+    });
+}
+
+/// Resume helper: persisted rescue artifact, when rescue is on and post stages run.
+///
+/// Read BEFORE the rescue compute; on a hit the caller skips the decode, so the
+/// artifact must never be re-read AFTER computing (that would override freshly
+/// computed segments with an older snapshot).
+fn resume_rescue_segments(
+    artifacts: Option<&StageArtifacts>,
+    rescue_enabled: bool,
+    skip_post: bool,
+) -> Option<Vec<Segment>> {
+    if !rescue_enabled || skip_post {
+        return None;
+    }
+    artifacts
+        .and_then(|a| a.read_segments(Stage::Rescue).ok().flatten())
+        .filter(|segs| !segs.is_empty())
+}
+
+/// Resume helper: persisted punctuation/polish artifact (Polish wins over Punctuate).
+fn resume_polish_segments(artifacts: Option<&StageArtifacts>) -> Option<Vec<Segment>> {
+    artifacts
+        .and_then(|a| a.read_segments(Stage::Polish).ok().flatten())
+        .or_else(|| artifacts.and_then(|a| a.read_segments(Stage::Punctuate).ok().flatten()))
+        .filter(|segs| !segs.is_empty())
+}
+
+/// Resume helper: cached media duration, valid only for the SAME input file.
+///
+/// A record describing another input is stale (task folder reused with a
+/// different media) and must not steer chunking; ignoring it makes the caller
+/// re-probe and rewrite the record.
+fn cached_extract_audio_duration(artifacts: Option<&StageArtifacts>, input: &str) -> Option<f64> {
+    let record = artifacts.and_then(|a| {
+        a.read_json::<ExtractAudioRecord>(Stage::ExtractAudio)
+            .ok()
+            .flatten()
+    })?;
+    if record.input != input {
+        warn!(
+            artifact = %record.input,
+            current = %input,
+            "断点续跑：时长记录输入的媒体与本次任务不一致，忽略该产物"
+        );
+        return None;
+    }
+    (record.duration_sec > 0.0).then_some(record.duration_sec)
 }
 
 #[cfg(test)]
@@ -2155,6 +2205,161 @@ mod tests {
             segs[0].start
         );
         assert!((segs[0].end - 1502.1).abs() < 1e-9, "实得 {}", segs[0].end);
+    }
+
+    /// A stale rescue artifact must be consumed BEFORE the compute (resume
+    /// shortcut), never after it: the old read-back overrode fresh segments.
+    #[test]
+    fn rescue_artifact_read_must_not_override_fresh_segments() {
+        let dir = tmp_dir("rescue_resume_override");
+        let artifacts = StageArtifacts::new(dir.clone());
+        let stale = vec![seg(1, 0.0, 2.0, Some(-1.0))];
+        artifacts.write_segments(Stage::Rescue, &stale).unwrap();
+
+        let rescue_enabled = true;
+        let skip_post = false;
+
+        let resumed = resume_rescue_segments(Some(&artifacts), rescue_enabled, skip_post);
+        let rescue_ran = rescue_enabled && !skip_post && resumed.is_none();
+        assert!(resumed.is_some(), "artifact hit must be reused");
+        assert!(!rescue_ran, "artifact hit must skip the compute");
+
+        std::fs::remove_file(artifacts.path(Stage::Rescue)).unwrap();
+        let resumed = resume_rescue_segments(Some(&artifacts), rescue_enabled, skip_post);
+        let rescue_ran = rescue_enabled && !skip_post && resumed.is_none();
+        assert!(resumed.is_none(), "no artifact must fall back to compute");
+        assert!(rescue_ran);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The resume shortcut is only valid when rescue is enabled and post stages run.
+    #[test]
+    fn rescue_artifact_ignored_when_rescue_disabled() {
+        let dir = tmp_dir("rescue_disabled_ignore");
+        let artifacts = StageArtifacts::new(dir.clone());
+        let stale = vec![seg(1, 0.0, 2.0, None)];
+        artifacts.write_segments(Stage::Rescue, &stale).unwrap();
+
+        assert!(resume_rescue_segments(Some(&artifacts), false, false).is_none());
+        assert!(resume_rescue_segments(Some(&artifacts), true, true).is_none());
+        assert!(resume_rescue_segments(None, true, false).is_none());
+        assert_eq!(
+            resume_rescue_segments(Some(&artifacts), true, false),
+            Some(stale)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With polish disabled, a stale polish artifact must not override the fresh
+    /// segments (the old gate only checked `!skip_post`).
+    #[test]
+    fn polish_off_ignores_stale_polish_artifact() {
+        let dir = tmp_dir("polish_off_ignore");
+        let artifacts = StageArtifacts::new(dir.clone());
+        let stale = vec![seg(1, 0.0, 2.0, None)];
+        artifacts.write_segments(Stage::Polish, &stale).unwrap();
+
+        let enable_polish = false;
+        let skip_post = false;
+        let mut segments = vec![seg(1, 10.0, 11.0, None)];
+        let fresh = segments.clone();
+        if enable_polish && !skip_post {
+            if let Some(segs) = resume_polish_segments(Some(&artifacts)) {
+                segments = segs;
+            }
+        }
+        assert_eq!(segments, fresh);
+
+        // Control: with polish on, the very same artifact is picked up.
+        assert_eq!(resume_polish_segments(Some(&artifacts)), Some(stale));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Word timings must follow the window shift and clamp into the shifted
+    /// segment; out-of-segment words are dropped.
+    #[test]
+    fn rescue_shifts_word_timings() {
+        let mut first = seg(1, 0.0, 2.0, None);
+        first.words = vec![
+            WordTiming {
+                word: "a".to_string(),
+                start: 0.2,
+                end: 1.0,
+            },
+            WordTiming {
+                word: "b".to_string(),
+                start: 1.0,
+                end: 1.8,
+            },
+            WordTiming {
+                word: "c".to_string(),
+                start: 1.9,
+                end: 2.6,
+            },
+            WordTiming {
+                word: "d".to_string(),
+                start: 2.5,
+                end: 3.0,
+            },
+        ];
+        let mut segs = vec![first];
+        shift_window_to_media_timeline(&mut segs, 100.0);
+        let shifted = &segs[0];
+        assert!((shifted.start - 100.0).abs() < 1e-9);
+        assert!((shifted.end - 102.0).abs() < 1e-9);
+        assert_eq!(
+            shifted.words.len(),
+            3,
+            "out-of-segment words must be dropped"
+        );
+        assert!((shifted.words[0].start - 100.2).abs() < 1e-9);
+        assert!((shifted.words[0].end - 101.0).abs() < 1e-9);
+        assert!((shifted.words[1].start - 101.0).abs() < 1e-9);
+        assert!((shifted.words[1].end - 101.8).abs() < 1e-9);
+        assert!((shifted.words[2].start - 101.9).abs() < 1e-9);
+        assert!(
+            (shifted.words[2].end - 102.0).abs() < 1e-9,
+            "word end must clamp to segment end"
+        );
+        for w in &shifted.words {
+            assert!(w.start >= shifted.start - 1e-9);
+            assert!(w.end <= shifted.end + 1e-9);
+            assert!(w.end >= w.start - 1e-9);
+        }
+    }
+
+    /// The duration cache must be invalidated when the recorded input differs
+    /// from the current one, and must ignore non-positive durations.
+    #[test]
+    fn extract_audio_cache_invalidated_when_input_changes() {
+        let dir = tmp_dir("audio_cache_input");
+        let artifacts = StageArtifacts::new(dir.clone());
+        let current = "C:/media/a.mp4";
+
+        assert!(cached_extract_audio_duration(Some(&artifacts), current).is_none());
+
+        let record = ExtractAudioRecord {
+            input: current.to_string(),
+            duration_sec: 123.0,
+        };
+        artifacts.write_json(Stage::ExtractAudio, &record).unwrap();
+        assert_eq!(
+            cached_extract_audio_duration(Some(&artifacts), current),
+            Some(123.0)
+        );
+        assert!(cached_extract_audio_duration(Some(&artifacts), "C:/media/b.mp4").is_none());
+
+        let zero = ExtractAudioRecord {
+            input: current.to_string(),
+            duration_sec: 0.0,
+        };
+        artifacts.write_json(Stage::ExtractAudio, &zero).unwrap();
+        assert!(cached_extract_audio_duration(Some(&artifacts), current).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
