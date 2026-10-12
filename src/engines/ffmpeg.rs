@@ -23,7 +23,8 @@
 use anyhow::{Context, Result};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 use tracing::info;
 
 use crate::utils::TempPathGuard;
@@ -47,16 +48,96 @@ fn temp_wav_path(stem: &str) -> PathBuf {
     ))
 }
 
+/// 短任务截止期：元数据探测 / 抽帧 / WAV 切片（秒级操作，120 秒足够覆盖冷启动抖动）。
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 重活截止期：整轨音频提取 / 窗口提取 / 字幕烧录（耗时与素材时长成正比，10 分钟为保守上界）。
+const SUBPROCESS_LONG_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 截止期轮询间隔：25 毫秒对秒级任务几乎无额外延迟，又不会把等待变成忙等。
+const DEADLINE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// 在截止期内等待子进程退出；超时就强杀并报错。
+///
+/// 过去所有调用点都直接用 status() / output() 无限期阻塞：遇到坏素材或
+/// 卡死的 FFmpeg 时，上层转写线程会一直陪葬（既无日志也没有取消手段）。统一
+/// 改成「轮询 + 超时杀进程」后，坏任务会失败得可控、可定位。
+fn wait_with_deadline(child: &mut Child, timeout: Duration, what: &str) -> Result<ExitStatus> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("等待子进程 {what} 失败"))?
+        {
+            return Ok(status);
+        }
+        if started.elapsed() >= timeout {
+            // 先杀再收尸：kill 失败（进程恰好已退出）也要 wait 掉僵尸，
+            // 否则重试路径会攒下一堆进程句柄。
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "子进程 {what} 超时（限时 {:.1} 秒未退出，已强制终止）",
+                timeout.as_secs_f64()
+            );
+        }
+        std::thread::sleep(DEADLINE_POLL_INTERVAL);
+    }
+}
+
+/// 带截止期地运行命令，并把 stdout / stderr 收齐成 Output。
+///
+/// 输出必须由后台线程持续抽干：等待期间子进程若把 64KB 管道写满，双方会互相
+/// 等待，表现和卡死一模一样。超时路径由主线程 kill，两个读取线程等到管道
+/// EOF 会自行结束。
+fn run_with_deadline(cmd: &mut Command, timeout: Duration) -> Result<Output> {
+    let what = cmd.get_program().to_string_lossy().into_owned();
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("启动子进程 {what} 失败"))?;
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let status = wait_with_deadline(&mut child, timeout, &what)?;
+    // 走到这里说明子进程已正常退出，管道 EOF 后两个读取线程会立即收尾
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// 构造烧录字幕用的 `-vf` 滤镜串。
 ///
 /// 入参必须是**纯文件名**（不含目录）：调用方需把子进程工作目录切到字幕所在
 /// 目录，否则 Windows 绝对路径的盘符冒号会被滤镜解析器当成选项分隔符。
 /// 抽成纯函数是为了让滤镜串可被单测直接断言，不必真的起 FFmpeg。
 fn subtitle_burn_filter(subtitle_file_name: &str) -> String {
-    format!(
-        "subtitles=filename='{}',scale=trunc(iw/2)*2:trunc(ih/2)*2",
-        subtitle_file_name
-    )
+    // 文件名包在单引号里，自带单引号或反斜杠时会被滤镜解析器提前截断：
+    // 单引号按滤镜语法转义成 '\''，反斜杠翻倍。
+    // 顺序不能颠倒：反斜杠先翻倍，再转义单引号，否则会二次转义反斜杠。
+    let escaped = subtitle_file_name
+        .replace('\\', "\\\\")
+        .replace('\'', r"'\''");
+    format!("subtitles=filename='{escaped}',scale=trunc(iw/2)*2:trunc(ih/2)*2")
 }
 /// 字幕烧录（硬字幕合成）的编码参数。
 ///
@@ -154,20 +235,20 @@ impl FFmpegEngine {
                 cmd.arg("-af").arg(chain);
             }
         }
-        let status = cmd
-            .args([
-                "-acodec",
-                "pcm_s16le",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-threads",
-                "0",
-            ])
-            .arg(&target_wav)
-            .status()
-            .with_context(|| format!("执行 FFmpeg 失败: {:?}", self.ffmpeg_path))?;
+        cmd.args([
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-threads",
+            "0",
+        ])
+        .arg(&target_wav);
+        let status = run_with_deadline(&mut cmd, SUBPROCESS_LONG_TIMEOUT)
+            .with_context(|| format!("执行 FFmpeg 失败: {:?}", self.ffmpeg_path))?
+            .status;
 
         if !status.success() {
             anyhow::bail!("FFmpeg 音频提取返回非零退出码");
@@ -208,8 +289,7 @@ impl FFmpegEngine {
         if duration_sec > 0.0 {
             cmd.arg("-t").arg(format!("{:.3}", duration_sec));
         }
-        let status = cmd
-            .arg("-i")
+        cmd.arg("-i")
             .arg(input_path)
             .args([
                 "-map",
@@ -224,9 +304,10 @@ impl FFmpegEngine {
                 "-ac",
                 "1",
             ])
-            .arg(&out_wav)
-            .status()
-            .with_context(|| format!("执行 FFmpeg 窗口抽音频失败: {:?}", self.ffmpeg_path))?;
+            .arg(&out_wav);
+        let status = run_with_deadline(&mut cmd, SUBPROCESS_LONG_TIMEOUT)
+            .with_context(|| format!("执行 FFmpeg 窗口抽音频失败: {:?}", self.ffmpeg_path))?
+            .status;
         if !status.success() {
             anyhow::bail!("FFmpeg 窗口抽音频返回非零退出码");
         }
@@ -380,15 +461,30 @@ impl FFmpegEngine {
             .with_context(|| format!("启动 FFmpeg 音频解码失败: {:?}", self.ffmpeg_path))?;
         crate::utils::child_registry::adopt(&child);
 
-        let mut raw = Vec::new();
-        if let Some(mut stdout) = child.stdout.take() {
-            stdout
-                .read_to_end(&mut raw)
-                .context("读取 FFmpeg 音频管道失败")?;
-        }
-        let status = child.wait().context("等待 FFmpeg 音频解码进程失败")?;
-        if !status.success() && raw.is_empty() {
-            anyhow::bail!("FFmpeg 音频解码返回非零退出码（可能该文件没有音轨）");
+        // 抽干管道与等待退出必须并行：一边读一边等会把「管道写满」拖成卡死。
+        let stdout_pipe = child.stdout.take();
+        let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout_pipe {
+                pipe.read_to_end(&mut buf)?;
+            }
+            Ok(buf)
+        });
+        let what = self.ffmpeg_path.display().to_string();
+        let status = wait_with_deadline(&mut child, SUBPROCESS_LONG_TIMEOUT, &what)?;
+        // 超时路径已提前返回并杀掉子进程，读线程会因管道 EOF 自行收尾；
+        // 只有正常路径才要求 join 出完整字节流。
+        let raw = reader
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("FFmpeg 音频管道读取线程 panic")))
+            .context("读取 FFmpeg 音频管道失败")?;
+        if !status.success() {
+            // 旧实现只在 raw 为空时报错，会把「非零退出但已吐出一段 PCM」的截断
+            // 结果当成功返回；这类半截音频会污染波形与说话人特征，必须整体丢弃。
+            anyhow::bail!(
+                "FFmpeg 音频解码返回非零退出码（已读取 {} 字节，丢弃截断结果）",
+                raw.len()
+            );
         }
         // s16le 小端逐样本还原；奇数尾巴（半个样本）直接丢弃
         // `as_chunks::<2>()` 给出的是 `&[[u8; 2]]`，比 `chunks_exact(2)` + 手工
@@ -404,10 +500,10 @@ impl FFmpegEngine {
 
     /// 获取视频/音频的时长 (秒)
     pub fn get_duration<P: AsRef<Path>>(&self, input_path: P) -> f64 {
-        let output = Command::new(&self.ffmpeg_path)
-            .arg("-i")
-            .arg(input_path.as_ref())
-            .output();
+        // 探测同样带截止期：坏文件让 ffmpeg -i 悬挂时不再拖死调用方。
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        cmd.arg("-i").arg(input_path.as_ref());
+        let output = run_with_deadline(&mut cmd, SUBPROCESS_TIMEOUT);
 
         if let Ok(out) = output {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -436,7 +532,8 @@ impl FFmpegEngine {
         let mut cmd = Command::new(&self.ffmpeg_path);
         // 跟随全局让路设置（此前硬编码 CREATE_NO_WINDOW，忽略用户的开关）
         super::media_pipeline::apply_default_child_flags(&mut cmd);
-        let output = cmd.arg("-i").arg(input_path.as_ref()).output().ok()?;
+        cmd.arg("-i").arg(input_path.as_ref());
+        let output = run_with_deadline(&mut cmd, SUBPROCESS_TIMEOUT).ok()?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         for line in stderr.lines() {
             let Some(video_pos) = line.find("Video:") else {
@@ -478,8 +575,7 @@ impl FFmpegEngine {
         // 跟随全局让路设置（此前硬编码 CREATE_NO_WINDOW，忽略用户的开关）
         super::media_pipeline::apply_default_child_flags(&mut cmd);
 
-        let status = cmd
-            .arg("-ss")
+        cmd.arg("-ss")
             .arg(&time_str)
             .arg("-i")
             .arg(video_path)
@@ -494,9 +590,10 @@ impl FFmpegEngine {
             .arg("-q:v")
             .arg("3")
             .arg("-y")
-            .arg(out_jpg)
-            .status()
-            .with_context(|| format!("执行 FFmpeg 抽帧失败: {:?}", self.ffmpeg_path))?;
+            .arg(out_jpg);
+        let status = run_with_deadline(&mut cmd, SUBPROCESS_TIMEOUT)
+            .with_context(|| format!("执行 FFmpeg 抽帧失败: {:?}", self.ffmpeg_path))?
+            .status;
 
         if !status.success() {
             anyhow::bail!("FFmpeg 抽取视频帧返回非零状态");
@@ -520,8 +617,7 @@ impl FFmpegEngine {
         let mut cmd = Command::new(&self.ffmpeg_path);
         // 跟随全局让路设置（此前硬编码 CREATE_NO_WINDOW，忽略用户的开关）
         super::media_pipeline::apply_default_child_flags(&mut cmd);
-        let status = cmd
-            .args(["-hide_banner", "-loglevel", "error", "-y"])
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
             .arg("-ss")
             .arg(format!("{:.3}", start_sec.max(0.0)))
             .arg("-t")
@@ -529,9 +625,10 @@ impl FFmpegEngine {
             .arg("-i")
             .arg(wav_path)
             .args(["-c", "copy"]) // 原音频已经是 16kHz s16le WAV，直接流复制，毫秒级完成切片，零 CPU 损耗！
-            .arg(&out_wav)
-            .status()
-            .with_context(|| format!("切分 WAV 失败: {:?}", self.ffmpeg_path))?;
+            .arg(&out_wav);
+        let status = run_with_deadline(&mut cmd, SUBPROCESS_TIMEOUT)
+            .with_context(|| format!("切分 WAV 失败: {:?}", self.ffmpeg_path))?
+            .status;
         if !status.success() {
             anyhow::bail!("FFmpeg 切分 WAV 返回非零退出码");
         }
@@ -580,8 +677,7 @@ impl FFmpegEngine {
         if let Some(dir) = sub_dir {
             cmd.current_dir(dir);
         }
-        let status = cmd
-            .args(["-hide_banner", "-loglevel", "error", "-y"])
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
             .arg("-i")
             .arg(input)
             .arg("-vf")
@@ -595,9 +691,10 @@ impl FFmpegEngine {
             .args(["-c:a", &opts.audio_codec])
             .arg("-b:a")
             .arg(&opts.audio_bitrate)
-            .arg(output)
-            .status()
-            .with_context(|| format!("执行 FFmpeg 字幕烧录失败: {:?}", self.ffmpeg_path))?;
+            .arg(output);
+        let status = run_with_deadline(&mut cmd, SUBPROCESS_LONG_TIMEOUT)
+            .with_context(|| format!("执行 FFmpeg 字幕烧录失败: {:?}", self.ffmpeg_path))?
+            .status;
 
         if !status.success() {
             anyhow::bail!("FFmpeg 字幕烧录返回非零退出码");
@@ -684,5 +781,70 @@ mod tests {
         assert_eq!(o.video_codec, "libx264");
         assert_eq!(o.audio_codec, "aac");
         assert!((18..=23).contains(&o.crf), "CRF 应落在常见质量区间");
+    }
+
+    /// 缺陷回归：退出码非零但 stdout 已吐出一段 PCM 时，必须整体报错，
+    /// 不能把截断音频当成功结果返回（旧判断是 !success() && raw.is_empty()）。
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn extract_audio_rejects_truncated_pcm_on_nonzero_exit() {
+        let dir = std::env::temp_dir().join(unique_temp_dir_name("v2w_fake_ffmpeg_decode"));
+        std::fs::create_dir_all(&dir).expect("创建假 FFmpeg 目录失败");
+        let fake = dir.join("ffmpeg.cmd");
+        // Windows 下 std 会用 cmd.exe /C 执行 .cmd：用它冒充 ffmpeg 最省事。
+        std::fs::write(&fake, "@echo off\r\necho partial-pcm\r\nexit /b 3\r\n")
+            .expect("写入假 FFmpeg 失败");
+
+        let engine = FFmpegEngine::new(&fake);
+        let err = engine
+            .decode_pcm_mono("dummy.mp4", 16000)
+            .expect_err("退出码非零必须报错，即便已经产出部分 PCM");
+        let msg = err.to_string();
+        assert!(msg.contains("已读取"), "错误信息应说明已读取字节数: {msg}");
+        assert!(msg.contains("字节"), "错误信息应带字节数单位: {msg}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 缺陷回归：任何子进程调用都必须带截止期，超时要杀干净并迅速报错。
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn ffmpeg_jobs_are_killed_after_deadline() {
+        // 用 ping 冒充卡死的长命令：它是直接子进程，kill 后不会留下孙子进程。
+        let mut cmd = Command::new("ping");
+        cmd.args(["-n", "30", "127.0.0.1"]);
+        let start = Instant::now();
+        let err = run_with_deadline(&mut cmd, Duration::from_millis(300))
+            .expect_err("超过截止期的子进程必须报错");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "超时路径必须迅速返回，不能等子进程自然结束"
+        );
+        assert!(
+            err.to_string().contains("超时"),
+            "错误信息应说明超时: {err}"
+        );
+    }
+
+    /// 缺陷回归：文件名里的单引号 / 反斜杠必须转义，否则滤镜解析器会提前截断。
+    #[test]
+    fn burn_filter_escapes_single_quote_in_filename() {
+        assert_eq!(
+            subtitle_burn_filter("it's.ass"),
+            "subtitles=filename='it'\\''s.ass',scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        );
+        assert!(
+            subtitle_burn_filter(r"a\b.ass").contains(r"a\\b.ass"),
+            "反斜杠必须成对转义"
+        );
+    }
+
+    /// 生成互不冲突的临时目录名：进程号区分进程，时间戳区分同一进程内的多次运行。
+    fn unique_temp_dir_name(prefix: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{prefix}_{}_{nanos}", std::process::id())
     }
 }
