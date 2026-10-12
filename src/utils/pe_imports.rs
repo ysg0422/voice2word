@@ -36,6 +36,16 @@ fn read_cstr(b: &[u8], off: usize) -> Option<String> {
     std::str::from_utf8(&tail[..len]).ok().map(str::to_string)
 }
 
+/// 净化 PE 导入名。导入表里的名字是不可信输入——恶意样本可写成
+/// `..\..\evil.dll` 之类，直接拼进路径就会穿越出目标目录。
+/// 带路径分隔符（`/` `\`）或 `..` 的名字一律拒绝，返回 `None`。
+fn sanitize_import_name(name: &str) -> Option<&str> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return None;
+    }
+    Some(name)
+}
+
 fn parse_sections(b: &[u8], start: usize, count: usize) -> Option<Vec<Section>> {
     // 节区表理论上不该有上万个；给个上限防御畸形文件。
     if count == 0 || count > 96 {
@@ -147,12 +157,16 @@ fn collect_import_closure(
         return;
     };
     for name in imports {
+        // 导入名不可信：不合法就整项跳过，绝不拼进路径。
+        let Some(safe) = sanitize_import_name(&name) else {
+            continue;
+        };
         if !needed.iter().any(|n| n == &name) {
             needed.push(name.clone());
         }
         // 只有「随附在同目录」的 DLL 才继续深挖；系统 DLL 不解析，
         // 省时也避免越权读系统目录。
-        let local = dir.join(&name);
+        let local = dir.join(safe);
         if local.exists() {
             collect_import_closure(&local, dir, depth + 1, needed, visited);
         }
@@ -167,7 +181,11 @@ fn collect_import_closure(
 /// 这里**不**遍历完整 PATH：逐个目录 stat 既慢，又容易把「恰好同名的无关 DLL」
 /// 当成可用；System32 + 同目录已覆盖 VC++ 运行库与随附 DLL 的全部正常落点。
 pub fn dll_is_resolvable(name: &str, dir: &std::path::Path) -> bool {
-    let lower = name.to_ascii_lowercase();
+    // 畸形导入名（含路径分隔符或 `..`）绝不可能被加载器解析到。
+    let Some(safe) = sanitize_import_name(name) else {
+        return false;
+    };
+    let lower = safe.to_ascii_lowercase();
     if lower.starts_with("api-ms-win-") || lower.starts_with("ext-ms-win-") {
         return true;
     }
@@ -277,6 +295,33 @@ mod tests {
         std::fs::write(&e2, synthetic_pe_importing("local-only.dll")).unwrap();
         std::fs::write(dir.join("local-only.dll"), b"stub").unwrap();
         assert!(missing_imports(&e2).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 导入名是不可信输入：带路径分隔符或 `..` 的名字必须被拒，
+    /// 绝不能拼进 `dir.join()` 造成路径穿越。
+    #[test]
+    fn rejects_import_names_that_could_traverse_paths() {
+        assert_eq!(sanitize_import_name("..\\..\\evil.dll"), None);
+        assert_eq!(sanitize_import_name("a/b.dll"), None);
+        assert_eq!(sanitize_import_name(".."), None);
+        assert_eq!(sanitize_import_name(""), None);
+        assert_eq!(sanitize_import_name("kernel32.dll"), Some("kernel32.dll"));
+        assert!(!dll_is_resolvable(
+            "..\\..\\evil.dll",
+            std::path::Path::new("C:/")
+        ));
+    }
+
+    /// 恶意 PE 里声明的穿越名不会被当成缺失项上报，也不会被拼成路径。
+    #[test]
+    fn missing_imports_ignores_traversal_names() {
+        let dir = std::env::temp_dir().join(format!("v2w_peimp3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("entry.exe");
+        std::fs::write(&entry, synthetic_pe_importing("..\\..\\evil.dll")).unwrap();
+        assert!(missing_imports(&entry).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
