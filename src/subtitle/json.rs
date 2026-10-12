@@ -7,6 +7,7 @@
 //! - `text`：按当前[`ExportMode`]渲染后的文本（双语时为「原文\n译文」，与字幕文件一致）；
 //! - `raw_text` / `translation`：**始终**分别给出原文与译文，不受导出模式裁剪；
 //! - `confidence` / `speaker` / `language` / `translation_lang`：质检与说话人相关的元数据。
+//! - `words`：词级时间戳（秒），无词级信息（旧记录 / 非 Whisper 引擎）时为空数组。
 //!
 //! 这样一份 JSON 既能直接当字幕用（读 `text`），又不会在任何导出模式下丢掉原始字段
 //! ——「导出成功但信息被裁掉」是结构化导出最需要避免的坑。
@@ -50,6 +51,7 @@ impl JsonSubtitleExporter {
                     "language": seg.language,
                     "confidence": seg.confidence,
                     "speaker": seg.speaker,
+                    "words": seg.words,
                     "speaker_label": seg.speaker_label(),
                 })
             })

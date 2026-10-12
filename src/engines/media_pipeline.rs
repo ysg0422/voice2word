@@ -3,6 +3,19 @@
 //! One NV12 WGSL shader is used for both GPU adapters and wgpu's CPU/WARP
 //! software backend. Preview always prefers an H.264 proxy on machines without
 //! a discrete/integrated GPU; export / independent playback keeps the original.
+//!
+//! # 输入侧硬解闭环
+//!
+//! 预览 / 代理链路的输入侧硬解现在**优先 `d3d12va`**，失败后按
+//! [`HWACCEL_PREFERENCE`] 回退 `d3d11va`，再失败回退纯软解。候选顺序由
+//! [`hwaccel_attempt_chain`] 统一给出，执行见 [`transcode_with_fallback`]；
+//! 每一步失败都只影响本次转码的耗时，不会让预览 / 代理整体失败。
+//!
+//! # 已知回落：ONNX DirectML
+//!
+//! ONNX Runtime 的 DirectML 执行提供器需要带 DirectML 的 `onnxruntime` 构建，
+//! 而本项目当前依赖的是 **CPU-only** 构建，因此 DirectML 路径会**静默回落到
+//! CPU**。这是依赖侧的既有限制，不在本模块的决策范围内，此处只作如实记录。
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
@@ -87,10 +100,14 @@ impl Vendor {
 
 /// FFmpeg 输入侧硬解后端。
 ///
-/// 本项目只面向 Windows，候选就这两种：`d3d11va` 覆盖面最广（AMD / Intel /
-/// NVIDIA 通吃，是唯一「一个后端打通三家」的选择），`d3d12va` 更新但老驱动更挑剔。
+/// 本项目只面向 Windows，候选就这两种，顺序见 [`HWACCEL_PREFERENCE`]：
+/// `d3d12va` 优先（较新的接口，在支持的驱动上通常开销更低），`d3d11va` 兜底
+/// （覆盖面最广，AMD / Intel / NVIDIA 通吃，是唯一「一个后端打通三家」的选择）。
 /// `None`（= 不加 `-hwaccel`）才是默认：无 GPU、厂商未知、或用户在设置页关掉
 /// `gpu.hwaccel_decode` 时都走纯软解。
+///
+/// 两个变体现在都**会被真正尝试**：先首选后端，失败后依次回退其余候选，末尾
+/// 兜底纯软解（见 [`hwaccel_attempt_chain`] / [`transcode_with_fallback`]）。
 ///
 /// 只用于**预览 / 代理**链路（见 [`proxy_args`]）；抽音频 / 转写链路一律纯软解，
 /// 边界见 `ffmpeg.rs` 顶部说明。
@@ -101,13 +118,62 @@ pub enum HwAccel {
 }
 
 impl HwAccel {
-    /// 传给 FFmpeg `-hwaccel` 的字面量。
-    pub fn flag(&self) -> &'static str {
+    /// 传给 FFmpeg `-hwaccel` 的字面量（`"d3d11va"` / `"d3d12va"`）。
+    pub fn as_ffmpeg_arg(self) -> &'static str {
         match self {
             HwAccel::D3d11va => "d3d11va",
             HwAccel::D3d12va => "d3d12va",
         }
     }
+
+    /// [`Self::as_ffmpeg_arg`] 的历史别名，保留给既有调用点。
+    pub fn flag(&self) -> &'static str {
+        self.as_ffmpeg_arg()
+    }
+
+    /// 面向日志 / UI 的短标签（软解不在此枚举内，统一显示为 `software`）。
+    pub fn label(&self) -> &'static str {
+        match self {
+            HwAccel::D3d11va => "D3D11VA",
+            HwAccel::D3d12va => "D3D12VA",
+        }
+    }
+}
+
+/// 硬解候选的偏好顺序（不含末尾的软解兜底），顺序即尝试顺序。
+///
+/// `d3d12va` 优先：D3D12 Video Decode 是较新的接口，在支持的驱动上通常有更低的
+/// 拷贝 / 同步开销。`d3d11va` 兜底：D3D11 Video Decoder 覆盖面最广，是 Windows 上
+/// 唯一能一家通吃（AMD / Intel / NVIDIA）的后端，老驱动与部分核显只实现了它。
+///
+/// 两个变体都必须在此出现——这既是策略来源，也保证「定义了的变体都被使用」。
+pub const HWACCEL_PREFERENCE: [HwAccel; 2] = [HwAccel::D3d12va, HwAccel::D3d11va];
+
+/// 把「首选后端」展开成完整尝试链：顺序即尝试顺序，末尾一定是软解（`None`）。
+///
+/// - `Some(hw)`：先试 `hw`，再试 [`HWACCEL_PREFERENCE`] 里其余的硬件候选，最后软解。
+/// - `None`（无 GPU / 厂商未知 / 用户关掉 `gpu.hwaccel_decode`）：只有软解一步。
+///
+/// 纯函数、无副作用，便于单测逐项断言顺序；执行侧见 [`transcode_with_fallback`]。
+pub fn hwaccel_attempt_chain(preferred: Option<HwAccel>) -> Vec<Option<HwAccel>> {
+    let mut chain: Vec<Option<HwAccel>> = Vec::new();
+    if let Some(hw) = preferred {
+        chain.push(Some(hw));
+        chain.extend(
+            HWACCEL_PREFERENCE
+                .iter()
+                .copied()
+                .filter(|candidate| *candidate != hw)
+                .map(Some),
+        );
+    }
+    chain.push(None);
+    chain
+}
+
+/// 日志用的后端名：软解统一显示为 `software`，硬件后端显示 FFmpeg 参数名。
+fn hwaccel_name(backend: Option<HwAccel>) -> &'static str {
+    backend.map_or("software", HwAccel::as_ffmpeg_arg)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -188,58 +254,68 @@ impl HardwareProfile {
         }
     }
 
-    /// 预览 / 代理链路的输入侧硬解后端（`-hwaccel` 的取值）。
+    /// 预览 / 代理链路的**首选**输入侧硬解后端（`-hwaccel` 的取值）。
     ///
     /// 规则（路线图 P0-A3）：
-    /// - AMD / Intel / NVIDIA → `d3d11va`。三家的 D3D11 驱动都实现了
-    ///   D3D11 Video Decoder，是 Windows 上唯一能一家通吃的后端；NVIDIA 的
-    ///   `cuda`/`nvdec` 在核显机器上不可用，故不在此分流。
+    /// - AMD / Intel / NVIDIA → `d3d12va`（首选）。三家在 Win10 1809+ 的驱动都
+    ///   提供 D3D12 Video Decode；用不上时由 [`hwaccel_attempt_chain`] 自动回退
+    ///   `d3d11va`，再回退纯软解。NVIDIA 的 `cuda`/`nvdec` 在核显机器上不可用，
+    ///   故不在此分流。
     /// - 无 GPU（软件后端 / 纯 CPU 档案）、厂商未知、`Vendor::Other` → `None`，
     ///   保持纯软解。
     ///
-    /// 注意这只是**候选**：是否真用上由构造者选定（
-    /// `ProxyManager::with_hwaccel`），默认构造不加任何 `-hwaccel`。
-    /// [`ProxyManager::ensure_proxy`] 会自动回退纯软解。
+    /// 注意这只是**首选候选**：是否真用上、用不上时如何回退由
+    /// [`hwaccel_attempt_chain`] 与 [`transcode_with_fallback`] 决定；默认构造
+    /// （[`ProxyManager::new`]）不加任何 `-hwaccel`。
     pub fn hwaccel_backend(&self) -> Option<HwAccel> {
         let supported = matches!(
             self.vendor,
             Some(Vendor::Amd) | Some(Vendor::Nvidia) | Some(Vendor::Intel)
         );
-        (self.hardware_decode && supported).then_some(HwAccel::D3d11va)
+        (self.hardware_decode && supported).then_some(HwAccel::D3d12va)
     }
 }
 
-/// 代理转码的执行器：跑一次硬解/软解尝试，返回该次是否成功。
+/// 代理转码的执行器：按候选跑一次硬解/软解尝试，返回该次是否成功。
 ///
 /// 抽成 `FnMut` 不是为了好看，而是为了**可测**：硬解在部分素材/驱动上真的会失败，
-/// 而在任何一台机器上都无法保证构造出「d3d11va 必然失败」的素材来跑端到端测试。
-/// 把「失败后怎么办」从「怎么跑」里切出来后，回退逻辑可以用一个假执行器
-/// 完整覆盖（见 `hardware_failure_retries_once_with_software`）。
+/// 而在任何一台机器上都无法保证构造出「d3d12va / d3d11va 必然失败」的素材来跑
+/// 端到端测试。把「失败后怎么办」从「怎么跑」里切出来后，回退逻辑可以用一个假
+/// 执行器完整覆盖（见 `hardware_failure_falls_back_through_the_candidate_chain`）。
 type ProxyAttempt<'a> = Box<dyn FnMut(Option<HwAccel>) -> Result<bool> + 'a>;
 
-/// 跑代理转码，**硬解失败时自动用纯软解重试恰好一次**；返回最终是否成功。
+/// 跑代理转码：**硬解候选按顺序尝试，失败逐级回退，最后兜底纯软解**；返回最终是否成功。
+///
+/// # 候选顺序
+///
+/// 顺序来自 [`hwaccel_attempt_chain`]：`preferred` 指定的后端先试，其余硬件候选
+/// 随后，末尾一定是纯软解（`None`）。每个候选最多跑一次，任一成功立即返回，因此
+/// 尝试次数有上界（2 个硬件 + 1 次软解），不存在循环。
 ///
 /// # 为什么这条回退是必须的
 ///
 /// `-hwaccel` 能不能用起来取决于素材编码、显卡驱动版本、图形会话类型（本地 /
 /// RDP / 虚拟显示器）等本进程看不见的因素。不加回退，「加硬解」就等于
-/// 「原本能转的素材现在转不了」——净负收益。回退走的是同一套参数，只把
+/// 「原本能转的素材现在转不了」——净负收益。软解那一步走的是同一套参数，只把
 /// `-hwaccel` 去掉，因此结果必然等价于加硬解之前的历史行为。
 ///
-/// 只重试一次：软解是最后兜底，再失败就是素材本身的问题，重试没有意义。
-fn transcode_with_fallback(hwaccel: Option<HwAccel>, mut run: ProxyAttempt<'_>) -> Result<bool> {
-    let Some(hw) = hwaccel else {
-        // 本来就是软解：没有可回退的东西，失败即失败。
-        return run(None);
-    };
-    if run(Some(hw))? {
-        return Ok(true);
+/// 软解也失败就收手：那是素材本身的问题，继续换后端重试没有意义。
+fn transcode_with_fallback(preferred: Option<HwAccel>, mut run: ProxyAttempt<'_>) -> Result<bool> {
+    let chain = hwaccel_attempt_chain(preferred);
+    let last = chain.len().saturating_sub(1);
+    for (idx, backend) in chain.iter().enumerate() {
+        if run(*backend)? {
+            return Ok(true);
+        }
+        if idx < last {
+            warn!(
+                hwaccel = hwaccel_name(*backend),
+                next = hwaccel_name(chain[idx + 1]),
+                "hardware decode failed; falling back to the next candidate"
+            );
+        }
     }
-    warn!(
-        hwaccel = hw.flag(),
-        "hardware decode failed; retrying this proxy with pure software decode"
-    );
-    run(None)
+    Ok(false)
 }
 
 /// 代理转码的输出侧参数（`-i <src>` 之后的那一段）。
@@ -322,6 +398,9 @@ pub struct ProxyManager {
     /// [`HardwareProfile`]——把它显式传进来，比藏一个全局开关更难配错，也不会
     /// 出现「设置页关了硬解、代理却还在用」的错位。默认构造（[`Self::new`]）
     /// 取 `None`，与加硬解之前的历史行为逐字节相同。
+    ///
+    /// `Some(hw)` 只是**首选**后端：执行时按 [`hwaccel_attempt_chain`] 依次回退
+    /// 其余硬件候选，最后兜底软解，因此单个后端不可用不会让代理失败。
     hwaccel: Option<HwAccel>,
     lock: Mutex<()>,
     height_cache: Mutex<HashMap<PathBuf, (FileSignature, Option<u32>)>>,
@@ -474,13 +553,19 @@ impl ProxyManager {
             return Ok(out);
         }
 
-        // 输入侧硬解策略：构造时由 [`HardwareProfile::hwaccel_backend`] 决定，`None` 即纯软解。
+        // 输入侧硬解策略：构造时由 [`HardwareProfile::hwaccel_backend`] 决定首选后端，
+        // `None` 即纯软解；实际尝试顺序（含回退）见 [`hwaccel_attempt_chain`]。
         let hwaccel = self.hwaccel;
+        let fallback_plan: Vec<&str> = hwaccel_attempt_chain(hwaccel)
+            .iter()
+            .map(|backend| (*backend).map_or("software", |hw| hw.label()))
+            .collect();
         info!(
             source = %source.display(),
             height,
             out = %out.display(),
-            hwaccel = hwaccel.map(|hw| hw.flag()).unwrap_or("software"),
+            hwaccel = hwaccel_name(hwaccel),
+            fallback_plan = ?fallback_plan,
             "generating H.264 proxy (libx264, never HEVC)"
         );
 
@@ -490,7 +575,8 @@ impl ProxyManager {
             "proxy transcode runs at below-normal priority with a bounded thread budget"
         );
 
-        // 硬解失败自动回退软解（只重试一次，决策逻辑见 `transcode_with_fallback`）。
+        // 硬解候选按 d3d12va → d3d11va → 软解 的顺序回退，决策逻辑见
+        // `transcode_with_fallback` / `hwaccel_attempt_chain`。
         // 每次尝试前先清掉半成品：失败的那次可能已经写出了截断的 mp4，`-y` 虽然
         // 会覆盖，但残留文件会让「成功判定」之外的下游误以为代理已就绪。
         let ok = transcode_with_fallback(
@@ -1471,14 +1557,15 @@ mod tests {
         );
     }
 
-    /// AMD / Intel / NVIDIA 三家都走 d3d11va——它是 Windows 上唯一能一家通吃的后端。
+    /// AMD / Intel / NVIDIA 三家都**首选** d3d12va；d3d11va 作为回退候选由
+    /// [`hwaccel_attempt_chain`] 提供（顺序在候选链测试里单独断言）。
     #[test]
-    fn hwaccel_backend_uses_d3d11va_for_known_vendors() {
+    fn hwaccel_backend_prefers_d3d12va_for_known_vendors() {
         for vendor in [Vendor::Amd, Vendor::Nvidia, Vendor::Intel] {
             assert_eq!(
                 vendor_profile(Some(vendor), true).hwaccel_backend(),
-                Some(HwAccel::D3d11va),
-                "{vendor:?} 应选 d3d11va"
+                Some(HwAccel::D3d12va),
+                "{vendor:?} 应首选 d3d12va"
             );
         }
     }
@@ -1500,23 +1587,34 @@ mod tests {
         );
     }
 
-    /// 硬解开启时，代理参数里必须带 `-hwaccel d3d11va`，且在 `-i` 之前。
+    /// 硬解开启时，代理参数里必须带上**所选**后端，且 `-hwaccel` 落在 `-i` 之前。
+    /// 档案驱动的默认选择是 d3d12va；显式传入回退候选 d3d11va 时同样成立。
     #[test]
-    fn proxy_args_adds_d3d11va_for_amd_and_intel() {
+    fn proxy_args_emits_the_selected_hwaccel_backend() {
         for vendor in [Vendor::Amd, Vendor::Intel] {
-            let policy = vendor_profile(Some(vendor), true).decode_policy();
-            assert!(policy.try_hwaccel, "{vendor:?} 应开启硬解");
+            let profile = vendor_profile(Some(vendor), true);
+            assert!(profile.decode_policy().try_hwaccel, "{vendor:?} 应开启硬解");
             let args = proxy_args(
                 Path::new("C:/media/demo.mp4"),
                 Path::new("C:/tmp/out.mp4"),
                 720,
-                vendor_profile(Some(vendor), true).hwaccel_backend(),
+                profile.hwaccel_backend(),
                 proxy_encode_threads(),
             );
-            assert_hwaccel_before_input(&args, "d3d11va");
+            assert_hwaccel_before_input(&args, "d3d12va");
             assert!(args.iter().any(|a| a == "-c:v"));
             assert!(args.iter().any(|a| a == "libx264"));
         }
+
+        // 回退候选（d3d11va）也要能原样拼进命令
+        let fallback = proxy_args(
+            Path::new("C:/media/demo.mp4"),
+            Path::new("C:/tmp/out.mp4"),
+            720,
+            Some(HwAccel::D3d11va),
+            proxy_encode_threads(),
+        );
+        assert_hwaccel_before_input(&fallback, "d3d11va");
     }
 
     /// 软解路径（无 GPU / 用户关开关）逐参数等价于历史版本：整条命令里没有 `-hwaccel`。
@@ -1574,16 +1672,16 @@ mod tests {
         assert_eq!(stripped, sw, "去掉 -hwaccel 后必须与软解参数逐参数相同");
     }
 
-    /// 硬解失败必须自动回退软解**恰好一次**——本任务最重要的健壮性约束。
+    /// 硬解失败必须自动回退：先换另一个硬件后端，再兜底软解——本任务最重要的健壮性约束。
     ///
     /// 用假执行器覆盖「怎么跑」之外的全部决策逻辑；真实 ffmpeg 调用只在
-    /// `real_ffmpeg_proxy_falls_back_when_hwaccel_is_unavailable` 里端到端验证。
+    /// `real_ffmpeg_proxy_runs_with_and_without_hwaccel` 里端到端验证。
     #[test]
-    fn hardware_failure_retries_once_with_software() {
-        // 第一次带 d3d11va 失败 → 第二次不带 -hwaccel，且必须成功
+    fn hardware_failure_falls_back_through_the_candidate_chain() {
+        // d3d12va 失败 → d3d11va 失败 → 软解成功：三次尝试，顺序即候选链
         let mut attempts: Vec<Option<HwAccel>> = Vec::new();
         let ok = transcode_with_fallback(
-            Some(HwAccel::D3d11va),
+            Some(HwAccel::D3d12va),
             Box::new(|backend| {
                 attempts.push(backend);
                 Ok(backend.is_none())
@@ -1593,8 +1691,28 @@ mod tests {
         assert!(ok, "回退后的软解尝试成功，整体应判成功");
         assert_eq!(
             attempts,
-            vec![Some(HwAccel::D3d11va), None],
-            "必须恰好「先硬解、再软解」各一次"
+            vec![Some(HwAccel::D3d12va), Some(HwAccel::D3d11va), None],
+            "必须按 d3d12va → d3d11va → 软解 的顺序各尝试一次"
+        );
+    }
+
+    /// 第一候选失败、第二候选成功时**不得**再多跑一次软解（避免凭空多一次全片转码）。
+    #[test]
+    fn second_hardware_candidate_success_stops_before_software() {
+        let mut attempts: Vec<Option<HwAccel>> = Vec::new();
+        let ok = transcode_with_fallback(
+            Some(HwAccel::D3d12va),
+            Box::new(|backend| {
+                attempts.push(backend);
+                Ok(backend == Some(HwAccel::D3d11va))
+            }),
+        )
+        .unwrap();
+        assert!(ok);
+        assert_eq!(
+            attempts,
+            vec![Some(HwAccel::D3d12va), Some(HwAccel::D3d11va)],
+            "d3d11va 成功后不应再跑软解"
         );
     }
 
@@ -1630,12 +1748,12 @@ mod tests {
         assert_eq!(attempts, vec![None], "不得重试");
     }
 
-    /// 硬解 + 软解都失败：只重试一次就收手，不得无限循环。
+    /// 全部候选（两个硬件 + 软解）都失败：跑完候选链就收手，不得无限循环。
     #[test]
-    fn both_attempts_failing_stops_after_one_retry() {
+    fn all_candidates_failing_stops_after_the_chain() {
         let mut attempts: Vec<Option<HwAccel>> = Vec::new();
         let ok = transcode_with_fallback(
-            Some(HwAccel::D3d11va),
+            Some(HwAccel::D3d12va),
             Box::new(|backend| {
                 attempts.push(backend);
                 Ok(false)
@@ -1643,7 +1761,11 @@ mod tests {
         )
         .unwrap();
         assert!(!ok);
-        assert_eq!(attempts, vec![Some(HwAccel::D3d11va), None]);
+        assert_eq!(
+            attempts,
+            vec![Some(HwAccel::D3d12va), Some(HwAccel::D3d11va), None],
+            "候选链长度有界，跑完即停"
+        );
     }
 
     /// 执行器自身报错（启动失败）时把错误原样上抛，不再吞掉去重试。
@@ -1742,9 +1864,9 @@ mod tests {
         let on = ProxyManager::with_hwaccel("ffmpeg", Some(HwAccel::D3d11va));
         assert_eq!(on.hwaccel(), Some(HwAccel::D3d11va));
 
-        // 档案驱动的构造：AMD 核显 + hardware_decode=true → d3d11va
+        // 档案驱动的构造：AMD 核显 + hardware_decode=true → 首选 d3d12va
         let from_amd = ProxyManager::with_profile("ffmpeg", &amd_profile(true));
-        assert_eq!(from_amd.hwaccel(), Some(HwAccel::D3d11va));
+        assert_eq!(from_amd.hwaccel(), Some(HwAccel::D3d12va));
         // 用户关掉硬解（hardware_decode=false）→ 纯软解
         assert_eq!(
             ProxyManager::with_profile("ffmpeg", &amd_profile(false)).hwaccel(),
@@ -1793,5 +1915,75 @@ mod tests {
         assert!(!yield_to_desktop(), "写入 false 后应读回 false");
 
         set_yield_to_desktop(before);
+    }
+
+    // ─────────── 硬解候选链（D3d12va 启用） ───────────
+
+    /// 每个变体都要给出稳定的 FFmpeg 参数与人类可读标签。
+    #[test]
+    fn hwaccel_ffmpeg_args_and_labels_are_stable() {
+        assert_eq!(HwAccel::D3d11va.as_ffmpeg_arg(), "d3d11va");
+        assert_eq!(HwAccel::D3d12va.as_ffmpeg_arg(), "d3d12va");
+        assert_eq!(HwAccel::D3d11va.flag(), HwAccel::D3d11va.as_ffmpeg_arg());
+        assert_eq!(HwAccel::D3d12va.flag(), HwAccel::D3d12va.as_ffmpeg_arg());
+        assert_eq!(HwAccel::D3d11va.label(), "D3D11VA");
+        assert_eq!(HwAccel::D3d12va.label(), "D3D12VA");
+        assert_ne!(
+            HwAccel::D3d11va.as_ffmpeg_arg(),
+            HwAccel::D3d12va.as_ffmpeg_arg(),
+            "两个后端不能映射到同一个 FFmpeg 参数"
+        );
+    }
+
+    /// 偏好表必须恰好覆盖全部变体，且 d3d12va 排在最前——这条同时是
+    /// 「没有定义却不被使用的变体」的语义检查（对应 dead_code 关注的场景）。
+    #[test]
+    fn hwaccel_preference_covers_every_variant_with_d3d12va_first() {
+        assert_eq!(HWACCEL_PREFERENCE.len(), 2);
+        assert_eq!(HWACCEL_PREFERENCE[0], HwAccel::D3d12va);
+        assert!(HWACCEL_PREFERENCE.contains(&HwAccel::D3d11va));
+        assert!(HWACCEL_PREFERENCE.contains(&HwAccel::D3d12va));
+    }
+
+    /// 候选链顺序：首选 → 其余硬件候选 → 软解兜底；纯软解档案只有一步。
+    #[test]
+    fn hwaccel_attempt_chain_orders_fallbacks() {
+        assert_eq!(
+            hwaccel_attempt_chain(Some(HwAccel::D3d12va)),
+            vec![Some(HwAccel::D3d12va), Some(HwAccel::D3d11va), None]
+        );
+        // 显式指定 d3d11va 时，d3d12va 作为第二候选补齐，末尾仍是软解
+        assert_eq!(
+            hwaccel_attempt_chain(Some(HwAccel::D3d11va)),
+            vec![Some(HwAccel::D3d11va), Some(HwAccel::D3d12va), None]
+        );
+        // 无 GPU / 厂商未知 / 用户关开关：只有软解一步
+        assert_eq!(hwaccel_attempt_chain(None), vec![None]);
+    }
+
+    /// 候选链不得出现重复项，硬件候选不超过偏好表大小，且软解恒在末尾。
+    #[test]
+    fn hwaccel_attempt_chain_is_deduplicated_with_software_last() {
+        for preferred in [None, Some(HwAccel::D3d11va), Some(HwAccel::D3d12va)] {
+            let chain = hwaccel_attempt_chain(preferred);
+            assert_eq!(chain.last().copied(), Some(None), "软解必须是最后一步");
+            let mut hardware: Vec<HwAccel> = chain.iter().flatten().copied().collect();
+            let count = hardware.len();
+            hardware.sort_by_key(|hw| hw.as_ffmpeg_arg());
+            hardware.dedup();
+            assert_eq!(hardware.len(), count, "候选链不得重复: {chain:?}");
+            assert!(
+                count <= HWACCEL_PREFERENCE.len(),
+                "硬件候选数不得超过偏好表: {chain:?}"
+            );
+        }
+    }
+
+    /// 日志名：硬件后端用 FFmpeg 参数名，软解统一显示 `software`。
+    #[test]
+    fn hwaccel_name_labels_software_and_hardware() {
+        assert_eq!(hwaccel_name(None), "software");
+        assert_eq!(hwaccel_name(Some(HwAccel::D3d11va)), "d3d11va");
+        assert_eq!(hwaccel_name(Some(HwAccel::D3d12va)), "d3d12va");
     }
 }

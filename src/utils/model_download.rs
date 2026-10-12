@@ -24,14 +24,30 @@
 //!
 //! # 关于校验
 //!
-//! 只校验**大小**，不校验哈希。原因是上游仓库会重新导出/重新量化模型文件
-//! （例如 `ggml-silero-v5.1.2.bin` 与本地同名文件同尺寸但哈希不同），写死哈希
-//! 会在上游更新后把下载判为失败，反而挡住用户。大小校验足以拦住截断的下载
-//! （这正是最常见的失败模式），而**截断文件才是真正会导致「模型加载失败」
-//! 且难以排查的那种损坏**。
+//! 校验分两层，都是**按条目可选**的：
+//!
+//! - **大小**：始终执行，下限为 `size * 0.95`（或条目显式给出的 `min_size`）。
+//!   这拦住最常见的失败模式——**截断文件**，而截断恰恰是「模型加载失败」里
+//!   最难排查的一种损坏。
+//! - **sha256**：仅当条目声明了 `sha256` 时才执行。上游会重新导出 / 重新量化
+//!   模型文件（例如 `ggml-silero-v5.1.2.bin` 与本地同名文件同尺寸但哈希不同），
+//!   所以**绝大多数条目填 `None`**；只有内容确知且稳定的条目（例如 GitHub
+//!   Release 的固定附件）才填 `Some(...)`。哈希不符时报错、删除 `.part` 并
+//!   尝试下一个源，绝不把损坏文件 rename 成正式名。
 //!
 //! 下载先写 `.part` 临时文件，成功后才 `rename` 到目标名。因此中断的下载
 //! 永远不会被误认成完整模型——这一点比哈希校验更关键。
+//!
+//! # 断点续传
+//!
+//! `.part` 不只是「半成品隔离」：若它已存在且大小介于 `(0, size)` 之间，
+//! 下次下载会带 `Range: bytes=<已有字节数>-` 续传。服务端返回 `206` 时以追加
+//! 方式写入；返回 `200`（不支持 Range）或异常状态码时**优雅回退**到从头下载
+//! （截断重写），不会因此把该源判死。若 `.part` 已不小于期望大小（上次下完但
+//! 没来得及 rename），则跳过网络直接进入校验。
+//!
+//! 注意：启动时的 `sweep_stale_parts` 仍会清掉残留的 `.part`，因此续传的收益
+//! 主要在**同一次运行内**（换源重试、网络抖动后重试）。
 
 use std::fs;
 use std::io::{Read, Write};
@@ -41,6 +57,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use super::AppConfig;
@@ -120,6 +137,11 @@ pub struct DownloadItem {
     /// .exe 只是几 KB 的启动桩。只看 .exe 大小会把「DLL 缺失 / 解压不完整」
     /// 误判为「已就位」，用户点翻译时才炸。给出伴生 DLL 后判定才可靠。
     pub companion: Option<&'static str>,
+    /// 可选的内容哈希（sha256，十六进制小写）。
+    ///
+    /// `None` 表示上游文件会变、不做哈希；`Some(...)` 表示强校验。只有内容
+    /// 确知且稳定的条目才填 `Some`——上游重新导出会把正常下载判为失败。
+    pub sha256: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +192,7 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Asr,
         is_archive: false,
         companion: None,
+        sha256: None,
     },
     DownloadItem {
         id: "sensevoice-tokens",
@@ -186,6 +209,7 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Asr,
         is_archive: false,
         companion: None,
+        sha256: None,
     },
     DownloadItem {
         id: "sensevoice-vad",
@@ -203,6 +227,9 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Asr,
         is_archive: false,
         companion: None,
+        // 来源是 GitHub Release 的固定附件（两个代理实测字节一致），内容稳定，
+        // 因此这里做**强校验**：拿到 HTML 错误页 / 被替换的文件都会当场暴露。
+        sha256: Some("9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"),
     },
     DownloadItem {
         id: "whisper-small",
@@ -221,6 +248,7 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Asr,
         is_archive: false,
         companion: None,
+        sha256: None,
     },
     DownloadItem {
         id: "whisper-base",
@@ -237,6 +265,7 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Asr,
         is_archive: false,
         companion: None,
+        sha256: None,
     },
     DownloadItem {
         id: "whisper-turbo-q5",
@@ -253,6 +282,7 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Asr,
         is_archive: false,
         companion: None,
+        sha256: None,
     },
     DownloadItem {
         id: "whisper-turbo-q8",
@@ -269,6 +299,7 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Asr,
         is_archive: false,
         companion: None,
+        sha256: None,
     },
     DownloadItem {
         id: "silero-vad",
@@ -284,6 +315,7 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Asr,
         is_archive: false,
         companion: None,
+        sha256: None,
     },
     // ── 标点与翻译 ──
     DownloadItem {
@@ -300,6 +332,7 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Text,
         is_archive: false,
         companion: None,
+        sha256: None,
     },
     DownloadItem {
         id: "qwen-llm",
@@ -315,6 +348,7 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Text,
         is_archive: false,
         companion: None,
+        sha256: None,
     },
     // ── 外部组件 ──
     DownloadItem {
@@ -335,6 +369,7 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Binary,
         is_archive: false,
         companion: None,
+        sha256: None,
     },
     DownloadItem {
         id: "llama-cpp",
@@ -356,6 +391,7 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Binary,
         is_archive: true,
         companion: Some("llama-server.exe"),
+        sha256: None,
     },
     DownloadItem {
         id: "whisper-cli",
@@ -385,6 +421,8 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Binary,
         is_archive: true,
         companion: Some("whisper.dll"),
+        // 同上：GitHub Release v1.8.4 的固定附件，两个代理实测字节一致。
+        sha256: Some("74f973345cb52ef5ba3ec9e7e7af8e48cc8c71722d1528603b80588a11f82e3e"),
     },
     DownloadItem {
         id: "whisper-cublas",
@@ -401,6 +439,7 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Binary,
         is_archive: true,
         companion: Some("cublas64_12.dll"),
+        sha256: None,
     },
 ];
 
@@ -950,8 +989,9 @@ pub type ProgressFn = Box<dyn Fn(u64, u64, &str) + Send + Sync>;
 
 /// 下载单个条目。
 ///
-/// 先写 `<dest>.part`，成功（含大小校验）后原子 rename 到目标名。
-/// 因此**任何中断都不会留下一个看起来完好的模型文件**。
+/// 先写 `<dest>.part`，成功（含大小校验、可选的 sha256 校验）后原子 rename
+/// 到目标名。因此**任何中断都不会留下一个看起来完好的模型文件**。
+/// `.part` 已存在且未下满时会带 Range 续传；校验失败会删除 `.part` 并换下一个源。
 pub fn download_one(
     item: &DownloadItem,
     cancel: &Arc<AtomicBool>,
@@ -990,6 +1030,29 @@ pub fn download_one(
         }
         match fetch_to_file(url, &part, item.size, item.id, cancel, progress) {
             Ok(()) => {
+                // 内容哈希强校验（仅当条目声明了 sha256）。不符时删 `.part` 换源，
+                // 绝不 rename —— 把损坏文件落到正式名比下载失败更难排查。
+                if let Some(expected) = item.sha256 {
+                    match sha256_file(&part) {
+                        Ok(actual) if actual == expected => {}
+                        Ok(actual) => {
+                            warn!(
+                                item = item.id,
+                                url, expected, actual, "sha256 校验失败，尝试下一个下载源"
+                            );
+                            let _ = fs::remove_file(&part);
+                            last_err =
+                                Some(anyhow!("sha256 校验失败：期望 {expected}，实际 {actual}"));
+                            continue;
+                        }
+                        Err(err) => {
+                            warn!(item = item.id, url, error = %err, "计算 sha256 失败，尝试下一个下载源");
+                            let _ = fs::remove_file(&part);
+                            last_err = Some(err);
+                            continue;
+                        }
+                    }
+                }
                 // 压缩包类组件（如 llama.cpp）：下载物是 zip，真正的程序在包内。
                 // 必须解压到 dest 的父目录并校验关键文件都在，才算成功。
                 if item.is_archive {
@@ -1018,7 +1081,9 @@ pub fn download_one(
             }
             Err(err) => {
                 warn!(item = item.id, url, error = %err, "该下载源失败，尝试下一个");
-                let _ = fs::remove_file(&part);
+                // 保留 `.part`：下一个源可以带 Range 从断点续传，避免把已经下到的
+                // 几百 MB 扔掉重来。它不会被误认成完整模型（判定只看目标名），
+                // 下次启动的 sweep 也会清掉它。
                 last_err = Some(err);
             }
         }
@@ -1121,7 +1186,95 @@ fn part_path_for(dest: &Path) -> Option<PathBuf> {
     Some(dest.with_extension(format!("{ext}part")))
 }
 
-/// 从单个 URL 流式下载到文件，并做大小校验。
+/// 请求使用的 User-Agent。
+///
+/// 部分镜像（尤其是 Cloudflare 后面的代理）会对空 UA / 非浏览器 UA 直接拒绝，
+/// 用常见的浏览器 UA 最省事。
+const USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)";
+
+/// 断点续传的起点判定：返回需要续传的字节偏移量。
+///
+/// 只有「`.part` 已有内容」且「尚未达到期望大小」时才续传；其余情况一律返回
+/// `None`（无 `.part`、空文件、大小未知、已下满），由调用方决定从头下还是直接校验。
+/// 抽成纯函数是为了能单测：真正的下载路径要联网，没法在测试里跑。
+fn resume_offset(part_len: u64, expected: u64) -> Option<u64> {
+    if part_len == 0 || expected == 0 || part_len >= expected {
+        None
+    } else {
+        Some(part_len)
+    }
+}
+
+/// 构造 HTTP `Range` 请求头：从 `offset` 一直取到文件末尾。
+fn range_header(offset: u64) -> String {
+    format!("bytes={offset}-")
+}
+
+/// 计算文件的 sha256，返回 64 位十六进制小写字符串。
+///
+/// 独立成函数便于单测：喂固定内容即可验证，不需要联网。
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("读取文件失败: {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// 发一次 GET 并返回响应；`resume` 为 `Some` 时带上 `Range` 头请求续传。
+///
+/// 服务端可能用状态码拒绝 `Range`（例如 416）。这是源之间的实现差异，
+/// 不该把该源判死：这里自动回退成不带 `Range` 的整文件请求再试一次。
+///
+/// 返回 `anyhow::Result` 而不是把 `ureq::Error` 直接放进 `Err`：后者体积很大，
+/// 直接返回会触发 `clippy::result_large_err`。
+fn send_get(
+    agent: &ureq::Agent,
+    url: &str,
+    item_id: &str,
+    resume: Option<u64>,
+) -> Result<ureq::Response> {
+    let Some(offset) = resume else {
+        // 不带 Range：整文件下载。
+        return agent
+            .get(url)
+            .set("User-Agent", USER_AGENT)
+            .call()
+            .map_err(|e| anyhow!("请求失败: {e}"));
+    };
+    match agent
+        .get(url)
+        .set("User-Agent", USER_AGENT)
+        .set("Range", &range_header(offset))
+        .call()
+    {
+        Ok(resp) => Ok(resp),
+        Err(ureq::Error::Status(code, _)) => {
+            warn!(
+                item = item_id,
+                url, code, "Range 请求被拒，回退为整文件下载"
+            );
+            agent
+                .get(url)
+                .set("User-Agent", USER_AGENT)
+                .call()
+                .map_err(|e| anyhow!("请求失败: {e}"))
+        }
+        Err(err) => Err(anyhow!("请求失败: {err}")),
+    }
+}
+
+/// 从单个 URL 流式下载到文件，支持断点续传，并做大小校验。
 fn fetch_to_file(
     url: &str,
     part: &Path,
@@ -1139,33 +1292,73 @@ fn fetch_to_file(
         .try_proxy_from_env(true)
         .build();
 
-    let resp = agent
-        .get(url)
-        .set(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
-        )
-        .call()
-        .map_err(|e| anyhow!("请求失败: {e}"))?;
+    // `.part` 的现有大小：用于判断能否续传。
+    let existing = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
 
-    let total = resp
-        .header("Content-Length")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
+    // 已不小于期望大小：多半是上次下完但没来得及 rename（进程被杀）。
+    // 直接跳过网络、交给上层做大小 / 哈希校验，省下一次几百 MB 的重下。
+    if expected_size > 0 && existing >= expected_size {
+        info!(
+            item = item_id,
+            bytes = existing,
+            "已有完整的临时文件，跳过下载直接校验"
+        );
+        if let Some(cb) = progress {
+            cb(existing, existing, item_id);
+        }
+        return Ok(());
+    }
+
+    let resume = resume_offset(existing, expected_size);
+
+    // 发请求；若 Range 被服务端拒绝，`send_get` 内部已回退为整文件请求。
+    let resp = send_get(&agent, url, item_id, resume)?;
+
+    let status = resp.status();
+    // 只有「发了 Range 且服务端明确回 206」才续写；其余（含 200）一律截断重下，
+    // 保证不会把两段不同来源的字节拼在一起。
+    let appending = status == 206 && resume.is_some();
+
+    let (mut file, mut written) = if appending {
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(part)
+            .with_context(|| format!("打开临时文件失败: {}", part.display()))?;
+        // 以文件**真实长度**为续写起点，而不是 metadata 快照——两者之间文件若被
+        // 截断，用旧快照会让进度与实际字节数对不上。
+        let base = f.metadata().map(|m| m.len()).unwrap_or(0);
+        (f, base)
+    } else {
+        let f = fs::File::create(part)
+            .with_context(|| format!("创建临时文件失败: {}", part.display()))?;
+        (f, 0)
+    };
+
+    // 进度条的总字节数一律用**登记大小**：206 响应里 `Content-Length` 只是剩余
+    // 长度，直接当总数会让进度从 0 跳变甚至倒退。未登记大小时才退回响应头估算。
+    let total = if expected_size > 0 {
+        expected_size
+    } else {
+        let remaining = resp
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        written + remaining
+    };
+    // 本次实际下载的字节数（用于测速）；`written` 里含续传前已有的部分。
+    let base_bytes = written;
 
     let mut reader = resp.into_reader();
-    let mut file =
-        fs::File::create(part).with_context(|| format!("创建临时文件失败: {}", part.display()))?;
 
     let mut buf = vec![0u8; 256 * 1024];
-    let mut written: u64 = 0;
     let started = Instant::now();
     let mut last_report = Instant::now();
 
     loop {
         if cancel.load(Ordering::Relaxed) {
             drop(file);
-            let _ = fs::remove_file(part);
+            // 保留 `.part`：用户重新点下载时可以接着下，不必从头再来。
             return Err(anyhow!("已取消"));
         }
         let n = reader.read(&mut buf).context("读取响应流失败")?;
@@ -1204,12 +1397,14 @@ fn fetch_to_file(
         }
     }
 
+    // 测速只算本次真正下载的字节数（续传时不含此前已有的部分）。
+    let fetched = written.saturating_sub(base_bytes);
     let secs = started.elapsed().as_secs_f64().max(0.001);
     info!(
         item = item_id,
-        mb = written / MB,
+        mb = fetched / MB,
         secs = secs,
-        speed_mbps = (written as f64 / MB as f64) / secs,
+        speed_mbps = (fetched as f64 / MB as f64) / secs,
         "下载完成"
     );
     Ok(())
@@ -1327,6 +1522,7 @@ mod tests {
             group: ItemGroup::Asr,
             is_archive: false,
             companion: None,
+            sha256: None,
         };
 
         let _ = fs::remove_file(&real);
@@ -1368,6 +1564,7 @@ mod tests {
             group: ItemGroup::Asr,
             is_archive: false,
             companion: None,
+            sha256: None,
         };
         fs::write(&real, b"").unwrap();
         assert!(!is_present(&item), "0 字节文件必须判为缺失");
@@ -1401,6 +1598,7 @@ mod tests {
             group: ItemGroup::Binary,
             is_archive: true,
             companion: Some("tool-server.exe"),
+            sha256: None,
         };
 
         // 只有入口文件 → 仍判为缺失（伴生文件不在）
@@ -1436,6 +1634,7 @@ mod tests {
             group: ItemGroup::Binary,
             is_archive: true,
             companion: Some("tool.dll"),
+            sha256: None,
         };
         // 入口 5 MB（> 2 MB 阈值）且没有 tool.dll → 应判为已就位
         fs::write(&real, vec![0u8; 5_000_000]).unwrap();
@@ -1466,6 +1665,7 @@ mod tests {
             group: ItemGroup::Binary,
             is_archive: true,
             companion: Some("tool.dll"),
+            sha256: None,
         };
 
         // 1) 大单文件、无 DLL → 判定为自编译构建
@@ -1520,6 +1720,7 @@ mod tests {
             group: ItemGroup::Binary,
             is_archive: true,
             companion: Some("whisper.dll"),
+            sha256: None,
         };
 
         // 1) 纯 CPU 形态：有 companion、无 vulkan DLL → 不算自定义构建
@@ -1619,6 +1820,7 @@ mod tests {
             group: ItemGroup::Binary,
             is_archive: true,
             companion: Some("tool-server.exe"),
+            sha256: None,
         };
         let part = dir.join("tool.exe.part");
         fs::write(
@@ -1655,6 +1857,7 @@ mod tests {
             group: ItemGroup::Binary,
             is_archive: true,
             companion: Some("tool-server.exe"),
+            sha256: None,
         };
         let part = dir.join("tool.exe.part");
         // 只有入口，缺伴生文件
@@ -1936,6 +2139,7 @@ mod tests {
             group: ItemGroup::Binary,
             is_archive: false,
             companion: Some("whisper.dll"),
+            sha256: None,
         };
         assert!(
             looks_like_custom_build(&companion_item, &exe),
@@ -2054,5 +2258,72 @@ mod tests {
         let (dir, dest) = isolated_dest("missing");
         assert_eq!(sweep_parts_for(std::slice::from_ref(&dest)), 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `sha256_file` 对已知内容必须给出标准摘要（"abc" 的经典向量）。
+    #[test]
+    fn sha256_file_matches_known_digest() {
+        let dir = std::env::temp_dir().join(format!("v2w_sha_abc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("abc.bin");
+        fs::write(&file, b"abc").unwrap();
+
+        assert_eq!(
+            sha256_file(&file).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 超过单次读取缓冲（256 KiB）的文件必须多轮 `update`，结果不能只覆盖第一块。
+    #[test]
+    fn sha256_file_streams_across_buffer_boundary() {
+        let dir = std::env::temp_dir().join(format!("v2w_sha_big_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big.bin");
+        // 300 KiB：超过 256 KiB 缓冲，必然触发第二轮读取。
+        let bytes: Vec<u8> = (0..307_200).map(|i| (i % 251) as u8).collect();
+        fs::write(&file, &bytes).unwrap();
+
+        assert_eq!(
+            sha256_file(&file).unwrap(),
+            "10a6169813fcc0410b3d72574ff2dd1997936b90db821427136315967cff2bb9"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 文件不存在时返回 `Err`，由调用方决定换源重试（而不是 panic）。
+    #[test]
+    fn sha256_file_errors_on_missing_path() {
+        let path = std::env::temp_dir().join(format!("v2w_sha_missing_{}.bin", std::process::id()));
+        let _ = fs::remove_file(&path);
+        assert!(sha256_file(&path).is_err());
+    }
+
+    /// 续传起点只在「已有内容且未下满」时给出偏移，其余一律 `None`。
+    #[test]
+    fn resume_offset_rules() {
+        // 无残留 / 空文件：从头下
+        assert_eq!(resume_offset(0, 1000), None);
+        // 已下满 / 超出：不再发 Range，交给上层做校验
+        assert_eq!(resume_offset(1000, 1000), None);
+        assert_eq!(resume_offset(1200, 1000), None);
+        // 大小未知：无法判断续传点，从头下
+        assert_eq!(resume_offset(500, 0), None);
+        // 中间态：从已有长度继续
+        assert_eq!(resume_offset(500, 1000), Some(500));
+        assert_eq!(resume_offset(1, 2), Some(1));
+    }
+
+    /// `Range` 头必须是「从 offset 到文件末尾」的开区间写法。
+    #[test]
+    fn range_header_formats_open_ended_offset() {
+        assert_eq!(range_header(0), "bytes=0-");
+        assert_eq!(range_header(500), "bytes=500-");
+        assert_eq!(range_header(4_078_768), "bytes=4078768-");
     }
 }

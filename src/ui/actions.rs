@@ -43,6 +43,15 @@ fn self_notice_import(this: &mut MainWindow, stem: &str, count: usize, is_txt: b
 /// 剪映（含导出到文件夹）/ FCPXML / Premiere XML 不走这条单文件链路
 /// （整个草稿目录或专用 exporter），由 `perform_editor_export` 的 `match`
 /// 提前分流，不会走到这里。
+/// 烧录临时 ASS 的进程内唯一序号（跨进程由 pid 区分，进程内靠原子自增）。
+///
+/// 与 `ffmpeg::temp_wav_path` 同一思路：避免并发/连续烧录时两条任务算出同一个
+/// `%TEMP%` 文件名，后写者覆盖前一个仍在被 FFmpeg 读取的字幕。
+fn burn_temp_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
 fn editor_export_format_string(fmt: EditorExportFormat) -> &'static str {
     match fmt {
         EditorExportFormat::Srt => "srt",
@@ -2489,6 +2498,98 @@ impl MainWindow {
         }
     }
 
+    /// 把当前字幕**烧录**（硬字幕合成）进视频，导出一个自带字幕的新 mp4。
+    ///
+    /// 这是「导出带字幕的成品视频」入口：与其它字幕导出（写 .srt/.ass 文件）不同，
+    /// 它调 FFmpeg 把字幕按当前样式渲染进画面并重新编码。字幕先写成临时 ASS
+    /// （内嵌样式，FFmpeg 的 `subtitles` 滤镜据此渲染），烧录完成后立即删除。
+    pub(crate) fn export_burned_video(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.state.selected_file.clone() else {
+            self.state.status =
+                ProcessStatus::Failed("请先打开一个视频文件，再烧录字幕".to_string());
+            cx.notify();
+            return;
+        };
+        if self.state.segments.is_empty() {
+            return;
+        }
+        self.state.flush_segments_if_dirty();
+
+        let segments = self.state.segments.clone();
+        let mode = self.editor_export_mode;
+        let style = self.state.config.subtitle_style.clone();
+        let ffmpeg_path = crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
+        let stem = input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("video")
+            .to_string();
+        let default_name = format!("{stem}_hardsub.mp4");
+
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("选择字幕烧录视频的保存位置")
+                .set_file_name(&default_name)
+                .add_filter("MP4 视频", &["mp4"])
+                .save_file()
+                .await;
+            let Some(save_handle) = handle else {
+                return;
+            };
+            let output = save_handle.path().to_path_buf();
+
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    // 临时 ASS：把当前样式写进字幕头，FFmpeg 的 subtitles 滤镜会按
+                    // 内嵌样式渲染，实现「预览即所得」的硬字幕。
+                    let sub_path = std::env::temp_dir().join(format!(
+                        "voice2word_burn_{}_{}.ass",
+                        std::process::id(),
+                        burn_temp_seq()
+                    ));
+                    let _ = std::fs::remove_file(&sub_path);
+                    SubtitleWriter::write_ass_with_style(&segments, &sub_path, mode, &style)?;
+                    let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
+                    let result = ffmpeg.burn_subtitles(
+                        &input,
+                        &sub_path,
+                        &output,
+                        &crate::engines::ffmpeg::BurnOptions::default(),
+                    );
+                    // 无论成败都清掉临时字幕，避免在 %TEMP% 里累积
+                    let _ = std::fs::remove_file(&sub_path);
+                    result
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                match res {
+                    Ok(path) => {
+                        info!("字幕烧录视频导出成功: {:?}", path);
+                        // 成品可能较大，直接打开所在目录方便用户找到文件
+                        if let Some(dir) = path.parent() {
+                            let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                        }
+                        this.notice = Some(format!(
+                            "已烧录字幕并导出视频：{}",
+                            path.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| path.display().to_string())
+                        ));
+                        this.state.status = ProcessStatus::Idle;
+                    }
+                    Err(e) => {
+                        tracing::error!("字幕烧录失败: {:?}", e);
+                        this.state.status = ProcessStatus::Failed(format!("字幕烧录失败: {}", e));
+                        this.notice = None;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
     /// 根据当前剪辑工作台选中的格式执行统一导出
     pub(crate) fn perform_editor_export(&mut self, cx: &mut Context<Self>) {
         self.state.flush_segments_if_dirty();
@@ -2510,6 +2611,7 @@ impl MainWindow {
             EditorExportFormat::JianYingFolder => self.export_jianying_folder(cx),
             EditorExportFormat::Fcpxml => self.export_fcpxml(cx),
             EditorExportFormat::PremiereXml => self.export_premiere_xml(cx),
+            EditorExportFormat::BurnVideo => self.export_burned_video(cx),
             EditorExportFormat::Srt
             | EditorExportFormat::Ass
             | EditorExportFormat::Txt
@@ -3111,7 +3213,7 @@ mod tests {
         }
     }
 
-    /// 上层的 `match` 已经替剪映 / FCPXML / Premiere XML 分流，它们不会走到
+    /// 上层的 `match` 已经替剪映 / FCPXML / Premiere XML / 烧录视频分流，它们不会走到
     /// 单文件导出；万一漏进来，也必须落在一个 writer 一定写得出来的格式上，
     /// 而不是 `unreachable!()` 把 UI 线程打挂。
     #[test]
@@ -3121,6 +3223,7 @@ mod tests {
             EditorExportFormat::JianYingFolder,
             EditorExportFormat::Fcpxml,
             EditorExportFormat::PremiereXml,
+            EditorExportFormat::BurnVideo,
         ] {
             assert_eq!(
                 editor_export_format_string(fmt),

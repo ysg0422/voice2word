@@ -47,6 +47,47 @@ fn temp_wav_path(stem: &str) -> PathBuf {
     ))
 }
 
+/// 构造烧录字幕用的 `-vf` 滤镜串。
+///
+/// 入参必须是**纯文件名**（不含目录）：调用方需把子进程工作目录切到字幕所在
+/// 目录，否则 Windows 绝对路径的盘符冒号会被滤镜解析器当成选项分隔符。
+/// 抽成纯函数是为了让滤镜串可被单测直接断言，不必真的起 FFmpeg。
+fn subtitle_burn_filter(subtitle_file_name: &str) -> String {
+    format!(
+        "subtitles=filename='{}',scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        subtitle_file_name
+    )
+}
+/// 字幕烧录（硬字幕合成）的编码参数。
+///
+/// 烧录是一条**纯软解 + 重编码**链路：把字幕滤镜结果与视频帧一起重新编码成新
+/// 视频，因此它与音频 / 转写链路一样**不启用输入侧硬解**（见文件头「硬解边界」）。
+/// 默认参数偏向「一次成功、体积可控」：H.264 + CRF 20 + veryfast + AAC 192k。
+#[derive(Debug, Clone)]
+pub struct BurnOptions {
+    /// 视频编码器。
+    pub video_codec: String,
+    /// 恒定质量因子（CRF，越小越清晰、体积越大；libx264 常用 18~23）。
+    pub crf: u32,
+    /// 编码预设（越慢压缩率越高；`veryfast` 兼顾速度与体积）。
+    pub preset: String,
+    /// 音频编码器。
+    pub audio_codec: String,
+    /// 音频码率。
+    pub audio_bitrate: String,
+}
+
+impl Default for BurnOptions {
+    fn default() -> Self {
+        Self {
+            video_codec: "libx264".to_string(),
+            crf: 20,
+            preset: "veryfast".to_string(),
+            audio_codec: "aac".to_string(),
+            audio_bitrate: "192k".to_string(),
+        }
+    }
+}
 pub struct FFmpegEngine {
     ffmpeg_path: PathBuf,
 }
@@ -496,6 +537,73 @@ impl FFmpegEngine {
         }
         Ok(out_wav)
     }
+
+    /// 把字幕**烧录**（硬字幕合成）进视频，输出一个自带字幕的新视频文件。
+    ///
+    /// 与预览链路（`play_video` 的 ffplay `subtitles=` 叠加）不同：那是「看」，
+    /// 这里是「焊死进画面」，用户拿到成品可直接分发，无需再进剪辑软件压一遍。
+    ///
+    /// # 为什么字幕只传文件名
+    ///
+    /// 字幕滤镜参数里的路径会被 FFmpeg 滤镜语法解析，Windows 绝对路径的盘符
+    /// 冒号（`C:`）会被当成选项分隔符而报错。这里把子进程工作目录切到字幕所在
+    /// 目录、只传文件名，与预览链路是同一套规避方式。
+    ///
+    /// # 滤镜链
+    ///
+    /// `subtitles=` 负责按 ASS 内嵌样式渲染字幕；其后接
+    /// `scale=trunc(iw/2)*2:trunc(ih/2)*2` 把宽高对齐到偶数——libx264 的
+    /// `yuv420p` 对奇数尺寸会直接编码失败，这一步只可能改动 1px，肉眼不可见。
+    pub fn burn_subtitles(
+        &self,
+        input: &Path,
+        subtitle: &Path,
+        output: &Path,
+        opts: &BurnOptions,
+    ) -> Result<PathBuf> {
+        let sub_dir = subtitle.parent().filter(|p| !p.as_os_str().is_empty());
+        let sub_name = subtitle
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("字幕文件名不是合法 UTF-8，无法构造烧录滤镜")?;
+
+        if let Some(parent) = output.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("创建输出目录失败: {:?}", parent))?;
+            }
+        }
+
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        // 跟随全局让路设置（与其它子进程一致，尊重用户的「不抢占」开关）
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
+        if let Some(dir) = sub_dir {
+            cmd.current_dir(dir);
+        }
+        let status = cmd
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .arg("-i")
+            .arg(input)
+            .arg("-vf")
+            .arg(subtitle_burn_filter(sub_name))
+            .args(["-c:v", &opts.video_codec])
+            .arg("-preset")
+            .arg(&opts.preset)
+            .arg("-crf")
+            .arg(opts.crf.to_string())
+            .args(["-pix_fmt", "yuv420p"])
+            .args(["-c:a", &opts.audio_codec])
+            .arg("-b:a")
+            .arg(&opts.audio_bitrate)
+            .arg(output)
+            .status()
+            .with_context(|| format!("执行 FFmpeg 字幕烧录失败: {:?}", self.ffmpeg_path))?;
+
+        if !status.success() {
+            anyhow::bail!("FFmpeg 字幕烧录返回非零退出码");
+        }
+        Ok(output.to_path_buf())
+    }
 }
 
 #[cfg(test)]
@@ -547,5 +655,34 @@ mod tests {
             !src.contains("\"-hwaccel\""),
             "抽音频 / 抽帧链路不得出现 -hwaccel：硬解只允许加在预览 / 代理链路（见文件头说明）"
         );
+    }
+
+    /// 烧录滤镜串必须只带**文件名**（不含目录），且宽高对齐到偶数：
+    /// 前者防止 Windows 盘符冒号被滤镜语法误判，后者防止 libx264 因奇数尺寸失败。
+    #[test]
+    fn burn_filter_uses_filename_only_and_even_dimensions() {
+        let f = subtitle_burn_filter("voice2word_burn_1.ass");
+        assert_eq!(
+            f,
+            "subtitles=filename='voice2word_burn_1.ass',scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        );
+        assert!(!f.contains("C:"), "滤镜串不应内嵌盘符绝对路径");
+        // 即便调用方误传绝对路径，也应只在 file_name 处取值（此处直接验证 helper
+        // 不会自作主张地拼接目录，因为目录由 current_dir 负责）。
+        let abs = Path::new(r"C:\temp\sub.ass");
+        let only_name = subtitle_burn_filter(abs.file_name().unwrap().to_str().unwrap());
+        assert_eq!(
+            only_name,
+            "subtitles=filename='sub.ass',scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        );
+    }
+
+    /// 烧录默认参数应产出「通用播放器可放」的成品：H.264 + AAC。
+    #[test]
+    fn burn_options_default_is_mp4_friendly() {
+        let o = BurnOptions::default();
+        assert_eq!(o.video_codec, "libx264");
+        assert_eq!(o.audio_codec, "aac");
+        assert!((18..=23).contains(&o.crf), "CRF 应落在常见质量区间");
     }
 }

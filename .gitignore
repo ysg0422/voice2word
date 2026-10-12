@@ -98,3 +98,6 @@ glossary.txt
 # 子智能体做「隔离编译验证」时可能在仓库根留下编译产物
 *.rlib
 *.rmeta
+
+# CLI 阶段产物 / 断点续跑缓存目录（--resume / --artifact-dir 的默认落点）
+.voice2word-stages/

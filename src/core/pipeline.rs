@@ -30,6 +30,159 @@ pub enum PipelineEvent {
     Error(String),
 }
 
+/// 转写引擎能力描述：把原先散落在 `run_with_options` 里的
+/// `is_sensevoice / can_stream / sv_parallel` 分支样板收敛为一次结构化查询。
+/// 新增引擎时只需扩展 [`EngineCapabilities::plan`]，管线其余部分只读字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineCapabilities {
+    /// 本次任务选用 SenseVoice 引擎
+    pub sensevoice: bool,
+    /// 走纯内存 PCM 管道推流（0 磁盘 I/O）
+    pub stream: bool,
+    /// SenseVoice 切块并行（多进程）
+    pub parallel_chunks: bool,
+    /// SenseVoice 单会话线程数（已按引擎上限 clamp）
+    pub sensevoice_threads: u32,
+}
+
+impl EngineCapabilities {
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan(
+        sensevoice_selected: bool,
+        sensevoice_available: bool,
+        use_gpu: bool,
+        audio_speed: f64,
+        duration_secs: f64,
+        cores: u32,
+        threads: Option<u32>,
+        chunk_threshold_secs: f64,
+    ) -> Self {
+        // 公式必须与改动前的内联逻辑逐条等价（见下方"等价公式"）
+        let sensevoice = sensevoice_selected;
+        let parallel_chunks = sensevoice
+            && sensevoice_available
+            && !use_gpu
+            && audio_speed <= 1.0
+            && duration_secs >= 180.0
+            && cores >= 4;
+        let stream = !parallel_chunks
+            && (sensevoice
+                || use_gpu
+                || duration_secs <= chunk_threshold_secs
+                || audio_speed > 1.0);
+        let sensevoice_threads = threads
+            .unwrap_or(crate::engines::sensevoice::MAX_THREADS)
+            .clamp(
+                crate::engines::sensevoice::MIN_THREADS,
+                crate::engines::sensevoice::MAX_THREADS,
+            );
+        Self {
+            sensevoice,
+            stream,
+            parallel_chunks,
+            sensevoice_threads,
+        }
+    }
+}
+
+/// 流水线阶段。用于替代散落的 `StageChanged("中文")` 字符串字面量，
+/// 并作为「每阶段产物落盘 / 断点续跑」的键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Stage {
+    ExtractAudio,
+    Preprocess,
+    Transcribe,
+    Rescue,
+    Punctuate,
+    Polish,
+    Write,
+}
+
+impl Stage {
+    pub const ALL: [Stage; 7] = [
+        Stage::ExtractAudio,
+        Stage::Preprocess,
+        Stage::Transcribe,
+        Stage::Rescue,
+        Stage::Punctuate,
+        Stage::Polish,
+        Stage::Write,
+    ];
+
+    /// UI 显示用的中文标签，必须与改动前 `StageChanged` 里的字面量完全一致。
+    pub fn label(self) -> &'static str {
+        match self {
+            Stage::ExtractAudio => "提取音频",
+            Stage::Preprocess => "音频预处理",
+            Stage::Transcribe => "语音识别",
+            Stage::Rescue => "置信度救场",
+            Stage::Punctuate => "极速标点",
+            Stage::Polish => "智能润色",
+            Stage::Write => "生成字幕",
+        }
+    }
+
+    /// 该阶段产物落盘的文件名（带序号，便于人工排查）。
+    pub fn artifact_file(self) -> &'static str {
+        match self {
+            Stage::ExtractAudio => "01_extract_audio.json",
+            Stage::Preprocess => "02_preprocess.json",
+            Stage::Transcribe => "03_transcribe.json",
+            Stage::Rescue => "04_rescue.json",
+            Stage::Punctuate => "05_punctuate.json",
+            Stage::Polish => "06_polish.json",
+            Stage::Write => "07_write.json",
+        }
+    }
+}
+
+/// 阶段产物落盘 / 读取。根目录由 [`TaskPipeline::set_artifact_dir`] 指定；
+/// 未指定时管线行为与历史完全一致（不写、不读）。
+#[derive(Debug, Clone)]
+pub struct StageArtifacts {
+    root: PathBuf,
+}
+
+impl StageArtifacts {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn path(&self, stage: Stage) -> PathBuf {
+        self.root.join(stage.artifact_file())
+    }
+
+    pub fn exists(&self, stage: Stage) -> bool {
+        self.path(stage).is_file()
+    }
+
+    /// 原子写：先写 `<file>.part` 再改名，失败不 panic（best-effort）。
+    pub fn write_segments(&self, stage: Stage, segments: &[Segment]) -> Result<()> {
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("创建阶段产物目录失败: {}", self.root.display()))?;
+        let path = self.path(stage);
+        let tmp = path.with_extension("json.part");
+        let data = serde_json::to_vec_pretty(segments).context("序列化阶段片段失败")?;
+        std::fs::write(&tmp, &data)
+            .with_context(|| format!("写入阶段产物失败: {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("替换阶段产物失败: {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn read_segments(&self, stage: Stage) -> Result<Option<Vec<Segment>>> {
+        let path = self.path(stage);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let data = std::fs::read(&path)
+            .with_context(|| format!("读取阶段产物失败: {}", path.display()))?;
+        let segments: Vec<Segment> = serde_json::from_slice(&data)
+            .with_context(|| format!("解析阶段产物失败: {}", path.display()))?;
+        Ok(Some(segments))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct WhisperRuntimeOptions {
     pub audio_speed: f64,
@@ -188,6 +341,12 @@ pub struct TaskPipeline {
     /// `None` = 从未写入（例如单测里裸构造的管线）→ 自动导出回落到无样式入口
     /// [`SubtitleWriter::write_to_file`]，与历史行为逐字节一致，绝不 panic。
     subtitle_style: Mutex<Option<SubtitleStyleConfig>>,
+    /// 阶段产物落盘目录：`None` = 不落盘（历史行为，逐字节一致）。
+    ///
+    /// 由调用方通过 [`Self::set_artifact_dir`] 指定，与 `subtitle_style` 同一层：
+    /// UI 线程写、任务线程读。开启后转写阶段会把最终片段原子落盘，
+    /// 并在下次运行时优先复用（断点续跑）。
+    artifact_dir: Mutex<Option<PathBuf>>,
 }
 
 impl TaskPipeline {
@@ -207,6 +366,7 @@ impl TaskPipeline {
             cancelled: Arc::new(AtomicBool::new(false)),
             parallel_workers: AtomicUsize::new(0),
             subtitle_style: Mutex::new(None),
+            artifact_dir: Mutex::new(None),
         }
     }
 
@@ -242,6 +402,16 @@ impl TaskPipeline {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// 指定阶段产物落盘目录（`None` = 关闭落盘 / 断点续跑，保持历史行为）。
+    pub fn set_artifact_dir(&self, dir: Option<PathBuf>) {
+        *self.artifact_dir.lock().unwrap() = dir;
+    }
+
+    /// 当前阶段产物落盘目录；`None` = 未开启。
+    pub fn artifact_dir(&self) -> Option<PathBuf> {
+        self.artifact_dir.lock().unwrap().clone()
     }
 
     /// 设置润色（Qwen）推理线程数，对下一次润色生效
@@ -380,6 +550,8 @@ impl TaskPipeline {
         };
         self.whisper.set_vad_threshold(options.vad_threshold);
         let pipeline_started = Instant::now();
+        // 阶段产物落盘句柄：None = 历史行为（不写不读）。
+        let artifacts = self.artifact_dir().map(StageArtifacts::new);
 
         let out_path = output_file.unwrap_or_else(|| {
             let stem = input_file
@@ -397,7 +569,9 @@ impl TaskPipeline {
             let _ = tx.send(PipelineEvent::Finished(Vec::new(), Default::default()));
             return Ok(Vec::new());
         }
-        let _ = tx.send(PipelineEvent::StageChanged("提取音频".into()));
+        let _ = tx.send(PipelineEvent::StageChanged(
+            Stage::ExtractAudio.label().into(),
+        ));
         let _ = tx.send(PipelineEvent::Progress {
             stage: "提取音频".into(),
             progress: 0.1,
@@ -433,20 +607,23 @@ impl TaskPipeline {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4) as u32;
-        let sv_parallel = is_sensevoice
-            && self.sensevoice.is_some()
-            && !use_gpu
-            && audio_speed <= 1.0
-            && duration_for_chunks >= 180.0
-            && cores >= 4;
+        // 引擎能力一次性求解：并行切块 / 纯内存推流 / 单会话线程数的判定公式
+        // 集中在 [`EngineCapabilities::plan`]，此处只读结果，下游局部变量名保持不变。
+        let caps = EngineCapabilities::plan(
+            is_sensevoice,
+            self.sensevoice.is_some(),
+            use_gpu,
+            audio_speed,
+            duration_for_chunks,
+            cores,
+            threads,
+            crate::engines::chunk_threshold_secs(),
+        );
+        let is_sensevoice = caps.sensevoice;
+        let sv_parallel = caps.parallel_chunks;
         // SenseVoice 单会话在 8 线程附近已饱和，继续加线程反而更慢
         // （实测 16 线程 41.6s vs 8 线程 32.6s），故对单会话线程数设上限。
-        let sv_threads = threads
-            .unwrap_or(crate::engines::sensevoice::MAX_THREADS)
-            .clamp(
-                crate::engines::sensevoice::MIN_THREADS,
-                crate::engines::sensevoice::MAX_THREADS,
-            );
+        let sv_threads = caps.sensevoice_threads;
         // 并行进程数：0 = 自动（沿用引擎内按核数推导的调优默认值）
         let workers_override = match self.parallel_workers.load(Ordering::Relaxed) {
             0 => None,
@@ -455,11 +632,7 @@ impl TaskPipeline {
 
         // 判断是否启用纯内存管道推流 (In-Memory PCM Streaming Pipe):
         // 当使用 SenseVoice、启用 GPU 推理，或音频时长无需多进程切块时，直接以 0 磁盘 I/O 管道推流
-        let mut can_stream = !sv_parallel
-            && (is_sensevoice
-                || use_gpu
-                || duration_for_chunks <= crate::engines::chunk_threshold_secs()
-                || audio_speed > 1.0);
+        let mut can_stream = caps.stream;
 
         let mut ffmpeg_audio_sec = 0.0;
         // 临时 WAV 用守卫持有：本函数后续有多个 `?` / 取消提前返回点，
@@ -509,7 +682,9 @@ impl TaskPipeline {
                 });
                 info!("音频前端预处理：仅语音增强（停顿压实已关闭），保持纯内存推流通道");
             } else {
-                let _ = tx.send(PipelineEvent::StageChanged("音频预处理".into()));
+                let _ = tx.send(PipelineEvent::StageChanged(
+                    Stage::Preprocess.label().into(),
+                ));
                 let _ = tx.send(PipelineEvent::Progress {
                     stage: "音频预处理".into(),
                     progress: 0.12,
@@ -677,7 +852,9 @@ impl TaskPipeline {
             "Whisper 神经转写".to_string()
         };
 
-        let _ = tx.send(PipelineEvent::StageChanged("语音识别".into()));
+        let _ = tx.send(PipelineEvent::StageChanged(
+            Stage::Transcribe.label().into(),
+        ));
         let _ = tx.send(PipelineEvent::Progress {
             stage: "语音识别".into(),
             progress: 0.15,
@@ -705,9 +882,16 @@ impl TaskPipeline {
             .set_need_token_probs_for_quality(!is_sensevoice);
 
         let transcription_started = Instant::now();
-        let (mut segments, vad_sec, pure_whisper_sec) = if let (true, Some(sv)) =
-            (is_sensevoice, self.sensevoice.as_ref())
-        {
+        // 断点续跑：开启产物落盘且上一次已留下识别结果时直接复用。
+        // 落盘的是「已还原到原始媒体时间轴」的最终片段，因此下方必须跳过二次还原。
+        let resumed_segments = artifacts
+            .as_ref()
+            .and_then(|a| a.read_segments(Stage::Transcribe).ok().flatten());
+        let resumed = resumed_segments.is_some();
+        let (mut segments, vad_sec, pure_whisper_sec) = if let Some(segs) = resumed_segments {
+            info!("断点续跑：复用已落盘的识别结果（{} 段）", segs.len());
+            (segs, 0.0, 0.0)
+        } else if let (true, Some(sv)) = (is_sensevoice, self.sensevoice.as_ref()) {
             let sv_engine = sv.clone();
             let in_file_stream = input_file.clone();
             let ffmpeg_stream = ffmpeg.clone();
@@ -903,19 +1087,31 @@ impl TaskPipeline {
         // 救场按时间窗从原始媒体重新切片，只有拿到原始时间轴才能切对位置。
         // 这是**唯一**的最终还原入口：各转写分支返回的片段都必须原样交到这里，
         // 分支内部不得再对返回片段自行还原（详见 `restore_final_timeline`）。
-        restore_final_timeline(&mut segments, &restorer, is_sensevoice);
-        if prep_active {
-            crate::subtitle::optimize_segments(&mut segments);
-            info!(
-                segments = segments.len(),
-                ratio = restorer.plan.as_deref().map(|p| p.ratio()).unwrap_or(1.0),
-                "预处理时间轴已还原到原始媒体"
-            );
+        // 断点续跑时落盘的已是最终时间轴，重复还原会二次缩放，故整段跳过。
+        if !resumed {
+            restore_final_timeline(&mut segments, &restorer, is_sensevoice);
+            if prep_active {
+                crate::subtitle::optimize_segments(&mut segments);
+                info!(
+                    segments = segments.len(),
+                    ratio = restorer.plan.as_deref().map(|p| p.ratio()).unwrap_or(1.0),
+                    "预处理时间轴已还原到原始媒体"
+                );
+            }
         }
 
         // 转写已完成，临时 wav 不再需要：显式释放守卫，尽早把磁盘空间还给用户。
         // 注意这里不是「唯一的删除点」——取消 / 报错提前返回时守卫的 Drop 会同样生效。
         drop(temp_wav_path.take());
+
+        // best-effort 落盘转写产物（写失败只告警，绝不中断流水线）。
+        if !resumed {
+            if let Some(a) = artifacts.as_ref() {
+                if let Err(e) = a.write_segments(Stage::Transcribe, &segments) {
+                    warn!("转写产物落盘失败: {e:#}");
+                }
+            }
+        }
 
         if self.is_cancelled() {
             let _ = tx.send(PipelineEvent::Finished(
@@ -959,7 +1155,7 @@ impl TaskPipeline {
                     detail: "低置信片段较多，已跳过二次解码".into(),
                 });
             } else {
-                let _ = tx.send(PipelineEvent::StageChanged("置信度救场".into()));
+                let _ = tx.send(PipelineEvent::StageChanged(Stage::Rescue.label().into()));
                 info!(
                     spans = spans.len(),
                     total_span_sec = format!("{total_span_sec:.1}"),
@@ -1077,7 +1273,7 @@ impl TaskPipeline {
                 });
             } else if use_punc {
                 polish_engine_name = Some("CT-Punc 极速标点".to_string());
-                let _ = tx.send(PipelineEvent::StageChanged("极速标点".into()));
+                let _ = tx.send(PipelineEvent::StageChanged(Stage::Punctuate.label().into()));
                 let _ = tx.send(PipelineEvent::Progress {
                     stage: "极速标点".into(),
                     progress: 0.85,
@@ -1117,7 +1313,7 @@ impl TaskPipeline {
                 }
             } else if mode == "qwen" {
                 polish_engine_name = Some("Qwen 字幕润色".to_string());
-                let _ = tx.send(PipelineEvent::StageChanged("智能润色".into()));
+                let _ = tx.send(PipelineEvent::StageChanged(Stage::Polish.label().into()));
                 let _ = tx.send(PipelineEvent::Progress {
                     stage: "智能润色".into(),
                     progress: 0.6,
@@ -1167,7 +1363,7 @@ impl TaskPipeline {
                 info!("润色模式为关闭或未知: {}", mode);
             }
         } else {
-            let _ = tx.send(PipelineEvent::StageChanged("生成字幕".into()));
+            let _ = tx.send(PipelineEvent::StageChanged(Stage::Write.label().into()));
             let _ = tx.send(PipelineEvent::Progress {
                 stage: "生成字幕".into(),
                 progress: 0.96,
@@ -1245,7 +1441,7 @@ impl TaskPipeline {
         }
 
         // ── 阶段 4: 输出字幕文件（失败也不阻塞 Finished，避免界面一直转圈）──
-        let _ = tx.send(PipelineEvent::StageChanged("生成字幕".into()));
+        let _ = tx.send(PipelineEvent::StageChanged(Stage::Write.label().into()));
         crate::subtitle::optimize_segments(&mut segments);
         let writing_started = Instant::now();
         // 样式在收尾读出（`AppState` 写入；从未写入时为 `None`）。`None` → 走无样式
@@ -1931,6 +2127,148 @@ mod tests {
             // 折行会把行尾标点并回上一行，允许 +2 的余量
             assert!(line.chars().count() <= 12, "折行后单行超长: {line:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 引擎能力抽象：真值表与线程数 clamp ──
+
+    /// 纯 CPU、≥4 核、≥180s、1.0x 的 SenseVoice：切块并行，并放弃纯内存推流。
+    #[test]
+    fn engine_caps_long_sensevoice_multicore_prefers_parallel_chunks() {
+        let caps = EngineCapabilities::plan(true, true, false, 1.0, 600.0, 8, None, 300.0);
+        assert!(caps.sensevoice);
+        assert!(caps.parallel_chunks);
+        assert!(!caps.stream, "切块并行需要完整临时 WAV，不能走推流");
+    }
+
+    /// 时长不足 180s：不切块，退回 0 磁盘 I/O 的推流通道。
+    #[test]
+    fn engine_caps_short_sensevoice_streams_without_parallel() {
+        let caps = EngineCapabilities::plan(true, true, false, 1.0, 60.0, 8, None, 300.0);
+        assert!(caps.sensevoice);
+        assert!(!caps.parallel_chunks);
+        assert!(caps.stream);
+    }
+
+    /// 非 SenseVoice + GPU：长音频也不切块（切块只服务 SenseVoice），直接推流。
+    #[test]
+    fn engine_caps_gpu_streams_for_long_whisper() {
+        let caps = EngineCapabilities::plan(false, false, true, 1.0, 3600.0, 2, None, 300.0);
+        assert!(!caps.sensevoice);
+        assert!(!caps.parallel_chunks);
+        assert!(caps.stream);
+    }
+
+    /// 并行的四个否决条件各自单独生效：缺引擎实例 / 有 GPU / 变速 / 核数不足。
+    #[test]
+    fn engine_caps_parallel_requires_sensevoice_available_and_no_gpu() {
+        let no_engine = EngineCapabilities::plan(true, false, false, 1.0, 600.0, 8, None, 300.0);
+        assert!(!no_engine.parallel_chunks, "缺 SenseVoice 实例不得并行");
+        assert!(no_engine.stream);
+
+        let gpu = EngineCapabilities::plan(true, true, true, 1.0, 600.0, 8, None, 300.0);
+        assert!(!gpu.parallel_chunks, "有 GPU 不得并行");
+        assert!(gpu.stream);
+
+        let sped = EngineCapabilities::plan(true, true, false, 1.25, 600.0, 8, None, 300.0);
+        assert!(!sped.parallel_chunks, "音频加速 > 1.0 不得并行");
+        assert!(sped.stream);
+
+        let few_cores = EngineCapabilities::plan(true, true, false, 1.0, 600.0, 2, None, 300.0);
+        assert!(!few_cores.parallel_chunks, "核数 < 4 不得并行");
+        assert!(few_cores.stream);
+    }
+
+    /// 非 SenseVoice、CPU、超过阈值的长音频：既不能并行也不满足推流条件（走临时 WAV 切块）。
+    #[test]
+    fn engine_caps_long_whisper_cpu_does_not_stream() {
+        let caps = EngineCapabilities::plan(false, false, false, 1.0, 3600.0, 8, None, 300.0);
+        assert!(!caps.sensevoice);
+        assert!(!caps.parallel_chunks);
+        assert!(!caps.stream);
+    }
+
+    /// 单会话线程数必须按引擎上下界 clamp：`None` → 上限，过小 → 下界，过大 → 上限。
+    #[test]
+    fn engine_caps_threads_clamped_to_engine_bounds() {
+        let max = crate::engines::sensevoice::MAX_THREADS;
+        let min = crate::engines::sensevoice::MIN_THREADS;
+        let default = EngineCapabilities::plan(false, false, false, 1.0, 10.0, 4, None, 300.0);
+        assert_eq!(default.sensevoice_threads, max, "None 应回落到引擎上限");
+        let low = EngineCapabilities::plan(false, false, false, 1.0, 10.0, 4, Some(0), 300.0);
+        assert_eq!(low.sensevoice_threads, min, "下界应被 clamp 到 MIN_THREADS");
+        let high = EngineCapabilities::plan(false, false, false, 1.0, 10.0, 4, Some(999), 300.0);
+        assert_eq!(
+            high.sensevoice_threads, max,
+            "上界应被 clamp 到 MAX_THREADS"
+        );
+    }
+
+    // ── Stage 枚举与阶段产物落盘 ──
+
+    /// 每个阶段的中文标签与产物文件名都必须唯一且非空（UI 标签是 StageChanged 的键）。
+    #[test]
+    fn stage_labels_and_artifact_files_are_unique_and_non_empty() {
+        let mut labels = std::collections::HashSet::new();
+        let mut files = std::collections::HashSet::new();
+        for stage in Stage::ALL {
+            assert!(!stage.label().is_empty(), "{stage:?} 标签为空");
+            assert!(!stage.artifact_file().is_empty(), "{stage:?} 产物名为空");
+            assert!(labels.insert(stage.label()), "重复标签: {}", stage.label());
+            assert!(
+                files.insert(stage.artifact_file()),
+                "重复产物名: {}",
+                stage.artifact_file()
+            );
+        }
+        assert_eq!(labels.len(), Stage::ALL.len());
+        assert_eq!(files.len(), Stage::ALL.len());
+    }
+
+    /// UI 依赖的收尾阶段标签必须与历史字面量逐字一致。
+    #[test]
+    fn stage_write_label_matches_ui_literal() {
+        assert_eq!(Stage::Write.label(), "生成字幕");
+    }
+
+    /// 落盘 → 读取 round-trip；未落盘返回 `Ok(None)`；坏 JSON 返回 `Err`；不留 `.part` 残留。
+    #[test]
+    fn stage_artifacts_round_trip_and_tolerates_bad_json() {
+        let dir = tmp_dir("stage_artifacts");
+        let artifacts = StageArtifacts::new(dir.clone());
+
+        assert!(!artifacts.exists(Stage::Transcribe));
+        assert!(
+            artifacts
+                .read_segments(Stage::Transcribe)
+                .unwrap()
+                .is_none(),
+            "文件不存在必须返回 Ok(None)"
+        );
+
+        let segs = vec![
+            Segment::new(1, 0.0, 1.5, "第一句"),
+            Segment::new(2, 1.5, 3.0, "第二句"),
+        ];
+        artifacts.write_segments(Stage::Transcribe, &segs).unwrap();
+        assert!(artifacts.exists(Stage::Transcribe));
+        assert!(artifacts.path(Stage::Transcribe).is_file());
+        assert!(
+            !artifacts
+                .path(Stage::Transcribe)
+                .with_extension("json.part")
+                .exists(),
+            "原子写不应留下 .part 残留"
+        );
+        assert_eq!(
+            artifacts.read_segments(Stage::Transcribe).unwrap().unwrap(),
+            segs
+        );
+
+        // 解析失败必须是 Err（调用方自行决定容错），而不是 panic / Ok(None)
+        std::fs::write(artifacts.path(Stage::Transcribe), b"{ not json").unwrap();
+        assert!(artifacts.read_segments(Stage::Transcribe).is_err());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

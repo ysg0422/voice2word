@@ -37,6 +37,7 @@ pub enum EditorExportFormat {
     Json,           // JSON 结构化字幕（无损字段，供程序化消费 / 质检）
     EbuTtD,         // EBU-TT-D (TTML，广播分发)
     NetflixTtal,    // Netflix TTAL (TTML，流媒体交付)
+    BurnVideo,      // 字幕烧录视频（硬字幕合成，导出带字幕的新 mp4）
 }
 
 impl EditorExportFormat {
@@ -53,6 +54,7 @@ impl EditorExportFormat {
             Self::Json => "JSON 结构化字幕 (.json)",
             Self::EbuTtD => "EBU-TT-D 广播字幕 (.ttml)",
             Self::NetflixTtal => "Netflix TTAL (.ttal)",
+            Self::BurnVideo => "烧录字幕视频 (.mp4)",
         }
     }
 
@@ -73,6 +75,7 @@ impl EditorExportFormat {
             Self::Json => "json",
             Self::EbuTtD => "ttml",
             Self::NetflixTtal => "ttal",
+            Self::BurnVideo => "burn_video",
         }
     }
 
@@ -93,6 +96,7 @@ impl EditorExportFormat {
             "json" => Self::Json,
             "ttml" | "ebu_tt_d" => Self::EbuTtD,
             "ttal" | "netflix_ttal" => Self::NetflixTtal,
+            "burn_video" | "burn" | "hardsub" => Self::BurnVideo,
             _ => Self::default(),
         }
     }
@@ -110,6 +114,7 @@ impl EditorExportFormat {
             Self::Json,
             Self::EbuTtD,
             Self::NetflixTtal,
+            Self::BurnVideo,
         ]
     }
 }
@@ -1684,6 +1689,26 @@ impl MainWindow {
                     ),
             )
     }
+
+    /// 任一文本输入类控件是否持有焦点。
+    ///
+    /// 裸键（Space / Delete）只有在该判定为 `false` 时才真正生效：GPUI 的动作在冒泡
+    /// 阶段默认停止传播，若在输入框内不主动 `cx.propagate()`，空格会被动作系统吃掉，
+    /// 用户就打不出空格。这里集中聚合所有「已真实接线」的输入焦点句柄，
+    /// 避免每加一个裸键都要重新列一遍。
+    fn any_input_focused(&self, window: &Window, cx: &App) -> bool {
+        self.text_focus.contains_focused(window, cx)
+            || self.subtitle_search_focus.contains_focused(window, cx)
+            || self.replace_find_focus.contains_focused(window, cx)
+            || self.replace_with_focus.contains_focused(window, cx)
+            || self.export_template_focus.contains_focused(window, cx)
+            || self.style_field_focus.contains_focused(window, cx)
+            || self.inline_edit_focus.contains_focused(window, cx)
+            || self.api_base_focus.contains_focused(window, cx)
+            || self.api_model_focus.contains_focused(window, cx)
+            || self.api_key_focus.contains_focused(window, cx)
+            || self.local_model_focus.contains_focused(window, cx)
+    }
 }
 
 impl Render for MainWindow {
@@ -1729,6 +1754,9 @@ impl Render for MainWindow {
         let tab = self.state.active_tab;
         // 布局随窗口宽度降级（窄窗口下剪辑台改为上下堆叠），这里取本帧的视口宽度下发
         let viewport_w = f32::from(window.viewport_size().width);
+        // 视口高度同样下发：监视器画面按真实宽高比等比内接需要「可用高度」这一维，
+        // 只给宽度的话竖屏 / 方屏视频会溢出视口。
+        let viewport_h = f32::from(window.viewport_size().height);
 
         let root = div()
             .relative()
@@ -1761,6 +1789,25 @@ impl Render for MainWindow {
                     }
                     // 转写期间预览解码会与 ASR 抢 CPU/内存带宽，此时不允许用快捷键起播
                     if matches!(this.state.status, ProcessStatus::Processing { .. }) {
+                        return;
+                    }
+                    this.toggle_play_preview(cx);
+                }),
+            )
+            // 裸 Space：仅当焦点不在任何输入框时才切播。焦点在输入框里时 `cx.propagate()`
+            // 让按键继续冒泡到输入组件，用户才能正常打空格；其余守卫与 Ctrl+Space 逐条对齐。
+            .on_action(
+                cx.listener(|this, _: &shortcuts::TogglePlaybackBare, window, cx| {
+                    if this.any_input_focused(window, cx) {
+                        cx.propagate();
+                        return;
+                    }
+                    if this.command_palette.is_some() {
+                        cx.propagate();
+                        return;
+                    }
+                    if matches!(this.state.status, ProcessStatus::Processing { .. }) {
+                        cx.propagate();
                         return;
                     }
                     this.toggle_play_preview(cx);
@@ -1946,6 +1993,23 @@ impl Render for MainWindow {
                     cx.notify();
                 }),
             )
+            // 裸 Delete：删除当前选中句（与编辑器「删除」按钮同源）。焦点在输入框时放行，
+            // 否则在字幕文本框里按 Delete 会被动作系统吃掉，退格/删除就打不出来。
+            .on_action(
+                cx.listener(|this, _: &shortcuts::DeleteActiveSegment, window, cx| {
+                    if this.any_input_focused(window, cx) {
+                        cx.propagate();
+                        return;
+                    }
+                    if this.command_palette.is_some() {
+                        cx.propagate();
+                        return;
+                    }
+                    this.state.delete_selected_segment();
+                    this.trigger_extract_frame(cx);
+                    cx.notify();
+                }),
+            )
             // 1. 顶部自定义标题栏 (极简沉浸式，包含窗口拖拽与控制按钮)
             .child(self.render_titlebar(cx))
             // 1.5 全局失败提示条：`ProcessStatus::Failed` 的产生点遍布导出 / 预览 /
@@ -1971,9 +2035,9 @@ impl Render for MainWindow {
                     .w_full()
                     .overflow_hidden()
                     .child(match tab {
-                        WorkspaceTab::Editor => {
-                            self.render_editor_layout(viewport_w, cx).into_any_element()
-                        }
+                        WorkspaceTab::Editor => self
+                            .render_editor_layout(viewport_w, viewport_h, cx)
+                            .into_any_element(),
                         WorkspaceTab::Generate => {
                             self.render_generate_layout(cx).into_any_element()
                         }

@@ -16,6 +16,7 @@ Voice2Word 是一款**完全本地运行**的音视频字幕工作台，覆盖�
 - [从源码构建](#从源码构建)
 - [配置说明](#配置说明)
 - [目录结构](#目录结构)
+- [命令行与集成](#命令行与集成)
 - [许可证](#许可证)
 
 ## 功能特性
@@ -251,6 +252,23 @@ examples/     基准与评测工具（cargo run --example <name>）
 scripts/      算法 A/B、CER 评测、模型量化等脚本
 docs/         优化记录与设计规范
 ```
+
+## 命令行与集成
+
+除图形界面外，Voice2Word 提供无头命令行（CLI），并附带 Claude Code / Codex Skill 与 MCP 服务器，便于脚本化与 AI 工具调用：
+
+- 完整说明见 [集成说明：CLI 与 MCP](docs/集成说明-CLI与MCP.md)。
+- 集成资产位于 [integrations/](integrations/)：
+  - [integrations/voice2word-skill/](integrations/voice2word-skill/)：Skill（`SKILL.md` + `scripts/transcribe.ps1`）。
+  - [integrations/mcp-server/](integrations/mcp-server/)：MCP stdio 服务器（`voice2word_mcp.py` + 协议测试）。
+
+快速开始：
+
+```powershell
+voice2word transcribe talk.mp4 -o out\talk.srt --format srt --lang zh
+```
+
+进度与诊断写入 stderr，最终结果路径写入 stdout，便于重定向只取结果。
 
 ## 许可证
 

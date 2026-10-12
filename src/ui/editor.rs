@@ -129,6 +129,61 @@ const EDITOR_STACK_BELOW_W: f32 = 820.0;
 /// 上下堆叠布局下视频监视器固定占用的高度（监视器自身最少需要 36+180+52=268）。
 const EDITOR_STACK_MONITOR_H: f32 = 320.0;
 
+/// 左右分栏时中间分隔条的宽度（与 `editor-split-divider` 的 `w` 保持一致）
+const EDITOR_SPLIT_DIVIDER_W: f32 = 5.0;
+
+/// 视频画面在监视器视口内屏里的最大占比：四周留出对称留白，避免画面顶满整块黑底
+/// 而显得过大。1.0 表示顶满；调小可让预览画面更小、留白更多。
+const MONITOR_VIDEO_FIT_FRAC: f32 = 0.78;
+
+/// 在 `avail_w × avail_h` 的容器内按 `aspect`（宽/高）等比内接得到的最大尺寸。
+/// 任一输入非有限或非正时返回 `(0.0, 0.0)`，交由调用方降级处理。
+fn fit_video_size(aspect: f32, avail_w: f32, avail_h: f32) -> (f32, f32) {
+    let invalid = !aspect.is_finite()
+        || aspect <= 0.0
+        || !avail_w.is_finite()
+        || !avail_h.is_finite()
+        || avail_w <= 0.0
+        || avail_h <= 0.0;
+    if invalid {
+        return (0.0, 0.0);
+    }
+    let height_by_width = avail_w / aspect;
+    if height_by_width <= avail_h {
+        (avail_w, height_by_width)
+    } else {
+        (avail_h * aspect, avail_h)
+    }
+}
+
+/// 监视器「视口内屏」（画面可用的那块黑底区域）的像素尺寸估算。
+///
+/// 由窗口视口尺寸、布局模式（左右二分 / 上下堆叠）与右侧面板宽度推出，用于把画面按
+/// 真实宽高比等比内接——不再依赖 taffy 的 aspect-ratio 推导，竖屏/方屏视频也不会溢出。
+fn monitor_screen_size(
+    viewport_w: f32,
+    viewport_h: f32,
+    is_processing: bool,
+    stacked: bool,
+    right_w: f32,
+) -> (f32, f32) {
+    // 视口内屏 = 监视器外框去掉标头与控制条
+    let chrome_v = Theme::HEADER_H_SM + Theme::CONTROL_BAR_H;
+    let screen_h = if stacked {
+        EDITOR_STACK_MONITOR_H - chrome_v
+    } else {
+        let editor_h =
+            viewport_h - Theme::TITLEBAR_H - if is_processing { Theme::BANNER_H } else { 0.0 };
+        editor_h - Theme::TIMELINE_H - chrome_v
+    };
+    let screen_w = if stacked {
+        viewport_w
+    } else {
+        viewport_w - right_w - EDITOR_SPLIT_DIVIDER_W
+    };
+    (screen_w.max(0.0), screen_h.max(0.0))
+}
+
 /// 上下并列字幕行高度（双语模式：时间 + 原文 + 译文）
 const SUBTITLE_ROW_H_BILINGUAL: f32 = 82.0;
 /// 上下并列字幕行高度（单语模式：时间 + 原文）
@@ -168,11 +223,20 @@ impl MainWindow {
     pub(crate) fn render_editor_layout(
         &mut self,
         viewport_w: f32,
+        viewport_h: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
         // 布局随窗口宽度二选一，见 `EDITOR_STACK_BELOW_W` 的说明
         let stacked = viewport_w < EDITOR_STACK_BELOW_W;
+        // 右侧字幕面板宽度：与下面的拖动逻辑同源，这里先算一次，供监视器尺寸估算复用
+        let right_w = self
+            .editor_split_w
+            .unwrap_or(EDITOR_RIGHT_PANEL_W)
+            .clamp(360.0, (viewport_w * 0.5).max(360.0));
+        // 监视器视口内屏尺寸（画面等比内接的可用空间）
+        let monitor_screen =
+            monitor_screen_size(viewport_w, viewport_h, is_processing, stacked, right_w);
 
         div()
             .id("editor-workspace-layout")
@@ -239,7 +303,7 @@ impl MainWindow {
                             .border_b_1()
                             .border_color(Theme::border())
                             .overflow_hidden()
-                            .child(self.render_video_monitor(cx)),
+                            .child(self.render_video_monitor(monitor_screen, cx)),
                     )
                     .child(
                         div()
@@ -250,10 +314,6 @@ impl MainWindow {
                             .child(self.render_subtitle_inspector(true, cx)),
                     )
             } else {
-                let right_w = self
-                    .editor_split_w
-                    .unwrap_or(EDITOR_RIGHT_PANEL_W)
-                    .clamp(360.0, (viewport_w * 0.5).max(360.0));
                 let is_dragging = self.editor_split_drag.is_some();
 
                 div()
@@ -298,7 +358,7 @@ impl MainWindow {
                             .h_full()
                             .min_w(px(EDITOR_LEFT_MIN_W))
                             .overflow_hidden()
-                            .child(self.render_video_monitor(cx)),
+                            .child(self.render_video_monitor(monitor_screen, cx)),
                     )
                     // 中间：可自由拖动的分隔条（宽度不超过窗口的 50%）
                     .child(
@@ -339,7 +399,11 @@ impl MainWindow {
     }
 
     /// 渲染专业视频监视器 (Preview Monitor)
-    pub(crate) fn render_video_monitor(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_video_monitor(
+        &mut self,
+        screen: (f32, f32),
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let cur_time = self.state.current_time;
         let tot_time = self.state.total_duration.max(1.0);
         let active_seg = self.state.get_active_segment().cloned();
@@ -415,8 +479,24 @@ impl MainWindow {
                     // 保证字幕始终压在画面上而不是视口黑边里
                     .child({
                         let video_aspect = self.state.video_aspect();
-                        let mut stage = div().relative().w_full().max_h_full();
-                        stage.style().aspect_ratio = Some(video_aspect);
+                        // 画面尺寸由「视口内屏尺寸 + 视频宽高比」显式算出并双向内接，
+                        // 而不是靠 taffy 的 aspect-ratio 推导：后者在竖屏/方屏下宽度不会
+                        // 随高度收缩，画面会溢出视口。显式尺寸下「监视器里看到多大，
+                        // 字幕覆盖层的定位基准就是多大」，两者永远一致。
+                        let (screen_w, screen_h) = screen;
+                        let (fit_w, fit_h) = fit_video_size(
+                            video_aspect,
+                            screen_w * MONITOR_VIDEO_FIT_FRAC,
+                            screen_h * MONITOR_VIDEO_FIT_FRAC,
+                        );
+                        let mut stage = div().relative();
+                        if fit_w > 0.0 && fit_h > 0.0 {
+                            stage = stage.w(px(fit_w)).h(px(fit_h));
+                        } else {
+                            // 尺寸不可得（视口尚未测量 / 比例非法）时退回旧的自适应行为
+                            stage = stage.w_full().max_h_full();
+                            stage.style().aspect_ratio = Some(video_aspect);
+                        }
                         stage
                             // 视频画面展示 (实时内嵌播放 vs 静态时间轴帧)
                             .child(self.render_monitor_picture())
@@ -629,7 +709,7 @@ impl MainWindow {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(img(render_img).size_full())
+                    .child(img(render_img).size_full().object_fit(ObjectFit::Contain))
             } else {
                 div().size_full()
             }
@@ -641,7 +721,11 @@ impl MainWindow {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(img(frame_path.clone()).size_full())
+                .child(
+                    img(frame_path.clone())
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
+                )
         } else if self.state.selected_file.is_some() {
             div().flex().flex_col().items_center().gap_1p5().child(
                 div()
@@ -5451,8 +5535,12 @@ impl MainWindow {
 #[cfg(test)]
 mod tests {
     use super::translated_out_count;
+    use super::{
+        fit_video_size, monitor_screen_size, EDITOR_STACK_MONITOR_H, MONITOR_VIDEO_FIT_FRAC,
+    };
     use crate::subtitle::Segment;
     use crate::ui::primitives::should_consume_scroll;
+    use crate::ui::theme::Theme;
 
     /// 回归（P2）：「已全部翻译」的判定必须用**实际译出**口径。
     /// 引擎可能给空串/纯空白译文打上 `translation_lang`（或直接复制原文），
@@ -5511,5 +5599,94 @@ mod tests {
 
         // 横向滚轮（dy == 0）不拦
         assert!(!should_consume_scroll(0.0, -50.0, max_h), "横向滚轮应放行");
+    }
+
+    /// 浮点近似比较（尺寸推导允许亚像素误差）
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.05
+    }
+
+    #[test]
+    fn fit_video_size_landscape_is_width_limited() {
+        // 16:9 放进 800×700：宽度先触边，得到 800×450
+        let (w, h) = fit_video_size(16.0 / 9.0, 800.0, 700.0);
+        assert!(close(w, 800.0), "w={w}");
+        assert!(close(h, 450.0), "h={h}");
+    }
+
+    #[test]
+    fn fit_video_size_portrait_is_height_limited() {
+        // 9:16 放进 800×700：高度先触边，宽度随之收缩，绝不溢出
+        let (w, h) = fit_video_size(9.0 / 16.0, 800.0, 700.0);
+        assert!(close(h, 700.0), "h={h}");
+        assert!(close(w, 700.0 * 9.0 / 16.0), "w={w}");
+        assert!(w <= 800.0 && h <= 700.0, "不得超出可用区域");
+    }
+
+    #[test]
+    fn fit_video_size_square_fills_shorter_axis() {
+        let (w, h) = fit_video_size(1.0, 640.0, 480.0);
+        assert!(close(w, 480.0) && close(h, 480.0), "w={w} h={h}");
+    }
+
+    #[test]
+    fn fit_video_size_rejects_degenerate_inputs() {
+        assert_eq!(fit_video_size(0.0, 800.0, 700.0), (0.0, 0.0));
+        assert_eq!(fit_video_size(-1.0, 800.0, 700.0), (0.0, 0.0));
+        assert_eq!(fit_video_size(f32::NAN, 800.0, 700.0), (0.0, 0.0));
+        assert_eq!(fit_video_size(f32::INFINITY, 800.0, 700.0), (0.0, 0.0));
+        assert_eq!(fit_video_size(16.0 / 9.0, 0.0, 700.0), (0.0, 0.0));
+        assert_eq!(fit_video_size(16.0 / 9.0, 800.0, -10.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn monitor_screen_size_subtracts_split_and_chrome() {
+        // 1920×1080、非处理中、左右二分、右栏 400：
+        // 宽 = 1920 - 400 - 5 = 1515；高 = 1080 - 38(标题) - 134(时间轴) - 36(标头) - 52(控制条) = 820
+        let (w, h) = monitor_screen_size(1920.0, 1080.0, false, false, 400.0);
+        assert!(close(w, 1515.0), "w={w}");
+        assert!(close(h, 820.0), "h={h}");
+    }
+
+    #[test]
+    fn monitor_screen_size_subtracts_banner_while_processing() {
+        let (_, h_idle) = monitor_screen_size(1920.0, 1080.0, false, false, 400.0);
+        let (_, h_busy) = monitor_screen_size(1920.0, 1080.0, true, false, 400.0);
+        assert!(
+            close(h_idle - h_busy, Theme::BANNER_H),
+            "处理中应让出横幅高度"
+        );
+    }
+
+    #[test]
+    fn monitor_screen_size_stacked_uses_full_width_and_fixed_height() {
+        let (w, h) = monitor_screen_size(700.0, 1000.0, false, true, 400.0);
+        assert!(close(w, 700.0), "堆叠布局下监视器占整行宽度");
+        assert!(
+            close(
+                h,
+                EDITOR_STACK_MONITOR_H - Theme::HEADER_H_SM - Theme::CONTROL_BAR_H
+            ),
+            "h={h}"
+        );
+    }
+
+    #[test]
+    fn monitor_screen_size_never_returns_negative() {
+        let (w, h) = monitor_screen_size(100.0, 50.0, true, false, 400.0);
+        assert_eq!((w, h), (0.0, 0.0), "极小视口下退化为 0，交由降级分支处理");
+    }
+
+    #[test]
+    fn monitor_video_fit_fraction_leaves_margin() {
+        // 16:9 视频在 1920×1080 二分布局下，按占比内接后应严格小于视口内屏
+        let screen = monitor_screen_size(1920.0, 1080.0, false, false, 400.0);
+        let (w, h) = fit_video_size(
+            16.0 / 9.0,
+            screen.0 * MONITOR_VIDEO_FIT_FRAC,
+            screen.1 * MONITOR_VIDEO_FIT_FRAC,
+        );
+        assert!(w > 0.0 && h > 0.0);
+        assert!(w < screen.0 && h < screen.1, "四周必须留白，避免画面顶满");
     }
 }

@@ -1,11 +1,13 @@
 //! 全局快捷键 (F-017)
 //!
-//! 设计取舍：**全部采用「修饰键 + 键」的组合，不占用裸字符键**。
+//! 设计取舍：**修饰键组合负责全局生效；裸键只保留「焦点不在输入框时才生效」的最小交互集**。
 //!
 //! 主界面的字幕搜索框、在线翻译配置框都是 GPUI 自绘输入（见 `apply_line_edit`），
-//! 靠 `on_key_down` 直接插入字符。裸键绑定（例如把空格绑成播放/暂停）会与打字
-//! 直接冲突——键位表是全局的，命中动作后字符就不再进入输入框。修饰键组合则不会
-//! 出现在正常打字路径上，因此可以全局安全生效。
+//! 靠 `on_key_down` 直接插入字符。键位表是全局的，命中动作后字符就不再进入输入框，
+//! 因此裸键绑定（空格 = 播放/暂停、Delete = 删除当前句）与打字天然冲突。这里的折中是：
+//! 裸键只保留 `BARE_KEYS` 这一小撮高频动作，**是否真的生效由各视图的 `.on_action(...)`
+//! 自己按焦点判断**——本模块只做动作定义与键位注册，不碰 `MainWindow`。其余动作仍全部
+//! 走修饰键组合，不会出现在正常打字路径上，可以全局安全生效。
 //!
 //! 绑定集中在 [`bind_default_keys`]（启动时注册一次），动作处理散落在各视图的
 //! `.on_action(...)` 上，避免把业务逻辑堆进这个模块。
@@ -47,6 +49,10 @@ actions!(
         OpenCommandPalette,
         /// 打开 / 关闭字幕「查找替换」面板
         OpenReplacePanel,
+        /// 裸空格（焦点不在输入框时）：播放 / 暂停当前预览
+        TogglePlaybackBare,
+        /// 裸 Delete（焦点不在输入框时）：删除当前选中的字幕片段
+        DeleteActiveSegment,
     ]
 );
 
@@ -65,8 +71,19 @@ pub struct ShortcutSpec {
     pub hint: &'static str,
 }
 
+/// 裸键（不带修饰键）绑定的键位描述。
+///
+/// 这些键位落在正常打字路径上，只有在焦点不在任何输入框时才该生效；真正的门控写在
+/// 各视图的 `.on_action(...)` 里（本模块只负责注册键位）。集中成一张表是为了让测试
+/// 能一眼看清「哪些裸键被占用了」，避免以后又悄悄绑一个裸字符键。
+pub const BARE_KEYS: [&str; 2] = ["space", "delete"];
+
+/// [`SHORTCUT_SPECS`] 的条目数：定长数组与测试共用同一个常量，
+/// 以后加绑定只改这一处，不会再出现「表里加了、长度常量忘了改」。
+pub const SPEC_COUNT: usize = 16;
+
 /// 默认键位表的唯一事实来源：启动时按此注册，速查表也按此校验。
-pub const SHORTCUT_SPECS: [ShortcutSpec; 14] = [
+pub const SHORTCUT_SPECS: [ShortcutSpec; SPEC_COUNT] = [
     ShortcutSpec {
         key: "ctrl-space",
         hint_key: "Ctrl+Space",
@@ -141,6 +158,20 @@ pub const SHORTCUT_SPECS: [ShortcutSpec; 14] = [
         hint_key: "Ctrl+H",
         hint: "查找替换",
     },
+    // 裸键最小交互集：只在焦点不在输入框时由 `.on_action` 放行（见 `BARE_KEYS`）。
+    // 空格是播放/暂停的通用约定（播放器、剪辑软件都是它），与 Ctrl+Space 并存：
+    // 前者给「手在鼠标上」的场景，后者给「正在打字」的场景，两条互不覆盖。
+    ShortcutSpec {
+        key: "space",
+        hint_key: "Space",
+        hint: "播放/暂停(裸键)",
+    },
+    // Delete 删除当前选中句，也是剪辑台里最顺手的一键操作。
+    ShortcutSpec {
+        key: "delete",
+        hint_key: "Delete",
+        hint: "删除当前句(裸键)",
+    },
 ];
 
 /// 把一条键位描述解析成具体的 [`KeyBinding`]。
@@ -164,6 +195,9 @@ fn binding_for(key: &str) -> KeyBinding {
         "ctrl-shift-z" => KeyBinding::new(key, Redo, None),
         "ctrl-y" => KeyBinding::new(key, Redo, None),
         "ctrl-h" => KeyBinding::new(key, OpenReplacePanel, None),
+        // 裸键：与上面的修饰键组合是两条独立绑定，键位描述不会互相覆盖。
+        "space" => KeyBinding::new(key, TogglePlaybackBare, None),
+        "delete" => KeyBinding::new(key, DeleteActiveSegment, None),
         other => panic!("SHORTCUT_SPECS 里有未登记的键位描述: {other}"),
     }
 }
@@ -178,7 +212,7 @@ pub fn bind_default_keys(cx: &mut gpui::App) {
 /// 与 [`SHORTCUT_SPECS`]（真正的绑定表）同一份动作清单，逐条对齐由本文件末尾的
 /// 测试守着——补了绑定却忘了写速查表、或速查表里留着已经删掉的键位，都会先在这里
 /// 失败，而不是让用户对着界面上写错的键位按半天。
-pub const SHORTCUT_HINTS: [(&str, &str); 12] = [
+pub const SHORTCUT_HINTS: [(&str, &str); 14] = [
     ("Ctrl+Space", "播放/暂停"),
     ("Alt+↑↓", "上/下句"),
     ("Alt+←→", "±1 秒"),
@@ -191,11 +225,13 @@ pub const SHORTCUT_HINTS: [(&str, &str); 12] = [
     ("Ctrl+Shift+Z", "重做"),
     ("Ctrl+Y", "重做"),
     ("Ctrl+H", "查找替换"),
+    ("Space", "播放/暂停(裸键)"),
+    ("Delete", "删除当前句(裸键)"),
 ];
 
 #[cfg(test)]
 mod tests {
-    use super::{binding_for, SHORTCUT_HINTS, SHORTCUT_SPECS};
+    use super::{binding_for, BARE_KEYS, SHORTCUT_HINTS, SHORTCUT_SPECS, SPEC_COUNT};
 
     /// 速查表必须覆盖每一条实际绑定：漏掉 Ctrl+Y 这类键位时，用户永远不知道
     /// 它存在（历史上正是这么漏过一次）。
@@ -246,5 +282,57 @@ mod tests {
     #[should_panic]
     fn unknown_key_spec_is_rejected() {
         let _ = binding_for("ctrl-shift-alt-q");
+    }
+
+    /// 裸键最小交互集必须真的注册进键位表，且键名就是 GPUI 认的那几个
+    /// （拼成 `spacebar` / `del` 时 `binding_for` 会 panic，这里先按名字断言一次）。
+    #[test]
+    fn bare_keys_are_registered_with_expected_names() {
+        assert!(BARE_KEYS.contains(&"space"), "裸键表里应有 space");
+        assert!(BARE_KEYS.contains(&"delete"), "裸键表里应有 delete");
+        for key in BARE_KEYS {
+            assert!(
+                SHORTCUT_SPECS.iter().any(|spec| spec.key == key),
+                "裸键 {key} 没有注册进 SHORTCUT_SPECS"
+            );
+            // 每条裸键都要能被解析成真正的 KeyBinding（键名拼错会在这里炸）。
+            let _ = binding_for(key);
+        }
+        // 速查表也要能看到裸键，否则用户永远不知道空格 / Delete 能用。
+        assert!(SHORTCUT_HINTS.iter().any(|(key, _)| *key == "Space"));
+        assert!(SHORTCUT_HINTS.iter().any(|(key, _)| *key == "Delete"));
+    }
+
+    /// 裸键不能带修饰键（写成 `ctrl-space` 就退回组合键了），
+    /// 也不能和既有快捷键撞成同一条键位描述。
+    #[test]
+    fn bare_keys_do_not_collide_with_modified_bindings() {
+        for key in BARE_KEYS {
+            assert!(
+                !key.contains('-'),
+                "裸键 {key} 带了修饰键，这里应该是不含 '-' 的键名"
+            );
+        }
+        // 全表键位描述唯一：裸 `space` 与 `ctrl-space` 是两条不同绑定，各自保留。
+        let mut seen = std::collections::HashSet::new();
+        for spec in SHORTCUT_SPECS {
+            assert!(seen.insert(spec.key), "重复的键位描述: {}", spec.key);
+        }
+        assert!(seen.contains("space"), "裸 space 绑定丢了");
+        assert!(seen.contains("ctrl-space"), "原有 Ctrl+Space 绑定丢了");
+        assert!(seen.contains("delete"), "裸 delete 绑定丢了");
+    }
+
+    /// 定长数组的 N 与常量必须一致：改了表却忘了改 N 时，这里会先失败
+    /// （N 被写大时多余项会退化成默认值，键位描述为空，同样是错的）。
+    #[test]
+    fn spec_count_matches_array_length() {
+        assert_eq!(SHORTCUT_SPECS.len(), SPEC_COUNT);
+        assert_eq!(SPEC_COUNT, 16, "新增绑定后请同步更新 SPEC_COUNT");
+        // 每条裸键都恰好出现一次，不多不少。
+        for key in BARE_KEYS {
+            let count = SHORTCUT_SPECS.iter().filter(|spec| spec.key == key).count();
+            assert_eq!(count, 1, "裸键 {key} 在键位表里出现了 {count} 次");
+        }
     }
 }

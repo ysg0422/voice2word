@@ -27,6 +27,11 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 fn main() -> Result<()> {
+    // CLI / 无头模式分流：命中 transcribe、--help、--version 时按对应退出码结束进程，
+    // 不初始化日志与 GPUI；无参数或 --gui 返回 None，继续走下面的图形界面启动路径。
+    if let Some(code) = voice2word::cli::run(std::env::args()) {
+        std::process::exit(code);
+    }
     // 冷启动量化（P1-A9）：从进程入口开始打点，每完成一个阶段就记一次耗时。
     // 只在启动路径上，之后不再有任何开销。
     let mut startup = StartupTimer::new();

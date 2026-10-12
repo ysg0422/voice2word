@@ -34,6 +34,24 @@ pub struct Segment {
     /// `None` 表示尚未做过说话人分离，或该段没有有效人声。
     #[serde(default)]
     pub speaker: Option<u32>,
+    /// 词级时间戳（秒）。空表示该段没有词级信息（旧记录 / 非 Whisper 引擎）。
+    #[serde(default)]
+    pub words: Vec<WordTiming>,
+}
+
+/// 词级时间戳（秒，来自 Whisper token 级 offsets）。
+///
+/// 独立成结构而不是塞进 text、也不另开一张表：逐词高亮、卡拉OK 式滚动、按词重排
+/// 断句都要按「段 → 词」的顺序取用，只有随 `Segment` 一起序列化才能读写无损。
+/// 没有词级信息的旧记录 / 非 Whisper 引擎保持空表，不影响既有行为。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WordTiming {
+    /// 词/子词文本（沿用 whisper.cpp 原始 token 文本，可能带前导空格）
+    pub word: String,
+    /// 起始时间 (秒)
+    pub start: f64,
+    /// 结束时间 (秒)
+    pub end: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +77,7 @@ impl Segment {
             language: None,
             confidence: None,
             speaker: None,
+            words: Vec::new(),
         }
     }
 
@@ -110,6 +129,11 @@ impl Segment {
             .as_deref()
             .map(|t| !t.trim().is_empty())
             .unwrap_or(false)
+    }
+
+    /// 该段是否带词级时间戳（words 非空即视为可用）。
+    pub fn has_word_timings(&self) -> bool {
+        !self.words.is_empty()
     }
 
     /// 说话人标签（1 起编号，供界面与导出使用）
@@ -808,6 +832,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         language: seg.language.clone(),
         confidence: seg.confidence,
         speaker: seg.speaker,
+        words: Vec::new(),
     };
     let right = Segment {
         index: 0,
@@ -820,6 +845,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         language: seg.language,
         confidence: seg.confidence,
         speaker: seg.speaker,
+        words: Vec::new(),
     };
     split_segment_recursive(left, out);
     split_segment_recursive(right, out);
@@ -1823,5 +1849,59 @@ mod tests {
         assert_eq!(QualityCategory::GlossaryViolation.label(), "术语违规");
         assert_eq!(QualityCategory::Untranslated.label(), "未翻译");
         assert_eq!(QualityCategory::EmptyOrShort.label(), "空/超短句");
+    }
+
+    // ==================== 词级时间戳 ====================
+
+    /// WordTiming / Segment.words 的 serde 往返：词序与时间精度都不得丢。
+    #[test]
+    fn word_timings_serde_round_trip() {
+        let mut seg = Segment::new(1, 0.0, 1.25, "你好");
+        assert!(!seg.has_word_timings(), "new() 出来的段默认无词级信息");
+        seg.words = vec![
+            WordTiming {
+                word: "你".to_string(),
+                start: 0.0,
+                end: 0.5,
+            },
+            WordTiming {
+                word: "好".to_string(),
+                start: 0.5,
+                end: 1.25,
+            },
+        ];
+        assert!(seg.has_word_timings());
+
+        let json = serde_json::to_string(&seg).expect("序列化 Segment 失败");
+        assert!(
+            json.contains("words"),
+            "words 必须随 Segment 一起序列化: {json}"
+        );
+        let back: Segment = serde_json::from_str(&json).expect("反序列化 Segment 失败");
+        assert_eq!(back, seg);
+        assert_eq!(back.words, seg.words, "词级时间戳往返后必须逐条一致");
+    }
+
+    /// 旧 JSON（无 words 字段）必须仍能反序列化，且 words 为空——向后兼容是硬要求。
+    #[test]
+    fn segment_without_words_field_deserializes_to_empty() {
+        let legacy = r#"{
+            "index": 3,
+            "start": 1.0,
+            "end": 2.0,
+            "text": "旧记录",
+            "translation": null,
+            "translation_lang": null,
+            "polished": "",
+            "language": "zh",
+            "confidence": -0.5,
+            "speaker": 1
+        }"#;
+        let seg: Segment = serde_json::from_str(legacy).expect("旧 JSON 必须仍可反序列化");
+        assert!(seg.words.is_empty(), "缺失 words 字段时按空表处理");
+        assert!(!seg.has_word_timings());
+        // 空表也要能再序列化回去，且字段存在（下游可稳定读到 words）
+        let back = serde_json::to_value(&seg).unwrap();
+        assert_eq!(back["words"], serde_json::json!([]));
     }
 }

@@ -502,6 +502,7 @@ impl SenseVoiceEngine {
                             language: None,
                             confidence: None,
                             speaker: None,
+                            words: Vec::new(),
                         };
                         segments.push(seg.clone());
                         if let Some(ref cb) = progress_cb {
@@ -539,6 +540,7 @@ impl SenseVoiceEngine {
                                     language: None,
                                     confidence: None,
                                     speaker: None,
+                                    words: Vec::new(),
                                 });
                             }
                         }

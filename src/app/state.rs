@@ -2212,6 +2212,9 @@ impl AppState {
             language: orig.language.clone(),
             confidence: orig.confidence,
             speaker: orig.speaker,
+            // 切分出的右半段暂不携带词级时间戳：拆分点未必落在词边界上，
+            // 强行分配会造出跨段的错误词时间；留空由后续需要时再对齐。
+            words: Vec::new(),
         };
         self.segments.insert(pos + 1, new_seg);
 

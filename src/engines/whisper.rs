@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 
+use crate::subtitle::segment::WordTiming;
 use crate::subtitle::Segment;
 use crate::utils::TempPathGuard;
 
@@ -174,6 +175,9 @@ struct WhisperJsonToken {
     text: Option<String>,
     #[serde(default)]
     p: Option<f64>,
+    /// token 级时间范围（毫秒）。只有 -ojf 全量 JSON 会带；轻量 -oj / 旧格式为 None。
+    #[serde(default)]
+    offsets: Option<WhisperOffsets>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -896,6 +900,7 @@ impl WhisperEngine {
                                     language: None,
                                     confidence: None,
                                     speaker: None,
+                                    words: Vec::new(),
                                 })
                             } else {
                                 None
@@ -1038,6 +1043,7 @@ impl WhisperEngine {
                             language: detected_lang.clone(),
                             confidence: Self::tokens_avg_logprob(&item.tokens),
                             speaker: None,
+                            words: Self::word_timings_from_tokens(&item.tokens),
                         });
                     }
                 }
@@ -1079,6 +1085,31 @@ impl WhisperEngine {
         } else {
             Some(logprobs.iter().sum::<f64>() / logprobs.len() as f64)
         }
+    }
+
+    /// 从 -ojf 的 token 明细提取词级时间戳（毫秒 → 秒）。
+    ///
+    /// 过滤口径与 [`WhisperEngine::tokens_avg_logprob`] 一致：跳过 `[_BEG_]` / `[_SOT_]`
+    /// 这类以 `[_` 开头的特殊标记；缺 from 或 to 的 token 直接丢弃——半个区间没有意义。
+    /// 旧格式 JSON（无 tokens / 无 offsets）自然得到空表，调用方不必分支。
+    fn word_timings_from_tokens(tokens: &[WhisperJsonToken]) -> Vec<WordTiming> {
+        tokens
+            .iter()
+            .filter_map(|t| {
+                let word = t.text.as_deref().unwrap_or("");
+                if word.starts_with("[_") {
+                    return None;
+                }
+                let offsets = t.offsets.as_ref()?;
+                let from = offsets.from?;
+                let to = offsets.to?;
+                Some(WordTiming {
+                    word: word.to_string(),
+                    start: from as f64 / 1000.0,
+                    end: to as f64 / 1000.0,
+                })
+            })
+            .collect()
     }
 
     /// 从单行 whisper-cli 日志中提取 VAD 耗时（毫秒），非 VAD 行返回 None。
@@ -1145,6 +1176,7 @@ impl WhisperEngine {
                             language: None,
                             confidence: None,
                             speaker: None,
+                            words: Vec::new(),
                         });
                         idx += 1;
                     }
@@ -1236,6 +1268,7 @@ mod tests {
         let tok = |text: &str, p: f64| WhisperJsonToken {
             text: Some(text.to_string()),
             p: Some(p),
+            offsets: None,
         };
         // [_BEG_] 应被过滤；两个真实 token: ln(0.9) 与 ln(0.5) 的均值
         let tokens = vec![tok("[_BEG_]", 0.913), tok("你", 0.9), tok("好", 0.5)];
@@ -1246,6 +1279,57 @@ mod tests {
         assert!(WhisperEngine::tokens_avg_logprob(&[tok("[_SOT_]", 1.0)]).is_none());
         assert!(WhisperEngine::tokens_avg_logprob(&[]).is_none());
         assert!(WhisperEngine::tokens_avg_logprob(&[tok("词", 0.0)]).is_none());
+    }
+
+    /// 词级时间戳解析三态：有 offsets 转秒、无 offsets 丢弃、特殊标记过滤。
+    #[test]
+    fn word_timings_from_tokens_handles_offsets_missing_and_special() {
+        let with_offsets = |text: &str, from: i64, to: i64| WhisperJsonToken {
+            text: Some(text.to_string()),
+            p: Some(0.9),
+            offsets: Some(WhisperOffsets {
+                from: Some(from),
+                to: Some(to),
+            }),
+        };
+        let no_offsets = |text: &str| WhisperJsonToken {
+            text: Some(text.to_string()),
+            p: Some(0.9),
+            offsets: None,
+        };
+
+        // 1) 有 offsets：毫秒 → 秒，顺序与 token 顺序一致
+        let words = WhisperEngine::word_timings_from_tokens(&[
+            with_offsets("你", 0, 500),
+            with_offsets("好", 500, 1250),
+        ]);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].word, "你");
+        assert!((words[0].start - 0.0).abs() < 1e-9);
+        assert!((words[0].end - 0.5).abs() < 1e-9);
+        assert_eq!(words[1].word, "好");
+        assert!((words[1].start - 0.5).abs() < 1e-9);
+        assert!((words[1].end - 1.25).abs() < 1e-9);
+
+        // 2) 无 offsets（旧 JSON / 轻量 -oj）→ 空表，不猜时间；半个区间同样丢弃
+        assert!(WhisperEngine::word_timings_from_tokens(&[no_offsets("你好")]).is_empty());
+        let half = WhisperJsonToken {
+            text: Some("你".to_string()),
+            p: Some(0.9),
+            offsets: Some(WhisperOffsets {
+                from: Some(0),
+                to: None,
+            }),
+        };
+        assert!(WhisperEngine::word_timings_from_tokens(&[half]).is_empty());
+
+        // 3) 特殊标记被过滤，只留真实 token
+        let words = WhisperEngine::word_timings_from_tokens(&[
+            with_offsets("[_BEG_]", 0, 0),
+            with_offsets("你", 0, 500),
+        ]);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].word, "你");
     }
 
     /// 质检置信度开关：默认开启（出厂配置下 `-ojf` 必须被加上，否则质检低置信恒空），
