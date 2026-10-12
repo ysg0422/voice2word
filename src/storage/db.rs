@@ -162,6 +162,86 @@ pub struct TaskRecord {
     pub metrics: Option<crate::core::PipelinePerformanceMetrics>,
 }
 
+/// `segments_json` 解码失败的可读原因（带 task id 与原始长度）。
+///
+/// 库里的 `segments_json` 是**外部可改**的数据：历史版本写的旧结构、手动改库、
+/// 外部工具、磁盘损坏都可能留下解不开的 JSON。旧实现把解码失败 `.ok()` 掉再
+/// `unwrap_or_default()`，坏数据一律变成「这份工程没有字幕」——用户看到空白剪辑台，
+/// 日志里也毫无线索。这个类型就是「把原因带回到调用方可读位置」的载体。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentDecodeError {
+    /// 出问题的记录主键（日志与界面提示都靠它定位）
+    pub task_id: i64,
+    /// `segments_json` 的原始字节数（截断/损坏的直观证据）
+    pub raw_len: usize,
+    /// `serde_json` 的原始报错文本
+    pub reason: String,
+}
+
+impl std::fmt::Display for SegmentDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "任务 {} 的字幕数据无法解析（{} 字节）: {}",
+            self.task_id, self.raw_len, self.reason
+        )
+    }
+}
+
+impl std::error::Error for SegmentDecodeError {}
+
+/// 字幕正文装载结果：`decode_error` 为 `Some` 时 `segments` 只是「尽力而为的空表」，
+/// 调用方**必须**把原因呈现出来，不能当成「这份素材没有语音」。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentLoadReport {
+    pub segments: Vec<Segment>,
+    pub decode_error: Option<SegmentDecodeError>,
+}
+
+impl SegmentLoadReport {
+    /// 是否装载失败（坏 `segments_json`）。
+    pub fn failed(&self) -> bool {
+        self.decode_error.is_some()
+    }
+}
+
+/// 解码一行 `segments_json`，把「坏数据」与「本来就没有字幕」彻底分开。
+///
+/// - `None`（行不存在 / 列为 NULL）与空串：这份工程确实没有字幕 → 空表、无错误；
+/// - 解码失败：空表 + `Some(err)`，并留一发带 task id 的 `warn!`。
+///
+/// 抽成纯函数是为了让单测能直接喂坏数据，不必真的去构造一个损坏的库文件。
+fn decode_segments_json(
+    task_id: i64,
+    raw: Option<&str>,
+) -> (Vec<Segment>, Option<SegmentDecodeError>) {
+    let Some(raw) = raw else {
+        return (Vec::new(), None);
+    };
+    if raw.trim().is_empty() {
+        return (Vec::new(), None);
+    }
+    match serde_json::from_str::<Vec<Segment>>(raw) {
+        Ok(segments) => (segments, None),
+        Err(err) => {
+            warn!(
+                task_id,
+                raw_len = raw.len(),
+                error = %err,
+                "历史库 segments_json 解析失败：这份工程的字幕无法装载（不再静默变成空表）"
+            );
+            (
+                Vec::new(),
+                Some(SegmentDecodeError {
+                    task_id,
+                    raw_len: raw.len(),
+                    reason: err.to_string(),
+                }),
+            )
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -616,8 +696,30 @@ impl Database {
         Ok(tasks)
     }
 
-    /// 按 id 装载某条工程的完整字幕（仅在真正需要正文时调用）
+    /// 按 id 装载某条工程的完整字幕（仅在真正需要正文时调用）。
+    ///
+    /// 坏 `segments_json`（历史版本、手动改库、外部工具、磁盘损坏）**返回 `Err`**
+    /// 并带上 task id，而不是像旧实现那样 `.ok()` + `unwrap_or_default()` 静默变成
+    /// 空表——那会让用户以为「这份工程没有字幕」。实例：`ui/actions.rs` 的批量导出
+    /// 已按 `Err` 分支提示「{name}（读取失败: {e}）」，这条路径因此能报出真因。
+    ///
+    /// 行不存在 / 列为 NULL / 空串仍是空表 + `Ok`：那是「确实没有字幕」，不是坏数据。
     pub fn load_task_segments(&self, id: i64) -> Result<Vec<Segment>> {
+        let report = self.load_task_segments_report(id)?;
+        match report.decode_error {
+            Some(err) => Err(anyhow::Error::new(err).context("装载历史工程字幕失败")),
+            None => Ok(report.segments),
+        }
+    }
+
+    /// 同 [`Database::load_task_segments`]，但把「坏 `segments_json`」降级进返回值，
+    /// 而不是 `Err`。
+    ///
+    /// 给那些签名不能改成 `Result` 的调用方用（例如 `AppState::load_task_with` 那条
+    /// 直接把结果灌进 `self.segments` 的装载路径）：它拿到的仍是空表，但可以顺手把
+    /// [`SegmentLoadReport::decode_error`] 挂到界面上，而不是让用户面对一个什么都
+    /// 没有的剪辑台。真正的数据库错误（加锁失败、SQL 失败）依旧是 `Err`。
+    pub fn load_task_segments_report(&self, id: i64) -> Result<SegmentLoadReport> {
         let conn = self.lock_conn();
         let json: Option<String> = conn
             .query_row(
@@ -626,28 +728,71 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?;
-        let mut segments: Vec<Segment> = json
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<Vec<Segment>>(s).ok())
-            .unwrap_or_default();
+        let (mut segments, decode_error) = decode_segments_json(id, json.as_deref());
         normalize_segment_blanks(&mut segments);
-        Ok(segments)
+        Ok(SegmentLoadReport {
+            segments,
+            decode_error,
+        })
     }
 
-    /// 把一条列表记录补齐为「已装载字幕」的完整记录（失败时保留原记录）
+    /// 把一条列表记录补齐为「已装载字幕」的完整记录。
+    ///
+    /// **新的调用点请用 [`Database::try_hydrate_task`]**：本方法签名不能返回 `Result`
+    /// （`AppState::load_task_with` 直接吃 `TaskRecord`，改签名会波及调用方文件），
+    /// 所以装载失败时只能降级——保留列表里由写入侧物化的摘要，并留一发带 task id 的
+    /// `warn!`，至少不再是「静默变成空字幕」。
     pub fn hydrate_task(&self, task: &TaskRecord) -> TaskRecord {
-        if task.segments_loaded {
-            return task.clone();
+        match self.try_hydrate_task(task) {
+            Ok(hydrated) => hydrated,
+            Err(err) => {
+                warn!(
+                    task_id = task.id,
+                    error = %err,
+                    "载入历史工程字幕失败：按未装载处理，保留列表里的句数与摘录"
+                );
+                // 保留 `segment_count` / `sample_text`（视频库卡片仍能显示「300 句 /
+                // 首句」），并明确标回 `segments_loaded = false`：一次失败的装载不能
+                // 伪装成「装载成功且字幕为空」。
+                task.clone()
+            }
         }
-        let segments = self.load_task_segments(task.id).unwrap_or_default();
+    }
+
+    /// 与 [`Database::hydrate_task`] 同源，但把装载失败**作为 `Err` 返回**。
+    ///
+    /// 推荐接法（`AppState::load_task_with`）：
+    ///
+    /// ```ignore
+    /// let task = match self.db.try_hydrate_task(task) {
+    ///     Ok(task) => task,
+    ///     Err(err) => {
+    ///         // 用户可见：一次性提示（例如 ProcessStatus::Failed(err.to_string())），
+    ///         // 并且**不要**清空当前工程 / 不要切到剪辑台
+    ///         tracing::warn!(error = %err, "载入历史工程失败");
+    ///         return;
+    ///     }
+    /// };
+    /// ```
+    pub fn try_hydrate_task(&self, task: &TaskRecord) -> Result<TaskRecord> {
+        if task.segments_loaded {
+            return Ok(task.clone());
+        }
+        let report = self.load_task_segments_report(task.id)?;
+        if let Some(err) = report.decode_error {
+            return Err(anyhow::Error::new(err).context(format!(
+                "载入工程「{}」（id={}）的字幕失败",
+                task.file_name, task.id
+            )));
+        }
         let mut out = task.clone();
-        out.segment_count = segments.len();
-        out.segments = segments;
+        out.segment_count = report.segments.len();
+        out.segments = report.segments;
         out.segments_loaded = true;
         // 正文刚装载回来：翻译状态按同一口径重算（列表空壳里的标志来自
         // 写入侧物化的列，装载后以内存字幕为准）。
         out.has_translation = out.segments.iter().any(|segment| segment.has_translation());
-        out
+        Ok(out)
     }
 
     /// 更新指定任务（按主键 `id`）的字幕片段列表 (用于在编辑器中修改错字或时间后写回)
@@ -671,6 +816,39 @@ impl Database {
                 // COALESCE 把 NULL 当 0 参与取大：既保留「duration 只增不减」的既有
                 // 口径（见 `state.rs` 载入时的 `task.duration.max(timeline_end)`），
                 // 又让编辑能把坏行救回来。
+                "UPDATE tasks SET segments_json = ?1, duration = MAX(COALESCE(duration, 0.0), ?2),
+                        segment_count = ?3, sample_text = ?4, has_translation = ?5
+                 WHERE id = ?6",
+                params![
+                    segments_json,
+                    total_dur,
+                    segment_count as i64,
+                    sample_text,
+                    has_translation,
+                    id
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// 与 [`Database::update_task_segments`] 同源，但直接接收**已经序列化好的**
+    /// `segments_json`。
+    ///
+    /// 给后台写库线程用：那边手上只有序列化完成的 JSON（序列化发生在渲染线程之外），
+    /// 不该为了写库再把整个数组解析成 `Vec<Segment>` 又序列化回去。派生列与 `duration`
+    /// 的刷新口径必须与 `update_task_segments` **完全一致**，所以这里解析一次只为算摘要，
+    /// 真正写回的字节就是调用方给的那一份（不做二次序列化，避免格式漂移）。
+    ///
+    /// 坏 JSON 返回 `Err`（带 task id）：损坏数据绝不能覆盖库里已有的字幕。
+    pub fn update_task_segments_json(&self, id: i64, segments_json: &str) -> Result<()> {
+        let segments: Vec<Segment> = serde_json::from_str(segments_json)
+            .with_context(|| format!("待写库的 segments_json 无法解析（task_id={id}）"))?;
+        let conn = self.lock_conn();
+        let total_dur = segments.last().map(|s| s.end).unwrap_or(0.0);
+        let (segment_count, sample_text, has_translation) = summarize_segments(&segments);
+        with_busy_retry(|| {
+            conn.execute(
                 "UPDATE tasks SET segments_json = ?1, duration = MAX(COALESCE(duration, 0.0), ?2),
                         segment_count = ?3, sample_text = ?4, has_translation = ?5
                  WHERE id = ?6",
@@ -746,7 +924,21 @@ impl Database {
     /// created_at, metrics_json, content_hash）转成 `TaskRecord`。
     fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRecord> {
         let segments_json: String = row.get(5)?;
-        let mut segments: Vec<Segment> = serde_json::from_str(&segments_json).unwrap_or_default();
+        // 坏 JSON 仍按空表降级：`find_cached_task` 的调用方是 `.ok().flatten()`，
+        // 这里返回 Err 只会被吞成「未命中」，让用户把已经转写过的文件重转一遍。
+        // 但必须留下可读线索——旧实现连一行日志都没有，用户只看到「字幕空了」。
+        let mut segments: Vec<Segment> = match serde_json::from_str(&segments_json) {
+            Ok(segments) => segments,
+            Err(err) => {
+                warn!(
+                    task_id = row.get::<_, i64>(0)?,
+                    raw_len = segments_json.len(),
+                    error = %err,
+                    "历史库 segments_json 解析失败：该记录按无字幕处理（缓存查询会视为未命中）"
+                );
+                Vec::new()
+            }
+        };
         // 反序列化即归一：`sample_text` 与写回路径共用这份内存态，
         // 让「全空白」在内存里就变成 None / 空串。
         normalize_segment_blanks(&mut segments);
@@ -2289,5 +2481,224 @@ mod tests {
         // 时摘录回退到首句正文，次句的 "\n" 不算译文。
         assert_eq!(stored_summary(&db, ids[3]), (1, "Polished".to_string(), 0));
         assert_eq!(stored_summary(&db, ids[4]), (2, "多句首句".to_string(), 0));
+    }
+
+    // ───────── 坏 segments_json：不再静默变成「字幕空了」 ─────────
+
+    /// 库里 `segments_json` 被外部改坏（历史版本、手动改库、磁盘损坏）时，装载必须
+    /// 明确失败，而不是 `.ok().unwrap_or_default()` 成空表让用户以为「这份没字幕」。
+    /// 批量导出（`ui/actions.rs`）已按 `Err` 分支提示失败原因，所以返回 `Err` 就等于
+    /// 把原因带到用户眼前。
+    #[test]
+    fn bad_segments_json_load_returns_err_instead_of_empty_table() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let id = db
+            .insert_task(
+                "D:/bad.mp4",
+                "bad.mp4",
+                1.0,
+                "completed",
+                &seg("原本有字幕"),
+                None,
+            )
+            .unwrap();
+        // 模拟外部写坏：JSON 数组被截断
+        db.lock_conn()
+            .execute(
+                "UPDATE tasks SET segments_json = ?1 WHERE id = ?2",
+                params!["[{\"index\":1,\"start\":0.0,", id],
+            )
+            .unwrap();
+
+        let err = db
+            .load_task_segments(id)
+            .expect_err("坏 JSON 必须返回 Err，而不是静默变空表");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&id.to_string()),
+            "错误必须带上 task id 以便定位，实际: {text}"
+        );
+
+        // 报告式接口：不返回 Err，但原因必须带得出来
+        let report = db.load_task_segments_report(id).unwrap();
+        assert!(report.segments.is_empty());
+        assert!(report.failed(), "报告式接口必须标出装载失败");
+        let decode_error = report.decode_error.expect("必须带出解码失败原因");
+        assert_eq!(decode_error.task_id, id);
+        assert!(decode_error.raw_len > 0, "原始字节数要能报出来");
+        assert!(
+            decode_error.to_string().contains(&id.to_string()),
+            "Display 必须可读且能定位到记录: {decode_error}"
+        );
+    }
+
+    /// 行不存在 / 列为 NULL / 空串都是「这份工程确实没有字幕」：不能升级成错误，
+    /// 否则历史库里合法的空壳记录会被判成坏数据。
+    #[test]
+    fn missing_or_empty_segments_json_is_not_an_error() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        assert!(
+            db.load_task_segments(9999).unwrap().is_empty(),
+            "不存在的 id 应为空表"
+        );
+        let id = db
+            .insert_task("D:/empty.mp4", "empty.mp4", 1.0, "completed", &[], None)
+            .unwrap();
+        db.lock_conn()
+            .execute(
+                "UPDATE tasks SET segments_json = '' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let report = db.load_task_segments_report(id).unwrap();
+        assert!(report.segments.is_empty());
+        assert!(report.decode_error.is_none(), "空串不是坏数据");
+        assert!(db.load_task_segments(id).unwrap().is_empty());
+    }
+
+    /// 纯函数口径：坏 JSON 与「没有字幕」必须分开，且坏数据的原始长度要如实报出。
+    /// 正常 JSON 的解析结果一个字都不许变（本次改动只把失败分离出来）。
+    #[test]
+    fn decode_segments_json_separates_corruption_from_absence() {
+        assert!(decode_segments_json(7, None).1.is_none());
+        assert!(decode_segments_json(7, Some("")).1.is_none());
+        assert!(decode_segments_json(7, Some("  \n ")).1.is_none());
+
+        let (segments, err) = decode_segments_json(7, Some("{{不是 JSON"));
+        assert!(segments.is_empty());
+        let err = err.expect("坏数据必须给出原因");
+        assert_eq!(err.task_id, 7);
+        assert_eq!(err.raw_len, "{{不是 JSON".len());
+
+        let raw = r#"[{"index":1,"start":0.0,"end":1.0,"text":"句子","language":null}]"#;
+        let (ok, none) = decode_segments_json(7, Some(raw));
+        assert!(none.is_none(), "合法 JSON 不是失败");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].text, "句子");
+    }
+
+    /// `hydrate_task` 的签名不能返回 `Result`（调用方 `AppState::load_task_with`
+    /// 直接吃 `TaskRecord`），所以它在坏数据上必须**保留列表摘要**并明确标回
+    /// 「未装载」，而不是伪装成「装载成功、只是没有字幕」；需要把原因显示给用户的
+    /// 调用点改走 `try_hydrate_task`。
+    #[test]
+    fn hydrate_task_keeps_list_summary_and_try_variant_reports_error() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let id = db
+            .insert_task("D:/h.mp4", "h.mp4", 1.0, "completed", &seg("摘要句"), None)
+            .unwrap();
+        let shell = db
+            .list_recent_tasks(10)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == id)
+            .expect("列表里应有刚插入的记录");
+        assert_eq!(shell.segment_count, 1);
+        assert_eq!(shell.sample_text, "摘要句");
+
+        db.lock_conn()
+            .execute(
+                "UPDATE tasks SET segments_json = 'not json' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        assert!(
+            db.try_hydrate_task(&shell).is_err(),
+            "try_hydrate_task 必须把坏数据报成 Err"
+        );
+
+        let degraded = db.hydrate_task(&shell);
+        assert_eq!(degraded.segment_count, 1, "列表里的句数摘要必须保留");
+        assert_eq!(degraded.sample_text, "摘要句", "列表里的摘录必须保留");
+        assert!(degraded.segments.is_empty());
+        assert!(
+            !degraded.segments_loaded,
+            "装载失败不能伪装成「已装载且没有字幕」"
+        );
+    }
+
+    /// 正常路径不许被上面的改动带偏：合法 JSON 经 `load_task_segments`、
+    /// `load_task_segments_report`、`try_hydrate_task` 三条路径必须给出同一份字幕
+    /// （含空白归一）。
+    #[test]
+    fn valid_segments_json_loads_identically_on_every_path() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let mut first = Segment::new(1, 0.0, 1.0, "第一句");
+        first.translation = Some("   ".to_string()); // 纯空白译文要在装载时被归一
+        let id = db
+            .insert_task(
+                "D:/ok.mp4",
+                "ok.mp4",
+                2.0,
+                "completed",
+                &[first, Segment::new(2, 1.0, 2.0, "第二句")],
+                None,
+            )
+            .unwrap();
+
+        let direct = db.load_task_segments(id).unwrap();
+        let report = db.load_task_segments_report(id).unwrap();
+        assert!(!report.failed());
+        assert_eq!(direct, report.segments, "两条装载路径必须给同一份字幕");
+        assert_eq!(direct.len(), 2);
+        assert!(direct[0].translation.is_none(), "空白译文应被归一为 None");
+
+        let shell = db
+            .list_recent_tasks(10)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == id)
+            .unwrap();
+        assert!(!shell.segments_loaded);
+        let hydrated = db.try_hydrate_task(&shell).unwrap();
+        assert!(hydrated.segments_loaded);
+        assert_eq!(hydrated.segments, direct, "hydrate 与直接装载必须一致");
+        assert_eq!(hydrated.segment_count, 2);
+        assert_eq!(hydrated.sample_text, "第一句");
+    }
+
+    /// 后台写库路径：直接写调用方给的 JSON（不二次序列化），派生列与 Vec 路径一致；
+    /// 坏 JSON 必须**拒绝入库**——它是「保存失败」这一可见状态的唯一来源，
+    /// 绝不能把损坏数据盖到已有字幕上。
+    #[test]
+    fn update_task_segments_json_writes_payload_and_derived_columns() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let id = db
+            .insert_task("D:/j.mp4", "j.mp4", 1.0, "completed", &seg("旧句"), None)
+            .unwrap();
+
+        let mut first = Segment::new(1, 0.0, 2.0, "新句");
+        first.translation = Some("Hello".to_string());
+        let payload = serde_json::to_string(&vec![first]).unwrap();
+        db.update_task_segments_json(id, &payload).unwrap();
+
+        let loaded = db.load_task_segments(id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].text, "新句");
+        assert_eq!(loaded[0].translation.as_deref(), Some("Hello"));
+        let stored: String = db
+            .lock_conn()
+            .query_row(
+                "SELECT segments_json FROM tasks WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, payload, "写回的字节必须与调用方给的一致");
+        assert_eq!(stored_summary(&db, id), (1, "新句".to_string(), 1));
+
+        let err = db
+            .update_task_segments_json(id, "{ 不是 JSON")
+            .expect_err("坏 JSON 必须返回 Err");
+        assert!(
+            format!("{err:#}").contains(&id.to_string()),
+            "报错要能定位到记录"
+        );
+        assert_eq!(
+            db.load_task_segments(id).unwrap()[0].text,
+            "新句",
+            "写失败时不得改动库里已有的字幕"
+        );
     }
 }

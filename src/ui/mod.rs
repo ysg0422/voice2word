@@ -23,8 +23,10 @@ use tokio::sync::watch;
 use crate::app::state::{AppState, ProcessStatus, WorkspaceTab};
 use crate::subtitle::segment::QualityReport;
 use crate::subtitle::stats::SubtitleStats;
-use crate::subtitle::{indices_cover_segments, matched_indices, ExportMode, Segment};
-use crate::ui::actions::{expected_translation_count, translated_out_count};
+use crate::subtitle::{indices_cover_segments, ExportMode, Segment};
+use crate::ui::actions::{
+    expected_translation_count, has_copied_translations, translated_out_count,
+};
 use theme::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorExportFormat {
@@ -487,6 +489,15 @@ pub struct MainWindow {
     pub(crate) focused_replace_field: Option<ReplaceField>,
     /// 替换输入框的光标位置（同一时刻只有一个框聚焦，共用一份）
     pub(crate) replace_cursor: usize,
+    /// 可保存 / 复用 / 导入导出的替换规则集（磁盘上是与 `config.toml` 同目录的
+    /// `replace_rules.json`，见 [`ReplaceRuleSet`]）。
+    pub(crate) replace_rule_sets: Vec<ReplaceRuleSet>,
+    /// 替换面板里当前选中的规则集（[`MainWindow::replace_rule_sets`] 的下标）。
+    pub(crate) replace_rule_selected: Option<usize>,
+    /// 规则集清单是否展开（面板里的轻量下拉，不引入新控件族）
+    pub(crate) replace_rules_open: bool,
+    /// 规则集最近一次操作提示（`(是否成功, 文案)`），形状与 `replace_status` 一致
+    pub(crate) replace_rules_status: Option<(bool, String)>,
     pub(crate) export_template_focus: FocusHandle,
     pub(crate) export_template_focused: bool,
     pub(crate) export_template_cursor: usize,
@@ -506,6 +517,12 @@ pub struct MainWindow {
     /// `subtitle_filter` 的缓存有效性依据：`(搜索关键字, segments_revision)`。
     /// 两者都没变时直接复用上次算好的下标序列，避免每帧重跑子串匹配。
     pub(crate) subtitle_filter_key: Option<(String, u64)>,
+    /// 字幕搜索的加速索引与增量收窄缓存（见 [`SubtitleSearchCache`]）。
+    ///
+    /// 与 `subtitle_filter_key` 分工：键不变时的逐帧复用靠上面那个键；这份索引专治
+    /// **逐字输入**——旧实现对每一句、每一个按键都重跑一次 `to_lowercase()`，
+    /// 几万句规模下每敲一个字就是一次成规模的堆分配，输入明显发顿。
+    pub(crate) subtitle_search_cache: SubtitleSearchCache,
     /// 低置信句下标的缓存：键为 `(阈值, segments_revision)`。
     ///
     /// 与 `glossary_bad_cache` 同一套理由：剪辑台的字幕清单每帧渲染可视行，
@@ -893,6 +910,13 @@ pub(crate) struct DerivedSnapshot {
     /// 是否存在非空译文（任意语言），见 [`has_any_translation`]。
     /// 质检的「未翻译」开关与清单子标头的「单语显示 (译文同原文)」取它。
     pub(crate) has_any_translation: bool,
+    /// 是否存在「译文与原文一字不差」的句子，见
+    /// [`crate::ui::actions::has_copied_translations`]。
+    ///
+    /// 翻译卡据此决定要不要给出「只清复制译文」入口。这条判据要按翻译管线的复制
+    /// 口径逐句算（大小写 / 空白归一后再比），面板每帧现算就是每帧一次 O(n)，
+    /// 因此与其它派生量放在一起、共用同一把失效键。
+    pub(crate) has_copied_translation: bool,
     /// 当前目标语言下实际译出的句数（`actions::translated_out_count`）。
     pub(crate) translated_out: usize,
     /// 应有译文的句数（源文非空的句数，`actions::expected_translation_count`）。
@@ -1139,6 +1163,7 @@ pub(crate) fn build_derived_snapshot(
     DerivedSnapshot {
         has_distinct_translation: has_distinct_translation(segments),
         has_any_translation: check_untranslated,
+        has_copied_translation: has_copied_translations(segments),
         translated_out: translated_out_count(segments, target_lang),
         expected_translation: expected_translation_count(segments),
         other_lang_translated: translated_other_lang_count(segments, target_lang),
@@ -1245,6 +1270,17 @@ impl MainWindow {
             crate::app::WhisperModelTier::SenseVoice => ModelManagerTab::SenseVoice,
             _ => ModelManagerTab::Whisper,
         };
+        // 替换规则集是独立 JSON（与 config.toml 同目录）：读失败不拦启动，把错误留给
+        // 替换面板的提示行——规则集读不到不该让整个界面起不来。
+        let (replace_rule_sets, replace_rules_status) = match load_replace_rule_sets_default() {
+            Ok(sets) => (sets, None),
+            Err(err) => (Vec::new(), Some((false, err))),
+        };
+        let replace_rule_selected = if replace_rule_sets.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
         let mut window = Self {
             state,
             metrics_rx,
@@ -1296,6 +1332,10 @@ impl MainWindow {
             replace_with_focus: cx.focus_handle(),
             focused_replace_field: None,
             replace_cursor: 0,
+            replace_rule_sets,
+            replace_rule_selected,
+            replace_rules_open: false,
+            replace_rules_status,
             export_template_focus: cx.focus_handle(),
             export_template_focused: false,
             export_template_cursor: 0,
@@ -1307,6 +1347,7 @@ impl MainWindow {
             subtitle_search_cursor: 0,
             subtitle_filter: Vec::new(),
             subtitle_filter_key: None,
+            subtitle_search_cache: SubtitleSearchCache::new(),
             glossary_bad_cache: None,
             low_confidence_cache: None,
             derived_snapshot_cache: None,
@@ -1412,25 +1453,50 @@ impl MainWindow {
     ///
     /// 结果按 `(关键字, segments_revision)` 缓存：播放时界面每 40ms 重绘一次，
     /// 若每帧都对上千条字幕重跑子串匹配，滚动与播放都会白白掉帧。
+    ///
+    /// 用户**逐字输入**时的代价也被压掉了（那正是此前每敲一个字卡一下的来源）：
+    /// 小写化后的搜索文本按修订号预建在 [`SubtitleSearchCache`] 里，改键只做逐句
+    /// `contains`（逐句零分配）；新键是上一个键的延长时直接在上一份结果上收窄，
+    /// 连全表都不必扫。结果与逐句调用 `matched_indices` 完全等价（见 `mod tests`
+    /// 里与旧逻辑内联副本的对照测试）。
     pub(crate) fn refresh_subtitle_filter(&mut self) {
-        let key = (self.subtitle_search.clone(), self.state.segments_revision);
-        // 缓存除了要求键不变，还必须确认这串下标仍落在当前片段表内（见
+        let revision = self.state.segments_revision;
+        let segment_count = self.state.segments.len();
+        // 快路径：键与修订号都没变、这串下标也仍落在当前片段表内（见
         // [`filter_cache_usable`]）。撤销/重做会整体替换 `segments` 并重排序号，
         // 沿用越界下标会让虚拟列表量不到行高，整片清单塌成空白且刷不出来。
-        if self.subtitle_filter_key.as_ref() == Some(&key)
-            && filter_cache_usable(&self.subtitle_filter, self.state.segments.len())
+        //
+        // 改造前这里要为每个键 clone 一份搜索串，播放期间逐帧一次堆分配；
+        // 现在只做一次字符串内容比较。
+        if matches!(
+            self.subtitle_filter_key.as_ref(),
+            Some((key, rev)) if *rev == revision && key == &self.subtitle_search
+        ) && filter_cache_usable(&self.subtitle_filter, segment_count)
         {
             return;
         }
-        let mut matched = matched_indices(&self.state.segments, &self.subtitle_search);
+        // 索引按修订号重建（同一次编辑会话里的连续按键都命中同一份，零重建）；
+        // 随后归一化关键字：能收窄就在上一份结果上收窄，否则全量扫描一次。
+        self.subtitle_search_cache
+            .sync(&self.state.segments, revision);
+        self.subtitle_search_cache.set_needle(&self.subtitle_search);
+        // 收窄还有个前提：上一份结果的下标都还在表内。片段表在别处被换过时
+        // （修订号没跟上），宁可退回全量扫描，也不要在半截旧结果上做交集。
+        let mut matched = if filter_cache_usable(&self.subtitle_filter, segment_count)
+            && self.subtitle_search_cache.can_narrow(revision)
+        {
+            self.subtitle_search_cache.narrow(&self.subtitle_filter)
+        } else {
+            self.subtitle_search_cache.scan()
+        };
         // 兜底：万一匹配结果本身越界（片段表在别处被换过），宁可退成「不过滤」，
         // 也不能把非法下标交给虚拟列表——空白列表比多显示几行难排查得多。
-        let segment_count = self.state.segments.len();
         if !indices_cover_segments(&matched, segment_count) {
             matched = (0..segment_count).collect();
         }
         self.subtitle_filter = matched;
-        self.subtitle_filter_key = Some(key);
+        self.subtitle_filter_key = Some((self.subtitle_search.clone(), revision));
+        self.subtitle_search_cache.commit(revision);
     }
 
     /// 术语表疑似未命中的句下标（按 `(术语表文本, segments_revision)` 缓存）。
@@ -2771,6 +2837,442 @@ fn filter_cache_usable(indices: &[usize], segment_count: usize) -> bool {
     indices.iter().all(|&i| i < segment_count)
 }
 
+/// 字幕搜索关键字的归一化口径：先去掉首尾空白，再整体小写化。
+///
+/// 与 [`crate::subtitle::matched_indices`] 内部的写法**必须逐字一致**（trim 之后
+/// 才 lower）：Unicode 小写化会改变字符数（`İ` U+0130 → `i` + U+0307），反过来
+/// 先小写再 trim 在首尾空白上就会得出不同的串。两处口径只要漂移一个字符，
+/// 索引扫描的结果就会与逐句匹配悄悄分家。
+pub(crate) fn normalize_search_needle(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
+/// 一句字幕的小写化搜索文本。
+///
+/// 原文与译文分成两栏而不是拼成一整串：旧判据是「原文命中 **或** 译文命中」，
+/// 拼串会造出跨字段的假命中（原文尾部接上译文头部凑出一个本不存在的词）。
+struct SearchHaystack {
+    text: String,
+    translation: Option<String>,
+}
+
+impl SearchHaystack {
+    /// 与 `matched_indices` 的逐句判据同义：任一侧 `contains` 即命中。
+    fn matches(&self, needle: &str) -> bool {
+        self.text.contains(needle)
+            || self
+                .translation
+                .as_deref()
+                .is_some_and(|t| t.contains(needle))
+    }
+}
+
+/// 字幕搜索的加速索引 + 增量收窄缓存（纯数据结构，可脱离 GPUI 直接单测）。
+///
+/// # 为什么值得单独做一个结构
+///
+/// [`crate::subtitle::matched_indices`] 每调用一次就对**每一句**跑一次
+/// `to_lowercase()`：几万句时用户每敲一个字都要重新分配几万个字符串。这里把
+/// 「小写化」摊到每次 `segments_revision` 变更后重建一次（一次 O(n) 分配），之后
+/// 每个关键字的扫描只读预建好的字符串、逐句零分配；若新关键字是上一次关键字的
+/// **延长**（逐字输入最常见的情形），还能直接在上一份结果上收窄，连全表都不必扫。
+///
+/// 结果与旧实现逐字等价，见 `mod tests` 里与旧逻辑内联副本的对照。
+pub(crate) struct SubtitleSearchCache {
+    /// 索引对应的修订号；与 `segment_count` 共同构成索引有效性依据
+    revision: u64,
+    /// 建索引时的片段数
+    segment_count: usize,
+    /// 逐句的小写化搜索文本（下标与 `segments` 一一对应）
+    haystacks: Vec<SearchHaystack>,
+    /// 上一次 commit 的**归一化**关键字（判断能否收窄）
+    last_needle: String,
+    /// `last_needle` 对应的修订号；`None` 表示还没有可用的上一次结果
+    last_needle_revision: Option<u64>,
+    /// 归一化关键字的复用缓冲：逐字输入时不重复申请
+    needle_buf: String,
+}
+
+impl SubtitleSearchCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            // 与任何真实修订号都不相等的初值：首次 sync 必然重建
+            revision: u64::MAX,
+            segment_count: 0,
+            haystacks: Vec::new(),
+            last_needle: String::new(),
+            last_needle_revision: None,
+            needle_buf: String::new(),
+        }
+    }
+
+    /// 按 `(segments_revision, 片段数)` 同步索引；真的重建了返回 `true`。
+    ///
+    /// 两个判据缺一不可：撤销/重做会整体换掉片段表并重排下标，只看片段数会拿着
+    /// 旧文本扫新表；片段数也要看——万一某个调用点漏了递增修订号，至少表长变了
+    /// 还能重建一次，不至于永久扫一份对不上的索引。
+    pub(crate) fn sync(&mut self, segments: &[Segment], revision: u64) -> bool {
+        if self.revision == revision && self.segment_count == segments.len() {
+            return false;
+        }
+        self.revision = revision;
+        self.segment_count = segments.len();
+        self.haystacks = segments
+            .iter()
+            .map(|seg| SearchHaystack {
+                text: seg.display_text().to_lowercase(),
+                translation: seg.translation.as_deref().map(str::to_lowercase),
+            })
+            .collect();
+        // 换表之后旧的「上一次结果」不再可信：禁止这次收窄，强制全量扫描一遍。
+        self.last_needle_revision = None;
+        true
+    }
+
+    /// 把原始关键字归一化进复用缓冲（口径见 [`normalize_search_needle`]）。
+    pub(crate) fn set_needle(&mut self, raw: &str) {
+        self.needle_buf.clear();
+        self.needle_buf.push_str(&normalize_search_needle(raw));
+    }
+
+    /// 当前归一化关键字。
+    pub(crate) fn needle(&self) -> &str {
+        &self.needle_buf
+    }
+
+    /// 现在这份关键字能否在**上一次结果**上收窄。
+    ///
+    /// 只有「同修订号 + 新关键字以上一次关键字为前缀」两条同时成立才允许：关键字
+    /// 延长后，命中集合必然是上一次命中集合的**子集**（`contains` 对前缀单调）。
+    ///
+    /// 前缀判定必须显式 `starts_with`，不能想当然：Unicode 里有上下文相关的小写
+    /// 映射（希腊语词尾 Σ→ς），`"ΟΣ"` 延长成 `"ΟΣΑ"` 后归一化结果并不是简单前缀
+    /// （`"ος"` vs `"οσα"`），这时必须老实全量重扫，否则会漏句。
+    pub(crate) fn can_narrow(&self, revision: u64) -> bool {
+        self.last_needle_revision == Some(revision)
+            && self.needle_buf.starts_with(&self.last_needle)
+    }
+
+    /// 全量扫描（关键字为空即全部下标，与旧实现同义）。
+    pub(crate) fn scan(&self) -> Vec<usize> {
+        let needle = self.needle();
+        if needle.is_empty() {
+            return (0..self.segment_count).collect();
+        }
+        (0..self.haystacks.len())
+            .filter(|&pos| self.haystacks[pos].matches(needle))
+            .collect()
+    }
+
+    /// 在上一份结果上收窄（调用前必须先确认 [`Self::can_narrow`]）。
+    ///
+    /// 收窄只是少扫几句，**判定仍逐句重做**：`can_narrow` 只保证「新结果 ⊆ 旧结果」，
+    /// 不保证旧结果里每一句都仍然命中。下标越界（片段表被别处换过）一律丢弃，
+    /// 调用方还有一层「越界即退成不过滤」的兜底。
+    pub(crate) fn narrow(&self, prev: &[usize]) -> Vec<usize> {
+        let needle = self.needle();
+        // 上一次关键字也是空 ⇒ 上一次结果就是全集，直接原样返回。
+        if needle.is_empty() {
+            return prev.to_vec();
+        }
+        prev.iter()
+            .copied()
+            .filter(|&pos| self.haystacks.get(pos).is_some_and(|h| h.matches(needle)))
+            .collect()
+    }
+
+    /// 记录本次关键字与修订号，供下一次判断能否收窄。
+    pub(crate) fn commit(&mut self, revision: u64) {
+        self.last_needle.clear();
+        self.last_needle.push_str(&self.needle_buf);
+        self.last_needle_revision = Some(revision);
+    }
+}
+
+impl Default for SubtitleSearchCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 规则集文件（与 `config.toml` 同目录）：独立 JSON，不进共享配置。
+///
+/// 为什么不塞进 `config.toml`：配置是**共享**文件，而规则集属于用户自己攒下来的
+/// 编辑资产（要能整份拷给别人导入），且 `src/utils/config.rs` 不在本次改动范围内。
+pub(crate) const REPLACE_RULES_FILE: &str = "replace_rules.json";
+
+/// 一条「查找 → 替换」规则（**字面量**，语义完全按 [`crate::subtitle::edit`]）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReplaceRule {
+    /// 查找文本（空串在应用时跳过：那是 `replace_all` 的硬禁区）
+    pub(crate) find: String,
+    /// 替换文本（允许空串＝删除）
+    pub(crate) replace: String,
+}
+
+/// 一组有名字的替换规则：保存 / 复用 / 导入导出的单位。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReplaceRuleSet {
+    /// 规则集名称（同时是去重键：同名即覆盖，不许空名）
+    pub(crate) name: String,
+    /// 按顺序应用的规则列表（前一条的输出是后一条的输入）
+    pub(crate) rules: Vec<ReplaceRule>,
+}
+
+/// 规则集的应用范围（界面上的「全部句 / 当前选中句」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplaceRuleScope {
+    /// 全部字幕
+    AllSegments,
+    /// 仅当前选中的那一句（`AppState::selected_segment_index` 指向的句）
+    SelectedSentence,
+}
+
+/// 一次规则集应用的结果汇总（多条 `ReplaceReport` 的合并版）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReplaceRuleReport {
+    /// 真有命中的规则条数（空 `find` 与 `find == replace` 都不计）
+    pub(crate) rules_hit: usize,
+    /// 主文本里替换掉的出现次数（全部规则累计）
+    pub(crate) text_hits: usize,
+    /// 译文里替换掉的出现次数（全部规则累计）
+    pub(crate) translation_hits: usize,
+    /// 被改动的句序号（`Segment::index`，升序去重，口径同 `ReplaceReport::changed`）
+    pub(crate) changed: Vec<usize>,
+}
+
+impl ReplaceRuleReport {
+    /// 主文本与译文命中次数之和。
+    pub(crate) fn total_hits(&self) -> usize {
+        self.text_hits + self.translation_hits
+    }
+
+    /// 一处都没改。调用方据此决定「不压撤销点、不置脏、不落库」——
+    /// 压一个什么都没做的撤销点，用户按 Ctrl+Z 只会觉得撤销坏了。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.total_hits() == 0
+    }
+
+    /// 并入一条规则的结果。
+    fn absorb(&mut self, report: crate::subtitle::edit::ReplaceReport) {
+        if report.is_empty() {
+            return;
+        }
+        self.rules_hit += 1;
+        self.text_hits += report.text_hits;
+        self.translation_hits += report.translation_hits;
+        self.changed.extend(report.changed);
+    }
+}
+
+/// 规则集文件路径：与 `config.toml` 同目录（项目根）。
+///
+/// 用 `AppConfig::app_root_dir()` 而不是 `current_dir()`：后者在「从任意目录启动」
+/// 时会把文件散落到别处，用户下次启动就找不回自己的规则集了。
+pub(crate) fn replace_rules_path() -> PathBuf {
+    crate::utils::AppConfig::app_root_dir().join(REPLACE_RULES_FILE)
+}
+
+/// 导出为**扁平** JSON（与 `AppConfig::export_custom_presets_json` 同一风格：
+/// 顶层数组、每条自包含），便于整份拷给别的机器导入。
+pub(crate) fn replace_rule_sets_to_json(sets: &[ReplaceRuleSet]) -> String {
+    // 序列化 `&[ReplaceRuleSet]` 本身不会失败；兜底只为让签名保持简单。
+    serde_json::to_string_pretty(sets).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// 解析磁盘上 / 导入进来的规则集 JSON。
+///
+/// 逐条校验、能救则救（与 `AppConfig::import_custom_presets_json` 同一口径）：
+/// - 不是合法 JSON、或顶层不是数组 → `Err`（提示用户看文件来源）；
+/// - 单条名字为空 → 跳过这一条，不整批失败；
+/// - 缺 `rules` / 缺 `replace` → 按空值补齐（空规则集、空替换＝删除）；
+/// - 单条规则缺 `find`（或不是字符串）→ 跳过这条规则；
+/// - 未知字段忽略。
+pub(crate) fn replace_rule_sets_from_json(raw: &str) -> Result<Vec<ReplaceRuleSet>, String> {
+    let parsed: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| format!("规则集文件解析失败：{e}。请使用「导出」得到的 JSON 文件。"))?;
+    let array = parsed
+        .as_array()
+        .ok_or_else(|| "规则集文件格式不对：顶层应该是 JSON 数组（[]）。".to_string())?;
+    let mut sets = Vec::new();
+    for entry in array {
+        let name = entry
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let rules = entry
+            .get("rules")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|rule| {
+                        // `find` 是规则的唯一必需字段：没有它就无从匹配。
+                        let find = rule.get("find").and_then(|v| v.as_str())?.to_string();
+                        Some(ReplaceRule {
+                            find,
+                            replace: rule
+                                .get("replace")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        sets.push(ReplaceRuleSet { name, rules });
+    }
+    Ok(sets)
+}
+
+/// 从指定路径读取规则集；文件不存在视为「还没有规则集」（`Ok(空)`，不是错误）。
+pub(crate) fn load_replace_rule_sets(
+    path: &std::path::Path,
+) -> Result<Vec<ReplaceRuleSet>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("规则集文件读取失败（{}）：{e}", path.display())),
+    };
+    replace_rule_sets_from_json(&raw)
+}
+
+/// 读取默认路径（项目根下的 [`REPLACE_RULES_FILE`]）。
+pub(crate) fn load_replace_rule_sets_default() -> Result<Vec<ReplaceRuleSet>, String> {
+    load_replace_rule_sets(&replace_rules_path())
+}
+
+/// 写回指定路径；父目录不存在会先建出来。
+///
+/// **失败必须原样交给调用方**：规则集是用户攒下来的编辑资产，静默吞掉写失败会让
+/// 用户以为「保存成功了」，下次启动才发现全没写进去。
+pub(crate) fn save_replace_rule_sets(
+    path: &std::path::Path,
+    sets: &[ReplaceRuleSet],
+) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("规则集目录创建失败（{}）：{e}", dir.display()))?;
+        }
+    }
+    std::fs::write(path, replace_rule_sets_to_json(sets))
+        .map_err(|e| format!("规则集写入失败（{}）：{e}", path.display()))
+}
+
+/// 写回默认路径（项目根下的 [`REPLACE_RULES_FILE`]）。
+pub(crate) fn save_replace_rule_sets_default(sets: &[ReplaceRuleSet]) -> Result<(), String> {
+    save_replace_rule_sets(&replace_rules_path(), sets)
+}
+
+/// 按名字查规则集（增删改查里的「查」）。
+pub(crate) fn find_replace_rule_set<'a>(
+    sets: &'a [ReplaceRuleSet],
+    name: &str,
+) -> Option<&'a ReplaceRuleSet> {
+    sets.iter().find(|s| s.name == name)
+}
+
+/// 新增或按名覆盖（增 / 改），返回该规则集在表里的下标。
+///
+/// 名字是去重键：同名覆盖而不是追加，否则每次导入同一份文件都会多出一份副本。
+/// 空名直接报错——那会让「按名选中 / 覆盖 / 删除」全部失去意义。
+pub(crate) fn upsert_replace_rule_set(
+    sets: &mut Vec<ReplaceRuleSet>,
+    set: ReplaceRuleSet,
+) -> Result<usize, String> {
+    let name = set.name.trim().to_string();
+    if name.is_empty() {
+        return Err("规则集名称不能为空".to_string());
+    }
+    let set = ReplaceRuleSet { name, ..set };
+    match sets.iter().position(|s| s.name == set.name) {
+        Some(pos) => {
+            sets[pos] = set;
+            Ok(pos)
+        }
+        None => {
+            sets.push(set);
+            Ok(sets.len() - 1)
+        }
+    }
+}
+
+/// 按名字删除（删）；返回是否真的删掉了。
+pub(crate) fn remove_replace_rule_set(sets: &mut Vec<ReplaceRuleSet>, name: &str) -> bool {
+    let Some(pos) = sets.iter().position(|s| s.name == name) else {
+        return false;
+    };
+    sets.remove(pos);
+    true
+}
+
+/// 把一整套规则**按顺序**应用到全部字幕。
+///
+/// 顺序有语义：前一条规则的输出就是后一条规则的输入（`a→b, b→c` 与反序结果不同）。
+/// 每条规则都调 [`crate::subtitle::edit::replace_all`]——大小写口径、译文保护、
+/// `display_text` 落点、空 `find` / `find == replace` 的禁区全部沿用那一份实现，
+/// 这里一行判据都不复制。
+pub(crate) fn apply_replace_rule_set(
+    segments: &mut [Segment],
+    set: &ReplaceRuleSet,
+    options: &crate::subtitle::edit::ReplaceOptions,
+) -> ReplaceRuleReport {
+    let mut report = ReplaceRuleReport::default();
+    for rule in &set.rules {
+        if rule.find.is_empty() {
+            continue;
+        }
+        report.absorb(crate::subtitle::edit::replace_all(
+            segments,
+            &rule.find,
+            &rule.replace,
+            options,
+        ));
+    }
+    report.changed.sort_unstable();
+    report.changed.dedup();
+    report
+}
+
+/// 只把规则应用到**指定位置**的句子（「应用到选中句」）。
+///
+/// 逐句、逐规则调用同一份 `replace_all`（单元素切片）：这样「应用到选中句」与
+/// 「应用到全部」在每一句上的结果逐字一致，不另写一套匹配逻辑。越界下标直接跳过
+/// （选中项可能已被前一次编辑删掉）。
+pub(crate) fn apply_replace_rule_set_to_indices(
+    segments: &mut [Segment],
+    indices: &[usize],
+    set: &ReplaceRuleSet,
+    options: &crate::subtitle::edit::ReplaceOptions,
+) -> ReplaceRuleReport {
+    let mut report = ReplaceRuleReport::default();
+    for &pos in indices {
+        if pos >= segments.len() {
+            continue;
+        }
+        for rule in &set.rules {
+            if rule.find.is_empty() {
+                continue;
+            }
+            report.absorb(crate::subtitle::edit::replace_all(
+                std::slice::from_mut(&mut segments[pos]),
+                &rule.find,
+                &rule.replace,
+                options,
+            ));
+        }
+    }
+    report.changed.sort_unstable();
+    report.changed.dedup();
+    report
+}
+
 /// 结果列表选中行移动 `delta` 格后的新位置（纯函数，便于单测）。
 ///
 /// 修的是旧写法里那条悬空判据：`count == 0` 时 `count - 1` 会算术回绕成
@@ -2804,13 +3306,18 @@ fn should_ignore_delete_in_status(status: &ProcessStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_derived_snapshot, build_timeline_index, cached_derived_snapshot, filter_cache_usable,
-        filter_commands, glossary_fingerprint, glossary_violations_cached, has_any_translation,
-        has_distinct_translation, insert_printable_key, move_palette_selection_row,
-        should_ignore_delete_in_status, timeline_visible_positions, translated_other_lang_count,
-        DerivedSnapshot, DerivedSnapshotKey, GlossaryBadCache, GlossaryFingerprint,
-        PALETTE_COMMANDS,
+        apply_replace_rule_set, apply_replace_rule_set_to_indices, build_derived_snapshot,
+        build_timeline_index, cached_derived_snapshot, filter_cache_usable, filter_commands,
+        find_replace_rule_set, glossary_fingerprint, glossary_violations_cached,
+        has_any_translation, has_copied_translations, has_distinct_translation,
+        insert_printable_key, load_replace_rule_sets, move_palette_selection_row,
+        normalize_search_needle, remove_replace_rule_set, replace_rule_sets_from_json,
+        replace_rule_sets_to_json, save_replace_rule_sets, should_ignore_delete_in_status,
+        timeline_visible_positions, translated_other_lang_count, upsert_replace_rule_set,
+        DerivedSnapshot, DerivedSnapshotKey, GlossaryBadCache, GlossaryFingerprint, ReplaceRule,
+        ReplaceRuleSet, SubtitleSearchCache, PALETTE_COMMANDS,
     };
+    use crate::subtitle::edit::ReplaceOptions;
     use crate::subtitle::Segment;
     use std::cell::Cell;
     use std::sync::Arc;
@@ -3502,6 +4009,30 @@ mod tests {
         assert!(has_distinct_translation(std::slice::from_ref(&seg)));
         assert!(has_any_translation(std::slice::from_ref(&seg)));
     }
+    /// 「译文与原文一字不差」的派生位：与判据函数同源，且只在真有复制句时为真。
+    ///
+    /// 界面用它决定要不要给出「只清复制译文」入口；假阴性会让入口消失（用户只能
+    /// 退回「清空全部译文」），假阳性则会让人点了没反应。
+    #[test]
+    fn derived_snapshot_carries_copied_translation_flag() {
+        let mut copied = Segment::new(1, 0.0, 1.0, "这段译文其实是原样复制的");
+        copied.translation = Some("这段译文其实是原样复制的".to_string());
+        let mut real = Segment::new(2, 1.0, 2.0, "这段是真翻译");
+        real.translation = Some("This one is translated".to_string());
+        let with_copy = vec![copied, real];
+        let snap = build_derived_snapshot(&with_copy, 60.0, 20, "中文", -0.35, &[]);
+        assert!(snap.has_copied_translation);
+        assert_eq!(
+            snap.has_copied_translation,
+            has_copied_translations(&with_copy)
+        );
+
+        // 没有译文 / 短句（`OK`→`OK` 这类本来就该原样保留）都不算复制句
+        let mut short = Segment::new(3, 2.0, 3.0, "OK");
+        short.translation = Some("OK".to_string());
+        let snap = build_derived_snapshot(&[short], 60.0, 20, "中文", -0.35, &[]);
+        assert!(!snap.has_copied_translation);
+    }
     /// 回归（P3）：术语表违规下标缓存命中时必须复用同一个 `Arc`，不得重算、
     /// 更不得像原来那样 `Vec::clone()` 深拷贝（编辑台每帧都取一次这批下标）。
     #[test]
@@ -3717,5 +4248,515 @@ mod tests {
             ),
             "走快照里的索引与现建索引必须给出同一批下标"
         );
+    }
+
+    // ── 字幕搜索：索引扫描 / 增量收窄与旧实现逐字等价（第 4 项提速的底线）──
+
+    /// 改造前 `matched_indices` 的**逐字内联副本**（等价性参照物）。
+    ///
+    /// 刻意抄一份而不是直接调库里那份：这个测试要钉死的正是「改造前后结果逐字
+    /// 相同」，参照物必须是改造前那段代码本身。另有一条测试把这份副本与
+    /// `crate::subtitle::matched_indices` 对齐，防止副本自己腐烂。
+    fn reference_matched_indices(segments: &[Segment], needle: &str) -> Vec<usize> {
+        let needle = needle.trim().to_lowercase();
+        if needle.is_empty() {
+            return (0..segments.len()).collect();
+        }
+        segments
+            .iter()
+            .enumerate()
+            .filter(|(_, seg)| {
+                seg.display_text().to_lowercase().contains(&needle)
+                    || seg
+                        .translation
+                        .as_deref()
+                        .map(|t| t.to_lowercase().contains(&needle))
+                        .unwrap_or(false)
+            })
+            .map(|(pos, _)| pos)
+            .collect()
+    }
+
+    /// 复刻 `MainWindow::refresh_subtitle_filter` 的决策流程（不含 GPUI）。
+    ///
+    /// `published` 就是 `(subtitle_filter_key, subtitle_filter)` 这对字段：等价性
+    /// 测试必须以**同一套决策**驱动索引，否则测的就不是真正上线的那条路径。
+    fn drive_filter(
+        cache: &mut SubtitleSearchCache,
+        published: &mut (Option<(String, u64)>, Vec<usize>),
+        segments: &[Segment],
+        revision: u64,
+        raw: &str,
+    ) -> Vec<usize> {
+        drive_filter_traced(cache, published, segments, revision, raw).0
+    }
+
+    /// [`drive_filter`] 的带痕版本：第二个返回值表示本次是否真的走了收窄路径。
+    /// 没有它，「收窄路径被覆盖到」就无从断言（等价性测试可能全在走全量扫描，
+    /// 看着绿，实际什么都没测到）。
+    fn drive_filter_traced(
+        cache: &mut SubtitleSearchCache,
+        published: &mut (Option<(String, u64)>, Vec<usize>),
+        segments: &[Segment],
+        revision: u64,
+        raw: &str,
+    ) -> (Vec<usize>, bool) {
+        let segment_count = segments.len();
+        if matches!(
+            published.0.as_ref(),
+            Some((key, rev)) if *rev == revision && key == raw
+        ) && filter_cache_usable(&published.1, segment_count)
+        {
+            // 键没变：与 `refresh_subtitle_filter` 一样直接复用，谈不上收窄。
+            return (published.1.clone(), false);
+        }
+        cache.sync(segments, revision);
+        cache.set_needle(raw);
+        // 与 `refresh_subtitle_filter` 同判据：旧下标越界时必须退回全量扫描。
+        let narrowed =
+            filter_cache_usable(&published.1, segment_count) && cache.can_narrow(revision);
+        let mut matched = if narrowed {
+            cache.narrow(&published.1)
+        } else {
+            cache.scan()
+        };
+        if !crate::subtitle::indices_cover_segments(&matched, segment_count) {
+            matched = (0..segment_count).collect();
+        }
+        published.1 = matched.clone();
+        published.0 = Some((raw.to_string(), revision));
+        cache.commit(revision);
+        (matched, narrowed)
+    }
+
+    /// 覆盖大小写 / 中英混排 / 只有译文命中 / 上下文相关小写映射的样本。
+    fn search_sample_segments() -> Vec<Segment> {
+        let mut segs = vec![
+            Segment::new(1, 0.0, 1.0, "Transformer 架构入门"),
+            Segment::new(2, 1.0, 2.0, "transformer 全部小写"),
+            Segment::new(3, 2.0, 3.0, "今天天气很好"),
+            Segment::new(4, 3.0, 4.0, "İstanbul 的土耳其字母"),
+            Segment::new(5, 4.0, 5.0, "ΟΔΟΣ ΑΘΗΝΑ"),
+            Segment::new(6, 5.0, 6.0, "ΟΔΟΣΑ ΝΙΚΗ"),
+        ];
+        segs[1].translation = Some("TRANSFORMER 大写译文".to_string());
+        segs[2].translation = Some("The weather is nice today".to_string());
+        segs[3].translation = Some("transformer 只出现在译文里".to_string());
+        segs
+    }
+
+    /// 全量扫描必须与旧实现逐项一致：ASCII 大小写、中文、纯译文命中、无命中、
+    /// 首尾空白关键字（trim 口径）全都要对上。
+    #[test]
+    fn search_scan_matches_inlined_reference() {
+        let segments = search_sample_segments();
+        let mut cache = SubtitleSearchCache::new();
+        assert!(cache.sync(&segments, 1), "首次同步必须真的建索引");
+        for key in [
+            "transformer",
+            "TRANSFORMER",
+            "架构",
+            "weather",
+            "只有译文",
+            "  npm  ",
+            "不存在的词",
+            "İSTANBUL",
+            "ΟΔΟΣΑ",
+        ] {
+            cache.set_needle(key);
+            assert_eq!(
+                cache.scan(),
+                reference_matched_indices(&segments, key),
+                "关键字「{key}」的扫描结果与旧实现不一致"
+            );
+        }
+    }
+
+    /// 逐字输入（每次把关键字延长一个字符）必须与旧实现逐项一致——这是第 4 项
+    /// 提速的正确性底线：收窄只能少扫，不能少给。
+    #[test]
+    fn search_typing_narrows_to_same_result_as_reference() {
+        let segments = search_sample_segments();
+        let revision = 7;
+        let mut cache = SubtitleSearchCache::new();
+        let mut published: (Option<(String, u64)>, Vec<usize>) = (None, Vec::new());
+        for typed in ["transformer", "全小写", "İstanbul", "ΟΔΟΣ"] {
+            let mut key = String::new();
+            let mut narrowed_at_least_once = false;
+            for ch in typed.chars() {
+                key.push(ch);
+                let (got, narrowed) =
+                    drive_filter_traced(&mut cache, &mut published, &segments, revision, &key);
+                // 从第二个字符起，键是上一个键的延长：除了首字符那一步，全都该走收窄
+                if key.chars().count() > 1 {
+                    assert!(narrowed, "「{key}」是上一个键的延长，应当走收窄路径");
+                }
+                narrowed_at_least_once |= narrowed;
+                assert_eq!(
+                    got,
+                    reference_matched_indices(&segments, &key),
+                    "逐字输入到「{key}」时与旧实现不一致"
+                );
+            }
+            assert!(
+                narrowed_at_least_once,
+                "「{typed}」的逐字输入至少应有一次走收窄路径（否则这条测试没测到收窄）"
+            );
+            // 清空关键字：回到「不过滤」，且下一次输入重新开始
+            let cleared = drive_filter(&mut cache, &mut published, &segments, revision, "");
+            assert_eq!(cleared, (0..segments.len()).collect::<Vec<_>>());
+        }
+    }
+
+    /// 内联参照物本身必须与生产实现对齐：副本一旦腐烂，上面的等价性测试就成了
+    /// 自证清白。
+    #[test]
+    fn search_reference_matches_production_matched_indices() {
+        let segments = search_sample_segments();
+        for key in [
+            "transformer",
+            "架构",
+            "weather",
+            "",
+            "  ",
+            "ΟΔΟΣΑ",
+            "没这句",
+        ] {
+            assert_eq!(
+                reference_matched_indices(&segments, key),
+                crate::subtitle::matched_indices(&segments, key),
+                "内联参照物与 `matched_indices` 在「{key}」上分家了"
+            );
+        }
+    }
+
+    /// 非「延长」的改键（退格、中间插入、清空后重打）必须退回全量扫描，
+    /// 结果依旧逐项等价。
+    #[test]
+    fn search_non_extension_edits_match_reference() {
+        let segments = search_sample_segments();
+        let revision = 12;
+        let mut cache = SubtitleSearchCache::new();
+        let mut published: (Option<(String, u64)>, Vec<usize>) = (None, Vec::new());
+        for key in [
+            "transformer",
+            "transforme",
+            "transfor",
+            "transXformer",
+            "transX",
+            "t",
+            "",
+            "transformer",
+        ] {
+            let got = drive_filter(&mut cache, &mut published, &segments, revision, key);
+            assert_eq!(
+                got,
+                reference_matched_indices(&segments, key),
+                "改键到「{key}」时与旧实现不一致"
+            );
+        }
+    }
+
+    /// 修订号推进（用户编辑了字幕）后必须重建索引：结果反映新文本，而不是旧索引
+    /// 或上一份结果；同一修订号下改多少个键都只建一次索引。
+    #[test]
+    fn search_index_rebuilds_after_revision_bump() {
+        let mut segments = search_sample_segments();
+        let key = "新加的句子";
+        let mut cache = SubtitleSearchCache::new();
+        let mut published: (Option<(String, u64)>, Vec<usize>) = (None, Vec::new());
+        assert!(drive_filter(&mut cache, &mut published, &segments, 1, key).is_empty());
+
+        segments.push(Segment::new(9, 9.0, 10.0, "新加的句子在这里"));
+        let got = drive_filter(&mut cache, &mut published, &segments, 2, key);
+        assert_eq!(got, reference_matched_indices(&segments, key));
+        assert_eq!(got, vec![segments.len() - 1], "必须命中新加的那一句");
+
+        for other in ["新加", "新加的句", "在这里"] {
+            drive_filter(&mut cache, &mut published, &segments, 2, other);
+            assert!(
+                !cache.sync(&segments, 2),
+                "同一修订号下改键不该重建索引（否则提速就白做了）"
+            );
+        }
+    }
+
+    /// 上下文相关的小写映射（土耳其 İ、希腊语词尾 Σ）不能靠「前缀即收窄」蒙混：
+    /// 归一化后不是前缀时必须退回全量扫描，且结果仍与旧实现一致。
+    #[test]
+    fn search_context_sensitive_case_folding_matches_reference() {
+        let segments = search_sample_segments();
+        let revision = 21;
+        let mut cache = SubtitleSearchCache::new();
+        let mut published: (Option<(String, u64)>, Vec<usize>) = (None, Vec::new());
+        for key in ["ΟΔΟ", "ΟΔΟΣ"] {
+            let got = drive_filter(&mut cache, &mut published, &segments, revision, key);
+            assert_eq!(got, reference_matched_indices(&segments, key));
+        }
+        // 追加 Α 后 Σ 从「词尾」变「词中」：归一化从「…ος」变成「…οσα」，
+        // 与上一次关键字不再是前缀关系，必须放弃收窄。
+        cache.set_needle("ΟΔΟΣΑ");
+        assert!(
+            !cache.can_narrow(revision),
+            "归一化后不是前缀时必须放弃收窄（否则会漏掉 ΟΔΟΣΑ 那一句）"
+        );
+        let got = drive_filter(&mut cache, &mut published, &segments, revision, "ΟΔΟΣΑ");
+        assert_eq!(got, reference_matched_indices(&segments, "ΟΔΟΣΑ"));
+        assert_eq!(got, vec![5], "必须命中「ΟΔΟΣΑ ΝΙΚΗ」那一句");
+    }
+
+    /// 空关键字 / 纯空白关键字 = 不过滤（全部下标），归一化口径与旧实现同义。
+    #[test]
+    fn search_empty_needle_lists_every_segment() {
+        let segments = search_sample_segments();
+        let mut cache = SubtitleSearchCache::new();
+        for key in ["", "   ", "\t"] {
+            cache.sync(&segments, 1);
+            cache.set_needle(key);
+            assert_eq!(cache.scan(), (0..segments.len()).collect::<Vec<_>>());
+            assert_eq!(
+                normalize_search_needle(key),
+                key.trim().to_lowercase(),
+                "归一化必须与旧实现同口径"
+            );
+        }
+        assert_eq!(normalize_search_needle("  AbC  "), "abc");
+        // `İ` 小写化会展开成两个字符（i + U+0307）：归一化口径必须原样保留这种展开，
+        // 不能自作主张做「只映射单字符」的简化。
+        assert_eq!(normalize_search_needle("İ").chars().count(), 2);
+    }
+
+    // ── 替换规则集（第 11 项）：JSON 读写 / 增删改查 / 按顺序应用 ──
+
+    /// JSON 往返逐字段一致，且必须是**扁平**结构（顶层数组、规则直接挂载）。
+    #[test]
+    fn replace_rule_sets_json_roundtrip_is_flat() {
+        let sets = vec![
+            ReplaceRuleSet {
+                name: "口头禅".to_string(),
+                rules: vec![
+                    ReplaceRule {
+                        find: "呃".to_string(),
+                        replace: String::new(),
+                    },
+                    ReplaceRule {
+                        find: "那个".to_string(),
+                        replace: String::new(),
+                    },
+                ],
+            },
+            ReplaceRuleSet {
+                name: "术语".to_string(),
+                rules: vec![ReplaceRule {
+                    find: "transformer".to_string(),
+                    replace: "变换器".to_string(),
+                }],
+            },
+        ];
+        let json = replace_rule_sets_to_json(&sets);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("导出必须是合法 JSON");
+        assert!(parsed.is_array(), "顶层必须是数组");
+        assert!(
+            parsed.as_array().expect("数组")[0]
+                .get("rules")
+                .is_some_and(|r| r.is_array()),
+            "规则必须直接挂在规则集上（扁平），不能再套一层"
+        );
+        assert_eq!(replace_rule_sets_from_json(&json).expect("往返"), sets);
+    }
+
+    /// 顶层不是数组 / 不是 JSON → 明确报错，让调用方能提示用户看文件来源。
+    #[test]
+    fn replace_rule_sets_from_json_rejects_garbage() {
+        assert!(replace_rule_sets_from_json("{\"name\":\"x\"}").is_err());
+        assert!(replace_rule_sets_from_json("这不是 JSON").is_err());
+    }
+
+    /// 单条损坏不整批失败：空名跳过、缺 `find` 的规则跳过、缺 `replace` 按空串补齐。
+    #[test]
+    fn replace_rule_sets_from_json_salvages_partial_entries() {
+        let raw = r#"[
+            {"name": "   ", "rules": [{"find": "a", "replace": "b"}]},
+            {"name": "保留", "rules": [{"find": "a"}, {"replace": "b"}, {"find": "c", "replace": "d"}]}
+        ]"#;
+        let sets = replace_rule_sets_from_json(raw).expect("能救则救");
+        assert_eq!(sets.len(), 1, "空名的条目应被跳过");
+        assert_eq!(sets[0].name, "保留");
+        assert_eq!(sets[0].rules.len(), 2);
+        assert_eq!(sets[0].rules[0].replace, "");
+        assert_eq!(sets[0].rules[1].find, "c");
+        assert_eq!(sets[0].rules[1].replace, "d");
+    }
+
+    /// 增 / 改：同名覆盖（不追加副本）、新名追加，并返回落点下标；空名报错。
+    #[test]
+    fn replace_rule_set_upsert_replaces_same_name_and_appends_new() {
+        let mut sets: Vec<ReplaceRuleSet> = Vec::new();
+        let first = ReplaceRuleSet {
+            name: "A".to_string(),
+            rules: vec![ReplaceRule {
+                find: "1".to_string(),
+                replace: "2".to_string(),
+            }],
+        };
+        assert_eq!(upsert_replace_rule_set(&mut sets, first).expect("新增"), 0);
+        assert_eq!(
+            upsert_replace_rule_set(
+                &mut sets,
+                ReplaceRuleSet {
+                    name: "B".to_string(),
+                    rules: Vec::new(),
+                }
+            )
+            .expect("新增"),
+            1
+        );
+        let updated = ReplaceRuleSet {
+            name: "A".to_string(),
+            rules: vec![ReplaceRule {
+                find: "x".to_string(),
+                replace: "y".to_string(),
+            }],
+        };
+        assert_eq!(
+            upsert_replace_rule_set(&mut sets, updated.clone()).expect("覆盖"),
+            0
+        );
+        assert_eq!(sets.len(), 2, "同名必须覆盖而不是追加");
+        assert_eq!(find_replace_rule_set(&sets, "A"), Some(&updated));
+        assert!(upsert_replace_rule_set(
+            &mut sets,
+            ReplaceRuleSet {
+                name: "   ".to_string(),
+                rules: Vec::new(),
+            }
+        )
+        .is_err());
+    }
+
+    /// 删：按名删除并返回是否命中；删不存在的名字不改动任何东西。
+    #[test]
+    fn replace_rule_set_remove_by_name() {
+        let mut sets = vec![
+            ReplaceRuleSet {
+                name: "A".to_string(),
+                rules: Vec::new(),
+            },
+            ReplaceRuleSet {
+                name: "B".to_string(),
+                rules: Vec::new(),
+            },
+        ];
+        assert!(remove_replace_rule_set(&mut sets, "A"));
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].name, "B");
+        assert!(!remove_replace_rule_set(&mut sets, "A"));
+    }
+
+    /// 多条规则**按顺序**应用：前一条的输出是后一条的输入。
+    #[test]
+    fn replace_rules_apply_in_order() {
+        let mut segs = vec![Segment::new(1, 0.0, 1.0, "a b c")];
+        let set = ReplaceRuleSet {
+            name: "链式".to_string(),
+            rules: vec![
+                ReplaceRule {
+                    find: "a".to_string(),
+                    replace: "b".to_string(),
+                },
+                ReplaceRule {
+                    find: "b".to_string(),
+                    replace: "c".to_string(),
+                },
+            ],
+        };
+        let report = apply_replace_rule_set(&mut segs, &set, &ReplaceOptions::default());
+        assert_eq!(segs[0].text, "c c c", "顺序反过来结果就不是这个");
+        assert_eq!(report.rules_hit, 2);
+        assert_eq!(report.total_hits(), 3, "1 处 + 2 处");
+        assert_eq!(report.changed, vec![1]);
+
+        // 空 find 与 find == replace 的规则都不算命中（与 `replace_all` 同禁区）
+        let noop = ReplaceRuleSet {
+            name: "空操作".to_string(),
+            rules: vec![
+                ReplaceRule {
+                    find: String::new(),
+                    replace: "x".to_string(),
+                },
+                ReplaceRule {
+                    find: "c".to_string(),
+                    replace: "c".to_string(),
+                },
+            ],
+        };
+        let report = apply_replace_rule_set(&mut segs, &noop, &ReplaceOptions::default());
+        assert!(report.is_empty(), "无命中时报告必须是空的");
+    }
+
+    /// 应用到选中句：只有指定下标被改，越界下标跳过；报告里的句序号口径不变。
+    #[test]
+    fn replace_rules_apply_to_selected_indices_only() {
+        let mut segs = vec![
+            Segment::new(1, 0.0, 1.0, "aaa"),
+            Segment::new(2, 1.0, 2.0, "aaa"),
+            Segment::new(3, 2.0, 3.0, "aaa"),
+        ];
+        let set = ReplaceRuleSet {
+            name: "s".to_string(),
+            rules: vec![ReplaceRule {
+                find: "a".to_string(),
+                replace: "b".to_string(),
+            }],
+        };
+        let report = apply_replace_rule_set_to_indices(
+            &mut segs,
+            &[1, 99],
+            &set,
+            &ReplaceOptions::default(),
+        );
+        assert_eq!(segs[0].text, "aaa", "没选中的句子一字不动");
+        assert_eq!(segs[1].text, "bbb");
+        assert_eq!(segs[2].text, "aaa");
+        assert_eq!(report.changed, vec![2]);
+        assert_eq!(report.total_hits(), 3);
+    }
+
+    /// 磁盘往返：写进去再读回来逐字段一致；文件不存在视为空表（不是错误）。
+    #[test]
+    fn replace_rules_save_load_roundtrip_on_disk() {
+        let dir = std::env::temp_dir().join(format!("v2w_rules_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("replace_rules.json");
+        assert!(
+            load_replace_rule_sets(&path)
+                .expect("缺文件应视为空表")
+                .is_empty(),
+            "首次运行还没有规则集，不该当成错误"
+        );
+        let sets = vec![ReplaceRuleSet {
+            name: "清理".to_string(),
+            rules: vec![ReplaceRule {
+                find: "嗯".to_string(),
+                replace: String::new(),
+            }],
+        }];
+        save_replace_rule_sets(&path, &sets).expect("父目录不存在也要建出来再写");
+        assert_eq!(load_replace_rule_sets(&path).expect("读回"), sets);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写失败必须**报错给调用方**（父路径被一个同名文件占住 → 建目录失败）。
+    #[test]
+    fn replace_rules_save_reports_error_to_caller() {
+        let dir = std::env::temp_dir().join(format!("v2w_rules_err_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let blocker = dir.join("plain_file");
+        std::fs::write(&blocker, b"x").expect("占位文件");
+        let err = save_replace_rule_sets(&blocker.join("replace_rules.json"), &[])
+            .expect_err("父路径是文件时保存必须失败");
+        assert!(err.contains("规则集"), "错误文案要说清是什么失败：{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

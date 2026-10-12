@@ -6,7 +6,12 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use super::types::{BatchSummary, CompletionDialogInfo};
-use super::{EditorExportFormat, MainWindow};
+use super::{
+    apply_replace_rule_set, apply_replace_rule_set_to_indices, find_replace_rule_set,
+    remove_replace_rule_set, replace_rule_sets_from_json, replace_rule_sets_to_json,
+    save_replace_rule_sets_default, upsert_replace_rule_set, EditorExportFormat, MainWindow,
+    ReplaceRule, ReplaceRuleReport, ReplaceRuleScope, ReplaceRuleSet, REPLACE_RULES_FILE,
+};
 use crate::app::state::{AppState, ProcessStatus, QueueState, WorkspaceTab};
 use crate::core::PipelineEvent;
 use crate::subtitle::audit::{EditKind, EditRecord};
@@ -277,11 +282,14 @@ fn settle_aborted_transcription(state: &mut AppState) -> bool {
     state.batch_running
 }
 
-/// 清空全部译文：先快照、再改动、落库并记一条审计；没有译文时返回 `false`。
+/// 清空全部译文：先快照、再改动、递增修订号、落库并记一条审计；没有译文时返回 `false`。
 ///
 /// 快照必须在改动之前：`Ctrl+Z` 要把**清空之前**的整份译文换回来。审计记录用
 /// `index = 0` 表示这不是针对单句的操作，`before` 写清空前的句数，日志面板
 /// 据此能看出「这一条是整批清空」。
+///
+/// `segments_revision` 由本函数自己递增（见函数内注释）：清译文会改掉一批按修订号
+/// 失效的派生量，失效责任收在改动点上，调用点不再手工补偿。
 fn clear_translations_with_undo(state: &mut AppState) -> bool {
     let cleared = state
         .segments
@@ -296,6 +304,12 @@ fn clear_translations_with_undo(state: &mut AppState) -> bool {
         seg.translation = None;
         seg.translation_lang = None;
     }
+    // 修订号必须在这里递增：清译文改掉了「是否还有双语行 / 译出句数 / 质检的未翻译」
+    // 这些一律按 `segments_revision` 失效的派生量。修前本函数不递增，靠调用点
+    // （`editor.rs` 里「清空译文」按钮那段）手工补一次——调用点一多，漏一个就会让
+    // 清单继续按双语行高渲染、翻译卡仍说「已全部翻译」。补偿现在已删：责任收归
+    // 本函数；双递增虽无副作用，却会让「谁负责失效」重新变模糊。
+    state.bump_segments_revision();
     state.segments_dirty = true;
     state.flush_segments_if_dirty();
     state.edit_log.push(EditRecord {
@@ -306,6 +320,67 @@ fn clear_translations_with_undo(state: &mut AppState) -> bool {
         at: chrono::Local::now(),
     });
     true
+}
+
+/// 「译文被模型原样复制回原文」的判定：直接复用翻译管线的告警判据
+/// （[`crate::engines::llm::is_untranslated_copy`]）。
+///
+/// 刻意不在这里另写一条「trim 后相等」：管线那条判据带着必要的**放行**——原文短于
+/// 4 个字符、或原文不含任何 CJK（`OK`、`P(A+B)`、纯数字、纯拉丁术语本来就该原样
+/// 保留）。两处口径一旦分家，用户会看到「这个按钮说没有复制句，而翻译卡告警说
+/// 检出 N 句复制」的自相矛盾画面。
+pub(crate) fn is_copied_translation(seg: &Segment) -> bool {
+    let Some(translation) = seg.translation.as_deref() else {
+        return false;
+    };
+    crate::engines::llm::is_untranslated_copy(seg.display_text(), translation)
+}
+
+/// 译文被判为「复制原文」的句在 `segments` 里的**位置**下标。
+///
+/// 位置（数组下标）与句序号（`Segment::index`）是两套坐标：这里是给「按位置改
+/// `segments`」用的，审计/报告里的 `index` 仍是句序号，两者别混。
+pub(crate) fn copied_translation_positions(segments: &[Segment]) -> Vec<usize> {
+    segments
+        .iter()
+        .enumerate()
+        .filter(|(_, seg)| is_copied_translation(seg))
+        .map(|(pos, _)| pos)
+        .collect()
+}
+
+/// 是否存在「译文与原文一字不差」的句子（界面据此决定要不要给出清理入口）。
+pub(crate) fn has_copied_translations(segments: &[Segment]) -> bool {
+    segments.iter().any(is_copied_translation)
+}
+/// 用面板里的「查找」文本给规则集起名（纯函数，便于单测）。
+///
+/// 规则集名字要能一眼看出它是干什么用的，而面板里唯一现成的语义就是查找串；
+/// 截断到 20 个字符，免得超长查找串把下拉列表撑爆。
+fn rule_set_name_for(find: &str) -> String {
+    let trimmed = find.trim();
+    let taken: String = trimmed.chars().take(20).collect();
+    if trimmed.chars().count() > 20 {
+        format!("规则：{taken}…")
+    } else {
+        format!("规则：{taken}")
+    }
+}
+
+/// 规则集应用结果的提示文案（纯函数，便于单测）。
+///
+/// 与面板里「全部替换」的文案同口径（处数 + 涉及句数，译文命中单独点名），
+/// 免得同一件事在两条入口给出两种说法。
+fn replace_rule_report_message(name: &str, report: &ReplaceRuleReport) -> String {
+    let mut msg = format!(
+        "规则集「{name}」已替换 {} 处，涉及 {} 句",
+        report.total_hits(),
+        report.changed.len()
+    );
+    if report.translation_hits > 0 {
+        msg.push_str(&format!("（其中译文 {} 处）", report.translation_hits));
+    }
+    msg
 }
 
 impl MainWindow {
@@ -3333,6 +3408,410 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// 只清理「译文与原文一字不差」的句子，其余译文一概不动。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 小模型（尤其离线 Qwen）摆烂时会把原文原样吐回来：那句译文在屏幕上看与原文
+    /// 一模一样，既没法读又让「已全部翻译」的统计失真。此前用户只剩两条路：忍着，
+    /// 或者点「清空译文」把**全部**译文（含已逐句校对好的）一起扔掉——后者代价太大。
+    ///
+    /// # 边界与口径
+    ///
+    /// - 判据复用管线那份（见 [`is_copied_translation`]）：短句 / 纯拉丁术语放行；
+    /// - 走撤销栈：先 `snapshot_for_undo`，`Ctrl+Z` 能把译文原样换回来；
+    /// - **无命中时不压撤销点**：否则按一次 `Ctrl+Z` 只会退掉一次什么都没做的操作；
+    /// - 只动 `translation` / `translation_lang`，**不碰 `words`**：词级时间戳属于
+    ///   原文字幕（卡拉 OK 高亮按它切分），清译文与它无关；既有的「清空全部译文」
+    ///   路径同样不动它，两处口径保持一致；
+    /// - 审计归到「改译文」（`EditKind::Translation`），与整批清空同一口径。
+    pub(crate) fn clear_copied_translations(&mut self, cx: &mut Context<Self>) {
+        if self.state.is_translating {
+            self.notice = Some("翻译正在进行中，请先取消翻译再清理复制译文".to_string());
+            cx.notify();
+            return;
+        }
+        let positions = copied_translation_positions(&self.state.segments);
+        if positions.is_empty() {
+            self.notice = Some("没有发现「译文与原文一字不差」的句子".to_string());
+            cx.notify();
+            return;
+        }
+        self.state.snapshot_for_undo();
+        let mut cleared = 0usize;
+        for &pos in &positions {
+            let Some(seg) = self.state.segments.get_mut(pos) else {
+                continue;
+            };
+            seg.translation = None;
+            seg.translation_lang = None;
+            cleared += 1;
+        }
+        // 双语行高 / 译出句数 / 质检「未翻译」都按修订号失效；随后置脏才算「未保存」，
+        // 只递增修订号不置脏的话这次清理不会被写回历史库。
+        self.state.bump_segments_revision();
+        self.state.segments_dirty = true;
+        self.state.flush_segments_if_dirty();
+        self.state.edit_log.push(EditRecord {
+            index: 0,
+            kind: EditKind::Translation,
+            before: format!("{cleared} 句复制译文"),
+            after: String::new(),
+            at: chrono::Local::now(),
+        });
+        self.notice = Some(format!(
+            "已清理 {cleared} 句「译文与原文一字不差」的译文，可按 Ctrl+Z 还原"
+        ));
+        cx.notify();
+    }
+
+    /// 当前选中的规则集（没选 / 下标越界都按「没选」处理）。
+    fn selected_replace_rule_set(&self) -> Option<ReplaceRuleSet> {
+        let idx = self.replace_rule_selected?;
+        self.replace_rule_sets.get(idx).cloned()
+    }
+
+    /// 当前选中句在 `segments` 里的**位置**下标（`None` = 没选中 / 已不存在）。
+    fn selected_segment_position(&self) -> Option<usize> {
+        let idx = self.state.selected_segment_index?;
+        self.state.segments.iter().position(|s| s.index == idx)
+    }
+
+    /// 把当前选中的规则集应用到字幕：`scope` 决定全部句还是选中句。
+    ///
+    /// # 几个刻意的取舍
+    ///
+    /// - **先在副本上试跑**：`replace_all` 是写操作，而「一处都没命中还压一个撤销点」
+    ///   会让 `Ctrl+Z` 变成退掉一次空操作。这里先在克隆出的片段表上跑一遍，真有命中
+    ///   才压快照并把结果换进去（多一次克隆，换撤销语义干净）。
+    /// - 匹配选项沿用替换面板上的两个勾选（大小写 / 含译文）：用户在同一处就能看清
+    ///   「这次会怎么匹配」，不另造一套开关。
+    /// - 有命中后置脏 + 递增修订号 + 落库 + 审计，与面板里的「全部替换」逐项对齐。
+    pub(crate) fn apply_selected_replace_rule_set(
+        &mut self,
+        scope: ReplaceRuleScope,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(set) = self.selected_replace_rule_set() else {
+            self.replace_rules_status = Some((
+                false,
+                "先在「规则集」里选一个（点开列表点一下）".to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        let options = crate::subtitle::edit::ReplaceOptions {
+            case_sensitive: self.replace_case_sensitive,
+            include_translation: self.replace_include_translation,
+        };
+        // 只有「选中句」需要目标下标表；「全部句」走整表入口，不必先铺出一个几万
+        // 元素的下标表（点了没用，纯属白分配）。
+        let targets: Vec<usize> = match scope {
+            ReplaceRuleScope::AllSegments => Vec::new(),
+            ReplaceRuleScope::SelectedSentence => match self.selected_segment_position() {
+                Some(pos) => vec![pos],
+                None => {
+                    self.replace_rules_status =
+                        Some((false, "先在字幕清单里选中一句，再应用规则".to_string()));
+                    cx.notify();
+                    return;
+                }
+            },
+        };
+        // 试跑：无命中就什么都不做——不压撤销点、不置脏、不落库。
+        // 「全部句」走整表入口、「选中句」走按下标的入口：两条路都在
+        // `subtitle::edit::replace_all` 上收敛，逐句语义不会有第二份实现。
+        let mut trial = self.state.segments.clone();
+        let report = match scope {
+            ReplaceRuleScope::AllSegments => apply_replace_rule_set(&mut trial, &set, &options),
+            ReplaceRuleScope::SelectedSentence => {
+                apply_replace_rule_set_to_indices(&mut trial, &targets, &set, &options)
+            }
+        };
+        if report.is_empty() {
+            self.replace_rules_status =
+                Some((false, format!("规则集「{}」没有找到匹配的内容", set.name)));
+            cx.notify();
+            return;
+        }
+        // 此刻 `state.segments` 还是原样：快照拿到的正是「应用之前」的那一份。
+        self.state.snapshot_for_undo();
+        // 审计里的 `index` 是**句序号**：整批应用记 0（不是针对单句），单句记那句的序号。
+        let audit_index = match scope {
+            ReplaceRuleScope::AllSegments => 0,
+            ReplaceRuleScope::SelectedSentence => targets
+                .first()
+                .and_then(|&pos| trial.get(pos))
+                .map_or(0, |s| s.index),
+        };
+        self.state.segments = trial;
+        self.state.bump_segments_revision();
+        self.state.segments_dirty = true;
+        self.state.flush_segments_if_dirty();
+        self.state.edit_log.push(EditRecord {
+            index: audit_index,
+            kind: EditKind::Replace,
+            before: format!("规则集「{}」", set.name),
+            after: format!("{} 处", report.total_hits()),
+            at: chrono::Local::now(),
+        });
+        self.replace_rules_status = Some((true, replace_rule_report_message(&set.name, &report)));
+        cx.notify();
+    }
+
+    /// 把内存里的规则集写回磁盘；**只把失败挂到状态行**（成功文案由调用方给：
+    /// 「刚保存」「刚导入」「刚删除」要说的话不一样）。失败原样返回给调用方。
+    pub(crate) fn persist_replace_rule_sets(&mut self) -> Result<(), String> {
+        match save_replace_rule_sets_default(&self.replace_rule_sets) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.replace_rules_status = Some((false, err.clone()));
+                Err(err)
+            }
+        }
+    }
+
+    /// 「保存」按钮：把当前规则集写回磁盘（`replace_rules.json`）。
+    pub(crate) fn save_replace_rule_sets_now(&mut self, cx: &mut Context<Self>) {
+        if self.persist_replace_rule_sets().is_ok() {
+            self.replace_rules_status = Some((
+                true,
+                format!(
+                    "已保存 {} 个规则集到 {}",
+                    self.replace_rule_sets.len(),
+                    REPLACE_RULES_FILE
+                ),
+            ));
+        }
+        cx.notify();
+    }
+
+    /// 把面板里当前的「查找 → 替换」存成一个新规则集（同名覆盖），并写回磁盘。
+    ///
+    /// 没有这个入口，规则集就只能靠手写 JSON 或从别人那里导入——用户自己在面板里
+    /// 试好的一条替换，理应能一键留下来。名字取查找串（见 [`rule_set_name_for`]）。
+    pub(crate) fn save_current_replace_as_rule_set(&mut self, cx: &mut Context<Self>) {
+        if self.replace_find.is_empty() {
+            self.replace_rules_status = Some((false, "先在「查找」里写上要匹配的文字".to_string()));
+            cx.notify();
+            return;
+        }
+        let name = rule_set_name_for(&self.replace_find);
+        let set = ReplaceRuleSet {
+            name: name.clone(),
+            rules: vec![ReplaceRule {
+                find: self.replace_find.clone(),
+                replace: self.replace_with.clone(),
+            }],
+        };
+        match upsert_replace_rule_set(&mut self.replace_rule_sets, set) {
+            Ok(pos) => {
+                self.replace_rule_selected = Some(pos);
+                if self.persist_replace_rule_sets().is_ok() {
+                    self.replace_rules_status = Some((
+                        true,
+                        format!("已保存规则集「{name}」（1 条规则），已写入 {REPLACE_RULES_FILE}"),
+                    ));
+                }
+            }
+            Err(err) => self.replace_rules_status = Some((false, err)),
+        }
+        cx.notify();
+    }
+
+    /// 把面板里当前的「查找 → 替换」追加到选中的规则集末尾，并写回磁盘。
+    ///
+    /// 同一条查找串只留一条规则：重复追加同一条规则会变成「同一处替换两次」，
+    /// 用户看到下拉里挂着一串一模一样的条目，纯属噪声。因此同 `find` 视作**改**
+    /// （覆盖替换文本），不是**增**。
+    pub(crate) fn append_current_replace_rule(&mut self, cx: &mut Context<Self>) {
+        if self.replace_find.is_empty() {
+            self.replace_rules_status = Some((false, "先在「查找」里写上要匹配的文字".to_string()));
+            cx.notify();
+            return;
+        }
+        let Some(pos) = self.replace_rule_selected else {
+            self.replace_rules_status = Some((false, "先选一个规则集再追加".to_string()));
+            cx.notify();
+            return;
+        };
+        let Some(set) = self.replace_rule_sets.get_mut(pos) else {
+            self.replace_rules_status = Some((false, "选中的规则集已不存在".to_string()));
+            cx.notify();
+            return;
+        };
+        let name = set.name.clone();
+        let find = self.replace_find.clone();
+        let replace = self.replace_with.clone();
+        match set.rules.iter_mut().find(|rule| rule.find == find) {
+            Some(existing) => existing.replace = replace,
+            None => set.rules.push(ReplaceRule { find, replace }),
+        }
+        let count = set.rules.len();
+        if self.persist_replace_rule_sets().is_ok() {
+            self.replace_rules_status = Some((
+                true,
+                format!("已把当前替换加入规则集「{name}」（现共 {count} 条）"),
+            ));
+        }
+        cx.notify();
+    }
+
+    /// 「删除当前集」：把选中的规则集从列表里删掉并写回磁盘。
+    ///
+    /// 删除是**即时生效**的（没有二次确认弹窗：这个面板里改的是用户自己攒的小
+    /// JSON，删错了重新导入/重建即可），因此文案里必须写清「已删除」而不是沉默。
+    pub(crate) fn delete_selected_replace_rule_set(&mut self, cx: &mut Context<Self>) {
+        let Some(pos) = self.replace_rule_selected else {
+            self.replace_rules_status = Some((false, "先选一个规则集再删除".to_string()));
+            cx.notify();
+            return;
+        };
+        let Some(name) = self.replace_rule_sets.get(pos).map(|s| s.name.clone()) else {
+            self.replace_rules_status = Some((false, "选中的规则集已不存在".to_string()));
+            cx.notify();
+            return;
+        };
+        if !remove_replace_rule_set(&mut self.replace_rule_sets, &name) {
+            self.replace_rules_status = Some((false, format!("没有找到规则集「{name}」")));
+            cx.notify();
+            return;
+        }
+        // 删完之后选中项夹回有效范围：列表空了就回到「未选择」，否则顶上来一条，
+        // 免得下拉停在越界下标上（渲染层虽然会夹，但状态本身不该是脏的）。
+        self.replace_rule_selected = if self.replace_rule_sets.is_empty() {
+            None
+        } else {
+            Some(pos.min(self.replace_rule_sets.len() - 1))
+        };
+        if self.persist_replace_rule_sets().is_ok() {
+            self.replace_rules_status = Some((
+                true,
+                format!("已删除规则集「{name}」，已同步写入 {REPLACE_RULES_FILE}"),
+            ));
+        }
+        // 失败时 `persist_replace_rule_sets` 已把错误挂到状态行，原地保留即可。
+        cx.notify();
+    }
+
+    /// 从 JSON 文件导入规则集（同名覆盖、新名追加），并立刻写回磁盘。
+    ///
+    /// 读盘与解析分两步：文件选择走异步对话框（同步版会起 Win32 模态循环，而 GPUI
+    /// 渲染回调里正持有 RefCell 借用），读盘交给后台执行器（文件可能在网络盘上），
+    /// 解析与合并回主线程做——那一步要改 `replace_rule_sets`。
+    pub(crate) fn import_replace_rule_sets(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("导入替换规则集（JSON）")
+                .add_filter("规则集 JSON", &["json"])
+                .add_filter("所有文件", &["*"])
+                .pick_file()
+                .await;
+            let Some(file) = handle else {
+                return;
+            };
+            let path = file.path().to_path_buf();
+            let read = cx
+                .background_executor()
+                .spawn(async move {
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| format!("规则集文件读取失败（{}）：{e}", path.display()))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match read {
+                    Ok(raw) => this.apply_imported_replace_rule_sets(&raw),
+                    Err(err) => this.replace_rules_status = Some((false, err)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 解析一段导入的 JSON 并合并进规则集（同名覆盖），随后写回磁盘。
+    ///
+    /// 与文件对话框分离成同步方法：那层没法单测，这层能。
+    fn apply_imported_replace_rule_sets(&mut self, raw: &str) {
+        let imported = match replace_rule_sets_from_json(raw) {
+            Ok(sets) => sets,
+            Err(err) => {
+                self.replace_rules_status = Some((false, err));
+                return;
+            }
+        };
+        if imported.is_empty() {
+            self.replace_rules_status = Some((false, "文件里没有可用的规则集".to_string()));
+            return;
+        }
+        let total = imported.len();
+        let mut overwritten = 0usize;
+        let mut last_pos = None;
+        for set in imported {
+            let existed = find_replace_rule_set(&self.replace_rule_sets, &set.name).is_some();
+            // 空名条目在解析层已被跳过，这里只做兜底：失败就跳过这一条，不整批失败。
+            if let Ok(pos) = upsert_replace_rule_set(&mut self.replace_rule_sets, set) {
+                if existed {
+                    overwritten += 1;
+                }
+                last_pos = Some(pos);
+            }
+        }
+        if let Some(pos) = last_pos {
+            self.replace_rule_selected = Some(pos);
+        }
+        if self.persist_replace_rule_sets().is_ok() {
+            self.replace_rules_status = Some((
+                true,
+                format!(
+                    "已导入 {total} 个规则集（覆盖 {overwritten} 个同名项），已写入 {REPLACE_RULES_FILE}"
+                ),
+            ));
+        } else if let Some((_, msg)) = self.replace_rules_status.as_mut() {
+            // 写盘失败时 `persist_replace_rule_sets` 已把错误挂上状态行，
+            // 这里只补一句「导入的内容还在内存里」，免得用户以为整次导入白做了。
+            msg.push_str("（导入的规则集仍在内存里，修好磁盘后可再点「保存」）");
+        }
+    }
+
+    /// 把当前规则集导出成一份 JSON（与导入同一种扁平格式，可直接给别人导入）。
+    pub(crate) fn export_replace_rule_sets(&mut self, cx: &mut Context<Self>) {
+        if self.replace_rule_sets.is_empty() {
+            self.replace_rules_status = Some((false, "还没有规则集可导出".to_string()));
+            cx.notify();
+            return;
+        }
+        let json = replace_rule_sets_to_json(&self.replace_rule_sets);
+        let count = self.replace_rule_sets.len();
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("导出替换规则集（JSON）")
+                .set_file_name(REPLACE_RULES_FILE)
+                .add_filter("规则集 JSON", &["json"])
+                .save_file()
+                .await;
+            let Some(file) = handle else {
+                return;
+            };
+            let write_path = file.path().to_path_buf();
+            let write = cx
+                .background_executor()
+                .spawn(async move {
+                    std::fs::write(&write_path, json)
+                        .map_err(|e| format!("规则集写入失败（{}）：{e}", write_path.display()))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.replace_rules_status = Some(match write {
+                    Ok(()) => (true, format!("已导出 {count} 个规则集")),
+                    Err(err) => (false, err),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 打开（或创建）术语表临时文件，供用户用记事本等编辑器编辑。
     ///
     /// 术语表是多行文本，自绘单行输入框既装不下也没法用输入法舒服编辑；改为写文件 +
@@ -3856,9 +4335,10 @@ fn finish_db_work(
 #[cfg(test)]
 mod tests {
     use super::{
-        editor_export_format_string, export_spec_for, finish_db_write_error,
-        flush_outcome_to_apply, frame_failure_notice, still_same_document, DocumentIdentity,
-        SegmentFlushOutcome,
+        clear_translations_with_undo, copied_translation_positions, editor_export_format_string,
+        export_spec_for, finish_db_write_error, flush_outcome_to_apply, frame_failure_notice,
+        has_copied_translations, is_copied_translation, replace_rule_report_message,
+        rule_set_name_for, still_same_document, DocumentIdentity, SegmentFlushOutcome,
     };
     use crate::subtitle::Segment;
     use crate::ui::EditorExportFormat;
@@ -4080,5 +4560,178 @@ mod tests {
             "阈值之后不再重复提示，避免刷屏"
         );
         assert!(frame_failure_notice(50).is_none(), "长期失败也只提示一次");
+    }
+
+    // ── 清空译文 / 清理复制译文（第 8、10 项）────────────────────────────
+
+    /// 最小可用的 `AppState`（内存 SQLite + 假路径引擎，不碰显卡/磁盘/子进程），
+    /// 只为验证「清空译文 / 撤销」这类纯状态逻辑。
+    ///
+    /// 与 `app::state` 测试里的同名助手同构：用 `HardwareProfile::cpu_only()` 而不是
+    /// `AppState::new`——后者会通过 wgpu 枚举显卡，单测没必要为一份硬件档案初始化
+    /// 图形栈。
+    fn copied_state(segments: Vec<Segment>) -> crate::app::state::AppState {
+        use crate::engines::{FFmpegEngine, HardwareProfile, LLMEngine, WhisperEngine};
+        use crate::storage::Database;
+        use crate::utils::AppConfig;
+        use std::sync::Arc;
+
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let pipeline = Arc::new(crate::core::TaskPipeline::new(
+            Arc::new(FFmpegEngine::new("ffmpeg")),
+            Arc::new(WhisperEngine::new("whisper-cli", "ggml-small.bin", 4, 1)),
+            None,
+            Arc::new(LLMEngine::new("llama-cli", "model.gguf", 2048, 4)),
+            None,
+        ));
+        let mut state = crate::app::state::AppState::with_hardware(
+            AppConfig::default(),
+            db,
+            pipeline,
+            HardwareProfile::cpu_only(),
+        );
+        state.segments = segments;
+        state
+    }
+
+    /// 回归（第 8 项）：清空译文的入口必须**自己**递增修订号。
+    ///
+    /// 修前本函数不递增、由 `editor.rs` 里那个按钮手工补一次：任何人加一个新调用点
+    /// 忘了补，字幕清单就会继续按双语行高渲染、翻译卡仍说「已全部翻译」。这里钉住
+    /// 「调用一次就递增一次」，并顺带验证撤销栈里拿到的是清空**之前**的快照。
+    #[test]
+    fn clear_translations_with_undo_bumps_segments_revision() {
+        let mut first = Segment::new(1, 0.0, 1.0, "第一句");
+        first.translation = Some("First".to_string());
+        first.translation_lang = Some("English".to_string());
+        let mut second = Segment::new(2, 1.0, 2.0, "第二句");
+        second.translation = Some("Second".to_string());
+        let mut state = copied_state(vec![first, second]);
+
+        let before = state.segments_revision;
+        assert!(clear_translations_with_undo(&mut state), "有译文就该清掉");
+        assert_eq!(
+            state.segments_revision,
+            before + 1,
+            "清空译文必须推进修订号（双语行高 / 译出句数 / 质检都按它失效）"
+        );
+        assert!(state.segments.iter().all(|s| s.translation.is_none()));
+        assert!(state.segments.iter().all(|s| s.translation_lang.is_none()));
+
+        // 撤销把两份译文原样换回来 ⇒ 快照确实取在改动之前。
+        assert!(state.undo(), "清空译文必须留在撤销栈里");
+        assert_eq!(state.segments[0].translation.as_deref(), Some("First"));
+        assert_eq!(state.segments[1].translation.as_deref(), Some("Second"));
+        assert_eq!(
+            state.segments[0].translation_lang.as_deref(),
+            Some("English")
+        );
+
+        // 没有译文可清时不许压撤销点（返回 false，也不该推进修订号）。
+        for seg in &mut state.segments {
+            seg.translation = None;
+            seg.translation_lang = None;
+        }
+        let revision_after_clear = state.segments_revision;
+        assert!(!clear_translations_with_undo(&mut state));
+        assert_eq!(state.segments_revision, revision_after_clear);
+    }
+
+    /// 「译文与原文一字不差」的判定必须与翻译管线那份判据同口径（同一份实现），
+    /// 包括短句 / 纯拉丁术语的放行——两处口径分家，界面与告警就会互相打脸。
+    #[test]
+    fn copied_translation_predicate_matches_pipeline_criterion() {
+        for (source, translation, expected) in [
+            (
+                "今天天气很好我们出去散步吧",
+                "今天天气很好我们出去散步吧",
+                true,
+            ),
+            (
+                "今天天气很好我们出去散步吧",
+                " 今天天气很好我们出去散步吧 ",
+                true,
+            ),
+            (
+                "今天天气很好我们出去散步吧",
+                "今天天气很好，我们出去散步吧",
+                false,
+            ),
+            ("OK", "OK", false),
+            ("Hello world", "Hello world", false),
+            ("P(A+B)=1 概率", "P(A+B)=1 概率", true),
+        ] {
+            let mut seg = Segment::new(1, 0.0, 1.0, source);
+            seg.translation = Some(translation.to_string());
+            assert_eq!(
+                is_copied_translation(&seg),
+                expected,
+                "原文「{source}」/ 译文「{translation}」的判定不符"
+            );
+            assert_eq!(
+                is_copied_translation(&seg),
+                crate::engines::llm::is_untranslated_copy(source, translation),
+                "与管线判据分家了"
+            );
+        }
+    }
+
+    /// 位置下标（清空用）与「有没有复制句」（决定入口显不显示）两个查询必须一致，
+    /// 且无译文 / 无复制句时都返回空。
+    #[test]
+    fn copied_translation_positions_and_probe_agree() {
+        let mut copied = Segment::new(1, 0.0, 1.0, "这是一句地道的复制译文");
+        copied.translation = Some("这是一句地道的复制译文".to_string());
+        let mut fine = Segment::new(2, 1.0, 2.0, "这句翻译是正常的");
+        fine.translation = Some("This sentence has been translated".to_string());
+        let mut untranslated = Segment::new(3, 2.0, 3.0, "这句还没翻译");
+        untranslated.translation = None;
+        let segments = vec![copied, fine, untranslated];
+
+        assert_eq!(copied_translation_positions(&segments), vec![0]);
+        assert!(has_copied_translations(&segments));
+        assert!(!has_copied_translations(&segments[1..]));
+        assert!(copied_translation_positions(&[]).is_empty());
+    }
+
+    /// 规则集应用后的提示文案：处数 / 涉及句数 / 译文命中都要说清（纯函数）。
+    #[test]
+    fn replace_rule_report_message_summarizes_hits() {
+        let report = crate::ui::ReplaceRuleReport {
+            rules_hit: 2,
+            text_hits: 5,
+            translation_hits: 3,
+            changed: vec![1, 2, 5],
+        };
+        let msg = replace_rule_report_message("口头禅", &report);
+        assert!(msg.contains("口头禅"), "{msg}");
+        assert!(msg.contains("8 处"), "总命中必须含译文命中：{msg}");
+        assert!(msg.contains("3 句"), "涉及句数要说清：{msg}");
+        assert!(msg.contains("译文 3 处"), "译文命中要单独点名：{msg}");
+
+        let text_only = crate::ui::ReplaceRuleReport {
+            text_hits: 1,
+            changed: vec![7],
+            ..Default::default()
+        };
+        let msg = replace_rule_report_message("术语", &text_only);
+        assert!(!msg.contains("译文"), "没有命中译文时不该提译文：{msg}");
+    }
+
+    /// 规则集名字取自查找串：短串原样（去掉首尾空白），超长串截断到 20 字 + 省略号，
+    /// 免得下拉列表被一条超长查找串撑爆。
+    #[test]
+    fn rule_set_name_for_find_text_truncates() {
+        assert_eq!(rule_set_name_for("  呃  "), "规则：呃");
+        assert_eq!(rule_set_name_for("transformer"), "规则：transformer");
+
+        let long: String = "这".repeat(25);
+        let name = rule_set_name_for(&long);
+        assert!(name.ends_with('…'), "{name}");
+        assert_eq!(
+            name.chars().count(),
+            "规则：".chars().count() + 20 + 1,
+            "截断到 20 个字符 + 省略号：{name}"
+        );
     }
 }

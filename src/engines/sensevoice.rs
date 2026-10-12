@@ -181,6 +181,14 @@ pub struct SenseVoiceEngine {
     fallback_reported: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     active_children: Arc<Mutex<Vec<ChildEntry>>>,
+
+    /// 上一次 `transcribe*` 是否因 stdout 管道**读取失败**（而不是正常 EOF）提前结束：
+    /// `true` 表示结果可能被截断（后面的句子根本没读出来）。
+    ///
+    /// 与 whisper 引擎同名的信号；用引擎级原子标志而不是改返回类型，因为
+    /// `Result<(Vec<Segment>, f64)>` 是与 whisper 对齐的既有签名，改它会波及本文件
+    /// 之外的调用点。Arc 是因为 `SenseVoiceEngine` 派生 Clone。
+    output_truncated: Arc<AtomicBool>,
 }
 
 impl SenseVoiceEngine {
@@ -259,6 +267,9 @@ impl SenseVoiceEngine {
             fallback_reported: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
             active_children: Arc::new(Mutex::new(Vec::new())),
+
+            // 本轮结果是否被截断：见 `output_truncated`。
+            output_truncated: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -281,8 +292,24 @@ impl SenseVoiceEngine {
     /// 只会把同一条回落告警刷进日志。
     pub fn reset(&self) {
         self.cancel.store(false, Ordering::SeqCst);
+        // 每轮任务开始都要清掉上一轮的截断标记：否则一次管道故障会一直挂在引擎上，
+        // 把后续每一次正常转写都误报成「输出被截断」。
+        self.output_truncated.store(false, Ordering::SeqCst);
     }
 
+    /// 上一次转写的 stdout 是否因**读取失败**（非 EOF）提前结束：`true` = 结果可能被截断。
+    ///
+    /// `line_res.unwrap_or_default()` 的旧写法把「读到一半管道报错」变成一行空文本，
+    /// 再被 `trimmed.is_empty()` 丢掉：与「runner 正常收尾」在结果上完全同形。
+    /// 调用方（管线 / UI）读到 `true` 时应提示「字幕可能不完整」。
+    pub fn output_truncated(&self) -> bool {
+        self.output_truncated.load(Ordering::SeqCst)
+    }
+
+    /// 读取并**复位**截断标记，适合「一次转写只提示一次」的调用点。
+    pub fn take_output_truncated(&self) -> bool {
+        self.output_truncated.swap(false, Ordering::SeqCst)
+    }
     /// 记录 runner 回报的 provider 实况；命中回落时打印一次可操作告警。
     ///
     /// 首次回报为准：并行切块时多个 worker 进程回报的是同一条事实，后到的只算重复。
@@ -459,6 +486,9 @@ impl SenseVoiceEngine {
         input_stream: Option<Box<dyn std::io::Read + Send + 'static>>,
         progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
+        // 本轮结果是否被截断：必须在任何读取线程启动前清零，保证读到的永远是
+        // **本次运行**的事实（上一轮的失败不能污染本轮）。
+        self.output_truncated.store(false, Ordering::SeqCst);
         // spawn 前的取消早退：若取消在准备区（拼参数、选解释器…）期间就已到达，就没必要
         // 真的把 runner 拉起来再靠 register_child 的复查把它杀掉——那几毫秒里进程创建与
         // Python 解释器启动已经白做一遍，用户看到的是「点了终止却还闪了一下子进程」。
@@ -505,8 +535,18 @@ impl SenseVoiceEngine {
                 use std::io::{copy, BufReader, BufWriter, Write};
                 let mut reader = BufReader::with_capacity(128 * 1024, stream);
                 let mut writer = BufWriter::with_capacity(128 * 1024, stdin);
-                let _ = copy(&mut reader, &mut writer);
-                let _ = writer.flush();
+                // `let _ =` 把写失败（runner 提前退出、管道断开）吞得干干净净：
+                // 上层只会看到「结果为空/偏短」，日志里没有任何线索。
+                if let Err(err) = copy(&mut reader, &mut writer) {
+                    warn!(
+                        error = %err,
+                        "SenseVoice 音频流泵送中断：runner 可能已提前结束，stdin 写入失败"
+                    );
+                }
+                if let Err(err) = writer.flush() {
+                    warn!(error = %err, "SenseVoice 音频流泵送收尾 flush 失败");
+                }
+                // writer 与 stdin 离开作用域自动 drop，向 runner 发送 EOF
             }))
         } else {
             None
@@ -524,7 +564,16 @@ impl SenseVoiceEngine {
         let stderr_handle = std::thread::spawn(move || {
             use std::io::Read;
             let mut err_str = String::new();
-            let _ = std::io::BufReader::new(stderr).read_to_string(&mut err_str);
+            // `let _ =` 把读失败吞成空串：失败分支随后会给出「无任何输出」的误导提示
+            // （见 `stderr_str.trim().is_empty()`），而真正的事实是诊断通道断了或只读
+            // 到一半。至少留下一条带字节数的日志。
+            if let Err(err) = std::io::BufReader::new(stderr).read_to_string(&mut err_str) {
+                warn!(
+                    error = %err,
+                    bytes = err_str.len(),
+                    "读取 SenseVoice 标准错误失败：诊断信息可能被截断"
+                );
+            }
             err_str
         });
 
@@ -533,14 +582,34 @@ impl SenseVoiceEngine {
 
         use std::io::BufRead;
         let reader = std::io::BufReader::new(stdout);
-        for line_res in reader.lines() {
-            let line = line_res.unwrap_or_default();
+        // 读失败（非 EOF）时 `drain_stdout_lines` 返回 Err：这件事必须能被带出去，
+        // 而不是像 `line_res.unwrap_or_default()` 那样变成一行空文本、再被
+        // `trimmed.is_empty()` 丢掉。
+        let mut unparsed_lines = 0usize;
+        let stdout_read = drain_stdout_lines(reader.lines(), "SenseVoice runner", |line| {
             let trimmed = line.trim();
             if trimmed.is_empty() {
-                continue;
+                // 闭包里的 `return` 等价于原 for 循环里的 `continue`。
+                return;
             }
 
-            if let Ok(parsed) = serde_json::from_str::<SenseVoiceStreamLine>(trimmed) {
+            let parsed = serde_json::from_str::<SenseVoiceStreamLine>(trimmed);
+            if let Err(err) = &parsed {
+                // runner 协议是逐行 JSON：解不开的行以前被完全静默地丢掉，版本不匹配
+                // 时用户只会看到「一句都没有」。只报首条（带截断预览）避免刷屏，
+                // 收尾再汇总总数。
+                if unparsed_lines == 0 {
+                    let preview: String = trimmed.chars().take(160).collect();
+                    warn!(
+                        error = %err,
+                        preview = %preview,
+                        "SenseVoice runner 输出了无法解析的行：已忽略"
+                    );
+                }
+                unparsed_lines += 1;
+                return;
+            }
+            if let Ok(parsed) = parsed {
                 match parsed.event.as_str() {
                     "segment" => {
                         let seg = Segment {
@@ -605,6 +674,17 @@ impl SenseVoiceEngine {
                     _ => {}
                 }
             }
+        });
+        if unparsed_lines > 0 {
+            warn!(
+                unparsed_lines,
+                "SenseVoice runner 输出中有无法解析的行（协议版本不匹配？详见前面那条日志）"
+            );
+        }
+        if stdout_read.is_err() {
+            // 「输出被截断」的正式信号：调用方（管线 / UI）据此提示用户，
+            // 而不是把半份结果当成完整结果。
+            self.output_truncated.store(true, Ordering::SeqCst);
         }
 
         let wait_result = child.wait();
@@ -687,6 +767,35 @@ impl SenseVoiceEngine {
         );
         Ok((segments, inference_elapsed))
     }
+}
+
+/// 逐行消费 runner 的 stdout（逐行 JSON 流），每行解码后交给 `on_line`。
+///
+/// 返回 `Ok(())` = 读到 EOF，**正常结束**；返回 `Err(..)` = **读失败**（非常 EOF）
+/// 中止，也就是「输出被截断」。
+///
+/// 为什么要专门区分：旧写法 `let line = line_res.unwrap_or_default();` 把读错误变成
+/// 一行空文本，紧接着被 `trimmed.is_empty()` 丢掉——「管道读到一半坏了」与「runner
+/// 正常收尾」在结果上完全同形，用户只看到字幕少了一截，日志里毫无线索。
+/// 迭代器由参数注入，单测可以直接喂一条「读一半就报错」的假 stdout，不必拉起 Python。
+fn drain_stdout_lines<I>(lines: I, what: &str, mut on_line: impl FnMut(&str)) -> std::io::Result<()>
+where
+    I: IntoIterator<Item = std::io::Result<String>>,
+{
+    for line_res in lines {
+        match line_res {
+            Ok(line) => on_line(&line),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    stdout = what,
+                    "读取标准输出失败：转写输出被截断（这不是正常结束）"
+                );
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1270,5 +1379,63 @@ mod tests {
         );
         let lo = SenseVoiceEngine::new("r.py", "m.onnx", "t.txt", "v.onnx", 0);
         assert_eq!(lo.threads, MIN_THREADS, "构造器必须把 0 抬到 MIN_THREADS");
+    }
+
+    // ───────── 读失败 ≠ 正常结束：管道故障不再静默变成「少了几句话」 ─────────
+
+    /// 回归：stdout **读失败**必须与正常结束（EOF）区分开。
+    ///
+    /// 旧写法 `line_res.unwrap_or_default()` 把读错误变成一行空文本、再被
+    /// `trimmed.is_empty()` 丢掉，用户侧就是「字幕少了一截」；两件事必须能分开。
+    /// 迭代器由参数注入，单测不必真的拉起 Python runner。
+    #[test]
+    fn drain_stdout_lines_separates_read_failure_from_eof() {
+        // 1) 正常读完（EOF 由迭代器结束表达）：Ok(())，所有行都交付
+        let mut got = Vec::new();
+        let clean = vec![
+            Ok("{\"event\":\"segment\"}".to_string()),
+            Ok("x".to_string()),
+        ];
+        assert!(
+            drain_stdout_lines(clean, "测试", |line| got.push(line.to_string())).is_ok(),
+            "正常结束不是失败"
+        );
+        assert_eq!(
+            got,
+            vec!["{\"event\":\"segment\"}".to_string(), "x".to_string()]
+        );
+
+        // 2) 读到第二行时管道报错：必须 Err，且失败前读到的行要保留
+        let mut got = Vec::new();
+        let broken = vec![
+            Ok("first".to_string()),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "假管道：读失败",
+            )),
+        ];
+        let outcome = drain_stdout_lines(broken, "测试", |line| got.push(line.to_string()));
+        assert!(outcome.is_err(), "读失败必须与 EOF 分开表达");
+        assert_eq!(got, vec!["first".to_string()], "失败前读到的行必须保留");
+    }
+
+    /// 「输出被截断」必须能从引擎读出来，并且是**一次取走即复位**的语义：
+    /// 调用方（管线 / UI）据此提示用户「字幕可能不完整」。
+    #[test]
+    fn output_truncated_flag_is_readable_take_once_and_cleared_by_reset() {
+        let engine = SenseVoiceEngine::new("r.py", "m.onnx", "t.txt", "v.onnx", 4);
+        assert!(!engine.output_truncated(), "新引擎默认没有截断");
+
+        engine.output_truncated.store(true, Ordering::SeqCst);
+        assert!(engine.output_truncated(), "读失败后必须能读到截断信号");
+        assert!(engine.take_output_truncated(), "取一次应为 true");
+        assert!(!engine.output_truncated(), "取走即复位");
+
+        engine.output_truncated.store(true, Ordering::SeqCst);
+        engine.reset();
+        assert!(
+            !engine.output_truncated(),
+            "reset（每轮任务开始调用）必须清掉上一轮的截断标记"
+        );
     }
 }

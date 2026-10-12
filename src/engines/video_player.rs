@@ -24,11 +24,80 @@ fn play_time_at(base: f64, wall_sec: f64) -> f64 {
     base + wall_sec.max(0.0)
 }
 
+/// 出帧管道读取结束的定性：`UnexpectedEof` 表示**视频正常播完**（管道按帧字节数收尾），
+/// 其余 io 错误才是故障。
+///
+/// 抽成纯函数是为了让单测直接断言两种结束方式可区分——旧写法 `Err(_) => break`
+/// 把「放完了」与「管道坏了」合并成同一个静默的画面停止，两者在日志里也无法分辨。
+fn is_playback_finished(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::UnexpectedEof
+}
+
 /// 一帧解码输出：BGRA 像素 + 本帧实际尺寸（随视频真实宽高比动态变化，UI 据此构建纹理）
 pub struct PlayerFrame {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
+}
+
+/// 播放启动失败的阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackStage {
+    /// 文件不存在或不可访问
+    MissingFile,
+    /// 解码进程起不来（硬解 + 软解都失败时，`PlaybackFailure::hardware_error`
+    /// 带上硬解那一路的原因）
+    DecodeSpawn,
+    /// 进程起来了，但拿不到出帧管道
+    FramePipe,
+    /// 出帧线程创建失败
+    FrameThread,
+}
+
+impl PlaybackStage {
+    /// 用户可读的阶段名（直接进提示文案）。
+    pub fn label(self) -> &'static str {
+        match self {
+            PlaybackStage::MissingFile => "文件不存在",
+            PlaybackStage::DecodeSpawn => "解码进程启动失败",
+            PlaybackStage::FramePipe => "取不到出帧管道",
+            PlaybackStage::FrameThread => "出帧线程创建失败",
+        }
+    }
+}
+
+/// 播放启动失败的可读原因。
+///
+/// 硬解与软解**双双失败**时，旧实现只留 `error!`/`warn!` 日志：界面表现就是
+/// 「点了播放没反应」（`is_playing` 被置回 false，却没有任何提示）。这里把失败
+/// 结构化地带回调用方，UI 直接 `ProcessStatus::Failed(err.to_string())` + 一次性
+/// 提示即可，不必改 `play()` 的签名（它被 `src/ui/*` 直接调用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackFailure {
+    /// 被播放的文件路径（原样，便于与日志、用户选中的文件对齐）
+    pub path: String,
+    /// 失败发生的阶段
+    pub stage: PlaybackStage,
+    /// 硬解那一路的失败原因（仅在确实尝试过硬解时存在）
+    pub hardware_error: Option<String>,
+    /// 该阶段的主要失败原因（`DecodeSpawn` 时即软解的失败原因）
+    pub detail: String,
+}
+
+impl std::fmt::Display for PlaybackFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "播放启动失败（{}）：{}", self.stage.label(), self.detail)?;
+        if let Some(hw) = &self.hardware_error {
+            write!(f, "；硬件解码尝试也失败：{hw}")?;
+        }
+        if self.stage == PlaybackStage::DecodeSpawn {
+            write!(
+                f,
+                "。请检查「性能设置 → FFmpeg 路径」是否指向可用的 ffmpeg.exe，或换一个视频文件重试"
+            )?;
+        }
+        Ok(())
+    }
 }
 
 pub struct VideoPlayerEngine {
@@ -59,6 +128,13 @@ pub struct VideoPlayerEngine {
     audio_feeder_proc: Arc<Mutex<Option<Child>>>,
     play_start_instant: Arc<Mutex<Option<Instant>>>,
     play_start_seconds: Arc<Mutex<f64>>,
+    /// 最近一次 `play()` 的失败原因（成功启动时清空）。
+    ///
+    /// `play()` 的签名是 `-> ()` 且被 `src/ui/*` 直接调用，改签名会波及调用方文件，
+    /// 所以失败原因放在引擎状态里：UI 读一次
+    /// [`VideoPlayerEngine::take_playback_error`] 就能把「点了没反应」变成一条可读
+    /// 提示（挂到 `ProcessStatus::Failed` 或一次性 toast）。
+    playback_failure: Mutex<Option<PlaybackFailure>>,
 }
 
 impl VideoPlayerEngine {
@@ -97,6 +173,7 @@ impl VideoPlayerEngine {
             audio_feeder_proc: Arc::new(Mutex::new(None)),
             play_start_instant: Arc::new(Mutex::new(None)),
             play_start_seconds: Arc::new(Mutex::new(0.0)),
+            playback_failure: Mutex::new(None),
         }
     }
 
@@ -167,6 +244,36 @@ impl VideoPlayerEngine {
 
     pub fn is_playing(&self) -> bool {
         self.is_playing.load(Ordering::SeqCst)
+    }
+
+    /// 最近一次 `play()` 的失败原因（没有失败时为 `None`）。
+    ///
+    /// UI 接法：`play()` 之后（或下一帧渲染时）读一次；`Some` → 把
+    /// `err.to_string()` 显示给用户（例如 `ProcessStatus::Failed(...)` + 一次性提示）。
+    /// 读后建议调用 [`VideoPlayerEngine::take_playback_error`] 清掉，
+    /// 避免每帧重复弹同一条提示。
+    pub fn playback_error(&self) -> Option<PlaybackFailure> {
+        self.playback_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 取走并清空失败原因（「一次失败只提示一次」的调用点用这个）。
+    pub fn take_playback_error(&self) -> Option<PlaybackFailure> {
+        self.playback_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    /// 记录一次启动失败：日志 + 结构化状态（供 UI 读取），两处一起写。
+    fn record_failure(&self, failure: PlaybackFailure) {
+        error!("{failure}");
+        *self
+            .playback_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(failure);
     }
 
     pub fn current_play_time(&self) -> f64 {
@@ -263,9 +370,21 @@ impl VideoPlayerEngine {
     pub fn play<P: AsRef<Path>>(&self, video_path: P, start_seconds: f64) {
         self.stop();
 
+        // 上一次的失败不能留到这一次：先清掉，再由本次启动决定要不要写入。
+        *self
+            .playback_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+
         let video_path = video_path.as_ref().to_path_buf();
         if !video_path.exists() {
-            warn!("播放失败：文件不存在 {:?}", video_path);
+            // 以前这里只有一行 warn：用户点了播放，界面毫无变化。
+            self.record_failure(PlaybackFailure {
+                path: video_path.display().to_string(),
+                stage: PlaybackStage::MissingFile,
+                hardware_error: None,
+                detail: format!("找不到文件 {}", video_path.display()),
+            });
             return;
         }
 
@@ -319,7 +438,13 @@ impl VideoPlayerEngine {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
 
-            if let Ok(mut feeder_child) = feeder_cmd.spawn() {
+            let feeder_spawn = feeder_cmd.spawn();
+            if let Err(err) = &feeder_spawn {
+                // 以前这里的 Err 被 `if let Ok` 直接吞掉：用户点了播放，没有声音也
+                // 没有任何提示。
+                warn!(error = %err, "音频馈送进程启动失败：本次播放将没有声音");
+            }
+            if let Ok(mut feeder_child) = feeder_spawn {
                 crate::utils::child_registry::adopt(&feeder_child);
                 if let Some(feeder_stdout) = feeder_child.stdout.take() {
                     let mut player_cmd = Command::new(&self.ffplay_path);
@@ -340,22 +465,26 @@ impl VideoPlayerEngine {
                         .stdout(Stdio::null())
                         .stderr(Stdio::null());
 
-                    if let Ok(player_child) = player_cmd.spawn() {
-                        crate::utils::child_registry::adopt(&player_child);
-                        if let Ok(mut lock) = self.audio_proc.lock() {
-                            *lock = Some(player_child);
+                    match player_cmd.spawn() {
+                        Ok(player_child) => {
+                            crate::utils::child_registry::adopt(&player_child);
+                            if let Ok(mut lock) = self.audio_proc.lock() {
+                                *lock = Some(player_child);
+                            }
+                            if let Ok(mut lock) = self.audio_feeder_proc.lock() {
+                                *lock = Some(feeder_child);
+                            }
                         }
-                        if let Ok(mut lock) = self.audio_feeder_proc.lock() {
-                            *lock = Some(feeder_child);
+                        Err(err) => {
+                            // ffplay 起不来：feeder 已经在往一个没人读的管道里灌 WAV。
+                            // `Child` 的 Drop 不会杀进程，放任下去会留下一个阻塞在满管道上的
+                            // 孤儿 ffmpeg —— 一直占着视频文件句柄，反复预览会越积越多，
+                            // 用户连改名/删除这个视频都会失败。以前这条 Err 完全不可见
+                            // （只有一句没有原因的 warn）。
+                            warn!(error = %err, "启动 ffplay 失败，就地回收音频馈送子进程");
+                            let _ = feeder_child.kill();
+                            let _ = feeder_child.wait();
                         }
-                    } else {
-                        // ffplay 起不来：feeder 已经在往一个没人读的管道里灌 WAV。
-                        // `Child` 的 Drop 不会杀进程，放任下去会留下一个阻塞在满管道上的
-                        // 孤儿 ffmpeg —— 一直占着视频文件句柄，反复预览会越积越多，
-                        // 用户连改名/删除这个视频都会失败。
-                        warn!("启动 ffplay 失败，就地回收音频馈送子进程");
-                        let _ = feeder_child.kill();
-                        let _ = feeder_child.wait();
                     }
                 }
             }
@@ -366,30 +495,44 @@ impl VideoPlayerEngine {
         let frame_bytes = frame_w as usize * frame_h as usize * 4;
 
         let mut used_hwaccel = self.policy.try_hwaccel;
+        // 硬解那一路的失败原因（走过回退才有值）：硬解 + 软解双双失败时，
+        // 两条原因要一起带回调用方，否则用户只能看到「点了没反应」。
+        let mut hardware_error: Option<String> = None;
         let mut video_child =
             match self.spawn_video(&video_path, &start_sec_str, used_hwaccel, frame_w, frame_h) {
                 Ok(child) => child,
                 Err(e) if used_hwaccel => {
                     warn!(error = %e, "硬件解码启动失败，回退软解");
                     used_hwaccel = false;
+                    hardware_error = Some(e.to_string());
                     match self.spawn_video(&video_path, &start_sec_str, false, frame_w, frame_h) {
                         Ok(child) => child,
                         Err(e) => {
-                            error!("启动 FFmpeg 视频流失败: {}", e);
-                            self.is_playing.store(false, Ordering::SeqCst);
                             // 音频管线（ffplay + ffmpeg feeder）在视频流之前就已启动并
                             // 存进 audio_proc / audio_feeder_proc。这里只置 is_playing
                             // 而不回收，界面显示「未播放」却仍有声音，且两进程一直占着
                             // 视频文件句柄。必须与 `stop()` 同源地把整条管线收掉。
+                            self.is_playing.store(false, Ordering::SeqCst);
                             self.kill_procs();
+                            self.record_failure(PlaybackFailure {
+                                path: video_path.display().to_string(),
+                                stage: PlaybackStage::DecodeSpawn,
+                                hardware_error: hardware_error.take(),
+                                detail: e.to_string(),
+                            });
                             return;
                         }
                     }
                 }
                 Err(e) => {
-                    error!("启动 FFmpeg 视频流失败: {}", e);
                     self.is_playing.store(false, Ordering::SeqCst);
                     self.kill_procs();
+                    self.record_failure(PlaybackFailure {
+                        path: video_path.display().to_string(),
+                        stage: PlaybackStage::DecodeSpawn,
+                        hardware_error: hardware_error.take(),
+                        detail: e.to_string(),
+                    });
                     return;
                 }
             };
@@ -402,6 +545,12 @@ impl VideoPlayerEngine {
                 let _ = video_child.kill();
                 let _ = video_child.wait();
                 self.kill_procs();
+                self.record_failure(PlaybackFailure {
+                    path: video_path.display().to_string(),
+                    stage: PlaybackStage::FramePipe,
+                    hardware_error: None,
+                    detail: "FFmpeg 进程起来了但没有交付 stdout 出帧管道".to_string(),
+                });
                 return;
             }
         };
@@ -486,7 +635,14 @@ impl VideoPlayerEngine {
                             }
                             frame_index += 1;
                         }
-                        Err(_) => break,
+                        Err(err) if is_playback_finished(&err) => break,
+                        Err(err) => {
+                            // 读失败 ≠ 正常播完：旧写法 `Err(_) => break` 让两者完全同形，
+                            // 画面静默停住而日志里没有一行。EOF（UnexpectedEof）才是
+                            // 「视频放完了」。
+                            warn!(gen, error = %err, "出帧管道读取失败：播放画面已停止");
+                            break;
+                        }
                     }
                 }
             });
@@ -498,6 +654,14 @@ impl VideoPlayerEngine {
         // 视频文件句柄的孤儿进程。
         if apply_spawn_result(spawn_result, &self.is_playing, gen).is_none() {
             self.kill_procs();
+            // 线程起不来 = 永远不会有新帧，界面却可能停在「正在播放」：以前同样只有
+            // 日志。具体 io 错误由 `apply_spawn_result` 记进日志，这里给 UI 一份可读原因。
+            self.record_failure(PlaybackFailure {
+                path: video_path.display().to_string(),
+                stage: PlaybackStage::FrameThread,
+                hardware_error: None,
+                detail: "出帧线程创建失败（详见日志）".to_string(),
+            });
         }
 
         info!(
@@ -1007,5 +1171,96 @@ mod tests {
             frame_with_marker(0x31),
         ));
         assert!(!engine.has_live_picture(), "过期帧不得把判据翻回 true");
+    }
+
+    // ───────── 播放起不来：失败原因必须能从引擎读到（不再只有日志） ─────────
+
+    /// 文件不存在以前只有一行 warn：用户点了播放，界面毫无反应。
+    /// 现在必须能读出一条可读原因，且「取走即清空」。
+    /// 用不存在的 ffmpeg 路径，全程不会拉起任何子进程。
+    #[test]
+    fn missing_file_playback_failure_is_readable_and_take_once() {
+        let engine = VideoPlayerEngine::new("Z:/definitely/missing/ffmpeg.exe");
+        let missing = std::env::temp_dir().join("v2w_definitely_missing_playback.mp4");
+        let _ = std::fs::remove_file(&missing);
+
+        engine.play(&missing, 0.0);
+
+        let failure = engine
+            .take_playback_error()
+            .expect("文件不存在必须留下失败原因");
+        assert_eq!(failure.stage, PlaybackStage::MissingFile);
+        assert!(
+            failure.hardware_error.is_none(),
+            "没走到解码，不该有硬解失败"
+        );
+        assert!(
+            failure
+                .detail
+                .contains("v2w_definitely_missing_playback.mp4"),
+            "提示里必须带上文件名，用户才知道是哪个文件：{}",
+            failure.detail
+        );
+        let shown = failure.to_string();
+        assert!(
+            shown.contains("文件不存在"),
+            "Display 要给出用户可读的阶段名：{shown}"
+        );
+        assert!(
+            engine.playback_error().is_none(),
+            "取走之后不能每帧再报同一发失败"
+        );
+        assert!(!engine.is_playing());
+    }
+
+    /// 硬解 + 软解**双双失败**：以前两条原因都只进日志，界面表现是「点了没反应」。
+    /// 现在必须一次拿到两条原因（硬解那一路 + 软解那一路），且文案可读、
+    /// 指向可排查的配置项。ffmpeg 路径不存在 → `spawn` 立刻失败，不会真跑子进程。
+    #[test]
+    fn hardware_and_software_spawn_failure_reports_both_reasons() {
+        let engine = VideoPlayerEngine::with_policy(
+            "Z:/definitely/missing/ffmpeg.exe",
+            DecodePolicy {
+                try_hwaccel: true,
+                software_threads: 0,
+            },
+            false,
+        );
+        let src = std::env::temp_dir().join(format!("v2w_player_src_{}.mp4", std::process::id()));
+        std::fs::write(&src, b"not a real video").unwrap();
+        let _guard = crate::utils::TempPathGuard::file(&src);
+
+        engine.play(&src, 0.0);
+
+        let failure = engine
+            .take_playback_error()
+            .expect("硬解与软解都失败时必须留下失败原因");
+        assert_eq!(failure.stage, PlaybackStage::DecodeSpawn);
+        let hw = failure
+            .hardware_error
+            .clone()
+            .expect("硬解那一路的原因也要带回来");
+        assert!(!hw.trim().is_empty(), "硬解失败原因不能是空串");
+        assert!(!failure.detail.trim().is_empty(), "软解失败原因不能为空");
+        let shown = failure.to_string();
+        assert!(shown.contains("解码进程启动失败"), "{shown}");
+        assert!(shown.contains(&hw), "硬解原因必须出现在可读文案里：{shown}");
+        assert!(
+            shown.contains("ffmpeg"),
+            "文案要指向「FFmpeg 路径」这条排查路径：{shown}"
+        );
+        assert!(!engine.is_playing(), "启动失败后不能停在「正在播放」");
+    }
+
+    /// 出帧管道读到 `UnexpectedEof` = 视频正常播完；其它 io 错误才是故障。
+    #[test]
+    fn frame_read_end_kind_distinguishes_eof_from_failure() {
+        assert!(is_playback_finished(&std::io::Error::from(
+            std::io::ErrorKind::UnexpectedEof
+        )));
+        assert!(!is_playback_finished(&std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        )));
+        assert!(!is_playback_finished(&std::io::Error::other("读取中断")));
     }
 }

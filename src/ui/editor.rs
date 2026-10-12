@@ -9,7 +9,7 @@ use super::primitives;
 use super::theme::Theme;
 use super::{
     apply_line_edit, timeline_visible_positions, EditorExportFormat, EditorSubtitlePanel,
-    MainWindow, StyleField, TimelineIndex,
+    MainWindow, ReplaceRuleScope, StyleField, TimelineIndex,
 };
 use crate::app::state::{ProcessStatus, WorkspaceTab};
 use crate::subtitle::segment::WordTiming;
@@ -3886,6 +3886,25 @@ impl MainWindow {
         let include_translation = self.replace_include_translation;
         let status = self.replace_status.clone();
         let can_apply = !find.is_empty() && !self.state.segments.is_empty();
+        // 规则集下拉要用的渲染数据：名字列表 + 当前选中项。只在面板展开时每帧克隆
+        // 一次（量级是个位数），不值得再开一份缓存，也不会碰 `self` 的别名字段。
+        let rule_names: Vec<String> = self
+            .replace_rule_sets
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let rule_selected = self
+            .replace_rule_selected
+            .filter(|&pos| pos < rule_names.len());
+        let rules_open = self.replace_rules_open;
+        let rules_status = self.replace_rules_status.clone();
+        let has_rules = !rule_names.is_empty();
+        let has_selection = rule_selected.is_some();
+        let has_segments = !self.state.segments.is_empty();
+        let has_selected_segment = self.state.selected_segment_index.is_some();
+        // 「存为规则集 / 追加到当前集」的可用性只看查找串：这两件事不依赖字幕表，
+        // 空查找串存下来只会变成一条永不适用的规则。
+        let has_find = !find.is_empty();
 
         // 两个自绘输入框：与 `render_api_input` 同一套最小可用编辑集合
         // （可打印字符 + 退格/方向/Home/End + Ctrl+A/C/V，见 `apply_line_edit`）。
@@ -4104,7 +4123,179 @@ impl MainWindow {
                     .child(msg),
             );
         }
-        Some(row.into_any_element())
+
+        // ── 规则集（第 11 项）──
+        //
+        // 独立一行：上面那一行的控件顺序、间距、折行行为都不动，只是在它下面多挂
+        // 一条同款外壳的行。「应用到全部 / 应用到选中句」沿用上面两个勾选
+        // （大小写 / 含译文）作为匹配口径，用户在同一面板里就能看清会怎么匹配。
+        let mut rules_row = div()
+            .w_full()
+            .px(px(Theme::SPACE_3))
+            .py(px(Theme::SPACE_2))
+            .bg(Theme::bg_sidebar())
+            .border_b_1()
+            .border_color(Theme::border())
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .child("规则集"),
+            )
+            .child(
+                primitives::mini_btn(
+                    if rules_open {
+                        "收起 ▴"
+                    } else {
+                        "选择 ▾"
+                    },
+                    true,
+                )
+                .id("replace-rules-toggle")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.replace_rules_open = !this.replace_rules_open;
+                    cx.notify();
+                })),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_primary())
+                    .child(match rule_selected {
+                        Some(pos) => rule_names[pos].clone(),
+                        None if has_rules => "未选择".to_string(),
+                        None => {
+                            "（还没有规则集，可点「导入」或先用「全部替换」跑一次）".to_string()
+                        }
+                    }),
+            );
+
+        // 展开时逐个列出（选中项带 ✓）：只有个位数条目，不必再做虚拟列表。
+        if rules_open {
+            for (pos, name) in rule_names.iter().enumerate() {
+                let label = if Some(pos) == rule_selected {
+                    format!("✓ {name}")
+                } else {
+                    name.clone()
+                };
+                rules_row = rules_row.child(
+                    primitives::mini_btn(label, true)
+                        .id(("replace-rule-set", pos))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.replace_rule_selected = Some(pos);
+                            this.replace_rules_open = false;
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+
+        rules_row = rules_row
+            .child(
+                primitives::mini_btn("应用到全部", has_selection && has_segments)
+                    .id("replace-rules-apply-all")
+                    .when(has_selection && has_segments, |d| {
+                        d.on_click(cx.listener(|this, _, _, cx| {
+                            this.apply_selected_replace_rule_set(ReplaceRuleScope::AllSegments, cx);
+                        }))
+                    }),
+            )
+            .child(
+                primitives::mini_btn("应用到选中句", has_selection && has_selected_segment)
+                    .id("replace-rules-apply-one")
+                    .when(has_selection && has_selected_segment, |d| {
+                        d.on_click(cx.listener(|this, _, _, cx| {
+                            this.apply_selected_replace_rule_set(
+                                ReplaceRuleScope::SelectedSentence,
+                                cx,
+                            );
+                        }))
+                    }),
+            )
+            .child(
+                primitives::mini_btn("保存", true)
+                    .id("replace-rules-save")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.save_replace_rule_sets_now(cx);
+                    })),
+            )
+            .child(
+                primitives::mini_btn("删除当前集", has_selection)
+                    .id("replace-rules-delete")
+                    .when(has_selection, |d| {
+                        d.on_click(cx.listener(|this, _, _, cx| {
+                            this.delete_selected_replace_rule_set(cx);
+                        }))
+                    }),
+            )
+            .child(
+                primitives::mini_btn("导入", true)
+                    .id("replace-rules-import")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.import_replace_rule_sets(cx);
+                    })),
+            )
+            .child(
+                primitives::mini_btn("导出", has_rules)
+                    .id("replace-rules-export")
+                    .when(has_rules, |d| {
+                        d.on_click(cx.listener(|this, _, _, cx| {
+                            this.export_replace_rule_sets(cx);
+                        }))
+                    }),
+            )
+            // 「增」的两个入口：新建一个集合 / 往当前集合里加一条。没有它们，
+            // 规则集只能靠导入 JSON 或手写文件，面板里试好的替换就留不下来。
+            .child(
+                primitives::mini_btn("存为规则集", has_find)
+                    .id("replace-rules-save-current")
+                    .when(has_find, |d| {
+                        d.on_click(cx.listener(|this, _, _, cx| {
+                            this.save_current_replace_as_rule_set(cx);
+                        }))
+                    }),
+            )
+            .child(
+                primitives::mini_btn("追加到当前集", has_find && has_selection)
+                    .id("replace-rules-append-current")
+                    .when(has_find && has_selection, |d| {
+                        d.on_click(cx.listener(|this, _, _, cx| {
+                            this.append_current_replace_rule(cx);
+                        }))
+                    }),
+            );
+
+        if let Some((ok, msg)) = rules_status {
+            rules_row = rules_row.child(
+                div()
+                    .flex_basis(relative(1.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(if ok {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::accent_orange()
+                    })
+                    .child(msg),
+            );
+        }
+
+        // 外层只是把「原有的那一行」与「新的规则集行」摞起来：原行的元素、属性、
+        // 子节点顺序一个没动。
+        Some(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(row)
+                .child(rules_row)
+                .into_any_element(),
+        )
     }
 
     /// 导出文件名模板输入框（走与 API 输入框同一套最小编辑集合）。
@@ -4296,6 +4487,9 @@ impl MainWindow {
         let other_lang = snapshot.other_lang_translated;
         let has_any_trans_overall = snapshot.has_any_translation;
         let has_distinct_trans = snapshot.has_distinct_translation;
+        // 「译文与原文一字不差」的句子存在与否：决定要不要给出「清理复制译文」入口。
+        // 取派生快照（按修订号重建一次），不在渲染路径上现扫全表。
+        let has_copied_trans = snapshot.has_copied_translation;
 
         // 引擎档位：本地 Qwen 免费离线，在线 API 更快更好但需要密钥
         let mode_row = div()
@@ -4502,13 +4696,27 @@ impl MainWindow {
                 )
                 .id("btn-translate-clear-all")
                 .on_click(cx.listener(|this, _, _, cx| {
-                    // `clear_all_translations` 会清掉全表译文（改掉
-                    // `has_distinct_translation` / 译出句数 / 质检的「未翻译」），
-                    // 而它自己只置脏落库、不递增修订号。派生统计快照与术语表高亮都按
-                    // `segments_revision` 失效，这里替它补一次——否则清空译文后列表
-                    // 仍按双语行高渲染、翻译卡仍说「已全部翻译」。
+                    // 这里**不再**手工补 `bump_segments_revision`：清空译文的实现
+                    // （`actions::clear_translations_with_undo`）自己会递增修订号，
+                    // 失效责任收在改动点上——此前靠这一行补偿，任何新调用点漏补一次
+                    // 都会让列表继续按双语行高渲染、翻译卡仍说「已全部翻译」。
                     this.clear_all_translations(cx);
-                    this.state.bump_segments_revision();
+                }))
+                .into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            // 只清「译文与原文一字不差」的句子：本地小模型摆烂时整份译文里往往只有
+            // 这几句是废的，一键全清会把已逐句校对好的译文一起扔掉。
+            .child(if has_copied_trans && !is_translating {
+                primitives::btn_clickable(
+                    "清理复制译文",
+                    primitives::BtnSize::Sm,
+                    primitives::BtnVariant::Secondary,
+                )
+                .id("btn-translate-clear-copied")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.clear_copied_translations(cx);
                 }))
                 .into_any_element()
             } else {

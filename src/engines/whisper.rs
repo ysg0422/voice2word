@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::subtitle::segment::WordTiming;
 use crate::subtitle::Segment;
@@ -20,6 +20,28 @@ use crate::utils::TempPathGuard;
 /// 引擎却按 0.30 跑——「改了没效果」且无从察觉。量程与夹取必须同源。
 pub const VAD_THRESHOLD_MIN: f64 = 0.30;
 pub const VAD_THRESHOLD_MAX: f64 = 0.80;
+
+/// Whisper 的默认 initial prompt：**只作简体锚点**。
+///
+/// whisper.cpp 的 zh 词表偏繁体，不注入这句时贪心解码会整篇输出繁体
+/// （见 docs/Whisper人工标准字幕对比.md 第 4 节），所以它不能因为「用户填了热词」而被丢掉。
+pub const DEFAULT_INITIAL_PROMPT: &str = "以下是普通话录音。";
+
+/// 用户热词（`[pipeline] asr_hotwords`）的字符数上限（按 `char` 计，不是字节）。
+///
+/// # 为什么是 200
+/// 1. **token 预算**：initial prompt 会跟着**每一个** 30 秒窗口一起进解码器，它的 token
+///    也要占 text context。whisper.cpp 内部把 prompt 限制在 text context 的一半以内
+///    （small/medium/large 的 `n_text_ctx` = 448 → 224 token），超出的部分会被它自己无声截掉；
+///    主动截断至少是我们能控制、能测的截断。
+/// 2. **中文最坏 ≈ 1 token/字**：GPT-2 byte-level BPE 下常见中文 1~2 字/token，按 1 token/字
+///    估最坏值，200 字（+9 字锚点）最坏约 209 token，仍在 224 之内，剩下的 context 留给正文。
+/// 3. **够用**：人名/品牌/术语一行能写 20~40 个，200 字够写一屏常用专名；
+///    真写超了也只丢尾部，前面的（用户最在意的）一定保留。
+pub const MAX_ASR_HOTWORDS_CHARS: usize = 200;
+
+/// 共享配置文件名，与 `AppConfig::load_from_file("config.toml")` 的约定一致。
+const CONFIG_FILE_NAME: &str = "config.toml";
 
 pub struct WhisperEngine {
     cli_path: PathBuf,
@@ -57,6 +79,15 @@ pub struct WhisperEngine {
     vad_threshold_bits: AtomicU64,
     cancel: Arc<AtomicBool>,
     active_children: Arc<Mutex<Vec<ChildEntry>>>,
+    /// 上一次 `transcribe_input*` 是否因 stdout 管道**读取失败**（而不是正常 EOF）
+    /// 提前结束：`true` 表示结果可能被截断——后面的句子根本没机会被读出来。
+    ///
+    /// 为什么用引擎级标志而不是改返回类型：`Result<(Vec<Segment>, f64)>` 被
+    /// chunked_whisper / media_pipeline 共用，改签名会波及本文件之外的调用点。
+    /// 调用方拿到结果后读一次 [`WhisperEngine::take_output_truncated`]，就能把
+    /// 「字幕可能不完整（输出管道中断）」提示给用户。用 Arc 是因为 stdout 读取
+    /// 线程（`'static`）也要置位它。
+    output_truncated: Arc<AtomicBool>,
 }
 
 /// 子进程登记表里的一行：`(pid, 本次登记的单调序号)`。
@@ -268,6 +299,7 @@ impl WhisperEngine {
             vad_threshold_bits: AtomicU64::new(0.50f64.to_bits()),
             cancel: Arc::new(AtomicBool::new(false)),
             active_children: Arc::new(Mutex::new(Vec::new())),
+            output_truncated: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -336,10 +368,27 @@ impl WhisperEngine {
     /// 标志的写方，那条竞态才真正闭合（完整时序见 `TaskPipeline::begin_task`）。
     pub fn reset(&self) {
         self.cancel.store(false, Ordering::SeqCst);
+        // 每轮任务开始都要清掉上一轮的截断标记：否则「上一次的管道故障」会一直
+        // 挂在引擎上，把后续每一次正常转写都误报成「输出被截断」。
+        self.output_truncated.store(false, Ordering::SeqCst);
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// 上一次转写的 stdout 是否因**读取失败**（非 EOF）提前结束：`true` = 结果可能被截断。
+    ///
+    /// `Err(_) => break` 的旧写法让「管道读到一半报错」与「子进程正常收尾」在结果上
+    /// 完全同形，用户只会看到字幕莫名少了一截。调用方（管线 / UI）读到 `true` 时应
+    /// 提示「字幕可能不完整」，而不是把半份结果当成功结果。
+    pub fn output_truncated(&self) -> bool {
+        self.output_truncated.load(Ordering::SeqCst)
+    }
+
+    /// 读取并**复位**截断标记，适合「一次转写只提示一次」的调用点。
+    pub fn take_output_truncated(&self) -> bool {
+        self.output_truncated.swap(false, Ordering::SeqCst)
     }
 
     /// 登记子进程 PID，并回报「登记这一刻取消是否已经到达」。
@@ -508,6 +557,9 @@ impl WhisperEngine {
         processors_override: Option<u32>,
         progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
+        // 本轮结果是否被截断：必须在任何读取线程启动前清零，保证读到的永远是
+        // **本次运行**的事实（上一轮的失败不能污染本轮）。
+        self.output_truncated.store(false, Ordering::SeqCst);
         let temp_dir = std::env::temp_dir();
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -696,8 +748,23 @@ impl WhisperEngine {
         // 更早一轮复核里去掉它则反过来快 0.28 s（26.89 → 26.61 s）。两次符号相反，说明速度
         // 差异落在噪声内、无稳定收益，而精度损失稳定在 1.1～1.2 pp，是「花 1% 速度换 1.1 pp
         // 精度」的净亏，故移除该参数，只保留 prompt 锚点。
-        if lang == "zh" || lang == "auto" {
-            cmd.arg("--prompt").arg("以下是普通话录音。");
+        // 用户热词（`[pipeline] asr_hotwords`）与上面那句锚点在这里合流，规则只有两条：
+        //   空热词 → 与加这个字段之前**逐字节相同**（中文链路仍只发锚点，其它语言不发 prompt）；
+        //   有热词 → 中文链路「锚点 + 热词」，其它语言只发热词——「以下是普通话录音。」
+        //            对英文/日文录音是错的前提，塞进 prompt 只会把解码往中文拽。
+        // 清洗（NUL / 控制字符 / `"` / `<|...|>`）与 200 字符上限都在 `initial_prompt_args`
+        // 与 `normalize_hotwords` 里，拼参数这一层只负责把结果逐项交给 `Command::arg`
+        //（逐项传参不经过 shell，因此这里不加引号，见 `normalize_hotwords` 的文档）。
+        let hotwords = asr_hotwords_from_config();
+        if !hotwords.trim().is_empty() {
+            info!(
+                configured_chars = hotwords.trim().chars().count(),
+                cap = MAX_ASR_HOTWORDS_CHARS,
+                "已读取 config.toml 里的热词，合入 Whisper initial prompt"
+            );
+        }
+        for arg in initial_prompt_args(lang, &hotwords) {
+            cmd.arg(arg);
         }
 
         cmd.env("PYTHONIOENCODING", "utf-8");
@@ -775,8 +842,17 @@ impl WhisperEngine {
                     use std::io::{copy, BufReader, BufWriter, Write};
                     let mut reader = BufReader::with_capacity(128 * 1024, stream);
                     let mut writer = BufWriter::with_capacity(128 * 1024, stdin);
-                    let _ = copy(&mut reader, &mut writer);
-                    let _ = writer.flush();
+                    // `let _ =` 把写失败（子进程提前退出、管道断开）吞得干干净净：
+                    // 上层只看到「结果为空/偏短」，日志里没有任何线索。
+                    if let Err(err) = copy(&mut reader, &mut writer) {
+                        warn!(
+                            error = %err,
+                            "Whisper 音频流泵送中断：子进程可能已提前结束，stdin 写入失败"
+                        );
+                    }
+                    if let Err(err) = writer.flush() {
+                        warn!(error = %err, "Whisper 音频流泵送收尾 flush 失败");
+                    }
                     // writer 与 stdin 离开作用域自动 drop，向 whisper-cli 发送 EOF
                 }))
             }
@@ -799,27 +875,23 @@ impl WhisperEngine {
             let Some(err) = stderr else {
                 return (0.0, String::new());
             };
-            use std::io::BufRead;
             let mut vad_ms = 0.0f64;
             let mut tail: std::collections::VecDeque<String> =
                 std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES);
-            let mut raw_line = Vec::new();
             let mut reader = std::io::BufReader::new(err);
-            loop {
-                raw_line.clear();
-                match reader.read_until(b'\n', &mut raw_line) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-                let line = decode_cli_bytes(&raw_line);
-                if let Some(ms) = WhisperEngine::parse_vad_ms_line(&line) {
+            // 读失败（≠ 正常 EOF）时 `read_pipe_lines` 返回 true：诊断日志已不可信，
+            // 在尾部补一条标记，避免用户把截断的报错当成完整原因。
+            let truncated = read_pipe_lines(&mut reader, "whisper-cli stderr", |line| {
+                if let Some(ms) = WhisperEngine::parse_vad_ms_line(line) {
                     vad_ms += ms;
                 }
                 if tail.len() == STDERR_TAIL_LINES {
                     tail.pop_front();
                 }
-                tail.push_back(line);
+                tail.push_back(line.to_string());
+            });
+            if truncated {
+                tail.push_back("[stderr 读取中断：以上日志被截断]".to_string());
             }
             (
                 vad_ms / 1000.0,
@@ -828,6 +900,9 @@ impl WhisperEngine {
         });
 
         let proc_count = processors;
+        // stdout 读取线程置位、调用方读取：读失败时它把「输出被截断」这一事实
+        // 从线程内部带回到 `transcribe_input*` 的调用方。
+        let output_truncated_flag = self.output_truncated.clone();
         let stdout_handle = std::thread::spawn(move || {
             let mut captured_lines = Vec::new();
             let mut last_emit = 0.0f64;
@@ -841,17 +916,11 @@ impl WhisperEngine {
             };
 
             if let Some(out) = stdout {
-                use std::io::BufRead;
                 let mut reader = std::io::BufReader::new(out);
-                let mut raw_line = Vec::new();
-                loop {
-                    raw_line.clear();
-                    match reader.read_until(b'\n', &mut raw_line) {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                    let line = decode_cli_bytes(&raw_line);
+                // 读失败必须与正常结束（EOF）分开：旧写法 `Err(_) => break` 让「管道
+                // 读到一半报错」与「子进程正常收尾」在结果上完全同形，用户只看到字幕
+                // 莫名少了一截。`read_pipe_lines` 返回 true = 因读失败中止。
+                let truncated = read_pipe_lines(&mut reader, "whisper-cli stdout", |line| {
                     let trimmed = line.trim();
                     if trimmed.contains("-->") {
                         if let Some((time_bracket, text_part)) = trimmed.split_once(']') {
@@ -954,9 +1023,16 @@ impl WhisperEngine {
                             // 的缩进与注释对齐、看起来像在循环体尾部，实际仍在 if 内（缩进是
                             // 24 空格，闭合花括号在 20）。不要把它挪到 if 外，否则长视频下
                             // 每一行进度日志都会被逐行 `String` 累积。
-                            captured_lines.push(line);
+                            // 闭包拿到的是解码后的 &str，这里显式持有；语义与原先
+                            // 「循环里把这一行 move 走」完全一致。
+                            captured_lines.push(line.to_string());
                         }
                     }
+                });
+                if truncated {
+                    // 「输出被截断」的正式信号：调用方据此提示用户，而不是把半份
+                    // 结果当成完整结果。
+                    output_truncated_flag.store(true, Ordering::SeqCst);
                 }
             }
             captured_lines.join("\n")
@@ -1037,20 +1113,49 @@ impl WhisperEngine {
         let mut json_parsed_ok = false;
 
         if json_file.exists() {
-            let json_raw = std::fs::read(&json_file).unwrap_or_default();
+            // 读失败（被清理、权限、磁盘错误）以前被 `unwrap_or_default()` 吞成空
+            // 字节 → JSON 解析失败 → 静默回退 stdout，用户只看到「少了些句子」。
+            let json_raw = match std::fs::read(&json_file) {
+                Ok(raw) => raw,
+                Err(err) => {
+                    warn!(
+                        path = %json_file.display(),
+                        error = %err,
+                        "--output-json 结果文件读取失败：回退 stdout 兜底解析"
+                    );
+                    Vec::new()
+                }
+            };
             let json_str = decode_cli_bytes(&json_raw);
             let parsed: Result<WhisperJsonOutput, _> = serde_json::from_str(&json_str);
             // 解析完立刻删除（守卫负责），不再依赖函数末尾的正常收尾路径
             json_guard.remove_now();
 
+            if let Err(err) = &parsed {
+                // 解析失败以前完全静默：结果会悄悄退化成 stdout 兜底（甚至空表），
+                // 用户与日志都看不到「JSON 是坏的」。
+                warn!(
+                    error = %err,
+                    raw_len = json_str.len(),
+                    "whisper --output-json 解析失败：回退 stdout 兜底解析"
+                );
+            }
             if let Ok(data) = parsed {
                 json_parsed_ok = true;
                 let detected_lang = data.result.and_then(|r| r.language);
+                // 缺 offsets 的片段会被当作 0.0 → 0.0：时间轴优化随后按「无效时长」把
+                // 它们剔掉，用户只看到字幕凭空少几句。这里计数，循环后统一告警。
+                let mut missing_offsets = 0usize;
                 if let Some(trans) = data.transcription {
                     for (i, item) in trans.into_iter().enumerate() {
                         let text = normalize_zh_text(&item.text.unwrap_or_default());
                         if text.is_empty() {
                             continue;
+                        }
+                        if item.offsets.as_ref().and_then(|o| o.from).is_none()
+                            || item.offsets.as_ref().and_then(|o| o.to).is_none()
+                        {
+                            missing_offsets += 1;
                         }
                         let start =
                             item.offsets.as_ref().and_then(|o| o.from).unwrap_or(0) as f64 / 1000.0;
@@ -1070,6 +1175,12 @@ impl WhisperEngine {
                             speaker: None,
                             words: Self::word_timings_from_tokens(&item.tokens),
                         });
+                    }
+                    if missing_offsets > 0 {
+                        warn!(
+                            missing_offsets,
+                            "whisper JSON 有片段缺少时间偏移：这些片段按 0.0 秒入表，可能被时间轴优化按无效时长剔除"
+                        );
                     }
                 }
             }
@@ -1299,6 +1410,159 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
+/// 从 `config.toml` 读用户热词（`[pipeline] asr_hotwords`）。
+///
+/// # 为什么是引擎自己读盘
+/// 本轮只允许改 `whisper.rs` / `config.rs` / `config_drawer.rs` 三个文件，而「把配置值送进
+/// 引擎」的接线点在管线里（别的文件，正被并发修改）。改成「每次拼参数时读一次」之后，
+/// 用户在界面上改完热词、下一次转写立刻生效：不用重启，也不用等别处的接线。
+/// 「引擎直接读 config.toml」在本仓已有先例（`media_pipeline.rs` 读同一份文件取 ffmpeg 路径）。
+/// 代价是每次转写多一次约 2 KB 文件的读取 + 解析。
+///
+/// 任何失败（文件缺失、TOML 坏、字段缺失）都退化成空串＝沿用默认提示词：
+/// 一个提示词不该把转写拦下来。
+fn asr_hotwords_from_config() -> String {
+    asr_hotwords_from_config_path(&crate::utils::AppConfig::resolve_path(CONFIG_FILE_NAME))
+}
+
+/// [`asr_hotwords_from_config`] 的按路径版本（拆出来是为了让单测能指向临时文件）。
+///
+/// 不改进程级的项目根环境变量来做测试：那会让同进程的其它测试一起看到被改过的根目录，
+/// 测试之间就不再独立。`AppConfig::resolve_path` 对绝对路径原样返回，所以这里能吃临时路径。
+fn asr_hotwords_from_config_path(path: &Path) -> String {
+    // 文件不存在时**不能**走 `load_from_file`：那条路径会把一份默认配置写到磁盘上
+    // （首次启动「生成默认配置」的既有行为）。这里只想读、不想写。
+    if !path.exists() {
+        return String::new();
+    }
+    match crate::utils::AppConfig::load_from_file(path) {
+        Ok(cfg) => cfg.pipeline.asr_hotwords,
+        Err(err) => {
+            error!(
+                file = %path.display(),
+                error = %err,
+                "热词配置读取失败，本次转写按默认提示词进行"
+            );
+            String::new()
+        }
+    }
+}
+
+/// 把用户填的热词规范成「可以原样作为**单个 argv 项**交给 whisper-cli」的 prompt 片段。
+///
+/// 返回 `None` = 没有可用热词（空、纯空白、或清洗后什么都不剩），调用方据此沿用默认提示词。
+///
+/// # 清洗规则（顺序即语义）
+/// 1. **NUL 丢弃**：`std::process::Command` 的参数里带 `\0` 时 `spawn()` 会直接失败
+///    （Windows 的 `CreateProcessW` 只收 NUL 结尾的串）。界面上粘不进 NUL，手写 config.toml 可以。
+/// 2. 其余控制字符（`\n` `\r` `\t` …）折成中文逗号：用多行 TOML 字符串写热词是合理写法，
+///    折成逗号后语义仍是「多个词」，不会变成一句带换行的怪话。
+/// 3. `<|...|>` 整段丢弃：whisper.cpp 的 tokenizer 把这种写法当控制 token（`<|endoftext|>` 一类），
+///    留在 prompt 里等于让用户直接改解码行为。未闭合的 `<|` 只是普通文本，原样保留。
+/// 4. 半角双引号丢弃：从文档里复制 `"张三"` 时引号对识别毫无用处，还白占 token 预算。
+///    半角单引号**保留**——`O'Brien` 这类名字里它就是内容。
+///
+/// # 为什么不加引号
+/// 这里的值是用 `Command::arg` **逐项**传给子进程的，不经过 shell：Windows 下由标准库按
+/// 命令行规则决定要不要包引号（值里有空格它自己会包）。手工再包一层，引号就成了 prompt 的一部分。
+/// 真正要防的是「参数解析被破坏」：NUL（见 1）与控制字符（见 2）已经处理；而值不会以 `-` 开头
+/// 被 whisper.cpp 当成下一个选项——中文链路一定先拼上锚点，非中文链路的裸热词则落在
+/// `--prompt` 之后，whisper.cpp 对该分支是**无条件**消费下一个 argv。
+fn normalize_hotwords(raw: &str) -> Option<String> {
+    let mut flattened = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\0' | '"' => {}
+            c if c.is_control() => flattened.push('，'),
+            c => flattened.push(c),
+        }
+    }
+    let stripped = strip_prompt_special_tokens(&flattened);
+    // 折叠：连续分隔符压成一个、连续空白压成一个。判据看「已经写出的最后一个字符」，
+    // 因此不需要额外状态位。
+    let mut collapsed = String::with_capacity(stripped.len());
+    for ch in stripped.chars() {
+        let prev = collapsed.chars().last();
+        if is_hotword_separator(ch) && prev.is_some_and(is_hotword_separator) {
+            continue;
+        }
+        if ch.is_whitespace() && prev.is_some_and(char::is_whitespace) {
+            continue;
+        }
+        collapsed.push(ch);
+    }
+    // 首尾的空白与分隔符一律去掉。这一条是「\t\n」这类纯控制字符输入、以及
+    // 「,,,」这类纯分隔符输入的分水岭：它们必须退化成空 → 沿用默认提示词，
+    // 而不是变成一段只有标点的怪 prompt。
+    let cleaned = collapsed
+        .trim_matches(|c: char| c.is_whitespace() || is_hotword_separator(c))
+        .to_string();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(truncate_hotwords(&cleaned, MAX_ASR_HOTWORDS_CHARS))
+}
+
+/// 丢掉 `<|...|>` 片段；未闭合的 `<|` 之后原样保留（那只是普通文本，不是控制 token）。
+fn strip_prompt_special_tokens(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("<|") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find("|>") {
+            Some(end) => rest = &after[end + 2..],
+            None => {
+                out.push_str(&rest[start..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 按字符数截断热词；窗口内还有分隔符时在**最后一个分隔符**处收口，别把一个名字劈成两半。
+fn truncate_hotwords(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let head: String = chars[..max].iter().collect();
+    match head.rfind(is_hotword_separator) {
+        // 分隔符落在开头（第一项自己就超长）时不能退化成空串，按上限硬截。
+        Some(idx) if idx > 0 => head[..idx].trim_end().to_string(),
+        _ => head.trim_end().to_string(),
+    }
+}
+
+/// 热词分隔符：逗号（半角/全角）、顿号、分号、竖线都算，用户爱用哪种用哪种。
+fn is_hotword_separator(c: char) -> bool {
+    matches!(c, ',' | '，' | '、' | ';' | '；' | '|')
+}
+
+/// 组装传给 whisper-cli 的 initial prompt 参数（`["--prompt", "<prompt>"]`）。
+///
+/// 规则表（`lang` 取管线给的语言码，`auto` = 未指定）：
+///
+/// | 热词 | 中文链路（zh / auto） | 其它语言 |
+/// |------|----------------------|----------|
+/// | 空   | `["--prompt", 默认锚点]`（与加这个字段之前逐字节相同） | `[]`（不传 `--prompt`，同旧行为） |
+/// | 非空 | `["--prompt", 默认锚点 + 空格 + 热词]` | `["--prompt", 热词]` |
+///
+/// 中文链路必须带上锚点：它是「输出简体」的唯一锚，丢了它整篇会转繁体（见
+/// [`DEFAULT_INITIAL_PROMPT`]）；热词排在其后，语义上就是「在这句之后继续说这些词」。
+pub fn initial_prompt_args(lang: &str, raw_hotwords: &str) -> Vec<String> {
+    let is_chinese = lang == "zh" || lang == "auto";
+    let prompt = match (normalize_hotwords(raw_hotwords), is_chinese) {
+        (Some(hotwords), true) => format!("{} {}", DEFAULT_INITIAL_PROMPT, hotwords),
+        (Some(hotwords), false) => hotwords,
+        (None, true) => DEFAULT_INITIAL_PROMPT.to_string(),
+        (None, false) => return Vec::new(),
+    };
+    vec!["--prompt".to_string(), prompt]
+}
+
 /// whisper-cli 在 Windows 上可能吐 UTF-8 或本机 ANSI/GBK。
 fn decode_cli_bytes(raw: &[u8]) -> String {
     let raw = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
@@ -1314,6 +1578,38 @@ fn decode_cli_bytes(raw: &[u8]) -> String {
 
 fn trim_cli_line(s: &str) -> String {
     s.trim_end_matches(['\r', '\n']).to_string()
+}
+/// 逐行读完一条管道：正常读到 EOF 返回 `false`；**读失败**（非常 EOF）中止并返回 `true`。
+///
+/// 这是「读失败」与「正常结束」在代码里的唯一分界点：
+/// - 交给 `on_line` 的永远是**成功读到**的行，失败不会被伪装成一行空文本
+///   （旧写法 `line_res.unwrap_or_default()` 与 `Err(_) => break` 正是如此）；
+/// - 返回值本身就是「输出被截断」这个信号，调用方据此提示用户，
+///   而不是把半份输出当成完整结果。
+///
+/// 泛型 `R: BufRead` 是为了让单测能注入「读到一半就报错」的假管道，
+/// 完全不必真的拉起 whisper-cli / Python runner 子进程。
+fn read_pipe_lines<R: std::io::BufRead>(
+    reader: &mut R,
+    what: &str,
+    mut on_line: impl FnMut(&str),
+) -> bool {
+    let mut raw_line = Vec::new();
+    loop {
+        raw_line.clear();
+        match reader.read_until(b'\n', &mut raw_line) {
+            Ok(0) => return false, // 正常结束（EOF）
+            Ok(_) => on_line(&decode_cli_bytes(&raw_line)),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    pipe = what,
+                    "读取管道失败：输出被截断（这不是正常结束）"
+                );
+                return true;
+            }
+        }
+    }
 }
 
 /// Whisper 的 zh 词表偏繁体；落地前统一转简体。
@@ -2103,4 +2399,269 @@ fn gpu_limit_percent_is_settable_at_runtime() {
     assert_eq!(eng.gpu_limit_percent(), 40, "运行期改写必须立即生效");
     eng.set_gpu_limit_percent(80);
     assert_eq!(eng.gpu_limit_percent(), 80);
+}
+/// 回归：管道**读失败**必须与正常结束（EOF）区分开。
+///
+/// 旧写法 `Err(_) => break`（以及 SenseVoice 侧的 `line_res.unwrap_or_default()`）
+/// 把两者混为一谈：读到一半报错与正常收尾在结果上完全同形，用户只会看到字幕莫名
+/// 少了一截，日志里也无线索。`read_pipe_lines` 用返回值把这件事表达出来；泛型
+/// `BufRead` 让单测能注入一条「读到第二行就报错」的假管道，不必拉起任何子进程。
+#[test]
+fn read_pipe_lines_separates_read_failure_from_eof() {
+    // 1) 正常读完：只有 EOF 才算结束，返回 false，所有行都在
+    let mut ok = std::io::BufReader::new(std::io::Cursor::new(b"line1\nline2\n".to_vec()));
+    let mut lines = Vec::new();
+    let truncated = read_pipe_lines(&mut ok, "测试管道", |l| lines.push(l.to_string()));
+    assert!(!truncated, "正常 EOF 不是截断");
+    assert_eq!(lines, vec!["line1".to_string(), "line2".to_string()]);
+
+    // 2) 读到第一行后管道立刻断：必须返回 true，失败前读到的行照常交付，
+    //    「本该有的 line2/line3 丢了」正是要靠这个返回值暴露的信号
+    let mut broken = std::io::BufReader::new(BrokenPipeAfterFirstLine {
+        data: b"line1\nline2\nline3\n",
+        sent: 0,
+    });
+    let mut got = Vec::new();
+    let truncated = read_pipe_lines(&mut broken, "测试管道", |l| got.push(l.to_string()));
+    assert!(truncated, "读失败必须与 EOF 分开表达（true = 输出被截断）");
+    assert_eq!(
+        got,
+        vec!["line1".to_string()],
+        "失败前读到的行必须保留，后续行丢失只由返回值表达"
+    );
+
+    // 3) 完全空的管道 = 正常结束，不是失败
+    let mut empty = std::io::BufReader::new(std::io::Cursor::new(Vec::new()));
+    assert!(
+        !read_pipe_lines(&mut empty, "测试管道", |_| {}),
+        "空管道读到 EOF 不是失败"
+    );
+}
+
+/// 假管道：每次只交付到（含）第一个换行；交付完最后一行后再读就报错。
+/// 用来模拟「子进程还在跑、管道却断了」这类只能靠注入复现的场景。
+#[cfg(test)]
+struct BrokenPipeAfterFirstLine {
+    data: &'static [u8],
+    sent: usize,
+}
+
+#[cfg(test)]
+impl std::io::Read for BrokenPipeAfterFirstLine {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // 第一批字节交付之后管道立刻断掉：这才是「读到一半坏了」的真实形态——
+        // 后面的行根本没机会被读到，而旧写法会把它和「正常收尾」混为一谈。
+        if self.sent > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "假管道：读失败",
+            ));
+        }
+        let rest = self.data;
+        let upto = rest
+            .iter()
+            .position(|b| *b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let n = upto.min(buf.len());
+        buf[..n].copy_from_slice(&rest[..n]);
+        self.sent += n;
+        Ok(n)
+    }
+}
+
+/// 「输出被截断」必须能从引擎读出来，并且是**一次取走即复位**的语义：
+/// 调用方（管线 / UI）据此提示用户「字幕可能不完整」，而不是把半份结果当成功。
+#[test]
+fn output_truncated_flag_is_readable_take_once_and_cleared_by_reset() {
+    let engine = WhisperEngine::with_device(
+        std::path::PathBuf::from("missing-whisper-cli.exe"),
+        std::path::PathBuf::from("missing-model.bin"),
+        None,
+        4,
+        1,
+        false,
+        true,
+        32,
+        100,
+    );
+    assert!(!engine.output_truncated(), "新引擎默认没有截断");
+
+    engine.output_truncated.store(true, Ordering::SeqCst);
+    assert!(engine.output_truncated(), "读失败后必须能读到截断信号");
+    assert!(engine.take_output_truncated(), "取一次应为 true");
+    assert!(
+        !engine.output_truncated(),
+        "取走即复位，不能每次调用都报同一发历史故障"
+    );
+
+    engine.output_truncated.store(true, Ordering::SeqCst);
+    engine.reset();
+    assert!(
+        !engine.output_truncated(),
+        "reset（每轮任务开始调用）必须清掉上一轮的截断标记"
+    );
+}
+
+/// 热词 / 自定义提示词（`[pipeline] asr_hotwords`）的回归测试。
+///
+/// 刻意**不写** `use super::*`：本组只依赖下面显式列出的几个名字，将来谁改了名字会在这里
+/// 直接编译失败，而不是被 glob 悄悄换成另一个同名项。
+#[cfg(test)]
+mod hotwords_tests {
+    use super::{
+        asr_hotwords_from_config_path, initial_prompt_args, DEFAULT_INITIAL_PROMPT,
+        MAX_ASR_HOTWORDS_CHARS,
+    };
+
+    /// 空 / 纯空白 / 只有噪声字符的热词一律沿用旧的默认提示词：这是「新字段缺失时行为
+    /// 与现在完全一致」的最后一环，参数必须逐字节相同。
+    #[test]
+    fn empty_hotwords_keep_the_legacy_default_prompt() {
+        let legacy = vec!["--prompt".to_string(), DEFAULT_INITIAL_PROMPT.to_string()];
+        for empty in [
+            "",
+            "   ",
+            "\t\n",
+            "\"\"",
+            "<|endoftext|>",
+            "\0\0",
+            ",,,",
+            "、；，",
+        ] {
+            assert_eq!(
+                initial_prompt_args("zh", empty),
+                legacy.clone(),
+                "热词为 {empty:?} 时必须逐字节沿用默认提示词"
+            );
+        }
+        // auto（未指定语言）与 zh 同路
+        assert_eq!(initial_prompt_args("auto", ""), legacy);
+    }
+
+    /// 非中文语言 + 空热词：仍然不传 `--prompt`（与加这个字段之前一致）。
+    #[test]
+    fn empty_hotwords_keep_skipping_prompt_for_other_languages() {
+        assert!(initial_prompt_args("en", "").is_empty());
+        assert!(initial_prompt_args("ja", "  ").is_empty());
+    }
+
+    /// 非空热词必须成为 `--prompt` 后面**单独一个** argv 项，且破坏参数解析的字节都被清掉。
+    #[test]
+    fn hotwords_become_one_escaped_argv_item() {
+        let args = initial_prompt_args("zh", "张三, 李四");
+        assert_eq!(args.len(), 2, "必须恰好 `--prompt` + 一个值：{args:?}");
+        assert_eq!(args[0], "--prompt");
+        assert_eq!(args[1], format!("{DEFAULT_INITIAL_PROMPT} 张三, 李四"));
+        assert!(
+            !args[1].contains('"'),
+            "命令行值不经过 shell，这里不该凭空多出引号：{:?}",
+            args[1]
+        );
+
+        // 脏输入：NUL（会让 Command::spawn 直接失败）、换行/制表（折成逗号）、
+        // `<|...|>`（whisper 的控制 token 写法）、半角双引号
+        let dirty = "\0张三\n\"李四\"\t<|endoftext|>OpenAI";
+        let args = initial_prompt_args("zh", dirty);
+        assert_eq!(args.len(), 2, "清洗结果仍必须是单个 argv 项：{args:?}");
+        let value = &args[1];
+        assert!(!value.contains('\0'), "NUL 会破坏 argv：{value:?}");
+        assert!(
+            !value.contains('\n') && !value.contains('\t'),
+            "控制字符应折成逗号：{value:?}"
+        );
+        assert!(
+            !value.contains("<|") && !value.contains("|>"),
+            "whisper 的特殊 token 必须清掉：{value:?}"
+        );
+        assert!(!value.contains('"'), "半角双引号是书写噪音：{value:?}");
+        assert!(value.contains("张三") && value.contains("李四") && value.contains("OpenAI"));
+
+        // 单引号是名字的一部分（O'Brien），不得被当成引号处理掉
+        let apostrophe = initial_prompt_args("zh", "O'Brien");
+        assert!(apostrophe[1].contains("O'Brien"), "{:?}", apostrophe[1]);
+    }
+
+    /// 非中文链路只用热词本身，不塞中文锚点（那句话对英文/日文录音是错的前提）。
+    #[test]
+    fn hotwords_without_chinese_anchor_for_other_languages() {
+        assert_eq!(
+            initial_prompt_args("en", "OpenAI, GPT-5"),
+            vec!["--prompt".to_string(), "OpenAI, GPT-5".to_string()]
+        );
+    }
+
+    /// 超长热词按**字符**截断（不是字节），并在窗口内最后一个分隔符处收口。
+    #[test]
+    fn overlong_hotwords_are_truncated_at_char_boundary() {
+        // 非中文链路的值就是热词本身，便于直接数长度
+        let long = "甲".repeat(MAX_ASR_HOTWORDS_CHARS + 500);
+        let args = initial_prompt_args("en", &long);
+        let value = &args[1];
+        assert_eq!(
+            value.chars().count(),
+            MAX_ASR_HOTWORDS_CHARS,
+            "上限必须按字符数生效"
+        );
+        assert!(
+            value.chars().all(|c| c == '甲'),
+            "多字节字符不得被截成半个：{value:?}"
+        );
+
+        // 窗口里出现过分隔符时，在最后一个分隔符处收口：后半项整段丢掉，且不以逗号结尾
+        let names = format!("{},{}", "a".repeat(100), "b".repeat(300));
+        let args = initial_prompt_args("en", &names);
+        let value = &args[1];
+        assert_eq!(value.chars().count(), 100, "{value:?}");
+        assert!(value.chars().all(|c| c == 'a'), "{value:?}");
+        assert!(!value.contains('b') && !value.ends_with(','), "{value:?}");
+    }
+
+    /// 旧配置（没有 `asr_hotwords` 键）、坏文件、文件缺失都必须读成「无热词」且不 panic。
+    #[test]
+    fn config_file_without_hotwords_key_reads_as_empty() {
+        let dir = std::env::temp_dir().join(format!("v2w_hotwords_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.toml");
+
+        // 旧版本的 config.toml：有 [paths] / [pipeline]，但没有 asr_hotwords 键
+        std::fs::write(
+            &path,
+            "[paths]\nffmpeg = \"tools/ffmpeg.exe\"\nwhisper_cli = \"tools/whisper-cli.exe\"\n\
+             whisper_model = \"models/whisper/ggml-small-q5_0.bin\"\n\
+             llama_cli = \"tools/llama-completion.exe\"\nllm_model = \"models/llm/qwen.gguf\"\n\n\
+             [pipeline]\nlanguage = \"zh\"\noutput_format = \"srt\"\nenable_polish = false\n\
+             whisper_threads = 12\nllm_threads = 4\nllm_ctx = 2048\n",
+        )
+        .expect("write legacy config");
+        assert_eq!(
+            asr_hotwords_from_config_path(&path),
+            "",
+            "旧配置没有该字段时必须读成空，且不得报错"
+        );
+
+        // 手写的新字段（含中文与分隔符）必须原样读出来
+        std::fs::write(
+            &path,
+            "[paths]\nffmpeg = \"tools/ffmpeg.exe\"\nwhisper_cli = \"tools/whisper-cli.exe\"\n\
+             whisper_model = \"models/whisper/ggml-small-q5_0.bin\"\n\
+             llama_cli = \"tools/llama-completion.exe\"\nllm_model = \"models/llm/qwen.gguf\"\n\n\
+             [pipeline]\nlanguage = \"zh\"\noutput_format = \"srt\"\nenable_polish = false\n\
+             whisper_threads = 12\nllm_threads = 4\nllm_ctx = 2048\nasr_hotwords = \"张三,李四\"\n",
+        )
+        .expect("write config with hotwords");
+        assert_eq!(asr_hotwords_from_config_path(&path), "张三,李四");
+
+        // 坏文件：读成空并留 error! 日志，不能 panic
+        std::fs::write(&path, "这不是 toml = = =").expect("write broken config");
+        assert_eq!(asr_hotwords_from_config_path(&path), "");
+
+        // 文件不存在：只读路径不得顺手把一份默认配置写到盘上
+        let missing = dir.join("nope.toml");
+        assert_eq!(asr_hotwords_from_config_path(&missing), "");
+        assert!(!missing.exists(), "读热词不得创建配置文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -1,7 +1,8 @@
 //! 应用程序全局状态
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::core::TaskPipeline;
 use crate::engines::TranslateMode;
@@ -460,6 +461,227 @@ pub type CachedTranscription = Arc<std::sync::Mutex<Option<(String, Option<Arc<T
 /// 而换工程 / 导出 / 关窗守卫走的都是**立刻写入**的那条路，不会丢。
 pub const SEGMENTS_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(1200);
 
+/// 单次「同步落库」等待后台写线程的最长时间。
+///
+/// 超过这个时间就不再干等，直接自己写（见 `flush_segments_if_dirty`）。宁可让当前这一份
+/// 最新快照先落盘（即便可能越过那个还没写完的旧快照），也不拖住关闭窗口 / 导出 / 换工程
+/// 这些「写完才能继续」的路径：那些路径的语义是「返回时数据已在库里」。
+const SEGMENTS_SYNC_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 待落库的一份一致快照（序列化好的整份字幕 + 目标行 + 修订号）。
+///
+/// 单独成型是为了让「取快照」与「写到哪一行」分开：前者必须留在渲染线程（要读正在编辑
+/// 的 `segments`），后者挪到后台。
+struct SegmentWriteSnapshot {
+    /// 目标行：派发那一刻的工程主键。
+    task_id: i64,
+    /// 派发那一刻的字幕修订号，用于判断回报是否已经过期。
+    revision: u64,
+    /// 序列化好的整份字幕（`segments_json` 参数原样带上）。
+    ///
+    /// # 为什么把序列化留在渲染线程，而不是把整份 Vec 交给后台
+    ///
+    /// `Database` 里给后台写库准备的入口是 `update_task_segments_json(id, &str)`：
+    /// 它接收已经序列化好的 JSON，后台只解析一次算派生列（样例文本 / 句数 / 有无译文）。
+    /// 于是后台线程不需要 `Vec<Segment>` 的所有权，快照可以是**纯 String**——
+    /// 但代价是序列化发生在渲染线程上，这与本任务「把写库挪走」的目标并不冲突：
+    /// 任务要求允许「序列化在当前线程做（要拿一致快照）」，真正必须挪走的是 sqlite 写。
+    /// 另一个好处是 `Segment` 类型不必跨线程克隆，派发时只移动一段字符串。
+    json: String,
+}
+
+/// 后台写线程回报给自己派发方的一条「写完了」信号。
+///
+/// # 为什么用通道，而不是「后台线程直接改 AppState」
+///
+/// 渲染线程按帧借用 `AppState`（`&mut`），后台线程若直接持有它就得共享可变引用——那等于
+/// 把整个界面状态变成全局锁。通道把「后台只想说的一件事」抽成值：序号 + 修订号 + 结局。
+/// 派发侧在渲染线程上收（`poll_background_writes`），于是**只有渲染线程写
+/// `db_write_error` / `segments_dirty`**，不需要给 AppState 加锁，也不会出现
+/// 「后台线程把一个已经换掉的工程标脏」。
+///
+/// # 错误怎么回到界面（本任务的难点）
+///
+/// 后台线程只把 `Result::Err` 的原样字符串塞进 `result` 投回来；`drain_segment_writes`
+/// 在渲染线程上把它拼成「字幕保存失败：…」挂进 `db_write_error`，并（在快照仍是当前
+/// 修订时）把 `segments_dirty` 置回触发重试。界面读的是原有字段，所以提示条与重试逻辑
+/// 一行都不用改。
+#[derive(Debug, Clone)]
+struct SegmentWriteDone {
+    /// 派发时领到的单调写序号（见 `BackgroundWriteTracker::next_seq`）。
+    seq: u64,
+    /// 快照对应的工程主键（原样带回，后台不查状态）。
+    ///
+    /// 只用于诊断日志与未来「按 task 归并失败」的扩展，回报判定不用它（判定看 seq +
+    /// revision + error_at_dispatch 三件套）。留 `#[allow(dead_code)]` 而不是删掉：
+    /// 删了之后 `tracing` 里那条「写过哪一行」的信息就再也补不回来了。
+    #[allow(dead_code)]
+    task_id: i64,
+    /// 落库时字幕内容的修订号：用来判断「这份快照是否已经被更新的编辑取代」。
+    revision: u64,
+    /// 派发时 `db_write_error` 的值：只有它没被后续更晚的失败改过，才允许按本次结局处理。
+    error_at_dispatch: Option<String>,
+    /// 写成功 / 失败原因（失败原因直接来自 sqlite 与它的前置校验）。
+    result: Result<(), String>,
+}
+
+/// 后台写线程的共享账本：单调序号、同步写水位、已完成序号、失败记录。
+///
+/// 这四样东西共同实现「防回退」——旧快照的结局不许覆盖新状态：
+///
+/// - `next_seq`：派发序号只增不减，后台结果自带「我是哪一代」；
+/// - `sync_watermark`：**同步**落库（关窗守卫 / 换工程 / 导出 / 翻译收尾）写的是更新的
+///   快照，它把水位推到自己领的序号上，于是还在排队的旧任务直接放弃写入（连写都不写，
+///   避免旧数据先在库里落地、再被新数据盖掉）；
+/// - `completed_floor`：已完成的最大写序号；更旧的回报只留日志，不许再点提示灯。
+///   （结果本身走 `submit` / `drain_results` 的通道，不在这里囤，所以不设失败队列。）
+///
+/// 只在**短暂持锁**的路径上用：领序号、标水位、收结果。真正的 sqlite 写不在这把锁里。
+#[derive(Debug)]
+struct BackgroundWriteTracker {
+    /// 下一个要发放的写序号。从 **1** 开始：`sync_watermark` 的 0 专门表示
+    /// 「还从未有过同步落库」，于是「水位 >= 待发序号」这条判据只在真发生过
+    /// 更新的同步写时才成立（不能从 0 起，否则第一次派发就会被这条判据吞掉）。
+    next_seq: AtomicU64,
+    /// 已完成的同步写的最大序号（0 = 还没写过）。
+    sync_watermark: AtomicU64,
+    /// 已有结论的最大写序号。
+    completed_floor: AtomicU64,
+}
+
+impl Default for BackgroundWriteTracker {
+    fn default() -> Self {
+        Self {
+            // 见字段注释：序号从 1 起，0 是「还没有任何写」的水位哨兵。
+            next_seq: AtomicU64::new(1),
+            sync_watermark: AtomicU64::new(0),
+            completed_floor: AtomicU64::new(0),
+        }
+    }
+}
+
+/// 后台写入子系统（在 `AppState` 里以 `Arc` 持有一份）。
+///
+/// # 同一 task_id 的写入为什么能按序号顺序落地
+///
+/// 两道闸：
+/// 1. **发放侧串行**：派发时 `writer` 这把锁把「检查水位 -> 取任务 id -> 起写线程」
+///    做成对同步写与其它派发原子的临界区；
+/// 2. **写入侧串行**：每个后台线程拿到快照后**先取同一把锁再写库**（`write_guard`），
+///    所以任意两个写（后台之间、后台与同步之间）不会交错。
+///
+/// 再加上 `Database` 内部那条连接锁，写入本身也已经串行——这里额外加锁是为了**顺序**：
+/// 光靠连接锁只能保证不交错，不保证先后。
+///
+/// # 为什么天然不会积压
+///
+/// 去抖路径停手 1.2s 才派发一次，而一次写只要 10~30ms，正常情况永远只有一个任务在飞。
+/// 满负荷下（磁盘卡住 + 用户狂停手）最多也只是每 1.2s 多一个线程，线程写完即退，不占
+/// 常驻资源；`in_flight_writes` 用于把这个量暴露给诊断与测试。
+#[derive(Debug)]
+struct BackgroundWrites {
+    writer: Mutex<()>,
+    tracker: Arc<BackgroundWriteTracker>,
+    submit: std::sync::mpsc::Sender<SegmentWriteDone>,
+    results: Mutex<std::sync::mpsc::Receiver<SegmentWriteDone>>,
+    in_flight_writes: AtomicUsize,
+}
+
+impl Default for BackgroundWrites {
+    fn default() -> Self {
+        let (submit, results) = std::sync::mpsc::channel();
+        Self {
+            writer: Mutex::new(()),
+            tracker: Arc::new(BackgroundWriteTracker::default()),
+            submit,
+            results: Mutex::new(results),
+            in_flight_writes: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// 后台写入期间记录「还有几个快照在飞」。
+///
+/// 计数在**结果投递成功之后**才归零（`disarm`），所以 `pending == 0` 的含义是
+/// 「结果已经在通道里」——同步落库靠这个等待，弱化成「线程已 spawn」就会等成早了。
+/// 剩下那些「没走到投递」的结局（提前放弃、panic、发送失败）由 `Drop` 兜底 -1，
+/// 免得每个 return 分支都得记得递减（漏一处，计数就永远回不了零）。
+struct WriteInFlight(Arc<AtomicUsize>);
+
+impl WriteInFlight {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+
+    /// 结果已经交给通道：可以安全地报告「这一份不在飞了」。
+    fn disarm(self) {}
+}
+
+impl Drop for WriteInFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl BackgroundWrites {
+    /// 取 `writer` 锁，**容忍 Mutex 中毒**（与 `Database::lock_conn` 同策略）。
+    ///
+    /// 中毒只说明「上次有人在持锁时 panic 了」，守卫本身要保护的是**写入顺序**，不是数据：
+    /// panic 的那个线程要么还没写、要么已经写完，锁里没有半截状态。若这里 `unwrap()`，
+    /// 一次后台 panic 会让此后每一次派发与同步落库都连环 panic，整程序直接不能保存字幕
+    /// ——比继续用这把锁危险得多。
+    fn lock_writer(&self) -> MutexGuard<'_, ()> {
+        self.writer.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 排空后台结果通道：只留「必须回到界面」的那些回报。
+    ///
+    /// # 这里丢掉的是什么（防回退的一部分）
+    ///
+    /// - `error_at_dispatch` 与**本轮排空之前**的 `db_write_error` 不一致：派发之后提示条被
+    ///   别的写库改动过（用户另一次操作失败 / 成功），本次结局不再代表当前状态，不能拿它回写。
+    ///   这一条必须在**排水位之前**判：成功回报也要参与「把提示条清空」的竞价。
+    ///
+    ///   注意比较对象是 `pre_drain_error`（调用方在调用本方法**之前**取的一份快照），
+    ///   不是「处理到一半时的 `db_write_error`」：同一轮里可能同时收到一条失败与一条成功
+    ///   （比如先写的失败、后写的成功在轮询窗口里一起到达），若拿已被前一条改过的字段去
+    ///   比后一条的派发快照，后一条会被误判成「别人改过」而整条丢掉——用户看到的就是
+    ///   「明明写成功了，提示条还挂着失败」。
+    /// - `seq` 已被 `completed_floor` 越过：更晚的写入（比如一次同步落库）已经有结论，这条
+    ///   迟到的失败描述的是一个**已经被覆盖**的快照，再挂提示只会让用户以为「刚存好的东西
+    ///   又坏了」。留日志即可。
+    ///
+    /// 与 `lock_writer` 同策略容忍中毒：`results` 里装的是一次性判定用的值，没有半截状态；
+    /// 而这里一旦 panic，界面就再也收不到写库失败的提示（错误被静默）。
+    fn drain_results(&self, pre_drain_error: Option<&str>) -> Vec<SegmentWriteDone> {
+        let floor = self.tracker.completed_floor.load(Ordering::SeqCst);
+        let receiver = self.results.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = Vec::new();
+        for done in receiver.try_iter() {
+            if done.error_at_dispatch.as_deref() != pre_drain_error {
+                tracing::debug!(
+                    seq = done.seq,
+                    "派发之后提示条已被别的写库改动过，丢弃这条后台写回报"
+                );
+                continue;
+            }
+            if done.seq <= floor {
+                if let Err(err) = &done.result {
+                    tracing::debug!(
+                        seq = done.seq,
+                        error = %err,
+                        "已被更新的写入越过，丢弃过期的后台写失败"
+                    );
+                }
+                continue;
+            }
+            kept.push(done);
+        }
+        kept
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
@@ -515,6 +737,21 @@ pub struct AppState {
     /// 剪辑台的字幕清单搜索结果是缓存渲染的，靠这个号判断缓存是否失效，
     /// 避免每帧都对上千条字幕重跑一遍子串匹配。
     pub segments_revision: u64,
+
+    /// 后台写线程的共享账本 + 串行闸（见 `BackgroundWrites`）：去抖路径
+    /// （`flush_segments_if_dirty_async`）派发的写在这里排队，写库本身不占渲染线程。
+    segments_writes: Arc<BackgroundWrites>,
+
+    /// 「已派发但还没落库」的字幕快照数（含正在写与排队中的）。
+    ///
+    /// # 为什么要有它
+    ///
+    /// 关窗守卫靠 `segments_dirty` 判断「还有没有没写的东西」。异步派发之后只清脏标记是
+    /// 不够的：那份快照**已经在后台了**，但还没落库。若此刻正赶上退出，重建窗口 / 进程
+    /// 收尾都可能抢在写线程之前跑完，改动就丢了。所以派发路径保留脏标记语义的同时，用这个
+    /// 计数暴露「后台还有几份在飞」——`flush_segments_if_dirty` 会先把它们全部等回来
+    /// （带上限）再自己写，于是「写完才返回」的旧语义对调用点仍然成立。
+    segments_write_pending: Arc<AtomicUsize>,
 
     /// 撤销栈：每次编辑前压入一份受影响状态的快照（见 [`EditSnapshot`]）。
     /// 快照式而非「反向操作」式：编辑动作有拆分/合并/删除/改时间五类，
@@ -773,6 +1010,9 @@ impl AppState {
 
         // 目标语言在 config 被 move 进 state 之前取出（否则借用已移动的值）
         let translate_target_lang = config.translate.target_lang.clone();
+        // 后台写线程与渲染线程之间的结果通道：发送端交给后台写线程，接收端装进
+        // `BackgroundWrites`（见 `BackgroundWrites::drain_results`）。
+        let (segments_write_tx, segments_write_results) = std::sync::mpsc::channel();
         let mut state = Self {
             config,
             db,
@@ -797,6 +1037,12 @@ impl AppState {
             segments_flush_due: None,
             active_task_id: None,
             segments_revision: 0,
+            segments_writes: Arc::new(BackgroundWrites {
+                submit: segments_write_tx,
+                results: Mutex::new(segments_write_results),
+                ..BackgroundWrites::default()
+            }),
+            segments_write_pending: Arc::new(AtomicUsize::new(0)),
             undo_stack: Vec::new(),
             edit_log: crate::subtitle::audit::EditLog::new(),
             redo_stack: Vec::new(),
@@ -2052,12 +2298,252 @@ impl AppState {
         self.bump_segments_revision();
     }
 
-    /// 将编辑产生的脏字幕落库（幂等，未脏时零开销）
+    /// 把后台写线程的回报收进 `db_write_error` / `segments_dirty`（在渲染线程上调）。
+    ///
+    /// # 后台错误怎么回到界面
+    ///
+    /// 后台线程**不碰 `AppState`**（渲染线程按帧借用它，共享可变状态等于给整个界面加锁），
+    /// 只把 `SegmentWriteDone` 投进 `segments_write_rx`。这里是唯一的消费点，
+    /// 也是唯一写这两个字段的地方，规则与同步版一致：
+    ///
+    /// - **失败一律不静默**：`Result::Err` 会被挂进 `db_write_error`（界面渲染成提示条），
+    ///   并把 `segments_dirty` 置回（若这份快照仍是当前修订），下一次 flush 会重试；
+    /// - **成功按序号收口**：只认「当前最新」那个写序号与修订号的结果，
+    ///   更旧的一律丢弃（见 `drain_segment_writes` 与 `BackgroundWriteTracker`）；
+    /// - 本次快照已经被更新的编辑取代（`revision` 变了）时，失败不再置脏：
+    ///   更新的内容本来就要重新走一遍落库，置脏只会让旧快照再写一次。
+    ///
+    /// 调用点：定时去抖（`flush_segments_if_due_at`）、同步落库前（`flush_segments_if_dirty`）、
+    /// 登记待落库时（`defer_segments_flush`：高频编辑也会顺手把结果收掉，
+    /// 失败提示因此最迟在下一次交互就出现，不必等 1.2s 的定时器）。
+    pub fn poll_background_writes(&mut self) {
+        // 快照必须在排空之前取：`drain_results` 用它与每条回报的「派发时提示条」比对，
+        // 判定这条回报是否已经被别的写库改动过（见该方法文档）。
+        let pre_drain_error = self.db_write_error.clone();
+        let done = self
+            .segments_writes
+            .drain_results(pre_drain_error.as_deref());
+        if done.is_empty() {
+            return;
+        }
+        let completed_floor = self
+            .segments_writes
+            .tracker
+            .completed_floor
+            .load(Ordering::SeqCst);
+        let floor = drain_segment_writes(
+            &mut self.db_write_error,
+            &mut self.segments_dirty,
+            self.segments_revision,
+            completed_floor,
+            pre_drain_error.as_deref(),
+            &done,
+        );
+        self.segments_writes
+            .tracker
+            .completed_floor
+            .fetch_max(floor, Ordering::SeqCst);
+    }
+
+    /// 是否还有后台字幕写在飞（诊断 / 测试用；关窗守卫看的是 `segments_dirty`）。
+    pub fn background_segments_write_pending(&self) -> usize {
+        self.segments_write_pending.load(Ordering::SeqCst)
+    }
+
+    /// 给后台写线程的一致快照（当前主键 + 序列化好的整份字幕 + 修订号）。
+    ///
+    /// 这里只做一次 `Vec<Segment>` 克隆：共享借用会让编辑与后台写交错，不可取；
+    /// 克隆是浅层复制，换来的是序列化 + sqlite UPDATE 全部离开渲染线程。
+    ///
+    /// 没有主键（尚未落库）时返回 `None`：退化成按路径更新会改掉同路径的其它历史记录。
+    ///
+    /// 序列化**不在这里做**：它和 sqlite UPDATE 一起交给后台线程（`write_segments_to_db`），
+    /// 这里只截一份一致的字幕快照。这样 5000 句工程的序列化开销（JSON 几十毫秒量级）
+    /// 也不再压渲染线程。
+    fn segments_write_snapshot(&self) -> Option<SegmentWriteSnapshot> {
+        let task_id = self.active_task_id?;
+        let json = match serde_json::to_string(&self.segments) {
+            Ok(json) => json,
+            Err(err) => {
+                // `Segment` 的字段都能被 `serde_json` 表达，这条路实际到不了。
+                // 真到了说明内存里的内容已经不是本程序写进去的形状，重试一万次也还是
+                // 同样的结果——只留日志，不派发（派发出去必然失败），也不动脏标记。
+                tracing::warn!(error = %err, "字幕序列化失败，本次不派发后台写");
+                return None;
+            }
+        };
+        Some(SegmentWriteSnapshot {
+            task_id,
+            revision: self.segments_revision,
+            json,
+        })
+    }
+
+    /// 去抖路径专用：把当前快照**派发**给后台写线程（立刻返回，不阻塞渲染线程）。
+    ///
+    /// # 与同步版的分工
+    ///
+    /// - `flush_segments_if_dirty()` 给「换工程 / 导出 / 关窗守卫 / 翻译收尾」用：
+    ///   返回时必须已经写进库（它还会把这里在飞的写等回来，见该函数与
+    ///   `SEGMENTS_SYNC_FLUSH_WAIT`）；
+    /// - 本函数给「停手 1.2s」的去抖路径用：只负责派发，
+    ///   结果在 `poll_background_writes` 里收（写失败同样会挂 `db_write_error`）。
+    ///
+    /// # 这里为什么可以立刻清 `segments_dirty`
+    ///
+    /// 脏标记的语义是「有改动还没人负责写」。派发成功之后这份快照已经归后台线程了，
+    /// 再留着只会让定时器每个窗口都重复派发同一份内容。
+    /// 「后台还没落地」这件事由 `segments_write_pending` 与后台回报继续跟踪：
+    /// 失败时会把脏标记置回（见 `drain_segment_writes`），而关窗守卫走的同步版会先等在飞的写。
+    pub fn flush_segments_if_dirty_async(&mut self) {
+        if !self.segments_dirty {
+            return;
+        }
+        self.segments_flush_due = None;
+        match self.segments_write_snapshot() {
+            Some(snapshot) => {
+                if self.dispatch_segment_write(snapshot) {
+                    // 只有真的派发出去才清脏：派发失败时同步兜底会把内容写掉。
+                    self.segments_dirty = false;
+                }
+            }
+            // 没有主键：没有可写回的行，等同已保存（与同步版一致），脏标记直接清掉。
+            None => self.segments_dirty = false,
+        }
+    }
+
+    /// 把一份字幕快照交给后台写线程；返回「是否真的派出去了」。
+    ///
+    /// # 防回退：派发前先领序号并检查同步水位
+    ///
+    /// 领序号与查水位都在 `db_write_writer` 锁里完成，和**同步**落库（也持有这把锁）
+    /// 是互斥的，于是两种派发顺序都自洽：
+    ///
+    /// - 同步写先完成（水位被推高）：本任务序号更旧，直接不派发——它带的快照是
+    ///   同步写之前取下的，写进去就是**回退**；
+    /// - 本任务先派发：序号比水位新，正常入队（后台线程写库前会再查一次水位，
+    ///   挡住「排队等锁期间同步写插进来」那种情形）。
+    ///
+    /// 派发失败（线程起不来 / 通道断了）不静默：挂提示条并把脏标记放回，
+    /// 下一次去抖（或关窗守卫的同步落库）会重试。
+    fn dispatch_segment_write(&mut self, snapshot: SegmentWriteSnapshot) -> bool {
+        let writes = Arc::clone(&self.segments_writes);
+        let pending = Arc::clone(&self.segments_write_pending);
+        // 写线程自己再拿一份 `Arc`：`writes` 会被 move 进闭包，派发侧的失败分支还要用。
+        let worker_writes = Arc::clone(&self.segments_writes);
+        let db = self.db.clone();
+        let seq = {
+            let _guard = writes.lock_writer();
+            let watermark = writes.tracker.sync_watermark.load(Ordering::SeqCst);
+            let next = writes.tracker.next_seq.load(Ordering::SeqCst);
+            if watermark >= next {
+                // 同步写已经写过更新的快照：这份快照写进去就是回退。直接算「已保存」——
+                // 它的内容本来就来自水位之前的状态，库里已经有更新的版本了。
+                tracing::debug!(
+                    task_id = snapshot.task_id,
+                    "同步落库已经写过更新的快照，放弃派发这次后台写"
+                );
+                return true;
+            }
+            let seq = writes.tracker.next_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            writes.in_flight_writes.fetch_add(1, Ordering::SeqCst);
+            seq
+        };
+        let done = SegmentWriteDone {
+            seq,
+            error_at_dispatch: self.db_write_error.clone(),
+            revision: snapshot.revision,
+            task_id: snapshot.task_id,
+            result: Ok(()),
+        };
+        let spawn = std::thread::Builder::new()
+            .name("voice2word-segments-write".to_string())
+            .spawn(move || {
+                // 计数器在闭包退出时自动 -1（`WriteInFlight` 的 Drop）：
+                // 正常返回 / 提前放弃 / panic 三种结局都不会把它挂住。
+                let in_flight = WriteInFlight::new(pending);
+                let write_guard = worker_writes.lock_writer();
+                if worker_writes.tracker.sync_watermark.load(Ordering::SeqCst) >= seq {
+                    // 同步写（关窗 / 换工程 / 导出 / 翻译收尾）已经写过**更新**的快照：
+                    // 本次不写（写进去就是回退），但这不是失败——把结局报成成功，
+                    // 否则界面会把一份已经写完的最新内容重新标脏、再派发一轮。
+                    tracing::debug!(seq, "同步落库已越过这份快照，后台放弃写入");
+                    let _ = worker_writes.submit.send(SegmentWriteDone {
+                        result: Ok(()),
+                        ..done
+                    });
+                    in_flight.disarm();
+                    return;
+                }
+                // 真正的 sqlite 写：序列化 + UPDATE 都在这条后台路径上，渲染线程不等它。
+                let result =
+                    Self::write_segments_to_db(&db, snapshot).map_err(|err| err.to_string());
+                drop(write_guard);
+                if worker_writes
+                    .submit
+                    .send(SegmentWriteDone { result, ..done })
+                    .is_ok()
+                {
+                    // 结果已进通道：这一份可以算「不在飞」了（同步落库等的是它落地）。
+                    in_flight.disarm();
+                }
+            });
+        match spawn {
+            Ok(_handle) => true,
+            Err(err) => {
+                // 线程都没起来：退回同步写（旧路径），失败同样记成可见提示。
+                tracing::warn!(error = %err, "后台写线程启动失败，改为同步写库");
+                writes.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
+                let _ = self.sync_segments_to_db();
+                self.segments_dirty = true;
+                self.record_db_write_error(format!("字幕保存失败（后台写线程启动失败）：{err}"));
+                false
+            }
+        }
+    }
+
+    /// 后台线程写库的落地调用（这一段就是被挪出渲染线程的 sqlite 写）。
+    ///
+    /// 只用 `Database` 已有的入口：`update_task_segments_json` 接收已经序列化好的
+    /// `segments_json`，自己解析一次算派生列（样例文本 / 句数 / 有无译文）并刷新 `duration`，
+    /// 本次不允许改 db.rs，所以这里不重复造轮子。后台线程因此不需要 `Vec<Segment>` 的所有权，
+    /// 快照可以是纯 String。
+    ///
+    /// 只拿到 `Database`（内部是 `Arc<Mutex<Connection>>`，天生可跨线程）与一个纯值快照、
+    /// 拿不到 `AppState`，所以这必须是**关联函数**而不是 `&self` 方法。
+    fn write_segments_to_db(db: &Database, snapshot: SegmentWriteSnapshot) -> anyhow::Result<()> {
+        db.update_task_segments_json(snapshot.task_id, &snapshot.json)
+    }
+
+    /// 将编辑产生的脏字幕落库（同步；幂等，未脏时零开销）
     ///
     /// 换工程 / 导出 / 关窗守卫 / 结构性编辑（拆分合并删除）都走这条**立刻写入**的路；
-    /// 高频交互走 [`AppState::defer_segments_flush`]。这里顺带作废待落库登记：登记留着
-    /// 的话，定时器稍后还会把同一份（或更旧的）内容再写一遍。
+    /// 高频交互走 `AppState::defer_segments_flush`（迟到 1.2s 后由
+    /// `flush_segments_if_dirty_async` 派发到后台线程）。
+    ///
+    /// # 与后台写的关系（旧语义必须保住）
+    ///
+    /// 调用点要的是「**返回时数据已经在库里**」。后台路径（去抖）只负责派发，返回时写
+    /// 可能还在飞——所以这里先等它们落地（上限 `SEGMENTS_SYNC_FLUSH_WAIT`），再自己写
+    /// 当前快照。等待超时不会丢东西：还在飞的旧快照写完就写完了，本次的同步写是更新的
+    /// 内容，它一定是最后落地的（两者共用同一把写入闸，见 `BackgroundWrites`）。
+    ///
+    /// 顺手作废「待落库」登记：登记留着的话，定时器稍后还会把同一份（或更旧的）内容再写一遍。
     pub fn flush_segments_if_dirty(&mut self) {
+        // 先把后台的回报收进 `db_write_error`：另一条入口只是定时器去抖，界面上就指望
+        // 这里把「后台写失败」变成可见提示。不收的话一次失败要等到下一次交互才显示。
+        self.poll_background_writes();
+        let pending = Arc::clone(&self.segments_write_pending);
+        if pending.load(Ordering::SeqCst) > 0 {
+            let deadline = std::time::Instant::now() + SEGMENTS_SYNC_FLUSH_WAIT;
+            while pending.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let still = pending.load(Ordering::SeqCst);
+            if still > 0 {
+                tracing::warn!(pending = still, "后台字幕写未在期限内收尾，同步落库先行");
+            }
+        }
         self.segments_flush_due = None;
         if self.segments_dirty {
             self.segments_dirty = false;
@@ -2081,23 +2567,38 @@ impl AppState {
     /// 登记「稍后落库」：高频交互节点用它代替立刻写库（见 [`SEGMENTS_FLUSH_IDLE`]）。
     ///
     /// 不脏就不登记：空登记只会让定时器白白醒来查一次。
+    ///
+    /// 顺手收一次后台写的回报：编辑是最频繁的动作，失败提示因此最迟在下一次敲键 /
+    /// 切句就出现，不必干等 1.2s 的定时器。
     pub fn defer_segments_flush(&mut self) {
+        self.poll_background_writes();
         if self.segments_dirty {
             self.segments_flush_due = Some(std::time::Instant::now());
         }
     }
 
-    /// 停手满 [`SEGMENTS_FLUSH_IDLE`] 就把待落库的改动写回；返回「这次真的走了写库」。
+    /// 停手满 [`SEGMENTS_FLUSH_IDLE`] 就把待落库的改动交给后台写线程；
+    /// 返回「这次真的派发了一次写」。
     ///
-    /// 写失败时 [`AppState::flush_segments_if_dirty`] 会把脏标记放回，这里再登记一次，
-    /// 于是定时器下一个窗口会重试——写库失败有提示条（`db_write_error`），
-    /// 但不该要求用户再点一下才重试。
+    /// # 为什么这里能返回 `true` 却还没写完
+    ///
+    /// 去抖路径的语义是「别再拖了、让它去写」，不是「已经写完」——写库本身
+    /// （序列化 + sqlite UPDATE，5000 句约 10~30ms）已经挪到后台（见
+    /// `flush_segments_if_dirty_async`）。返回值只用来驱动界面重绘。
+    /// 需要「写完才继续」的调用点走的是同步版 [`Self::flush_segments_if_dirty`]。
+    ///
+    /// 写失败时后台回报会在 `poll_background_writes` 里把 `segments_dirty` 置回
+    /// （提示条同时挂上 `db_write_error`），这里再登记一次，于是定时器下一个窗口会重试
+    /// ——写库失败有提示条，但不该要求用户再点一下才重试。
     pub fn flush_segments_if_due(&mut self) -> bool {
         self.flush_segments_if_due_at(std::time::Instant::now())
     }
 
     /// [`Self::flush_segments_if_due`] 的可注入时钟版本（单测直接给时刻，不睡真实时间）。
     pub fn flush_segments_if_due_at(&mut self, now: std::time::Instant) -> bool {
+        // 到点与否都得先把后台回报收掉：否则失败置回的脏标记要等到下一个窗口才看得到，
+        // 而那个窗口又可能因为「还没到点」直接返回，白拖一轮。
+        self.poll_background_writes();
         let Some(due) = self.segments_flush_due else {
             return false;
         };
@@ -2105,12 +2606,13 @@ impl AppState {
             return false;
         }
         if !self.segments_dirty {
-            // 期间已经被别的路（换工程 / 关窗 / 导出）写过：登记作废，别一直挂着。
+            // 期间已经被别的路（换工程 / 关窗 / 导出 / 后台写已完成）写过：登记作废，别一直挂着。
             self.segments_flush_due = None;
             return false;
         }
-        self.flush_segments_if_dirty();
+        self.flush_segments_if_dirty_async();
         if self.segments_dirty {
+            // 没派发出去（序列化失败）：重新登记，下一个窗口再试。
             self.segments_flush_due = Some(std::time::Instant::now());
         }
         true
@@ -2777,9 +3279,148 @@ fn merge_concat_translations(
     }
 }
 
+/// 把后台写线程的回报并进 UI 状态（**纯函数**，只在渲染线程上跑，便于单测钉死判定）。
+///
+/// # 判定规则（防回退的核心）
+///
+/// 一条回报只有在**两件事同时成立**时才算数：
+///
+/// 1. `seq > completed_floor`——更晚的写入已经有结论了，这条描述的是**已经被覆盖**的
+///    快照（`BackgroundWrites::drain_results` 已经按它筛过一轮，这里再判一次是为了让
+///    纯函数自己就是完整的，单测不必构造排水位的现场）；
+/// 2. `pre_drain_error`（**本轮排空之前**的 `db_write_error`；调用方在调用前取快照）
+///    与这条回报的「派发时提示条」一致——否则说明后台写这段时间里用户别的落库也
+///    失败 / 成功过，那是**更新**的事实，不能被这次结局回写。用调用方给的快照而不是
+///    `db_write_error` 的当前值：同一轮里可能同时收到失败与成功两条，若拿已被前一条
+///    改过的字段去比后一条的派发快照，后一条会被误判成「别人改过」整条丢掉；
+/// 2. 这份快照仍然是当前内容（`revision` 没变）或者这次写**成功**。旧快照的失败
+///    不再置脏：用户已经又改过，新的内容会自己走一遍落库，置脏只会让定时器把那份
+///    旧内容再派发一次（而它注定写不进最新状态）。
+///
+/// 成功：把提示条清空（与同步版 flush 成功一致）。
+/// 失败：追加「字幕保存失败：…」；**只有**这条回报本身就是最新的一条
+/// （`seq == floor`）**且** `revision` 还是当前的才把 `segments_dirty` 置回，
+/// 让定时器 / 关窗守卫重试。
+///
+/// # 为什么置脏还要看「是不是最新一条」
+///
+/// 同一轮排空里可能同时收到一份旧快照的失败与一份更新的成功。旧失败若也把脏标记
+/// 置回，界面会显示「有未保存改动」并要求再写一遍——而库里那一段内容其实已经被
+/// 更新的成功写进去了。这与「旧快照的失败不回写当前状态」是同一条原则。
+///
+/// 返回参与判定的最大写序号，供调用方推进 `completed_floor`。
+fn drain_segment_writes(
+    db_write_error: &mut Option<String>,
+    segments_dirty: &mut bool,
+    current_revision: u64,
+    completed_floor: u64,
+    pre_drain_error: Option<&str>,
+    done: &[SegmentWriteDone],
+) -> u64 {
+    let floor = done
+        .iter()
+        .map(|write| write.seq)
+        .max()
+        .unwrap_or(0)
+        .max(completed_floor);
+    for write in done {
+        if write.seq <= completed_floor {
+            // 更晚的写入已经有结论了：这条描述的快照**已经被覆盖**，再挂结果只会回退。
+            // （`drain_results` 已经按同一条件筛过一轮，这里再判一次让本函数自洽。）
+            tracing::debug!(
+                seq = write.seq,
+                floor = completed_floor,
+                "回报比已完成水位更旧，丢弃"
+            );
+            continue;
+        }
+        if pre_drain_error != write.error_at_dispatch.as_deref() {
+            // 派发之后又发生过别的失败 / 成功：本次结局不再代表当前状态，丢弃。
+            tracing::debug!(
+                seq = write.seq,
+                "派发之后提示条已被别的写库改动过，本次后台写结局不再回写"
+            );
+            continue;
+        }
+        apply_segment_write_result(
+            db_write_error,
+            segments_dirty,
+            write,
+            current_revision,
+            write.seq == floor,
+        );
+    }
+    floor
+}
+
+/// 一条后台写结局落到状态上的**唯一入口**（纯函数，供 `poll_background_writes` 与测试复用）。
+///
+/// `newest`：这条回报是不是同一轮里的最新一条（调用方按 `seq == floor` 判定）。
+///
+/// # 错误通道永远不静默
+///
+/// 失败一定写进 `db_write_error`（与同步版同文案、同「；」拼接规则），界面提示条读的
+/// 就是这个字段——后台线程与渲染线程之间没有任何别的错误通路。
+///
+/// # 为什么「置脏」必须看修订号
+///
+/// `segments_dirty` 的语义是「**当前**内容还没落库」。后台写的是**过去某一刻**的快照：
+/// 它失败时若直接把脏标记置回，而用户其实已经又改过（`segments_revision` 更大），
+/// 定时器稍后会把那份**旧快照**当成当前内容派发一次——落进库的就不是用户最新改的东西。
+/// 所以只有「失败的那份快照正好还是当前修订」才置脏；否则脏标记归更新的那份编辑负责，
+/// 由下一次 `defer_segments_flush` / 去抖重新标记。
+///
+/// 同理，已经被同一轮里更新的一条越过（`newest == false`）的失败也不置脏：那段内容
+/// 已经有更新的写落库了，再标脏只会让用户看到一次多余的「未保存」与一次无谓的重写。
+fn apply_segment_write_result(
+    db_write_error: &mut Option<String>,
+    segments_dirty: &mut bool,
+    write: &SegmentWriteDone,
+    current_revision: u64,
+    newest: bool,
+) {
+    match &write.result {
+        Ok(()) => *db_write_error = None,
+        Err(err) => {
+            // 与同步版文案、拼接规则完全一致：界面提示条读的就是这个字段。
+            *db_write_error = Some(match db_write_error.take() {
+                Some(prev) => format!("{prev}；字幕保存失败：{err}"),
+                None => format!("字幕保存失败：{err}"),
+            });
+            // 失败不能静默之外，还得**能重试**：把脏标记放回，让定时器 / 关窗守卫
+            // 再走一遍。只对「落库时那份快照就是当前内容、且这条就是最新一条」的失败
+            // 置回，理由见函数文档。
+            if newest {
+                mark_segments_dirty_for_revision(segments_dirty, write.revision, current_revision);
+            }
+        }
+    }
+}
+
+/// 失败发生在旧修订上时，`segments_dirty` 该怎么处理（纯函数）。
+///
+/// - `queued_revision == current_revision`：这份快照仍是当前内容，放回脏标记以便重试；
+/// - 否则：用户已经又改过（更新修订号），新的内容会自己走一遍落库，不要动脏标记。
+fn mark_segments_dirty_for_revision(
+    segments_dirty: &mut bool,
+    queued_revision: u64,
+    current_revision: u64,
+) -> bool {
+    if queued_revision == current_revision {
+        *segments_dirty = true;
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AppState, PolishMode, ProcessStatus, WhisperModelTier, SEGMENTS_FLUSH_IDLE};
+    use super::{
+        apply_segment_write_result, drain_segment_writes, mark_segments_dirty_for_revision,
+        AppState, PolishMode, ProcessStatus, SegmentWriteDone, WhisperModelTier,
+        SEGMENTS_FLUSH_IDLE,
+    };
     use crate::subtitle::Segment;
 
     /// 构造一个最小可用、不碰显卡/磁盘/子进程的 AppState：内存 SQLite + 假路径引擎，
@@ -4863,14 +5504,30 @@ mod tests {
         assert!(state.db_write_error.is_none(), "成功落库后应清空提示");
     }
 
-    /// 去抖落库：登记之后不许立刻写；停手满窗口才写一次；立刻写入的入口要作废登记。
+    /// 一条合成回报。`error_at_dispatch` 传 `None` 表示「派发时提示条是干净的」——
+    /// 真实链路里就是这个状态（上一次成功已经清空），所以测试里的回报必须照抄。
+    fn synthetic_write(seq: u64, revision: u64, result: Result<(), String>) -> SegmentWriteDone {
+        SegmentWriteDone {
+            seq,
+            task_id: 1,
+            revision,
+            error_at_dispatch: None,
+            result,
+        }
+    }
+
+    /// 去抖落库：登记之后不许立刻写；停手满窗口才交给后台；立刻写入的入口要作废登记。
     ///
     /// 回归护栏：`seek_to` 在拖动时间轴时每 40ms 被调一次。一旦回到「每次都同步写库」，
     /// 5000 句的工程每拖一下就要多付 10~30ms 的序列化 + UPDATE，手感直接变差。
+    ///
+    /// 异步化之后的契约：到点那次只**派发**（脏标记在派发成功时清掉，登记同时作废），
+    /// 写库本身在后台；同步版 `flush_segments_if_dirty`（换工程 / 导出 / 关窗守卫）仍然
+    /// 是「返回时已写完」，所以它照样会把登记一起作废。
     #[test]
     fn deferred_flush_waits_for_idle_window() {
         let mut state = test_state(Vec::new());
-        state.active_task_id = None; // 无主键 → 写库路径直接 Ok，本测试只验时序
+        state.active_task_id = None; // 无主键 → 没有可写回的行，等同已保存
 
         // 没有改动就不登记：空登记只会让定时器白醒一次
         state.segments_dirty = false;
@@ -4881,15 +5538,15 @@ mod tests {
         state.defer_segments_flush();
         let due = state.segments_flush_due.expect("有改动必须登记待落库");
 
-        // 窗口没到：不写，也不清脏标记，登记继续留着
+        // 窗口没到：不派发，也不清脏标记，登记继续留着
         assert!(!state.flush_segments_if_due_at(due + std::time::Duration::from_millis(300)));
         assert!(state.segments_dirty, "没到点就不该清脏标记");
         assert!(state.segments_flush_due.is_some(), "没到点登记要留着");
 
-        // 停手满窗口：写一次，脏标记与登记一起清掉
+        // 停手满窗口：派发一次（无主键 → 直接清脏），脏标记与登记一起清掉
         assert!(state.flush_segments_if_due_at(due + SEGMENTS_FLUSH_IDLE));
-        assert!(!state.segments_dirty, "写过之后脏标记必须清掉");
-        assert!(state.segments_flush_due.is_none(), "写过之后登记必须清掉");
+        assert!(!state.segments_dirty, "派发之后脏标记必须清掉");
+        assert!(state.segments_flush_due.is_none(), "派发之后登记必须清掉");
 
         // 立刻写入的入口（换工程 / 导出 / 关窗）要作废登记：
         // 不作废的话定时器稍后还会把同一份内容再写一遍。
@@ -4905,6 +5562,241 @@ mod tests {
         state.segments_dirty = false;
         assert!(!state.flush_segments_if_due_at(due + SEGMENTS_FLUSH_IDLE * 2));
         assert!(state.segments_flush_due.is_none(), "空登记不能一直挂着");
+    }
+
+    /// 后台写真的把字幕写进了库，而且**渲染线程不再等它**。
+    ///
+    /// 这是本任务的主路径验证：`flush_segments_if_dirty` 的同步语义一个字没改，
+    /// 但去抖那条路（`flush_segments_if_dirty_async`）改成派发——派发返回时脏标记已清、
+    /// 已有快照在后台（`background_segments_write_pending()` 能看到），
+    /// 一两帧之后落库完成，`Database::load_task_segments` 能读回改动。
+    #[test]
+    fn async_flush_writes_to_database_from_background_thread() {
+        let mut state = test_state(Vec::new());
+        let db = crate::storage::Database::open(":memory:").expect("内存库应能打开");
+        let task_id = db
+            .insert_task("bg.mp4", "bg.mp4", 10.0, "completed", &Vec::new(), None)
+            .expect("先插一条空工程");
+        state.db = db;
+        state.active_task_id = Some(task_id);
+        state.segments = vec![Segment::new(1, 0.0, 1.0, "后台写进去的第一句")];
+        state.bump_segments_revision();
+        state.segments_dirty = true;
+
+        state.flush_segments_if_dirty_async();
+
+        assert!(
+            !state.segments_dirty,
+            "派发之后脏标记必须清掉（这份快照已归后台）"
+        );
+        assert!(
+            state.segments_flush_due.is_none(),
+            "派发同时要作废待落库登记"
+        );
+
+        // 后台线程跑完之前，渲染线程只做「收回报」这件事；这里轮询模拟定时器窗口。
+        //
+        // 等的判据是「写真的落库了」——`background_segments_write_pending()` 归零只说明
+        // 「结果已经投进通道」，而收到回报本身不会让库里立刻可见（回报是在写完之后才投的，
+        // 但本测试的轮询窗口比写线程快，可能先看到 pending == 0 而写还没落到读连接上）。
+        // 所以直接以「读得回这一句」为完成条件，另外用错误通道做失败短路。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut loaded = Vec::new();
+        while std::time::Instant::now() < deadline {
+            state.poll_background_writes();
+            if state.db_write_error.is_some() {
+                break;
+            }
+            loaded = state
+                .db
+                .load_task_segments(task_id)
+                .expect("读回后台写的字幕");
+            if !loaded.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            state.db_write_error.is_none(),
+            "写库不该失败：{:?}",
+            state.db_write_error
+        );
+        assert_eq!(
+            loaded.len(),
+            1,
+            "后台写必须真的落库（读到 {} 句）",
+            loaded.len()
+        );
+        assert_eq!(loaded[0].text, "后台写进去的第一句");
+    }
+
+    /// 派发不等于写完：旧快照的失败结局**不许**回写现在的状态（防回退）。
+    ///
+    /// 三条判定一起钉住：
+    /// 1. 派发过的就作废旧登记，不让定时器把同一份内容再写一遍；
+    /// 2. 迟到的旧失败（通道里还有、但水位已被更新的成功越过）只留日志，不点提示灯；
+    /// 3. 落在旧修订上的失败不置脏——否则定时器会把那份旧内容当当前内容再派发一次。
+    #[test]
+    fn background_write_completion_never_rewinds_state() {
+        let mut state = test_state(Vec::new());
+        state.active_task_id = None;
+        state.segments_dirty = true;
+        state.defer_segments_flush();
+
+        state.flush_segments_if_dirty_async();
+
+        assert!(!state.segments_dirty, "派发之后脏标记必须清掉");
+        assert!(
+            state.segments_flush_due.is_none(),
+            "派发过的快照不许再挂着待落库登记"
+        );
+
+        // 同一轮排空里同时到达「旧失败 + 更新的成功」：两条都要处理（这正是
+        // 「拿被前一条改过的字段去比后一条」会漏掉成功的那种情形），最终以更新的成功收口。
+        let mut dirty = false;
+        let mut error = None;
+        let old_failure = synthetic_write(1, 7, Err("库被锁".to_string()));
+        let newer_success = synthetic_write(2, 7, Ok(()));
+        let floor = drain_segment_writes(
+            &mut error,
+            &mut dirty,
+            7,
+            0,
+            None,
+            &[old_failure, newer_success],
+        );
+        assert_eq!(floor, 2, "水位要推进到最大写序号");
+        assert!(error.is_none(), "更新的成功之后不许再挂旧失败");
+        assert!(
+            !dirty,
+            "旧失败被同轮更新的成功越过，不许再标脏（否则界面会要求重写一遍）"
+        );
+
+        // 换到「更新的成功在前、更旧的失败在后」（乱序到达）：失败已经被水位越过，
+        // 它描述的是一份被覆盖掉的快照——提示灯与脏标记都不许回退。
+        let stale_failure = synthetic_write(1, 7, Err("旧快照写失败".to_string()));
+        let newest_success = synthetic_write(3, 7, Ok(()));
+        let floor = drain_segment_writes(
+            &mut error,
+            &mut dirty,
+            7,
+            // 水位已经推进到 2（第二次写有结论了）：seq=1 的迟到失败属于「已被覆盖」。
+            2,
+            None,
+            &[newest_success, stale_failure],
+        );
+        assert_eq!(floor, 3);
+        assert!(
+            error.is_none(),
+            "被水位越过的迟到失败不许覆盖更新的成功结局"
+        );
+        assert!(!dirty, "迟到的旧失败不许把当前内容标脏");
+
+        // 最新一条失败 + 旧修订：错误挂上（不许静默），但不置脏——交给更新的那份编辑去落库
+        error = None;
+        let mut dirty = false;
+        apply_segment_write_result(
+            &mut error,
+            &mut dirty,
+            &synthetic_write(4, 7, Err("磁盘已满".to_string())),
+            9,
+            true,
+        );
+        assert_eq!(
+            error.as_deref(),
+            Some("字幕保存失败：磁盘已满"),
+            "失败本身必须可见（提示条是用户唯一的了解渠道）"
+        );
+        assert!(!dirty, "旧修订的失败不许把当前内容标脏");
+
+        // 最新一条失败 + 当前修订：必须置脏，否则定时器不再重试
+        error = None;
+        let mut dirty = false;
+        apply_segment_write_result(
+            &mut error,
+            &mut dirty,
+            &synthetic_write(4, 9, Err("磁盘已满".to_string())),
+            9,
+            true,
+        );
+        assert!(dirty, "当前修订上的失败必须置脏以便重试");
+
+        // 修订号判定的边界：同一修订才置脏，更新过的修订不置脏（纯函数直接钉住）
+        let mut dirty = false;
+        assert!(mark_segments_dirty_for_revision(&mut dirty, 9, 9));
+        assert!(dirty);
+        let mut dirty = false;
+        assert!(!mark_segments_dirty_for_revision(&mut dirty, 8, 9));
+        assert!(!dirty, "旧修订的失败不许把当前内容标脏");
+    }
+
+    /// 后台写失败**不能静默**：走一次真实的异步派发失败，等它把「字幕保存失败：…」
+    /// 挂回 `db_write_error`，并把脏标记置回（下一次 flush 会重试）。
+    ///
+    /// 失败是**确定性**造出来的：库文件照常建、工程照常插，然后把库文件设成只读
+    /// （模拟只读挂载 / 磁盘满这类持久性故障）。SQLite 在 WAL 模式下连写都起不来，
+    /// `update_task_segments_json` 必然返回 Err——正是用户实际会撞上的那类错误，
+    /// 也是「错误不许静默」这条要求的端到端验证。
+    #[test]
+    fn async_flush_surfaces_database_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "voice2word_bg_fail_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let db_path = dir.join("voice2word.db");
+        let id = {
+            let db = crate::storage::Database::open(&db_path).expect("打开文件库");
+            let id = db
+                .insert_task("fail.mp4", "fail.mp4", 5.0, "completed", &Vec::new(), None)
+                .expect("先插一条空工程");
+            // 把 WAL 合并回主库文件，保证随后只读打开时读得到这条记录。
+            db.maintain_on_shutdown();
+            id
+        };
+        let mut perms = std::fs::metadata(&db_path)
+            .expect("库文件元数据")
+            .permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&db_path, perms).expect("把库文件设为只读");
+
+        let mut state = test_state(Vec::new());
+        state.db = crate::storage::Database::open(&db_path).expect("只读打开（读没问题）");
+        state.active_task_id = Some(id);
+        state.segments = vec![Segment::new(1, 0.0, 1.0, "这一句写不进去")];
+        state.bump_segments_revision();
+        state.segments_dirty = true;
+
+        state.flush_segments_if_dirty_async();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.db_write_error.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            state.poll_background_writes();
+        }
+        let text = state.db_write_error.clone().unwrap_or_default();
+        assert!(
+            text.contains("字幕保存失败"),
+            "后台失败必须挂到提示通道（db_write_error），实际：{text:?}"
+        );
+        assert!(
+            state.segments_dirty,
+            "当前修订上的失败必须把脏标记置回，下一次 flush 才会重试"
+        );
+
+        // 收尾：恢复可写再整目录删掉（连同 -wal/-shm），不给下一次测试留垃圾。
+        drop(state);
+        let mut perms = std::fs::metadata(&db_path)
+            .expect("收尾时读元数据")
+            .permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(&db_path, perms);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 修复常见错误：命中才压撤销点；改动要标脏、推修订号、清词级时间戳，且可撤销。
