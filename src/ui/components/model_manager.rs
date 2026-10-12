@@ -50,8 +50,8 @@ pub(crate) fn is_item_needed_for_tab(
             }
         }
         ModelManagerTab::Common => {
-            // 公用组件：FFmpeg 媒体流提取、yt-dlp、本地翻译大模型及 llama.cpp
-            matches!(item_id, "ffmpeg" | "yt-dlp" | "llama-cpp" | "qwen-llm")
+            // 公用组件：FFmpeg 媒体流提取、本地翻译大模型及 llama.cpp
+            matches!(item_id, "ffmpeg" | "llama-cpp" | "qwen-llm")
         }
     }
 }
@@ -367,8 +367,8 @@ impl MainWindow {
             ],
             ModelManagerTab::Common => vec![
                 ModelCategory {
-                    title: "音视频解码与流媒体解析",
-                    item_ids: &["ffmpeg", "yt-dlp"],
+                    title: "音视频解码（FFmpeg）",
+                    item_ids: &["ffmpeg"],
                 },
                 ModelCategory {
                     title: "本地大模型翻译与润色引擎",
