@@ -2892,7 +2892,12 @@ impl MainWindow {
             seg.end = end;
         }
         let changed = plan.changed;
+        // 整轨重定时改的是 `segments`，必须置脏才会落库：`bump_segments_revision`
+        // 只驱动清单缓存失效，不碰脏位；漏置脏时关窗守卫读到的 `segments_dirty`
+        // 仍是 false，这次改动会被当作「无改动」直接丢弃。
+        self.state.segments_dirty = true;
         self.state.bump_segments_revision();
+        self.state.flush_segments_if_dirty();
         // 时间轴变了：波形/监视器的定位与质检缓存都要跟着重算。
         self.subtitle_filter_key = None;
         self.notice = Some(format!(
@@ -3597,7 +3602,11 @@ impl MainWindow {
                                 (true, msg)
                             });
                             // 内容变了：字幕清单的过滤结果与质检缓存都要跟着重算。
+                            // 同时置脏并落库：`bump_segments_revision` 只失效清单缓存，
+                            // 不置脏的话这次整轨替换不会被写回历史库。
+                            this.state.segments_dirty = true;
                             this.state.bump_segments_revision();
+                            this.state.flush_segments_if_dirty();
                             this.subtitle_filter_key = None;
                             cx.notify();
                         }))
