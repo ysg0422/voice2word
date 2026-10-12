@@ -240,18 +240,35 @@ fn render_confidence_note(format: QcFormat) -> String {
     }
 }
 
-/// CSV 字段转义：含 `,` / `"` / 换行的字段整体加双引号，内部的 `"` 翻倍。
+/// CSV 字段转义：先把公式前缀钉成文本，再把含 `,` / `"` / 换行的字段整体加双引号，
+/// 内部的 `"` 翻倍。
 ///
 /// 字幕文本里逗号与引号极常见（对话、术语、引用）。裸拼的 CSV 会被 Excel 静默按
 /// 逗号切列——打开看像成功，实则整列数据错位到相邻列，是「看着没问题、内容全错」
 /// 的那类 bug。
+///
+/// 公式注入同理：首个字符是 `=` `+` `@`、制表符或回车时，Excel/WPS 会按公式求值
+/// （`=cmd` 之类能拉起外部程序），必须前置单引号钉成文本；前导 `-` 只在后面不是
+/// 数字时才需要防护。
 fn csv_field(value: &str) -> String {
-    let needs_quoting =
-        value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r');
+    // 单引号前缀要在双引号包裹之前加：既危险又含逗号的字段应得 `"'=a,b"`。
+    let guarded = match value.chars().next() {
+        // `=` / `+` / `@` / 制表符 / 回车开头一律钉成文本（`+1` 会被 Excel/WPS 补成
+        // 公式 `=+1`）。
+        Some('=' | '+' | '@' | '\t' | '\r') => format!("'{value}"),
+        // 前导 `-` 只有后面不是合法数字时才有公式风险（`-2+3`）；`-0.9` 这类纯数值
+        // Excel 按数字解析，加前缀反而会把置信度列变成文本。
+        Some('-') if value.parse::<f64>().is_err() => format!("'{value}"),
+        _ => value.to_string(),
+    };
+    let needs_quoting = guarded.contains(',')
+        || guarded.contains('"')
+        || guarded.contains('\n')
+        || guarded.contains('\r');
     if !needs_quoting {
-        return value.to_string();
+        return guarded;
     }
-    let escaped = value.replace('"', "\"\"");
+    let escaped = guarded.replace('"', "\"\"");
     format!("\"{escaped}\"")
 }
 
@@ -351,6 +368,32 @@ mod tests {
             "换行加引号"
         );
         assert_eq!(csv_field("回车\r结尾"), "\"回车\r结尾\"", "回车同样加引号");
+    }
+
+    /// CSV 公式注入防护：首字符是 `=` `+` `@`、制表符或回车的字段，以及 `-` 开头但
+    /// 不是数字的字段，必须前置单引号，否则 Excel/WPS 打开表格时会按公式求值。
+    ///
+    /// Why：字幕原文/译文完全可能以 `=` 或 `@` 开头，裸导出等于「一打开表格就执行
+    /// 内容里的公式」，属于导出即中招的问题。
+    #[test]
+    fn csv_field_guards_formula_injection() {
+        assert_eq!(csv_field("=cmd"), "'=cmd");
+        assert_eq!(csv_field("+1"), "'+1");
+        assert_eq!(csv_field("@x"), "'@x");
+        assert_eq!(csv_field("-2+3"), "'-2+3");
+        for raw in ["=cmd", "+1", "@x", "-2+3", "\tTAB", "\rCR"] {
+            let out = csv_field(raw);
+            assert!(
+                out.starts_with('\'') || out.starts_with("\"'"),
+                "危险首字符必须前置单引号：{raw:?} -> {out:?}"
+            );
+        }
+        // 纯数值的负号不是公式（Excel 按数字解析），别把置信度列变成文本。
+        assert_eq!(csv_field("-0.9"), "-0.9");
+        // 单引号在内、双引号在外：既危险又含逗号的字段两套规则都要生效。
+        assert_eq!(csv_field("=a,b"), "\"'=a,b\"");
+        // 普通字段不受影响。
+        assert_eq!(csv_field("普通文本"), "普通文本");
     }
 
     /// CSV 带 BOM、Markdown 不带。
