@@ -446,9 +446,16 @@ impl Database {
                 id: row.get(0)?,
                 file_path: row.get(1)?,
                 file_name: row.get(2)?,
-                duration: row.get(3)?,
+                // `duration` / `created_at` 都是**可空列**（`REAL DEFAULT 0.0` /
+                // `DATETIME DEFAULT CURRENT_TIMESTAMP`），而 DEFAULT 只在 INSERT
+                // 未提及该列时生效——显式写 NULL 照存，且没有任何迁移回填 duration。
+                // 老库/外部工具留下的 NULL 行若按必填读，`?` 会把**整张历史列表**
+                // 拖成 Err；调用方再 `unwrap_or_default()`，用户看到的是「视频库整个
+                // 空了」，而不是一条记录降级。与相邻的 segment_count / sample_text /
+                // content_hash 一样，按缺省值容错读。
+                duration: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
                 status: row.get(4)?,
-                created_at: row.get(5)?,
+                created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                 metrics,
                 segments: Vec::new(),
                 segment_count: row.get::<_, i64>(8).unwrap_or(0).max(0) as usize,
@@ -507,7 +514,12 @@ impl Database {
         let total_dur = segments.last().map(|s| s.end).unwrap_or(0.0);
         with_busy_retry(|| {
             conn.execute(
-                "UPDATE tasks SET segments_json = ?1, duration = MAX(duration, ?2) WHERE id = ?3",
+                // `MAX(NULL, ?2)` 在 SQLite 里仍是 NULL（标量 max() 遇 NULL 即 NULL），
+                // 于是「编辑并保存」这条唯一的自然修复路径永远修不好 NULL duration。
+                // COALESCE 把 NULL 当 0 参与取大：既保留「duration 只增不减」的既有
+                // 口径（见 `state.rs` 载入时的 `task.duration.max(timeline_end)`），
+                // 又让编辑能把坏行救回来。
+                "UPDATE tasks SET segments_json = ?1, duration = MAX(COALESCE(duration, 0.0), ?2) WHERE id = ?3",
                 params![segments_json, total_dur, id],
             )
         })?;
@@ -586,13 +598,16 @@ impl Database {
             id: row.get(0)?,
             file_path: row.get(1)?,
             file_name: row.get(2)?,
-            duration: row.get(3)?,
+            // 同 `list_recent_tasks`：可空列按缺省值容错读，一行 NULL 不能把
+            // `find_cached_task` 的整次查询变成 Err（那会被调用方 `.ok()` 吞成
+            // 「未命中」，用户被迫把已经转写过的文件重转一遍）。
+            duration: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
             status: row.get(4)?,
             segment_count: segments.len(),
             sample_text,
             segments_loaded: true,
             segments,
-            created_at: row.get(6)?,
+            created_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
             content_hash: row.get(8).unwrap_or(None),
             metrics,
         })
@@ -1544,5 +1559,127 @@ mod tests {
         }
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────── 可空列（duration / created_at）容错读回归 ─────────────
+
+    /// 老库/外部工具可能留下 duration = NULL 的行。list_recent_tasks 若按必填
+    /// f64 读，`?` 会把整张历史列表变成 Err，调用方 unwrap_or_default() 后
+    /// 用户看到的是「视频库整个空了」。
+    #[test]
+    fn null_duration_row_does_not_break_library_list() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let id = db
+            .insert_task("D:/n.mp4", "n.mp4", 1.0, "completed", &seg("有字幕"), None)
+            .unwrap();
+        db.lock_conn()
+            .execute(
+                "UPDATE tasks SET duration = NULL WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let listed = db
+            .list_recent_tasks(10)
+            .expect("duration 为 NULL 的行不应让整个列表查询报错");
+        assert_eq!(listed.len(), 1, "坏行自身也要照常列出，而不是让列表为空");
+        assert_eq!(listed[0].duration, 0.0, "NULL duration 应容错降级为 0.0");
+        assert_eq!(listed[0].file_name, "n.mp4");
+    }
+
+    /// 同一类坏行经 find_cached_task（走 row_to_task）也不能把「命中」变成 Err，
+    /// 否则调用方 .ok() 会把它吞成「未命中」，用户被迫把已转写过的文件重转一遍。
+    #[test]
+    fn null_duration_row_does_not_break_cache_lookup() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let id = db
+            .insert_task("D:/n.mp4", "n.mp4", 1.0, "completed", &seg("有字幕"), None)
+            .unwrap();
+        db.lock_conn()
+            .execute(
+                "UPDATE tasks SET duration = NULL WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        // 文件不存在 → 指纹为 None → 退回路径匹配；该行 content_hash 为 NULL，属老记录分支。
+        let hit = db
+            .find_cached_task("D:/n.mp4")
+            .expect("duration 为 NULL 的行不应让缓存查询报错")
+            .expect("该行有字幕，应算缓存命中");
+        assert_eq!(hit.duration, 0.0, "NULL duration 应容错降级为 0.0");
+        assert_eq!(hit.segments[0].text, "有字幕");
+    }
+
+    /// created_at 同为可空列：一条 NULL 行不能把列表与缓存两条读路径都拖成 Err。
+    #[test]
+    fn null_created_at_row_does_not_break_list_or_cache() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let id = db
+            .insert_task("D:/c.mp4", "c.mp4", 1.0, "completed", &seg("字幕"), None)
+            .unwrap();
+        db.lock_conn()
+            .execute(
+                "UPDATE tasks SET created_at = NULL WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let listed = db
+            .list_recent_tasks(10)
+            .expect("created_at 为 NULL 的行不应让列表查询报错");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].created_at, "", "NULL created_at 应容错降级为空串");
+
+        let hit = db
+            .find_cached_task("D:/c.mp4")
+            .expect("created_at 为 NULL 的行不应让缓存查询报错")
+            .expect("该行有字幕，应算缓存命中");
+        assert_eq!(hit.created_at, "");
+    }
+
+    /// 写侧：MAX(duration, ?2) 在 SQLite 里遇 NULL 仍得 NULL，坏行永远修不回。
+    /// 编辑保存是唯一的自然修复路径，必须能把 NULL 救成末句 end，同时保持
+    /// 「duration 只增不减」的既有口径。
+    #[test]
+    fn update_task_segments_repairs_null_duration() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let id = db
+            .insert_task("D:/u.mp4", "u.mp4", 1.0, "completed", &seg("x"), None)
+            .unwrap();
+        db.lock_conn()
+            .execute(
+                "UPDATE tasks SET duration = NULL WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        db.update_task_segments(id, &[Segment::new(1, 0.0, 9.0, "y")])
+            .unwrap();
+        let d: Option<f64> = db
+            .lock_conn()
+            .query_row(
+                "SELECT duration FROM tasks WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(d, Some(9.0), "编辑保存应把 NULL duration 修成末句 end");
+
+        db.update_task_segments(id, &[Segment::new(1, 0.0, 2.0, "z")])
+            .unwrap();
+        let d: Option<f64> = db
+            .lock_conn()
+            .query_row(
+                "SELECT duration FROM tasks WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            d,
+            Some(9.0),
+            "末句变短时 duration 不应回退（沿用 MAX 口径）"
+        );
     }
 }

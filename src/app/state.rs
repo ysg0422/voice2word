@@ -1241,12 +1241,13 @@ impl AppState {
         self.reset_edit_history();
         self.bump_segments_revision();
         crate::subtitle::optimize_segments(&mut self.segments);
-        let dur = if task.duration > 0.0 {
-            task.duration
-        } else {
-            task.segments.last().map(|s| s.end).unwrap_or(0.0)
-        };
-        self.total_duration = dur;
+        // 时长回退必须取**优化后**的末句 end：`optimize_segments` 会平滑延展极短尾句
+        // （最短可读 0.8s）、也会剔除无效/鬼影片段。此前用优化前的 `task.segments`
+        // 取末句，`total_duration` 会比真实时间轴还短——`seek_to` 于是把播放指针夹在
+        // 末尾之前，用户点时间轴最后一段跳不过去。与落库口径保持一致：
+        // `db.update_task_segments` 写的就是 `MAX(duration, 末句 end)`。
+        let timeline_end = self.segments.last().map(|s| s.end).unwrap_or(0.0);
+        self.total_duration = task.duration.max(timeline_end);
         if let Some(first) = self.segments.first() {
             self.select_segment(first.index);
         } else {
@@ -1425,12 +1426,14 @@ impl AppState {
     pub fn load_from_cache(&mut self, cached: TaskRecord) {
         self.flush_segments_if_dirty();
         let file_path = PathBuf::from(&cached.file_path);
-        let total_dur = if cached.duration > 0.0 {
+        // 时长基准：优先工程记录，其次本次转写探测值。**不含**片段回退——
+        // 片段末句要等 `optimize_segments` 跑完再取，否则会读到被平滑/剔除前的旧边界。
+        let base_dur = if cached.duration > 0.0 {
             cached.duration
         } else if self.transcribe_duration > 0.0 {
             self.transcribe_duration
         } else {
-            cached.segments.last().map(|s| s.end).unwrap_or(0.0)
+            0.0
         };
 
         self.selected_file = Some(file_path.clone());
@@ -1446,7 +1449,9 @@ impl AppState {
         if let Some(first) = self.segments.first() {
             self.select_segment(first.index);
         }
-        self.total_duration = total_dur;
+        // 与 `load_task_with` 同口径：取「基准时长」与优化后末句 end 的较大者。
+        let timeline_end = self.segments.last().map(|s| s.end).unwrap_or(0.0);
+        self.total_duration = base_dur.max(timeline_end);
 
         self.status = ProcessStatus::Idle;
         self.transcribe_file = None;
@@ -3038,6 +3043,87 @@ mod tests {
         assert_eq!(
             state.segments[0].text, "乙工程第一句",
             "撤销把上一个工程的字幕灌回了当前工程"
+        );
+    }
+
+    /// 载入历史工程时 `total_duration` 必须与**优化后**的时间轴自洽。
+    ///
+    /// `load_task_with` 先 `optimize_segments` 再落定 `self.segments`，但时长回退
+    /// 此前取的是优化**前**的 `task.segments.last().end`。极短尾句会在优化时被平滑
+    /// 延展到最短可读时长（0.8s），于是 `total_duration` 比真实时间轴还短：`seek_to`
+    /// 会把播放指针夹在末尾之前，用户点时间轴最后一段跳不过去。
+    #[test]
+    fn load_task_duration_uses_optimized_timeline() {
+        use crate::storage::TaskRecord;
+
+        let mut state = test_state(Vec::new());
+        let task = TaskRecord {
+            id: 7,
+            file_path: "D:/video/c.mp4".to_string(),
+            file_name: "c.mp4".to_string(),
+            // 库里没记时长（探测失败）：必须回退到时间轴
+            duration: 0.0,
+            status: "completed".to_string(),
+            segments: vec![
+                Segment::new(1, 0.0, 1.0, "第一句话"),
+                Segment::new(2, 1.0, 1.2, "嗯"),
+            ],
+            segment_count: 2,
+            sample_text: "第一句话".to_string(),
+            segments_loaded: true,
+            created_at: String::new(),
+            content_hash: None,
+            metrics: None,
+        };
+        state.load_task_with(&task, false);
+
+        let timeline_end = state.segments.last().map(|s| s.end).unwrap_or(0.0);
+        assert!(
+            timeline_end > 1.2,
+            "前置条件：尾句应被极短句平滑延展（实际末句 end = {timeline_end}）"
+        );
+        assert_eq!(
+            state.total_duration, timeline_end,
+            "total_duration 必须跟随优化后的时间轴，否则 seek_to 会把指针夹在末尾之前"
+        );
+    }
+
+    /// 缓存命中载入与 `load_task_with` 同口径：`total_duration` 取优化后末句 end。
+    ///
+    /// 回归护栏：`load_from_cache` 此前在 `optimize_segments` **之前**用
+    /// `cached.segments.last().end` 算回退时长，同一个坑。
+    #[test]
+    fn load_from_cache_duration_uses_optimized_timeline() {
+        use crate::storage::TaskRecord;
+
+        let mut state = test_state(Vec::new());
+        let cached = TaskRecord {
+            id: 9,
+            file_path: "D:/video/d.mp4".to_string(),
+            file_name: "d.mp4".to_string(),
+            duration: 0.0,
+            status: "completed".to_string(),
+            segments: vec![
+                Segment::new(1, 0.0, 1.0, "第一句话"),
+                Segment::new(2, 1.0, 1.2, "嗯"),
+            ],
+            segment_count: 2,
+            sample_text: "第一句话".to_string(),
+            segments_loaded: true,
+            created_at: String::new(),
+            content_hash: None,
+            metrics: None,
+        };
+        state.load_from_cache(cached);
+
+        let timeline_end = state.segments.last().map(|s| s.end).unwrap_or(0.0);
+        assert!(
+            timeline_end > 1.2,
+            "前置条件：尾句应被平滑延展（实际 {timeline_end}）"
+        );
+        assert_eq!(
+            state.total_duration, timeline_end,
+            "缓存命中载入也必须用优化后的时间轴算 total_duration"
         );
     }
 
