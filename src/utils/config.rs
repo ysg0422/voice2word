@@ -1064,7 +1064,7 @@ pub struct PathsConfig {
     pub ffmpeg: String,
     pub whisper_cli: String,
     pub whisper_model: String,
-    #[serde(default)]
+    #[serde(default = "default_vad_model")]
     pub vad_model: Option<String>,
     #[serde(default = "default_punc_model")]
     pub punc_model: Option<String>,
@@ -1110,6 +1110,10 @@ fn default_python() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_vad_model() -> Option<String> {
+    Some("models/whisper/ggml-silero-v6.2.0.bin".to_string())
 }
 
 fn default_punc_model() -> Option<String> {
@@ -1573,11 +1577,20 @@ impl AppConfig {
         // 只有覆盖文件确实已经在磁盘上，换过去才是安全的；反过来先写共享配置，
         // 一旦覆盖文件写失败，用户的可用路径就丢了。
         let local_file = Self::local_override_path(&full_path);
-        let should_write_local = local_paths.has_any();
-        if should_write_local {
+
+        // 磁盘上已有的 `[gpu]` 段必须原样保留：`split_machine_paths` 只认绝对路径，
+        // 看不到用户手写的 `[gpu]` 覆盖。若不先读出来，下面「没有绝对路径可写」的
+        // 分支会把整个覆盖文件删掉，用户的 GPU 策略会在下次启动时静默丢失。
+        let existing_gpu = std::fs::read_to_string(&local_file)
+            .ok()
+            .and_then(|text| toml::from_str::<LocalOverride>(&text).ok())
+            .and_then(|local| local.gpu);
+
+        let has_paths = local_paths.has_any();
+        if has_paths || existing_gpu.is_some() {
             let local = LocalOverride {
-                paths: Some(local_paths),
-                gpu: None,
+                paths: if has_paths { Some(local_paths) } else { None },
+                gpu: existing_gpu,
             };
             let text = toml::to_string_pretty(&local).with_context(|| "序列化本机配置覆盖失败")?;
             let body = format!(
@@ -1597,9 +1610,10 @@ impl AppConfig {
                     .with_context(|| format!("写回本机配置失败: {:?}", local_file))?;
             }
         } else if local_file.exists() {
-            // 本机覆盖已无内容（例如用户把绝对路径改回默认值、或切了硬件档），
-            // 必须把磁盘上的旧覆盖删掉：否则下次启动 `load_from_file` 会把旧的
-            // 绝对路径重新盖回共享配置，「恢复默认」在重启后被静默撤销。
+            // 本机覆盖里既没有绝对路径、也没有 `[gpu]` 段（例如用户把绝对路径改回
+            // 默认值、或切了硬件档），必须把磁盘上的旧覆盖删掉：否则下次启动
+            // `load_from_file` 会把旧的绝对路径重新盖回共享配置，「恢复默认」在
+            // 重启后被静默撤销。
             std::fs::remove_file(&local_file)
                 .with_context(|| format!("清理本机配置覆盖失败: {:?}", local_file))?;
         }
@@ -2372,6 +2386,133 @@ mod tests {
         assert_eq!(back.paths.ffmpeg, super::AppConfig::default().paths.ffmpeg);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 只含 `[gpu]` 段的本机覆盖文件必须被保留：`split_machine_paths` 只认绝对路径，
+    /// 看不到用户手写的 `[gpu]`；若保存时按「没有绝对路径」直接删文件，用户的 GPU
+    /// 策略会在下次启动时被静默丢弃。
+    #[test]
+    fn save_must_not_delete_local_override_holding_only_gpu() {
+        let dir = std::env::temp_dir().join(format!("v2w_cfg_gpuonly_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let main_path = dir.join("config.toml");
+        let local_path = dir.join(super::AppConfig::LOCAL_OVERRIDE);
+
+        // 用户手写的覆盖文件：只有 [gpu]，没有任何绝对路径。
+        std::fs::write(
+            &local_path,
+            r#"[gpu]
+whisper_offload = true
+yield_to_desktop = true
+gpu_limit_percent = 60
+"#,
+        )
+        .expect("seed local override");
+
+        // 共享配置全是可移植相对路径，split_machine_paths 不会给出任何本地路径。
+        let cfg = super::AppConfig::default();
+        cfg.save_to_file(&main_path).expect("save");
+
+        assert!(
+            local_path.exists(),
+            "只含 [gpu] 的覆盖文件不能被 save_to_file 删除"
+        );
+        let text = std::fs::read_to_string(&local_path).expect("read local");
+        let parsed: super::LocalOverride = toml::from_str(&text).expect("parse local");
+        assert!(parsed.gpu.is_some(), "[gpu] 段必须保留:\n{text}");
+        assert!(parsed.paths.is_none(), "没有绝对路径时不应凭空写出 [paths]");
+
+        // 重新加载后 GPU 策略必须仍然生效
+        let back = super::AppConfig::load_from_file(&main_path).expect("load");
+        assert!(back.gpu.whisper_offload, "重启后 GPU offload 策略应保留");
+        assert_eq!(back.gpu.mode(), "eco");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 覆盖文件同时含绝对路径与 `[gpu]` 时，重写必须保留 `[gpu]` 段
+    /// （旧实现硬编码 `gpu: None`，会在写回绝对路径时把它擦掉）。
+    #[test]
+    fn save_preserves_gpu_section_alongside_absolute_paths() {
+        let dir = std::env::temp_dir().join(format!("v2w_cfg_gpupaths_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let main_path = dir.join("config.toml");
+        let local_path = dir.join(super::AppConfig::LOCAL_OVERRIDE);
+
+        std::fs::write(
+            &local_path,
+            r#"[paths]
+ffmpeg = 'A:\cppsoft\ffmpeg.exe'
+[gpu]
+gpu_limit_percent = 60
+"#,
+        )
+        .expect("seed local override");
+
+        let mut cfg = super::AppConfig::default();
+        cfg.paths.ffmpeg = r"D:\tools\ffmpeg.exe".to_string();
+        cfg.save_to_file(&main_path).expect("save");
+
+        let text = std::fs::read_to_string(&local_path).expect("read local");
+        let parsed: super::LocalOverride = toml::from_str(&text).expect("parse local");
+        assert_eq!(
+            parsed.gpu.as_ref().map(|g| g.gpu_limit_percent),
+            Some(60),
+            "重写覆盖文件时 [gpu] 段不能被擦除:\n{text}"
+        );
+        assert_eq!(
+            parsed.paths.as_ref().and_then(|p| p.ffmpeg.as_deref()),
+            Some(r"D:\tools\ffmpeg.exe"),
+            "当前绝对路径应写回覆盖文件"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧 `config.toml` 省略 `vad_model` 时必须落到与 `PathsConfig::default()` 一致的
+    /// Silero 路径，而不是 `None`——消费点（`main.rs` 体检、`model_download.rs`）
+    /// 会把 `None` 当作「用户没配 VAD」，导致内置 VAD 静默失效。
+    #[test]
+    fn vad_model_defaults_to_silero_when_omitted() {
+        let parsed: super::PathsConfig = toml::from_str(
+            r#"
+            ffmpeg = "tools/ffmpeg.exe"
+            whisper_cli = "tools/whisper.exe"
+            whisper_model = "models/whisper/ggml-small-q5_0.bin"
+            llama_cli = "tools/llama-completion.exe"
+            llm_model = "models/llm/qwen.gguf"
+            "#,
+        )
+        .expect("旧配置应能解析");
+        assert_eq!(
+            parsed.vad_model.as_deref(),
+            Some("models/whisper/ggml-silero-v6.2.0.bin"),
+            "缺省 vad_model 必须落到 Silero 路径，而不是 None"
+        );
+        assert_eq!(
+            parsed.vad_model,
+            super::PathsConfig::default().vad_model,
+            "serde 默认值不能与 PathsConfig::default() 漂移"
+        );
+
+        // 显式写死别的路径仍必须被尊重
+        let explicit: super::PathsConfig = toml::from_str(
+            r#"
+            ffmpeg = "tools/ffmpeg.exe"
+            whisper_cli = "tools/whisper.exe"
+            whisper_model = "models/whisper/ggml-small-q5_0.bin"
+            vad_model = "models/whisper/custom.bin"
+            llama_cli = "tools/llama-completion.exe"
+            llm_model = "models/llm/qwen.gguf"
+            "#,
+        )
+        .expect("显式值应能解析");
+        assert_eq!(
+            explicit.vad_model.as_deref(),
+            Some("models/whisper/custom.bin")
+        );
     }
 
     /// 覆盖文件损坏时不能把启动带崩——退回 config.toml 即可。
