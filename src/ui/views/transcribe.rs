@@ -1061,6 +1061,8 @@ impl MainWindow {
                 .into_any_element()
         };
 
+        // 修复区块先渲染（需要 &mut self），再拼进卡片尾部
+        let cleanup_section = self.render_cleanup_section(cx);
         Some(
             primitives::card_sm()
                 .w_full()
@@ -1074,8 +1076,157 @@ impl MainWindow {
                         .text_color(Theme::text_muted())
                         .child(coverage)
                 }))
+                .child(cleanup_section)
                 .into_any_element(),
         )
+    }
+
+    /// 「修复常见错误」区块：四类机械修复的勾选 + 一键应用 + 相邻重复句折叠。
+    ///
+    /// 挂在质检卡片里而不是另开一张卡：用户的动线是「看到问题 → 顺手修掉」，
+    /// 结论与修复入口分家，他就得在两个地方来回找。计数直接来自与落地同一套的
+    /// 纯函数（`cleanup::plan`），按钮上的数字就是点下去真正会改的处数。
+    fn render_cleanup_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::subtitle::cleanup::CleanupRule;
+
+        let rules = self.state.cleanup_rules;
+        let plan = self.state.cleanup_preview();
+        let groups = self.state.duplicate_cue_groups();
+        // 每组至少 2 句，可删的是「组内除第一句以外」的那些
+        let duplicate_cues: usize = groups.iter().map(|g| g.indices.len() - 1).sum();
+        let note = self.state.cleanup_note.clone();
+        // 样例先算成 String：下面给按钮挂监听时要可变借用 `this`，闭包里再读 plan
+        // 就与借用打架（与质检胶囊同一种处理）。
+        let sample = plan.first().map(|hit| {
+            let after = if hit.after.trim().is_empty() {
+                "（清空）".to_string()
+            } else {
+                truncate_for_ui(&hit.after)
+            };
+            format!(
+                "例（{}·{}）：{} → {}",
+                hit.target.label(),
+                hit.rule.label(),
+                truncate_for_ui(&hit.before),
+                after
+            )
+        });
+
+        let chips = div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .children(
+                CleanupRule::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, rule)| {
+                        // 零处也照样显示：用户要看得出「这一类确实检查过、结果是 0」，
+                        // 而不是被悄悄藏掉；勾选态与命中数分开表达，才知道自己关了哪条。
+                        primitives::chip_clickable(
+                            format!("{} {}", rule.label(), plan.count_of(rule)),
+                            rules.enabled(rule),
+                            false,
+                        )
+                        .id(("cleanup-rule", slot))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.state.toggle_cleanup_rule(rule);
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                    }),
+            );
+
+        let apply_enabled = !plan.is_empty();
+        let apply_btn = primitives::btn_state(
+            format!("应用修复（{} 处）", plan.len()),
+            primitives::BtnSize::Sm,
+            primitives::BtnVariant::Primary,
+            apply_enabled,
+        )
+        .id("cleanup-apply")
+        .when(apply_enabled, |d| {
+            d.on_click(cx.listener(|this, _, _, cx| {
+                // 不跳页、不换选中：修复是「原地改字」，把用户甩到剪辑台会打断
+                // 他刚在看的质检结论；结果提示就落在这个区块下面。
+                this.state.apply_cleanup();
+                cx.notify();
+            }))
+        });
+
+        let fold_enabled = duplicate_cues > 0;
+        let fold_btn = primitives::btn_state(
+            if fold_enabled {
+                format!("折叠重复句（删 {duplicate_cues} 句）")
+            } else {
+                "无重复句".to_string()
+            },
+            primitives::BtnSize::Sm,
+            primitives::BtnVariant::Secondary,
+            fold_enabled,
+        )
+        .id("cleanup-fold-duplicates")
+        .when(fold_enabled, |d| {
+            d.on_click(cx.listener(|this, _, _, cx| {
+                this.state.fold_duplicate_segments();
+                cx.notify();
+            }))
+        });
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_2))
+            .child(primitives::divider())
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_BODY))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(Theme::text_primary())
+                            .child("修复常见错误"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child(format!(
+                                "{} 句可修 · {} 组重复句",
+                                plan.affected_segments(),
+                                groups.len()
+                            )),
+                    ),
+            )
+            .child(chips)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(Theme::SPACE_2))
+                    .child(apply_btn)
+                    .child(fold_btn),
+            )
+            .children(sample.map(|text| {
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_muted())
+                    .child(text)
+            }))
+            .children(note.map(|text| {
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::accent_mint())
+                    .child(text)
+            }))
+            .into_any_element()
     }
 
     /// 批量转写队列面板 (F-012)：文件清单 + 「开始全部 / 终止 / 清空」操作组。
@@ -1521,9 +1672,26 @@ fn is_last_stream_row(i: usize, total: usize) -> bool {
     total > 0 && i.checked_add(1) == Some(total)
 }
 
+/// 预览样例里的一段文本：压成单行、只留头 24 个字符。
+///
+/// 样例是给用户「确认改的是哪一类东西」用的，不是给他读全文的；一条长句铺开会把
+/// 下面的按钮挤出可视区，所以宁可截断。
+fn truncate_for_ui(text: &str) -> String {
+    const MAX_CHARS: usize = 24;
+    // 换行与连续空白先压成一个空格：字幕文本里的多空格/换行在样例里没有信息量，
+    // 原样带出来只会让「例：…」这一行看起来像排版坏了。
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = flat.trim();
+    let mut out: String = flat.chars().take(MAX_CHARS).collect();
+    if flat.chars().count() > MAX_CHARS {
+        out.push('…');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_last_stream_row, queue_progress_view, QueueProgressView};
+    use super::{is_last_stream_row, queue_progress_view, truncate_for_ui, QueueProgressView};
     use crate::app::state::{QueueItem, QueueState};
     use crate::ui::split_mm_ss;
     use std::path::PathBuf;
@@ -1629,5 +1797,17 @@ mod tests {
             },
             None,
         );
+    }
+
+    /// 修复样例的展示截断：压单行、短句原样、长句留头 24 字并补省略号。
+    #[test]
+    fn cleanup_sample_is_truncated_for_display() {
+        assert_eq!(truncate_for_ui("  你好  \n世界  "), "你好 世界");
+        assert_eq!(truncate_for_ui("短句"), "短句");
+        let long = "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十";
+        let out = truncate_for_ui(long);
+        assert_eq!(out.chars().count(), 25, "24 个字 + 省略号");
+        assert!(out.ends_with('…'), "截断要有省略号，让用户知道还有后半句");
+        assert!(long.starts_with(&out[..out.len() - '…'.len_utf8()]));
     }
 }

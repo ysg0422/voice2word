@@ -532,6 +532,15 @@ pub struct AppState {
     /// 同一句的连续输入只记一层撤销，换句或插入别的编辑即置 `None`。
     pub undo_text_coalesce: Option<usize>,
 
+    /// 「修复常见错误」勾选的规则（转写页质检卡片用）。
+    ///
+    /// 只活在会话里、不写进 `config.toml`：默认值就是四类全开，用户下次开程序看到
+    /// 的仍是同一套默认；而把一次临时试勾落进配置，会让它在下一次转写里悄悄生效
+    /// ——用户会看到「嗯」莫名其妙少了一个，却找不到是谁干的。
+    pub cleanup_rules: crate::subtitle::cleanup::CleanupRules,
+    /// 上一次修复的结果提示（「已修复 12 处」）。改勾选或下一次修复时刷新。
+    pub cleanup_note: Option<String>,
+
     // 字幕翻译相关状态
     pub is_translating: bool,
     pub translate_progress: f32,
@@ -792,6 +801,8 @@ impl AppState {
             edit_log: crate::subtitle::audit::EditLog::new(),
             redo_stack: Vec::new(),
             undo_text_coalesce: None,
+            cleanup_rules: crate::subtitle::cleanup::CleanupRules::default(),
+            cleanup_note: None,
             is_translating: false,
             translate_progress: 0.0,
             translate_status_msg: String::new(),
@@ -2490,6 +2501,156 @@ impl AppState {
         }
     }
 
+    /// 「修复常见错误」的预览：按当前勾选的规则能改多少处、分别是什么。
+    ///
+    /// 每帧现算而不是缓存：纯字符串扫描（一小时素材量级在毫秒以下），比再引一份
+    /// 缓存与失效键便宜得多，也不会出现「预览是旧的、落地是新的」这种两张皮。
+    pub fn cleanup_preview(&self) -> crate::subtitle::cleanup::CleanupPlan {
+        crate::subtitle::cleanup::plan(&self.segments, self.cleanup_rules)
+    }
+
+    /// 勾选/取消一条修复规则。规则一变，上一条「已修复 N 处」的提示就成了旧结果，
+    /// 继续挂着会把用户引到已经不成立的结论上，所以一起清掉。
+    pub fn toggle_cleanup_rule(&mut self, rule: crate::subtitle::cleanup::CleanupRule) {
+        self.cleanup_rules.toggle(rule);
+        self.cleanup_note = None;
+    }
+
+    /// 一键修复常见错误（语气词 / 重复字词 / 听障标记 / 空白标点）。
+    ///
+    /// 没有可改之处时**不压撤销点**：空操作占掉一层 Ctrl+Z，用户按下去只会把上一次
+    /// 真正的编辑退掉，看起来像「撤销坏了」。
+    pub fn apply_cleanup(&mut self) -> crate::subtitle::cleanup::CleanupPlan {
+        let plan = crate::subtitle::cleanup::plan(&self.segments, self.cleanup_rules);
+        if plan.is_empty() {
+            self.cleanup_note = Some(if self.cleanup_rules.any() {
+                "按当前勾选的规则没有发现可修复的地方".to_string()
+            } else {
+                "先勾选至少一条规则".to_string()
+            });
+            return plan;
+        }
+        self.snapshot_for_undo();
+        // 审计按规则记摘要，不逐句记：一次清洗动辄上百句，逐句写会把有界日志瞬间
+        // 挤满，把它们之后真正需要追溯的人工编辑挤出去。
+        for rule in crate::subtitle::cleanup::CleanupRule::ALL {
+            let hits: Vec<&crate::subtitle::cleanup::CleanupHit> =
+                plan.hits.iter().filter(|h| h.rule == rule).collect();
+            let Some(first) = hits.first() else {
+                continue;
+            };
+            let sample = format!(
+                "{} → {}",
+                audit_snippet(&first.before),
+                audit_snippet(&first.after)
+            );
+            self.audit(
+                crate::subtitle::audit::EditKind::Replace,
+                first.index,
+                format!("{} 处未修复（{}）", hits.len(), rule.label()),
+                sample,
+            );
+        }
+        crate::subtitle::cleanup::apply(&mut self.segments, self.cleanup_rules);
+        self.segments_dirty = true;
+        self.bump_segments_revision();
+        self.flush_segments_if_dirty();
+        let emptied = plan.emptied_count();
+        self.cleanup_note = Some(if emptied > 0 {
+            format!(
+                "已修复 {} 处（{emptied} 句只剩标记或停顿词，已清空，要不要删条由你决定）",
+                plan.len()
+            )
+        } else {
+            format!("已修复 {} 处，可 Ctrl+Z 撤销", plan.len())
+        });
+        plan
+    }
+
+    /// 相邻重复句的预览（界面据此显示「N 组重复、可删 M 句」）。
+    pub fn duplicate_cue_groups(&self) -> Vec<crate::subtitle::cleanup::DuplicateGroup> {
+        crate::subtitle::cleanup::duplicate_groups(&self.segments)
+    }
+
+    /// 折叠相邻重复句：每组保留第一句并让它的结束时间盖住整组，其余删掉。
+    ///
+    /// 为什么交给用户点而不是自动做：真说过两遍同样的话（副歌、口头禅）与模型重复
+    /// 出句在数据上长得一样，只差时间间隔；规则给出候选，删不删由人决定——所以
+    /// 界面先显示组数与被删句数，让用户看清代价再点。
+    pub fn fold_duplicate_segments(&mut self) -> usize {
+        let groups = crate::subtitle::cleanup::duplicate_groups(&self.segments);
+        if groups.is_empty() {
+            self.cleanup_note = Some("没有发现相邻重复句".to_string());
+            return 0;
+        }
+        // 折叠会让被删句之后的序号整体前移，所以先按「原表位置」记下两件事：选中句的
+        // 位置，以及它被折进哪一组（选中句本身就是要被删掉的那句时）。不这么做，
+        // 用户会发现「点了一下折叠，选中的句子悄悄换成了另一句」。
+        let selected_index = self.selected_segment_index;
+        let selected_pos =
+            selected_index.and_then(|idx| self.segments.iter().position(|s| s.index == idx));
+        let folded_owner_pos: Option<usize> = selected_index.and_then(|idx| {
+            groups
+                .iter()
+                .find(|g| g.indices.iter().skip(1).any(|i| *i == idx))
+                .and_then(|g| g.indices.first().copied())
+                .and_then(|keep| self.segments.iter().position(|s| s.index == keep))
+        });
+        let removed: Vec<usize> = groups
+            .iter()
+            .flat_map(|g| g.indices.iter().skip(1).copied())
+            .collect();
+        let survivors: Vec<usize> = self
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !removed.contains(&s.index))
+            .map(|(pos, _)| pos)
+            .collect();
+
+        self.snapshot_for_undo();
+        for group in &groups {
+            let index = group.indices.first().copied().unwrap_or(0);
+            self.audit(
+                crate::subtitle::audit::EditKind::Merge,
+                index,
+                format!(
+                    "{} 句重复：{}",
+                    group.indices.len(),
+                    audit_snippet(&group.text)
+                ),
+                format!("保留 1 句，时间 {:.2}-{:.2}", group.start, group.end),
+            );
+        }
+        let report = crate::subtitle::cleanup::fold_duplicates(&mut self.segments);
+        // 删条会改序号与清单长度：与 `delete_selected_segment` 同一套收尾。
+        self.reindex_segments();
+        if selected_index.is_some() {
+            // 选中句还在就跟随同一句（删除发生在它之前时序号前移），被折掉就跟随
+            // 它并进去的那一句——那正是用户原本在看的那句话的归并结果。
+            let anchor = folded_owner_pos.or(selected_pos);
+            let new_pos = anchor.and_then(|pos| survivors.iter().position(|&s| s == pos));
+            match new_pos.and_then(|pos| self.segments.get(pos).map(|s| s.index)) {
+                Some(idx) => self.select_segment(idx),
+                None => match self.segments.first().map(|s| s.index) {
+                    Some(first) => self.select_segment(first),
+                    None => {
+                        self.selected_segment_index = None;
+                        self.editing_text.clear();
+                    }
+                },
+            }
+        }
+        self.segments_dirty = true;
+        self.bump_segments_revision();
+        self.flush_segments_if_dirty();
+        self.cleanup_note = Some(format!(
+            "已折叠 {} 组重复句（删除 {} 句），可 Ctrl+Z 撤销",
+            report.groups, report.removed
+        ));
+        report.removed
+    }
+
     /// 同步当前字幕到 SQLite 数据库。
     ///
     /// # 为什么返回 `Result` 而不是吞掉
@@ -2577,6 +2738,21 @@ impl AppState {
 /// 理由：一条 cue 里混着两种目标语言的译文，任何单一标记都是谎报——留下任一边的标记，
 /// `translation_matches` 会宣称整条都已是那个语言、永远不会重译；置 `None` 则让这条
 /// 在下一次翻译里被当待译重译，同时译文文本仍在（界面不显示「—」）。
+/// 审计摘要里的一段文本：只留前 40 个字符并压成单行。
+///
+/// 编辑日志是有界的、还要整份进导出，把整句（甚至整段）塞进 before/after 会让
+/// 日志体积随素材长度线性膨胀；而审计要回答的是「改过什么」，一句样例就够。
+fn audit_snippet(text: &str) -> String {
+    const MAX_CHARS: usize = 40;
+    let flat = text.replace(['\r', '\n'], " ");
+    let flat = flat.trim();
+    let mut out: String = flat.chars().take(MAX_CHARS).collect();
+    if flat.chars().count() > MAX_CHARS {
+        out.push('…');
+    }
+    out
+}
+
 fn merge_concat_translations(
     cur: Option<&str>,
     cur_lang: Option<&str>,
@@ -4729,5 +4905,131 @@ mod tests {
         state.segments_dirty = false;
         assert!(!state.flush_segments_if_due_at(due + SEGMENTS_FLUSH_IDLE * 2));
         assert!(state.segments_flush_due.is_none(), "空登记不能一直挂着");
+    }
+
+    /// 修复常见错误：命中才压撤销点；改动要标脏、推修订号、清词级时间戳，且可撤销。
+    #[test]
+    fn apply_cleanup_edits_text_and_is_undoable() {
+        use crate::subtitle::cleanup::CleanupRule;
+
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 1.0, "嗯，我来了。"),
+            Segment::new(2, 1.0, 2.0, "这个这个"),
+        ]);
+        state.segments[1].words = vec![crate::subtitle::segment::WordTiming {
+            word: "这个".to_string(),
+            start: 1.0,
+            end: 1.5,
+        }];
+        let revision = state.segments_revision;
+
+        let plan = state.apply_cleanup();
+        assert_eq!(plan.count_of(CleanupRule::Filler), 1);
+        assert_eq!(state.segments[0].text, "我来了。");
+        assert_eq!(state.segments[1].text, "这个");
+        assert!(
+            state.segments[1].words.is_empty(),
+            "文本一变，词级时间戳必须清空"
+        );
+        assert!(state.segments_revision > revision, "清单缓存要失效");
+        // 立刻写入的入口会把脏标记清掉（`flush_segments_if_dirty` 落库后清），
+        // 所以这里看的是审计与修订号，而不是 `segments_dirty`。
+        let logged = state
+            .edit_log
+            .of_kind(crate::subtitle::audit::EditKind::Replace);
+        assert_eq!(logged.len(), 2, "语气词与重复字词各记一条摘要");
+        assert!(
+            logged[0].before.contains("未修复"),
+            "摘要要写清改的是哪一类问题：{}",
+            logged[0].before
+        );
+        assert!(state.cleanup_note.is_some(), "界面要能显示结果提示");
+        assert!(state.can_undo(), "改动必须可撤销");
+        assert!(state.undo());
+        assert_eq!(state.segments[0].text, "嗯，我来了。");
+    }
+
+    /// 没有可改之处时不压撤销点：空操作占掉一层 Ctrl+Z 会让用户以为撤销坏了。
+    #[test]
+    fn apply_cleanup_without_hits_leaves_state_untouched() {
+        let mut state = test_state(vec![Segment::new(1, 0.0, 1.0, "你好世界")]);
+        assert!(!state.can_undo());
+        let plan = state.apply_cleanup();
+        assert!(plan.is_empty());
+        assert!(!state.can_undo(), "无命中不该产生撤销点");
+        assert!(!state.segments_dirty, "无命中不该把工程标脏");
+    }
+
+    /// 规则全关时给出明确提示，而不是静默什么都不做。
+    #[test]
+    fn apply_cleanup_with_no_rules_points_at_the_toggles() {
+        let mut state = test_state(vec![Segment::new(1, 0.0, 1.0, "嗯，我来了")]);
+        state.cleanup_rules = crate::subtitle::cleanup::CleanupRules::NONE;
+        let plan = state.apply_cleanup();
+        assert!(plan.is_empty());
+        let note = state.cleanup_note.clone().unwrap_or_default();
+        assert!(note.contains("勾选"), "提示要指向勾选项：{note}");
+    }
+
+    /// 折叠重复句：句数减少、序号重排、时间跨度合并、可撤销。
+    #[test]
+    fn fold_duplicate_segments_merges_and_renumbers() {
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 1.0, "你好世界"),
+            Segment::new(2, 1.0, 2.0, "你好世界"),
+            Segment::new(3, 2.5, 3.5, "别的"),
+        ]);
+        state.selected_segment_index = Some(2);
+
+        let removed = state.fold_duplicate_segments();
+        assert_eq!(removed, 1);
+        assert_eq!(state.segments.len(), 2);
+        assert_eq!(state.segments[0].end, 2.0, "保留句的时间要盖住整组");
+        assert_eq!(state.segments[1].index, 2, "删条后必须重排序号");
+        assert_eq!(
+            state.selected_segment_index,
+            Some(1),
+            "选中的那句被删掉后要落到现存的第一句"
+        );
+        // 立刻写入的入口会在落库后清掉脏标记，所以这里看审计留痕与撤销可用性。
+        assert_eq!(
+            state
+                .edit_log
+                .of_kind(crate::subtitle::audit::EditKind::Merge)
+                .len(),
+            1,
+            "折叠属于结构性删除，审计必须留一条合并记录"
+        );
+        assert!(state.can_undo());
+        assert!(state.undo());
+        assert_eq!(state.segments.len(), 3);
+
+        // 删除发生在选中句之前时，选中的仍是同一句话（序号前移一位），
+        // 而不是「序号不变、内容换人」。
+        state.selected_segment_index = Some(3);
+        state.fold_duplicate_segments();
+        assert_eq!(state.segments.len(), 2);
+        assert_eq!(state.selected_segment_index, Some(2));
+        assert_eq!(
+            state
+                .segments
+                .iter()
+                .find(|s| s.index == 2)
+                .map(|s| s.text.as_str()),
+            Some("别的"),
+            "选中的必须还是原来那一句"
+        );
+    }
+
+    /// 没有重复句时不产生撤销点、也不假装删了东西。
+    #[test]
+    fn fold_duplicate_segments_is_a_noop_without_duplicates() {
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 1.0, "甲句"),
+            Segment::new(2, 1.0, 2.0, "乙句"),
+        ]);
+        assert_eq!(state.fold_duplicate_segments(), 0);
+        assert!(!state.can_undo());
+        assert_eq!(state.segments.len(), 2);
     }
 }

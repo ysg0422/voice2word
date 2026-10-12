@@ -7,7 +7,10 @@
 
 use super::primitives;
 use super::theme::Theme;
-use super::{apply_line_edit, EditorExportFormat, EditorSubtitlePanel, MainWindow, StyleField};
+use super::{
+    apply_line_edit, timeline_visible_positions, EditorExportFormat, EditorSubtitlePanel,
+    MainWindow, StyleField, TimelineIndex,
+};
 use crate::app::state::{ProcessStatus, WorkspaceTab};
 use crate::subtitle::segment::WordTiming;
 use crate::subtitle::{ExportMode, Segment};
@@ -175,6 +178,46 @@ pub(crate) fn click_seek_target(segments: &[Segment], index: usize) -> Option<f6
 /// 造成列表高亮与画面不一致。
 pub(crate) fn is_playing_at(start: f64, end: f64, t: f64) -> bool {
     t >= start && t < end
+}
+
+/// 时间轴字幕轨的窗口半径：只画「视口中心 ±该秒数」内的片段。
+///
+/// 只在这里定义一次——渲染路径与等价性单测共用同一个来源，改窗口只改这一处。
+/// 旧实现把 `15.0` 直接写死在 `render_multitrack_timeline` 的内联过滤里。
+pub(crate) const TIMELINE_WINDOW_MARGIN_SECS: f64 = 15.0;
+
+/// 片段数不超过该值时不做窗口裁剪，整条轨道全画。
+///
+/// 与窗口常量同理抽出来：这是渲染路径的另一半判据（句少时全画，避免用户看到
+/// 「轨道上什么都没有」），单测要按同一个阈值对照旧逻辑。
+pub(crate) const TIMELINE_FULL_DRAW_LIMIT: usize = 20;
+
+/// 时间轴字幕轨这一帧要画的片段下标（**存储顺序**，即旧实现的绘制顺序）。
+///
+/// 判据与改造前逐条一致：片段数 ≤ [`TIMELINE_FULL_DRAW_LIMIT`] 时整表全画，
+/// 否则取「与视口 ±[`TIMELINE_WINDOW_MARGIN_SECS`] 秒窗口相交」的片段，外加选中句
+/// （选中句无论落在哪都必须可见，旧实现同样如此）。
+///
+/// 窗口查询走派生快照里的排序索引二分（见 [`timeline_visible_positions`]），
+/// 不再每帧全量扫一遍片段表——几千~几万句时那是每帧一次 O(n)，播放时 40ms 一帧。
+///
+/// 抽成纯函数（不吃 `MainWindow`）是为了能在无 GUI 的单测里与旧逻辑逐点对照。
+pub(crate) fn timeline_clip_positions(
+    segments: &[Segment],
+    timeline: &TimelineIndex,
+    current_time: f64,
+    selected: Option<usize>,
+) -> Vec<usize> {
+    if segments.len() <= TIMELINE_FULL_DRAW_LIMIT {
+        return (0..segments.len()).collect();
+    }
+    timeline_visible_positions(
+        segments,
+        timeline,
+        current_time,
+        selected,
+        TIMELINE_WINDOW_MARGIN_SECS,
+    )
 }
 
 /// 逐词高亮里单个词的标记态：只有「已读完 / 正在读」两种可画状态。
@@ -4978,84 +5021,90 @@ impl MainWindow {
                                     )
                                     // 字幕片段渲染 (紧凑纤细卡片，高度 28px)
                                     .children({
-                                        let relevant_segments: Vec<_> =
-                                            if self.state.segments.len() <= 20 {
-                                                self.state.segments.iter().collect()
-                                            } else {
-                                                self.state
-                                                    .segments
-                                                    .iter()
-                                                    .filter(|seg| {
-                                                        sel_idx == Some(seg.index)
-                                                            || (cur_time >= seg.start
-                                                                && cur_time <= seg.end)
-                                                            || (cur_time >= seg.start - 15.0
-                                                                && cur_time <= seg.end + 15.0)
+                                        // 窗口内的片段走派生快照里的排序索引二分（见
+                                        // `timeline_clip_positions`）：不再每帧全量扫一遍
+                                        // 片段表——几千~几万句时那是每帧一次 O(n)。
+                                        let snapshot = self.derived_snapshot();
+                                        let segments: &[Segment] = &self.state.segments;
+                                        let positions = timeline_clip_positions(
+                                            segments,
+                                            &snapshot.timeline,
+                                            cur_time,
+                                            sel_idx,
+                                        );
+                                        // 元素在块内就建好：下面的 `cx.listener` 要独占
+                                        // 借用 `cx`，闭包再借走块内的局部切片会活不过这里
+                                        // （`Vec<AnyElement>` 与原来的惰性迭代等价，画出来的
+                                        // 元素、顺序、样式完全一致）。
+                                        let clips: Vec<AnyElement> = positions
+                                            .into_iter()
+                                            .map(|pos| {
+                                                let seg = &segments[pos];
+                                                let seg_idx = seg.index;
+                                                let start_r =
+                                                    (seg.start / total_dur).clamp(0.0, 1.0) as f32;
+                                                let width_r = (((seg.end - seg.start) / total_dur)
+                                                    .clamp(0.015, 1.0)
+                                                    as f32)
+                                                    .max(0.02);
+                                                let is_selected = sel_idx == Some(seg_idx);
+                                                // 与列表高亮、AppState::get_active_segment() 共用半开
+                                                // 区间 [start, end)：共享边界属于下一句（见 is_playing_at）。
+                                                let is_active =
+                                                    is_playing_at(seg.start, seg.end, cur_time);
+                                                div()
+                                                    .id(("timeline-clip", seg_idx))
+                                                    .absolute()
+                                                    .top(px(Theme::TRACK_CLIP_INSET))
+                                                    .bottom(px(Theme::TRACK_CLIP_INSET))
+                                                    .left(relative(start_r))
+                                                    .w(relative(width_r))
+                                                    .min_w(px(Theme::SEG_CLIP_MIN_W))
+                                                    .rounded(px(Theme::RADIUS_SM))
+                                                    .bg(if is_selected {
+                                                        Theme::accent_primary()
+                                                    } else if is_active {
+                                                        Theme::accent_mint_deep()
+                                                    } else {
+                                                        Theme::bg_dot_idle()
                                                     })
-                                                    .collect()
-                                            };
-
-                                        relevant_segments.into_iter().map(|seg| {
-                                            let seg_idx = seg.index;
-                                            let start_r =
-                                                (seg.start / total_dur).clamp(0.0, 1.0) as f32;
-                                            let width_r = (((seg.end - seg.start) / total_dur)
-                                                .clamp(0.015, 1.0)
-                                                as f32)
-                                                .max(0.02);
-                                            let is_selected = sel_idx == Some(seg_idx);
-                                            // 与列表高亮、AppState::get_active_segment() 共用半开
-                                            // 区间 [start, end)：共享边界属于下一句（见 is_playing_at）。
-                                            let is_active =
-                                                is_playing_at(seg.start, seg.end, cur_time);
-                                            div()
-                                                .id(("timeline-clip", seg_idx))
-                                                .absolute()
-                                                .top(px(Theme::TRACK_CLIP_INSET))
-                                                .bottom(px(Theme::TRACK_CLIP_INSET))
-                                                .left(relative(start_r))
-                                                .w(relative(width_r))
-                                                .min_w(px(Theme::SEG_CLIP_MIN_W))
-                                                .rounded(px(Theme::RADIUS_SM))
-                                                .bg(if is_selected {
-                                                    Theme::accent_primary()
-                                                } else if is_active {
-                                                    Theme::accent_mint_deep()
-                                                } else {
-                                                    Theme::bg_dot_idle()
-                                                })
-                                                .border_1()
-                                                .border_color(if is_selected {
-                                                    Theme::text_on_saturated()
-                                                } else if is_active {
-                                                    Theme::accent_mint()
-                                                } else {
-                                                    Theme::tint_neutral_border()
-                                                })
-                                                .cursor_pointer()
-                                                .px_1p5()
-                                                .flex()
-                                                .items_center()
-                                                .overflow_hidden()
-                                                .hover(|s| s.opacity(0.85))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.state.select_segment(seg_idx);
-                                                    this.trigger_extract_frame(cx);
-                                                    cx.notify();
-                                                }))
-                                                .child(
-                                                    div()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        // 未选中的片段底色是**翻转**的中性槽，文字须跟着翻；
-                                                        // 选中/激活态是深色饱和块，改用恒白文字
-                                                        .text_color(if is_selected || is_active {
-                                                            Theme::text_on_saturated()
-                                                        } else {
-                                                            Theme::text_primary()
-                                                        })
-                                                        .child(seg.display_text().to_string()),
-                                                )
-                                        })
+                                                    .border_1()
+                                                    .border_color(if is_selected {
+                                                        Theme::text_on_saturated()
+                                                    } else if is_active {
+                                                        Theme::accent_mint()
+                                                    } else {
+                                                        Theme::tint_neutral_border()
+                                                    })
+                                                    .cursor_pointer()
+                                                    .px_1p5()
+                                                    .flex()
+                                                    .items_center()
+                                                    .overflow_hidden()
+                                                    .hover(|s| s.opacity(0.85))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.state.select_segment(seg_idx);
+                                                        this.trigger_extract_frame(cx);
+                                                        cx.notify();
+                                                    }))
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(Theme::TEXT_SMALL))
+                                                            // 未选中的片段底色是**翻转**的中性槽，文字须跟着翻；
+                                                            // 选中/激活态是深色饱和块，改用恒白文字
+                                                            .text_color(
+                                                                if is_selected || is_active {
+                                                                    Theme::text_on_saturated()
+                                                                } else {
+                                                                    Theme::text_primary()
+                                                                },
+                                                            )
+                                                            .child(seg.display_text().to_string()),
+                                                    )
+                                                    .into_any_element()
+                                            })
+                                            .collect();
+                                        clips
                                     }),
                             ),
                     )
@@ -5887,12 +5936,14 @@ mod tests {
     use super::{
         click_seek_target, fit_video_size, is_playing_at, karaoke_mark_style, karaoke_word_marks,
         monitor_picture_source, monitor_screen_size, raw_line_byte_start,
-        render_image_from_frame_file, MonitorPictureSource, WordMark, EDITOR_STACK_MONITOR_H,
-        MONITOR_VIDEO_FIT_FRAC,
+        render_image_from_frame_file, timeline_clip_positions, MonitorPictureSource, WordMark,
+        EDITOR_STACK_MONITOR_H, MONITOR_VIDEO_FIT_FRAC, TIMELINE_FULL_DRAW_LIMIT,
+        TIMELINE_WINDOW_MARGIN_SECS,
     };
     use crate::subtitle::segment::WordTiming;
     use crate::subtitle::{ExportMode, Segment};
     use crate::ui::actions::translated_out_count;
+    use crate::ui::build_timeline_index;
     use crate::ui::primitives::should_consume_scroll;
     use crate::ui::theme::Theme;
     use gpui::FontWeight;
@@ -6348,6 +6399,133 @@ mod tests {
         assert_eq!(
             monitor_picture_source(false, true, false),
             MonitorPictureSource::Static
+        );
+    }
+
+    /// 改造前 `render_multitrack_timeline` 里那段判据的参照物：片段数 ≤ 20 时全画，
+    /// 否则按「选中句，或与 ±15 秒窗口相交」过滤，输出存储顺序。
+    ///
+    /// 只服务于比对，不进生产代码；三条分支（含被 ±margin 包含的 `cur ∈ [start, end]`）
+    /// 逐字照抄改造前的实现。
+    fn legacy_timeline_clip_positions(
+        segments: &[Segment],
+        current_time: f64,
+        selected: Option<usize>,
+    ) -> Vec<usize> {
+        if segments.len() <= 20 {
+            return (0..segments.len()).collect();
+        }
+        segments
+            .iter()
+            .enumerate()
+            .filter(|(_, seg)| {
+                selected == Some(seg.index)
+                    || (current_time >= seg.start && current_time <= seg.end)
+                    || (current_time >= seg.start - 15.0 && current_time <= seg.end + 15.0)
+            })
+            .map(|(pos, _)| pos)
+            .collect()
+    }
+
+    /// 渲染路径真正调用的入口必须与改造前的两分支逻辑逐点等价：≤ 20 句全画、
+    /// 否则走 ±15 秒窗口；20 / 21 句两份表覆盖两侧分支。
+    #[test]
+    fn timeline_clip_positions_matches_legacy_two_branch_filter() {
+        let small: Vec<Segment> = (0..20)
+            .map(|i| Segment::new(i + 1, i as f64 * 10.0, i as f64 * 10.0 + 2.0, "句"))
+            .collect();
+        let big: Vec<Segment> = (0..21)
+            .map(|i| Segment::new(i + 1, i as f64 * 10.0, i as f64 * 10.0 + 2.0, "句"))
+            .collect();
+        for segments in [small, big] {
+            let index = build_timeline_index(&segments);
+            for selected in [None, Some(1usize), Some(21usize)] {
+                let mut t = -30.0f64;
+                while t <= 260.0 {
+                    assert_eq!(
+                        timeline_clip_positions(&segments, &index, t, selected),
+                        legacy_timeline_clip_positions(&segments, t, selected),
+                        "片段数 {} t={t} selected={selected:?}",
+                        segments.len()
+                    );
+                    t += 1.0;
+                }
+            }
+        }
+    }
+
+    /// 绘制顺序必须是存储顺序（索引是按 start 排过的，取出的下标要先还原），
+    /// 且选中句同时落在窗口内时不得画两遍——旧实现只可能命中一次。
+    #[test]
+    fn timeline_clip_positions_restores_storage_order_without_duplicates() {
+        // 存储顺序与时间顺序**相反**：忘了还原顺序，画出来的块就会整体颠倒
+        let segments: Vec<Segment> = (0..30)
+            .map(|i| {
+                let start = (30 - i) as f64;
+                Segment::new(i + 1, start, start + 0.5, "句")
+            })
+            .collect();
+        let index = build_timeline_index(&segments);
+
+        // t = 15：窗口 [0, 30] 正好罩住全部 30 句，选中句（index 3）也在窗口内
+        let positions = timeline_clip_positions(&segments, &index, 15.0, Some(3));
+        assert_eq!(positions, (0..segments.len()).collect::<Vec<_>>());
+        let selected_pos = segments
+            .iter()
+            .position(|s| s.index == 3)
+            .expect("表里有 3");
+        assert_eq!(
+            positions.iter().filter(|&&p| p == selected_pos).count(),
+            1,
+            "选中句同时在窗口内时只能画一次：{positions:?}"
+        );
+
+        // 选中句远在窗口外时依然要画（旧实现无条件画它）
+        let far = timeline_clip_positions(&segments, &index, 100.0, Some(30));
+        assert_eq!(far, vec![29usize], "窗口内没有别的片段，只剩选中句");
+    }
+
+    /// ±15 秒窗口只允许有一个来源：窗口常量就是渲染路径用的那个值（旧实现把它
+    /// 写死在过滤闭包里），同时钉住「片段数 ≤ 阈值时全画」的另一半判据。
+    #[test]
+    fn timeline_window_margin_constant_is_the_single_source() {
+        assert!((TIMELINE_WINDOW_MARGIN_SECS - 15.0).abs() < f64::EPSILON);
+        assert_eq!(TIMELINE_FULL_DRAW_LIMIT, 20);
+
+        // 21 句（越过全画阈值）里只有一句恰好压在 +15 秒边界上
+        let mut segments: Vec<Segment> = (0..19)
+            .map(|i| {
+                Segment::new(
+                    i + 1,
+                    100.0 + i as f64 * 10.0,
+                    105.0 + i as f64 * 10.0,
+                    "远离窗口",
+                )
+            })
+            .collect();
+        segments.push(Segment::new(
+            20,
+            TIMELINE_WINDOW_MARGIN_SECS,
+            TIMELINE_WINDOW_MARGIN_SECS,
+            "零长度：恰好压在窗口右界",
+        ));
+        segments.push(Segment::new(
+            21,
+            TIMELINE_WINDOW_MARGIN_SECS + 0.001,
+            TIMELINE_WINDOW_MARGIN_SECS + 0.001,
+            "零长度：刚超出窗口右界",
+        ));
+        let index = build_timeline_index(&segments);
+        assert_eq!(
+            timeline_clip_positions(&segments, &index, 0.0, None),
+            vec![19usize],
+            "只有恰好压界那句可见，刚超界与远处的都不可见"
+        );
+        // 选中那句刚超界的：窗口扫描取不到它，但「选中句恒可见」必须把它补上
+        assert_eq!(
+            timeline_clip_positions(&segments, &index, 0.0, Some(21)),
+            vec![19usize, 20],
+            "选中句必须在绘制集合里，且仍按存储顺序"
         );
     }
 }

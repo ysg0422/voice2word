@@ -904,6 +904,137 @@ pub(crate) struct DerivedSnapshot {
     /// 转写质检报告（`subtitle::segment::quality_report`，术语违规已填）。
     /// 存 `Arc` 是为了「按帧取用」不必深拷贝它内部的四个 `Vec`。
     pub(crate) quality_report: Arc<QualityReport>,
+    /// 时间轴「按窗口取字幕」用的排序索引，见 [`TimelineIndex`]。
+    ///
+    /// 与上面几项共用同一个失效键（`segments_revision` + 配置）：时间轴每帧都要问
+    /// 一次「视口 ±15 秒内有哪些片段」，全量扫几千~几万句就是每帧一次 O(n)；
+    /// 索引只在片段表或配置变了时重建一次，逐帧只付两次二分。
+    pub(crate) timeline: TimelineIndex,
+}
+
+/// 时间轴「按窗口取字幕」用的排序索引（随 [`DerivedSnapshot`] 一起缓存）。
+///
+/// # 为什么要有它
+///
+/// 时间轴每帧都要问一次「视口 ±15 秒内有哪些片段」（见
+/// [`timeline_visible_positions`]）。原实现是遍历整张片段表再过滤，几千~几万句时
+/// 就是每帧一次 O(n)，播放时 40ms 一帧纯属白烧。索引只在 `segments_revision`
+/// 或配置变化时重建一次（与派生快照同键，不另开一份缓存），逐帧只付
+/// 「两次二分 + 扫窗口内那几条」。
+///
+/// # 为什么是三个数组
+///
+/// - `by_start`：`start` 升序的片段表下标。相交判据里的 `start <= 窗口右界` 在它
+///   上面是一个前缀，二分即可定位；排序**稳定**，`start` 相同的段保持存储顺序。
+/// - `prefix_max_end`：`by_start` 前缀内 `end` 的最大值，单调不减。`end >= 窗口左界`
+///   在 `by_start` 顺序里**并不**单调（长句可以跨越整个窗口），但「前缀里已经出现过
+///   `end >= 窗口左界`」是单调的，因此在它上面二分能安全跳过左侧无关段；重叠 / 乱序
+///   的片段表也不会漏句（等价性由单测逐点钉住）。
+/// - `by_index`：`Segment::index` 升序的片段表下标。时间轴的「选中句必须始终可见」
+///   这一支与时间无关，窗口扫描覆盖不到它；没有这张索引就得每帧全表找一遍选中句。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TimelineIndex {
+    /// 按 `start` 升序（稳定）排列的片段表下标。
+    pub(crate) by_start: Vec<usize>,
+    /// `by_start[..=i]` 里 `end` 的最大值（单调不减）。
+    pub(crate) prefix_max_end: Vec<f64>,
+    /// 按 `Segment::index` 升序（稳定）排列的片段表下标。
+    pub(crate) by_index: Vec<usize>,
+}
+
+/// 建 [`TimelineIndex`]：一次 O(n log n)，之后每帧只 O(log n + 窗口内条数)。
+///
+/// 抽成自由函数（不吃 `AppState`）是为了能在无 GUI 的单测里钉住三条性质：
+/// `by_start` 按 `start` 稳定升序、`prefix_max_end` 单调不减、`by_index` 按
+/// `Segment::index` 升序且是 `0..n` 的一个排列——这三条是窗口查询能安全二分的全部前提。
+pub(crate) fn build_timeline_index(segments: &[Segment]) -> TimelineIndex {
+    let mut by_start: Vec<usize> = (0..segments.len()).collect();
+    // 稳定排序：`start` 相同的段保持存储顺序，扫出来的下标集合因此与「按存储顺序
+    // 全量过滤」的旧实现天然对齐（顺序由调用方再排回来，见查询函数末尾）。
+    by_start.sort_by(|&a, &b| {
+        segments[a]
+            .start
+            .partial_cmp(&segments[b].start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // 前缀最大 end：初值取负无穷，`f64::max` 会把 NaN 当「忽略」，因此这条序列
+    // 永远是单调不减的实数序列，可以放心二分（NaN 的段本来就判不中，见查询函数）。
+    let mut prefix_max_end: Vec<f64> = Vec::with_capacity(segments.len());
+    let mut running = f64::NEG_INFINITY;
+    for &pos in &by_start {
+        running = running.max(segments[pos].end);
+        prefix_max_end.push(running);
+    }
+    let mut by_index: Vec<usize> = (0..segments.len()).collect();
+    by_index.sort_by_key(|&pos| segments[pos].index);
+    TimelineIndex {
+        by_start,
+        prefix_max_end,
+        by_index,
+    }
+}
+
+/// 时间轴窗口查询：返回「与 `[current_time - margin, current_time + margin]` 相交的，
+/// 外加选中句」这些片段在**存储顺序**下的下标。
+///
+/// # 与原实现逐条等价
+///
+/// 渲染路径原来的判据是
+/// `selected == Some(seg.index) || cur ∈ [seg.start, seg.end] || cur ∈ [seg.start - margin, seg.end + margin]`
+/// （`render_multitrack_timeline`）。中间那条被 ±margin 那条包含（`margin >= 0`），
+/// 所以等价于 `start <= cur + margin && end >= cur - margin`，再或上「选中句」。
+/// 本函数给的就是同一个集合，且按存储顺序返回——旧实现正是把过滤结果按存储顺序画出来的，
+/// 因此可见集合与绘制顺序都不变。
+///
+/// # 怎么做到不全量扫
+///
+/// `by_start` 上 `start <= cur + margin` 是一个前缀，二分定位右界；前缀里
+/// `prefix_max_end < cur - margin` 的部分整体不可能命中，二分跳过左界（注意**不能**
+/// 在 `by_start` 顺序上直接二分 `end`：重叠句会让 `end` 不再单调，那会漏句）。
+/// 两者之间线性扫一遍：正常（按时间有序的）字幕表里这段就是窗口内那几条，
+/// 而不是每帧几千~几万句。
+pub(crate) fn timeline_visible_positions(
+    segments: &[Segment],
+    timeline: &TimelineIndex,
+    current_time: f64,
+    selected: Option<usize>,
+    margin: f64,
+) -> Vec<usize> {
+    let left = current_time - margin;
+    let right = current_time + margin;
+    // 右界：`start > right` 的段整体落在窗口右侧，不可能相交。
+    let prefix_end = timeline
+        .by_start
+        .partition_point(|&pos| segments[pos].start <= right);
+    // 左界：越过它的段满足「前缀里出现过 end >= left」，之前的段必然 end < left。
+    // 钳到 `prefix_end` 之内是防御性写法：万一有 end < start 的倒置段，
+    // 直接切片会 panic（那种段本来也判不中，钳一下只是不让它越界）。
+    let scan_from = timeline
+        .prefix_max_end
+        .partition_point(|&max_end| max_end < left)
+        .min(prefix_end);
+    let mut visible: Vec<usize> = Vec::new();
+    for &pos in &timeline.by_start[scan_from..prefix_end] {
+        if segments[pos].end >= left {
+            visible.push(pos);
+        }
+    }
+    if let Some(id) = selected {
+        // 「选中句恒可见」这一支与时间无关：按 index 二分取等值区间。同一个 index
+        // 重复出现时与旧实现同口径（全部可见），这里刻意不去重。
+        let from = timeline
+            .by_index
+            .partition_point(|&pos| segments[pos].index < id);
+        let to = timeline
+            .by_index
+            .partition_point(|&pos| segments[pos].index <= id);
+        visible.extend_from_slice(&timeline.by_index[from..to]);
+    }
+    // 绘制顺序必须是存储顺序（旧实现就是按存储顺序遍历的）：排的是下标而不是片段，
+    // 顺带把「选中句同时落在窗口内」造成的重复项去掉——集合与顺序都不变。
+    visible.sort_unstable();
+    visible.dedup();
+    visible
 }
 
 /// 术语表原文的内容指纹：`(UTF-8 字节长度, FNV-1a 64 位哈希)`。
@@ -1018,6 +1149,9 @@ pub(crate) fn build_derived_snapshot(
             low_confidence_threshold,
             check_untranslated,
         )),
+        // 时间轴窗口索引与上面几项共用同一份快照、同一把失效键，不另开缓存：
+        // 它的唯一输入就是 `segments`，revision 一动就整体重建。
+        timeline: build_timeline_index(segments),
     }
 }
 
@@ -2670,11 +2804,12 @@ fn should_ignore_delete_in_status(status: &ProcessStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_derived_snapshot, cached_derived_snapshot, filter_cache_usable, filter_commands,
-        glossary_fingerprint, glossary_violations_cached, has_any_translation,
+        build_derived_snapshot, build_timeline_index, cached_derived_snapshot, filter_cache_usable,
+        filter_commands, glossary_fingerprint, glossary_violations_cached, has_any_translation,
         has_distinct_translation, insert_printable_key, move_palette_selection_row,
-        should_ignore_delete_in_status, translated_other_lang_count, DerivedSnapshot,
-        DerivedSnapshotKey, GlossaryBadCache, GlossaryFingerprint, PALETTE_COMMANDS,
+        should_ignore_delete_in_status, timeline_visible_positions, translated_other_lang_count,
+        DerivedSnapshot, DerivedSnapshotKey, GlossaryBadCache, GlossaryFingerprint,
+        PALETTE_COMMANDS,
     };
     use crate::subtitle::Segment;
     use std::cell::Cell;
@@ -3422,6 +3557,165 @@ mod tests {
             &*reverted,
             &[6usize][..],
             "文本相同但 revision 变过，必须重算"
+        );
+    }
+
+    /// 等价性测试用的片段表：故意让**存储顺序 ≠ 时间顺序**，并塞进重叠句、
+    /// 零长度句、跨窗口左界的长句、压边的长句，以及重复的 `Segment::index`。
+    fn timeline_sample_segments() -> Vec<Segment> {
+        vec![
+            Segment::new(7, 100.0, 130.0, "最靠后的长句：窗口右界附近"),
+            Segment::new(3, 0.0, 0.0, "零长度：只在 t == 0 那一瞬可见"),
+            Segment::new(11, 15.0, 15.0, "零长度：恰好落在 +15 秒边界"),
+            Segment::new(1, 5.0, 10.0, "乱序出现的最早一句"),
+            Segment::new(9, -20.0, -5.0, "跨窗口左界的长句（负时间）"),
+            Segment::new(5, 40.0, 50.0, "远在窗口右侧"),
+            Segment::new(2, 10.0, 30.0, "与本表其它句重叠"),
+            Segment::new(13, 20.0, 20.0, "零长度：窗口内（index 重复）"),
+            Segment::new(13, 20.0, 20.0, "零长度：窗口内（同 index 的第二份）"),
+            Segment::new(4, -15.0, -15.0, "零长度：恰好落在 -15 秒边界"),
+            Segment::new(6, -30.0, -15.0, "终点恰好压在窗口左界的长句"),
+        ]
+    }
+
+    /// 旧的全量过滤（改造前 `render_multitrack_timeline` 里那段内联判据的参照物）：
+    /// 按存储顺序收集「选中句，或与 ±margin 窗口相交」的下标。
+    ///
+    /// 这里刻意把三条分支逐字抄下来（含已被 ±margin 包含的 `cur ∈ [start, end]`），
+    /// 它只服务于比对，不进生产代码。
+    fn legacy_timeline_filter(
+        segments: &[Segment],
+        current_time: f64,
+        selected: Option<usize>,
+        margin: f64,
+    ) -> Vec<usize> {
+        segments
+            .iter()
+            .enumerate()
+            .filter(|(_, seg)| {
+                selected == Some(seg.index)
+                    || (current_time >= seg.start && current_time <= seg.end)
+                    || (current_time >= seg.start - margin && current_time <= seg.end + margin)
+            })
+            .map(|(pos, _)| pos)
+            .collect()
+    }
+
+    /// 索引的三条性质：`by_start` 按 start 稳定升序、`prefix_max_end` 单调不减、
+    /// `by_index` 按 `Segment::index` 升序且是 `0..n` 的排列。这三条是窗口查询
+    /// 能安全二分的全部前提，乱序 / start 相同的段上也必须成立。
+    #[test]
+    fn timeline_index_orders_are_sorted_and_stable() {
+        let segments = vec![
+            Segment::new(3, 10.0, 12.0, "同 start 的后一份（存储顺序靠后）"),
+            Segment::new(1, 0.0, 5.0, "最早"),
+            Segment::new(2, 10.0, 11.0, "同 start 的前一份"),
+            Segment::new(9, 4.0, 4.0, "零长度"),
+            Segment::new(5, 0.0, 30.0, "跨窗口长句"),
+        ];
+        let index = build_timeline_index(&segments);
+
+        assert_eq!(index.by_start.len(), segments.len());
+        assert_eq!(index.prefix_max_end.len(), segments.len());
+        // start 升序；两句 start 都是 10.0，稳定排序必须保持存储顺序（下标 0 在 2 前）
+        assert_eq!(index.by_start, vec![1usize, 4, 3, 0, 2]);
+        // 前缀最大 end 按 by_start 顺序累积：5.0 → 30.0 → 30.0 → 30.0 → 30.0
+        assert_eq!(index.prefix_max_end, vec![5.0, 30.0, 30.0, 30.0, 30.0]);
+        for pair in index.prefix_max_end.windows(2) {
+            assert!(pair[1] >= pair[0], "前缀最大 end 必须单调不减：{pair:?}");
+        }
+        // by_index 升序，且恰好是 0..n 的一个排列
+        assert_eq!(index.by_index, vec![1usize, 2, 0, 4, 3]);
+        let mut perm = index.by_index.clone();
+        perm.sort_unstable();
+        assert_eq!(perm, (0..segments.len()).collect::<Vec<_>>());
+        // 空表也得能建：渲染路径在「还没有字幕」时就会走到这里
+        let empty = build_timeline_index(&[]);
+        assert!(empty.by_start.is_empty());
+        assert!(empty.prefix_max_end.is_empty());
+        assert!(empty.by_index.is_empty());
+    }
+
+    /// 窗口查询与「旧的全量过滤」逐点等价——这是本次改造的底线：给定重叠、乱序、
+    /// 零长度、恰好压在窗口边界上的片段表，扫一遍整条时间轴逐点比对两份结果
+    /// （元素与顺序都要一致，因为渲染顺序就是返回顺序）。
+    #[test]
+    fn timeline_window_query_matches_full_scan_filter() {
+        let segments = timeline_sample_segments();
+        let index = build_timeline_index(&segments);
+        let margin = 15.0f64;
+        let selections = [
+            None,
+            Some(0usize),  // 表里没有这个 index：不该因此让任何一句可见
+            Some(7usize),  // 远在窗口右侧的那句：选中句必须恒可见
+            Some(13usize), // 重复出现的 index：旧实现两处都可见
+        ];
+        let mut checks = 0usize;
+        let mut t = -40.0f64;
+        while t <= 140.0 {
+            for selected in selections {
+                assert_eq!(
+                    timeline_visible_positions(&segments, &index, t, selected, margin),
+                    legacy_timeline_filter(&segments, t, selected, margin),
+                    "t={t} selected={selected:?}"
+                );
+                checks += 1;
+            }
+            // 步长 0.5 秒：既能扫过所有片段，也能覆盖「恰好压界」的整数时刻
+            t += 0.5;
+        }
+        assert!(checks > 1400, "扫描点数太少（{checks}），等价性覆盖不足");
+    }
+
+    /// 边界口径与旧实现一致（两侧都是闭区间）：恰好落在 ±margin 上的片段必须可见，
+    /// 刚超出一点点的必须不可见——这是等价性里最容易改错的一格。
+    #[test]
+    fn timeline_window_edges_are_inclusive() {
+        let margin = 15.0f64;
+        let segments = vec![
+            Segment::new(1, -15.0, -15.0, "零长度：恰好压在左界"),
+            Segment::new(2, 15.0, 15.0, "零长度：恰好压在右界"),
+            Segment::new(3, -15.001, -15.001, "刚超出左界"),
+            Segment::new(4, 15.001, 15.001, "刚超出右界"),
+            Segment::new(5, -100.0, -15.0, "终点恰好压在左界的长句"),
+            Segment::new(6, 15.0, 100.0, "起点恰好压在右界的长句"),
+        ];
+        let index = build_timeline_index(&segments);
+        // t = 0：窗口 [-15, 15]
+        assert_eq!(
+            timeline_visible_positions(&segments, &index, 0.0, None, margin),
+            vec![0usize, 1, 4, 5],
+            "压界的必须可见、越界的必须不可见，且按存储顺序"
+        );
+        // margin = 0 时窗口退化成一个点：上面这些段一条都不该命中
+        assert!(timeline_visible_positions(&segments, &index, 0.0, None, 0.0).is_empty());
+        // 空表 / 全部在窗口外：返回空而不是 panic
+        assert!(
+            timeline_visible_positions(&[], &build_timeline_index(&[]), 0.0, None, margin)
+                .is_empty()
+        );
+        let far = vec![Segment::new(1, 1000.0, 1001.0, "远")];
+        let far_index = build_timeline_index(&far);
+        assert!(timeline_visible_positions(&far, &far_index, 0.0, None, margin).is_empty());
+    }
+
+    /// 索引必须随派生快照一起给（同一份缓存，不另开一份）：渲染路径只从快照里取，
+    /// 索引与片段表一旦不同步，时间轴就会画错块。
+    #[test]
+    fn derived_snapshot_carries_timeline_index() {
+        let segments = timeline_sample_segments();
+        let snap = build_derived_snapshot(&segments, 60.0, 20, "中文", -0.35, &[]);
+        assert_eq!(snap.timeline, build_timeline_index(&segments));
+        assert_eq!(
+            timeline_visible_positions(&segments, &snap.timeline, 20.0, Some(13), 15.0),
+            timeline_visible_positions(
+                &segments,
+                &build_timeline_index(&segments),
+                20.0,
+                Some(13),
+                15.0
+            ),
+            "走快照里的索引与现建索引必须给出同一批下标"
         );
     }
 }
