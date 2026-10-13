@@ -13,7 +13,18 @@ use crate::subtitle::Segment;
 use crate::utils::TempPathGuard;
 
 const CHUNK_SEC: f64 = 360.0;
-const OVERLAP_SEC: f64 = 1.5;
+/// 相邻块之间显式共享的重叠时长（秒）。
+///
+/// 为什么必须有重叠：长音频被切成互相独立的块后，压在块交界上的整句会被两块各转
+/// 一次（交界处重复出句），或者在两块里都只转出半句（交界处丢句）。让相邻块共享
+/// 一段音频后，交界句必然完整落在至少一块里，拼接阶段再用模糊匹配把两次识别合并
+/// 成一条即可（见 [`stitch_chunks`]）。
+///
+/// 为什么取 10s：段内单句通常 2~8s，10s 足以装下交界处 1~2 句，模糊匹配才拿得到
+/// 完整上下文；旧值 1.5s 连一句都装不下，边界句始终以半截形式出现，匹配无从谈起。
+/// 也不能更大：重叠区每块都要重新解码并转写，等于把算力白烧在重复音频上
+/// （4 小时素材切 320 块时，10s 重叠约占总转写量的 1%）。硬上限见 [`plan_chunks`] 的夹取。
+const CHUNK_OVERLAP_SEC: f64 = 10.0;
 const MIN_CHUNK_SEC: f64 = 45.0;
 /// `ceil` 前的容差：抵消 `total / (total / n)` 的 f64 舍入，见 [`plan_chunks_target`]。
 /// 远大于该处舍入误差（约 1e-15 相对量级），又远小于任何真实块长，不会改变正常分块。
@@ -52,7 +63,7 @@ pub const MAX_SV_WORKERS: usize = 6;
 /// 切块路径内部（[`transcribe_chunked`]）与管线侧决定是否走 0 磁盘内存推流
 /// （`can_stream`）都读这一个函数。此前管线里直接写死 `405.0`，与这里的常量是同一
 /// 门限的两份写法，改动任一处都会让两条路径悄悄分叉——收敛到一处消除该风险。
-/// 该值同时等价于 [`plan_chunks`] 从单块切到多块的边界。
+/// 该值同时等价于 [`plan_chunks_whisper`] 从单块切到多块的边界。
 pub fn chunk_threshold_secs() -> f64 {
     CHUNK_SEC + MIN_CHUNK_SEC
 }
@@ -64,65 +75,93 @@ pub struct AudioChunk {
     pub duration: f64,
 }
 
-pub fn plan_chunks(total_duration: f64) -> Vec<AudioChunk> {
+/// Whisper 长音频切块的公开入口：360s 目标块长 + [`CHUNK_OVERLAP_SEC`] 重叠。
+pub fn plan_chunks_whisper(total_duration: f64) -> Vec<AudioChunk> {
     plan_chunks_target(total_duration, CHUNK_SEC)
 }
 
-/// 按指定目标块长切块（Whisper 用 360s；SenseVoice 进程并行用更短的块以获得
-/// 更好的负载均衡——块数应为 worker 数的整数倍附近，避免最后一轮只有少数
-/// worker 在跑、其余空转）。
-pub fn plan_chunks_target(total_duration: f64, target_sec: f64) -> Vec<AudioChunk> {
-    let target = target_sec.max(MIN_CHUNK_SEC);
-    // 非有限时长（`inf` / `NaN`）绝不能进分块算术：`ceil` 得 `inf`，`as usize`
-    // 饱和成 `usize::MAX`，下面 `(0..chunk_count)` 立刻容量溢出 panic；`NaN` 则让
-    // 每块的 `start` / `duration` 全成 `NaN`，直接进 ffmpeg 的切片参数。
-    // 时长字段损坏时按「单块」返回：调用方（`transcribe_chunked` /
-    // `transcribe_chunked_sensevoice`）见单块自会落回整段路径。
-    let total_duration = if total_duration.is_finite() {
-        total_duration
+/// 纯函数：把 `[0, duration]` 按 `chunk_sec` 目标块长切成**带重叠**的块，返回每块
+/// 的 `(start, duration)`（秒）。切块算术全部收敛在这里，与 ffmpeg / 并行调度无关，
+/// 因此每种数值边界都能直接单测。
+///
+/// 三条硬边界，都是「坏输入不 panic、不死循环、不爆容量」：
+/// - **非有限或非正时长**按 0 处理。`inf` 会让 `ceil` 得 `inf`、`as usize` 饱和成
+///   `usize::MAX`，随后 `collect()` 按 `size_hint` 预分配直接容量溢出 panic；`NaN`
+///   则把每块时间戳污染成 `NaN`，原样送进 ffmpeg 的切片参数。
+/// - **块数**夹在 `[2, MAX_CHUNK_COUNT]`：时长字段损坏（1e9 秒级伪值 / `f64::MAX`）
+///   时否则会切出上千万块，把临时目录与内存吃干。
+/// - **重叠**夹到 `[0, chunk_sec/2]`：负值 / `NaN` 当 0；超过半个块长时相邻块的
+///   `start` 会倒退（后一块的起点落在前一块之前），块序与时间轴同时错乱——夹到半块
+///   即保证重叠恒小于块长、每块 `start` 单调不减。
+///
+/// 时长不到「一个块长 + [`MIN_CHUNK_SEC`]」时返回单块 `(0.0, duration.max(0.1))`：
+/// 即使 `duration` 为 0 也给一个最小正时长，避免下游拿到 0 长度切片。
+pub fn plan_chunks(duration: f64, chunk_sec: f64, overlap_sec: f64) -> Vec<(f64, f64)> {
+    // 非有限 / 负时长统一按 0：NaN 会把整条时间轴污染成 NaN，inf 会让块数爆容量。
+    let total = if duration.is_finite() && duration > 0.0 {
+        duration
     } else {
         0.0
     };
-    if total_duration <= target + MIN_CHUNK_SEC {
-        return vec![AudioChunk {
-            index: 0,
-            start: 0.0,
-            duration: total_duration.max(0.1),
-        }];
+    // 目标块长同样要过「非有限」这关，并保证不小于 `MIN_CHUNK_SEC`。
+    let chunk = if chunk_sec.is_finite() {
+        chunk_sec.max(MIN_CHUNK_SEC)
+    } else {
+        MIN_CHUNK_SEC
+    };
+    // 半块长是重叠的硬上限：见函数文档。
+    let overlap = if overlap_sec.is_finite() {
+        overlap_sec.clamp(0.0, chunk * 0.5)
+    } else {
+        0.0
+    };
+    if total <= chunk + MIN_CHUNK_SEC {
+        return vec![(0.0, total.max(0.1))];
     }
-    // Keep the historical six-minute target for the chunk count, but divide
-    // the media evenly. A fixed step leaves a short tail chunk, making the
-    // final parallel round wait on one long worker while the other is idle.
-    // 调用方（`transcribe_chunked_sensevoice`）常以 `total/chunk_count` 作 target：
-    // 数学上 `total / target` 恰为该整数，但 f64 除法会把它舍入到略大于该整数
-    // （如 `4324.0 / (4324.0 / 14.0) == 14.000000000000002`），直接 `ceil` 就凭空
-    // 多切一块，末轮只剩一个 worker 在跑、其余空转——正是调用方要避免的场景。
-    // `ceil` 前减去 `CHUNK_COUNT_EPS`，把「本应为整数的商」还原成该整数。
-    let chunk_count = (total_duration / target - CHUNK_COUNT_EPS)
+    // 块数取 `total / 块长` 的向上取整，但先减 `CHUNK_COUNT_EPS` 抵消 f64 舍入：
+    // 调用方（`transcribe_chunked_sensevoice`）常以 `total/chunk_count` 作块长，数学上
+    // `total / 块长` 恰为该整数，浮动除法却会把它舍入到略大一点
+    // （如 `4324.0 / (4324.0 / 14.0) == 14.000000000000002`），直接 `ceil` 就凭空多切
+    // 一块，末轮只剩一个 worker 在跑、其余空转——正是调用方要避免的场景。
+    let chunk_count = (total / chunk - CHUNK_COUNT_EPS)
         .ceil()
         .max(2.0)
         .min(MAX_CHUNK_COUNT as f64) as usize;
-    let nominal = total_duration / chunk_count as f64;
-    let half_overlap = OVERLAP_SEC * 0.5;
+    // 按块数均分，而不是固定步长：固定步长会在片尾留一个短块，末轮让一个 worker 独自
+    // 拖尾、其余空转。均分后各块长度只差半个重叠。
+    let nominal = total / chunk_count as f64;
+    let half_overlap = overlap * 0.5;
     (0..chunk_count)
         .map(|index| {
             let boundary_start = index as f64 * nominal;
-            let boundary_end = ((index + 1) as f64 * nominal).min(total_duration);
+            let boundary_end = ((index + 1) as f64 * nominal).min(total);
+            // 首块不从负数起、末块一定收在 `total`：两端各让出半个重叠。
             let start = if index == 0 {
                 0.0
             } else {
                 (boundary_start - half_overlap).max(0.0)
             };
             let end = if index + 1 == chunk_count {
-                total_duration
+                total
             } else {
-                (boundary_end + half_overlap).min(total_duration)
+                (boundary_end + half_overlap).min(total)
             };
-            AudioChunk {
-                index,
-                start,
-                duration: (end - start).max(0.1),
-            }
+            (start, (end - start).max(0.1))
+        })
+        .collect()
+}
+
+/// 按指定目标块长切块（Whisper 用 360s；SenseVoice 进程并行用更短的块以获得
+/// 更好的负载均衡——块数应为 worker 数的整数倍附近，避免最后一轮只有少数
+/// worker 在跑、其余空转）。切块算术与重叠夹取见 [`plan_chunks`]。
+pub fn plan_chunks_target(total_duration: f64, target_sec: f64) -> Vec<AudioChunk> {
+    plan_chunks(total_duration, target_sec, CHUNK_OVERLAP_SEC)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (start, duration))| AudioChunk {
+            index,
+            start,
+            duration,
         })
         .collect()
 }
@@ -177,8 +216,14 @@ fn per_process_threads(threads: u32, workers: usize) -> u32 {
     (threads / workers.max(1) as u32).max(1)
 }
 
-/// 去掉切块重叠区里的重复句：后一块落在上一块尾部的字幕丢弃。
-/// 重叠区只存在于相邻两块之间，因此这条去重只对**跨块**的一对生效（见函数内注释）。
+/// 拼接各块的片段表：跨块重叠区的同一句话合并成一条，块内的重复句原样保留。
+///
+/// 切块时相邻块共享 [`CHUNK_OVERLAP_SEC`] 秒音频，于是压在交界上的整句会被两块各转
+/// 一次。这里对**跨块**且落在重叠窗口内的一对做模糊匹配（[`merge_overlap`]）：判为
+/// 同一句就合并成一条（保留更早的起点、取较晚的终点，避免合并后短了一截），判为
+/// 不同就都保留。**只对跨块的一对生效**——块内不存在重叠来源，块内时间上并不重叠的
+/// 重复句是说话人真的重复了一遍（跟读 / 听写类课程极常见），无差别套用会把那句静默
+/// 吃掉。块内的真重叠（时间上互相压着）仍按更严格的包含式判定丢弃。
 pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment> {
     parts.sort_by_key(|(idx, _, _)| *idx);
     // 所有块的最大结束时间（按各自偏移还原到全局时间轴）。用于兜住「末块整体落在
@@ -188,25 +233,34 @@ pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment>
         .map(|(_, offset, segs)| segs.iter().map(|s| s.end + offset).fold(0.0f64, f64::max))
         .fold(0.0f64, f64::max);
     let mut out: Vec<Segment> = Vec::new();
-    // 已接受片段所属的块下标：1.5s 重叠只存在于相邻两块之间，重叠去重也只该对
-    // **跨块**的一对生效（见下方 `similar && gap < ...` 分支）。
+    // 已接受片段所属的块下标：重叠只存在于相邻两块之间，合并也只该对**跨块**的一对
+    // 生效（见下方分支）。
     let mut last_chunk: Option<usize> = None;
     for (chunk_idx, offset, segs) in parts {
         for mut seg in segs {
             seg.start += offset;
             seg.end += offset;
-            if let Some(prev) = out.last() {
+            if let Some(prev) = out.last_mut() {
+                let cross_chunk = last_chunk != Some(chunk_idx);
                 let gap = seg.start - prev.end;
-                let similar = text_similar(prev.display_text(), seg.display_text());
-                // 切块有 1.5s 重叠：后一块落在重叠区里的重复句丢掉。只对跨块的一对
-                // 生效——块内不存在重叠来源，块内时间上并不重叠的重复句是说话人真的
-                // 重复了一遍（跟读 / 听写类课程极常见），无差别套用这条规则会把那句
-                // 静默吃掉：字幕凭空少一句。块内的真重叠仍由下面的负 `gap` 分支处理。
-                if similar && gap < OVERLAP_SEC + 0.4 && last_chunk != Some(chunk_idx) {
-                    continue;
+                // 跨块 + 落在重叠窗口内：模糊匹配把「同一句话的两次识别」合并成一条。
+                // 命中即吃掉当前这条（保留更早的 start、取较晚的 end），不新增片段。
+                // 窗口上加 0.4s 容差，吸收两侧时间戳的抖动。
+                if cross_chunk && gap < CHUNK_OVERLAP_SEC + MERGE_GAP_TOLERANCE {
+                    if let MergeDecision::Merged(m) =
+                        merge_overlap(prev, &seg, OVERLAP_MATCH_THRESHOLD)
+                    {
+                        *prev = m;
+                        continue;
+                    }
                 }
+                // 块内的真重叠或已越过重叠窗口的跨块重叠：仍按更严格的包含式判定丢弃，
+                // 避免把只是「像」的两句话连成一条。块内时间上不重叠的重复句不在此列，
+                // 原样保留。
                 if gap < -0.25 {
-                    if similar || seg.end <= prev.end + 0.15 {
+                    if text_similar(prev.display_text(), seg.display_text())
+                        || seg.end <= prev.end + 0.15
+                    {
                         continue;
                     }
                     if seg.start < prev.end {
@@ -259,6 +313,100 @@ fn text_similar(a: &str, b: &str) -> bool {
         (&b, &a)
     };
     long.contains(short.as_str()) && short.chars().count() >= 4
+}
+
+/// 归一化文本后按「最长公共子序列占比」算相似度（0.0~1.0）。
+///
+/// 归一化（[`normalize_for_match`]）：去掉标点与空白、统一小写，只留字母 / 数字 /
+/// 汉字。同一句话被相邻两块各转一次时，两次差别基本集中在标点、空格、大小写与个别
+/// 断句字符上，归一化后即可正面比较。
+///
+/// 为什么用 LCS 占比而不是字符集 Dice：这里的差异主要是「多一个字 / 少一个字」「半句
+/// 变整句」，LCS 对这类**保序**的增删最敏感；字符集 Dice 不看顺序，`甲乙丙` 与 `丙乙甲`
+/// 会被判成完全相似，而字幕里顺序恰恰有意义（同音误听后的重排常出现在边界上）。
+/// 片段文本只有几十个字符，O(n·m) 的 DP 开销可以忽略。
+///
+/// 归一化后任一侧为空（空串 / 纯标点 / 纯空白）一律返回 0.0：空文本不构成「同一句
+/// 话」的证据，宁可两条都留。
+pub fn text_similarity(a: &str, b: &str) -> f64 {
+    let a = normalize_for_match(a);
+    let b = normalize_for_match(b);
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let lcs = lcs_len(&a, &b);
+    (2.0 * lcs as f64) / (a.len() + b.len()) as f64
+}
+
+/// 归一化：转小写、只留字母 / 数字 / 汉字（去掉标点与空白）。
+fn normalize_for_match(s: &str) -> Vec<char> {
+    s.chars()
+        .flat_map(|c| c.to_lowercase())
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+/// 两个字符序列的最长公共子序列长度（滚动数组，额外空间 O(min(n, m))）。
+fn lcs_len(a: &[char], b: &[char]) -> usize {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    let mut prev = vec![0usize; short.len() + 1];
+    let mut cur = vec![0usize; short.len() + 1];
+    for &lc in long {
+        for (j, &sc) in short.iter().enumerate() {
+            cur[j + 1] = if sc == lc {
+                prev[j] + 1
+            } else {
+                cur[j].max(prev[j + 1])
+            };
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[short.len()]
+}
+
+/// 跨块重叠区里一对字幕被判为「同一句话」的相似度阈值。
+///
+/// 同一句话被相邻两块各转一次时，归一化后的 LCS 占比通常 ≥ 0.9（差异只在标点与个别
+/// 断句字符）。取 0.7 留出余量：边界上常见的「半句 vs 整句」「丢一两个字」仍能命中；
+/// 低于它多半是两块各自识别出的不同内容，不该并成一条。阈值只作用于**跨块**的一对
+/// （见 [`stitch_chunks`]），块内重复句不受影响。
+pub const OVERLAP_MATCH_THRESHOLD: f64 = 0.7;
+
+/// 跨块合并的时间窗口容差（秒）：重叠本身是 [`CHUNK_OVERLAP_SEC`]，再加这点容差吸收
+/// 两侧时间戳抖动。只有落在窗口内的一对才考虑合并——窗口外即便文本偶然相似，也是块后
+/// 的新内容。
+const MERGE_GAP_TOLERANCE: f64 = 0.4;
+
+/// 相邻块边界处一对候选字幕的合并决策。
+#[derive(Debug, Clone, PartialEq)]
+pub enum MergeDecision {
+    /// 两条是同一句话的两次识别：合并成一条——起点取更早者、终点取较晚者（避免合并后
+    /// 短了一截），文本等其余字段沿用更早的那条。
+    Merged(Segment),
+    /// 两条不是同一句话：都保留（宁可重复，也不丢句子）。
+    KeepBoth,
+}
+
+/// 纯函数：判定跨块边界的「上一块尾部」与「下一块头部」是否为同一句话，并给出合并
+/// 结果。相似度取 [`text_similarity`]，达到 `threshold` 即判命中（`>=`）。
+///
+/// 只做文本层面的判断，不含时间窗口 / 块下标等编排逻辑——那些留在 [`stitch_chunks`]，
+/// 这样「什么时候该合并」这条核心规则可以脱离拼接流程单独测。
+pub fn merge_overlap(prev_tail: &Segment, next_head: &Segment, threshold: f64) -> MergeDecision {
+    let similarity = text_similarity(prev_tail.display_text(), next_head.display_text());
+    if similarity < threshold {
+        return MergeDecision::KeepBoth;
+    }
+    // 文本判为同一句：以时间更早的那条为基准（保留它的文本与字段，时间轴上也更靠前），
+    // 终点取两条里较晚的，避免合并后比实际语音短一截。
+    let (earlier, later) = if prev_tail.start <= next_head.start {
+        (prev_tail, next_head)
+    } else {
+        (next_head, prev_tail)
+    };
+    let mut merged = earlier.clone();
+    merged.end = earlier.end.max(later.end);
+    MergeDecision::Merged(merged)
 }
 
 /// 单块转写回调：传入（切片 WAV 路径, 该块时长秒, 建议线程数），
@@ -509,7 +657,7 @@ pub fn transcribe_chunked(
         );
     }
 
-    let chunks = plan_chunks(total_duration);
+    let chunks = plan_chunks_whisper(total_duration);
     if chunks.len() <= 1 {
         return whisper.transcribe_with_model(
             wav_path,
@@ -584,30 +732,31 @@ mod tests {
 
     #[test]
     fn short_audio_is_single_chunk() {
-        let c = plan_chunks(120.0);
+        let c = plan_chunks_whisper(120.0);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].start, 0.0);
     }
 
     /// 门限是「单块 vs 多块」的统一判据：等于门限时仍是单块，略过即切成多块。
     /// 管线侧 `can_stream` 与切块路径都读 `chunk_threshold_secs()`，此处锁住它与
-    /// `plan_chunks` 的边界一致，防止两处再次各写一个数字后悄悄分叉。
+    /// `plan_chunks_whisper` 的边界一致，防止两处再次各写一个数字后悄悄分叉。
     #[test]
     fn chunk_threshold_matches_plan_chunks_boundary() {
         assert_eq!(chunk_threshold_secs(), 405.0);
-        assert_eq!(plan_chunks(chunk_threshold_secs()).len(), 1);
-        assert!(plan_chunks(chunk_threshold_secs() + 1.0).len() >= 2);
+        assert_eq!(plan_chunks_whisper(chunk_threshold_secs()).len(), 1);
+        assert!(plan_chunks_whisper(chunk_threshold_secs() + 1.0).len() >= 2);
     }
 
     #[test]
     fn long_audio_is_chunked_with_overlap() {
-        let c = plan_chunks(32.0 * 60.0);
+        let c = plan_chunks_whisper(32.0 * 60.0);
         assert!(c.len() >= 5, "32min -> {:?}", c.len());
         assert!(c[1].start < 32.0 * 60.0 / c.len() as f64);
         let longest = c.iter().map(|x| x.duration).fold(0.0, f64::max);
         let shortest = c.iter().map(|x| x.duration).fold(f64::INFINITY, f64::min);
+        // 首尾块各只向一侧让出半个重叠，中间块两侧各让半个：块长的极差恰为半个重叠。
         assert!(
-            longest - shortest < OVERLAP_SEC + 0.1,
+            longest - shortest < CHUNK_OVERLAP_SEC * 0.5 + 0.1,
             "unbalanced chunks: {:?}",
             c
         );
@@ -653,18 +802,21 @@ mod tests {
         );
     }
 
-    /// 末段兜底必须封顶：整块被判为重复丢弃时 `global_end - last.end` 会接近一个
-    /// 整块（Whisper 360s），旧实现会把一条字幕直接拉长几十秒。超限时应保留原 end。
+    /// 末段兜底延展必须封顶：`global_end` 是「全部块的最大结束时间」，被丢弃的末句若
+    /// 拖得很长，`global_end - last.end` 会远大于真实漏删，旧实现会把一条字幕无上限地
+    /// 拉长几十秒。这里用块内真重叠（时间上互相压着）构造丢弃场景：末句一路拖到 90s，
+    /// 不封顶时 `out[0].end` 会被拉到 90s，须保留原 `end`。
     #[test]
     fn stitch_tail_recovery_is_capped() {
-        let head = vec![Segment::new(1, 250.0, 300.0, "切比雪夫不等式")];
-        // 末块内唯一的句子长 30s，整体被判为与上一块尾部重复而丢弃：
-        // 不封顶时 out[0].end 会被拉到 330s（单条字幕凭空多出 30s）。
-        let tail = vec![Segment::new(1, 0.1, 30.0, "切比雪夫不等式")];
-        let out = stitch_chunks(vec![(0, 0.0, head), (1, 300.0, tail)]);
-        assert_eq!(out.len(), 1, "重复句仍应被丢掉: {out:?}");
+        let segs = vec![
+            Segment::new(1, 0.0, 30.0, "切比雪夫不等式"),
+            // 与上一句时间上互相压着且文本相同：按块内重叠去重丢弃；终点却拖到 90s。
+            Segment::new(2, 29.0, 90.0, "切比雪夫不等式"),
+        ];
+        let out = stitch_chunks(vec![(0, 0.0, segs)]);
+        assert_eq!(out.len(), 1, "块内重叠重复句应被丢弃: {out:?}");
         assert!(
-            (out[0].end - 300.0).abs() < 1e-9,
+            (out[0].end - 30.0).abs() < 1e-9,
             "延展超限时必须保留原 end，而不是把单条字幕拉长: {out:?}"
         );
     }
@@ -1009,7 +1161,7 @@ mod tests {
         assert_eq!(segs.len(), 2, "两块各产出一条片段: {segs:?}");
         assert!((segs[0].start - 0.0).abs() < 1e-6);
         assert!(
-            segs[1].start > 45.0,
+            segs[1].start > 40.0,
             "第二块应被偏移到时间轴后段: {}",
             segs[1].start
         );
@@ -1144,7 +1296,7 @@ mod tests {
 #[cfg(test)]
 mod chunk_boundary_tests {
     use super::{
-        plan_chunks, plan_chunks_target, sensevoice_chunk_count, stitch_chunks, CHUNK_SEC,
+        plan_chunks_target, plan_chunks_whisper, sensevoice_chunk_count, stitch_chunks, CHUNK_SEC,
         MAX_CHUNK_COUNT,
     };
     use crate::subtitle::Segment;
@@ -1158,7 +1310,7 @@ mod chunk_boundary_tests {
     #[test]
     fn non_finite_duration_collapses_to_single_chunk() {
         for total in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
-            let chunks = plan_chunks(total);
+            let chunks = plan_chunks_whisper(total);
             assert_eq!(chunks.len(), 1, "非有限时长 {total} 必须退回单块");
             assert_eq!(chunks[0].start, 0.0);
             assert!(
@@ -1174,7 +1326,7 @@ mod chunk_boundary_tests {
     #[test]
     fn chunk_count_is_capped_for_absurd_durations() {
         for chunks in [
-            plan_chunks(1.0e9),
+            plan_chunks_whisper(1.0e9),
             plan_chunks_target(1.0e9, 45.0),
             plan_chunks_target(f64::MAX, 45.0),
         ] {
@@ -1193,7 +1345,7 @@ mod chunk_boundary_tests {
         }
         // 真实量级：4 小时 / 45s 恰好 320 块，不受封顶影响
         assert_eq!(plan_chunks_target(4.0 * 3600.0, 45.0).len(), 320);
-        assert!(plan_chunks(32.0 * 60.0).len() <= MAX_CHUNK_COUNT);
+        assert!(plan_chunks_whisper(32.0 * 60.0).len() <= MAX_CHUNK_COUNT);
     }
 
     /// SenseVoice 的块数推导：必须是 worker 的整数倍（否则末轮有 worker 空转）、
@@ -1227,9 +1379,9 @@ mod chunk_boundary_tests {
         }
     }
 
-    /// 块内的重复句必须保留。1.5s 重叠只存在于相邻两块之间，同一块内不存在重叠
-    /// 来源：时间上并不重叠的两句完全相同的字幕，是说话人真的重复了一遍
-    /// （跟读 / 听写类课程极常见）。旧实现无条件套用重叠去重，会把第二句静默吃掉。
+    /// 块内的重复句必须保留。重叠只存在于相邻两块之间，同一块内不存在重叠来源：
+    /// 时间上并不重叠的两句完全相同的字幕，是说话人真的重复了一遍（跟读 / 听写类
+    /// 课程极常见）。旧实现无条件套用重叠去重，会把第二句静默吃掉。
     #[test]
     fn repeated_sentence_inside_one_chunk_is_kept() {
         let repeated = vec![
@@ -1246,8 +1398,9 @@ mod chunk_boundary_tests {
         assert_eq!(out[1].text, "我们把这句话再读一遍");
     }
 
-    /// 反向保护：跨块的重复句（同一句话被相邻两块各转了一次，后块落在 1.5s 重叠
-    /// 区里）仍必须丢掉——这正是重叠去重的本意，修块内误删不能把它一起放掉。
+    /// 反向保护：跨块的重复句（同一句话被相邻两块各转了一次，后块落在重叠区里）
+    /// 仍必须只保留一条，且保留更早的起点——这正是边界合并的本意，修块内误删不能
+    /// 把它一起放掉。
     #[test]
     fn duplicate_sentence_across_chunk_boundary_is_dropped() {
         let head = vec![Segment::new(1, 350.0, 358.0, "我们把这句话再读一遍")];
@@ -1255,5 +1408,203 @@ mod chunk_boundary_tests {
         let out = stitch_chunks(vec![(0, 0.0, head), (1, 358.5, tail)]);
         assert_eq!(out.len(), 1, "跨块重复句仍应被丢掉: {out:?}");
         assert_eq!(out[0].start, 350.0);
+    }
+}
+
+/// 重叠切块 + 边界模糊合并的专项用例：切块规划的数值边界、相似度的边界、合并决策，
+/// 以及拼接后的时间顺序与连续编号。
+///
+/// 只测纯函数，不碰 ffmpeg / 子进程。
+#[cfg(test)]
+mod overlap_merge_tests {
+    use super::{
+        merge_overlap, plan_chunks, stitch_chunks, text_similarity, MergeDecision,
+        CHUNK_OVERLAP_SEC, MAX_CHUNK_COUNT, OVERLAP_MATCH_THRESHOLD,
+    };
+    use crate::subtitle::Segment;
+
+    fn seg(start: f64, end: f64, text: &str) -> Segment {
+        Segment::new(1, start, end, text)
+    }
+
+    // ---------- 相似度函数的边界 ----------
+
+    #[test]
+    fn similarity_identical_is_one() {
+        let s = text_similarity("我们把这句话再读一遍", "我们把这句话再读一遍");
+        assert!((s - 1.0).abs() < 1e-9, "相同文本应为 1.0，实得 {s}");
+    }
+
+    #[test]
+    fn similarity_disjoint_is_zero() {
+        assert_eq!(text_similarity("甲乙丙丁戊", "12345"), 0.0);
+    }
+
+    #[test]
+    fn similarity_empty_or_punctuation_only_is_zero() {
+        assert_eq!(text_similarity("", ""), 0.0);
+        assert_eq!(text_similarity("", "有内容"), 0.0);
+        assert_eq!(text_similarity("有内容", ""), 0.0);
+        assert_eq!(text_similarity("，。！？ ", "……——  "), 0.0);
+    }
+
+    #[test]
+    fn similarity_ignores_punctuation_whitespace_and_case() {
+        let en = text_similarity("Hello, World!", "  hello world  ");
+        assert!(
+            (en - 1.0).abs() < 1e-9,
+            "标点/空白/大小写差异应被抹平，实得 {en}"
+        );
+        let zh = text_similarity("切比雪夫不等式，对吗？", "切比雪夫不等式 对吗");
+        assert!((zh - 1.0).abs() < 1e-9, "中英标点差异应被抹平，实得 {zh}");
+    }
+
+    #[test]
+    fn similarity_handles_mixed_cjk_and_latin() {
+        // 归一化后 "abc中文def"(8) 与 "abc中def"(7)，LCS = 7 -> 2*7/15 = 14/15
+        let sim = text_similarity("abc中文 def", "ABC中DEF");
+        assert!((sim - 14.0 / 15.0).abs() < 1e-9, "实得 {sim}");
+        assert!(
+            text_similarity("abc中文 def", "ABCX") < sim,
+            "缺得越多占比越低"
+        );
+    }
+
+    // ---------- 阈值与合并决策 ----------
+
+    #[test]
+    fn merge_overlap_threshold_boundary_merges_at_threshold() {
+        let a = seg(10.0, 20.0, "我们把这句话再读一遍");
+        let b = seg(18.0, 24.0, "我们把这句话再读一遍");
+        let exact = text_similarity(a.display_text(), b.display_text());
+        // 判据是 `>=`：阈值取到相似度本身仍应命中
+        assert!(
+            matches!(merge_overlap(&a, &b, exact), MergeDecision::Merged(_)),
+            "相似度恰好等于阈值应命中"
+        );
+        // 阈值再抬高一丁点：落到阈值之下，两条都留
+        assert_eq!(merge_overlap(&a, &b, exact + 1e-6), MergeDecision::KeepBoth);
+    }
+
+    #[test]
+    fn merge_overlap_keeps_earlier_start_and_later_end() {
+        let prev = seg(100.0, 108.0, "我们把这句话再读一遍");
+        let next = seg(106.0, 114.0, "我们把这句话再读一遍");
+        // 无论谁先传入，结果都以时间更早者为准
+        for (a, b) in [(&prev, &next), (&next, &prev)] {
+            match merge_overlap(a, b, OVERLAP_MATCH_THRESHOLD) {
+                MergeDecision::Merged(m) => {
+                    assert_eq!(m.start, 100.0, "start 应取更早者");
+                    assert_eq!(m.end, 114.0, "end 应取较晚者，不能停在 108");
+                }
+                other => panic!("应判为同一句并合并，实得 {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn merge_overlap_keeps_both_when_dissimilar() {
+        let prev = seg(100.0, 108.0, "我们现在看第二个定理");
+        let next = seg(108.2, 115.0, "它的证明用到了柯西不等式");
+        assert_eq!(
+            merge_overlap(&prev, &next, OVERLAP_MATCH_THRESHOLD),
+            MergeDecision::KeepBoth
+        );
+    }
+
+    #[test]
+    fn stitch_merge_keeps_ascending_time_and_continuous_index() {
+        let head = vec![
+            seg(0.0, 5.0, "第一句内容"),
+            seg(5.0, 10.0, "我们把这句话再读一遍"),
+        ];
+        // 第二块从 10s 起：头部那句与上一块尾部重复，随后是一句新内容
+        let tail = vec![
+            seg(0.05, 5.0, "我们把这句话再读一遍"),
+            seg(5.0, 10.0, "下一句是新内容"),
+        ];
+        let out = stitch_chunks(vec![(0, 0.0, head), (1, 10.0, tail)]);
+        assert_eq!(out.len(), 3, "边界重复句应合并成一条: {out:?}");
+        assert_eq!(out[1].start, 5.0, "合并后保留更早的 start: {out:?}");
+        assert_eq!(out[1].end, 15.0, "合并后 end 取较晚者: {out:?}");
+        for w in out.windows(2) {
+            assert!(w[0].start <= w[1].start, "拼接后必须保持时间升序: {out:?}");
+        }
+        for (i, s) in out.iter().enumerate() {
+            assert_eq!(s.index, i + 1, "index 必须从 1 连续: {out:?}");
+        }
+    }
+
+    // ---------- 切块规划的边界 ----------
+
+    #[test]
+    fn plan_chunks_zero_duration_is_single_minimal_chunk() {
+        let spans = plan_chunks(0.0, 360.0, CHUNK_OVERLAP_SEC);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].0, 0.0);
+        assert!(spans[0].1 > 0.0 && spans[0].1.is_finite(), "须给最小正时长");
+    }
+
+    #[test]
+    fn plan_chunks_exactly_one_chunk_stays_single() {
+        assert_eq!(plan_chunks(360.0, 360.0, CHUNK_OVERLAP_SEC).len(), 1);
+        // 门限 = 块长 + MIN_CHUNK_SEC = 405：等于门限仍是单块
+        assert_eq!(plan_chunks(405.0, 360.0, CHUNK_OVERLAP_SEC).len(), 1);
+    }
+
+    #[test]
+    fn plan_chunks_just_over_boundary_splits_with_overlap() {
+        let spans = plan_chunks(405.5, 360.0, CHUNK_OVERLAP_SEC);
+        assert_eq!(spans.len(), 2, "刚过门限应切成两块: {spans:?}");
+        assert_eq!(spans[0].0, 0.0);
+        assert!(spans[0].0 + spans[0].1 > spans[1].0, "相邻块必须重叠");
+        let last = spans.last().unwrap();
+        assert!((last.0 + last.1 - 405.5).abs() < 1e-9, "末块必须贴住片尾");
+    }
+
+    #[test]
+    fn plan_chunks_clamps_overlap_larger_than_chunk() {
+        let chunk = 100.0;
+        let spans = plan_chunks(1000.0, chunk, 500.0);
+        assert!(spans.len() > 1);
+        for w in spans.windows(2) {
+            let overlap = w[0].0 + w[0].1 - w[1].0;
+            assert!(overlap > 0.0, "相邻块仍须重叠: {w:?}");
+            assert!(overlap < chunk, "重叠必须夹到小于块长，实得 {overlap}");
+            assert!(w[1].0 >= w[0].0, "start 必须单调不减");
+        }
+        for s in &spans {
+            assert!(s.1 <= chunk * 1.5 + 1e-9, "块长失控: {s:?}");
+        }
+    }
+
+    #[test]
+    fn plan_chunks_non_finite_and_huge_terminate() {
+        for d in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let spans = plan_chunks(d, 360.0, CHUNK_OVERLAP_SEC);
+            assert_eq!(spans.len(), 1, "坏时长 {d} 必须退回单块");
+            assert_eq!(spans[0].0, 0.0);
+            assert!(spans[0].1.is_finite() && spans[0].1 > 0.0);
+        }
+        // 极大时长：块数封顶、绝不无界，几何全部有限
+        let spans = plan_chunks(1.0e9, 45.0, CHUNK_OVERLAP_SEC);
+        assert!(
+            spans.len() >= 2 && spans.len() <= MAX_CHUNK_COUNT,
+            "块数须封顶，实得 {}",
+            spans.len()
+        );
+        for s in &spans {
+            assert!(
+                s.0.is_finite() && s.1.is_finite() && s.1 > 0.0,
+                "几何须有限: {s:?}"
+            );
+        }
+        // 非有限的块长 / 重叠也不得让几何变 NaN
+        for s in plan_chunks(1000.0, f64::NAN, f64::NAN) {
+            assert!(
+                s.0.is_finite() && s.1.is_finite() && s.1 > 0.0,
+                "几何须有限: {s:?}"
+            );
+        }
     }
 }
