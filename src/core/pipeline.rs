@@ -543,6 +543,15 @@ pub struct TaskPipeline {
 }
 
 impl TaskPipeline {
+    /// 本次装配是否带上了 SenseVoice 引擎（四项齐全才会装配，见 `cli::build_sensevoice`）。
+    ///
+    /// 为什么要有它：无头模式要在**发起转写之前**决定用哪个引擎（见 `cli::choose_engine`），
+    /// 而「可用性」的真相在装配那一刻就定了。让调用方各自去 `stat` 四个文件是第二份判断，
+    /// 迟早与装配口径分叉。
+    pub fn has_sensevoice(&self) -> bool {
+        self.sensevoice.is_some()
+    }
+
     pub fn new(
         ffmpeg: Arc<FFmpegEngine>,
         whisper: Arc<WhisperEngine>,
@@ -769,7 +778,13 @@ impl TaskPipeline {
             input_file
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
-                .join(format!("{}.{}", stem, output_format))
+                .join(format!(
+                    "{}.{}",
+                    stem,
+                    // 后缀取**扩展名**：`txt-ts`（带时间码纯文本）的扩展名是 `txt`，
+                    // 直接用格式名会产出 `xxx.txt-ts` 这种双后缀文件名。
+                    crate::subtitle::writer::export_spec_for(&output_format).0
+                ))
         });
 
         // ── 阶段 1: 探测时长与音频管道准备 ──

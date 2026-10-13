@@ -118,6 +118,8 @@ pub struct TranscribeArgs {
     pub hotwords: Option<String>,
     /// 覆盖 Whisper 模型文件。
     pub model: Option<PathBuf>,
+    /// 指定识别引擎：`whisper` / `sensevoice` / `auto`（默认 auto）。
+    pub engine: Option<String>,
     /// 覆盖推理线程数。
     pub threads: Option<u32>,
     /// 强制开启润色/标点阶段。
@@ -246,6 +248,8 @@ const COMMON_OPTIONS_HELP: &str = "\
       --glossary <文本>     术语表覆盖：`原文=译文`，多条用逗号/分号/换行分隔
       --hotwords <文本>     热词覆盖（人名、品牌、术语，逗号分隔），不必改 config.toml
       --model <路径>        覆盖 Whisper 模型文件
+      --engine <名称>       识别引擎：auto（默认）/ whisper / sensevoice
+                            auto 在 whisper 模型不可用而 SenseVoice 就位时自动选后者
       --threads <数量>      推理线程数（正整数，覆盖 config.toml；超过本机逻辑核数自动收敛）
       --polish              强制开启润色/标点（默认沿用 config.toml）
       --diarize             开启说话人分离
@@ -480,6 +484,7 @@ fn parse_run_like(args: &[String], mode: OutputMode) -> std::result::Result<CliA
     let mut glossary: Option<String> = None;
     let mut hotwords: Option<String> = None;
     let mut model: Option<PathBuf> = None;
+    let mut engine: Option<String> = None;
     let mut threads: Option<u32> = None;
     let mut polish = false;
     let mut diarize = false;
@@ -563,6 +568,15 @@ fn parse_run_like(args: &[String], mode: OutputMode) -> std::result::Result<CliA
             }
             "--model" => {
                 model = Some(PathBuf::from(take_value(flag, inline, args, &mut i)?));
+            }
+            "--engine" => {
+                let value = take_value(flag, inline, args, &mut i)?;
+                if !matches!(value.as_str(), "whisper" | "sensevoice" | "auto") {
+                    return Err(CliError::new(format!(
+                        "--engine 只接受 whisper / sensevoice / auto，收到: {value}"
+                    )));
+                }
+                engine = Some(value);
             }
             "--threads" => {
                 let value = take_value(flag, inline, args, &mut i)?;
@@ -661,6 +675,7 @@ fn parse_run_like(args: &[String], mode: OutputMode) -> std::result::Result<CliA
         glossary,
         hotwords,
         model,
+        engine,
         threads,
         polish,
         diarize,
@@ -1712,7 +1727,34 @@ fn run_pipeline(
     // `--threads` 允许任意正整数，但推理线程数超过本机逻辑核数只会互相抢占 CPU，
     // 反而拖慢转写，因此在这里按与图形界面完全相同的口径收敛。
     let threads = args.threads.map(bound_cli_threads);
-    let model = args.model.clone();
+    // 引擎选择：命令行默认 `auto`，规则见 `choose_engine` 的文档。
+    // SenseVoice 的「可用」判据与装配处同源（`build_sensevoice` 只在四项齐全时返回 Some）。
+    let sensevoice_ready = pipeline.has_sensevoice();
+    let chosen_engine = choose_engine(
+        args.engine.as_deref(),
+        args.model.as_deref(),
+        whisper_model_looks_usable(config),
+        sensevoice_ready,
+    );
+    if chosen_engine == "sensevoice" && !sensevoice_ready {
+        anyhow::bail!(
+            "指定了 --engine sensevoice，但 SenseVoice 引擎不完整（需要模型 / 词表 / VAD / runner 四项都在位；当前模型配置：{}）",
+            config.paths.sensevoice_model.as_deref().unwrap_or("未配置")
+        );
+    }
+    // 管线靠「模型路径里有没有 sensevoice」识别引擎，所以选中 SenseVoice 时
+    // 必须把它的模型路径传下去（这也是图形界面同款做法）。
+    let model = if chosen_engine == "sensevoice" {
+        Some(AppConfig::resolve_path(
+            config
+                .paths
+                .sensevoice_model
+                .as_deref()
+                .unwrap_or("models/sensevoice/model.int8.onnx"),
+        ))
+    } else {
+        args.model.clone()
+    };
     let rescue_logprob = config.pipeline.whisper_rescue_logprob;
 
     let handle = rt.spawn(async move {
@@ -1917,6 +1959,63 @@ fn build_runtime_options(config: &AppConfig) -> WhisperRuntimeOptions {
     }
 }
 
+/// 无头模式的引擎选择（纯函数，便于单测）。
+///
+/// # 为什么命令行必须自己决定这件事
+///
+/// 管线判断「这次是不是 SenseVoice」的依据是**传下去的模型路径里有没有 `sensevoice`**
+/// （见 `core::pipeline::run_with_options`）。图形界面按用户选的档位把这条路径传下去，
+/// 所以能选中；命令行默认不传 `--model`，于是**永远走 Whisper**——可 `config.toml` 里的
+/// `whisper_model` 在只装了 SenseVoice 的机器上压根没有可用的 ggml 模型（甚至被指到
+/// SenseVoice 的 `.onnx` 上），结果就是「界面上跑得好好的，命令行报 bad magic」。
+///
+/// 规则（顺序即优先级）：
+/// 1. `--model` 给了路径：路径里含 `sensevoice` → SenseVoice，否则 Whisper（尊重显式选择）；
+/// 2. `--engine` 显式指定 → 照办（`sensevoice` 但引擎不可用时由调用方报错）；
+/// 3. `auto`：SenseVoice 可用、且 whisper 模型看起来不可用（文件不存在，或扩展名是
+///    `.onnx` 这种不是 ggml 的形态）→ 选 SenseVoice；否则 Whisper。
+pub fn choose_engine(
+    requested: Option<&str>,
+    model_override: Option<&std::path::Path>,
+    whisper_model_usable: bool,
+    sensevoice_available: bool,
+) -> &'static str {
+    if let Some(path) = model_override {
+        let lowered = path.to_string_lossy().to_lowercase();
+        return if lowered.contains("sensevoice") {
+            "sensevoice"
+        } else {
+            "whisper"
+        };
+    }
+    match requested {
+        Some("sensevoice") => "sensevoice",
+        Some("whisper") => "whisper",
+        // `auto` 与「没给」等价。
+        _ => {
+            if sensevoice_available && !whisper_model_usable {
+                "sensevoice"
+            } else {
+                "whisper"
+            }
+        }
+    }
+}
+
+/// 配置里的 whisper 模型**看起来能不能被 whisper-cli 加载**。
+///
+/// 只做两道便宜判断：文件在不在、扩展名像不像 ggml 权重。`.onnx` 一定不是
+/// whisper 模型（那是 SenseVoice/标点这类 ONNX 引擎的形态），出现它说明配置被指错了。
+fn whisper_model_looks_usable(config: &AppConfig) -> bool {
+    let path = AppConfig::resolve_path(&config.paths.whisper_model);
+    if !path.is_file() {
+        return false;
+    }
+    !path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
+}
 /// 装配完整管线：FFmpeg + Whisper + （可选）SenseVoice + LLM + （可选）标点。
 fn build_pipeline(config: &AppConfig, args: &TranscribeArgs) -> Arc<TaskPipeline> {
     let ffmpeg = Arc::new(FFmpegEngine::new(AppConfig::resolve_path(
@@ -3747,6 +3846,48 @@ mod tests {
     }
 
     /// `--` 之后停止解析选项：文件名以 '-' 开头时也能当输入传入。
+    /// 引擎选择规则：auto 只在「whisper 模型不可用 + SenseVoice 就位」时选 SenseVoice。
+    ///
+    /// 回归护栏：无头模式以前**从不传引擎信息**，于是永远走 Whisper。而只装 SenseVoice
+    /// 的机器上 `whisper_model` 往往没有可用的 ggml 模型（甚至被指到 `.onnx`），表现就是
+    /// 「界面上跑得好好的，命令行报 bad magic」。
+    #[test]
+    fn engine_choice_prefers_sensevoice_only_when_whisper_is_unusable() {
+        use super::choose_engine;
+        use std::path::Path;
+
+        // auto：whisper 模型不可用 + SenseVoice 就位 → SenseVoice
+        assert_eq!(choose_engine(None, None, false, true), "sensevoice");
+        // auto：whisper 可用 → 尊重配置，仍走 Whisper（SenseVoice 只是备选）
+        assert_eq!(choose_engine(None, None, true, true), "whisper");
+        // auto：SenseVoice 没装配 → 只能 Whisper
+        assert_eq!(choose_engine(None, None, false, false), "whisper");
+        // 显式 --engine 一律照办
+        assert_eq!(choose_engine(Some("whisper"), None, false, true), "whisper");
+        assert_eq!(
+            choose_engine(Some("sensevoice"), None, true, true),
+            "sensevoice"
+        );
+        // 显式 --model：按路径判定，压过 auto
+        assert_eq!(
+            choose_engine(
+                None,
+                Some(Path::new("models/sensevoice/model.int8.onnx")),
+                true,
+                true
+            ),
+            "sensevoice"
+        );
+        assert_eq!(
+            choose_engine(
+                None,
+                Some(Path::new("models/whisper/ggml-small.bin")),
+                false,
+                true
+            ),
+            "whisper"
+        );
+    }
     #[test]
     fn double_dash_terminates_option_parsing() {
         let args = transcribe_args(&["voice2word", "transcribe", "--", "-h"]);
