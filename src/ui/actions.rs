@@ -4289,7 +4289,8 @@ const FRAME_FAILURE_NOTICE_AFTER: u32 = 3;
 /// 一旦抽帧成功，计数清零（见调用点），下次再连续失败会重新提示一次。
 fn frame_failure_notice(streak: u32) -> Option<&'static str> {
     (streak == FRAME_FAILURE_NOTICE_AFTER).then_some(
-        "画面预览取帧失败：可能是 ffmpeg 路径不正确、或视频文件被其它程序占用；字幕与导出不受影响",
+        "画面预览取帧失败：多半是找不到 ffmpeg——把它放到 tools/ffmpeg.exe，
+或装到系统 PATH 里（也可以在设置里填绝对路径）；字幕与导出不受影响",
     )
 }
 
@@ -4741,17 +4742,24 @@ mod tests {
 
     /// 抽帧连续失败的提示必须在「跨过阈值那一次」给，且文案要指向可操作的原因；
     /// 每条都挂等于刷屏，超过阈值还挂也等于刷屏。
+    ///
+    /// 文案钉子：实测里这条提示最常见的成因是「机器上有 ffmpeg 但没放进 tools/、
+    /// 也没加进 PATH」——所以提示必须给出这两条可操作的做法，而不是只说「失败了」。
     #[test]
     fn frame_failure_notice_fires_once_per_failure_streak() {
         assert!(frame_failure_notice(0).is_none());
         assert!(frame_failure_notice(1).is_none());
         assert!(frame_failure_notice(2).is_none());
         let msg = frame_failure_notice(3).expect("连续失败到阈值必须给一次提示");
+        assert!(msg.contains("ffmpeg"), "提示要指向 ffmpeg：{msg}");
         assert!(
-            msg.contains("ffmpeg"),
-            "提示要说清可能是 ffmpeg 路径：{msg}"
+            msg.contains("PATH") && msg.contains("tools/ffmpeg.exe"),
+            "提示要给出两条可操作的做法（放进 tools/ 或加进 PATH）：{msg}"
         );
-        assert!(msg.contains("占用"), "提示要提到文件被占用：{msg}");
+        assert!(
+            msg.contains("字幕与导出不受影响"),
+            "要说明影响面，避免用户以为转写结果也坏了：{msg}"
+        );
         assert!(
             frame_failure_notice(4).is_none(),
             "阈值之后不再重复提示，避免刷屏"
