@@ -137,9 +137,18 @@ const EDITOR_STACK_MONITOR_H: f32 = 320.0;
 /// 左右分栏时中间分隔条的宽度（与 `editor-split-divider` 的 `w` 保持一致）
 const EDITOR_SPLIT_DIVIDER_W: f32 = 5.0;
 
-/// 视频画面在监视器视口内屏里的最大占比：四周留出对称留白，避免画面顶满整块黑底
-/// 而显得过大。1.0 表示顶满；调小可让预览画面更小、留白更多。
-const MONITOR_VIDEO_FIT_FRAC: f32 = 0.78;
+/// 视频画面在监视器视口内屏里的最大占比。
+///
+/// # 为什么是 1.0（顶满），而不是留一圈白
+///
+/// 这里曾经是 0.78：四周人为留一圈对称留白。实际用下来是反效果——监视器的价值就是
+/// 「看清这一帧写了什么」，而在 16:9 视频 + 宽视口的组合下，宽高比本身就已经在左右
+/// 留出黑边了，再乘一个 0.78 就变成**四周同时**一圈黑框，画面被压到只有视口的一半
+/// 多点，字小得看不清，用户第一反应是「怎么这么多黑框」。
+///
+/// 现在取满：黑边只由宽高比决定，不再由这个系数额外制造。留白靠视口自身的边距
+/// （`monitor-viewport-screen`），不靠缩画面。
+const MONITOR_VIDEO_FIT_FRAC: f32 = 1.0;
 
 /// 在 `avail_w × avail_h` 的容器内按 `aspect`（宽/高）等比内接得到的最大尺寸。
 /// 任一输入非有限或非正时返回 `(0.0, 0.0)`，交由调用方降级处理。
@@ -6306,9 +6315,13 @@ mod tests {
         assert_eq!((w, h), (0.0, 0.0), "极小视口下退化为 0，交由降级分支处理");
     }
 
+    /// 画面按宽高比内接后，**至少有一个方向顶满**视口内屏——黑边只由宽高比造成。
+    ///
+    /// 回归护栏：这个系数曾经是 0.78。16:9 视频放进宽视口本来就左右留黑边，再乘
+    /// 0.78 就变成**四周一圈**黑框、画面只剩视口一半多点，字小到看不清，用户直接
+    /// 问「这个视频四周怎么这么多黑框」。
     #[test]
-    fn monitor_video_fit_fraction_leaves_margin() {
-        // 16:9 视频在 1920×1080 二分布局下，按占比内接后应严格小于视口内屏
+    fn monitor_video_fills_viewport_on_the_limiting_axis() {
         let screen = monitor_screen_size(1920.0, 1080.0, false, false, 400.0);
         let (w, h) = fit_video_size(
             16.0 / 9.0,
@@ -6316,7 +6329,33 @@ mod tests {
             screen.1 * MONITOR_VIDEO_FIT_FRAC,
         );
         assert!(w > 0.0 && h > 0.0);
-        assert!(w < screen.0 && h < screen.1, "四周必须留白，避免画面顶满");
+        assert!(
+            w <= screen.0 + 0.01 && h <= screen.1 + 0.01,
+            "内接结果不得溢出视口内屏：{w}×{h} ⊆ {screen:?}"
+        );
+        assert!(
+            (w - screen.0).abs() < 0.01 || (h - screen.1).abs() < 0.01,
+            "至少一个方向顶满（16:9 在 {screen:?} 内接得 {w}×{h}）"
+        );
+    }
+
+    /// 方向对调：竖屏素材放进宽视口时应当是**高度**顶满、只在左右留黑边。
+    #[test]
+    fn monitor_video_letterboxes_only_on_the_other_axis() {
+        let screen = monitor_screen_size(1920.0, 1080.0, false, false, 400.0);
+        let (w, h) = fit_video_size(
+            9.0 / 16.0,
+            screen.0 * MONITOR_VIDEO_FIT_FRAC,
+            screen.1 * MONITOR_VIDEO_FIT_FRAC,
+        );
+        assert!(
+            (h - screen.1).abs() < 0.01,
+            "竖屏素材高度顶满：{h} vs {screen:?}"
+        );
+        assert!(
+            w < screen.0,
+            "宽度方向的黑边由宽高比决定：{w} vs {screen:?}"
+        );
     }
 
     /// 回归（P2）：「正在播放」行高亮必须用半开区间 `[start, end)`，与
