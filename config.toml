@@ -1,7 +1,7 @@
 [paths]
 ffmpeg = "tools/ffmpeg.exe"
 whisper_cli = "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"
-whisper_model = "models/whisper/ggml-small-q5_0.bin"
+whisper_model = "models/sensevoice/model.int8.onnx"
 vad_model = "models/whisper/ggml-silero-v6.2.0.bin"
 punc_model = "models/punc/model.int8.onnx"
 sensevoice_model = "models/sensevoice/model.int8.onnx"

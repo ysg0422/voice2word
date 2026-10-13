@@ -2004,8 +2004,16 @@ pub fn choose_engine(
 
 /// 配置里的 whisper 模型**看起来能不能被 whisper-cli 加载**。
 ///
-/// 只做两道便宜判断：文件在不在、扩展名像不像 ggml 权重。`.onnx` 一定不是
-/// whisper 模型（那是 SenseVoice/标点这类 ONNX 引擎的形态），出现它说明配置被指错了。
+/// 只做两道便宜判断：文件在不在、扩展名像不像 ggml 权重。
+///
+/// # 为什么 `.onnx` 出现在这里不算「配置错误」
+///
+/// `config.paths.whisper_model` 这个字段身兼两职：它既是 whisper 的模型路径，
+/// 也是**用户选中的引擎档位**的落盘标记——界面切档位时 `set_whisper_model_tier`
+/// 会把该档位的路径写进来，选中 SenseVoice 时写的就是 `model.int8.onnx`。
+/// 所以看到 `.onnx` 只说明「用户选的是 SenseVoice」，不是配置被改坏；
+/// 这里返回 false 的用途是让 [`choose_engine`] 走 `auto` 时选中 SenseVoice，
+/// 而不是替用户把引擎换成 Whisper。
 fn whisper_model_looks_usable(config: &AppConfig) -> bool {
     let path = AppConfig::resolve_path(&config.paths.whisper_model);
     if !path.is_file() {
