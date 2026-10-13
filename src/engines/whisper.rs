@@ -40,6 +40,25 @@ pub const DEFAULT_INITIAL_PROMPT: &str = "以下是普通话录音。";
 ///    真写超了也只丢尾部，前面的（用户最在意的）一定保留。
 pub const MAX_ASR_HOTWORDS_CHARS: usize = 200;
 
+/// 传给 whisper-cli `-t` 的线程数**有效区间**（含端点）。
+///
+/// 下界为什么是 1：`-t 0` 会让识别程序在 ggml 的线程池断言上直接 abort
+/// （实测：退出码 0xC0000409、stdout 0 字节、stderr 里连一行报错都没有），而本文件的
+/// 失败分支会把「退出码异常 + 无输出」解释成「缺少运行库」，把用户引向错误的排查方向。
+/// 上界为什么是 512：它远超任何桌面 CPU 的核数，只用来挡住 config.toml 里的荒谬值——
+/// `-t` 一旦超过 32 位有符号上限，识别程序的 `std::stoi` 会抛 out_of_range 立刻终止
+/// （同一次实测：`-t 4294967295` 同样是 0xC0000409 + 空 stderr）。
+pub const MIN_THREADS: u32 = 1;
+pub const MAX_THREADS: u32 = 512;
+
+/// 传给 whisper-cli `-p` 的并行处理器数**有效区间**（含端点）。
+///
+/// 下界 1：`-p 0` 会让子进程做整数除零（切块长度 = 样本数 / 处理器数），直接崩。
+/// 上界 8：每个处理器都持有一整份推理状态（small 档约 160 MB、large 档数百 MB），
+/// 而推荐档位实测用到的最大值只有 3（见 `core/performance.rs` 的决策矩阵）。
+pub const MIN_PROCESSORS: u32 = 1;
+pub const MAX_PROCESSORS: u32 = 8;
+
 /// 共享配置文件名，与 `AppConfig::load_from_file("config.toml")` 的约定一致。
 const CONFIG_FILE_NAME: &str = "config.toml";
 
@@ -608,11 +627,12 @@ impl WhisperEngine {
         let json_file = PathBuf::from(format!("{}.json", prefix.display()));
         let mut json_guard = TempPathGuard::file(&json_file);
 
-        let lang = language.unwrap_or("auto");
+        let lang = normalize_language(language.unwrap_or("auto"));
         let th = threads.unwrap_or(self.threads);
         // 处理器数量保持可配置：不同 Vulkan 驱动对单实例/多实例调度差异很大，
         // 应通过同一素材基准测试选择最佳值，而不是硬编码 GPU 并发策略。
-        let processors = processors_override.unwrap_or(self.processors).max(1) as usize;
+        let processors =
+            effective_processors(processors_override.unwrap_or(self.processors)) as usize;
 
         // 线程保护机制：多处理器并行时，单处理器线程数等额下调，
         // 保证所有处理器的总 CPU 线程受控在配额内，防止 CPU 线程超售抢占桌面资源。
@@ -1235,6 +1255,14 @@ impl WhisperEngine {
             );
         }
 
+        // 成功退出（退出码 0）却拿不到任何文本来源：必须报错，不能静默返回 Ok(空)。
+        // 触发路径与文案见 [`empty_result_error`]。
+        if segments.is_empty() {
+            if let Some(msg) = empty_result_error(lang, json_parsed_ok) {
+                anyhow::bail!(msg);
+            }
+        }
+
         // 智能优化时间轴：消除 100ms 重叠鬼影、消除时间重叠冲突、广播级短句延展平滑
         crate::subtitle::optimize_segments(&mut segments);
 
@@ -1377,7 +1405,17 @@ impl WhisperEngine {
         let parts: Vec<f64> = s
             .trim()
             .split(':')
-            .map(|p| p.trim().replace(',', ".").parse::<f64>().unwrap_or(0.0))
+            // `parse::<f64>()` 会接受 `nan` / `inf` 字面量，而 NaN 一旦进入时间轴，
+            // 下游所有量值判据都会失效（`NaN <= 0.05` 为 false，「无效时长」筛不掉它），
+            // 于是 NaN 一路流进字幕表与导出文件。非有限值按「解析失败」处理（0.0）。
+            .map(|p| {
+                p.trim()
+                    .replace(',', ".")
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .unwrap_or(0.0)
+            })
             .collect();
         match parts.as_slice() {
             [h, m, sec] => h * 3600.0 + m * 60.0 + sec,
@@ -1401,12 +1439,67 @@ impl WhisperEngine {
 /// 以「单实例不超配额」优先，总量上界为 `max(th, 2 × processors)`；配额充足
 /// （`th ≥ 2 × processors`）时总量严格 ≤ 配额，不产生超售。回归测试见
 /// `tests::effective_threads_never_exceed_quota_when_processors_gt_one`。
+///
+/// 入参 `th` 先按 [`MIN_THREADS`] / [`MAX_THREADS`] 夹取：本函数是 `-t` 的**唯一**出口，
+/// 夹在这里就没有任何调用路径能把 0 或荒谬大值送进子进程的命令行（两者都会让子进程
+/// 在参数解析/线程池断言处直接 abort，且 stderr 一行不留）。
 fn effective_threads(th: u32, processors: usize) -> u32 {
+    let th = th.clamp(MIN_THREADS, MAX_THREADS);
     if processors > 1 {
         (th / (processors as u32)).max(2).min(th)
     } else {
         th
     }
+}
+
+/// 把请求的并行处理器数夹到 [`MIN_PROCESSORS`] / [`MAX_PROCESSORS`]。
+///
+/// 这是 `-p` 的唯一出口：`0` 会让子进程除零崩溃，荒谬大值会让它按处理器数创建同数量的
+/// 推理状态（内存翻倍再翻倍）与工作线程。
+fn effective_processors(requested: u32) -> u32 {
+    requested.clamp(MIN_PROCESSORS, MAX_PROCESSORS)
+}
+
+/// `-l` 的取值清洗：**空串/纯空白**一律回退 `auto`，其余值（含 `zh-CN` 这类可疑写法）
+/// 只去掉首尾空白后原样透传。
+///
+/// 为什么必须在这里兜住空值：`Some("")` 会原样变成 `-l ""`，识别程序判它为未知语言，
+/// 只往 stderr 打一行 error 就以**退出码 0** 结束（实测：stdout 0 字节、不产生 JSON），
+/// 上层只能拿到「成功 + 0 条字幕」。空值的语义本来就是「未指定」，对应 `auto`。
+///
+/// 为什么**不**顺手把 `zh-CN` 之类也改写成 `auto`：那是在猜用户意图（对方要的是中文，
+/// 却可能被自动检测带到别的语种）。未知码交给 [`empty_result_error`] 变成一条看得懂的
+/// 报错，而不是静默换个语义继续跑。
+fn normalize_language(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "auto"
+    } else {
+        trimmed
+    }
+}
+
+/// 子进程以退出码 0 收尾、却拿不到任何文本来源时给出的报错文案；`None` = 空结果**正常**。
+///
+/// 正常收尾必然写出 `--output-json`（素材里没有语音时也会写出空的 `transcription`），
+/// 所以 `json_parsed_ok = true` 已经证明「结果是空的」是素材事实、不是失败；只有
+/// `false`（文件没产出或解析失败）才是「没有任何文本来源」。
+///
+/// 实测触发路径：`-l <未知语言码>`。识别程序只往 stderr 打一行 `error: unknown language`
+/// （紧跟着 60 多行用法说明，正好把那一行挤出本文件只保留的 stderr 尾部），然后
+/// `exit(0)`——退出码为 0、stdout 0 字节、没有 JSON 文件，于是旧代码返回 `Ok((空, 0.0))`，
+/// 调用方（UI / HTTP API）看到的是「转写完成，共 0 个片段」，真正的原因只躺在日志里。
+/// 文案里带上 `-l` 的取值，正是因为它比 stderr 尾部更有用。
+fn empty_result_error(lang: &str, json_parsed_ok: bool) -> Option<String> {
+    if json_parsed_ok {
+        return None;
+    }
+    Some(format!(
+        "Whisper 未产出任何识别结果：既没有 --output-json 文件，stdout 也没有任何片段。\
+         最常见的原因是语言码 `-l {lang}` 不被识别程序接受（它只认 2 字母语言码、语言全名或 auto；\
+         遇到未知值只会打印一行 error 后以退出码 0 结束，因此不会走别的报错分支）。\
+         请把「识别语言」改成 auto 或有效代码后重试。"
+    ))
 }
 
 /// 收尾子线程：把 `JoinHandle::join()` 的 panic 显式记录成日志，而不是用
@@ -1431,17 +1524,63 @@ pub(super) fn join_or_log<T>(handle: std::thread::JoinHandle<T>, what: &str) -> 
 }
 
 /// 跨平台强杀指定进程及其子进程树（用于用户「终止转写」即时生效）
+///
+/// 非 Windows 分支只对目标进程本身发 SIGKILL（`kill` 的 PID 语义，不覆盖它的子进程）：
+/// 本仓只在 Windows 上发布交付，该分支目前仅作编译兜底，且改动无法在 Windows 上编译验证，
+/// 因此这里只记录事实、不做修改。
 fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
-        let mut cmd = Command::new("taskkill");
+        let mut cmd = Command::new(taskkill_program());
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let _ = cmd.args(["/F", "/T", "/PID", &pid.to_string()]).output();
+        match cmd.args(["/F", "/T", "/PID", &pid.to_string()]).output() {
+            Ok(out) if out.status.success() => {}
+            // 以前这里是 `let _ = ...`：终止信号没送到时，用户看到的是「点了终止但转写照跑」，
+            // 日志里没有任何线索可查。
+            Ok(out) => warn!(
+                pid,
+                code = ?out.status.code(),
+                "taskkill 未能终止子进程树，转写可能仍在继续"
+            ),
+            Err(err) => warn!(
+                pid,
+                error = %err,
+                "taskkill 启动失败，子进程树可能仍在运行"
+            ),
+        }
     }
     #[cfg(not(windows))]
     {
         let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    }
+}
+
+/// 强杀时使用的 `taskkill` 程序路径（Windows）。
+///
+/// 为什么不裸用 `Command::new("taskkill")`：Windows 创建进程时的搜索顺序把**当前目录**
+/// 排在系统目录之前，于是应用目录里被塞一个同名 `taskkill.exe`，就会在用户点「终止转写」
+/// 时被执行。这里优先用 `%SystemRoot%\System32\taskkill.exe`，只有它确实不存在时才
+/// 回退到 PATH 查找（保持原来的可用性）。
+#[cfg(windows)]
+fn taskkill_program() -> String {
+    let candidate = taskkill_program_from(std::env::var("SystemRoot").ok().as_deref());
+    if Path::new(&candidate).is_file() {
+        candidate
+    } else {
+        "taskkill".to_string()
+    }
+}
+
+/// [`taskkill_program`] 的纯函数部分：只做路径拼装，便于单测（不读环境变量、不碰文件系统）。
+#[cfg(windows)]
+fn taskkill_program_from(system_root: Option<&str>) -> String {
+    match system_root.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(root) => format!(
+            "{}\\System32\\taskkill.exe",
+            root.trim_end_matches(['\\', '/'])
+        ),
+        None => "taskkill".to_string(),
     }
 }
 
@@ -2739,5 +2878,169 @@ mod hotwords_tests {
         // 因此只校验「覆盖已失效」这一条可判定事实）。
         engine.set_hotwords_override(None);
         assert_ne!(engine.resolved_hotwords(), "李四,某品牌");
+    }
+}
+
+/// `-t` / `-p` 的数据边界、`-l` 取值清洗、`empty_result_error` 判定与 `taskkill`
+/// 路径拼装的回归测试。
+///
+/// 刻意**不写** `use super::*`：本组只依赖下面显式列出的名字，将来谁改了名字会在这里
+/// 直接编译失败，而不是被 glob 悄悄换成另一个同名项。
+#[cfg(test)]
+mod argv_and_result_guard_tests {
+    use super::{
+        effective_processors, effective_threads, empty_result_error, normalize_language,
+        WhisperEngine, MAX_PROCESSORS, MAX_THREADS, MIN_PROCESSORS, MIN_THREADS,
+    };
+
+    /// `-t 0` 会让识别程序在 ggml 的线程池断言上 abort（实测：退出码 0xC0000409、
+    /// stderr 里一行报错都没有，本文件的错误分支还会把它误报成「缺少运行库」），
+    /// `-t` 超过 32 位有符号上限则会让它的 `std::stoi` 抛 out_of_range 终止。
+    /// 因此 `-t` 的取值必须恒在 [MIN_THREADS, MAX_THREADS] 内。
+    #[test]
+    fn threads_arg_never_leaves_valid_range() {
+        assert_eq!(
+            effective_threads(0, 1),
+            MIN_THREADS,
+            "-t 0 会让子进程直接 abort"
+        );
+        assert_eq!(
+            effective_threads(0, 4),
+            MIN_THREADS,
+            "多处理器下更会被除成 0"
+        );
+        assert_eq!(
+            effective_threads(u32::MAX, 1),
+            MAX_THREADS,
+            "荒谬大值会触发子进程 std::stoi 的 out_of_range 终止"
+        );
+        // 正常取值不受影响：用户配置的 16 线程必须原样生效。
+        assert_eq!(effective_threads(1, 1), 1);
+        assert_eq!(effective_threads(8, 1), 8);
+        assert_eq!(effective_threads(16, 1), 16);
+        assert_eq!(effective_threads(64, 2), 32);
+
+        // 穷举：夹取之后「单实例线程数合法」与「单实例不超配额」两条约束依然成立。
+        for th in [0u32, 1, 2, 3, 7, 16, 64, 255, 512, 513, 4096, u32::MAX] {
+            for processors in 1usize..=MAX_PROCESSORS as usize {
+                let per = effective_threads(th, processors);
+                let quota = th.clamp(MIN_THREADS, MAX_THREADS);
+                assert!(
+                    (MIN_THREADS..=MAX_THREADS).contains(&per),
+                    "th={th}, processors={processors}: -t {per} 越界"
+                );
+                assert!(
+                    per <= quota,
+                    "th={th}, processors={processors}: 单实例 {per} 超过配额 {quota}"
+                );
+            }
+        }
+    }
+
+    /// `-p` 同理：0 会让子进程做整数除零（切块长度 = 样本数 / 处理器数）直接崩，
+    /// 超大值会让它按处理器数复制推理状态（每份都是几百 MB）。
+    #[test]
+    fn processors_arg_is_clamped_into_supported_range() {
+        assert_eq!(
+            effective_processors(0),
+            MIN_PROCESSORS,
+            "-p 0 会让子进程除零崩溃"
+        );
+        assert_eq!(effective_processors(1), 1);
+        assert_eq!(effective_processors(3), 3, "推荐档位用到的值必须原样保留");
+        assert_eq!(effective_processors(MAX_PROCESSORS), MAX_PROCESSORS);
+        assert_eq!(effective_processors(MAX_PROCESSORS + 1), MAX_PROCESSORS);
+        assert_eq!(effective_processors(u32::MAX), MAX_PROCESSORS);
+        for requested in 0u32..=64 {
+            assert!((MIN_PROCESSORS..=MAX_PROCESSORS).contains(&effective_processors(requested)));
+        }
+    }
+
+    /// 空语言值必须回退 `auto`：`-l ""` 会让识别程序打印一行 error 后以**退出码 0** 结束
+    /// （实测 stdout 0 字节、不产生 JSON），上层只能拿到「成功 + 0 条字幕」。
+    /// 非空值只去首尾空白，不猜用户意图。
+    #[test]
+    fn blank_language_falls_back_to_auto_without_rewriting_real_values() {
+        assert_eq!(normalize_language(""), "auto");
+        assert_eq!(normalize_language("   "), "auto");
+        assert_eq!(normalize_language("\t\n"), "auto");
+        assert_eq!(normalize_language("auto"), "auto");
+        assert_eq!(
+            normalize_language(" zh "),
+            "zh",
+            "带空白同样会被判未知，必须去掉"
+        );
+        assert_eq!(normalize_language("ZH"), "ZH", "大小写由子进程自行归一");
+        assert_eq!(
+            normalize_language("zh-CN"),
+            "zh-CN",
+            "可疑但非空的取值原样透传，由上层报错而不是静默换语义"
+        );
+    }
+
+    /// 「成功退出却没有任何文本来源」必须报错，而不是 `Ok((空, 0.0))`：
+    /// 只有 JSON 正常产出（哪怕是空转写）才算「素材里确实没有语音」这一正常情况。
+    #[test]
+    fn empty_result_without_text_source_is_reported_as_failure() {
+        assert!(
+            empty_result_error("zh", true).is_none(),
+            "json 已产出就证明空结果是素材事实，不得报错"
+        );
+        let msg = empty_result_error("zh-CN", false).expect("没有任何文本来源必须报错");
+        assert!(msg.contains("zh-CN"), "报错要带上实际传入的 -l 值: {msg}");
+        assert!(
+            msg.contains("auto"),
+            "报错要给出可操作的下一步（改用 auto 或有效代码）: {msg}"
+        );
+    }
+
+    /// stdout 兜底解析不得把 `nan` / `inf` 写进时间轴：NaN 会让下游所有量值判据失效
+    /// （`NaN <= 0.05` 恒为 false，「无效时长」筛不掉它），一路流进字幕表与导出文件。
+    #[test]
+    fn stdout_fallback_never_emits_non_finite_timestamps() {
+        assert_eq!(WhisperEngine::parse_time_str("nan"), 0.0);
+        assert_eq!(WhisperEngine::parse_time_str("inf"), 0.0);
+        assert_eq!(WhisperEngine::parse_time_str("-inf"), 0.0);
+        assert_eq!(WhisperEngine::parse_time_str("00:01:02.500"), 62.5);
+
+        let segments = WhisperEngine::parse_stdout_segments("[nan --> inf]  你好");
+        for seg in &segments {
+            assert!(
+                seg.start.is_finite() && seg.end.is_finite(),
+                "非有限时间戳混进了字幕表: {} -> {}",
+                seg.start,
+                seg.end
+            );
+        }
+    }
+}
+
+/// `taskkill` 路径拼装的回归测试（Windows）：必须走系统目录的绝对路径，避免应用目录里
+/// 同名的可执行文件被优先执行；拿不到系统目录时才回退到 PATH 查找。
+#[cfg(all(test, windows))]
+mod taskkill_program_tests {
+    use super::taskkill_program_from;
+
+    #[test]
+    fn taskkill_prefers_absolute_system_path_and_falls_back() {
+        assert_eq!(
+            taskkill_program_from(Some("C:\\Windows")),
+            "C:\\Windows\\System32\\taskkill.exe"
+        );
+        assert_eq!(
+            taskkill_program_from(Some("C:\\Windows\\")),
+            "C:\\Windows\\System32\\taskkill.exe",
+            "尾部多余的分隔符不得拼出双斜杠"
+        );
+        assert_eq!(
+            taskkill_program_from(Some("  C:\\Windows  ")),
+            "C:\\Windows\\System32\\taskkill.exe"
+        );
+        assert_eq!(
+            taskkill_program_from(Some("")),
+            "taskkill",
+            "拿不到系统目录时必须回退 PATH 查找，保持原可用性"
+        );
+        assert_eq!(taskkill_program_from(None), "taskkill");
     }
 }

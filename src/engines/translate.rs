@@ -152,6 +152,15 @@ impl TranslateEngine {
         progress_cb: Option<crate::engines::TextProgressCb>,
         cancel: Arc<AtomicBool>,
     ) -> Result<Vec<Segment>> {
+        // 目标语言来自 CLI（`--translate`）、`config.toml` 与界面，可能带首尾空白。
+        // 必须在这里归一化：带空白的语言名会被原样写进 `Segment::translation_lang`，
+        // 而界面收尾统计与 `Segment::translation_matches` 都是**精确比对**，
+        // 「 English」与「English」对不上，于是界面永远显示「未译」，每点一次
+        // 「开始翻译」都把整片重译一遍（在线链路还要重复计费）。
+        // 空值同样拦下：提示词会退化成「翻译为地道的。」，写回的
+        // `translation_lang = Some("")` 还会让 `translation_matches("")` 恒真——
+        // 变成「界面说已全部译完、实际并没有目标语言」的假成功。
+        let target_lang = ensure_target_lang(target_lang)?;
         info!(
             "开始执行字幕翻译 (目标语言: {}, 引擎: {:?})",
             target_lang, self.mode
@@ -224,6 +233,31 @@ impl TranslateEngine {
         Ok(extract_message_content(&value)
             .unwrap_or_else(|| "(接口返回成功，但未解析到文本内容)".to_string()))
     }
+}
+
+/// 归一化并校验翻译目标语言，返回去掉首尾空白的语言名。
+///
+/// # 为什么必须归一化
+///
+/// `Segment::translation_lang` 与 `Segment::translation_matches` 都是**精确比对**，
+/// 且增量翻译、收尾统计、界面按钮三处共用同一套判定。目标语言若带首尾空白
+/// （CLI 参数、手改的 `config.toml` 都可能带来），写出的标签就是「 English」，
+/// 与界面上的「English」对不上：界面显示「未译」，用户再点「开始翻译」又整片重译。
+///
+/// # 为什么空值必须拒绝
+///
+/// 空串/纯空白会让提示词退化成「将用户给出的带序号字幕逐条翻译为地道的。」，
+/// 而回填写下的 `translation_lang = Some("")` 会让 `translation_matches("")` 恒真，
+/// 此后再也不会重译——「界面说全部译完、实际并没有目标语言」的假成功。
+/// 宁可在这里明确报错，也不要静默产出一份没有目标语言的译文。
+fn ensure_target_lang(target_lang: &str) -> Result<&str> {
+    let trimmed = target_lang.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "目标语言为空：请先选择要翻译成的语言（如 简体中文 / 繁体中文 / English）"
+        ));
+    }
+    Ok(trimmed)
 }
 
 /// 在线翻译主流程：按 `batch_size` 切片，逐批请求并回填 `segment.translation`。
@@ -557,6 +591,29 @@ fn retry_missing_online(
 /// 不如跳过本批让后面的句子先译完，用户可再点一次「开始翻译」补齐。
 const MAX_BATCH_RETRIES: usize = 3;
 
+/// 可取消的退避等待，返回 `false` 表示等待期间被取消。
+///
+/// 单次退避就有 0.6~1.8 秒，直接 `sleep` 会让「取消」最多迟滞这么久才生效，
+/// 而且睡醒后还会再发一次请求。这里把整段等待切成小片，片间检查取消标志：
+/// 一旦用户点了取消就立刻返回 `false`，调用方随即以「翻译已取消」退出，
+/// 上层据此走**取消语义**（保留已完成的部分），而不是把它当成该批失败。
+fn wait_with_cancel(total: Duration, cancel: &AtomicBool) -> bool {
+    // 睡眠切片远小于最短退避（600ms）：取消几乎即时生效。
+    let slice = Duration::from_millis(50);
+    let mut left = total;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        if left.is_zero() {
+            return true;
+        }
+        let step = left.min(slice);
+        std::thread::sleep(step);
+        left = left.saturating_sub(step);
+    }
+}
+
 /// 带重试地请求一批译文。仅对**可重试**错误重试（网络/限流/5xx），
 /// 参数类错误（401/403/404）立刻返回，重试只是浪费用户时间。
 fn request_batch_with_retry(
@@ -580,8 +637,11 @@ fn request_batch_with_retry(
                 warn!(attempt = attempt + 1, total = MAX_BATCH_RETRIES, error = %err, "在线翻译请求失败，准备重试");
                 last_err = Some(err);
                 // 线性退避：失败往往是限流，立刻重发只会继续被拒。
-                // 取消标志已在上面的循环处检查，这里的等待是可中断的短睡。
-                std::thread::sleep(Duration::from_millis(600 * (attempt as u64 + 1)));
+                // 等待本身必须可中断：用户点「取消」后不该再把这 0.6~1.8s 睡完，
+                // 更不该睡醒后再发一次请求（[`wait_with_cancel`]）。
+                if !wait_with_cancel(Duration::from_millis(600 * (attempt as u64 + 1)), cancel) {
+                    return Err(anyhow!("翻译已取消"));
+                }
             }
         }
     }
@@ -875,7 +935,6 @@ fn request_batch_translation(
         "messages": [
             {
                 "role": "system",
-                // 与 [`ONLINE_SYSTEM_PROMPT_TEMPLATE`] 逐字一致：预算推导与
                 // 必须与 [`ONLINE_SYSTEM_PROMPT_TEMPLATE`] **逐字一致**——预算推导与
                 // `max_output_tokens` 都按该常量的字符数折算。`format!` 只接受字符串
                 // 字面量，故此处不能直接引用常量；漂移由测试
@@ -972,26 +1031,25 @@ fn request_batch_translation(
     let expected: HashSet<usize> = batch.iter().map(|seg| seg.index).collect();
     let mut parsed = LLMEngine::parse_batch_response(&content, &expected);
 
-    // 输出被截断（`finish_reason=length`）时，**最后一条几乎必然是被切一半的**（模型
-    // 写到一半就撞上 max_tokens）。麻烦在于这种半截行**仍能被
+    // 输出被截断（`finish_reason=length`）时，**生成流末尾的那一条几乎必然是被切
+    // 一半的**（模型写到一半就撞上 max_tokens）。麻烦在于这种半截行**仍能被
     // `parse_batch_response` 当成一条完整译文**——于是 `matched == chunk.len()`，
     // 上层的“本批未译全”分支不会触发，用户看到的就是一句被截断的译文。
     //
-    // 这里主动**丢掉最后一条已解析的译文**：它自带的“缺一条”会让上层走
-    // 现有的折半重试（`retry_missing_online`）把它当成“漏译”补回来。丢掉的那条
-    // 即使本来完整，重译一次也不会出错，只是多一次请求。
+    // 「末尾那条」按**译文在响应体里最后出现的位置**判定，而不是按批内顺序
+    // （见 [`truncation_victim`]）：模型偶尔乱序输出，批内顺序的最后一条可能是
+    // 完整的，按批序丢它反而会把半截译文留在字幕里。
+    //
+    // 丢掉的那条会被上层当成“漏译”，由折半重试（`retry_missing_online`）补回来；
+    // 即使它本来完整，重译一次也不会出错，只是多一次请求。
     if finish_reason_is_length(&value) {
-        let last_matched = batch
-            .iter()
-            .rev()
-            .map(|s| s.index)
-            .find(|i| parsed.contains_key(i));
-        if let Some(idx) = last_matched {
+        let batch_order: Vec<usize> = batch.iter().map(|s| s.index).collect();
+        if let Some(idx) = truncation_victim(&content, &batch_order, &parsed) {
             parsed.remove(&idx);
             warn!(
                 index = idx,
                 batch = batch.len(),
-                "在线翻译输出被截断，丢弃末条并交由折半重试补齐"
+                "在线翻译输出被截断，丢弃流末尾那条并交由折半重试补齐"
             );
         } else if profile.is_reasoning() {
             // 一条都没解析出来、对面又是推理模型：输出预算被思考吃光了，
@@ -1004,6 +1062,51 @@ fn request_batch_translation(
     }
 
     Ok(parsed)
+}
+
+/// 输出被截断时，挑出最可能是「被切一半」的那条已解析译文的序号。
+///
+/// 判据是**译文文本在响应体里最后出现的位置**：截断发生在生成流的末尾，最后写下的
+/// 那条才是被切的。不能按「批内顺序的最后一条」来挑——模型偶尔会乱序输出（先写第
+/// 3 句、再写第 2 句），此时批内顺序的最后一条其实是**完整**的，丢掉它、却把被切
+/// 一半的那条当成完整译文写进字幕，正是这里要避免的静默截断。
+///
+/// 文本在响应体里定位不到时（个别服务端的应答片段被清洗过）回退到**批内倒序的
+/// 第一条**，与旧行为一致。`batch_order` 是批内序号（升序）。
+fn truncation_victim(
+    content: &str,
+    batch_order: &[usize],
+    parsed: &HashMap<usize, String>,
+) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for (&index, text) in parsed {
+        let needle = text.trim();
+        if needle.is_empty() {
+            continue;
+        }
+        let Some(offset) = content.rfind(needle) else {
+            continue;
+        };
+        // 位置更靠后者胜出；位置相同（两条译文文本完全一致）时取序号更大者，
+        // 这样结果与 HashMap 的遍历顺序无关。
+        let better = match best {
+            Some((best_offset, best_index)) => {
+                offset > best_offset || (offset == best_offset && index > best_index)
+            }
+            None => true,
+        };
+        if better {
+            best = Some((offset, index));
+        }
+    }
+    if let Some((_, index)) = best {
+        return Some(index);
+    }
+    batch_order
+        .iter()
+        .rev()
+        .copied()
+        .find(|index| parsed.contains_key(index))
 }
 
 /// 响应的 `choices[0].finish_reason` 是否为 `length`（输出被 max_tokens 截断）。
@@ -1037,6 +1140,11 @@ pub(crate) fn post_chat_completions(
     cfg: &OnlineApiConfig,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value> {
+    // 密钥里的换行/全角字符会让底层客户端以「非法头」拒绝整条请求，而那种错误
+    // 既无状态码又会文案成「无法连接」，被判为可重试的暂时性故障。发请求前拦下。
+    if let Some(message) = api_key_header_error(&cfg.api_key) {
+        return Err(anyhow!(message));
+    }
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(cfg.timeout_secs.clamp(10, 600)))
         .build();
@@ -1065,6 +1173,26 @@ pub(crate) fn post_chat_completions(
         }
         Err(e) => Err(anyhow!("无法连接在线翻译接口 {}: {e}", cfg.endpoint)),
     }
+}
+
+/// 校验 API Key 能否安全放进 `Authorization` 请求头；不合法时返回可操作的中文原因。
+///
+/// HTTP 头字段值只允许 `0x20..=0x7E` 与 TAB。从网页或聊天窗口复制密钥时常带上
+/// 换行、全角字符或弯引号，底层 HTTP 客户端会在组装请求时以「非法头」直接拒绝整条
+/// 请求；而这类错误既没有状态码、文案又是「无法连接」，会被 [`classify_batch_error`]
+/// 当成**暂时性**故障重试 3 次，最终只报「未能译出任何一句」——真正的根因（密钥里
+/// 混进了非法字符）被彻底藏起来。这里在发请求前拦下，直接指出是哪个字符不合法。
+///
+/// 首尾空白由 `trim` 容忍（复制密钥时最常见的尾随换行/空格不影响使用）。
+fn api_key_header_error(raw_key: &str) -> Option<String> {
+    let key = raw_key.trim();
+    let bad = key.chars().find(|c| !matches!(*c, '\t' | ' '..='~'))?;
+    let column = key.chars().take_while(|c| *c != bad).count() + 1;
+    Some(format!(
+        "在线翻译 API Key 含有无法放进 HTTP 请求头的字符 `{bad}`（U+{:04X}，第 {column} 个字符）：\
+         多半是从网页复制时带上了换行或全角字符。请重新粘贴只含 ASCII 可见字符的密钥。",
+        bad as u32
+    ))
 }
 
 /// 从 OpenAI 兼容响应里取出回复文本。
@@ -2615,6 +2743,106 @@ mod tests {
         assert!(
             mt >= REASONING_THINKING_TOKENS,
             "重试必须给足推理预算: {mt}"
+        );
+    }
+}
+
+/// 在线翻译链路的健壮性回归：只测**纯函数**，不起子进程、不联网。
+///
+/// 与上面的 `tests` 模块分开：这里刻意**不用** `use super::*`，逐项列出被测函数，
+/// 免得测试跟着实现细节（私有常量、内部类型）一起漂移。
+#[cfg(test)]
+mod translate_robustness_tests {
+    use super::{api_key_header_error, ensure_target_lang, truncation_victim, wait_with_cancel};
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    /// 目标语言归一化：首尾空白必须去掉（否则写出的语言标签与界面/增量判定的精确
+    /// 比对对不上，界面永远显示「未译」，每点一次「开始翻译」都整片重译）；
+    /// 空值/纯空白必须直接报错，而不是让提示词退化成「翻译为地道的。」并写回
+    /// 恒真的空语言标签（此后 `translation_matches("")` 永远为真）。
+    #[test]
+    fn target_lang_is_trimmed_and_blank_is_rejected() {
+        assert_eq!(ensure_target_lang("  English  ").expect("非空"), "English");
+        assert_eq!(ensure_target_lang("简体中文").expect("非空"), "简体中文");
+        assert_eq!(ensure_target_lang("日本語\n").expect("非空"), "日本語");
+
+        for blank in ["", "   ", "\t\n"] {
+            let err = ensure_target_lang(blank).expect_err("空目标语言必须报错");
+            assert!(err.to_string().contains("目标语言"), "{err}");
+        }
+    }
+
+    /// 截断受害者必须按「译文在响应体里最后出现的位置」挑，而不是按批内顺序：
+    /// 模型乱序输出（先写 [3]、再写被切一半的 [2]）时，按批内顺序取最后一条会丢掉
+    /// 完整的 [3]，却把半截的 [2] 当成完整译文写进字幕——静默截断。
+    #[test]
+    fn truncation_victim_follows_response_order_not_batch_order() {
+        let content = "[1] 甲甲甲甲\n[3] 丙丙丙丙\n[2] 乙乙乙";
+        let parsed = HashMap::from([
+            (1usize, "甲甲甲甲".to_string()),
+            (3usize, "丙丙丙丙".to_string()),
+            (2usize, "乙乙乙".to_string()),
+        ]);
+        assert_eq!(
+            truncation_victim(content, &[1, 2, 3], &parsed),
+            Some(2),
+            "被截断的是最后写下的 [2]，不能丢掉完整的 [3]"
+        );
+
+        // 正序输出：结论与旧行为一致（丢最后一条）
+        let in_order = "[1] aaa\n[2] bbb";
+        let parsed_ok = HashMap::from([(1usize, "aaa".to_string()), (2usize, "bbb".to_string())]);
+        assert_eq!(truncation_victim(in_order, &[1, 2], &parsed_ok), Some(2));
+
+        // 译文文本在响应体里定位不到：回退到批内倒序的第一条
+        let unlocatable = HashMap::from([(1usize, "不在响应体里".to_string())]);
+        assert_eq!(truncation_victim("", &[1, 2], &unlocatable), Some(1));
+
+        // 一条都没解析出来：没有受害者
+        assert_eq!(truncation_victim("", &[1, 2], &HashMap::new()), None);
+    }
+
+    /// `Authorization` 头只接受可见 ASCII：密钥里的换行/全角字符必须在发请求前被
+    /// 拦下，否则底层客户端报「非法头」，还会被误判成可重试的「无法连接」，
+    /// 重试 3 次后只报「未能译出任何一句」，把真正的根因藏起来。
+    #[test]
+    fn api_key_header_chars_are_validated_before_request() {
+        assert!(api_key_header_error("sk-abc_123-_.~+/=").is_none());
+        assert!(
+            api_key_header_error("  sk-abc\n").is_none(),
+            "首尾空白必须被容忍（复制密钥最常见的尾随换行）"
+        );
+
+        let newline = api_key_header_error("sk-abc\ndef").expect("内嵌换行必须被拒绝");
+        assert!(newline.contains("API Key"), "{newline}");
+        assert!(newline.contains("U+000A"), "应指出非法字符码位: {newline}");
+        assert!(newline.contains("第 7 个字符"), "应指出位置: {newline}");
+
+        let full_width = api_key_header_error("sk-密钥").expect("非 ASCII 必须被拒绝");
+        assert!(full_width.contains("U+"), "{full_width}");
+    }
+
+    /// 退避等待必须可取消：已取消时立刻返回 `false`，而不是把 0.6~1.8s 睡完
+    /// （睡醒还会再发一次请求）。
+    #[test]
+    fn backoff_wait_is_interruptible() {
+        let idle = AtomicBool::new(false);
+        assert!(
+            wait_with_cancel(Duration::from_millis(1), &idle),
+            "未取消时应等待完再返回 true"
+        );
+
+        let cancelled = AtomicBool::new(true);
+        let started = Instant::now();
+        assert!(
+            !wait_with_cancel(Duration::from_secs(5), &cancelled),
+            "已取消时必须返回 false"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "取消后不该把整段退避睡完"
         );
     }
 }

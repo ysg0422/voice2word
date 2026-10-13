@@ -321,6 +321,28 @@ fn transcode_with_fallback(preferred: Option<HwAccel>, mut run: ProxyAttempt<'_>
     Ok(false)
 }
 
+/// 一次代理尝试的收尾：失败时删掉可能已经写出的截断 mp4，成功时保留它。
+///
+/// 为什么必须清理「执行器报错」这条路径：`proxy_ready` 的判据只有
+/// 「存在且 >1KB」，而带 `+faststart` 的输出在转码中途被中断时 moov 还没写、
+/// 文件却早就超过 1KB。这种半成品一旦留在 `%TEMP%`，下一次 `ensure_proxy` 的
+/// 无锁快路径就会把它当成合格代理直接返回，同一个素材的预览会**一直**坏到用户
+/// 清空临时目录为止。旧实现只在 `!ok`（退出码非零）时清理，而超时被杀 /
+/// 启动失败是从执行器里 `?` 上抛的 `Err`——绕过清理，正是最需要清的那一类。
+fn settle_proxy_attempt(out: &Path, result: Result<bool>) -> Result<bool> {
+    match result {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            let _ = std::fs::remove_file(out);
+            Ok(false)
+        }
+        Err(err) => {
+            let _ = std::fs::remove_file(out);
+            Err(err)
+        }
+    }
+}
+
 /// 代理转码的输出侧参数（`-i <src>` 之后的那一段）。
 ///
 /// `-hwaccel` **绝不**出现在这里：硬解属于输入侧，且只有 [`proxy_args`] 的
@@ -631,9 +653,14 @@ impl ProxyManager {
         let ok = transcode_with_fallback(
             hwaccel,
             Box::new(|backend| {
+                // 每轮开始先清残留：上一轮失败（或更早一次被超时杀掉）可能已经
+                // 写出截断的 mp4，而 `proxy_ready` 只按「>1KB」判完整。
                 let _ = std::fs::remove_file(&out);
-                self.run_proxy(source, &out, height, backend, encode_threads)
-                    .map(|status| status.success())
+                settle_proxy_attempt(
+                    &out,
+                    self.run_proxy(source, &out, height, backend, encode_threads)
+                        .map(|status| status.success()),
+                )
             }),
         )?;
 
@@ -1016,21 +1043,52 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// NV12 尺寸上界：既挡奇数尺寸（UV 平面下标越界），也挡会让
+/// `width * height` / `padded_bytes_per_row(width * 4)` 这类 u32 运算回绕的
+/// 天文数字。16K 远超任何真实素材与 wgpu 的纹理上限。
+const NV12_MAX_DIM: u32 = 16_384;
+
+/// NV12 尺寸是否可用：偶数、非零、不超过 [`NV12_MAX_DIM`]。
+///
+/// 纯判定，CPU 转换与 wgpu 渲染器共用同一条约束。
+fn nv12_dims_ok(width: u32, height: u32) -> bool {
+    width >= 2
+        && height >= 2
+        && width <= NV12_MAX_DIM
+        && height <= NV12_MAX_DIM
+        && width.is_multiple_of(2)
+        && height.is_multiple_of(2)
+}
+
+/// NV12 平面布局：返回 `(Y 平面字节数, 缓冲区总需求字节数)`。
+///
+/// 尺寸非法或乘法溢出时返回 `None`——调用方据此给出可恢复的 `Err`，
+/// 而不是让 `usize` 乘法在 debug 下 panic、在 release 下回绕后拿一个
+/// 荒谬的下标去切片。
+fn nv12_plane_layout(width: u32, height: u32) -> Option<(usize, usize)> {
+    if !nv12_dims_ok(width, height) {
+        return None;
+    }
+    let y_size = (width as usize).checked_mul(height as usize)?;
+    let need = y_size.checked_add(y_size / 2)?;
+    Some((y_size, need))
+}
+
 /// CPU fallback of the same BT.601 limited-range conversion (R,G,B,A).
 pub fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     // NV12 的 UV 平面是 2x2 下采样：宽（或高）为奇数时 `col & !1` / `row / 2` 会
     // 算出越过 UV 平面末尾的下标——例如 w=3, h=2 时 y_size=6、UV 平面只有 3 字节，
     // 而最后一列取到 `uv_plane[3]`，直接 index out of bounds panic。
-    // GPU 路径（`Nv12Renderer::new`）已经要求偶数尺寸，这里补齐同一条约束，
+    // GPU 路径（`Nv12Renderer::new`）与这里共用 [`nv12_dims_ok`] / [`nv12_plane_layout`]，
     // 让非法尺寸走可恢复的 Err 而不是在渲染线程里崩溃。
     anyhow::ensure!(
         width.is_multiple_of(2) && height.is_multiple_of(2),
         "NV12 尺寸必须为偶数: {width}x{height}"
     );
+    let (y_size, need) = nv12_plane_layout(width, height)
+        .with_context(|| format!("NV12 尺寸超出安全范围: {width}x{height}"))?;
     let w = width as usize;
     let h = height as usize;
-    let y_size = w.checked_mul(h).context("nv12 size overflow")?;
-    let need = y_size + y_size / 2;
     if nv12.len() < need {
         anyhow::bail!("NV12 buffer too small: {} < {}", nv12.len(), need);
     }
@@ -1135,8 +1193,8 @@ pub struct Nv12Renderer {
 impl Nv12Renderer {
     pub fn new(prefer_gpu: bool, width: u32, height: u32) -> Result<Self> {
         anyhow::ensure!(
-            width.is_multiple_of(2) && height.is_multiple_of(2),
-            "NV12 size must be even"
+            nv12_dims_ok(width, height),
+            "NV12 渲染器尺寸非法（需为 2..={NV12_MAX_DIM} 的偶数）: {width}x{height}"
         );
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let mut adapters = instance.enumerate_adapters(wgpu::Backends::all());
@@ -1220,6 +1278,7 @@ impl Nv12Renderer {
             view_formats: &[],
         });
 
+        // `width` 已被 `nv12_dims_ok` 限到 16K 以内，`width * 4` 不可能回绕
         let padded_bpr = padded_bytes_per_row(width * 4);
         let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("nv12-readback"),
@@ -1319,8 +1378,11 @@ impl Nv12Renderer {
     }
 
     pub fn convert(&self, nv12: &[u8]) -> Result<Vec<u8>> {
-        let y_size = (self.width * self.height) as usize;
-        let need = y_size + y_size / 2;
+        // 走与 CPU 转换同一条布局计算：`self.width * self.height` 直接相乘
+        // 在 debug 下会因回绕 panic，release 下回绕出的小尺寸会让下面切出
+        // 一段错误的平面。
+        let (y_size, need) = nv12_plane_layout(self.width, self.height)
+            .context("NV12 渲染器尺寸非法（构造时已校验）")?;
         if nv12.len() < need {
             anyhow::bail!("NV12 buffer too small");
         }
@@ -2172,5 +2234,80 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&out);
+    }
+}
+
+#[cfg(test)]
+mod media_pipeline_robustness_tests {
+    use super::{nv12_dims_ok, nv12_plane_layout, proxy_ready, settle_proxy_attempt, NV12_MAX_DIM};
+    use std::path::PathBuf;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("v2w_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("创建临时目录");
+        dir
+    }
+
+    /// 尺寸/行距边界：NV12 的 Y 平面是 `w*h`、总需求是 1.5 倍；奇数尺寸、
+    /// 零尺寸与天文数字尺寸都必须被判定为非法（旧代码在 GPU 路径直接用
+    /// `width * height` 与 `width * 4`，debug 下会乘法回绕 panic）。
+    #[test]
+    fn nv12_layout_rejects_odd_zero_and_oversized_dimensions() {
+        assert_eq!(nv12_plane_layout(2, 2), Some((4, 6)));
+        assert_eq!(nv12_plane_layout(1920, 1080), Some((2_073_600, 3_110_400)));
+
+        // 奇数尺寸：UV 平面比色度采样少一列/一行，下标会越界
+        assert_eq!(nv12_plane_layout(3, 2), None);
+        assert_eq!(nv12_plane_layout(2, 3), None);
+        // 零尺寸没有意义，也要拒绝（旧写法会返回空图而不是报错）
+        assert_eq!(nv12_plane_layout(0, 2), None);
+        assert_eq!(nv12_plane_layout(2, 0), None);
+        // 天文数字：挡在 u32 乘法回绕与 wgpu 超限纹理之前
+        assert_eq!(nv12_plane_layout(u32::MAX - 1, u32::MAX - 1), None);
+        assert_eq!(nv12_plane_layout(NV12_MAX_DIM + 2, 2), None);
+        assert!(nv12_dims_ok(NV12_MAX_DIM, NV12_MAX_DIM));
+        assert!(!nv12_dims_ok(NV12_MAX_DIM + 2, 2));
+        assert!(!nv12_dims_ok(16, 15));
+    }
+
+    /// 缺陷回归：一次失败的代理尝试（退出码非零 **或** 执行器报错——超时被杀 /
+    /// 启动失败）必须删掉已经写出的截断 mp4。`proxy_ready` 只判「存在且 >1KB」，
+    /// 所以残留的半成品会被下一次 `ensure_proxy` 当成合格代理直接复用——预览对
+    /// 同一个素材会一直坏到临时目录被清空。
+    #[test]
+    fn failed_proxy_attempt_removes_partial_output() {
+        let dir = temp_dir("settle_proxy");
+        let out = dir.join("proxy.mp4");
+
+        // 前提：半成品（无 moov 的截断 mp4）在判据眼里就是「可用代理」
+        std::fs::write(&out, vec![0u8; 4096]).expect("写入半成品");
+        assert!(proxy_ready(&out), "前提：>1KB 的文件会被判为可用代理");
+
+        // 退出码非零：清理
+        let ok = settle_proxy_attempt(&out, Ok(false)).expect("非零退出码不上抛错误");
+        assert!(!ok);
+        assert!(!out.exists(), "退出码非零留下的截断 mp4 必须被清理");
+
+        // 执行器报错（超时被杀 / 启动失败）：同样清理，且错误原样上抛
+        std::fs::write(&out, vec![0u8; 4096]).expect("写入半成品");
+        let err = settle_proxy_attempt(&out, Err(anyhow::anyhow!("子进程 ffmpeg 解码停滞超时")))
+            .expect_err("执行器报错必须上抛");
+        assert!(
+            err.to_string().contains("超时"),
+            "错误信息应原样保留: {err}"
+        );
+        assert!(
+            !out.exists(),
+            "超时残留的半成品必须被清理，否则会被当成合格代理"
+        );
+
+        // 成功时必须保留刚转好的代理
+        std::fs::write(&out, vec![0u8; 4096]).expect("写入代理");
+        assert!(settle_proxy_attempt(&out, Ok(true)).expect("成功路径不上抛"));
+        assert!(out.exists(), "成功时不得删除代理文件");
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

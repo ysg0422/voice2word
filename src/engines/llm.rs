@@ -74,6 +74,56 @@ fn fixed_prompt_tokens(fixed_prompt: &str) -> u32 {
     (fixed_prompt.chars().count() as f64 * PROMPT_TOKENS_PER_CHAR).ceil() as u32
 }
 
+/// 上下文窗口的合法区间。
+///
+/// `llm_ctx` 来自 `config.toml`（用户可手改）。`0` 会让 llama.cpp 直接拒绝启动
+/// （`-c 0` 连 KV cache 都建不出来），表现是「常驻服务起不来、命令行回退也失败」
+/// 的连环失败，而且日志只有一句参数非法；极大值则会在启动时按窗口大小申请
+/// KV cache，直接 OOM 崩掉。这里夹到可用区间：太小会让 [`batch_char_budget`]
+/// 退化成「一批一句」，太大对字幕批量没有收益。
+fn clamp_ctx_size(ctx_size: u32) -> u32 {
+    const MIN_CTX: u32 = 512;
+    const MAX_CTX: u32 = 65_536;
+    let clamped = ctx_size.clamp(MIN_CTX, MAX_CTX);
+    if clamped != ctx_size {
+        warn!("llm_ctx={ctx_size} 超出可用区间 [{MIN_CTX}, {MAX_CTX}]，已夹为 {clamped}");
+    }
+    clamped
+}
+
+/// 命令行回退路径（[`LLMEngine::run_prompt`]）的等待上限。
+///
+/// 命令行路径**没有**常驻服务那种读超时：`Command::output()` 一旦卡住就是永久
+/// 阻塞，用户在界面上点「终止」也杀不掉它（取消标志只在批次之间被检查）。因此按
+/// 「本批最多生成多少 token」给出等待上限，超时/取消都终止并回收子进程，把
+/// 「整条流水线卡死」降级成「这一批失败，其余批次继续」。
+///
+/// 0.5B 模型 CPU 推理实测每 token 几十毫秒，这里按 0.5s/token 给足余量；下限 60s
+/// （模型首次加载本身就要几秒到十几秒），上限 15 分钟。
+fn cli_wait_budget(max_tokens: u32) -> Duration {
+    const MIN_SECS: u64 = 60;
+    const MAX_SECS: u64 = 900;
+    const PER_TOKEN_MS: u64 = 500;
+    let want_secs = (max_tokens as u64).saturating_mul(PER_TOKEN_MS) / 1000;
+    Duration::from_secs(want_secs.clamp(MIN_SECS, MAX_SECS))
+}
+
+/// 起一个后台线程把子进程管道（stdout / stderr）抽干，返回该线程的句柄。
+///
+/// 管道缓冲区只有几十 KB：没人读的话，子进程写满就阻塞在 write 上，而父进程又在
+/// 等它退出——双方一起卡死。`None` 表示这条管道没有被 pipe（无可读）。
+fn drain_pipe<P: Read + Send + 'static>(
+    pipe: Option<P>,
+) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+    pipe.map(|mut p| {
+        std::thread::spawn(move || {
+            let mut buf: Vec<u8> = Vec::new();
+            let _ = p.read_to_end(&mut buf);
+            buf
+        })
+    })
+}
+
 /// 「译文 == 原文」的复制率告警阈值（P0-B 兜底）。
 const COPY_RATE_ALERT: f64 = 0.5;
 /// 复制率样本下限：待译句太少时比例没有统计意义（3 句里 2 句是复制不代表模型摆烂）。
@@ -270,7 +320,7 @@ impl LlamaServer {
         let mut cmd = Command::new(server_path);
         // 让路模式：llama-server 是常驻进程，CPU 占用高，必须跟随全局设置
         super::media_pipeline::apply_default_child_flags(&mut cmd);
-        let child = cmd
+        let mut child = cmd
             .arg("-m")
             .arg(model_path)
             .arg("-c")
@@ -293,6 +343,14 @@ impl LlamaServer {
         let address = format!("127.0.0.1:{port}");
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(30) {
+            // 子进程已经自行退出（端口被别人抢了 / 模型坏了 / 参数被拒）：它不可能
+            // 再就绪；更不能把「恰好占着这个端口的别人」当成自己的服务——那会让
+            // 之后每一批请求都发给陌生进程，白白多走一轮失败 + 命令行回退。
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                warn!("llama-server 启动后立即退出，放弃常驻服务，回退命令行");
+                let _ = child.wait();
+                return None;
+            }
             if TcpStream::connect_timeout(&address.parse().ok()?, Duration::from_millis(250))
                 .is_ok()
             {
@@ -301,7 +359,6 @@ impl LlamaServer {
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        let mut child = child;
         let _ = child.kill();
         let _ = child.wait();
         None
@@ -445,7 +502,7 @@ impl LLMEngine {
         Self {
             cli_path: cli_path.as_ref().to_path_buf(),
             model_path: model_path.as_ref().to_path_buf(),
-            ctx_size,
+            ctx_size: clamp_ctx_size(ctx_size),
             threads: std::sync::atomic::AtomicU32::new(threads.max(1)),
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             glossary: Mutex::new(String::new()),
@@ -545,7 +602,7 @@ impl LLMEngine {
         let mut cli_cmd = Command::new(&self.cli_path);
         // 让路模式同样适用于命令行回退路径
         super::media_pipeline::apply_default_child_flags(&mut cli_cmd);
-        let output = cli_cmd
+        let mut child = cli_cmd
             .arg("-m")
             .arg(&self.model_path)
             .arg("-c")
@@ -563,23 +620,87 @@ impl LLMEngine {
             .arg("-no-cnv")
             .arg("--no-warmup")
             .arg("--no-display-prompt")
-            .output();
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?;
+
+        // 必须**边跑边读** stdout：管道缓冲区只有几 KB，长批的译文（上千 token）
+        // 一旦把它写满，子进程会阻塞在 write 上，而父进程又在等它退出——双方一起
+        // 卡死。读线程负责抽干 stdout，父线程只负责等待与超时。
+        // stderr 一起抽干：既避免同样的写满互等，也保住失败时的排障信息。
+        let stdout_reader = drain_pipe(child.stdout.take());
+        let stderr_reader = drain_pipe(child.stderr.take());
+
+        // 有界等待：正常退出、取消、超时三种出口都走这里，出口之后一律 kill + wait
+        // 回收，绝不留下挂着不退的子进程。
+        //
+        // 没有直接复用 `engines::ffmpeg::run_with_deadline`：那套执行器只有截止期、
+        // 没有取消钩子，而这条路径必须能立刻响应界面的「终止」（长批可能跑几分钟）。
+        let budget = cli_wait_budget(max_tokens);
+        let deadline = Instant::now() + budget;
+        let mut status = None;
+        loop {
+            match child.try_wait() {
+                Ok(Some(s)) => {
+                    status = Some(s);
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(error = %e, "等待 llama.cpp 润色进程失败");
+                    break;
+                }
+            }
+            if self.is_cancelled() {
+                warn!("润色/翻译被取消，终止命令行 llama.cpp 子进程");
+                break;
+            }
+            if Instant::now() >= deadline {
+                warn!(
+                    seconds = budget.as_secs(),
+                    "命令行 llama.cpp 超过等待上限仍未退出，终止该批（其余批次继续）"
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        // kill 之后必须 wait：只 kill 不 wait 会留下未回收的进程条目。
+        let _ = child.wait();
+        let stdout_bytes = stdout_reader
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
 
         // 进程已退出，提示词文件不再需要：立刻删除（守卫仍会在返回时兜底）
         prompt_guard.remove_now();
 
-        match output {
-            Ok(out) if out.status.success() => {
-                Some(String::from_utf8_lossy(&out.stdout).into_owned())
-            }
-            Ok(out) => {
-                warn!("llama.cpp 润色退出失败: {:?}", out.status.code());
+        match status {
+            Some(s) if s.success() => Some(String::from_utf8_lossy(&stdout_bytes).into_owned()),
+            Some(s) => {
+                let err_bytes = stderr_reader
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or_default();
+                let err = String::from_utf8_lossy(&err_bytes);
+                let tail: String = err
+                    .chars()
+                    .rev()
+                    .take(400)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                warn!(
+                    "llama.cpp 润色退出失败: {:?}；stderr 尾部: {}",
+                    s.code(),
+                    tail.trim()
+                );
                 None
             }
-            Err(e) => {
-                warn!("调用 llama.cpp 润色失败: {}", e);
-                None
-            }
+            // 取消 / 超时：日志已在上面记过，这里保持「本批无结果」。
+            None => None,
         }
     }
 
@@ -1216,6 +1337,91 @@ impl LLMEngine {
         Some((index, rest.to_string()))
     }
 
+    /// 正文是否含「实义字符」（字母 / 数字 / CJK 表意字…）。
+    ///
+    /// 只由标点组成的片段（`。`、`…`、`——`）不是有效结果：它只可能来自解析时的
+    /// 错切，写回字幕就是一句「只剩标点的译文」。宁可拒收（该句保持未译 / 保留
+    /// 原文），也不把垃圾写进字幕。
+    fn has_substantive_text(text: &str) -> bool {
+        text.chars().any(|c| c.is_alphanumeric())
+    }
+
+    /// 去掉块首的分隔装饰（`:`、`-`、`|`、markdown 的 `*` 等）与首尾空白，
+    /// 再清掉模型多吐的结束标签。
+    fn clean_indexed_body(raw: &str) -> String {
+        Self::strip_stop_tags(
+            raw.trim()
+                .trim_start_matches([
+                    ':', '：', '-', '—', '|', '。', '，', '、', '）', ')', '.', '*', '#',
+                ])
+                .trim(),
+        )
+    }
+
+    /// 把一段文本按**行内 `[序号]` 标记**切成 `(序号, 正文)` 块。
+    ///
+    /// 为什么需要它：提示词要求逐行输出，但小模型偶发把两三条并进同一行
+    /// （`[1] 甲。 [2] 乙。`）。行级正则只认行首那个序号，`(.+?)$` 会把**后面那几条
+    /// 连同它们的 `[2]` 标记一起塞进前一条的正文**——用户看到的就是「第 1 句译文里
+    /// 莫名多了第 2 句」。这里按标记把正文切开，每条各自成块，再由调用方用
+    /// `expected` 过滤。
+    ///
+    /// 分块边界判据：标记之前必须是行首、空白或标点。`见参考文献[3]的证明` 里的
+    /// `[3]` 紧贴汉字（引用标注，不是分块），**不算边界**——否则会把前一句译文的
+    /// 尾巴错切给第 3 句，正是要避免的「张冠李戴」。
+    fn split_inline_indexed_blocks(line: &str, re_marker: &regex::Regex) -> Vec<(usize, String)> {
+        let mut marks: Vec<(usize, usize, usize)> = Vec::new();
+        for caps in re_marker.captures_iter(line) {
+            let (Some(m), Some(index)) = (
+                caps.get(0),
+                caps.get(1).and_then(|c| c.as_str().parse::<usize>().ok()),
+            ) else {
+                continue;
+            };
+            let at_boundary = line[..m.start()]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+            if at_boundary {
+                marks.push((index, m.start(), m.end()));
+            }
+        }
+
+        let mut blocks = Vec::with_capacity(marks.len());
+        for (i, &(index, _, end)) in marks.iter().enumerate() {
+            let stop = marks.get(i + 1).map(|m| m.1).unwrap_or(line.len());
+            blocks.push((index, Self::clean_indexed_body(&line[end..stop])));
+        }
+        blocks
+    }
+
+    /// 一条解析结果的准入判据，三条缺一不可：
+    /// 1. 序号必须在**本批**待处理集合里（`expected`）——防模型改写 / 自己重新编号；
+    /// 2. 正文必须含实义字符——纯标点碎片不是译文；
+    /// 3. 正文里不得再出现本批**其它序号**的 `[n]` 标记——那说明模型把多条并进了
+    ///    一行（或正文里带了引用标注），切分点无从判断；写回就可能张冠李戴。
+    ///
+    /// 拒收的代价只是「这一句这一轮没写回」：翻译链路会走折半重试（小批通常吐得出
+    /// 干净的逐行结果），润色链路则保留上一遍润色/原文。**宁可漏认，不可错认**。
+    fn batch_entry_is_trustworthy(
+        index: usize,
+        text: &str,
+        expected: &std::collections::HashSet<usize>,
+        re_marker: Option<&regex::Regex>,
+    ) -> bool {
+        if !expected.contains(&index) || !Self::has_substantive_text(text) {
+            return false;
+        }
+        let Some(re) = re_marker else {
+            return true;
+        };
+        !re.captures_iter(text).any(|caps| {
+            caps.get(1)
+                .and_then(|c| c.as_str().parse::<usize>().ok())
+                .is_some_and(|n| n != index && expected.contains(&n))
+        })
+    }
+
     pub(crate) fn parse_batch_response(
         raw: &str,
         expected: &std::collections::HashSet<usize>,
@@ -1231,11 +1437,10 @@ impl LLMEngine {
             clean
         };
 
-        // 2. 逐行匹配与容错正则识取 (兼容 Markdown 列表、加粗、方括号、点号等)
-        let re_bracket = regex::Regex::new(
-            r"(?m)^\s*(?:[-*•>#\s]*)\s*(?:\*\*)?\[\s*(\d+)\s*\](?:\*\*)?\s*[:：\-—]?\s*(.+?)\s*$",
-        )
-        .ok();
+        // 2. 行内 `[序号]` 标记：一行可能塞了多条，先切块再逐块过滤。
+        let re_marker = regex::Regex::new(r"\[\s*(\d+)\s*\]").ok();
+        // 3. 无方括号的容错写法（`123.` / `123)` / `123、` / `123:`），兼容
+        //    Markdown 列表与加粗。
         let re_numbered = regex::Regex::new(
             r"(?m)^\s*(?:[-*•>#\s]*)\s*(?:\*\*)?(\d+)(?:\*\*)?\s*[\.\)）\:：、\-—\|]\s*(.+?)\s*$",
         )
@@ -1246,59 +1451,64 @@ impl LLMEngine {
             if line_trim.is_empty() {
                 continue;
             }
-            let mut matched = false;
-            if let Some(ref re) = re_bracket {
+
+            // 2) 行内 `[序号]`（兼容 `[ 3 ]`、`**[3]**`、列表前缀等）。
+            if let Some(ref re) = re_marker {
+                let mut inserted = false;
+                for (index, text) in Self::split_inline_indexed_blocks(line_trim, re) {
+                    if Self::batch_entry_is_trustworthy(index, &text, expected, Some(re)) {
+                        result.insert(index, text);
+                        inserted = true;
+                    }
+                }
+                if inserted {
+                    continue;
+                }
+            }
+
+            // 3) 无方括号的容错写法。
+            let mut numbered_matched = false;
+            if let Some(ref re) = re_numbered {
                 if let Some(caps) = re.captures(line_trim) {
                     if let (Some(m_idx), Some(m_text)) = (caps.get(1), caps.get(2)) {
-                        if let Ok(idx) = m_idx.as_str().parse::<usize>() {
+                        if let Ok(index) = m_idx.as_str().parse::<usize>() {
                             let text = Self::strip_stop_tags(m_text.as_str().trim());
-                            if expected.contains(&idx) && !text.is_empty() {
-                                result.insert(idx, text);
-                                matched = true;
+                            if Self::batch_entry_is_trustworthy(
+                                index,
+                                &text,
+                                expected,
+                                re_marker.as_ref(),
+                            ) {
+                                result.insert(index, text);
+                                numbered_matched = true;
                             }
                         }
                     }
                 }
             }
-            if !matched {
-                if let Some(ref re) = re_numbered {
-                    if let Some(caps) = re.captures(line_trim) {
-                        if let (Some(m_idx), Some(m_text)) = (caps.get(1), caps.get(2)) {
-                            if let Ok(idx) = m_idx.as_str().parse::<usize>() {
-                                let text = Self::strip_stop_tags(m_text.as_str().trim());
-                                if expected.contains(&idx) && !text.is_empty() {
-                                    result.insert(idx, text);
-                                    matched = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if !matched {
+
+            // 4) 兜底：前导数字 + 分隔标点（`2. 译文`）。
+            if !numbered_matched {
                 if let Some((index, text)) = Self::parse_indexed_line(line_trim) {
                     let text = Self::strip_stop_tags(&text);
-                    if expected.contains(&index) && !text.is_empty() {
+                    if Self::batch_entry_is_trustworthy(index, &text, expected, re_marker.as_ref())
+                    {
                         result.insert(index, text);
                     }
                 }
             }
         }
 
-        // 3. 全局正则容错扫描：如果行级解析仍有缺失，扫描全文中的 `[序号] 译文` 结构
+        // 5. 全文兜底扫描：行级解析仍有缺失时按标记再扫一遍。只取标记后的**第一行**
+        //    （与旧行为一致）：跨行拼接会把后文的散文吞进正文，得不偿失。
         if result.len() < expected.len() {
-            if let Ok(re_global) = regex::Regex::new(r"\[\s*(\d+)\s*\]\s*[:：\-—]?\s*([^\n\r\[]+)")
-            {
-                for caps in re_global.captures_iter(clean) {
-                    if let (Some(m_idx), Some(m_text)) = (caps.get(1), caps.get(2)) {
-                        if let Ok(idx) = m_idx.as_str().parse::<usize>() {
-                            if expected.contains(&idx) && !result.contains_key(&idx) {
-                                let text = Self::strip_stop_tags(m_text.as_str().trim());
-                                if !text.is_empty() {
-                                    result.insert(idx, text);
-                                }
-                            }
-                        }
+            if let Some(ref re) = re_marker {
+                for (index, text) in Self::split_inline_indexed_blocks(clean, re) {
+                    let text = text.lines().next().unwrap_or("").trim().to_string();
+                    if !result.contains_key(&index)
+                        && Self::batch_entry_is_trustworthy(index, &text, expected, Some(re))
+                    {
+                        result.insert(index, text);
                     }
                 }
             }
@@ -1373,12 +1583,14 @@ impl LLMEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_char_budget, chinese_variant_target, fixed_prompt_tokens, is_untranslated_copy,
-        llama_stop_type_is_limit, output_token_budget, plan_translate_batches, CopyRate, LLMEngine,
-        MAX_SEGMENTS_PER_BATCH, OUTPUT_TOKENS_PER_CHAR, PROMPT_TOKENS_PER_CHAR,
+        batch_char_budget, chinese_variant_target, clamp_ctx_size, cli_wait_budget,
+        fixed_prompt_tokens, is_untranslated_copy, llama_stop_type_is_limit, output_token_budget,
+        plan_translate_batches, CopyRate, LLMEngine, MAX_SEGMENTS_PER_BATCH,
+        OUTPUT_TOKENS_PER_CHAR, PROMPT_TOKENS_PER_CHAR,
     };
     use crate::subtitle::Segment;
     use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
 
     #[test]
     fn parses_indexed_batch_response() {
@@ -1436,6 +1648,91 @@ mod tests {
     #[test]
     fn strips_llama_stop_tags() {
         assert_eq!(LLMEngine::strip_stop_tags("结果。 [end of text]"), "结果。");
+    }
+
+    // ─────────── 回填对齐：一行塞多条 / 引用标注 / 纯标点碎片 ───────────
+
+    /// 回归：模型把两条并到同一行时，**不得**把后一条连同它的 `[2]` 标记一起塞进
+    /// 前一条的正文。此前行级正则 `(.+?)$` 会整段吞下，第 1 句译文里出现第 2 句
+    /// （用户看到的就是「句子张冠李戴」）。
+    #[test]
+    fn merged_line_splits_blocks_instead_of_leaking_into_previous() {
+        let expected = HashSet::from([1, 2]);
+        let result = LLMEngine::parse_batch_response("[1] 第一句。 [2] 第二句！", &expected);
+        assert_eq!(result.get(&1).map(String::as_str), Some("第一句。"));
+        assert_eq!(result.get(&2).map(String::as_str), Some("第二句！"));
+        assert!(
+            !result.get(&1).unwrap().contains("[2]"),
+            "序号标记不得并进前一条正文: {result:?}"
+        );
+    }
+
+    /// 一行塞三条：每条各自归位，正文互不串味。
+    #[test]
+    fn merged_line_splits_every_block() {
+        let expected = HashSet::from([1, 2, 3]);
+        let result = LLMEngine::parse_batch_response("[1] 甲。 [2] 乙。 [3] 丙。", &expected);
+        assert_eq!(result.len(), 3, "三条都要解析出来: {result:?}");
+        assert_eq!(result.get(&1).map(String::as_str), Some("甲。"));
+        assert_eq!(result.get(&2).map(String::as_str), Some("乙。"));
+        assert_eq!(result.get(&3).map(String::as_str), Some("丙。"));
+    }
+
+    /// 引用标注（`参考文献[3]`）里的 `[3]` 紧贴汉字，不是分块边界：绝不能把第 1 句
+    /// 译文的尾巴当第 3 句写回。带这种标注的块一律**拒收**（保守），
+    /// 交给折半重试补，不会错位。
+    #[test]
+    fn glued_reference_marker_is_not_a_block_boundary() {
+        let expected = HashSet::from([1, 3]);
+        let only_ref = LLMEngine::parse_batch_response("[1] 见参考文献[3]的证明。", &expected);
+        assert!(
+            !only_ref.contains_key(&3),
+            "引用标注不得被当成第 3 句的译文: {only_ref:?}"
+        );
+
+        // 同一行里另有真正的 `[3] ` 分块：第 3 句拿到自己的译文，带标注的块保守拒收。
+        let mixed = LLMEngine::parse_batch_response("[1] 见参考文献[3]的证明。[3] 丙。", &expected);
+        assert_eq!(mixed.get(&3).map(String::as_str), Some("丙。"));
+        assert!(
+            !mixed.contains_key(&1),
+            "带引用标注的块保守拒收，不得错位写回: {mixed:?}"
+        );
+    }
+
+    /// 纯标点碎片不是译文：既不得写回第 2 句，也不得并进第 1 句。
+    #[test]
+    fn punctuation_only_fragment_is_rejected() {
+        let expected = HashSet::from([1, 2]);
+        let result = LLMEngine::parse_batch_response("[1] 甲。 [2] 。", &expected);
+        assert_eq!(result.get(&1).map(String::as_str), Some("甲。"));
+        assert!(!result.contains_key(&2), "纯标点碎片不得写回: {result:?}");
+    }
+
+    // ─────────── 数值边界：上下文窗口 / 命令行等待上限 ───────────
+
+    /// 离谱的 `llm_ctx`（0 / 极大）必须在构造时夹到可用区间——`-c 0` 会让 llama.cpp
+    /// 直接拒绝启动（常驻服务与命令行回退双双失败）。
+    #[test]
+    fn ctx_size_is_clamped_to_usable_range() {
+        assert_eq!(clamp_ctx_size(0), 512);
+        assert_eq!(clamp_ctx_size(1), 512);
+        assert_eq!(clamp_ctx_size(4096), 4096);
+        assert_eq!(clamp_ctx_size(u32::MAX), 65_536);
+        // 引擎必须拿夹过的窗口去算预算；线程数下限同样是 1。
+        let engine = LLMEngine::new("cli", "model.gguf", 0, 0);
+        assert_eq!(engine.ctx_size, 512);
+        assert_eq!(engine.threads(), 1);
+    }
+
+    /// 命令行回退路径的等待上限：随 token 预算增长，且有下限/上限——既不能
+    /// 「无限等」（子进程挂住就整条流水线卡死），也不能小到把正常生成掐掉。
+    #[test]
+    fn cli_wait_budget_is_bounded_and_grows_with_tokens() {
+        assert_eq!(cli_wait_budget(0), Duration::from_secs(60));
+        assert_eq!(cli_wait_budget(64), Duration::from_secs(60));
+        assert_eq!(cli_wait_budget(1_000), Duration::from_secs(500));
+        assert_eq!(cli_wait_budget(u32::MAX), Duration::from_secs(900));
+        assert!(cli_wait_budget(1_000) > cli_wait_budget(200));
     }
 
     #[test]

@@ -33,6 +33,23 @@ use std::path::Path;
 /// 全链路统一的音频采样率（Whisper 要求 16 kHz 单声道）。
 pub const SAMPLE_RATE: u32 = 16_000;
 
+/// 高通截止频率上限（Hz）。
+///
+/// 用户可以在 config 里手写任意 f64（JSON 里的 `1e400` 会解析成 `inf`）。实测
+/// ffmpeg 对 `highpass=f` 的可接受范围是 `[0, 999999]`：`inf` / `1e300` 会被判
+/// "out of range"，让整条滤镜图直接失败（`-af` 报错 → 预处理整体失败）；而
+/// 落在 `(源 Nyquist, 999999]` 的值不报错、却把语音整段削成静音。
+/// 取 2000 Hz：低于任何常见语音采样率（≥8 kHz）的 Nyquist，高通永远不可能把
+/// 整段语音削没，同时离默认值 70 Hz / UI 上限 200 Hz 还有十倍余量。
+const MAX_HIGHPASS_HZ: f64 = 2_000.0;
+
+/// `aresample` 允许的目标采样率区间（Hz）。0 表示不做重采样。
+const MIN_TARGET_RATE: u32 = 8_000;
+const MAX_TARGET_RATE: u32 = 192_000;
+
+/// `atempo` 的速率上限（实测 ffmpeg 对 `tempo` 的合法区间是 `[0.5, 100]`）。
+const MAX_SPEED: f64 = 100.0;
+
 // ───────────────────────── 语音增强滤镜链 ─────────────────────────
 
 /// 语音增强开关集合。默认值按「保守但有效」选取：
@@ -42,6 +59,7 @@ pub struct SpeechFilterOptions {
     /// 高通截止频率（Hz）。0 = 关闭。
     /// Whisper 的 mel 从 80 Hz 起，低于此的频率只贡献能量不贡献信息；
     /// 去直流与低频轰鸣还能避免 VAD 被低频噪声触发。
+    /// 拼串时会净化：`NaN` / `inf` / 负值按关闭处理，上限见 [`MAX_HIGHPASS_HZ`]。
     pub highpass_hz: f64,
     /// FFT 谱减降噪（afftdn）。稳态底噪（空调、风扇、电流声）会让
     /// Whisper 在静音处「听出」词语。
@@ -49,7 +67,7 @@ pub struct SpeechFilterOptions {
     /// 语音动态电平归一（dynaudnorm）。远场/手机录音电平常低到
     /// 让 `no_speech_thold` 误判，归一后 VAD 阈值也才可靠。
     pub normalize: bool,
-    /// 输出采样率
+    /// 输出采样率。0 = 不重采样；非 0 时限制在 `[MIN_TARGET_RATE, MAX_TARGET_RATE]`。
     pub target_rate: u32,
 }
 
@@ -85,9 +103,22 @@ impl SpeechFilterOptions {
     pub fn chain_with_speed(&self, speed: f64) -> Option<String> {
         let mut stages: Vec<String> = Vec::new();
 
-        if self.highpass_hz > 0.0 {
+        // 用户可在 config 里手写 `preprocess_highpass_hz`（含 JSON `1e400` 解析出的
+        // `inf`）。`inf` / `NaN` / 负值 / 极大值直接拼进 `-af` 的后果见
+        // [`MAX_HIGHPASS_HZ`]：轻则 ffmpeg 参数越界整条链失败，重则静默把语音削成
+        // 静音。所以非有限的、非正的一律按「关闭」处理，其余限幅。
+        //
+        // 取整成整数 Hz 再拼串：`{:.0}` 的银行家舍入会把 (0, 0.5) 里的值格式化成
+        // `highpass=f=0`（实测 ffmpeg 把 f=0 当无滤波处理），配置上却显示「高通已开」，
+        // 语义不一致。取整后不足 1 Hz 的档位直接丢弃。
+        let highpass_hz = if self.highpass_hz.is_finite() && self.highpass_hz > 0.0 {
+            self.highpass_hz.min(MAX_HIGHPASS_HZ).round() as u32
+        } else {
+            0
+        };
+        if highpass_hz > 0 {
             // poles=2 是 12 dB/oct，足够削掉直流与轰鸣又不动 80 Hz 以上的语音基频
-            stages.push(format!("highpass=f={:.0}:poles=2", self.highpass_hz));
+            stages.push(format!("highpass=f={highpass_hz}:poles=2"));
         }
         if self.denoise {
             // nr=12：只衰减 12 dB，宁可少降也不引入伪影
@@ -103,16 +134,26 @@ impl SpeechFilterOptions {
             //        归一器会把句间底噪放大到「像语音」，反而制造幻觉
             stages.push("dynaudnorm=f=250:g=15:p=0.90:m=4.0".to_string());
         }
+        // atempo 的合法区间是 [0.5, 100]：`inf` / `NaN` 会被判 out of range 让整条
+        // 滤镜图失败（实测 exit≠0）。上游虽然已经 limit 过一次，这里作为公开 API
+        // 仍然自己兜底：非有限值 = 不变速，其余限幅。
+        let speed = if speed.is_finite() {
+            speed.clamp(1.0, MAX_SPEED)
+        } else {
+            1.0
+        };
         if speed > 1.0 {
             // 1.0~1.5 区间内 atempo 不需要级联（>2.0 才需要）
             stages.push(format!("atempo={speed:.3}"));
         }
         if self.target_rate != 0 {
+            // 非法采样率（1 Hz / u32::MAX）ffmpeg 并不报错，只会把音频重采样成静音；
+            // 限幅到可选区间后再拼串。0 = 不重采样（保留源采样率）。
+            let target_rate = self.target_rate.clamp(MIN_TARGET_RATE, MAX_TARGET_RATE);
             // soxr 在 16 kHz 目标下的阻带抑制明显优于默认 swr，
             // mel 谱更干净；precision=28 是 32 位浮点下的实用上限
             stages.push(format!(
-                "aresample={}:resampler=soxr:precision=28:cutoff=0.97",
-                self.target_rate
+                "aresample={target_rate}:resampler=soxr:precision=28:cutoff=0.97"
             ));
         }
 
@@ -271,6 +312,8 @@ impl CompactionPlan {
 
 /// 逐帧 RMS（dBFS），用于能量 VAD。
 fn frame_db(pcm: &[i16], frame: usize) -> Vec<f64> {
+    // 帧长按 1 兜底：`pcm.chunks(0)` 会直接 panic（首帧都进不去）。
+    let frame = frame.max(1);
     let mut out = Vec::with_capacity(pcm.len() / frame + 1);
     for chunk in pcm.chunks(frame) {
         if chunk.is_empty() {
@@ -327,6 +370,13 @@ fn ms_to_frames(ms: u32, frame_ms: u32) -> usize {
 pub fn plan_compaction(pcm: &[i16], rate: u32, cfg: &CompactionConfig) -> CompactionPlan {
     let total = pcm.len();
     let identity = |total: usize, rate: u32| CompactionPlan::identity(total, rate);
+
+    // 采样率 0 无法解释时间轴：帧长、时段与映射表都要按 rate 换算，放过去会在
+    // 映射表里算出 `inf` 时长（`(e - s) as f64 / 0.0`），回映射时把整条字幕时间轴
+    // 打飞。0 采样率下不做任何判断，直接退回恒等计划。
+    if rate == 0 {
+        return identity(total, rate);
+    }
 
     let frame = ((rate as u64 * cfg.frame_ms.max(1) as u64) / 1000).max(1) as usize;
     if total < frame * 4 {
@@ -450,6 +500,12 @@ pub fn plan_compaction(pcm: &[i16], rate: u32, cfg: &CompactionConfig) -> Compac
 /// 原实现直接 `(samples.len() * 2) as u32`，超 4 GiB 会静默回绕，写出的头长与
 /// 真实数据不符，播放器按头截断，尾部样本被整段丢弃。
 fn wav_header_mono16(sample_count: usize, rate: u32) -> Result<Vec<u8>> {
+    // 采样率 0 写出的是非法 WAV：头里 byte_rate / 采样率都是 0，解码端要么直接
+    // 拒绝、要么按 0 做除法。这里的调用方都传真实采样率，所以直接报错而不是静默
+    // 落一个坏文件。
+    if rate == 0 {
+        anyhow::bail!("WAV 采样率必须大于 0（收到 0），否则写出的是无法解析的非法 WAV");
+    }
     let data_len = u32::try_from(sample_count.checked_mul(2).context("WAV 数据长度溢出")?)
         .context("WAV 数据超过 4 GiB，超出标准 WAV 头可表示范围")?;
     let riff_len = 36u32
@@ -495,7 +551,10 @@ pub fn write_wav_mono16<P: AsRef<Path>>(path: P, samples: &[i16], rate: u32) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        ms_to_frames, plan_compaction, wav_header_mono16, write_wav_mono16, CompactionConfig,
+        CompactionPlan, SpeechFilterOptions,
+    };
 
     /// 生成 rate 采样率、指定秒数的语音样信号（正弦，幅度 amplitude）
     fn tone(seconds: f64, rate: u32, amplitude: i16) -> Vec<i16> {
@@ -816,5 +875,399 @@ mod tests {
             "错误必须点明目录创建失败: {msg}"
         );
         let _ = std::fs::remove_file(&blocker);
+    }
+}
+
+/// 参数净化与退化输入的下限测试：全部是纯函数，不碰子进程、不联网。
+#[cfg(test)]
+mod sanitize_tests {
+    use super::{
+        frame_db, plan_compaction, wav_header_mono16, CompactionConfig, SpeechFilterOptions,
+        MAX_HIGHPASS_HZ, MAX_SPEED, MAX_TARGET_RATE, MIN_TARGET_RATE,
+    };
+
+    /// 一个除了被测字段外全部关闭的选项集，避免其它级干扰断言。
+    fn bare() -> SpeechFilterOptions {
+        SpeechFilterOptions {
+            highpass_hz: 0.0,
+            denoise: false,
+            normalize: false,
+            target_rate: 0,
+        }
+    }
+
+    fn tone(seconds: f64, rate: u32, amplitude: i16) -> Vec<i16> {
+        let n = (seconds * rate as f64) as usize;
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / rate as f64;
+                (amplitude as f64 * (2.0 * std::f64::consts::PI * 220.0 * t).sin()) as i16
+            })
+            .collect()
+    }
+
+    fn silence(seconds: f64, rate: u32) -> Vec<i16> {
+        vec![0i16; (seconds * rate as f64) as usize]
+    }
+
+    /// config 里的 highpass 是裸 f64：`inf` / `NaN` / 负值必须按「关闭」处理，
+    /// 极大值必须限幅。`inf` 拼进 `-af` 会被 ffmpeg 判 out of range（实测整条链
+    /// 失败），而 (Nyquist, 999999] 的极大值不报错、只把语音静默削没。
+    #[test]
+    fn filter_chain_rejects_nonfinite_highpass_and_clamps_extremes() {
+        assert!(bare().chain().is_none());
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -12.0, -0.0, 0.0] {
+            let opts = SpeechFilterOptions {
+                highpass_hz: bad,
+                ..bare()
+            };
+            assert!(opts.chain().is_none(), "highpass={bad} 不得产生任何滤镜串");
+        }
+
+        for huge in [1e300, 999_999.0, MAX_HIGHPASS_HZ + 1.0] {
+            let chain = SpeechFilterOptions {
+                highpass_hz: huge,
+                ..bare()
+            }
+            .chain()
+            .expect("限幅后必须仍有高通级");
+            assert_eq!(
+                chain,
+                format!("highpass=f={MAX_HIGHPASS_HZ:.0}:poles=2"),
+                "highpass={huge} 必须限幅到 {MAX_HIGHPASS_HZ}"
+            );
+        }
+
+        // 上限以内的合法值原样保留（用户可感知的档位不得被改）
+        let kept = SpeechFilterOptions {
+            highpass_hz: 120.0,
+            ..bare()
+        }
+        .chain()
+        .unwrap();
+        assert_eq!(kept, "highpass=f=120:poles=2");
+
+        // 取整：不足 1 Hz 的档位丢弃，刚好 0.5 Hz 取整成 1 Hz 而不是 `f=0`
+        assert!(
+            SpeechFilterOptions {
+                highpass_hz: 0.4,
+                ..bare()
+            }
+            .chain()
+            .is_none(),
+            "round 到 0 Hz 的高通必须整级丢弃"
+        );
+        assert_eq!(
+            SpeechFilterOptions {
+                highpass_hz: 0.5,
+                ..bare()
+            }
+            .chain()
+            .unwrap(),
+            "highpass=f=1:poles=2"
+        );
+        assert_eq!(
+            SpeechFilterOptions {
+                highpass_hz: 119.6,
+                ..bare()
+            }
+            .chain()
+            .unwrap(),
+            "highpass=f=120:poles=2"
+        );
+    }
+
+    /// 非法采样率不能让 ffmpeg 静默把音频重采样成静音；0 仍然是「不重采样」。
+    #[test]
+    fn filter_chain_clamps_invalid_target_rate() {
+        assert!(
+            SpeechFilterOptions {
+                target_rate: 0,
+                ..bare()
+            }
+            .chain()
+            .is_none(),
+            "target_rate=0 表示不重采样"
+        );
+
+        for (given, want) in [
+            (16_000u32, 16_000u32),
+            (1, MIN_TARGET_RATE),
+            (4_000, MIN_TARGET_RATE),
+            (8_000, MIN_TARGET_RATE),
+            (48_000, 48_000),
+            (MAX_TARGET_RATE, MAX_TARGET_RATE),
+            (800_000, MAX_TARGET_RATE),
+            (u32::MAX, MAX_TARGET_RATE),
+        ] {
+            let chain = SpeechFilterOptions {
+                target_rate: given,
+                ..bare()
+            }
+            .chain()
+            .expect("非 0 采样率必须产出 aresample 级");
+            assert_eq!(
+                chain,
+                format!("aresample={want}:resampler=soxr:precision=28:cutoff=0.97"),
+                "target_rate={given} 应限幅为 {want}"
+            );
+        }
+    }
+
+    /// `speed` 非有限值不得变成 `atempo=inf`，超大值必须限幅到 ffmpeg 的合法区间。
+    #[test]
+    fn filter_chain_sanitizes_speed() {
+        let opts = SpeechFilterOptions::default();
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let chain = opts.chain_with_speed(bad).expect("增强级仍在，链不为空");
+            assert!(
+                !chain.contains("atempo"),
+                "speed={bad} 不得产生 atempo: {chain}"
+            );
+        }
+
+        for slow in [0.25, 0.999, 1.0] {
+            let chain = opts.chain_with_speed(slow).unwrap();
+            assert!(!chain.contains("atempo"), "speed={slow} 不应变速: {chain}");
+        }
+
+        assert!(
+            opts.chain_with_speed(1.35)
+                .unwrap()
+                .contains("atempo=1.350"),
+            "区间内的合法变速必须保留"
+        );
+        assert!(
+            opts.chain_with_speed(1e9)
+                .unwrap()
+                .contains(&format!("atempo={MAX_SPEED:.3}")),
+            "超大 speed 必须限幅到 {MAX_SPEED}"
+        );
+    }
+
+    /// 滤镜串唯一的安全前提：所有用户可控量都是数值，拼出来只能由数字和滤镜语法
+    /// 字符组成，不可能出现能拆开 `-af` 的引号/分号/反斜杠/方括号，也不可能出现
+    /// `inf` / `NaN` 这类会被参数校验拒掉的记号。
+    #[test]
+    fn filter_chain_contains_only_filter_graph_syntax() {
+        const KNOWN: [&str; 5] = ["highpass", "afftdn", "dynaudnorm", "atempo", "aresample"];
+
+        for hp in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -3.0,
+            0.5,
+            70.0,
+            1e30,
+            MAX_HIGHPASS_HZ,
+        ] {
+            let opts = SpeechFilterOptions {
+                highpass_hz: hp,
+                denoise: true,
+                normalize: true,
+                target_rate: 16_000,
+            };
+            let chain = opts.chain_with_speed(1e30).expect("默认开关下链必然存在");
+
+            for ch in chain.chars() {
+                assert!(
+                    ch.is_ascii_alphanumeric() || matches!(ch, '=' | ':' | ',' | '.' | '_' | '-'),
+                    "滤镜串出现可疑字符 {ch:?}: {chain}"
+                );
+            }
+            assert!(!chain.to_ascii_lowercase().contains("inf"), "{chain}");
+            assert!(!chain.contains("NaN"), "{chain}");
+
+            for stage in chain.split(',') {
+                let (name, params) = stage
+                    .split_once('=')
+                    .unwrap_or_else(|| panic!("每级滤镜必须是 name=params: {chain}"));
+                assert!(
+                    KNOWN.contains(&name),
+                    "出现未知滤镜名（可能是注入）: {name} in {chain}"
+                );
+                assert!(!params.is_empty(), "滤镜参数不得为空: {chain}");
+            }
+
+            if let Some(stage) = chain.split(',').find(|s| s.starts_with("highpass=")) {
+                let f: u32 = stage
+                    .trim_start_matches("highpass=f=")
+                    .split(':')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .expect("高通截止必须是整数 Hz");
+                assert!(
+                    f >= 1 && f <= MAX_HIGHPASS_HZ as u32,
+                    "highpass f={f} 越界: {chain}"
+                );
+            }
+        }
+    }
+
+    /// 0 采样率下不得算出 `inf` 时长：直接退回恒等计划，不做任何压实判断。
+    #[test]
+    fn plan_compaction_zero_rate_returns_identity() {
+        // 1200 个固定电平样本接 1200 个 0：若不拦 0 采样率，这段会被判成
+        //「有语音 + 有静音」，然后在映射表里做 `(e - s) as f64 / 0.0`，得到 inf。
+        let mut pcm = vec![3_000i16; 1_200];
+        pcm.extend(vec![0i16; 1_200]);
+        let plan = plan_compaction(&pcm, 0, &CompactionConfig::default());
+
+        assert!(plan.is_identity(), "0 采样率必须恒等: {:?}", plan.spans);
+        assert_eq!(plan.spans, vec![(0, pcm.len())]);
+        assert_eq!(plan.kept_samples, pcm.len());
+        assert_eq!(plan.ratio(), 1.0);
+        for piece in &plan.map {
+            assert!(
+                piece.duration.is_finite() && piece.compact_start.is_finite(),
+                "0 采样率不得产出非有限时长: {piece:?}"
+            );
+        }
+    }
+
+    /// `chunks(0)` 会 panic；帧长 0 必须按 1 样本兜底。
+    #[test]
+    fn frame_db_zero_frame_len_does_not_panic() {
+        let dbs = frame_db(&[0i16, 3_000, -3_000, 8_000], 0);
+        assert_eq!(dbs.len(), 4, "帧长 0 按 1 样本兜底");
+        assert_eq!(dbs[0], -100.0, "全 0 帧按 -100 dBFS");
+        assert!(dbs.iter().all(|v| v.is_finite() && *v >= -100.0));
+    }
+
+    /// 采样率 0 写出的是非法 WAV：必须报错，而不是静默落一个 byte_rate=0 的文件。
+    #[test]
+    fn wav_header_rejects_zero_sample_rate() {
+        let err = wav_header_mono16(8, 0).expect_err("0 采样率必须报错");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("采样率"), "错误必须点明采样率: {msg}");
+
+        // 非 0 采样率不受影响，空音频也要能写出合法头
+        assert!(wav_header_mono16(0, 16_000).is_ok());
+        assert!(wav_header_mono16(1, 8_000).is_ok());
+    }
+
+    /// 空音频 / 极短音频必须恒等，且 materialize 与 to_original 都不出格。
+    #[test]
+    fn plan_compaction_handles_empty_and_tiny_audio() {
+        let cfg = CompactionConfig::default();
+
+        let empty = plan_compaction(&[], 16_000, &cfg);
+        assert!(empty.spans.is_empty() && empty.map.is_empty());
+        assert_eq!(empty.kept_samples, 0);
+        assert!(empty.is_identity());
+        assert_eq!(empty.to_original(3.0), 3.0, "空映射必须恒等透传");
+        assert_eq!(empty.to_original(-1.0), -1.0);
+        assert!(empty.materialize(&[]).is_empty());
+
+        let tiny = plan_compaction(&[0i16; 3], 16_000, &cfg);
+        assert_eq!(tiny.spans, vec![(0, 3)], "极短音频不得被压实");
+        assert_eq!(tiny.materialize(&[0i16; 3]).len(), 3);
+    }
+
+    /// 退化配置（frame_ms=0 / pad 极大 / min_* 为 0 / 分位数越界或 NaN）下，
+    /// 计划本身必须自洽：区间有序不重叠不越界、kept_samples 与区间总长一致、
+    /// 映射表与区间一一对应、时间全部有限且单调、materialize 长度对得上。
+    #[test]
+    fn plan_compaction_degenerate_configs_stay_consistent() {
+        let rate = 16_000u32;
+        let mut pcm = tone(1.0, rate, 8_000);
+        pcm.extend(silence(3.0, rate));
+        pcm.extend(tone(1.0, rate, 8_000));
+
+        let mut cfgs: Vec<CompactionConfig> = Vec::new();
+        for frame_ms in [0u32, 1, 20, u32::MAX] {
+            for noise_percentile in [f64::NAN, -1.0, 0.0, 0.20, 1.0, 2.0] {
+                for pad_ms in [0u32, 180, u32::MAX] {
+                    cfgs.push(CompactionConfig {
+                        frame_ms,
+                        noise_percentile,
+                        pad_ms,
+                        min_speech_ms: 0,
+                        min_gap_ms: 0,
+                        keep_gap_ms: u32::MAX,
+                        ..CompactionConfig::default()
+                    });
+                }
+            }
+        }
+
+        for cfg in cfgs {
+            let plan = plan_compaction(&pcm, rate, &cfg);
+            assert_eq!(plan.total_samples, pcm.len());
+
+            let mut prev_end = 0usize;
+            let mut sum = 0usize;
+            for &(s, e) in &plan.spans {
+                assert!(s < e, "空/倒挂区间: {s}..{e} ({cfg:?})");
+                assert!(s >= prev_end, "区间重叠或乱序: {:?} ({cfg:?})", plan.spans);
+                assert!(e <= plan.total_samples, "区间越界: {:?}", plan.spans);
+                prev_end = e;
+                sum += e - s;
+            }
+            assert_eq!(sum, plan.kept_samples, "kept_samples 必须等于区间总长");
+            assert_eq!(plan.map.len(), plan.spans.len(), "映射表必须与区间一一对应");
+
+            for piece in &plan.map {
+                assert!(
+                    piece.duration.is_finite()
+                        && piece.compact_start.is_finite()
+                        && piece.orig_start.is_finite(),
+                    "映射表出现非有限值: {piece:?} ({cfg:?})"
+                );
+                assert!(piece.duration > 0.0);
+                assert!(piece.orig_start >= 0.0);
+            }
+            if let Some(first) = plan.map.first() {
+                assert_eq!(first.compact_start, 0.0);
+                let last = plan.map.last().unwrap();
+                let end = (last.compact_start + last.duration) * rate as f64;
+                assert!(
+                    (end - plan.kept_samples as f64).abs() < 1e-6,
+                    "映射表末尾必须等于 kept_samples: {end} vs {}",
+                    plan.kept_samples
+                );
+            }
+
+            let kept_sec = plan.kept_samples as f64 / rate as f64;
+            let mut prev = -1.0f64;
+            let mut t = 0.0f64;
+            while t <= kept_sec {
+                let o = plan.to_original(t);
+                assert!(o.is_finite(), "t={t} 映射出 {o}");
+                assert!(o >= prev - 1e-9, "映射不单调: t={t} o={o} prev={prev}");
+                prev = o;
+                t += 0.05;
+            }
+            assert!(plan.to_original(f64::NAN).is_finite());
+            assert!(plan.to_original(-1.0) >= 0.0);
+
+            assert_eq!(
+                plan.materialize(&pcm).len(),
+                plan.kept_samples,
+                "materialize 长度必须等于 kept_samples"
+            );
+        }
+    }
+
+    /// kept_samples 与实际音频对不上时，materialize 只能截断，不能 panic 或越界。
+    #[test]
+    fn materialize_tolerates_short_input() {
+        let rate = 16_000u32;
+        let mut pcm = tone(1.0, rate, 8_000);
+        pcm.extend(silence(3.0, rate));
+        pcm.extend(tone(1.0, rate, 8_000));
+
+        let plan = plan_compaction(&pcm, rate, &CompactionConfig::default());
+        assert!(plan.kept_samples < pcm.len(), "该素材应被压实");
+
+        let short = &pcm[..pcm.len() / 4];
+        let out = plan.materialize(short);
+        assert!(out.len() <= short.len());
+        assert!(out.len() <= plan.kept_samples);
+        assert!(plan.materialize(&[]).is_empty());
     }
 }

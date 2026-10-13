@@ -165,8 +165,14 @@ struct SegmentStats {
 /// 均匀采样而不是逐帧扫描，是为了让成本与「字幕条数」成正比；
 /// 同时要求浊音帧占比达标，否则该段没有稳定的说话人特征可言。
 fn segment_stats(samples: &[i16], sample_rate: u32, seg: &Segment) -> Option<SegmentStats> {
-    let seg_start = (seg.start.max(0.0) * sample_rate as f64) as usize;
-    let seg_end = (seg.end.max(0.0) * sample_rate as f64) as usize;
+    // 先把区间夹到真实样本范围内再算长度。上游时间戳可能是坏的（导出 / 导入
+    // 环节把 `end` 写成天文数字），`as usize` 是饱和转换，`end = 1e300` 会直接
+    // 变成 `usize::MAX`；此时下面的 `span = seg_end - seg_start` 是接近 `usize::MAX`
+    // 的值，`span * i` 立刻 usize 乘法溢出——debug 直接 panic，release 静默回绕成
+    // 垃圾偏移。夹到 `samples.len()` 顺带把「跨过片尾的长段」的采样点摊回真实
+    // 音频范围内（旧行为是若干帧全被 `min(samples.len())` 挤到尾部同一小段上）。
+    let seg_start = ((seg.start.max(0.0) * sample_rate as f64) as usize).min(samples.len());
+    let seg_end = ((seg.end.max(0.0) * sample_rate as f64) as usize).min(samples.len());
     let seg_len = seg_end.saturating_sub(seg_start);
     if seg_len < FRAME_LEN / 2 {
         return None;
@@ -530,5 +536,45 @@ mod tests {
         let labels = kmeans(&same, 3);
         assert_eq!(labels.len(), 5);
         assert!(labels.iter().all(|c| *c < 3));
+    }
+}
+
+#[cfg(test)]
+mod diarization_robustness_tests {
+    use super::detect_speakers;
+    use crate::subtitle::Segment;
+
+    fn tone(len: usize, freq: f32, sample_rate: u32, amp: i16) -> Vec<i16> {
+        (0..len)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (amp as f32 * (2.0 * std::f32::consts::PI * freq * t).sin()) as i16
+            })
+            .collect()
+    }
+
+    fn seg(i: usize, start: f64, end: f64) -> Segment {
+        Segment::new(i, start, end, format!("第 {i} 句"))
+    }
+
+    /// 缺陷回归：字幕时间戳被上游写坏（`end` 是个天文数字）时，
+    /// `segment_stats` 里 `span = seg_end - seg_start` 会接近 `usize::MAX`，
+    /// 紧接着 `span * i` 触发 usize 乘法溢出（debug panic / release 回绕成
+    /// 垃圾采样偏移）。段区间必须先夹到真实样本范围内再算长度。
+    #[test]
+    fn absurd_end_timestamp_does_not_overflow_segment_span() {
+        let sample_rate = 8_000u32;
+        let mut samples = Vec::new();
+        for i in 0..2 {
+            let freq = if i % 2 == 0 { 120.0 } else { 260.0 };
+            samples.extend(tone(sample_rate as usize, freq, sample_rate, 12_000));
+        }
+        let segs = vec![seg(1, 0.0, 1.0), seg(2, 1.0, 1e300)];
+        let labels = detect_speakers(&samples, sample_rate, &segs, 2);
+        assert_eq!(labels.len(), segs.len(), "标签必须与字幕段一一对应");
+        assert!(
+            labels[1].is_some(),
+            "越界段被夹到音频范围内后应有标签: {labels:?}"
+        );
     }
 }

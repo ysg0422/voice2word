@@ -26,6 +26,15 @@ const CHUNK_COUNT_EPS: f64 = 1e-9;
 /// 又能在「末块整块被丢弃」时挡住把一条字幕拉长到几十秒 / 整块时长的错误行为。
 /// （不取 `MIN_CHUNK_SEC`=45s：那等于允许单条字幕被拉到接近一个整块，正是要挡的场景。）
 const TAIL_EXTEND_MAX_SEC: f64 = 12.0;
+/// 单条音频允许切出的**最大块数**。
+///
+/// 块数是 `total / 块长` 的整数（见 [`plan_chunks_target`]），而每块都要落一个临时
+/// WAV 并起一个转写进程。时长字段一旦损坏（`inf`、或 1e9 秒级的伪值），块数会冲到
+/// `usize::MAX`：`(0..count).map(..).collect()` 按 `size_hint` 预分配 → 容量溢出
+/// panic；即使侥幸没 panic，上亿个块也会把磁盘与内存吃干。
+/// 4096 块 × 最短块长 45s ≈ 51 小时素材，远超任何真实输入（4 小时课程只有 320 块），
+/// 因此这个上限只可能挡住损坏值，不会改变正常素材的分块。
+const MAX_CHUNK_COUNT: usize = 4096;
 const DEFAULT_WORKERS: usize = 2;
 /// Whisper 多进程并行的 worker 上限。
 ///
@@ -64,6 +73,16 @@ pub fn plan_chunks(total_duration: f64) -> Vec<AudioChunk> {
 /// worker 在跑、其余空转）。
 pub fn plan_chunks_target(total_duration: f64, target_sec: f64) -> Vec<AudioChunk> {
     let target = target_sec.max(MIN_CHUNK_SEC);
+    // 非有限时长（`inf` / `NaN`）绝不能进分块算术：`ceil` 得 `inf`，`as usize`
+    // 饱和成 `usize::MAX`，下面 `(0..chunk_count)` 立刻容量溢出 panic；`NaN` 则让
+    // 每块的 `start` / `duration` 全成 `NaN`，直接进 ffmpeg 的切片参数。
+    // 时长字段损坏时按「单块」返回：调用方（`transcribe_chunked` /
+    // `transcribe_chunked_sensevoice`）见单块自会落回整段路径。
+    let total_duration = if total_duration.is_finite() {
+        total_duration
+    } else {
+        0.0
+    };
     if total_duration <= target + MIN_CHUNK_SEC {
         return vec![AudioChunk {
             index: 0,
@@ -79,7 +98,10 @@ pub fn plan_chunks_target(total_duration: f64, target_sec: f64) -> Vec<AudioChun
     // （如 `4324.0 / (4324.0 / 14.0) == 14.000000000000002`），直接 `ceil` 就凭空
     // 多切一块，末轮只剩一个 worker 在跑、其余空转——正是调用方要避免的场景。
     // `ceil` 前减去 `CHUNK_COUNT_EPS`，把「本应为整数的商」还原成该整数。
-    let chunk_count = (total_duration / target - CHUNK_COUNT_EPS).ceil().max(2.0) as usize;
+    let chunk_count = (total_duration / target - CHUNK_COUNT_EPS)
+        .ceil()
+        .max(2.0)
+        .min(MAX_CHUNK_COUNT as f64) as usize;
     let nominal = total_duration / chunk_count as f64;
     let half_overlap = OVERLAP_SEC * 0.5;
     (0..chunk_count)
@@ -111,6 +133,23 @@ pub fn sensevoice_worker_count(cores: u32) -> usize {
     (cores / 2).clamp(2, MAX_SV_WORKERS as u32) as usize
 }
 
+/// SenseVoice 并行切块的块数推导：worker 数的整数倍，且保证单块不超过 [`CHUNK_SEC`]。
+///
+/// 时长非有限（`ffprobe` 时长字段损坏）时直接返回 `workers`、**不进循环**：
+/// `inf / 块数` 恒为 `inf`，`while` 永不终止（真死循环，连超时都等不到）。
+/// 随后 [`plan_chunks_target`] 对非有限时长只给出单块，调用方据此落回整段路径。
+fn sensevoice_chunk_count(total_duration: f64, workers: usize) -> usize {
+    let workers = workers.max(1);
+    if !total_duration.is_finite() {
+        return workers;
+    }
+    let mut count = workers;
+    while total_duration / count as f64 > CHUNK_SEC {
+        count += workers;
+    }
+    count
+}
+
 pub fn worker_count(chunk_n: usize, requested_threads: u32, use_gpu: bool) -> usize {
     if chunk_n <= 1 {
         return 1;
@@ -139,6 +178,7 @@ fn per_process_threads(threads: u32, workers: usize) -> u32 {
 }
 
 /// 去掉切块重叠区里的重复句：后一块落在上一块尾部的字幕丢弃。
+/// 重叠区只存在于相邻两块之间，因此这条去重只对**跨块**的一对生效（见函数内注释）。
 pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment> {
     parts.sort_by_key(|(idx, _, _)| *idx);
     // 所有块的最大结束时间（按各自偏移还原到全局时间轴）。用于兜住「末块整体落在
@@ -148,15 +188,21 @@ pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment>
         .map(|(_, offset, segs)| segs.iter().map(|s| s.end + offset).fold(0.0f64, f64::max))
         .fold(0.0f64, f64::max);
     let mut out: Vec<Segment> = Vec::new();
-    for (_idx, offset, segs) in parts {
+    // 已接受片段所属的块下标：1.5s 重叠只存在于相邻两块之间，重叠去重也只该对
+    // **跨块**的一对生效（见下方 `similar && gap < ...` 分支）。
+    let mut last_chunk: Option<usize> = None;
+    for (chunk_idx, offset, segs) in parts {
         for mut seg in segs {
             seg.start += offset;
             seg.end += offset;
             if let Some(prev) = out.last() {
                 let gap = seg.start - prev.end;
                 let similar = text_similar(prev.display_text(), seg.display_text());
-                // 切块有 1.5s 重叠：时间交叉或紧挨着的重复句都丢掉后一块。
-                if similar && gap < OVERLAP_SEC + 0.4 {
+                // 切块有 1.5s 重叠：后一块落在重叠区里的重复句丢掉。只对跨块的一对
+                // 生效——块内不存在重叠来源，块内时间上并不重叠的重复句是说话人真的
+                // 重复了一遍（跟读 / 听写类课程极常见），无差别套用这条规则会把那句
+                // 静默吃掉：字幕凭空少一句。块内的真重叠仍由下面的负 `gap` 分支处理。
+                if similar && gap < OVERLAP_SEC + 0.4 && last_chunk != Some(chunk_idx) {
                     continue;
                 }
                 if gap < -0.25 {
@@ -172,6 +218,7 @@ pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment>
                 }
             }
             out.push(seg);
+            last_chunk = Some(chunk_idx);
         }
     }
     // 末块整体被上面的重叠判定吞掉时的兜底：若已接受字幕整体提前于全部块的真实
@@ -396,10 +443,7 @@ pub fn transcribe_chunked_sensevoice(
 
     // 块数取 worker 数的整数倍，保证每一轮都满载（否则最后一轮只有少数 worker
     // 在跑、其余空转）；同时保证单块不超过 360s，避免单块过长拖尾。
-    let mut chunk_count = workers;
-    while total_duration / chunk_count as f64 > CHUNK_SEC {
-        chunk_count += workers;
-    }
+    let chunk_count = sensevoice_chunk_count(total_duration, workers);
     let target = total_duration / chunk_count as f64;
     let chunks = plan_chunks_target(total_duration, target);
 
@@ -1092,5 +1136,124 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&wav);
+    }
+}
+
+/// 切块规划的数值边界与重叠去重的范围：这两处出的错都不会报错，只会静默少字 /
+/// 空转，因此逐条钉死。
+#[cfg(test)]
+mod chunk_boundary_tests {
+    use super::{
+        plan_chunks, plan_chunks_target, sensevoice_chunk_count, stitch_chunks, CHUNK_SEC,
+        MAX_CHUNK_COUNT,
+    };
+    use crate::subtitle::Segment;
+
+    /// 非有限时长不得进分块算术。
+    ///
+    /// `(inf / target - eps).ceil()` 是 `inf`，`as usize` 饱和成 `usize::MAX`：
+    /// `(0..count).map(..).collect()` 会按 `size_hint` 预分配 → 容量溢出 panic。
+    /// `NaN` 好一点也坏一点：不 panic，但每块的 `start` / `duration` 全成 `NaN`，
+    /// 直接进 ffmpeg 的切片参数。两者都必须退回单块（调用方随后落回整段路径）。
+    #[test]
+    fn non_finite_duration_collapses_to_single_chunk() {
+        for total in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let chunks = plan_chunks(total);
+            assert_eq!(chunks.len(), 1, "非有限时长 {total} 必须退回单块");
+            assert_eq!(chunks[0].start, 0.0);
+            assert!(
+                chunks[0].duration.is_finite() && chunks[0].duration > 0.0,
+                "单块必须拿到有限的正时长，而不是 NaN/inf: {:?}",
+                chunks[0]
+            );
+        }
+    }
+
+    /// 极大时长不得让块数无上限：损坏的时长字段（1e9 秒）曾会切出上千万块，
+    /// 每块一个临时 WAV + 一个转写进程。封顶只该挡住这种值，真实素材逐档不变。
+    #[test]
+    fn chunk_count_is_capped_for_absurd_durations() {
+        for chunks in [
+            plan_chunks(1.0e9),
+            plan_chunks_target(1.0e9, 45.0),
+            plan_chunks_target(f64::MAX, 45.0),
+        ] {
+            assert!(
+                chunks.len() <= MAX_CHUNK_COUNT,
+                "块数 {} 越过上限 {MAX_CHUNK_COUNT}",
+                chunks.len()
+            );
+            assert!(chunks.len() >= 2, "封顶不该把长素材压成单块");
+            for c in &chunks {
+                assert!(
+                    c.start.is_finite() && c.duration.is_finite() && c.duration > 0.0,
+                    "封顶后的几何仍须有限且为正: {c:?}"
+                );
+            }
+        }
+        // 真实量级：4 小时 / 45s 恰好 320 块，不受封顶影响
+        assert_eq!(plan_chunks_target(4.0 * 3600.0, 45.0).len(), 320);
+        assert!(plan_chunks(32.0 * 60.0).len() <= MAX_CHUNK_COUNT);
+    }
+
+    /// SenseVoice 的块数推导：必须是 worker 的整数倍（否则末轮有 worker 空转）、
+    /// 单块不超过 `CHUNK_SEC`，且**非有限时长必须直接返回**——`inf / 块数` 恒为
+    /// `inf`，`while` 永不终止，真死循环连超时都等不到。
+    #[test]
+    fn sensevoice_chunk_count_terminates_and_stays_worker_multiple() {
+        for workers in [1usize, 2, 4, 6] {
+            assert_eq!(
+                sensevoice_chunk_count(f64::INFINITY, workers),
+                workers,
+                "inf 时长必须立即返回，不得进 while 循环"
+            );
+            assert_eq!(sensevoice_chunk_count(f64::NAN, workers), workers);
+            assert_eq!(sensevoice_chunk_count(f64::NEG_INFINITY, workers), workers);
+        }
+        // workers = 0 不得 panic（`.max(1)` 兜底）也不得死循环
+        assert_eq!(sensevoice_chunk_count(f64::INFINITY, 0), 1);
+
+        for workers in 1usize..=6 {
+            for total in [0.0f64, 100.0, 405.0, 1000.0, 4324.0, 4.0 * 3600.0] {
+                let count = sensevoice_chunk_count(total, workers);
+                assert!(count >= workers, "块数不得少于一轮 workers");
+                assert_eq!(count % workers, 0, "块数必须是 worker 的整数倍");
+                assert!(
+                    total / count as f64 <= CHUNK_SEC + 1e-9,
+                    "total={total} workers={workers}: 单块 {} 超过 {CHUNK_SEC}s",
+                    total / count as f64
+                );
+            }
+        }
+    }
+
+    /// 块内的重复句必须保留。1.5s 重叠只存在于相邻两块之间，同一块内不存在重叠
+    /// 来源：时间上并不重叠的两句完全相同的字幕，是说话人真的重复了一遍
+    /// （跟读 / 听写类课程极常见）。旧实现无条件套用重叠去重，会把第二句静默吃掉。
+    #[test]
+    fn repeated_sentence_inside_one_chunk_is_kept() {
+        let repeated = vec![
+            Segment::new(1, 10.0, 12.0, "我们把这句话再读一遍"),
+            Segment::new(2, 12.4, 14.4, "我们把这句话再读一遍"),
+        ];
+        let out = stitch_chunks(vec![(0, 0.0, repeated)]);
+        assert_eq!(
+            out.len(),
+            2,
+            "块内时间不重叠的重复句不得被当成跨块重叠丢掉: {out:?}"
+        );
+        assert_eq!(out[0].text, "我们把这句话再读一遍");
+        assert_eq!(out[1].text, "我们把这句话再读一遍");
+    }
+
+    /// 反向保护：跨块的重复句（同一句话被相邻两块各转了一次，后块落在 1.5s 重叠
+    /// 区里）仍必须丢掉——这正是重叠去重的本意，修块内误删不能把它一起放掉。
+    #[test]
+    fn duplicate_sentence_across_chunk_boundary_is_dropped() {
+        let head = vec![Segment::new(1, 350.0, 358.0, "我们把这句话再读一遍")];
+        let tail = vec![Segment::new(1, 0.2, 8.0, "我们把这句话再读一遍")];
+        let out = stitch_chunks(vec![(0, 0.0, head), (1, 358.5, tail)]);
+        assert_eq!(out.len(), 1, "跨块重复句仍应被丢掉: {out:?}");
+        assert_eq!(out[0].start, 350.0);
     }
 }
