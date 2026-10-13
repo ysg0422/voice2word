@@ -268,9 +268,40 @@ impl Stage {
 
 /// 阶段产物落盘 / 读取。根目录由 [`TaskPipeline::set_artifact_dir`] 指定；
 /// 未指定时管线行为与历史完全一致（不写、不读）。
+///
+/// # 归属校验（断点续跑的自我保护）
+///
+/// 可续跑的片段产物用 `OwnedSegments` 信封落盘：除片段本体外，还记下产出它的
+/// 输入媒体。经 [`Self::owned_by`] 构造的句柄在读取时校验归属，不一致就当作
+/// 「没有产物」（`Ok(None)`）走全流程重算。于是「同一个产物目录被复用去跑第二支
+/// 片子」（`--artifact-dir` 指向固定目录，或目录名只按文件名主干去重、两支片子的
+/// 主干同名）不会把前一支的识别结果贴到后一支上。
+///
+/// 为什么归属写在**每份产物内部**、而不是目录里单独放一份记录：各阶段产物是
+/// **按条件**落盘的（例如本次没开润色就不写 `06_polish.json`）。目录级记录只要
+/// 有一份旧片段没被本次覆盖，就会被误判成「本次输入所有」，从而把旧片段放行——
+/// 归属必须跟着产物本身走。
 #[derive(Debug, Clone)]
 pub struct StageArtifacts {
     root: PathBuf,
+    /// `Some` = 启用归属校验（值 = 本次任务的输入媒体标识）；`None` = 不校验。
+    owner: Option<String>,
+}
+
+/// 可续跑片段产物的落盘信封（写入侧）：借用片段，避免整份克隆。
+#[derive(serde::Serialize)]
+struct OwnedSegmentsRef<'a> {
+    /// 产出这份片段的输入媒体（落盘时刻的 `display()` 路径）
+    input: &'a str,
+    /// 片段本体
+    segments: &'a [Segment],
+}
+
+/// 可续跑片段产物的落盘信封（读取侧）。
+#[derive(serde::Deserialize)]
+struct OwnedSegments {
+    input: String,
+    segments: Vec<Segment>,
 }
 
 /// `ExtractAudio` 阶段的产物记录：原始媒体路径与探测到的时长。
@@ -294,7 +325,21 @@ pub struct StageRecord {
 
 impl StageArtifacts {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            owner: None,
+        }
+    }
+
+    /// 带归属的句柄：`input` 为本次任务的输入媒体标识（管线的 `input_file`）。
+    ///
+    /// 读取片段产物时校验「落盘时记录的输入」是否为 `input`；不一致或解析不出
+    /// 归属（老格式裸数组）一律按「没有产物」处理。写入时把 `input` 记进信封。
+    pub fn owned_by(root: impl Into<PathBuf>, input: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            owner: Some(input.into()),
+        }
     }
 
     pub fn path(&self, stage: Stage) -> PathBuf {
@@ -319,7 +364,11 @@ impl StageArtifacts {
     }
 
     pub fn write_segments(&self, stage: Stage, segments: &[Segment]) -> Result<()> {
-        let data = serde_json::to_vec_pretty(segments).context("序列化阶段片段失败")?;
+        let envelope = OwnedSegmentsRef {
+            input: self.owner.as_deref().unwrap_or_default(),
+            segments,
+        };
+        let data = serde_json::to_vec_pretty(&envelope).context("序列化阶段片段失败")?;
         self.write_bytes(stage, &data)
     }
 
@@ -344,7 +393,21 @@ impl StageArtifacts {
     }
 
     pub fn read_segments(&self, stage: Stage) -> Result<Option<Vec<Segment>>> {
-        self.read_json(stage)
+        let Some(envelope) = self.read_json::<OwnedSegments>(stage)? else {
+            return Ok(None);
+        };
+        if let Some(owner) = self.owner.as_deref() {
+            if !resume_owner_matches(&envelope.input, owner) {
+                warn!(
+                    stage = stage.artifact_file(),
+                    recorded = %envelope.input,
+                    current = %owner,
+                    "断点续跑：阶段产物不属于本次输入，忽略该产物并重算"
+                );
+                return Ok(None);
+            }
+        }
+        Ok(Some(envelope.segments))
     }
 }
 
@@ -752,14 +815,24 @@ impl TaskPipeline {
         };
         self.whisper.set_vad_threshold(options.vad_threshold);
         let pipeline_started = Instant::now();
-        // 阶段产物落盘句柄：None = 历史行为（不写不读）。
-        let artifacts = self.artifact_dir().map(StageArtifacts::new);
+        // 本次任务的输入标识：阶段产物的归属键（见 [`StageArtifacts`] 的说明）。
+        let input_id = input_file.display().to_string();
+        // 阶段产物落盘句柄：None = 历史行为（不写不读）。带上归属键后，读取任何
+        // 可续跑产物都会校验「落盘时记录的输入」是否就是本次输入，不一致按「没有
+        // 产物」处理（走全流程重算），因此下面几处续跑读取自带归属闸门。
+        let artifacts = self
+            .artifact_dir()
+            .map(|dir| StageArtifacts::owned_by(dir, input_id.clone()));
 
         // 断点续跑检测必须早于「音频预处理」决策：命中续跑产物时要整段跳过解码 / 压实。
         // 优先复用「走完全流程」的最终产物（Stage::Write），命中即跳过 ASR + 救场 +
         // 标点/润色 + 说话人分离，直接写字幕（输出文件会被幂等重写）；退而求其次复用
         // 「已还原到原始媒体时间轴」的识别结果（Stage::Transcribe），此时仍需跑完后续阶段。
         // 两者落盘的都是最终时间轴，故下方必须跳过二次还原。
+        //
+        // 归属校验在 `read_segments` 内部完成：目录里的产物若属于另一支片子
+        // （目录被复用 / 只按文件名主干去重而主干撞车），这里拿到的就是 `None`，
+        // 于是整条链路重算，绝不会把 A 的识别结果贴到 B 上。
         let resumed_final = artifacts
             .as_ref()
             .and_then(|a| a.read_segments(Stage::Write).ok().flatten());
@@ -802,8 +875,7 @@ impl TaskPipeline {
         });
 
         // 断点续跑：阶段 1 的时长探测若已有落盘记录，直接复用并跳过 ffprobe。
-        let cached_duration =
-            cached_extract_audio_duration(artifacts.as_ref(), &input_file.display().to_string());
+        let cached_duration = cached_extract_audio_duration(artifacts.as_ref(), &input_id);
         let total_dur = if let Some(d) = cached_duration {
             info!("断点续跑：复用已落盘的媒体时长（{:.1}s），跳过探测", d);
             Some(d)
@@ -1741,6 +1813,20 @@ impl TaskPipeline {
             }
         }
 
+        // ── 阶段 4 前的取消检查点 ──
+        // 说话人分离（上一阶段）在 spawn_blocking 里做整轨解码 + 聚类，是最后一个
+        // 「长阶段」，内部没有取消检查；再往下就直接落盘导出。缺了这道闸，用户在分离
+        // 期间点「终止」仍会拿到一份字幕文件——而「终止 ⇒ 不产出成品」是全链路的契约。
+        // 与转写后、润色后的两个检查点同一语义（`may_export`）。
+        if !may_export(self.is_cancelled()) {
+            warn!("任务已取消，跳过最终字幕导出");
+            let _ = tx.send(PipelineEvent::Finished(
+                segments.clone(),
+                Default::default(),
+            ));
+            return Ok(segments);
+        }
+
         // ── 阶段 4: 输出字幕文件（失败也不阻塞 Finished，避免界面一直转圈）──
         let _ = tx.send(PipelineEvent::StageChanged(Stage::Write.label().into()));
         crate::subtitle::optimize_segments(&mut segments);
@@ -1888,6 +1974,15 @@ fn write_export_with_style<P: AsRef<Path>>(
         ),
         None => SubtitleWriter::write_to_file(segments, path, format),
     }
+}
+
+/// 收尾闸门（纯函数）：当前片段是否允许当作成品导出 / 落盘。
+///
+/// 「取消 ⇒ 不产出成品」是整条链路的契约：界面侧靠 `cancel_requested` 做静默收尾，
+/// 但字幕文件是管线自己写的，所以管线每个长阶段出口都必须过同一道闸。抽成判据
+/// 是为了让这条契约可以被单测直接钉住，而不是散成若干个 `is_cancelled()`。
+fn may_export(cancelled: bool) -> bool {
+    !cancelled
 }
 
 fn scale_segment_to_original_time(segment: &mut Segment, speed: f64, original_duration: f64) {
@@ -2094,7 +2189,7 @@ fn cached_extract_audio_duration(artifacts: Option<&StageArtifacts>, input: &str
             .ok()
             .flatten()
     })?;
-    if record.input != input {
+    if !resume_owner_matches(&record.input, input) {
         warn!(
             artifact = %record.input,
             current = %input,
@@ -2103,6 +2198,37 @@ fn cached_extract_audio_duration(artifacts: Option<&StageArtifacts>, input: &str
         return None;
     }
     (record.duration_sec > 0.0).then_some(record.duration_sec)
+}
+
+/// 媒体路径的等价归一（纯函数）：分隔符统一、折叠重复分隔符、去掉结尾分隔符、
+/// 大小写折叠。
+///
+/// 只做**无损等价**的归一，不做软链 / 相对路径解析：后者要访问文件系统、会引入
+/// 失败模式，而判错方向的代价是把 B 的产物认成 A 的。大小写折叠在 Windows（本项目
+/// 目标平台）上是对的——同一路径的不同大小写写法指向同一支媒体；在区分大小写的
+/// 文件系统上，只有「两支片子的路径除大小写外完全相同且共用同一产物目录」才可能
+/// 被误判为同一支，这种情形可以忽略。
+fn normalize_media_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for ch in path.chars() {
+        let ch = if ch == '\\' { '/' } else { ch };
+        if ch == '/' && out.ends_with('/') {
+            continue;
+        }
+        out.extend(ch.to_lowercase());
+    }
+    while out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+/// 归属判据（纯函数）：产物落盘时记下的输入 `recorded` 是否就是本次输入 `current`。
+///
+/// 同一条判据同时服务「片段产物」（[`StageArtifacts::read_segments`]）与
+/// 「时长缓存」（[`cached_extract_audio_duration`]），避免两处各写一套比较口径。
+fn resume_owner_matches(recorded: &str, current: &str) -> bool {
+    normalize_media_path(recorded) == normalize_media_path(current)
 }
 
 #[cfg(test)]
@@ -2508,6 +2634,30 @@ mod tests {
             .run_with_options(
                 PathBuf::from("__v2w_missing_media__.mp4"),
                 None,
+                None,
+                "srt".to_string(),
+                false,
+                None,
+                None,
+                None,
+                -0.65,
+                WhisperRuntimeOptions::default(),
+                DiarizationOptions::default(),
+                tx,
+            )
+            .await
+    }
+
+    /// 同上，但把自动导出指向 `out`：验证「取消的任务不产出字幕文件」。
+    async fn run_task_entry_exporting_to(
+        pipeline: &TaskPipeline,
+        out: PathBuf,
+    ) -> Result<Vec<Segment>> {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        pipeline
+            .run_with_options(
+                PathBuf::from("__v2w_missing_media__.mp4"),
+                Some(out),
                 None,
                 "srt".to_string(),
                 false,
@@ -3030,6 +3180,124 @@ mod tests {
         artifacts.write_json(Stage::Preprocess, &note).unwrap();
         let note_back: StageRecord = artifacts.read_json(Stage::Preprocess).unwrap().unwrap();
         assert_eq!(note_back, note, "StageRecord 必须往返相等");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 断点续跑：产物归属 ──
+    //
+    // 修复前：`Stage::Write` / `Stage::Transcribe` / `Stage::Rescue` 等片段产物只以
+    // 「文件存在且能解析」为续跑判据，完全没有绑定输入文件。`--artifact-dir` 复用
+    // 同一目录跑第二个文件（或目录名只按文件名主干去重、两支片子主干同名）时，
+    // `07_write.json` 一命中就 `skip_post`，整条 ASR + 后处理全跳过，把 A 片子的
+    // 识别结果贴到 B 片子并导出。
+    //
+    // 修复后：片段产物用归属信封落盘（片段 + 产出它的输入），读取时校验归属；
+    // 不一致或读不出归属（老格式裸数组）一律按「没有产物」处理，走全流程重算。
+
+    /// 归属判据是纯函数：覆盖分隔符 / 大小写 / 结尾分隔符 / 重复分隔符的等价写法，
+    /// 以及「同主干不同目录」这种必须判为不同片子的情形。
+    #[test]
+    fn resume_owner_matches_normalizes_equivalent_paths() {
+        assert!(resume_owner_matches(r"C:\media\a.mp4", "c:/media/a.mp4"));
+        assert!(resume_owner_matches("c:/media/a.mp4", "C:/MEDIA/A.MP4"));
+        assert!(resume_owner_matches("c:/media/a.mp4/", "c:/media/a.mp4"));
+        assert!(resume_owner_matches("c://media//a.mp4", "c:/media/a.mp4"));
+        assert!(resume_owner_matches(r"c:\media\a.mp4", "c:/media/a.mp4/"));
+
+        assert!(!resume_owner_matches("c:/media/a.mp4", "c:/media/b.mp4"));
+        assert!(
+            !resume_owner_matches("a/talk.mp4", "b/talk.mp4"),
+            "同主干不同目录是两支片子，不得互相续跑"
+        );
+        assert!(!resume_owner_matches("", "c:/media/a.mp4"));
+    }
+
+    /// 归属校验：A 落的产物用 B 读取必须拿不到；同一输入（等价写法）可读回；
+    /// 无归属句柄保持历史行为；拒绝时不删文件（换回 A 仍能续跑）。
+    #[test]
+    fn stage_artifacts_owned_by_rejects_foreign_segments() {
+        let dir = tmp_dir("stage_owner");
+        let writer = StageArtifacts::owned_by(dir.clone(), r"C:\media\a.mp4");
+        let segs = vec![Segment::new(1, 0.0, 1.5, "甲片的字幕")];
+        writer.write_segments(Stage::Write, &segs).unwrap();
+
+        // 同一输入（分隔符 + 大小写归一后等价）→ 可续跑
+        assert_eq!(
+            StageArtifacts::owned_by(dir.clone(), "C:/MEDIA/A.MP4")
+                .read_segments(Stage::Write)
+                .unwrap(),
+            Some(segs.clone())
+        );
+        // 另一支片子 → 归属不符，按「没有产物」处理
+        assert_eq!(
+            StageArtifacts::owned_by(dir.clone(), "c:/media/b.mp4")
+                .read_segments(Stage::Write)
+                .unwrap(),
+            None,
+            "目录被复用跑第二支片子时，A 的产物必须被拒绝"
+        );
+        // 无归属句柄（单测 / 历史行为）不校验
+        assert_eq!(
+            StageArtifacts::new(dir.clone())
+                .read_segments(Stage::Write)
+                .unwrap(),
+            Some(segs)
+        );
+        // 拒绝不能把文件删掉：下次换回同一支片子还能续跑
+        assert!(writer.exists(Stage::Write));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 老格式（裸片段数组）没有归属字段：保守拒绝，按「没有产物」处理并重算。
+    #[test]
+    fn stage_artifacts_legacy_bare_array_is_not_resumable() {
+        let dir = tmp_dir("stage_legacy");
+        let artifacts = StageArtifacts::owned_by(dir.clone(), "c:/media/a.mp4");
+        let legacy = vec![Segment::new(1, 0.0, 1.0, "旧格式")];
+        std::fs::write(
+            artifacts.path(Stage::Transcribe),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            artifacts
+                .read_segments(Stage::Transcribe)
+                .ok()
+                .flatten()
+                .is_none(),
+            "老格式产物无归属信息，必须保守拒绝（走全流程重算）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 取消语义：终止 ⇒ 不产出成品 ──
+
+    /// 收尾闸门：取消后不得导出，未取消才允许。
+    #[test]
+    fn may_export_blocks_delivery_after_cancel() {
+        assert!(may_export(false), "未取消应允许导出");
+        assert!(!may_export(true), "取消后不得导出");
+    }
+
+    /// 已取消的任务不得写出任何字幕文件。这里走的是阶段 1 的检查点；「说话人分离
+    /// 期间取消」由一个独立的导出前检查点覆盖，但那条路径需要真媒体才能走到。
+    #[test]
+    fn cancelled_task_never_writes_output_file() {
+        let dir = tmp_dir("cancel_no_export");
+        let out = dir.join("out.srt");
+
+        let pipeline = test_pipeline();
+        pipeline.begin_task();
+        pipeline.cancel();
+
+        let segments = block_on(run_task_entry_exporting_to(&pipeline, out.clone()))
+            .expect("取消应走空结果的成功返回");
+        assert!(segments.is_empty(), "已取消的任务不得产出字幕");
+        assert!(!out.exists(), "取消后不得写出字幕文件");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

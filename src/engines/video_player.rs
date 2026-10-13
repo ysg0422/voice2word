@@ -196,6 +196,14 @@ impl VideoPlayerEngine {
     /// 调用方 `Arc::try_unwrap` 必然成功：这就是「每帧一次整帧深拷贝」的消失点。
     pub fn take_unconsumed_frame(&self) -> Option<(u64, Arc<PlayerFrame>)> {
         let mut lock = self.current_frame.lock().ok()?;
+        // 判据与帧在**同一把锁**里读：判据为 false 的这一刻没有可显示的实时画面
+        // （`stop()` 已清帧，或出帧线程刚写好槽位、判据还没置位）。这种帧交出去也只会被
+        // UI 的静态帧分支丢掉 —— 就是「消费了版本号却没人渲染」的那条丢帧路径。
+        // 这里既不交出、也不推进已消费版本：帧留在槽位里，等判据为 true 的下一次 take
+        // 原样取走，版本号因此不跳，UI 也不会把同一版本重建两次。
+        if !self.has_live_picture.load(Ordering::SeqCst) {
+            return None;
+        }
         let version = self.frame_version.load(Ordering::SeqCst);
         if version == self.consumed_frame_version.load(Ordering::SeqCst) {
             return None;
@@ -300,7 +308,10 @@ impl VideoPlayerEngine {
         }
     }
 
-    /// 暂停时钟但不杀解码进程（保留当前帧）。
+    /// 暂停时钟：把当前读数固化进基线、摘掉墙钟锚点，并回收取帧/音频子进程（**保留最后一帧**作定格）。
+    ///
+    /// 子进程照杀：此刻出帧线程正阻塞在管道读上，不杀就会留下一个解码进程挂在没人读的管道上
+    /// （占着视频文件句柄），直到下一次 `stop()` / `play()`；恢复播放由 `play()` 重新按关键帧寻轨启动。
     pub fn pause_clock(&self) {
         let now = self.current_play_time();
         self.is_playing.store(false, Ordering::SeqCst);
@@ -316,12 +327,21 @@ impl VideoPlayerEngine {
     }
 
     pub fn stop(&self) {
+        // 先把读数固化进基线、摘掉墙钟锚点，**再**落 `is_playing`：顺序反过来（先落旗）
+        // 会让停播之后的 `current_play_time()` 退回**本次会话的起点**——一次 3 分钟的预览
+        // 停下后读出的是 3 分钟前的位置，而任何「停播后再读一次时钟」的路径都会记错播放头。
+        // 暂停（`pause_clock`）一直就是这么收尾的，停止不该比暂停更退化。
         self.generation.fetch_add(1, Ordering::SeqCst);
-        self.is_playing.store(false, Ordering::SeqCst);
+        let frozen = self.current_play_time();
+        *self
+            .play_start_seconds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = frozen;
         *self
             .play_start_instant
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        self.is_playing.store(false, Ordering::SeqCst);
         self.kill_procs();
         // 连同最后一帧一起丢弃。`stop()` 的三个调用点（开始转写、时间轴跳转/上下句、
         // 引擎析构）语义都是「结束这次预览」，而跳转路径紧接着会抽一张**新位置**的
@@ -1262,5 +1282,214 @@ mod tests {
             std::io::ErrorKind::BrokenPipe
         )));
         assert!(!is_playback_finished(&std::io::Error::other("读取中断")));
+    }
+}
+
+/// 播放器状态机（状态迁移 / 判据 / 时钟代数）的回归测试。
+///
+/// 刻意**不写** `use super::*`：本组只依赖下面显式列出的名字，将来谁改了名字或签名，
+/// 这里会直接编译失败，而不是被通配导入悄悄带过。
+#[cfg(test)]
+mod state_tests {
+    use super::{try_publish_frame, PlayerFrame, VideoPlayerEngine, PLAYER_HEIGHT, PLAYER_WIDTH};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    /// 造一台「已在播放、墙钟锚点已落了 elapsed」的引擎（不拉起任何子进程）。
+    fn engine_with_playing_clock(base_seconds: f64, elapsed: Duration) -> VideoPlayerEngine {
+        let engine = VideoPlayerEngine::new("ffmpeg");
+        engine.is_playing.store(true, Ordering::SeqCst);
+        *engine.play_start_seconds.lock().unwrap() = base_seconds;
+        *engine.play_start_instant.lock().unwrap() = Some(Instant::now() - elapsed);
+        engine
+    }
+
+    fn frame_with_marker(marker: u8) -> PlayerFrame {
+        PlayerFrame {
+            data: vec![marker; 4 * 4 * 4],
+            width: 4,
+            height: 4,
+        }
+    }
+
+    /// 出帧线程「把一帧写回共享缓冲」的动作：真线程里就是这一次调用。
+    fn publish(engine: &VideoPlayerEngine, gen: u64, marker: u8) -> bool {
+        try_publish_frame(
+            &engine.current_frame,
+            &engine.frame_version,
+            &engine.has_live_picture,
+            &engine.generation,
+            &engine.is_playing,
+            gen,
+            frame_with_marker(marker),
+        )
+    }
+
+    /// 「停止」必须和「暂停」一样把时钟**收尾**在当前读数上，而不是退回会话起点。
+    ///
+    /// 回归路径：`stop()` 以前只清锚点、不更新基线，于是停播之后的 `current_play_time()`
+    /// 退回**本次会话的起点**——一次 3 分钟的预览停下后读出 3 分钟前的位置。
+    /// 凡是「停播之后再读一次时钟」的路径（补一次播放头落库、跳转前记录位置）都会记错。
+    #[test]
+    fn stop_freezes_clock_at_last_position_instead_of_session_start() {
+        let engine = engine_with_playing_clock(90.0, Duration::from_millis(250));
+        let before = engine.current_play_time();
+        assert!(
+            before >= 90.25,
+            "锚点已过 250ms，读数应在 90.25s 之后: {before}"
+        );
+
+        engine.stop();
+
+        assert!(!engine.is_playing(), "stop() 之后不得停留在播放态");
+        let after = engine.current_play_time();
+        assert!(
+            after + 1e-9 >= before,
+            "stop() 后时钟不得倒退: {before}s -> {after}s"
+        );
+        assert!(after >= 90.25, "不许退回本次会话起点 90.0s: {after}");
+
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            engine.current_play_time(),
+            after,
+            "停播后时钟不得再被墙钟推进"
+        );
+
+        engine.stop(); // 幂等：再停一次不改变读数
+        assert_eq!(engine.current_play_time(), after);
+    }
+
+    /// 首帧锚点未到达时，时钟必须停在起点（此时 `is_playing` 已经是 true）。
+    ///
+    /// 这条语义是刻意的（锚点取首帧真正到达的时刻，避免把解码启动延迟算进时钟造成初始
+    /// 跳变），但它有一个必须写清的副作用：解码进程一帧都没交付时，时钟**永远**停在起点。
+    /// 依赖「时钟自己会推进」收尾的调用方（UI 那个 40ms 计时任务）因此不能只看时钟，
+    /// 必须同时看引擎的播放态与失败原因。
+    #[test]
+    fn clock_waits_at_start_until_first_frame_anchor() {
+        let engine = VideoPlayerEngine::new("ffmpeg");
+        engine.is_playing.store(true, Ordering::SeqCst);
+        assert_eq!(engine.current_play_time(), 0.0, "没有锚点时读数就是基线");
+
+        *engine.play_start_seconds.lock().unwrap() = 42.0;
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            engine.current_play_time(),
+            42.0,
+            "锚点未到，时钟不得靠墙钟偷跑"
+        );
+
+        *engine.play_start_instant.lock().unwrap() = Some(Instant::now());
+        let t = engine.current_play_time();
+        assert!((42.0..42.5).contains(&t), "锚点到达后按墙钟推进: {t}");
+        engine.stop();
+    }
+
+    /// 判据为 false 时不得把帧交出去（更不得推进已消费版本）。
+    ///
+    /// 回归路径：UI 是「先锁外读判据、再 take」的两步协议。出帧线程写回槽位与置位判据
+    /// 之间有极短窗口，UI 若在这个窗口里读到 false，就会去走静态帧分支——而紧接着的 take
+    /// 又能把帧拿走：**帧被消费掉却没人渲染**（白丢一帧 + 闪一次静态图）。
+    /// 现在 take 在**同一把锁**里复核判据：判据为 false 时不交出、不推进消费版本，帧留在
+    /// 槽位里，等判据为 true 的下一次 take 原样取走，一帧都不丢。
+    #[test]
+    fn take_refuses_to_consume_frame_while_picture_is_not_live() {
+        let engine = VideoPlayerEngine::new("ffmpeg");
+        engine.is_playing.store(true, Ordering::SeqCst);
+        let gen = engine.generation();
+
+        assert!(publish(&engine, gen, 0x7A), "有效代次的帧应写入槽位");
+        assert!(engine.has_live_picture(), "写回一帧后判据必须为 true");
+        // 正常路径不受影响：判据为 true 时照旧一次取走、同版本不得二次取
+        let (v0, f0) = engine
+            .take_unconsumed_frame()
+            .expect("判据为 true 时应能取帧");
+        assert_eq!(f0.data[0], 0x7A);
+        assert!(
+            engine.take_unconsumed_frame().is_none(),
+            "同版本不得二次取帧"
+        );
+
+        // 再发一版，然后把它置成「槽位有帧、判据为 false」的窗口态
+        assert!(publish(&engine, gen, 0x7B));
+        engine.has_live_picture.store(false, Ordering::SeqCst);
+        let version_before = engine.frame_version();
+        assert!(version_before > v0, "帧版本必须单调前进");
+
+        assert!(
+            engine.take_unconsumed_frame().is_none(),
+            "判据为 false 时不得交帧（否则 UI 会消费掉却掉回静态帧分支）"
+        );
+        assert!(
+            engine.get_frame().is_some(),
+            "帧必须留在槽位里，不许被消费掉"
+        );
+        assert_eq!(
+            engine.frame_version(),
+            version_before,
+            "这次 take 不得推进帧版本"
+        );
+
+        // 判据恢复（出帧线程迟一步置位）后，这一帧原样取到：没有丢帧
+        engine.has_live_picture.store(true, Ordering::SeqCst);
+        let (v1, f1) = engine
+            .take_unconsumed_frame()
+            .expect("判据恢复后应能取到那一帧");
+        assert_eq!(v1, version_before);
+        assert_eq!(f1.data[0], 0x7B, "取到的必须是同一次发布的那一帧");
+        assert_eq!(
+            std::sync::Arc::strong_count(&f1),
+            1,
+            "交出去的仍必须是独占 Arc（零拷贝的前提）"
+        );
+        engine.stop();
+    }
+
+    /// 出帧尺寸：任何输入（0 / 1 / 超大 / 竖屏 / 奇数）都必须落在预算内、非零、偶数对齐，
+    /// 且不翻转宽高比。
+    ///
+    /// 尺寸为 0 会让 `frame_bytes == 0`，`read_exact` 立刻返回 Ok 并空转发布空帧；
+    /// 奇数宽高与 BGRA 纹理对不齐。这两个坑都从 `set_frame_dimensions` 的钳制上堵住。
+    #[test]
+    fn frame_dimensions_survive_degenerate_sources() {
+        let engine = VideoPlayerEngine::new("ffmpeg");
+        let cases: [(u32, u32); 8] = [
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (7, 13),
+            (1920, 1080),
+            (1080, 1920),
+            (3840, 2160),
+            (u32::MAX, 1),
+        ];
+        for (src_w, src_h) in cases {
+            engine.set_frame_dimensions(src_w, src_h);
+            let (fw, fh) = engine.frame_dimensions();
+            assert!(
+                fw >= 2 && fh >= 2,
+                "{src_w}x{src_h} 出了 {fw}x{fh}：尺寸过小"
+            );
+            assert!(
+                fw <= PLAYER_WIDTH && fh <= PLAYER_HEIGHT,
+                "{src_w}x{src_h} 出了 {fw}x{fh}：超出预算"
+            );
+            assert_eq!(fw % 2, 0, "宽必须偶数对齐: {fw}");
+            assert_eq!(fh % 2, 0, "高必须偶数对齐: {fh}");
+            assert!(fw as u64 * fh as u64 * 4 > 0, "frame_bytes 不得为 0");
+            if src_w.max(2) > src_h.max(2) {
+                assert!(fw >= fh, "横屏源出了竖屏帧: {src_w}x{src_h} -> {fw}x{fh}");
+            } else if src_h.max(2) > src_w.max(2) {
+                assert!(fh >= fw, "竖屏源出了横屏帧: {src_w}x{src_h} -> {fw}x{fh}");
+            }
+        }
+
+        // 竖屏必须顶到高预算（按高适配），不能按宽度铺满把画面压扁
+        engine.set_frame_dimensions(1080, 1920);
+        assert_eq!(engine.frame_dimensions().1, PLAYER_HEIGHT);
+        // 16:9 源必须铺满预算
+        engine.set_frame_dimensions(1920, 1080);
+        assert_eq!(engine.frame_dimensions(), (PLAYER_WIDTH, PLAYER_HEIGHT));
     }
 }
