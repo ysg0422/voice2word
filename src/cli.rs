@@ -42,7 +42,14 @@ use crate::subtitle::{Segment, SubtitleWriter};
 use crate::utils::AppConfig;
 
 /// 允许导出的字幕格式；顺序与帮助文本里展示的一致。
-pub const SUPPORTED_FORMATS: [&str; 7] = ["srt", "ass", "vtt", "json", "txt", "ttml", "ttal"];
+///
+/// 末尾三项是播放器与社区场景常用的小格式：SBV（SubViewer，`0:00:01.000,0:00:02.000`
+/// 一行时间轴 + 一行正文）、LRC 唱词（每行只带起点）、带时间码纯文本
+/// （`[00:01:23.456] 正文`，一行一句但带着几分几秒）。它们的写出与读回都在
+/// `subtitle::writer` / `subtitle::reader`，与 SRT 等主格式同一张分派表。
+pub const SUPPORTED_FORMATS: [&str; 10] = [
+    "srt", "ass", "vtt", "json", "txt", "ttml", "ttal", "sbv", "lrc", "txt-ts",
+];
 
 /// 未指定 `--format` 时使用的格式。
 const DEFAULT_FORMAT: &str = "srt";
@@ -228,7 +235,9 @@ fn bound_cli_threads(requested: u32) -> u32 {
 const COMMON_OPTIONS_HELP: &str = "\
   -i, --input <路径>        输入音视频文件或目录（等价于位置参数）
   -o, --output <路径>       输出字幕路径；输入是目录时视为输出目录
-      --format <格式>       输出格式，可选 srt|ass|vtt|json|txt|ttml|ttal（默认 srt）
+      --format <格式>       输出格式，可选 srt|ass|vtt|json|txt|ttml|ttal|sbv|lrc|txt-ts
+                            （默认 srt）。sbv=播放器两行式；lrc=唱词（只带起点时间）；
+                            txt-ts=带时间码纯文本（[00:01:23.456] 正文，一行一句）
       --lang, --language <代码>
                             指定源语言（如 zh / en / ja / auto；默认取 config.toml）
       --translate <语言>    转写后翻译字幕（如 English / 日本語 / 简体中文；默认不翻译）
@@ -968,6 +977,121 @@ pub struct Job {
     pub artifact_dir: Option<PathBuf>,
 }
 
+/// 批量任务失败后的重试计划（只算不改执行结果）。
+///
+/// # 为什么批量要重试
+///
+/// 一个目录里排 30 个视频，跑到第 27 个时磁盘临时写满、或 ffmpeg 抽音频时被别的
+/// 程序占住了句柄——这类失败**与这个文件本身无关**，重跑一次往往就过。但整批到此
+/// 为止，用户看到的是「27 成功 3 失败」，而那 3 个得他手工再挑一遍。反过来，
+/// 「文件本身有问题」（编码不支持、0 字节、路径不存在）重试多少次都一样，重试只是
+/// 白白把批量的总时长拉长。
+///
+/// 因此这里不无脑重试，而是先按错误文本**分类**：只有「看起来是环境抖动」的才进
+/// 重试清单，每条还带一个递增的退避秒数——立刻重试往往撞上同一个瞬时状态
+/// （句柄还没释放、磁盘还没回收），等一等反而更快过。
+///
+/// # 为什么退避是递增的
+///
+/// 统一等同一个间隔，第一次和第三次的成因几乎不可能相同：第一次多半是句柄/临时
+/// 文件没释放（几秒就够），第三次更可能是磁盘真的满了或服务在重启（要等更久）。
+/// 递增间隔让「快好」的情况不被拖慢，同时给「慢好」的情况留出恢复窗口。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchRetryPlan {
+    /// 需要重跑的任务在 `jobs` 里的下标（升序）
+    pub indices: Vec<usize>,
+    /// 每条下标对应的退避秒数（与 `indices` 等长、同序）
+    pub delays_secs: Vec<u64>,
+}
+
+impl BatchRetryPlan {
+    /// 一条都不重试（全部失败都与文件本身有关，或没有失败）。
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+}
+
+/// 单次批量最多重试几轮。
+///
+/// 取 2 而不是 3：第三轮还能失败的情况，成因基本不可能是瞬时抖动，继续重试只是
+/// 把用户的等待时间无限拉长，不如早点把失败清单交给他。
+const MAX_BATCH_RETRY_ROUNDS: usize = 2;
+
+/// 首轮退避秒数，之后每轮翻倍。
+const RETRY_BASE_DELAY_SECS: u64 = 2;
+
+/// 退避上限：再长用户会以为程序卡死，而批量的总时长往往以分钟计。
+const RETRY_MAX_DELAY_SECS: u64 = 30;
+
+/// 判定一条失败是否「值得重试」。
+///
+/// 判据是错误文本里是否出现**环境类**关键词。刻意用关键词而不是枚举错误类型：
+/// 失败来自 ffmpeg 子进程、whisper 子进程、SQLite、IO 等完全不同的层，把它们的
+/// 错误类型收敛成一个枚举等于要求每一层都改造；而这些层的错误字符串都是稳定的
+/// 英文/中文短语，关键词匹配足够，且误判的代价只是多等几秒。
+fn error_is_retryable(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    const MARKERS: [&str; 17] = [
+        // 句柄 / 文件被占用：Windows 上最常见的瞬时失败
+        "busy",
+        "locked",
+        "另一个程序",
+        "正在使用",
+        "共享违规",
+        // 网络 / 超时：在线翻译与模型下载
+        "timed out",
+        "timeout",
+        "connection",
+        "network",
+        "超时",
+        // 磁盘 / 资源
+        "temporarily",
+        "again",
+        "no space",
+        "disk full",
+        "resource",
+        "拒绝访问",
+        "空间不足",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
+
+/// 为一批失败的任务生成重试计划。`failures` 与 `jobs` 等长，`Some(msg)` 表示该条失败。
+///
+/// 返回空计划表示「没有值得重试的」——调用方据此直接收尾，不必再跑一轮。
+pub fn plan_batch_retry(failures: &[Option<String>], round: usize) -> BatchRetryPlan {
+    let mut indices = Vec::new();
+    for (idx, failure) in failures.iter().enumerate() {
+        let Some(message) = failure else { continue };
+        if !error_is_retryable(message) {
+            continue;
+        }
+        indices.push(idx);
+    }
+    let delays_secs = indices
+        .iter()
+        .map(|_| retry_delay(round))
+        .collect::<Vec<_>>();
+    BatchRetryPlan {
+        indices,
+        delays_secs,
+    }
+}
+
+/// 第 `round` 轮（从 0 起）的退避秒数：`base * 2^round`，上限 [`RETRY_MAX_DELAY_SECS`]。
+///
+/// 用 `saturating_mul` / `min` 而不是浮点幂：轮次是 usize，`2f64.powi` 在轮次很大时
+/// 会溢出成 inf，再转 u64 是饱和值，行为不可控；整数运算则永远落在定好的区间内。
+fn retry_delay(round: usize) -> u64 {
+    let doubled = RETRY_BASE_DELAY_SECS.saturating_mul(1u64 << round.min(16));
+    doubled.min(RETRY_MAX_DELAY_SECS)
+}
+
+/// 本次批量允许的重试轮数上限（供调用方与测试共用同一个口径）。
+pub fn max_batch_retry_rounds() -> usize {
+    MAX_BATCH_RETRY_ROUNDS
+}
+
 /// 跑完一次任务并汇总成一份结果。
 fn execute(args: &TranscribeArgs) -> Result<RunReport> {
     let policy = build_policy(args)?;
@@ -993,6 +1117,9 @@ fn execute_with_policy(args: &TranscribeArgs, policy: &PathPolicy) -> Result<Run
 
     let started = Instant::now();
     let mut items: Vec<RunReport> = Vec::with_capacity(jobs.len());
+    // 每条任务的最近一次失败原因（`None` = 成功或未执行）。批循环按它决定
+    // 要不要重跑，因此必须是「与 jobs 等长」的并行数组，而不是边跑边丢。
+    let mut last_error: Vec<Option<String>> = vec![None; jobs.len()];
     let mut failures = 0usize;
     for job in &jobs {
         let item = match execute_job(&config, args, job) {
@@ -1017,7 +1144,64 @@ fn execute_with_policy(args: &TranscribeArgs, policy: &PathPolicy) -> Result<Run
                 item.segments
             );
         }
+        // 记下这条的失败原因，供循环结束后的重试判定使用。
+        if let Some(err) = item.error.clone() {
+            if let Some(slot) = last_error.get_mut(items.len()) {
+                *slot = Some(err);
+            }
+        }
         items.push(item);
+    }
+
+    // ── 失败重试 ──
+    //
+    // 只补跑「看起来是环境抖动」的那些文件（判据见 `error_is_retryable`），
+    // 每条之前按轮次退避。补跑成功后**就地替换**原来的失败项，因此 `items`
+    // 与 `jobs` 的下标始终一一对应，汇总逻辑一行都不用改。
+    for round in 0..MAX_BATCH_RETRY_ROUNDS {
+        if failures == 0 {
+            break;
+        }
+        let plan = plan_batch_retry(&last_error, round);
+        if plan.is_empty() {
+            break;
+        }
+        for (&idx, &delay) in plan.indices.iter().zip(&plan.delays_secs) {
+            let Some(job) = jobs.get(idx) else { continue };
+            eprintln!(
+                "重试 ({}/{}): {}（等待 {delay}s）",
+                round + 1,
+                MAX_BATCH_RETRY_ROUNDS,
+                job.input.display()
+            );
+            std::thread::sleep(std::time::Duration::from_secs(delay));
+            match execute_job(&config, args, job) {
+                Ok(item) => {
+                    eprintln!("重试成功: {}", job.input.display());
+                    failures -= 1;
+                    last_error[idx] = None;
+                    // 成功的那条也要走一遍人用提示，与首轮完全一致。
+                    if !args.json {
+                        println!(
+                            "字幕已写入: {}（共 {} 段）",
+                            job.output.display(),
+                            item.segments
+                        );
+                    }
+                    items[idx] = item;
+                }
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    eprintln!("重试失败 ({}): {message}", job.input.display());
+                    last_error[idx] = Some(message);
+                    // 保持 `items[idx]` 的失败原样，但刷新错误文本，
+                    // 让最终 JSON 里带的是**最后一次**的失败原因。
+                    if let Some(report) = items.get_mut(idx) {
+                        report.error = last_error[idx].clone();
+                    }
+                }
+            }
+        }
     }
 
     let mut report = RunReport::new("transcribe");
@@ -1876,7 +2060,7 @@ fn transcribe_tool_definition() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": TOOL_NAME_TRANSCRIBE,
-            "description": "把本机上的一个音视频文件转成字幕文件（srt/ass/vtt/json/txt/ttml/ttal），可选择翻译与润色；返回输出文件绝对路径、片段数与时长。",
+            "description": "把本机上的一个音视频文件转成字幕文件（srt/ass/vtt/json/txt/ttml/ttal/sbv/lrc/txt-ts），可选择翻译与润色；返回输出文件绝对路径、片段数与时长。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1902,7 +2086,7 @@ fn tool_definitions() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
             "name": TOOL_NAME_TRANSCRIBE,
-            "description": "把单个音视频文件转成字幕文件（srt/ass/vtt/json/txt/ttml/ttal），可选翻译与润色。",
+            "description": "把单个音视频文件转成字幕文件（srt/ass/vtt/json/txt/ttml/ttal/sbv/lrc/txt-ts），可选翻译与润色。",
             "command": "voice2word run --json --input <input> [--format <format>] [--lang <code>] [--translate <lang>] [--polish] [--hotwords <text>] [--speakers <2-4>] [--resume]",
             "parameters": transcribe_tool_definition()["function"]["parameters"].clone(),
             "examples": [
@@ -3557,5 +3741,74 @@ mod tests {
 
         let message = parse_error(&["voice2word", "transcribe", "a.mp3", "--", "b.mp3"]);
         assert!(message.contains("多余的参数"), "{message}");
+    }
+    // ── 批量失败重试计划 ──
+
+    /// 环境类失败进重试清单，文件本身的问题不进。
+    #[test]
+    fn batch_retry_classifies_failures_by_message() {
+        let failures = vec![
+            None,
+            Some("写入字幕失败: 另一个程序正在使用此文件 (os error 32)".to_string()),
+            Some("不支持的编码格式".to_string()),
+            Some("request timed out after 120s".to_string()),
+        ];
+        let plan = plan_batch_retry(&failures, 0);
+        assert_eq!(plan.indices, vec![1, 3], "只有环境类失败该重试");
+        assert_eq!(plan.delays_secs, vec![RETRY_BASE_DELAY_SECS; 2]);
+    }
+
+    /// 没有失败、或没有一条值得重试时，计划为空。
+    #[test]
+    fn batch_retry_is_empty_without_retryable_failures() {
+        assert!(plan_batch_retry(&[], 0).is_empty());
+        assert!(plan_batch_retry(&[None, None], 0).is_empty());
+        assert!(plan_batch_retry(&[Some("输入路径不存在".to_string())], 0).is_empty());
+    }
+
+    /// 退避递增且封顶：第 0 轮 2s、第 1 轮 4s、之后一路到 30s 停住。
+    #[test]
+    fn batch_retry_delay_doubles_and_caps() {
+        assert_eq!(retry_delay(0), 2);
+        assert_eq!(retry_delay(1), 4);
+        assert_eq!(retry_delay(2), 8);
+        assert_eq!(retry_delay(3), 16);
+        assert_eq!(retry_delay(4), 30, "超过上限必须钳住");
+        assert_eq!(retry_delay(5), 30);
+        // 轮次大到会溢出 1u64 << round 时也不能 panic
+        assert_eq!(retry_delay(usize::MAX), 30);
+    }
+
+    /// 轮次上限对外可见，供调用方与测试共用同一个口径。
+    #[test]
+    fn batch_retry_round_cap_is_positive_and_small() {
+        assert_eq!(max_batch_retry_rounds(), MAX_BATCH_RETRY_ROUNDS);
+        assert!(max_batch_retry_rounds() >= 1, "至少要给一次机会");
+        assert!(max_batch_retry_rounds() <= 3, "轮次太多只会拉长批量总时长");
+    }
+
+    /// `plan.indices` 与 `plan.delays_secs` 必须等长同序：调用方是 zip 着用的。
+    #[test]
+    fn batch_retry_plan_keeps_indices_and_delays_aligned() {
+        let failures = vec![
+            Some("disk full".to_string()),
+            None,
+            Some("connection refused".to_string()),
+            Some("磁盘空间不足".to_string()),
+        ];
+        for round in 0..4 {
+            let plan = plan_batch_retry(&failures, round);
+            assert_eq!(plan.indices.len(), plan.delays_secs.len(), "round {round}");
+            assert!(plan.indices.windows(2).all(|w| w[0] < w[1]), "下标必须升序");
+        }
+    }
+
+    /// 中文环境类关键词同样要认：ffmpeg / SQLite 的中文错误串在这些场景下最常见。
+    #[test]
+    fn batch_retry_recognises_chinese_environment_markers() {
+        assert!(error_is_retryable("数据库已锁定 (database is locked)"));
+        assert!(error_is_retryable("另一个程序正在使用此文件"));
+        assert!(!error_is_retryable("未能解析出任何字幕"));
+        assert!(!error_is_retryable("不支持的输出格式"));
     }
 }

@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::Path;
 
 use super::segment::{ExportMode, Segment, WordTiming};
-use crate::utils::time::{seconds_to_ass_time, seconds_to_srt_time};
+use crate::utils::time::{seconds_to_ass_time, seconds_to_srt_time, seconds_to_timestamp};
 use crate::utils::SubtitleStyleConfig;
 
 pub struct SubtitleWriter;
@@ -109,6 +109,18 @@ impl SubtitleWriter {
         format: &str,
         mode: ExportMode,
     ) -> Result<()> {
+        // `wrap == 0`：无样式入口。带样式的三个可折行格式（SBV / 带时间码纯文本）
+        // 由 `write_to_file_with_style` 直接调到 inner，不走这里。
+        Self::write_in_place_wrapped(segments, path, format, mode, 0)
+    }
+
+    fn write_in_place_wrapped(
+        segments: &[Segment],
+        path: &Path,
+        format: &str,
+        mode: ExportMode,
+        wrap: usize,
+    ) -> Result<()> {
         // 工程文件（剪映 / FCPXML / Premiere）同样认「导出模式」：原文 / 仅译文 / 双语，
         // 有译文时压成一行。此前这三个分支只写原文、直接丢弃译文，用户在剪辑软件里
         // 根本看不到已译好的字幕。
@@ -117,9 +129,11 @@ impl SubtitleWriter {
             "ass" => Self::write_ass_with_mode(segments, path, mode),
             "vtt" => Self::write_vtt_with_mode(segments, path, mode),
             // ── 播放器/社区常用的小格式（P1-12）──
-            "sbv" => Self::write_sbv_with_mode(segments, path, mode),
+            "sbv" => Self::write_sbv_inner(segments, path, mode, wrap),
             "lrc" => Self::write_lrc_with_mode(segments, path, mode),
-            "txt-ts" | "txtts" => Self::write_txt_with_timecodes(segments, path, mode),
+            "txt-ts" | "txtts" => {
+                Self::write_txt_with_timecodes_wrapped(segments, path, mode, wrap)
+            }
             "txt" => Self::write_txt_with_mode(segments, path, mode),
             "fcpxml" => super::fcpxml::FcpXmlExporter::write_to_file(
                 segments,
@@ -221,6 +235,107 @@ impl SubtitleWriter {
             .map(|(l, _)| l.to_string())
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // 小格式：SBV / LRC / 带时间码纯文本
+    // ─────────────────────────────────────────────────────────────
+
+    /// SBV（SubViewer）写出：`0:00:01.000,0:00:02.000` 一行时间轴，紧跟一行正文。
+    ///
+    /// 这是 YouTube 早期字幕与一批国产播放器仍在认的格式。它与 SRT 的差别只在
+    /// 时间戳写法（`HH:MM:SS.mmm,HH:MM:SS.mmm`，逗号分隔、点号毫秒、**序号可有可无**），
+    /// 但两边都不支持多行 cue 之外的转义，因此正文里的换行一律压成空格：SBV 的
+    /// 一条字幕就是一行，塞进换行会让下一句被播放器当成另一条字幕的正文。
+    /// 无样式入口：不折行（`wrap == 0`）。
+    pub fn write_sbv_with_mode<P: AsRef<Path>>(
+        segments: &[Segment],
+        path: P,
+        mode: ExportMode,
+    ) -> Result<()> {
+        Self::write_sbv_inner(segments, path, mode, 0)
+    }
+
+    fn write_sbv_inner<P: AsRef<Path>>(
+        segments: &[Segment],
+        path: P,
+        mode: ExportMode,
+        wrap: usize,
+    ) -> Result<()> {
+        let mut file = File::create(path).with_context(|| "创建 SBV 文件失败")?;
+        let with_speaker = super::segment::has_speaker_labels(segments);
+        for seg in segments {
+            let start = seconds_to_sbv_time(seg.start);
+            let end = seconds_to_sbv_time(seg.end);
+            let raw = super::segment::export_text_for(seg, mode, with_speaker);
+            // SBV 一条字幕只有一行：双语/折行产生的换行必须先压成空格，否则播放器
+            // 会把第二行当成另一条字幕，整条轨的时间轴跟着错位。
+            let text = escape_sbv_text(&wrap_text_capped(&raw, wrap, WRAP_MAX_LINES))
+                .replace(['\r', '\n'], " ");
+            writeln!(file, "{start},{end}")?;
+            writeln!(file, "{}", text.trim())?;
+            writeln!(file)?;
+        }
+        Ok(())
+    }
+
+    /// LRC 唱词写出：每行 `[mm:ss.cc]正文`。
+    ///
+    /// LRC 只带**起点**时间（这是它本身的设计），因此这里只写起点；结束时间由播放器
+    /// 按下一行起点补齐——与导入侧（`reader::parse_lrc`）的规则互为逆运算，写出来
+    /// 再读回来时中间各句的时间轴不变。
+    pub fn write_lrc_with_mode<P: AsRef<Path>>(
+        segments: &[Segment],
+        path: P,
+        mode: ExportMode,
+    ) -> Result<()> {
+        let mut file = File::create(path).with_context(|| "创建 LRC 文件失败")?;
+        let with_speaker = super::segment::has_speaker_labels(segments);
+        for seg in segments {
+            let stamp = seconds_to_lrc_time(seg.start);
+            // 一行一句：换行一律压成空格。LRC 播放器同样把一行当一条。
+            let raw = super::segment::export_text_for(seg, mode, with_speaker);
+            // 只能 trim **尾部**：行首那个空格正是「[」的隔断层，
+            // `trim()` 会把它连同隔断一起吃掉，等于没转义。
+            let text = escape_lrc_text(&raw).trim_end().to_string();
+            writeln!(file, "[{}]{}", stamp, text)?;
+        }
+        Ok(())
+    }
+
+    /// 带时间码的纯文本写出：`[00:01:23] 正文`，一行一句。
+    ///
+    /// 与纯 TXT 的分工：TXT 是给人和下游脚本逐行读的，一行就是一句、没有任何时间
+    /// 信息；这份则在「保留一行一句」的同时把起点时间带在身上——贴进会议记录、邮件
+    /// 或聊天里，读者能直接看出这句话出现在几分几秒，而不用再开一个播放器对。
+    /// 因为不带时间轴的 `.txt` 语义不能变（导入侧按字数合成时间轴），这里用独立的
+    /// 格式名，而不是给 TXT 加一个开关。
+    pub fn write_txt_with_timecodes<P: AsRef<Path>>(
+        segments: &[Segment],
+        path: P,
+        mode: ExportMode,
+    ) -> Result<()> {
+        // 与 TXT 一致：一行一句，无样式入口不折行。
+        Self::write_txt_with_timecodes_wrapped(segments, path, mode, 0)
+    }
+
+    fn write_txt_with_timecodes_wrapped<P: AsRef<Path>>(
+        segments: &[Segment],
+        path: P,
+        mode: ExportMode,
+        wrap: usize,
+    ) -> Result<()> {
+        let mut file = File::create(path).with_context(|| "创建 TXT 文件失败")?;
+        let with_speaker = super::segment::has_speaker_labels(segments);
+        for seg in segments {
+            let stamp = seconds_to_timestamp(seg.start);
+            let raw = super::segment::export_text_for(seg, mode, with_speaker);
+            // 与 TXT 一致：一行一句；折行参数 0 表示不折。
+            let flat = raw.replace(['\r', '\n'], " ");
+            let wrapped = wrap_text_capped(&flat, wrap, WRAP_MAX_LINES);
+            let text = escape_markup_entities(&wrapped).replace(['\r', '\n'], " ");
+            writeln!(file, "[{}] {}", stamp, text.trim())?;
+        }
+        Ok(())
+    }
     /// 生成标准 SRT 格式
     pub fn write_srt<P: AsRef<Path>>(segments: &[Segment], path: P) -> Result<()> {
         Self::write_srt_with_mode(segments, path, ExportMode::RawOnly)
@@ -331,6 +446,13 @@ impl SubtitleWriter {
             }),
             "ass" => Self::write_atomic(path, |target| {
                 Self::write_ass_inner(segments, target, mode, style, wrap)
+            }),
+            // SBV / 带时间码的纯文本同样支持按样式折行（LRC 一行一句，不折）。
+            "sbv" => Self::write_atomic(path, |target| {
+                Self::write_sbv_inner(segments, target, mode, wrap)
+            }),
+            "txt-ts" | "txtts" => Self::write_atomic(path, |target| {
+                Self::write_txt_with_timecodes_wrapped(segments, target, mode, wrap)
             }),
             // TXT 是给人读 / 给下游喂的纯文本，折行会破坏「一行一句」，
             // 因此**明确不折**（`write_txt_with_mode` 本身也不折）。
@@ -614,6 +736,9 @@ pub fn export_spec_for(fmt: &str) -> (&'static str, &'static str) {
     match fmt.trim().to_lowercase().as_str() {
         "ass" => ("ass", "ASS 特效字幕"),
         "vtt" => ("vtt", "VTT 网页字幕"),
+        "sbv" => ("sbv", "SBV 播放器字幕"),
+        "lrc" => ("lrc", "LRC 唱词"),
+        "txt-ts" | "txtts" => ("txt", "带时间码纯文本"),
         "txt" => ("txt", "TXT 纯文本"),
         "json" => ("json", "JSON 结构化字幕"),
         "ttml" | "ebu-tt-d" | "ebutt" => ("ttml", "EBU-TT-D 广播字幕"),
@@ -1182,6 +1307,65 @@ fn ass_preset_colors(preset: &str) -> (&'static str, &'static str, &'static str,
     }
 }
 
+// ── 小格式的时间戳 / 转义 helper ──
+//
+// 这三个函数只做「秒 → 某格式的时间串」与「文本 → 某格式的安全文本」，不依赖
+// `SubtitleWriter` 的任何关联状态，因此是模块级自由函数：SBV / LRC / 带时间码
+// 纯文本三个写出函数共用，也便于单独测试。
+
+/// SBV 时间戳：`H:MM:SS.mmm`（小时不补零）。
+///
+/// 小时位补不补零两种写法都有实现接受，这里取 YouTube 自己导出那份的写法。
+/// 复用 `seconds_to_srt_time` 的进位与钳位逻辑，只改分隔符与补零，保证
+/// 与 SRT 的时间表示完全一致——同一个 `seg.start` 在两种格式里必须是同一时刻。
+fn seconds_to_sbv_time(seconds: f64) -> String {
+    let text = seconds_to_srt_time(seconds);
+    let (clock, millis) = text.split_once(',').expect("SRT 时间必含毫秒段");
+    // 只剥**小时位**的前导零（`00:01:05` → `0:01:05`），分与秒两位必须保留：
+    // 对整个串做 trim_start_matches 会把 `00:00:01` 剥成 `:00:01`。
+    // 至少留一位，避免小时为 0 时剥出空段。
+    let (hours, rest) = match clock.split_once(':') {
+        Some((hours, rest)) => (hours, rest),
+        None => (clock, ""),
+    };
+    let hours = hours.trim_start_matches('0');
+    let hours = if hours.is_empty() { "0" } else { hours };
+    format!("{hours}:{rest}.{millis}")
+}
+
+/// LRC 时间戳：`mm:ss.cc`（百分秒，小时位超出 99 分钟时进位到分）。
+///
+/// 只支持两位分钟是 LRC 规范本身的上限（播放器按 `[mm:ss.xx]` 匹配）；超过
+/// 99 分钟的素材会进位成三位分钟，仍可被主流播放器解析，但导入侧只按
+/// `mm:ss.cc` 读，因此超过 99 分钟的内容**不要**选 LRC——那是格式的锅，
+/// 不是本函数的锅，这里如实进位而不是截断。
+fn seconds_to_lrc_time(seconds: f64) -> String {
+    let total_cs = (seconds.max(0.0) * 100.0).round() as u64;
+    let cs = total_cs % 100;
+    let total_s = total_cs / 100;
+    format!("{:02}:{:02}.{:02}", total_s / 60, total_s % 60, cs)
+}
+
+/// SBV 文本转义：`&` `<` `>` → 实体（与 SRT 同一套判据）。
+///
+/// SBV 的正文也是纯文本，播放器（含 YouTube 的渲染器）对 `<` 的处理与 SRT
+/// 一致，因此复用同一份单遍实现。
+fn escape_sbv_text(text: &str) -> String {
+    escape_markup_entities(text)
+}
+
+/// LRC 文本转义：只处理换行（压成空格）与行首的 `[`。
+///
+/// 行首的 `[` 会被播放器当成时间标签的开头，导致这一行整条不显示；在它前面补
+/// 一个空格即可，不需要引入 LRC 规范之外的转义语法。
+fn escape_lrc_text(text: &str) -> String {
+    let collapsed = text.replace(['\r', '\n'], " ");
+    if collapsed.starts_with('[') {
+        format!(" {collapsed}")
+    } else {
+        collapsed
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2803,5 +2987,237 @@ mod tests {
             Some(vec![(0, 10)]),
             "空白词元与 NaN 只跳过，不拖累整句"
         );
+    }
+
+    // ── SBV / LRC / 带时间码纯文本 ──
+
+    /// 造一句带（可选）译文的片段，省掉每处样板。
+    fn bilingual(index: usize, start: f64, end: f64, text: &str, trans: &str) -> Segment {
+        let mut s = Segment::new(index, start, end, text);
+        s.translation = Some(trans.to_string());
+        s.translation_lang = Some("English".to_string());
+        s
+    }
+
+    /// SBV：时间轴一行、正文一行，毫秒用点号，逗号分隔起止。
+    #[test]
+    fn sbv_writes_timing_and_text_lines() {
+        let segs = vec![
+            Segment::new(1, 1.0, 2.5, "第一句"),
+            Segment::new(2, 3.0, 4.0, "第二句"),
+        ];
+        let dir = tmp_dir("sbv");
+        let out = dir.join("out.sbv");
+        SubtitleWriter::write_to_file(&segs, &out, "sbv").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "0:00:01.000,0:00:02.500\n第一句\n\n0:00:03.000,0:00:04.000\n第二句\n\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SBV 一条字幕只有一行：双语两行必须压成空格，否则播放器会把第二行当成
+    /// 另一条字幕的正文，整条轨错位。
+    #[test]
+    fn sbv_flattens_bilingual_into_one_line() {
+        let segs = vec![bilingual(1, 0.0, 2.0, "你好", "Hello")];
+        let dir = tmp_dir("sbv_biling");
+        let out = dir.join("out.sbv");
+        SubtitleWriter::write_to_file_with_mode(&segs, &out, "sbv", ExportMode::Bilingual).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(text, "0:00:00.000,0:00:02.000\nHello 你好\n\n");
+        // 三行：时间轴、正文、块末空行。正文里不能出现换行（否则会被当成另一条字幕）。
+        assert_eq!(text.lines().count(), 3, "正文必须是单行: {text:?}");
+        assert!(!text.contains("Hello'\n'"), "双语不能被折成两行: {text:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SBV 文本同样要转义 `<` `&`：播放器按 HTML 子集解析，未转义的 `<` 会吞文本。
+    #[test]
+    fn sbv_escapes_markup_entities() {
+        let segs = vec![Segment::new(1, 0.0, 1.0, "a & b <tag>")];
+        let dir = tmp_dir("sbv_esc");
+        let out = dir.join("out.sbv");
+        SubtitleWriter::write_to_file(&segs, &out, "sbv").unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("a &amp; b &lt;tag&gt;"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SBV 与 SRT 必须表示同一时刻：同一份输入只换分隔符，时间数值逐一相等。
+    #[test]
+    fn sbv_timestamps_match_srt_numerically() {
+        assert_eq!(seconds_to_sbv_time(0.0), "0:00:00.000");
+        assert_eq!(seconds_to_sbv_time(65.123), "0:01:05.123");
+        assert_eq!(seconds_to_sbv_time(3661.5), "1:01:01.500");
+        // 进位与钳位沿用 SRT 的实现：59.9995 进位成 1 分，100 小时钳到上限
+        assert_eq!(seconds_to_sbv_time(59.9995), "0:01:00.000");
+        assert_eq!(seconds_to_sbv_time(360_000.0), "99:59:59.999");
+        // 负值与 NaN 不产出怪东西
+        assert_eq!(seconds_to_sbv_time(-1.0), "0:00:00.000");
+        assert_eq!(seconds_to_sbv_time(f64::NAN), "0:00:00.000");
+    }
+
+    /// LRC：每行 `[mm:ss.cc]正文`，只带起点时间（这是 LRC 自身的设计）。
+    #[test]
+    fn lrc_writes_start_time_and_text() {
+        let segs = vec![
+            Segment::new(1, 7.0, 9.0, "第一句"),
+            Segment::new(2, 65.25, 66.0, "第二句"),
+        ];
+        let dir = tmp_dir("lrc");
+        let out = dir.join("out.lrc");
+        SubtitleWriter::write_to_file(&segs, &out, "lrc").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "[00:07.00]第一句\n[01:05.25]第二句\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LRC 行首的 `[` 会被播放器当成时间标签开头，导致整行不显示，必须补一个空格。
+    #[test]
+    fn lrc_escapes_leading_bracket() {
+        let segs = vec![Segment::new(1, 0.0, 1.0, "[掌声]谢谢大家")];
+        let dir = tmp_dir("lrc_bracket");
+        let out = dir.join("out.lrc");
+        SubtitleWriter::write_to_file(&segs, &out, "lrc").unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(text, "[00:00.00] [掌声]谢谢大家\n");
+        assert!(
+            !text.starts_with("[00:00.00]["),
+            "行首方括号必须被隔开: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 带时间码纯文本：`[00:01:23.456] 正文`，一行一句，换行压平。
+    #[test]
+    fn txt_with_timecodes_prefixes_each_line() {
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "第一句"),
+            bilingual(2, 83.456, 84.0, "第二句", "Second"),
+        ];
+        let dir = tmp_dir("txt_ts");
+        let out = dir.join("out.txt");
+        SubtitleWriter::write_to_file_with_mode(&segs, &out, "txt-ts", ExportMode::Bilingual)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "[00:00:00.000] 第一句\n[00:01:23.456] Second 第二句\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 纯 TXT 的语义不能被带时间码的格式顶掉：`.txt` 仍是一行一句、不带时间。
+    #[test]
+    fn plain_txt_stays_untouched_by_new_format() {
+        let segs = vec![
+            Segment::new(1, 1.0, 2.0, "第一句"),
+            Segment::new(2, 3.0, 4.0, "第二句"),
+        ];
+        let dir = tmp_dir("txt_plain");
+        let plain = dir.join("plain.txt");
+        let stamped = dir.join("stamped.txt");
+        SubtitleWriter::write_to_file(&segs, &plain, "txt").unwrap();
+        SubtitleWriter::write_to_file(&segs, &stamped, "txt-ts").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&plain).unwrap(), "第一句\n第二句\n");
+        assert_ne!(
+            std::fs::read_to_string(&plain).unwrap(),
+            std::fs::read_to_string(&stamped).unwrap(),
+            "两种纯文本格式必须可区分"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `export_spec_for` 的新条目必须**真的**被 writer 接受，且扩展名与内容一致
+    /// （否则会出现「文件叫 .sbv、内容是 SRT」这种静默不一致）。
+    #[test]
+    fn export_spec_covers_new_formats_and_writer_accepts_them() {
+        for (fmt, ext) in [
+            ("sbv", "sbv"),
+            ("lrc", "lrc"),
+            ("txt-ts", "txt"),
+            ("txtts", "txt"),
+        ] {
+            let (spec_ext, label) = export_spec_for(fmt);
+            assert_eq!(spec_ext, ext, "{fmt} 的扩展名应一致");
+            assert!(!label.is_empty(), "{fmt} 必须有对话框过滤器名");
+
+            let dir = tmp_dir(&format!("spec_{fmt}"));
+            let out = dir.join(format!("out.{spec_ext}"));
+            SubtitleWriter::write_to_file_with_mode(&sample(), &out, fmt, ExportMode::RawOnly)
+                .unwrap_or_else(|e| panic!("{fmt} 未被 writer 接受: {e}"));
+            assert!(
+                !std::fs::read_to_string(&out).unwrap().trim().is_empty(),
+                "{fmt} 导出内容为空"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// 带样式入口对 SBV / 带时间码纯文本同样生效（按 `max_chars_per_line` 折行），
+    /// 而 `max_chars_per_line == 0` 时必须与无样式入口逐字节一致。
+    #[test]
+    fn style_path_wraps_new_formats_and_is_byte_identical_when_zero() {
+        let segs = vec![Segment::new(
+            1,
+            0.0,
+            2.0,
+            "今天天气很好，我们一起去公园散步，然后回家吃饭，明天再说。",
+        )];
+        let wrapping = SubtitleStyleConfig {
+            max_chars_per_line: 8,
+            ..SubtitleStyleConfig::default()
+        };
+        let zero = SubtitleStyleConfig {
+            max_chars_per_line: 0,
+            ..SubtitleStyleConfig::default()
+        };
+
+        for fmt in ["sbv", "txt-ts"] {
+            let dir = tmp_dir(&format!("style_{fmt}"));
+            let plain = dir.join(format!("plain.{fmt}"));
+            let zeroed = dir.join(format!("zeroed.{fmt}"));
+            let wrapped = dir.join(format!("wrapped.{fmt}"));
+
+            SubtitleWriter::write_to_file(&segs, &plain, fmt).unwrap();
+            SubtitleWriter::write_to_file_with_style(
+                &segs,
+                &zeroed,
+                fmt,
+                ExportMode::RawOnly,
+                &zero,
+            )
+            .unwrap();
+            SubtitleWriter::write_to_file_with_style(
+                &segs,
+                &wrapped,
+                fmt,
+                ExportMode::RawOnly,
+                &wrapping,
+            )
+            .unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(&plain).unwrap(),
+                std::fs::read_to_string(&zeroed).unwrap(),
+                "{fmt}: max_chars == 0 必须与无样式导出逐字节一致"
+            );
+            // LRC 刻意不折行（一行一句是它的语义），因此只有 SBV 参与折行断言。
+            if fmt == "sbv" {
+                assert_ne!(
+                    std::fs::read_to_string(&plain).unwrap(),
+                    std::fs::read_to_string(&wrapped).unwrap(),
+                    "{fmt}: 带样式应当真的折行"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

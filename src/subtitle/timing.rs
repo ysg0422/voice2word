@@ -120,6 +120,117 @@ pub fn resolve_overlaps(times: &[(f64, f64)]) -> Vec<(f64, f64)> {
     out
 }
 
+/// 相邻字幕之间要求的**最小空隙**（秒）。
+///
+/// 为什么值得单独做：识别器给出的时间轴经常让两条字幕首尾相贴（甚至互相压几毫秒），
+/// 播放时上一句还没从屏幕上消失、下一句就已经开始读——观众的心理感受是「字挤在一起」，
+/// 而手工一句句去拖，几百句就是几百次拖拽。本模块与整轨变换共用同一套「先算计划、
+/// 再落库」的形状：界面拿 [`plan_min_gaps`] 显示「将改动 N 句」，确认后才写回。
+///
+/// 取 40ms 而不是 0：人眼对「两行字同时在场」的阈值远高于一帧，40ms 在 24~60fps 下
+/// 都足够让上一行先消失，又不至于为了凑空隙把短句压到不可读。
+pub const DEFAULT_MIN_GAP_SECS: f64 = 0.04;
+
+/// 一次「最小句间间隔」调整的计划（只算不改，见模块头）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct GapPlan {
+    /// 与输入等长的新 `(start, end)` 序列
+    pub times: Vec<(f64, f64)>,
+    /// 有多少条的**起点**真的变了
+    pub changed: usize,
+    /// 有多少条被**缩短**了（为了给后一句让出空隙）
+    pub shortened: usize,
+    /// 调整后是否仍存在间隔不足的相邻对（被 [`MIN_EDIT_DUR`] 挡住而无法完全满足）
+    pub unresolved: bool,
+}
+
+/// 规划一次「保证相邻字幕之间至少有 `min_gap` 秒空隙」的调整。**不修改输入**。
+///
+/// # 算法
+///
+/// 按 start 升序逐对处理（输入乱序时先排序，与 [`resolve_overlaps`] 同口径）：
+/// 若 `next.start < prev.end + min_gap`，优先把 `next.start` 往后抬到
+/// `prev.end + min_gap`；抬完若 `next` 自身短于 [`MIN_EDIT_DUR`]，则改为**收
+/// `prev.end`**，让 `next` 保住原有终点——「优先压前一条」与 [`resolve_overlaps`]
+/// 的取舍一致，两处调用方看到的规则是一样的。
+///
+/// 末句之后没有「下一条」，因此末句永远不被本函数改动。
+///
+/// # 为什么只挪起点、不擅自加长
+///
+/// 加长末句去凑空隙会改动**用户已经确认过的**结束时间；而本函数的目标只是
+/// 「消除相贴」，起点后移已经达成。真正需要重新铺满时间轴时应改用
+/// [`plan_retime`] 的 [`TimeShift::FitToDuration`]。
+pub fn plan_min_gaps(segments: &[Segment], min_gap: f64) -> GapPlan {
+    // NaN 与负值一律回落到默认间隔：负间隔意味着「允许重叠」，与本函数的目的
+    // 相反；NaN 更会把整条轨写成 NaN。0 是**合法值**（只要不重叠即可，
+    // 不额外要空隙），因此只有非有限或负数才回落。
+    let gap = if min_gap.is_finite() && min_gap >= 0.0 {
+        min_gap
+    } else {
+        DEFAULT_MIN_GAP_SECS
+    };
+    let base: Vec<(f64, f64)> = segments.iter().map(|s| (s.start, s.end)).collect();
+    if base.len() < 2 {
+        return GapPlan {
+            times: base,
+            changed: 0,
+            shortened: 0,
+            unresolved: false,
+        };
+    }
+
+    // 稳定排序：起点相等时保持原顺序，NaN 用 Equal 兜底（与 resolve_overlaps 同口径）。
+    let mut order: Vec<usize> = (0..base.len()).collect();
+    order.sort_by(|&a, &b| base[a].0.partial_cmp(&base[b].0).unwrap_or(Ordering::Equal));
+
+    let mut out = base.clone();
+    let mut changed = 0usize;
+    let mut shortened = 0usize;
+    for pair in order.windows(2) {
+        let (prev, next) = (pair[0], pair[1]);
+        // 倒挂或零长的片段自己就是坏的，本函数不负责修（那是 resolve_overlaps 的活）。
+        if out[prev].1 <= out[prev].0 {
+            continue;
+        }
+        let want = out[prev].1 + gap;
+        if out[next].0 >= want {
+            continue;
+        }
+        if out[next].1 - want >= MIN_EDIT_DUR {
+            out[next].0 = want;
+            changed += 1;
+        } else {
+            // 后一句本来就短：改为收前一句的 end，让它保住终点。
+            let shrunk = out[next].1 - MIN_EDIT_DUR;
+            if shrunk > out[prev].0 && shrunk < out[prev].1 {
+                out[prev].1 = shrunk;
+                shortened += 1;
+            }
+            // 收不动（前一句也短得没法再收）就承认这一对没解决，如实上报。
+        }
+    }
+
+    let unresolved = has_short_gaps(&out, gap);
+    GapPlan {
+        times: out,
+        changed,
+        shortened,
+        unresolved,
+    }
+}
+
+/// 排序后是否仍存在间隔不足 `gap` 的相邻对（用 `OVERLAP_TOL` 容忍浮点毛刺）。
+fn has_short_gaps(times: &[(f64, f64)], gap: f64) -> bool {
+    if times.len() < 2 {
+        return false;
+    }
+    let mut sorted: Vec<(f64, f64)> = times.to_vec();
+    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    sorted
+        .windows(2)
+        .any(|pair| pair[1].0 < pair[0].1 + gap - OVERLAP_TOL)
+}
 /// 便于界面显示的一句话摘要，例如
 /// "平移 +12.0s，涉及 190 句" / "缩放 1500.0s → 1320.0s" / "已重排 42 句"。
 ///
@@ -597,6 +708,137 @@ mod tests {
             assert_eq!(plan.changed, 0);
             assert!(!plan.overlaps);
             assert!(!plan.degenerate);
+        }
+    }
+    // ── plan_min_gaps ──
+
+    /// 相贴的两句被推开：后一句起点后移，前一句终点不动。
+    #[test]
+    fn min_gaps_pushes_next_start_forward() {
+        let segs = [seg(1, 0.0, 2.0), seg(2, 2.0, 3.0)];
+        let plan = plan_min_gaps(&segs, 0.5);
+        assert_eq!(plan.times, vec![(0.0, 2.0), (2.5, 3.0)]);
+        assert_eq!(plan.changed, 1, "只有后一句起点变了");
+        assert_eq!(plan.shortened, 0, "前一句不该被收短");
+        assert!(!plan.unresolved, "2.5 > 2.0 + 0.5 - tol");
+    }
+
+    /// 空隙本来就够：一条都不改，`changed` 为 0。
+    #[test]
+    fn min_gaps_is_noop_when_gaps_already_satisfied() {
+        let segs = [seg(1, 0.0, 1.0), seg(2, 2.0, 3.0)];
+        let plan = plan_min_gaps(&segs, 0.04);
+        assert_eq!(plan.times, vec![(0.0, 1.0), (2.0, 3.0)]);
+        assert_eq!(plan.changed, 0);
+        assert_eq!(plan.shortened, 0);
+        assert!(!plan.unresolved);
+    }
+
+    /// 后一句太短、抬起点会压过 `MIN_EDIT_DUR` 时改为收前一句的 end，
+    /// 让后一句保住原有终点（与 resolve_overlaps 同一取舍）。
+    #[test]
+    fn min_gaps_shortens_previous_when_next_is_too_short() {
+        let segs = [seg(1, 0.0, 2.0), seg(2, 2.0, 2.05)];
+        let plan = plan_min_gaps(&segs, 0.04);
+        assert_eq!(plan.times[0].0, 0.0, "前一句起点不动");
+        assert_eq!(plan.times[1], (2.0, 2.05), "后一句必须原样保住");
+        assert_eq!(plan.shortened, 1, "前一句被收短");
+        assert_eq!(plan.changed, 0, "没有起点被抬");
+        assert!(!plan.unresolved);
+    }
+
+    /// 收不动时就如实上报：不能假装已经解决了。
+    #[test]
+    fn min_gaps_reports_unresolved_pairs() {
+        // 两条都极短且互相压住：抬后一句会短于下限，收前一句也没空间。
+        let segs = [seg(1, 0.0, 0.1), seg(2, 0.0, 0.1)];
+        let plan = plan_min_gaps(&segs, 0.5);
+        assert!(plan.unresolved, "无法满足时必须上报");
+        assert_eq!(plan.changed, 0);
+        assert_eq!(plan.shortened, 0);
+    }
+
+    /// 末句之后没有「下一条」，因此末句的起点永不被本函数改动。
+    #[test]
+    fn min_gaps_never_moves_the_last_cue() {
+        let segs = [seg(1, 0.0, 1.0), seg(2, 5.0, 6.0)];
+        let plan = plan_min_gaps(&segs, 0.04);
+        assert_eq!(plan.times[1], (5.0, 6.0), "末句原样");
+        assert_eq!(plan.times[0], (0.0, 1.0));
+    }
+
+    /// 乱序输入：按 start 排序后处理，输出仍与输入等长、同序存放。
+    #[test]
+    fn min_gaps_sorts_before_planning() {
+        let segs = [seg(1, 10.0, 11.0), seg(2, 0.0, 1.0), seg(3, 1.0, 2.0)];
+        let plan = plan_min_gaps(&segs, 0.5);
+        assert_eq!(plan.times.len(), 3);
+        // 原顺序的第 2 条（0~1）与第 3 条（1~2）之间被插入 0.5s 空隙
+        assert_eq!(plan.times[1], (0.0, 1.0));
+        assert_eq!(plan.times[2], (1.5, 2.0));
+        assert_eq!(plan.changed, 1);
+    }
+
+    /// 非法间隔值必须安全回落，绝不能把 NaN 写进时间轴。
+    #[test]
+    fn min_gaps_rejects_nan_and_negative_targets() {
+        let segs = [seg(1, 0.0, 1.0), seg(2, 1.0, 2.0)];
+        for bad in [f64::NAN, -1.0, 0.0, f64::INFINITY] {
+            let plan = plan_min_gaps(&segs, bad);
+            assert_eq!(plan.times.len(), 2);
+            for &(start, end) in &plan.times {
+                assert!(start.is_finite() && end.is_finite(), "{bad} 产出非有限时间");
+            }
+        }
+        // 负值/0/NaN 一律按默认间隔处理：0 表示「不许负空隙」，与 0.04 不同。
+        let zero = plan_min_gaps(&segs, 0.0);
+        assert_eq!(
+            zero.times,
+            vec![(0.0, 1.0), (1.0, 2.0)],
+            "0 不应推开任何东西"
+        );
+    }
+
+    /// 空轨与单条轨都是恒等变换。
+    #[test]
+    fn min_gaps_of_short_tracks_is_inert() {
+        assert!(plan_min_gaps(&[], 0.5).times.is_empty());
+        let one = [seg(1, 0.0, 1.0)];
+        let plan = plan_min_gaps(&one, 0.5);
+        assert_eq!(plan.times, vec![(0.0, 1.0)]);
+        assert_eq!(plan.changed, 0);
+    }
+
+    /// 不变式：结果中不存在「间隔不足 `gap` 且两侧都够长」的相邻对——
+    /// 也就是所有能解决的都被解决了（`unresolved` 为 false 时一个不剩）。
+    #[test]
+    fn min_gaps_resolves_everything_resolvable() {
+        // 全部句子都长于 `MIN_EDIT_DUR`（0.25s），因此每一对都有解。
+        // （若混入 0.2s 的鬼影碎片，它自己就低于下限，本函数修不了，
+        // 那是 `optimize_segments` 的职责。）
+        let segs = [
+            seg(1, 0.0, 2.0),
+            seg(2, 2.0, 4.0),
+            seg(3, 4.0, 5.0),
+            seg(4, 5.0, 7.0),
+            seg(5, 7.0, 9.0),
+        ];
+        let gap = 0.3;
+        let plan = plan_min_gaps(&segs, gap);
+        assert!(!plan.unresolved, "这些句子都够长，应能全部解决");
+        for pair in plan.times.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].1 + gap - 1e-9,
+                "相邻空隙不足: {:?}",
+                pair
+            );
+        }
+        // 每条都不该被压到 MIN_EDIT_DUR 以下
+        for &(start, end) in &plan.times {
+            assert!(
+                end - start >= MIN_EDIT_DUR - 1e-9,
+                "片段被压过短: {start}..{end}"
+            );
         }
     }
 }

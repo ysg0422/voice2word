@@ -1,13 +1,13 @@
-//! 字幕导入：把 SRT / WebVTT / LRC / ASS(SSA) / TTML 系 / JSON / 纯文本读回 `Vec<Segment>`
+//! 字幕导入：把 SRT / WebVTT / LRC / ASS(SSA) / TTML 系 / JSON / SBV / 纯文本读回 `Vec<Segment>`
 //!
-//! Voice2Word 能写出八种字幕格式，导入侧却长期只认 SRT / WebVTT / 纯文本：用户手里
+//! Voice2Word 能写出十余种字幕格式，导入侧却长期只认 SRT / WebVTT / 纯文本：用户手里
 //! 有同事发来的 LRC 唱词、剪辑交付的 ASS，或者想修一版自己上次导出的 JSON / TTML 时，
 //! 只能把整段视频重新转写一遍——又慢又费钱。本模块把导入侧补齐到与导出侧同一张格式表，
 //! 导出什么格式就能原样读回什么格式。
 //!
 //! **各格式的时间信息完整度不同**，导入时必须区别对待，否则会把「猜出来的时间轴」
 //! 当成文件里的真实标注：
-//! - SRT / WebVTT / ASS / TTML / JSON 都带起止时间，读回的就是文件里的原始值；
+//! - SRT / WebVTT / ASS / TTML / JSON / SBV 都带起止时间，读回的就是文件里的原始值；
 //! - LRC 每行只带起点，中间各句的终点由**下一行的起点**补齐，只有最后一句的终点
 //!   按字数估算（[`LRC_TAIL_SECONDS_PER_CHAR`]）；
 //! - TXT 完全没有时间信息，整条时间轴都是按字数合成的占位值
@@ -56,6 +56,8 @@ pub enum SubtitleFormat {
     Ass,
     /// TTML 系（EBU-TT-D / Netflix TTAL / 通用 TTML、DFXP）
     Ttml,
+    /// SBV（SubViewer）：`0:00:01.000,0:00:02.000` 一行时间轴 + 一行正文
+    Sbv,
 }
 
 impl SubtitleFormat {
@@ -75,6 +77,7 @@ impl SubtitleFormat {
             "ass" | "ssa" => Some(Self::Ass),
             // `dfxp` 是 TTML 的旧称；`ttal` 是 Netflix 的 TTML 变体，同样按 TTML 读取。
             "ttml" | "dfxp" | "ttal" => Some(Self::Ttml),
+            "sbv" => Some(Self::Sbv),
             _ => None,
         }
     }
@@ -89,6 +92,7 @@ impl SubtitleFormat {
             Self::Lrc => "LRC 歌词",
             Self::Ass => "ASS 字幕",
             Self::Ttml => "TTML 字幕",
+            Self::Sbv => "SBV 字幕",
         }
     }
 }
@@ -178,6 +182,7 @@ pub fn parse(content: &str, format: SubtitleFormat) -> Result<Vec<Segment>> {
         SubtitleFormat::Lrc => parse_lrc(content),
         SubtitleFormat::Ass => parse_ass(content),
         SubtitleFormat::Ttml => parse_ttml(content),
+        SubtitleFormat::Sbv => parse_sbv(content),
     }
 }
 
@@ -188,7 +193,7 @@ pub fn parse(content: &str, format: SubtitleFormat) -> Result<Vec<Segment>> {
 pub fn read_subtitle_file(path: &Path) -> Result<Vec<Segment>> {
     let format = SubtitleFormat::from_path(path).with_context(|| {
         format!(
-            "不支持的字幕扩展名（只支持 .srt / .vtt / .txt / .json / .lrc / .ass / .ssa / .ttml / .dfxp / .ttal）：{}",
+            "不支持的字幕扩展名（只支持 .srt / .vtt / .txt / .json / .lrc / .ass / .ssa / .ttml / .dfxp / .ttal / .sbv）：{}",
             path.display()
         )
     })?;
@@ -626,6 +631,58 @@ fn lrc_tail_estimate(body: &str) -> f64 {
     (body.chars().count() as f64 * LRC_TAIL_SECONDS_PER_CHAR).max(LRC_TAIL_MIN_DURATION)
 }
 
+/// 解析 SBV（SubViewer）文本。
+///
+/// 结构是「一行时间轴 + 一行正文」交替，时间轴写作 `H:MM:SS.mmm,H:MM:SS.mmm`
+/// （逗号分隔、毫秒用点号）。与 SRT 的差别只在时间戳写法与序号可有可无，因此
+/// 坏块（时间戳不可解析 / `end < start` / 正文为空）的处理与 SRT 完全一致：
+/// 丢它自己，不影响后面的块。
+///
+/// 时间戳的小时位可以不补零（`0:00:01.500`），`parse_timestamp` 已经吃下这种写法；
+/// 只写 `M:SS.mmm,M:SS.mmm` 的两段式同样支持。
+pub fn parse_sbv(content: &str) -> Result<Vec<Segment>> {
+    let text = normalize_newlines(strip_bom(content));
+    let mut segments = Vec::new();
+    let mut pending: Option<Segment> = None;
+    for line in text.split('\n') {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = parse_sbv_timing_line(line) {
+            // 上一条还没配上正文（时间轴行连着时间轴行）：它是坏块，直接丢掉，
+            // 不要让它的时间被下面这条正文用上。
+            pending = Some(Segment::new(0, start, end, String::new()));
+            continue;
+        }
+        if let Some(mut seg) = pending.take() {
+            // 正文行：无论上一条是否完整，都消费掉 pending。
+            // 时间轴行丢了正文、或正文行没有对应的头，都只影响这一条。
+            if !line.is_empty() && seg.end >= seg.start {
+                seg.text = line.to_string();
+                segments.push(seg);
+            }
+        }
+        // 没有 pending 的裸正文行（文件头部的说明文字）直接忽略。
+    }
+    finalize_segments(segments, "SBV")
+}
+
+/// 解析一行 SBV 时间轴：`start,end`。不是时间轴行（含正文或格式不符）返回 `None`。
+fn parse_sbv_timing_line(line: &str) -> Option<(f64, f64)> {
+    let (left, right) = line.split_once(',')?;
+    // 时间轴行只有两个字段：多一个逗号说明这是正文（正文里逗号极常见），
+    // 因此字段数不对就整行当正文，而不是硬解前半段。
+    if line.matches(',').count() != 1 {
+        return None;
+    }
+    let start = parse_timestamp(left)?;
+    let end = parse_timestamp(right)?;
+    if end < start {
+        return None;
+    }
+    Some((start, end))
+}
 /// 解析 ASS / SSA 字幕文本。
 ///
 /// 只读 `[Events]` 段里的 `Dialogue:` 行：`[Script Info]`、`[V4+ Styles]`、`[Fonts]`
@@ -2385,6 +2442,94 @@ Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,第一句,还有,两个逗号
             assert_eq!(read_back[1].start, 3.0);
             assert_eq!(read_back[1].end, 4.25);
             let _ = std::fs::remove_file(&path);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SBV：时间轴行 + 正文行交替，毫秒用点号、逗号分隔起止。
+    #[test]
+    fn sbv_reads_timing_and_text_pairs() {
+        let content = "0:00:01.000,0:00:02.500\n第一句\n\n0:00:03.000,0:00:04.000\n第二句,含逗号\n";
+        let segs = parse_sbv(content).unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].index, 1, "序号应从 1 重排");
+        assert_eq!(segs[0].start, 1.0);
+        assert_eq!(segs[0].end, 2.5);
+        assert_eq!(segs[0].text, "第一句");
+        // 正文里的逗号不能让时间轴行被误判（`split_once` 取第一段即止）
+        assert_eq!(segs[1].text, "第二句,含逗号");
+        assert_eq!(segs[1].start, 3.0);
+        assert_eq!(segs[1].end, 4.0);
+    }
+
+    /// SBV 的三种坏块各自只丢自己：时间轴连着时间轴、时间倒挂、正文为空。
+    #[test]
+    fn sbv_skips_bad_blocks_but_keeps_good_ones() {
+        let content = concat!(
+            "0:00:01.000,0:00:02.000\n",   // 时间轴
+            "0:00:05.000,0:00:06.000\n",   // 又是时间轴：上一条没有正文，丢掉
+            "这条正文\n",                  // 消费上一条时间轴
+            "0:00:07.000,0:00:06.000\n",   // 倒挂：丢掉
+            "0:00:08.000,0:00:09.000\n\n", // 正文为空：丢掉
+            "0:00:10.000,0:00:11.000\n好行\n",
+        );
+        let segs = parse_sbv(content).unwrap();
+        assert_eq!(segs.len(), 2, "只保留两条完整块: {:?}", segs);
+        assert_eq!(segs[0].text, "这条正文");
+        assert_eq!(segs[0].start, 5.0);
+        assert_eq!(segs[1].text, "好行");
+        assert_eq!(segs[1].index, 2, "跳过的坏块不占序号");
+    }
+
+    /// 文件头部的说明文字（没有对应时间轴的裸行）必须被忽略，而不是变成字幕。
+    #[test]
+    fn sbv_ignores_bare_lines_without_timing() {
+        let content = "这是文件头说明\n0:00:01.000,0:00:02.000\n正文\n";
+        let segs = parse_sbv(content).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "正文");
+    }
+
+    /// 一条可用块都没有时要报错，而不是返回空表让调用方以为「导入成功但字幕是空的」。
+    #[test]
+    fn sbv_errors_when_nothing_parsable() {
+        assert!(parse_sbv("").is_err(), "空输入应报错");
+        assert!(parse_sbv("只有正文\n没有时间轴\n").is_err());
+    }
+
+    /// 扩展名识别：`.sbv`（大小写不敏感）必须被认出来。
+    #[test]
+    fn sbv_extension_is_recognized() {
+        assert_eq!(
+            SubtitleFormat::from_path(Path::new("a.sbv")),
+            Some(SubtitleFormat::Sbv)
+        );
+        assert_eq!(
+            SubtitleFormat::from_path(Path::new("b.SBV")),
+            Some(SubtitleFormat::Sbv)
+        );
+        assert_eq!(SubtitleFormat::Sbv.label(), "SBV 字幕");
+    }
+
+    /// 导出侧写出的 SBV 必须能被导入侧原样读回（时间与文本都保真）。
+    #[test]
+    fn sbv_export_import_round_trip() {
+        use crate::subtitle::writer::SubtitleWriter;
+
+        let segments = vec![
+            Segment::new(1, 1.0, 2.5, "第一句"),
+            Segment::new(2, 65.25, 66.0, "第二句"),
+        ];
+        let dir = temp_dir("sbv_roundtrip");
+        let path = dir.join("out.sbv");
+        SubtitleWriter::write_to_file(&segments, &path, "sbv").unwrap();
+
+        let read_back = parse_sbv(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(read_back.len(), 2, "往返后应仍是两句");
+        for (want, got) in segments.iter().zip(&read_back) {
+            assert_eq!(got.text, want.text, "文本应保真");
+            assert!((got.start - want.start).abs() < 1e-9, "起点应保真");
+            assert!((got.end - want.end).abs() < 1e-9, "终点应保真");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

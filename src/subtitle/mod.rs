@@ -23,5 +23,6 @@ pub use segment::{
     next_issue_in, optimize_segments, plan_time_edit, split_long_segments, ExportMode,
     QualityCategory, Segment, TimeEdit, MIN_EDIT_DUR, MIN_SEGMENT_DUR,
 };
+pub use timing::{plan_min_gaps, GapPlan, DEFAULT_MIN_GAP_SECS};
 pub use ttml::{TtmlExporter, TtmlProfile};
 pub use writer::SubtitleWriter;
