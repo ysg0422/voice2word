@@ -445,6 +445,92 @@ pub const ITEMS: &[DownloadItem] = &[
     },
 ];
 
+/// 系统 PATH 上能不能找到这个命令（不含扩展名，例如 `ffmpeg`）。
+///
+/// # 为什么自己扫 PATH 而不 spawn 一次 `--version`
+///
+/// 这里只回答「有没有这个可执行文件」：扫目录是纯文件系统读，几十微秒；spawn 一次
+/// 进程要几十毫秒，还可能被杀软拦。判定口径是按 `PATHEXT` 依次试
+/// `name` + 各扩展名（Windows 文件系统大小写不敏感，不必为 `.EXE`/`.exe` 各写一遍）；
+/// 非 Windows 上 `PATHEXT` 不存在，退化成只试裸文件名。
+pub fn is_command_available(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let mut extensions: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".EXE;.CMD;.BAT".to_string())
+        .split(';')
+        .map(|ext| ext.trim().to_string())
+        .filter(|ext| !ext.is_empty())
+        .collect();
+    // 裸文件名先试一次（PATH 里直接放了带执行位的文件的情形）。
+    extensions.insert(0, String::new());
+    std::env::split_paths(&path).any(|dir| {
+        !dir.as_os_str().is_empty()
+            && extensions
+                .iter()
+                .any(|ext| dir.join(format!("{name}{ext}")).is_file())
+    })
+}
+
+/// 把配置里写的可执行文件路径解析成「真正能跑起来的那一个」。
+///
+/// 1. 配置里的路径存在 → 原样使用（用户显式指定的永远优先，不能被系统里另一个
+///    同名程序顶掉）；
+/// 2. 不存在、但文件名就是这个名字（`tools/ffmpeg.exe` → `ffmpeg`）且 PATH 上有
+///    同名命令 → 用裸命令名，交给操作系统搜索 PATH。这样「机器上早装好了 ffmpeg」
+///    不必为了本程序再放一份副本；
+/// 3. 都不成立 → 原样返回。调用方据此判定「缺失」，**由调用方决定要不要下载到
+///    配置写死的那个相对路径**，而不是在这里偷偷换成别的路径。
+pub fn resolve_configured_executable(configured: &std::path::Path) -> std::path::PathBuf {
+    if configured.exists() {
+        return configured.to_path_buf();
+    }
+    let Some(stem) = configured.file_stem().and_then(|stem| stem.to_str()) else {
+        return configured.to_path_buf();
+    };
+    if is_command_available(stem) {
+        return std::path::PathBuf::from(stem);
+    }
+    configured.to_path_buf()
+}
+
+/// 配置里**这条下载项**对应的可执行文件路径（找不到对应字段就退回它自己的 `dest`）。
+fn configured_executable_for(cfg: &AppConfig, item: &DownloadItem) -> String {
+    match item.id {
+        "ffmpeg" => cfg.paths.ffmpeg.clone(),
+        "whisper-cli" | "whisper-cublas" => cfg.paths.whisper_cli.clone(),
+        "llama-cpp" => cfg.paths.llama_cli.clone(),
+        _ => item.dest.to_string(),
+    }
+}
+
+/// 某个可执行组件现在能不能用：配置里的路径在，或系统 PATH 上有同名命令。
+pub fn executable_is_usable(cfg: &AppConfig, item: &DownloadItem) -> bool {
+    let configured = configured_executable_for(cfg, item);
+    let resolved = AppConfig::resolve_path(&configured);
+    if resolved.exists() {
+        return true;
+    }
+    resolved
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(is_command_available)
+}
+
+/// 「必需的可执行组件」里当前确实不可用的那些。
+///
+/// 判定对象是「程序能不能干活」，不是「`tools/ffmpeg.exe` 这个文件在不在」——
+/// 否则一台早就装了 ffmpeg 的机器会在启动时被推着再下一份几十 MB 的副本。
+/// 返回的条目可以直接喂给下载流程（它会落到 `item.dest` 这个**相对路径**上）。
+pub fn missing_required_executables(cfg: &AppConfig) -> Vec<&'static DownloadItem> {
+    ITEMS
+        .iter()
+        .filter(|item| item.required)
+        .filter(|item| item.dest.to_ascii_lowercase().ends_with(".exe"))
+        .filter(|item| !executable_is_usable(cfg, item))
+        .collect()
+}
 /// 一次扫描中复用的配置快照。
 /// 为什么需要它：`resolve_existing_path` 要知道「用户把 ffmpeg 配在哪」，
 /// 而那需要读 `config.toml`。若每个条目各自读一次，一次扫描就是 13 次
@@ -1568,6 +1654,75 @@ fn fetch_to_file(
     Ok(())
 }
 
+#[cfg(test)]
+mod executable_resolution_tests {
+    use super::{
+        executable_is_usable, is_command_available, missing_required_executables,
+        resolve_configured_executable, ITEMS,
+    };
+    use crate::utils::AppConfig;
+    use std::path::Path;
+
+    /// 配置里的路径存在时原样使用：用户显式指定的永远优先。
+    #[test]
+    fn existing_configured_path_wins() {
+        let dir = std::env::temp_dir();
+        let real = dir.join("v2w_exec_placeholder.exe");
+        std::fs::write(&real, b"x").unwrap();
+        assert_eq!(resolve_configured_executable(&real), real);
+        let _ = std::fs::remove_file(&real);
+    }
+
+    /// 不存在的路径、文件名也不是 PATH 上的命令：保持原值，让调用方判定「缺失」
+    /// 并下载到配置写死的那个相对路径。
+    #[test]
+    fn unrelated_missing_path_is_left_untouched() {
+        let typo = Path::new("Z:/definitely/not/here/bin/v2w_no_such_tool_zzz.exe");
+        assert_eq!(resolve_configured_executable(typo), typo.to_path_buf());
+        assert!(!is_command_available("v2w_no_such_tool_zzz"));
+    }
+
+    /// 缺失的 ffmpeg（本机 PATH 上也没有）必须被判为「不可用」→ 会被自动下载。
+    #[test]
+    fn missing_ffmpeg_is_reported_as_needed() {
+        let mut cfg = AppConfig::default();
+        // 指向一个绝对不存在的路径，且文件名不是 PATH 上的命令。
+        cfg.paths.ffmpeg = "Z:/definitely/not/here/tools/v2w_no_ffmpeg_zzz.exe".to_string();
+        cfg.paths.whisper_cli = "Z:/definitely/not/here/tools/v2w_no_whisper_zzz.exe".to_string();
+        let missing = missing_required_executables(&cfg);
+        let ids: Vec<&str> = missing.iter().map(|i| i.id).collect();
+        assert!(ids.contains(&"ffmpeg"), "缺 ffmpeg 必须被报出来：{ids:?}");
+    }
+
+    /// 反例：配置指向一个**存在**的文件时不该再报缺失（否则每次启动都重复下载）。
+    #[test]
+    fn present_executable_is_not_reported() {
+        let dir = std::env::temp_dir();
+        let real = dir.join("v2w_present_ffmpeg.exe");
+        std::fs::write(&real, b"x").unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.paths.ffmpeg = real.display().to_string();
+        let item = ITEMS
+            .iter()
+            .find(|i| i.id == "ffmpeg")
+            .expect("清单里有 ffmpeg");
+        assert!(executable_is_usable(&cfg, item), "存在的文件必须算可用");
+        let missing = missing_required_executables(&cfg);
+        assert!(
+            !missing.iter().any(|i| i.id == "ffmpeg"),
+            "已就位的不该出现在待下载清单里"
+        );
+        let _ = std::fs::remove_file(&real);
+    }
+
+    /// `is_command_available` 至少要对「一个几乎肯定存在的命令」为真、
+    /// 对编造的名字为假——这条是 PATH 扫描本身的冒烟测试。
+    #[test]
+    fn command_lookup_sanity() {
+        let bogus = "v2w_definitely_not_a_command_zzz";
+        assert!(!is_command_available(bogus));
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

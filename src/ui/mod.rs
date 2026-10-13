@@ -2419,6 +2419,9 @@ impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 脏字幕的延迟落库定时器：首次渲染时起一次，之后常驻。
         self.ensure_segments_flush_ticker(cx);
+        // 必需组件（ffmpeg / whisper-cli）缺失时的自动补下载：进程内只检查一次，
+        // 下载是网络活，不能压在首帧之前，但也要在用户动手之前给反馈。
+        self.check_required_components_once(cx);
         if self.metrics_rx.has_changed().unwrap_or(false) {
             self.state.metrics = self.metrics_rx.borrow_and_update().clone();
         }

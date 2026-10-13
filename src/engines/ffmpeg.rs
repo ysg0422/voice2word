@@ -248,41 +248,12 @@ pub struct FFmpegEngine {
     ffmpeg_path: PathBuf,
 }
 
-/// 把配置里的 ffmpeg 路径解析成「真正能执行的路径」。
-///
-/// # 为什么需要这一层
-///
-/// 共享配置里的默认值是相对路径 `tools/ffmpeg.exe`，它只在「随包一起分发 ffmpeg」
-/// 的安装形态下成立。用户机器上更常见的情况是 **ffmpeg 早就在系统 PATH 里**
-/// （自己装的、scoop/winget 装的）。以前这两种情况合不上时就是静默失败：
-/// 抽帧、视频库缩略图、时间轴波形全都取不到数据，界面只剩一句「画面预览取帧失败」，
-/// 用户完全猜不到是缺一个 ffmpeg。
-///
-/// 这里的规则：
-/// - 配置里的路径存在 → 原样使用（用户显式指定的永远优先）；
-/// - 不存在、但文件名看起来就是 `ffmpeg` → 退回裸命令名，交给操作系统在 PATH 里找；
-/// - 不存在、文件名是别的东西（拼错的绝对路径、别的工具）→ 保持原值，
-///   让报错如实指向用户写的那条路径，而不是被悄悄替换成系统 ffmpeg。
-fn resolve_ffmpeg_binary(configured: &Path) -> PathBuf {
-    if configured.exists() {
-        return configured.to_path_buf();
-    }
-    let named_ffmpeg = configured
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| stem.eq_ignore_ascii_case("ffmpeg"));
-    if named_ffmpeg {
-        // 不自己扫 PATH：Windows 会在 `CreateProcess` 时补 `.exe` 并搜索 PATH，
-        // 自己实现一份只会多出「PATHEXT/引号/相对路径」这些边界。
-        return PathBuf::from("ffmpeg");
-    }
-    configured.to_path_buf()
-}
-
 impl FFmpegEngine {
     pub fn new<P: AsRef<Path>>(ffmpeg_path: P) -> Self {
         Self {
-            ffmpeg_path: resolve_ffmpeg_binary(ffmpeg_path.as_ref()),
+            ffmpeg_path: crate::utils::model_download::resolve_configured_executable(
+                ffmpeg_path.as_ref(),
+            ),
         }
     }
 
@@ -954,38 +925,6 @@ impl FFmpegEngine {
     }
 }
 
-#[cfg(test)]
-mod ffmpeg_binary_resolution_tests {
-    use super::resolve_ffmpeg_binary;
-    use std::path::{Path, PathBuf};
-
-    /// 配置里的路径存在时必须原样使用：用户显式指定的永远优先，
-    /// 不能被「系统里也有个 ffmpeg」顶掉。
-    #[test]
-    fn existing_configured_path_wins() {
-        let dir = std::env::temp_dir();
-        let real = dir.join("v2w_ffmpeg_placeholder.exe");
-        std::fs::write(&real, b"x").unwrap();
-        assert_eq!(resolve_ffmpeg_binary(&real), real);
-        let _ = std::fs::remove_file(&real);
-    }
-
-    /// 配置里的相对默认值（`tools/ffmpeg.exe`）不存在时，退回裸命令名交给 PATH。
-    /// 这条钉住的正是「用户机器上 ffmpeg 装在 PATH、但没放进 tools/」导致的
-    /// 画面黑屏 + 封面全空——以前它会带着一个不存在的绝对路径去起进程。
-    #[test]
-    fn missing_tools_ffmpeg_falls_back_to_path_lookup() {
-        let missing = Path::new("Z:/definitely/not/here/tools/ffmpeg.exe");
-        assert_eq!(resolve_ffmpeg_binary(missing), PathBuf::from("ffmpeg"));
-    }
-
-    /// 不存在的路径、且文件名不是 ffmpeg：保持原值，让报错如实指向用户写的那条路径。
-    #[test]
-    fn unrelated_missing_path_is_left_untouched() {
-        let typo = Path::new("Z:/definitely/not/here/bin/ffmpegg.exe");
-        assert_eq!(resolve_ffmpeg_binary(typo), typo.to_path_buf());
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;

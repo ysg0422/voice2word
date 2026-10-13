@@ -383,6 +383,12 @@ fn replace_rule_report_message(name: &str, report: &ReplaceRuleReport) -> String
     msg
 }
 
+/// 自动补下载的尝试次数（进程级）。防「下载失败 → 完成回调立刻再试」这种死循环：
+/// 网络不通时每次尝试都要等一轮超时，不设上限会让界面永远在转圈。
+static REQUIRED_AUTO_TRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// 最多自动尝试几次（含首次）。到顶后只提示一次、转人工。
+const REQUIRED_AUTO_MAX_TRIES: u32 = 3;
+
 impl MainWindow {
     /// 裁剪视频库的界面缓存，只保留仍存在于列表里的条目。
     ///
@@ -4138,6 +4144,8 @@ impl MainWindow {
                         this.refresh_model_presence_offloaded(cx);
                         // 模型换了，硬件档案里的推荐配置与预览代理可能要重算
                         this.state.refresh_hardware_recommendation();
+                        // 还缺别的必需组件就接着补下一个（缺几个依次补几个）。
+                        this.ensure_required_components(cx);
                     }
                     Err(err) => {
                         let msg = err.to_string();
@@ -4155,6 +4163,59 @@ impl MainWindow {
         .detach();
     }
 
+    /// 启动后的首次检查（进程级只跑一次）。
+    ///
+    /// 挂在首帧渲染里而不是启动流程里：下载是网络活，不能压在首帧之前；
+    /// 而又必须在用户动手之前给出「正在补组件」的反馈，否则他看到的就是黑屏。
+    pub(crate) fn check_required_components_once(&mut self, cx: &mut Context<Self>) {
+        static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if CHECKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.ensure_required_components(cx);
+    }
+
+    /// 必需的可执行组件（ffmpeg / whisper-cli）缺了就直接下到**配置里的相对路径**。
+    ///
+    /// # 判据是「能不能干活」，不是「文件在不在」
+    ///
+    /// `missing_required_executables` 已经把「系统 PATH 上早装好了同名命令」算作可用
+    /// （见 `utils::model_download`），所以这里不会对一台已有 ffmpeg 的机器重复下几十 MB。
+    /// 真正缺了才下，且落在 `item.dest` 这条相对路径上——用户不需要手改配置。
+    ///
+    /// # 为什么一次只下一个
+    ///
+    /// 下载通道（`is_downloading` + 单条进度）本来就是一次一条；下完的完成回调会再调
+    /// 本函数，于是「缺几个就依次补几个」。失败则靠 [`REQUIRED_AUTO_MAX_TRIES`] 收口。
+    pub(crate) fn ensure_required_components(&mut self, cx: &mut Context<Self>) {
+        if self.state.is_downloading {
+            // 正在下：完成回调会再进来一次。
+            return;
+        }
+        let missing =
+            crate::utils::model_download::missing_required_executables(&self.state.config);
+        let Some(first) = missing.first() else {
+            return;
+        };
+        let tries = REQUIRED_AUTO_TRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if tries >= REQUIRED_AUTO_MAX_TRIES {
+            if tries == REQUIRED_AUTO_MAX_TRIES {
+                // 到顶只提示一次：再刷同样的提示条只会把界面变成噪音。
+                self.notice = Some(format!(
+                    "{} 仍未就位，已停止自动下载；请到「模型与组件」里手动下载，\
+                     或把它放到程序目录的 {} 位置",
+                    first.label, first.dest
+                ));
+                cx.notify();
+            }
+            return;
+        }
+        let (id, label, dest) = (first.id, first.label, first.dest);
+        tracing::info!(item = id, "必需组件缺失，自动下载到配置里的相对路径");
+        self.notice = Some(format!("缺少必需组件 {label}，正在自动下载到 {dest}…"));
+        cx.notify();
+        self.start_model_download(id, cx);
+    }
     /// 一键补齐所有**缺失**的条目（按体积从小到大，先让用户看到进展）。
     pub(crate) fn download_all_missing(&mut self, cx: &mut Context<Self>) {
         if self.state.is_downloading {
