@@ -13,7 +13,7 @@ use super::{
 };
 use crate::app::state::{ProcessStatus, WorkspaceTab};
 use crate::subtitle::segment::WordTiming;
-use crate::subtitle::{ExportMode, Segment};
+use crate::subtitle::{ExportMode, GapPlan, Segment};
 use crate::utils::time::{format_duration_short, seconds_to_hms, seconds_to_timestamp_short};
 use gpui::prelude::*;
 use gpui::*;
@@ -483,6 +483,59 @@ pub(crate) fn monitor_picture_source(
         (false, false) => MonitorPictureSource::LivePending,
     }
 }
+
+/// 「句间最小间隔」界面给出的三档间隔（秒）：以 [`crate::subtitle::DEFAULT_MIN_GAP_SECS`]
+/// 为基准逐档加倍（0.04 / 0.08 / 0.16）。取默认值当第一档，用户不用去猜「官方推荐」是多少。
+const MIN_GAP_PRESETS: [f64; 3] = [
+    crate::subtitle::DEFAULT_MIN_GAP_SECS,
+    crate::subtitle::DEFAULT_MIN_GAP_SECS * 2.0,
+    crate::subtitle::DEFAULT_MIN_GAP_SECS * 4.0,
+];
+
+/// 句间最小间隔档位在 `retime_op` 里的起始值：`4..=6` 依次对应
+/// [`MIN_GAP_PRESETS`]，`0..=3` 仍是平移 / 缩放 / 铺满——两者共用同一个
+/// 「当前方式」选择位（本文件之外不新增窗口状态字段）。
+const MIN_GAP_OP_BASE: u8 = 4;
+
+/// 「句间最小间隔」那一行的小字说明（只此一处，避免两处文案漂移）。
+const MIN_GAP_INTRO: &str = "上一句还没消失下一句就开始读时，用它把间隔推开";
+
+/// 「句间最小间隔」的预览 / 回执文案（纯函数、无 GUI，便于单测）。
+///
+/// `applied == false` 是点「应用间隔」**之前**的预览（「将改动 N 句」）；
+/// `applied == true` 是写回后的回执（「已推开 N 句」）。无命中时两种口径都明说
+/// 「无需改动」，用户不会对着一个没有反应的按钮反复点。
+///
+/// # 为什么 `shortened` 也要看
+///
+/// `changed` 只数**起点被抬**的句；「收短前一句、让后一句保住原终点」那条路径只加
+/// `shortened`——只看 `changed` 会把这种真实改动说成「无需改动」。
+fn min_gap_hint(plan: &GapPlan, applied: bool) -> String {
+    if plan.changed == 0 && plan.shortened == 0 {
+        return "间隔已经够宽，无需改动".to_string();
+    }
+    let mut text = if plan.changed > 0 {
+        format!(
+            "{} {} 句",
+            if applied { "已推开" } else { "将改动" },
+            plan.changed
+        )
+    } else {
+        format!(
+            "{} {} 句的结束时间",
+            if applied { "已收短" } else { "将收短" },
+            plan.shortened
+        )
+    };
+    if plan.changed > 0 && plan.shortened > 0 {
+        text.push_str(&format!("，其中 {} 句收短前句", plan.shortened));
+    }
+    if plan.unresolved {
+        text.push_str("（个别短句仍贴太紧）");
+    }
+    text
+}
+
 impl MainWindow {
     /// 渲染类似剪映 / Premiere 风格的剪辑工作区布局 (左中右之 中：视频与时间轴，右：字幕属性)
     pub(crate) fn render_editor_layout(
@@ -3139,7 +3192,7 @@ impl MainWindow {
         }
     }
 
-    /// 整轨时间轴调整卡：平移 / 缩放 / 铺满目标时长。
+    /// 整轨时间轴调整卡：平移 / 缩放 / 铺满目标时长，以及句间最小间隔档位。
     ///
     /// # 为什么需要它
     ///
@@ -3157,7 +3210,9 @@ impl MainWindow {
     ///   自动过一遍 `resolve_overlaps`，保证结果仍能原样通过 `optimize_segments`
     ///   ——否则用户下次载入工程会被「排序 + 截断重叠」再改一遍，看起来像怎么改都丢。
     fn render_retime_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::subtitle::timing::{describe, plan_retime, suggest_fit, TimeShift};
+        use crate::subtitle::timing::{
+            describe, plan_min_gaps, plan_retime, suggest_fit, TimeShift,
+        };
         let segments = &self.state.segments;
         // 三个参数：平移量、缩放比、铺满目标。都用整数档位（渲染器只吃 u32），
         // 显示时换算回秒 / 百分比。
@@ -3165,6 +3220,16 @@ impl MainWindow {
         let scale_pct = self.retime_scale_pct;
         let target_secs = self.retime_target_secs;
         let op = self.retime_op;
+        // 「句间最小间隔」：与平移 / 缩放 / 铺满共用同一个「当前方式」选择位
+        // （`retime_op` 的 4..=6 对应 [`MIN_GAP_PRESETS`] 三档，0..=3 语义不动）。
+        let gap_span = MIN_GAP_OP_BASE + MIN_GAP_PRESETS.len() as u8;
+        let gap_idx: Option<usize> = if (MIN_GAP_OP_BASE..gap_span).contains(&op) {
+            Some((op - MIN_GAP_OP_BASE) as usize)
+        } else {
+            None
+        };
+        // 预览：按当前档位在**副本**上算一遍，不改任何字幕（与整轨变换同一形状）。
+        let gap_plan = gap_idx.map(|i| plan_min_gaps(segments, MIN_GAP_PRESETS[i]));
 
         // 预览：按当前参数算一遍，把「会改几句 / 是否重叠」如实显示出来。
         let preview = match op {
@@ -3209,6 +3274,11 @@ impl MainWindow {
                     t.push_str(" · 含过短片段，应用时会自纠到最短时长");
                 }
                 t
+            }
+            (None, _) if gap_plan.is_some() => {
+                // 当前生效的是句间间隔档位：整轨变换这一栏没有参数可显示，不要停在
+                // 「选择一种调整方式」上，让用户以为漏选了什么。
+                "整轨变换未启用".to_string()
             }
             (None, _) => "选择一种调整方式".to_string(),
         };
@@ -3315,7 +3385,10 @@ impl MainWindow {
             _ => div().into_any_element(),
         };
 
-        let can_apply = op != 0 && !segments.is_empty();
+        // 只有平移 / 缩放 / 铺满走这个按钮（`retime_op` 1..=3）；4..=6 是句间间隔
+        // 档位，它们有自己的「应用间隔」——这里必须置灰，否则会亮着一个点了没反应的
+        // 按钮。
+        let can_apply = matches!(op, 1..=3) && !segments.is_empty();
         let apply_label = match op {
             1 => "应用平移",
             2 => "应用缩放",
@@ -3343,6 +3416,44 @@ impl MainWindow {
                     }),
             );
 
+        // 「句间最小间隔」一组（追加在整轨变换之后，不改动上面三行的排布）：档位胶囊
+        // + 一行小字 + 自己的「应用间隔」。形状与整轨变换一致——先在副本上算
+        // （`gap_plan`）→ 小字里显示会改几句 → 点应用才写回。
+        let gap_ready = gap_idx.is_some() && !segments.is_empty();
+        let gap_row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .children(MIN_GAP_PRESETS.iter().enumerate().map(|(i, secs)| {
+                primitives::chip_clickable(format!("{secs:.2}s"), gap_idx == Some(i), false)
+                    .id(("min-gap-preset", i))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.retime_op = MIN_GAP_OP_BASE + i as u8;
+                        cx.notify();
+                    }))
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_muted())
+                    .child(match &gap_plan {
+                        Some(plan) => format!("{MIN_GAP_INTRO} · {}", min_gap_hint(plan, false)),
+                        None => MIN_GAP_INTRO.to_string(),
+                    }),
+            )
+            .child(
+                primitives::mini_btn("应用间隔", gap_ready)
+                    .id("min-gap-apply")
+                    .when(gap_ready, |d| {
+                        d.on_click(cx.listener(|this, _, _, cx| {
+                            this.apply_min_gap(cx);
+                        }))
+                    }),
+            );
+
         primitives::card_sm()
             .gap(px(Theme::SPACE_2))
             .child(
@@ -3355,6 +3466,7 @@ impl MainWindow {
             .child(op_row)
             .child(param_row)
             .child(apply_row)
+            .child(gap_row)
     }
 
     /// 把当前参数对应的整轨变换真正写回字幕，并自纠重叠。
@@ -3404,6 +3516,54 @@ impl MainWindow {
                 ""
             }
         ));
+        cx.notify();
+    }
+
+    /// 把当前档位的「句间最小间隔」真正写回字幕。
+    ///
+    /// 写回口径与 [`MainWindow::apply_retime`] 逐条对齐：应用前记撤销快照 → 置脏 →
+    /// `bump_segments_revision` → `flush_segments_if_dirty`，再清时间轴缓存键、给提示。
+    /// 预览与写回共用同一份 `plan_min_gaps` 参数与同一个 [`min_gap_hint`]，不会出现
+    /// 「预览说改 3 句、应用改了 4 句」。
+    fn apply_min_gap(&mut self, cx: &mut Context<Self>) {
+        use crate::subtitle::timing::plan_min_gaps;
+        let op = self.retime_op;
+        let gap_span = MIN_GAP_OP_BASE + MIN_GAP_PRESETS.len() as u8;
+        if !(MIN_GAP_OP_BASE..gap_span).contains(&op) || self.state.segments.is_empty() {
+            return;
+        }
+        let plan = plan_min_gaps(
+            &self.state.segments,
+            MIN_GAP_PRESETS[(op - MIN_GAP_OP_BASE) as usize],
+        );
+        // 无命中时不压撤销点：与 `plan_retime` 一样先看计划结果。两个计数都要看——
+        // `changed` 只数起点被抬的句，「收短前句让后一句保住终点」只加 `shortened`，
+        // 漏看它会把该做的改动当成无事发生，`Ctrl+Z` 又会白退一层。
+        if plan.changed == 0 && plan.shortened == 0 {
+            self.notice = Some(min_gap_hint(&plan, true));
+            cx.notify();
+            return;
+        }
+        // 回执文案先算好：`plan.times` 下面要被 move 走，之后不能再借 `plan` 取它。
+        let notice_text = min_gap_hint(&plan, true);
+        // 应用前记快照：一次可能挪动几十上百句，点错了必须有路可退。
+        self.state.snapshot_for_undo();
+        // 计划本身已保证「升序 + 相邻不重叠」，直接落地即可；**不再**过
+        // `resolve_overlaps`——它会顺手把计划没打算动的过短片段补长，破坏
+        // 「预览说改几句就改几句」的口径。
+        for (seg, (start, end)) in self.state.segments.iter_mut().zip(plan.times) {
+            seg.start = start;
+            seg.end = end;
+        }
+        // 改的是 `segments`，必须置脏才会落库：`bump_segments_revision` 只驱动清单
+        // 缓存失效，不碰脏位；漏置脏时关窗守卫读到的 `segments_dirty` 仍是 false，
+        // 这次改动会被当作「无改动」直接丢弃。
+        self.state.segments_dirty = true;
+        self.state.bump_segments_revision();
+        self.state.flush_segments_if_dirty();
+        // 时间轴变了：波形/监视器的定位与质检缓存都要跟着重算。
+        self.subtitle_filter_key = None;
+        self.notice = Some(notice_text);
         cx.notify();
     }
 
@@ -6038,10 +6198,12 @@ impl MainWindow {
             .gap_1()
             .bg(Theme::bg_inset())
             .border_1()
+            // 未编辑时用真正的描边 token：以前这里错用了一个**背景色** token，
+            // 在浅色主题下会变成「亮一档的底」压在同一个底上，看起来像没有边框。
             .border_color(if is_editing {
                 Theme::accent_mint()
             } else {
-                Theme::bg_hover_strong()
+                Theme::border_mid()
             })
             .rounded_md()
             .p_0p5()
@@ -6165,13 +6327,13 @@ impl MainWindow {
 mod tests {
     use super::{
         click_seek_target, fit_video_size, is_playing_at, karaoke_mark_style, karaoke_word_marks,
-        monitor_picture_source, monitor_screen_size, raw_line_byte_start,
+        min_gap_hint, monitor_picture_source, monitor_screen_size, raw_line_byte_start,
         render_image_from_frame_file, timeline_clip_positions, MonitorPictureSource, WordMark,
         EDITOR_STACK_MONITOR_H, MONITOR_VIDEO_FIT_FRAC, TIMELINE_FULL_DRAW_LIMIT,
         TIMELINE_WINDOW_MARGIN_SECS,
     };
     use crate::subtitle::segment::WordTiming;
-    use crate::subtitle::{ExportMode, Segment};
+    use crate::subtitle::{ExportMode, GapPlan, Segment};
     use crate::ui::actions::translated_out_count;
     use crate::ui::build_timeline_index;
     use crate::ui::primitives::should_consume_scroll;
@@ -6250,6 +6412,58 @@ mod tests {
 
         // 横向滚轮（dy == 0）不拦
         assert!(!should_consume_scroll(0.0, -50.0, max_h), "横向滚轮应放行");
+    }
+
+    /// 无命中：提示必须明说「无需改动」，不能显示「将改动 0 句」这种让人以为坏了的
+    /// 文案；预览与回执两种口径必须一致。
+    #[test]
+    fn min_gap_hint_reports_no_change_when_nothing_to_push() {
+        let inert = GapPlan {
+            times: Vec::new(),
+            changed: 0,
+            shortened: 0,
+            unresolved: false,
+        };
+        let preview = min_gap_hint(&inert, false);
+        let applied = min_gap_hint(&inert, true);
+        assert!(preview.contains("无需改动"), "{preview}");
+        assert_eq!(preview, applied, "无命中时预览与回执文案一致");
+        assert!(!preview.contains("0 句"), "{preview}");
+    }
+
+    /// 有命中：预览说「将改动 N 句」、回执说「已推开 N 句」，句数必须与计划一致；
+    /// 顺带把「收短了前句」如实带出来。
+    #[test]
+    fn min_gap_hint_counts_changed_sentences() {
+        // 提示只读三个计数字段，`times` 与文案无关，这里不铺时间。
+        let plan = GapPlan {
+            times: Vec::new(),
+            changed: 7,
+            shortened: 2,
+            unresolved: false,
+        };
+        let preview = min_gap_hint(&plan, false);
+        let applied = min_gap_hint(&plan, true);
+        assert!(preview.contains("将改动 7 句"), "{preview}");
+        assert!(applied.contains("已推开 7 句"), "{applied}");
+        assert!(applied.contains("2 句收短前句"), "{applied}");
+    }
+
+    /// 只有前一句被收短（后一句太短、抬起点会把它压没）时也要说清楚：起点没变，
+    /// 但时间轴确实动了，不能落到「无需改动」那一支。
+    #[test]
+    fn min_gap_hint_reports_shortened_ends_without_start_moves() {
+        let plan = GapPlan {
+            times: Vec::new(),
+            changed: 0,
+            shortened: 3,
+            unresolved: false,
+        };
+        let preview = min_gap_hint(&plan, false);
+        let applied = min_gap_hint(&plan, true);
+        assert!(preview.contains("将收短 3 句"), "{preview}");
+        assert!(applied.contains("已收短 3 句"), "{applied}");
+        assert!(!applied.contains("无需改动"), "{applied}");
     }
 
     /// 浮点近似比较（尺寸推导允许亚像素误差）

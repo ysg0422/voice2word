@@ -39,6 +39,82 @@ fn start_button_label(
     }
 }
 
+/// 失败摘要最多显示的字符数（按**字符**而非字节计）。
+///
+/// 42 个全角字符约为状态栏右区被按钮挤占后剩下的宽度；再宽就会顶到操作按钮。
+const FAILURE_SUMMARY_MAX_CHARS: usize = 42;
+
+/// 错误串为空（或纯空白）时的兜底文案：宁可直说「没给原因」，也不能显示成空白——
+/// 空白会被读成「没出错」。
+const FAILURE_SUMMARY_PLACEHOLDER: &str = "出错（未提供原因）";
+
+/// 悬停浮层的最大宽度：错误串常常很长（模型路径、引擎 stderr），限宽让它换行显示，
+/// 而不是拉成一条横贯屏幕的长线。
+const FAILURE_TOOLTIP_MAX_W: f32 = 360.0;
+
+/// 把失败原因压成状态栏里放得下的**一行摘要**（纯函数，便于单测）。
+///
+/// 规则：
+/// - 换行 / 制表 / 连续空白折叠成单个空格：状态栏只有一行高，留着换行会把栏位撑高；
+/// - 空串或纯空白给 `FAILURE_SUMMARY_PLACEHOLDER`，避免看起来像没出错；
+/// - 超过 `FAILURE_SUMMARY_MAX_CHARS` 个字符时**按字符**截断并补「…」。按字节切
+///   （如 `String::truncate`）会把中文 / emoji 劈成半个码位，渲染成乱码方块。
+fn failure_summary(full: &str) -> String {
+    let mut flat = String::with_capacity(full.len());
+    let mut pending_space = false;
+    for ch in full.chars() {
+        if ch.is_whitespace() {
+            // 前导空白直接吞掉，避免摘要以空格开头
+            pending_space = !flat.is_empty();
+        } else {
+            if pending_space {
+                flat.push(' ');
+                pending_space = false;
+            }
+            flat.push(ch);
+        }
+    }
+
+    if flat.is_empty() {
+        return FAILURE_SUMMARY_PLACEHOLDER.to_string();
+    }
+
+    if flat.chars().count() <= FAILURE_SUMMARY_MAX_CHARS {
+        return flat;
+    }
+
+    // 用 `chars()` 取整字符，天然落在 UTF-8 字符边界上
+    let kept: String = flat.chars().take(FAILURE_SUMMARY_MAX_CHARS).collect();
+    format!("{kept}…")
+}
+
+/// 状态栏失败摘要的悬停浮层。
+///
+/// gpui 的 `tooltip` 只接受 `AnyView`（须是 `Render` 实体），没有「挂一个 title 字符串」
+/// 这种轻量入口，所以这里放一个最小视图承载**完整**错误串：状态栏只放得下一行摘要，
+/// 但用户要判断下一步怎么做，得看全。
+struct FailureTooltip {
+    /// 完整错误串（不截断），与状态栏摘要同源。
+    text: String,
+}
+
+impl Render for FailureTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(FAILURE_TOOLTIP_MAX_W))
+            .px(px(Theme::SPACE_2))
+            .py(px(Theme::SPACE_1))
+            .rounded(px(Theme::RADIUS_SM))
+            .bg(Theme::bg_raised())
+            .border_1()
+            .border_color(Theme::border_strong())
+            .shadow_lg()
+            .text_size(px(Theme::TEXT_SMALL))
+            .text_color(Theme::text_primary())
+            .child(self.text.clone())
+    }
+}
+
 impl MainWindow {
     /// 全局失败提示条。
     ///
@@ -328,6 +404,22 @@ impl MainWindow {
         let can_export = !self.state.segments.is_empty();
         let can_play = self.state.selected_file.is_some() && can_export && !is_processing;
 
+        // 失败态：状态栏必须说清「为什么失败」，而不是只丢一个「出错」——用户在语音转写页
+        // 看到红点却分不出是转写失败、导出失败还是设置没存上。取原文后，摘要（截断到一行）
+        // 与悬停浮层（看全文）都从同一条 `Failed(msg)` 派生，口径不会走偏。
+        let failure: Option<(String, String)> = match &self.state.status {
+            ProcessStatus::Failed(msg) => {
+                // 生产者没给原因时也要有可读兜底，状态栏不能空着
+                let full = if msg.trim().is_empty() {
+                    FAILURE_SUMMARY_PLACEHOLDER.to_string()
+                } else {
+                    msg.clone()
+                };
+                Some((failure_summary(msg), full))
+            }
+            _ => None,
+        };
+
         // 只取阶段名与进度即可：`detail` 从未被消费（下游只用 stage/progress），
         // 而它是 `String`——每帧 `clone()` 一个可能非空的详情串纯属浪费。改为只借用。
         let (stage_text, progress_val) = match &self.state.status {
@@ -336,7 +428,9 @@ impl MainWindow {
                 stage, progress, ..
             } => (stage.as_str(), *progress),
             ProcessStatus::Completed => ("转写完成", 1.0),
-            ProcessStatus::Failed(_) => ("出错", 0.0),
+            // 失败态的可见文案取自上面的 `failure`（截断摘要），不从这里出；
+            // `progress_val` 只在进行中分支被消费，这里给 0 不影响任何渲染。
+            ProcessStatus::Failed(_) => ("", 0.0),
         };
 
         div()
@@ -351,101 +445,133 @@ impl MainWindow {
             .items_center()
             .justify_between()
             // 左侧状态指示
-            .child(div().flex().items_center().gap_3().child(if is_processing {
-                let total_dur = self.state.transcribe_duration;
-                let cur_sec = self.state.streaming_current_sec;
-                // `mm:ss` 文本统一走 `ui::format_mm_ss`：异常时长（负数 / NaN / 无穷）
-                // 回退成 00:00，渲染路径上不再做 `as u32` 截断。
-                let display_ratio = if total_dur > 0.0 && cur_sec > 0.0 {
-                    (cur_sec / total_dur).clamp(0.0, 1.0)
-                } else {
-                    progress_val.clamp(0.0, 1.0)
-                };
-
+            // 左区允许收缩（`flex_1` + `min_w(0)`）：失败摘要过长时在文本上截断，
+            // 而不是把右侧操作按钮挤出栏外。
+            .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
+                    .items_center()
+                    .gap_3()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(if is_processing {
+                        let total_dur = self.state.transcribe_duration;
+                        let cur_sec = self.state.streaming_current_sec;
+                        // `mm:ss` 文本统一走 `ui::format_mm_ss`：异常时长（负数 / NaN / 无穷）
+                        // 回退成 00:00，渲染路径上不再做 `as u32` 截断。
+                        let display_ratio = if total_dur > 0.0 && cur_sec > 0.0 {
+                            (cur_sec / total_dur).clamp(0.0, 1.0)
+                        } else {
+                            progress_val.clamp(0.0, 1.0)
+                        };
+
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(Theme::TEXT_BODY))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(Theme::text_primary())
+                                            .child(stage_text.to_string()),
+                                    )
+                                    .child(if total_dur > 0.0 {
+                                        div()
+                                            .text_size(px(Theme::TEXT_SMALL))
+                                            .text_color(Theme::text_secondary())
+                                            .child(format!(
+                                                "{} / {}",
+                                                crate::ui::format_mm_ss(cur_sec),
+                                                crate::ui::format_mm_ss(total_dur)
+                                            ))
+                                    } else {
+                                        div()
+                                    })
+                                    .child(primitives::badge_accent(format!(
+                                        "{:.1}%",
+                                        display_ratio * 100.0
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .w(px(Theme::PROGRESS_W))
+                                    .child(primitives::progress_bar(display_ratio as f32)),
+                            )
+                    } else if let Some((summary, full)) = failure {
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
+                            .min_w(px(0.0))
+                            .child(primitives::stat_dot_sm(Theme::accent_red()))
+                            .child(
+                                div()
+                                    .id("status-bar-failure")
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .text_color(Theme::accent_red())
+                                    .child(summary)
+                                    // 摘要被截断过，完整原因留给悬停——用户排查问题要看全
+                                    .tooltip(move |_window, cx| {
+                                        cx.new(|_| FailureTooltip { text: full.clone() }).into()
+                                    }),
+                            )
+                    } else if self.state.transcribe_file.is_some() {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(primitives::stat_dot_sm(Theme::accent_blue()))
                             .child(
                                 div()
                                     .text_size(px(Theme::TEXT_BODY))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(Theme::text_primary())
-                                    .child(stage_text.to_string()),
+                                    .text_color(Theme::text_secondary())
+                                    .child("文件已就绪"),
                             )
-                            .child(if total_dur > 0.0 {
+                    } else if has_batch {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(primitives::stat_dot_sm(Theme::accent_mint()))
+                            .child(
                                 div()
-                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .text_size(px(Theme::TEXT_BODY))
                                     .text_color(Theme::text_secondary())
                                     .child(format!(
-                                        "{} / {}",
-                                        crate::ui::format_mm_ss(cur_sec),
-                                        crate::ui::format_mm_ss(total_dur)
-                                    ))
-                            } else {
+                                        "批量队列已就绪 · {} 个待处理",
+                                        self.state.queue_pending_count()
+                                    )),
+                            )
+                    } else {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(primitives::stat_dot_sm(Theme::bg_dot_idle()))
+                            .child(
                                 div()
-                            })
-                            .child(primitives::badge_accent(format!(
-                                "{:.1}%",
-                                display_ratio * 100.0
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .w(px(Theme::PROGRESS_W))
-                            .child(primitives::progress_bar(display_ratio as f32)),
-                    )
-            } else if self.state.transcribe_file.is_some() {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(primitives::stat_dot_sm(Theme::accent_blue()))
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_BODY))
-                            .text_color(Theme::text_secondary())
-                            .child("文件已就绪"),
-                    )
-            } else if has_batch {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(primitives::stat_dot_sm(Theme::accent_mint()))
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_BODY))
-                            .text_color(Theme::text_secondary())
-                            .child(format!(
-                                "批量队列已就绪 · {} 个待处理",
-                                self.state.queue_pending_count()
-                            )),
-                    )
-            } else {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(primitives::stat_dot_sm(Theme::bg_dot_idle()))
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_BODY))
-                            .text_color(Theme::text_muted())
-                            .child("就绪"),
-                    )
-            }))
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .text_color(Theme::text_muted())
+                                    .child("就绪"),
+                            )
+                    }),
+            )
             // 右侧核心操作按钮 (iOS 椭圆胶囊 Pill Buttons)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2p5()
+                    .flex_shrink_0()
                     .child(
                         // 「播放预览」：禁用态只置灰不接交互，形状不变
                         primitives::pill_btn_outline_state("播放预览", can_play)
@@ -483,7 +609,9 @@ impl MainWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::start_button_label;
+    use super::{
+        failure_summary, start_button_label, FAILURE_SUMMARY_MAX_CHARS, FAILURE_SUMMARY_PLACEHOLDER,
+    };
 
     /// 归位：同一颗按钮在四种状态下必须说清「点下去会做什么」，且用词与转写配置
     /// 抽屉的主 CTA 同源（都说「转写」）——同一件事不该在底部工具栏里换个说法。
@@ -521,5 +649,58 @@ mod tests {
                 "进行中文案 {label} 用省略号表示还在跑"
             );
         }
+    }
+
+    /// 短文本原样返回：摘要只在放不下时才动手，不该顺手改写正常文案。
+    #[test]
+    fn failure_summary_keeps_short_text() {
+        let short = "转写失败：模型文件缺失";
+        assert_eq!(failure_summary(short), short);
+    }
+
+    /// 空串 / 纯空白给占位文案：生产者没给原因时状态栏不能空着，空白会被读成「没出错」。
+    #[test]
+    fn failure_summary_falls_back_to_placeholder() {
+        assert_eq!(failure_summary(""), FAILURE_SUMMARY_PLACEHOLDER);
+        assert_eq!(failure_summary("   \n\t "), FAILURE_SUMMARY_PLACEHOLDER);
+    }
+
+    /// 换行与连续空白折叠成单个空格，并去掉首尾空白：状态栏只有一行高，
+    /// 原文里的换行会把栏位撑高、多空格会把摘要往右推。
+    #[test]
+    fn failure_summary_flattens_whitespace_to_one_line() {
+        assert_eq!(
+            failure_summary("导出失败\n\n  磁盘已满"),
+            "导出失败 磁盘已满"
+        );
+        assert_eq!(failure_summary("  转写失败  "), "转写失败");
+        assert!(!failure_summary("a\nb").contains('\n'));
+    }
+
+    /// 超长文本按**字符**边界截断并补「…」：字符数恰好是上限 +1（省略号），
+    /// 且保留部分与上限字数逐字相同。
+    #[test]
+    fn failure_summary_truncates_long_text_at_char_boundary() {
+        let long = "错".repeat(100);
+        let out = failure_summary(&long);
+        assert_eq!(out.chars().count(), FAILURE_SUMMARY_MAX_CHARS + 1);
+        assert!(out.ends_with('…'));
+        assert_eq!(out, format!("{}…", "错".repeat(FAILURE_SUMMARY_MAX_CHARS)));
+    }
+
+    /// 多字节安全：截断点正好落在 4 字节 emoji 之后也不许劈坏码位——
+    /// 结果是合法 UTF-8，保留的最后一个字符是完整 emoji 而不是半个字节。
+    #[test]
+    fn failure_summary_is_multibyte_safe() {
+        // 共 MAX+1 个字符，截到 MAX 个时尾巴正好是一个完整 emoji
+        let long = format!("{}🎬🎬", "a".repeat(FAILURE_SUMMARY_MAX_CHARS - 1));
+        let out = failure_summary(&long);
+        assert_eq!(out.chars().count(), FAILURE_SUMMARY_MAX_CHARS + 1);
+        assert_eq!(
+            out,
+            format!("{}🎬…", "a".repeat(FAILURE_SUMMARY_MAX_CHARS - 1))
+        );
+        // 结果本身是合法 UTF-8：每个字节都能被 String 重新解析
+        assert_eq!(String::from_utf8(out.clone().into_bytes()), Ok(out));
     }
 }
