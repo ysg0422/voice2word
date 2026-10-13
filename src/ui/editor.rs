@@ -23,6 +23,28 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
+/// 替换面板里「正则 / 整词 / 范围」三项选择的会话态。
+///
+/// 为什么不挂在 `MainWindow` 上：这三项只被本模块使用，而窗口结构体定义在
+/// `ui/mod.rs`，本模块不便向外扩字段。GPUI 的渲染与事件都在主线程执行，线程局部
+/// 变量的可见性与窗口字段一致；面板收起再展开会保留上次选择，与「区分大小写 /
+/// 含译文」两个既有开关的行为对齐。
+struct ReplacePanelToggles {
+    regex: std::cell::Cell<bool>,
+    whole_word: std::cell::Cell<bool>,
+    scope_selected: std::cell::Cell<bool>,
+}
+
+thread_local! {
+    static REPLACE_PANEL_TOGGLES: ReplacePanelToggles = const {
+        ReplacePanelToggles {
+            regex: std::cell::Cell::new(false),
+            whole_word: std::cell::Cell::new(false),
+            scope_selected: std::cell::Cell::new(false),
+        }
+    };
+}
+
 /// 字幕配置 → 预览配色 `(文字色, 底色, 描边色)`。
 ///
 /// 完全由 `SubtitleStyleConfig` 驱动，支持自定义文字颜色、描边粗细与底框不透明度。
@@ -4079,7 +4101,7 @@ impl MainWindow {
     /// 为什么替换前要记一次撤销快照：替换动辄改几十句，用户点错了必须有路可退。
     /// 走 `state.push_undo_snapshot()`（与所有编辑入口同一套），不另造机制。
     fn render_replace_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use crate::subtitle::edit::{replace_all, ReplaceOptions};
+        use crate::subtitle::edit::{replace_all, ReplaceOptions, ReplaceScope, MAX_REPLACEMENTS};
         if !self.replace_panel_open {
             return None;
         }
@@ -4087,6 +4109,9 @@ impl MainWindow {
         let with = self.replace_with.clone();
         let case_sensitive = self.replace_case_sensitive;
         let include_translation = self.replace_include_translation;
+        // 本会话的正则 / 整词 / 范围选择（见 `REPLACE_PANEL_TOGGLES`）。
+        let (toggle_regex, toggle_whole_word, toggle_scope_selected) = REPLACE_PANEL_TOGGLES
+            .with(|t| (t.regex.get(), t.whole_word.get(), t.scope_selected.get()));
         let status = self.replace_status.clone();
         let can_apply = !find.is_empty() && !self.state.segments.is_empty();
         // 规则集下拉要用的渲染数据：名字列表 + 当前选中项。只在面板展开时每帧克隆
@@ -4260,15 +4285,86 @@ impl MainWindow {
                 })),
             )
             .child(
+                primitives::mini_btn(if toggle_regex { "✓ 正则" } else { "正则" }, true)
+                    .id("replace-toggle-regex")
+                    .on_click(cx.listener(|_this, _, _, cx| {
+                        REPLACE_PANEL_TOGGLES.with(|t| t.regex.set(!t.regex.get()));
+                        cx.notify();
+                    })),
+            )
+            .child(
+                primitives::mini_btn(
+                    if toggle_whole_word {
+                        "✓ 整词"
+                    } else {
+                        "整词"
+                    },
+                    true,
+                )
+                .id("replace-toggle-whole-word")
+                .on_click(cx.listener(|_this, _, _, cx| {
+                    REPLACE_PANEL_TOGGLES.with(|t| t.whole_word.set(!t.whole_word.get()));
+                    cx.notify();
+                })),
+            )
+            .child(
+                primitives::mini_btn(
+                    if toggle_scope_selected {
+                        "全部句"
+                    } else {
+                        "✓ 全部句"
+                    },
+                    true,
+                )
+                .id("replace-scope-all")
+                .on_click(cx.listener(|_this, _, _, cx| {
+                    REPLACE_PANEL_TOGGLES.with(|t| t.scope_selected.set(false));
+                    cx.notify();
+                })),
+            )
+            .child(
+                primitives::mini_btn(
+                    if toggle_scope_selected {
+                        "✓ 仅当前句"
+                    } else {
+                        "仅当前句"
+                    },
+                    has_selected_segment,
+                )
+                .id("replace-scope-selected")
+                .when(has_selected_segment, |d| {
+                    d.on_click(cx.listener(|_this, _, _, cx| {
+                        REPLACE_PANEL_TOGGLES.with(|t| t.scope_selected.set(true));
+                        cx.notify();
+                    }))
+                }),
+            )
+            .child(
                 primitives::mini_btn("全部替换", can_apply)
                     .id("replace-apply")
                     .when(can_apply, |d| {
                         d.on_click(cx.listener(move |this, _, _, cx| {
+                            // 范围=仅当前句但此刻没有选中句时：只提示、绝不动全部——
+                            // 否则「只想改一句」会变成整轨批量替换，方向正好反了。
+                            let scope_selected =
+                                REPLACE_PANEL_TOGGLES.with(|t| t.scope_selected.get());
+                            let scope = match (scope_selected, this.state.selected_segment_index) {
+                                (true, Some(index)) => ReplaceScope::SelectedSentence(index),
+                                (true, None) => {
+                                    this.replace_status = Some((false, "未选中句子".to_string()));
+                                    cx.notify();
+                                    return;
+                                }
+                                (false, _) => ReplaceScope::All,
+                            };
                             // 先记快照：替换可能一次改几十句，点错必须有路可退。
                             this.state.snapshot_for_undo();
                             let options = ReplaceOptions {
                                 case_sensitive: this.replace_case_sensitive,
                                 include_translation: this.replace_include_translation,
+                                regex: REPLACE_PANEL_TOGGLES.with(|t| t.regex.get()),
+                                whole_word: REPLACE_PANEL_TOGGLES.with(|t| t.whole_word.get()),
+                                scope,
                             };
                             let report = replace_all(
                                 &mut this.state.segments,
@@ -4276,22 +4372,31 @@ impl MainWindow {
                                 &this.replace_with,
                                 &options,
                             );
-                            this.replace_status = Some(if report.is_empty() {
-                                (false, "没有找到匹配的内容".to_string())
-                            } else {
-                                let mut msg = format!(
-                                    "已替换 {} 处，涉及 {} 句",
-                                    report.total_hits(),
-                                    report.changed.len()
-                                );
-                                if report.translation_hits > 0 {
-                                    msg.push_str(&format!(
-                                        "（其中译文 {} 处）",
-                                        report.translation_hits
-                                    ));
-                                }
-                                (true, msg)
-                            });
+                            this.replace_status =
+                                Some(if let Some(err) = report.regex_error.as_deref() {
+                                    (false, format!("正则表达式无效：{err}"))
+                                } else if report.is_empty() {
+                                    (false, "没有找到匹配的内容".to_string())
+                                } else {
+                                    let mut msg = format!(
+                                        "已替换 {} 处，涉及 {} 句",
+                                        report.total_hits(),
+                                        report.changed.len()
+                                    );
+                                    if report.translation_hits > 0 {
+                                        msg.push_str(&format!(
+                                            "（其中译文 {} 处）",
+                                            report.translation_hits
+                                        ));
+                                    }
+                                    if report.truncated {
+                                        msg.push_str(&format!(
+                                            "；命中 {} 处，已达单次上限 {}，其余未替换",
+                                            report.matched_hits, MAX_REPLACEMENTS
+                                        ));
+                                    }
+                                    (true, msg)
+                                });
                             // 内容变了：字幕清单的过滤结果与质检缓存都要跟着重算。
                             // 同时置脏并落库：`bump_segments_revision` 只失效清单缓存，
                             // 不置脏的话这次整轨替换不会被写回历史库。
