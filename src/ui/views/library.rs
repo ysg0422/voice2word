@@ -145,8 +145,10 @@ impl MainWindow {
             .rounded(px(Theme::RADIUS_MD))
             .bg(Theme::bg_input())
             .border_1()
+            // 聚焦描边走 primitives::text_input 的口径（accent_blue）：薄荷绿在本站
+            // 专表「我在哪一页」，控件自己的编辑态再用绿会和导航语义撞车。
             .border_color(if is_focused {
-                Theme::accent_mint()
+                Theme::accent_blue()
             } else {
                 Theme::border_mid()
             })
@@ -184,14 +186,14 @@ impl MainWindow {
                     .text_size(px(Theme::TEXT_SMALL))
                     .text_color(Theme::text_primary())
                     .child(before)
-                    .child(div().text_color(Theme::accent_mint()).child("▌"))
+                    .child(div().text_color(Theme::accent_blue()).child("▌"))
                     .child(after)
                     .into_any_element()
             } else if char_count == 0 {
                 div()
                     .text_size(px(Theme::TEXT_SMALL))
                     .text_color(Theme::text_muted())
-                    .child("搜索视频...")
+                    .child("搜索视频…")
                     .into_any_element()
             } else {
                 div()
@@ -398,7 +400,7 @@ impl MainWindow {
                     .text_size(px(Theme::TEXT_HEADING))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(Theme::text_secondary())
-                    .child("暂无解析历史"),
+                    .child("暂无转写记录"),
             )
             .child(
                 div()
@@ -779,19 +781,9 @@ impl MainWindow {
             .cloned()
             .unwrap_or_else(|| "未知大小".to_string());
 
-        // 摘录首条字幕文本 (按字符边界截断，避免切进多字节中文字符导致 panic)
-        // 列表查询已由 SQLite 抽出首句文本，这里不再反序列化整段字幕
-        let sample_text = {
-            let t = task.sample_text.clone();
-            if t.trim().is_empty() {
-                "无字幕内容".to_string()
-            } else if t.chars().count() > 40 {
-                let cut: String = t.chars().take(40).collect();
-                format!("{}...", cut)
-            } else {
-                t
-            }
-        };
+        // 摘录首条字幕文本：列表查询已由 SQLite 抽出首句文本，这里不再反序列化整段字幕。
+        // 截断规则见 `library_sample_preview`（按字符边界，避免切进多字节中文字符）。
+        let sample_text = library_sample_preview(&task.sample_text, LIBRARY_SAMPLE_MAX_CHARS);
 
         // 格式化日期（取日期部分）
         // 取日期部分（前 10 字节 = "YYYY-MM-DD"）。这里用 `get(..10)` 而不是直接
@@ -1030,15 +1022,29 @@ impl MainWindow {
                     .items_center()
                     .gap_2()
                     // 耗时详情 (if metrics)
-                    .children(task.metrics.clone().map(|m| {
-                        let fname = task.file_name.clone();
+                    // 与「校对 / 导出」同法：渲染期只判断「有没有指标」，点开那一刻才把
+                    // 那一条的指标取出来。这里原先每帧对每张卡片 `clone()` 一次 metrics
+                    // （十来个 f64 的聚合结构），50 条库就是每帧 50 次纯浪费的分配——
+                    // 而这些数字只有用户点「耗时」时才真正被读到。
+                    .children(task.metrics.as_ref().map(|_| {
                         primitives::btn_mint_soft("耗时")
                             .id(("lib-metrics-btn", task_id as usize))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some((metrics, file_name)) = this
+                                    .state
+                                    .recent_tasks
+                                    .iter()
+                                    .find(|t| t.id == task_id)
+                                    .and_then(|t| {
+                                        t.metrics.clone().map(|m| (m, t.file_name.clone()))
+                                    })
+                                else {
+                                    return;
+                                };
                                 this.benchmark_dialog =
                                     Some(crate::ui::types::BenchmarkDialogInfo {
-                                        file_name: fname.clone(),
-                                        metrics: m.clone(),
+                                        file_name,
+                                        metrics,
                                     });
                                 cx.notify();
                             }))
@@ -1236,6 +1242,25 @@ fn library_ext_label(file_name: &str) -> String {
 /// - 卡片总数 ≤ 上限的小库仍然整库解码（与改造前行为一致，不闪占位）。
 const LIBRARY_THUMB_IMAGE_CAP: usize = 32;
 
+/// 卡片字幕摘录的最大显示字数（字符数，不是字节数）。
+const LIBRARY_SAMPLE_MAX_CHARS: usize = 40;
+
+/// 卡片上的字幕摘录：空内容给占位符，超长按**字符**边界截断并补省略号。
+///
+/// 按字符而不是按字节截断：中文字幕按字节切会切进多字节字符，轻则最后一个字变
+/// 乱码，重则 panic——而卡片是每帧都渲染的地方。截断处补「…」而不是三连点，
+/// 与全站其它进行中/截断文案保持同一种记号。
+fn library_sample_preview(sample_text: &str, max_chars: usize) -> String {
+    if sample_text.trim().is_empty() {
+        return "无字幕内容".to_string();
+    }
+    if sample_text.chars().count() > max_chars {
+        let cut: String = sample_text.chars().take(max_chars).collect();
+        return format!("{}…", cut);
+    }
+    sample_text.to_string()
+}
+
 /// 视口上下各多解码几张：滚动时下一屏的卡片已经就绪，不至于边滚边闪占位。
 const LIBRARY_THUMB_PREFETCH_MARGIN: usize = 4;
 
@@ -1373,9 +1398,26 @@ fn thumb_demand_slice(len: usize, top: usize, bottom: usize, margin: usize) -> R
 mod tests {
     use super::{
         export_spec_for, format_file_size, library_ext_label, library_ordered_tasks,
-        library_task_index, thumb_demand_slice, ThumbImageLru,
+        library_sample_preview, library_task_index, thumb_demand_slice, ThumbImageLru,
     };
     use crate::storage::TaskRecord;
+
+    /// 卡片摘录的三种形态：空内容给占位、超长按字符边界截断并补省略号、短句原样。
+    /// 省略号必须是单个「…」：三连点在本站其它文案里已被统一掉，这里不能再冒出来。
+    #[test]
+    fn library_sample_preview_keeps_full_sentences_and_truncates_long_ones() {
+        assert_eq!(library_sample_preview("   ", 40), "无字幕内容");
+        assert_eq!(library_sample_preview("短句", 40), "短句");
+        // 正好等于上限：不截断、不加省略号
+        let exact = "一".repeat(40);
+        assert_eq!(library_sample_preview(&exact, 40), exact);
+        // 超出一个字：截到上限再补省略号，总长 = 上限 + 1
+        let long = "一".repeat(41);
+        let out = library_sample_preview(&long, 40);
+        assert_eq!(out.chars().count(), 41, "40 个字 + 省略号");
+        assert!(out.ends_with('…'), "截断要留省略号，让用户知道还有后半句");
+        assert!(!out.contains("..."), "三连点写法不该出现在界面上");
+    }
 
     #[test]
     fn file_size_formatting_matches_previous_rendering() {

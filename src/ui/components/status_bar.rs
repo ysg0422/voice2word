@@ -8,6 +8,37 @@ use super::super::theme::Theme;
 use super::super::MainWindow;
 use crate::app::state::ProcessStatus;
 
+/// 底部状态栏主按钮的文案。
+///
+/// 抽成纯函数是为了能单测：这段判定有五个分支，写在渲染闭包里就只能靠肉眼比对；
+/// 而它决定的恰恰是「按钮说自己在做什么」——文案与真实动作对不上，用户会以为
+/// 按下它会发生别的事。
+///
+/// 口径与右侧转写配置抽屉的主 CTA 完全一致（「开始转写 / 开始全部」，进行中一律
+/// 带「转写」二字）：同一件事不该在底部工具栏里换个说法。
+fn start_button_label(
+    is_processing: bool,
+    batch_running: bool,
+    has_file: bool,
+    has_batch: bool,
+) -> &'static str {
+    if is_processing {
+        if batch_running {
+            // 批量跑的是队列，说「转写中」会让用户以为只有当前这一条在跑
+            "批量转写中…"
+        } else {
+            "转写中…"
+        }
+    } else if has_file {
+        "开始转写"
+    } else if has_batch {
+        "开始全部"
+    } else {
+        // 无文件也无队列：按钮本来就是禁用态，这里给的是「补上文件后它会做什么」
+        "开始转写"
+    }
+}
+
 impl MainWindow {
     /// 全局失败提示条。
     ///
@@ -424,21 +455,14 @@ impl MainWindow {
                             }),
                     )
                     .child(
-                        // 「开始处理 / 开始全部」：实心薄荷胶囊，禁用时退化为中性底槽
+                        // 「开始转写 / 开始全部」：实心薄荷胶囊，禁用时退化为中性底槽
                         primitives::pill_btn_solid_state(
-                            if is_processing {
-                                if self.state.batch_running {
-                                    "批量处理中..."
-                                } else {
-                                    "处理中..."
-                                }
-                            } else if has_file {
-                                "开始处理"
-                            } else if has_batch {
-                                "开始全部"
-                            } else {
-                                "开始处理"
-                            },
+                            start_button_label(
+                                is_processing,
+                                self.state.batch_running,
+                                has_file,
+                                has_batch,
+                            ),
                             Theme::accent_mint(),
                             can_start,
                         )
@@ -454,5 +478,48 @@ impl MainWindow {
                         }),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::start_button_label;
+
+    /// 归位：同一颗按钮在四种状态下必须说清「点下去会做什么」，且用词与转写配置
+    /// 抽屉的主 CTA 同源（都说「转写」）——同一件事不该在底部工具栏里换个说法。
+    #[test]
+    fn start_button_label_matches_drawer_cta() {
+        assert_eq!(start_button_label(false, false, true, false), "开始转写");
+        assert_eq!(start_button_label(false, false, false, true), "开始全部");
+        // 无文件也无队列：按钮是禁用态，文案仍要预告补上文件后的动作
+        assert_eq!(start_button_label(false, false, false, false), "开始转写");
+        assert_eq!(start_button_label(true, false, true, false), "转写中…");
+        // 批量进行中：必须能看出跑的是整批，而不是当前这一条
+        assert_eq!(start_button_label(true, true, true, true), "批量转写中…");
+    }
+
+    /// 进行中态优先于文件/队列判定：任何组合都不许漏出「开始…」文案，否则用户会
+    /// 在转写途中看到一颗写着「开始转写」的按钮，以为任务没跑起来。
+    #[test]
+    fn running_states_never_show_start_wording() {
+        for (batch_running, has_file, has_batch) in [
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let label = start_button_label(true, batch_running, has_file, has_batch);
+            assert!(
+                label.contains("转写"),
+                "进行中文案 {label} 没说明自己在转写"
+            );
+            assert!(
+                !label.starts_with("开始"),
+                "进行中文案 {label} 不该出现在「开始…」这一档"
+            );
+            assert!(
+                label.ends_with('…'),
+                "进行中文案 {label} 用省略号表示还在跑"
+            );
+        }
     }
 }

@@ -183,7 +183,7 @@ impl MainWindow {
             .bg(Theme::bg_input())
             .border_1()
             .border_color(if is_focused {
-                Theme::accent_mint()
+                Theme::accent_blue()
             } else {
                 Theme::border_mid()
             })
@@ -248,7 +248,7 @@ impl MainWindow {
                         div()
                             .text_size(px(Theme::TEXT_SMALL))
                             .text_color(Theme::text_muted())
-                            .child("搜索字幕与译文...")
+                            .child("搜索字幕与译文…")
                     } else {
                         div()
                             .text_size(px(Theme::TEXT_SMALL))
@@ -320,7 +320,7 @@ impl MainWindow {
             .gap_1()
             .pr_2()
             .child(if downloaded {
-                primitives::chip_clickable("新版本就绪(打开)", true, false)
+                primitives::chip_clickable("新版本就绪（打开）", true, false)
                     .id("titlebar-update-open-btn")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.open_downloaded_update(cx);
@@ -342,7 +342,7 @@ impl MainWindow {
                     .text_color(Theme::text_on_accent())
                     .cursor_pointer()
                     .hover(|s| s.bg(Theme::accent_mint_deep()))
-                    .child("发现新版本(点击更新)")
+                    .child("发现新版本（点击更新）")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.download_app_update(cx);
                     }))
@@ -361,7 +361,7 @@ impl MainWindow {
                     .cursor_pointer()
                     .hover(|s| s.bg(Theme::bg_hover()))
                     .child(format!(
-                        "当前已是最新版(v{}) ✓",
+                        "当前已是最新版（v{}）✓",
                         crate::utils::update_check::current_version()
                     ))
                     .on_click(cx.listener(|this, _, _, cx| {

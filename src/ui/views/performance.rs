@@ -1,4 +1,4 @@
-//! 性能与推理设置工作台视图
+//! 性能设置工作台视图
 //!
 //! 实现「硬件检测 → 性能评估 → 策略矩阵决策 → 一键应用」的原生 GPUI 交互面板。
 //! 此功能为实验性功能。
@@ -93,7 +93,7 @@ pub(crate) fn provider_status_line(
     engine_mounted: bool,
 ) -> (String, bool) {
     if !engine_mounted {
-        return ("未启用（SenseVoice / CT-Punc 均未就绪）".to_string(), false);
+        return ("未启用（SenseVoice / CT-Punc 均未就位）".to_string(), false);
     }
     // 空串兜底成 cpu：与 `resolve_onnx_provider` 的「其余一律 cpu」一致，
     // 保证这个纯函数对任意输入都有确定输出。
@@ -261,7 +261,7 @@ fn http_get_models(url: &str, key: &str, timeout_secs: u64) -> Result<String, Mo
     match response {
         Ok(resp) => resp
             .into_string()
-            .map_err(|e| ModelFetchError::transport(format!("读取 {url} 的响应失败: {e}"))),
+            .map_err(|e| ModelFetchError::transport(format!("读取 {url} 的响应失败：{e}"))),
         Err(ureq::Error::Status(code, resp)) => {
             let body = resp.into_string().unwrap_or_default();
             let detail = crate::utils::config::gateway_error_summary(&body)
@@ -269,10 +269,10 @@ fn http_get_models(url: &str, key: &str, timeout_secs: u64) -> Result<String, Mo
             Err(ModelFetchError {
                 status: Some(code),
                 detail,
-                raw: format!("在线接口返回 HTTP {code}: {body}"),
+                raw: format!("在线接口返回 HTTP {code}：{body}"),
             })
         }
-        Err(e) => Err(ModelFetchError::transport(format!("无法连接 {url}: {e}"))),
+        Err(e) => Err(ModelFetchError::transport(format!("无法连接 {url}：{e}"))),
     }
 }
 
@@ -392,8 +392,40 @@ fn vad_slider_value(vad: f64) -> u32 {
     (vad.clamp(VAD_THRESHOLD_MIN, VAD_THRESHOLD_MAX) * 100.0).round() as u32
 }
 
+/// 「测试连接」按钮的文案：探测进行中要说清「正在探测」，别让按钮看起来仍可点击
+/// （重复点击会连发多轮网络请求）。
+///
+/// 抽成纯函数的理由与一旁的滑条换算相同：文案判定进不了界面单测，而它恰好决定
+/// 「按钮此刻代表哪个状态」——这里写反了，用户就分不清该不该再点一次。
+fn probe_button_label(probing: bool) -> &'static str {
+    if probing {
+        "测试中…"
+    } else {
+        "测试连接"
+    }
+}
+
+/// 「可用模型池」内嵌滚动网格的跨帧状态（只为一个滚动句柄）。
+///
+/// 为什么放在 GPUI 全局而不是 `MainWindow` 字段：字段定义在 `ui/mod.rs`（本模块无权
+/// 改动），而滚动句柄必须**跨帧是同一个**——每帧新建一个，`track_scroll` 读到的偏移
+/// 永远归零，滚轮判据也随之失效。全局随 App 生命周期存活，等价于视图级状态。
+struct ModelPoolScroll {
+    handle: ScrollHandle,
+}
+
+impl Default for ModelPoolScroll {
+    fn default() -> Self {
+        Self {
+            handle: ScrollHandle::new(),
+        }
+    }
+}
+
+impl Global for ModelPoolScroll {}
+
 impl MainWindow {
-    /// 渲染性能与推理设置工作台
+    /// 渲染性能设置工作台
     pub(crate) fn render_performance_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         // 页面外壳统一走 primitives::page_shell：内边距 / 分区间距 / 标题字号
         // 与其余三个工作台页同源，切页时内容不再横向跳动。
@@ -418,7 +450,7 @@ impl MainWindow {
             .child(self.render_audio_pipeline_card(cx))
             // 7. 步骤 5: 字幕翻译引擎（离线 Qwen / 在线 OpenAI 兼容 API）
             .child(self.render_translate_settings_card(cx))
-            // 8. 步骤 6: 模型与外部组件（缺什么、一键补齐；全部走国内镜像）
+            // 8. 步骤 6: 模型与组件（缺什么、一键补齐；全部走国内镜像）
             .child(self.render_model_manager(false, cx))
     }
 
@@ -439,7 +471,7 @@ impl MainWindow {
             ))
             .child(self.seg_option(
                 "perf-tier-cpu",
-                "无独立显卡 (纯 CPU 模式)",
+                "无独立显卡（纯 CPU 模式）",
                 !is_gpu,
                 cx,
                 |this, cx| {
@@ -587,40 +619,21 @@ impl MainWindow {
                 div().into_any_element()
             })
             .child(
-                div()
-                    .id("perf-translate-probe-btn")
-                    .px(px(Theme::SPACE_4))
-                    .h(px(Theme::CTRL_H_SM))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(Theme::RADIUS_LG))
-                    .bg(if probing {
-                        Theme::bg_disabled()
-                    } else {
-                        Theme::bg_panel()
-                    })
-                    .border_1()
-                    .border_color(Theme::bg_hover_strong())
-                    .text_size(px(Theme::TEXT_SMALL))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if probing {
-                        Theme::text_disabled()
-                    } else {
-                        Theme::accent_blue()
-                    })
-                    .when(!probing, |s| {
-                        s.cursor_pointer()
-                            .hover(|s| s.bg(Theme::bg_track()).text_color(Theme::accent_blue()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.probe_online_translate_api(cx);
-                            }))
-                    })
-                    .child(if probing {
-                        "测试中…"
-                    } else {
-                        "测试连接"
-                    }),
+                // 外观走 btn_state 原语（尺寸 / 圆角 / 禁用配色全站同源），探测中显示
+                // 「测试中…」并置灰：按钮长得还能点、点了却没反应，用户会以为程序卡死，
+                // 连点还会连发多轮请求。
+                primitives::btn_state(
+                    probe_button_label(probing),
+                    primitives::BtnSize::Sm,
+                    primitives::BtnVariant::Secondary,
+                    !probing,
+                )
+                .id("perf-translate-probe-btn")
+                .when(!probing, |d| {
+                    d.on_click(cx.listener(|this, _, _, cx| {
+                        this.probe_online_translate_api(cx);
+                    }))
+                }),
             )
             .into_any_element();
 
@@ -773,7 +786,7 @@ impl MainWindow {
             .flex()
             .items_center()
             .justify_between()
-            .child(primitives::page_title("性能与推理设置"))
+            .child(primitives::page_title("性能设置"))
             .child(
                 div()
                     .id("perf-help-toggle-btn")
@@ -793,7 +806,7 @@ impl MainWindow {
                     .border_color(if show_help {
                         Theme::tint_blue_border()
                     } else {
-                        Theme::bg_hover_strong()
+                        Theme::border_mid()
                     })
                     .text_size(px(Theme::TEXT_BODY_LG))
                     .font_weight(FontWeight::BOLD)
@@ -846,7 +859,7 @@ impl MainWindow {
             // 就位徽标缓存要跟着重算，否则会显示成上一档位的结论。
             this.state.refresh_model_presence();
             if let Err(e) = this.state.config.save_to_file("config.toml") {
-                this.notice = Some(format!("推荐配置已生效，但写入 config.toml 失败: {e}"));
+                this.notice = Some(format!("推荐配置已生效，但写入 config.toml 失败：{e}"));
             }
             cx.notify();
         };
@@ -954,7 +967,7 @@ impl MainWindow {
     fn render_perf_help_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let items: [(&'static str, &'static str); 7] = [
             (
-                "转写引擎",
+                "识别引擎",
                 "SenseVoice：中文极速、自带标点；Whisper：多语种、方言口音更稳。",
             ),
             (
@@ -1378,7 +1391,7 @@ impl MainWindow {
                             .text_size(px(Theme::TEXT_CAPTION))
                             .font_weight(FontWeight::BOLD)
                             .text_color(Theme::text_primary())
-                            .child(format!("可用模型池 ({} 个)", models.len())),
+                            .child(format!("可用模型池（{} 个）", models.len())),
                     )
                     .child(if !selected.is_empty() {
                         div()
@@ -1390,7 +1403,7 @@ impl MainWindow {
                             .border_color(Theme::tint_mint_border())
                             .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(Theme::accent_mint())
-                            .child(format!("当前: {selected}"))
+                            .child(format!("当前：{selected}"))
                     } else {
                         div()
                     }),
@@ -1401,19 +1414,23 @@ impl MainWindow {
                     .items_center()
                     .gap(px(Theme::SPACE_1))
                     .child(
-                        primitives::chip(format!("全部 ({})", models.len()), cat.is_empty(), false)
-                            .id("model-cat-all")
-                            .cursor_pointer()
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                if let Ok(mut g) = MODEL_CATEGORY.lock() {
-                                    *g = String::new();
-                                }
-                                cx.notify();
-                            })),
+                        primitives::chip(
+                            format!("全部（{}）", models.len()),
+                            cat.is_empty(),
+                            false,
+                        )
+                        .id("model-cat-all")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            if let Ok(mut g) = MODEL_CATEGORY.lock() {
+                                *g = String::new();
+                            }
+                            cx.notify();
+                        })),
                     )
                     .when(cn_count > 0, |d| {
                         d.child(
-                            primitives::chip(format!("国内 ({cn_count})"), cat == "cn", false)
+                            primitives::chip(format!("国内（{cn_count}）"), cat == "cn", false)
                                 .id("model-cat-cn")
                                 .cursor_pointer()
                                 .on_click(cx.listener(|_, _, _, cx| {
@@ -1427,7 +1444,7 @@ impl MainWindow {
                     .when(global_count > 0, |d| {
                         d.child(
                             primitives::chip(
-                                format!("国际 ({global_count})"),
+                                format!("国际（{global_count}）"),
                                 cat == "global",
                                 false,
                             )
@@ -1445,11 +1462,32 @@ impl MainWindow {
         container = container.child(header);
 
         // 核心滚动网格：限制高度 max-h 140px，带平滑滚动，绝不霸占整个屏幕
+        //
+        // 滚轮判据与批量队列清单同源（见 `primitives::should_consume_scroll`）：模型池
+        // 是**嵌在可滚动设置页里**的小网格，而 GPUI 的内建滚动监听不会阻止冒泡——
+        // 少了这一刀，鼠标停在模型池上滚轮会「网格和整页一起滚」，用户根本对不准列表。
+        let pool_scroll =
+            cx.update_default_global::<ModelPoolScroll, _>(|state, _| state.handle.clone());
         let mut scroll_box = div()
             .id("perf-model-scroll-box")
             .w_full()
             .max_h(px(140.0))
             .overflow_y_scroll()
+            .track_scroll(&pool_scroll)
+            .on_scroll_wheel(cx.listener(|_, event: &ScrollWheelEvent, _window, cx| {
+                let delta_y = match event.delta {
+                    ScrollDelta::Lines(p) => p.y,
+                    ScrollDelta::Pixels(p) => f32::from(p.y),
+                };
+                let consume = cx.update_default_global::<ModelPoolScroll, _>(|state, _| {
+                    let offset_y = f32::from(state.handle.offset().y);
+                    let max_h = f32::from(state.handle.max_offset().height);
+                    crate::ui::primitives::should_consume_scroll(delta_y, offset_y, max_h)
+                });
+                if consume {
+                    cx.stop_propagation();
+                }
+            }))
             .flex()
             .flex_wrap()
             .gap(px(Theme::SPACE_1_5))
@@ -1571,7 +1609,7 @@ impl MainWindow {
         let engine_control = primitives::segmented_cluster()
             .child(self.seg_option(
                 "perf-engine-pill-sv",
-                "SenseVoice 极速 (推荐)",
+                "SenseVoice 极速（推荐）",
                 is_sv,
                 cx,
                 |this, cx| {
@@ -1620,7 +1658,7 @@ impl MainWindow {
             .gap(px(Theme::PAGE_GAP))
             .child(
                 primitives::card_rows()
-                    .child(Self::render_setting_row("转写引擎", engine_control))
+                    .child(Self::render_setting_row("识别引擎", engine_control))
                     .child(Self::render_setting_divider())
                     .child(
                         // 下拉展开时菜单要占满整行：走 setting_row（左标签 + 右对齐控件）
@@ -2555,8 +2593,27 @@ impl MainWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_glossary_count, local_model_status, tier_menu_desc, vad_slider_value};
+    use super::{
+        effective_glossary_count, local_model_status, probe_button_label, tier_menu_desc,
+        vad_slider_value,
+    };
     use crate::utils::config::TranslateConfig;
+
+    /// 「测试连接」按钮的两态文案：探测中必须换成进行时，否则用户会以为还能再点一次
+    /// （连点会连发多轮网络请求），也看不出上一轮请求还没回来。
+    #[test]
+    fn probe_button_label_switches_while_probing() {
+        assert_eq!(probe_button_label(false), "测试连接");
+        assert_eq!(probe_button_label(true), "测试中…");
+        assert!(
+            !probe_button_label(true).starts_with("测试连接"),
+            "探测中不能再显示可点状态的文案"
+        );
+        assert!(
+            probe_button_label(true).ends_with('…'),
+            "进行态要用省略号，让用户知道请求还在路上"
+        );
+    }
 
     /// 回归（P2）：术语表计数必须与**实际注入**一致——超过上限时显示生效数，
     /// 而不是解析出的全部条数。
@@ -2731,7 +2788,7 @@ mod tests {
         // 未启用：SenseVoice / CT-Punc 都没挂载
         assert_eq!(
             provider_status_line("dml", None, false),
-            ("未启用（SenseVoice / CT-Punc 均未就绪）".to_string(), false)
+            ("未启用（SenseVoice / CT-Punc 均未就位）".to_string(), false)
         );
         // 边界：引擎在、但本次会话还没跑过 ONNX 推理
         assert_eq!(

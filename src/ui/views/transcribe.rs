@@ -53,7 +53,7 @@ impl MainWindow {
         // 撑满剩余宽度的职责。
         primitives::page_shell("transcribe-main-workspace")
             .flex_1()
-            // ── 顶部步骤流式导航栏：转写是一条「导入 → 识别 → 翻译 → 导出」的直线，
+            // ── 顶部步骤流式导航栏：转写是一条「导入媒体 → 语音转写 → 剪辑校对 → 导出工程」的直线，
 // 步骤常驻在顶部，用户随时知道自己在第几步、下一步该干什么 ──
             .child(
                 div()
@@ -161,7 +161,7 @@ impl MainWindow {
                                             .text_size(px(Theme::TEXT_BODY))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(Theme::text_secondary())
-                                            .child("字幕校对"),
+                                            .child("剪辑校对"),
                                     ),
                             )
                             .child(primitives::step_connector())
@@ -205,7 +205,7 @@ impl MainWindow {
                                 .items_center()
                                 .gap(px(Theme::SPACE_1))
                                 .child(primitives::stat_dot_sm(Theme::accent_mint()))
-                                .child(primitives::badge_accent("正在转写..."))
+                                .child(primitives::badge_accent("正在转写…"))
                         } else if let Some(ref file) = self.state.transcribe_file {
                             div()
                                 .flex()
@@ -238,7 +238,7 @@ impl MainWindow {
                         ProcessStatus::Processing { stage, progress, detail } => {
                             (stage.clone(), *progress, detail.clone())
                         }
-                        _ => ("正在全速转写中...".to_string(), 0.0, String::new()),
+                        _ => ("正在全速转写中…".to_string(), 0.0, String::new()),
                     };
                     let total_dur = self.state.transcribe_duration;
                     let cur_sec = self.state.streaming_current_sec;
@@ -299,7 +299,7 @@ impl MainWindow {
                                                         .text_size(px(Theme::TEXT_SMALL))
                                                         .text_color(Theme::text_muted())
                                                         .child(if detail.trim().is_empty() {
-                                                            if is_sensevoice { "SenseVoice 正在通过纯内存音频管道极速识别...".to_string() } else { "Whisper 模型正在转写音频流...".to_string() }
+                                                            if is_sensevoice { "SenseVoice 正在通过纯内存音频管道极速识别…".to_string() } else { "Whisper 模型正在转写音频流…".to_string() }
                                                         } else {
                                                             detail
                                                         }),
@@ -349,13 +349,13 @@ impl MainWindow {
                                                 .text_color(Theme::text_secondary())
                                                 .child(if total_dur > 0.0 {
                                                     format!(
-                                                        "进度: {} / {} ({:.1}%)",
+                                                        "进度：{} / {}（{:.1}%）",
                                                         format_mm_ss(cur_sec),
                                                         format_mm_ss(total_dur),
                                                         display_ratio * 100.0
                                                     )
                                                 } else {
-                                                    "正在实时推流...".to_string()
+                                                    "正在实时推流…".to_string()
                                                 }),
                                         ),
                                 )
@@ -373,9 +373,9 @@ impl MainWindow {
                                             .text_size(px(Theme::TEXT_BODY_LG))
                                             .text_color(Theme::text_muted())
                                             .child(if is_sensevoice {
-                                                "SenseVoice 极速模型正在解析音频流，首句字幕即将秒级呈现..."
+                                                "SenseVoice 极速模型正在解析音频流，首句字幕即将秒级呈现…"
                                             } else {
-                                                "AI 语音引擎正在加载权重并解析音频流，首句字幕即将实时呈现..."
+                                                "AI 语音引擎正在加载权重并解析音频流，首句字幕即将实时呈现…"
                                             })
                                             .into_any_element()
                                     } else {
@@ -580,7 +580,7 @@ impl MainWindow {
                                                     div()
                                                         .text_size(px(Theme::TEXT_SMALL))
                                                         .text_color(Theme::text_secondary())
-                                                        .child(format!("时长: {}", dur_str)),
+                                                        .child(format!("时长：{}", dur_str)),
                                                 )
                                                 .children(if has_dur {
                                                     // 预估耗时药丸：薄荷档 = 极速引擎，其余走主重音 tint，
@@ -626,7 +626,7 @@ impl MainWindow {
                                                 .text_size(px(Theme::TEXT_BODY))
                                                 .font_weight(FontWeight::BOLD)
                                                 .text_color(Theme::accent_mint())
-                                                .child(format!("命中本地转写缓存 (含 {} 句字幕)", cached.segments.len())),
+                                                .child(format!("命中本地转写缓存（含 {} 句字幕）", cached.segments.len())),
                                         )
                                 }))
                                 // 转写质检摘要（已在卡片上方算好；无字幕时为 None）
@@ -665,13 +665,13 @@ impl MainWindow {
                                             ]
                                         } else {
                                             vec![
-                                                primitives::btn(if is_sensevoice { "开始极速转写" } else { "开始神经转写" }, primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
+                                                primitives::btn("开始转写", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
                                                     .id("ready-start-process-btn")
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.start_processing(cx);
                                                     }))
                                                     .into_any_element(),
-                                                primitives::btn("重新选择", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
+                                                primitives::btn("更换视频", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
                                                     .id("ready-repick-file-btn")
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.choose_file(cx);

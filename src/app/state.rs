@@ -1,5 +1,6 @@
 //! 应用程序全局状态
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -525,37 +526,60 @@ struct SegmentWriteDone {
     result: Result<(), String>,
 }
 
-/// 后台写线程的共享账本：单调序号、同步写水位、已完成序号、失败记录。
+/// 后台写线程的共享账本：单调序号、已完成水位、按工程的落库水位。
 ///
-/// 这四样东西共同实现「防回退」——旧快照的结局不许覆盖新状态：
+/// 这三样东西共同实现「防回退」——旧快照的结局不许覆盖新状态：
 ///
-/// - `next_seq`：派发序号只增不减，后台结果自带「我是哪一代」；
-/// - `sync_watermark`：**同步**落库（关窗守卫 / 换工程 / 导出 / 翻译收尾）写的是更新的
-///   快照，它把水位推到自己领的序号上，于是还在排队的旧任务直接放弃写入（连写都不写，
-///   避免旧数据先在库里落地、再被新数据盖掉）；
-/// - `completed_floor`：已完成的最大写序号；更旧的回报只留日志，不许再点提示灯。
-///   （结果本身走 `submit` / `drain_results` 的通道，不在这里囤，所以不设失败队列。）
+/// - `next_seq`：派发序号只增不减，后台结果自带「我是哪一代」；同步写也从同一
+///   序列领号，因此同步写与后台写在序号上可以直接比较先后；
+/// - `applied`：**每个工程已经真正落库**的最大写序号。同步写与后台写都在写入闸
+///   （[`BackgroundWrites::lock_writer`]）里先查它再写，于是更旧的快照不可能在
+///   更新的内容之后落地——不依赖线程调度的先后（[`write_snapshot_under_gate`]）；
+/// （结果本身走 `submit` / `drain_results` 的通道，不在这里囤，所以不设失败队列：
+/// 一条回报该不该算数，只看同工程的 `applied` 与它自己的结局。）
 ///
-/// 只在**短暂持锁**的路径上用：领序号、标水位、收结果。真正的 sqlite 写不在这把锁里。
+/// `applied` 按**工程**分开记而不是记一个全局水位：全局水位会让「B 工程的新写」
+/// 把「A 工程还没落地的最新快照」也一起吞掉，那是最难排查的一种丢写。
 #[derive(Debug)]
 struct BackgroundWriteTracker {
-    /// 下一个要发放的写序号。从 **1** 开始：`sync_watermark` 的 0 专门表示
-    /// 「还从未有过同步落库」，于是「水位 >= 待发序号」这条判据只在真发生过
-    /// 更新的同步写时才成立（不能从 0 起，否则第一次派发就会被这条判据吞掉）。
+    /// 下一个要发放的写序号。从 **1** 开始：0 专门表示「还没写过」，
+    /// 于是「水位 >= 待发序号」这条判据不会被第一次派发误命中。
     next_seq: AtomicU64,
-    /// 已完成的同步写的最大序号（0 = 还没写过）。
-    sync_watermark: AtomicU64,
-    /// 已有结论的最大写序号。
-    completed_floor: AtomicU64,
+    /// 每个工程已经真正落库的最大写序号（`tasks.id` → seq）。
+    ///
+    /// 只在写入闸里读写，所以用普通 `Mutex` 而不是原子类型；条目数 = 本次运行
+    /// 写过库的工程数，量级很小，不需要清理。
+    applied: Mutex<HashMap<i64, u64>>,
 }
 
 impl Default for BackgroundWriteTracker {
     fn default() -> Self {
         Self {
-            // 见字段注释：序号从 1 起，0 是「还没有任何写」的水位哨兵。
+            // 见字段注释：序号从 1 起，0 是「还没写过」的哨兵。
             next_seq: AtomicU64::new(1),
-            sync_watermark: AtomicU64::new(0),
-            completed_floor: AtomicU64::new(0),
+            applied: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl BackgroundWriteTracker {
+    /// 某个工程已落库的最大写序号（0 = 还没写过）。
+    fn applied_seq(&self, task_id: i64) -> u64 {
+        self.applied
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&task_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 记下一次**真正落库**的写。只增不减：并发下后到的更小序号绝不能把水位拉回去，
+    /// 否则防回退就白做了。
+    fn note_applied(&self, task_id: i64, seq: u64) {
+        let mut applied = self.applied.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = applied.entry(task_id).or_insert(0);
+        if *entry < seq {
+            *entry = seq;
         }
     }
 }
@@ -565,10 +589,15 @@ impl Default for BackgroundWriteTracker {
 /// # 同一 task_id 的写入为什么能按序号顺序落地
 ///
 /// 两道闸：
-/// 1. **发放侧串行**：派发时 `writer` 这把锁把「检查水位 -> 取任务 id -> 起写线程」
+/// 1. **发放侧串行**：派发时 `writer` 这把锁把「查同工程水位 -> 领写序号 -> 起写线程」
 ///    做成对同步写与其它派发原子的临界区；
-/// 2. **写入侧串行**：每个后台线程拿到快照后**先取同一把锁再写库**（`write_guard`），
-///    所以任意两个写（后台之间、后台与同步之间）不会交错。
+/// 2. **写入侧串行 + 按序号收口**：每个后台线程拿到快照后**先取同一把锁再写库**
+///    （`write_guard`），同步写同样持锁写完；锁里同时完成「查同工程水位 -> 写 -> 记水位」
+///    （[`write_snapshot_under_gate`]）。
+///
+/// 只靠「串行」是不够的：普通 `Mutex` 不保证先到先得，两个线程谁先拿到锁由调度决定，
+/// 更晚派发（更新）的快照完全可能先写、再被更旧的快照盖掉。加上按工程的水位之后，
+/// **更新的写一旦落库，更旧的写在锁里就会看到水位比自己新而直接放弃**——不依赖运气。
 ///
 /// 再加上 `Database` 内部那条连接锁，写入本身也已经串行——这里额外加锁是为了**顺序**：
 /// 光靠连接锁只能保证不交错，不保证先后。
@@ -577,7 +606,8 @@ impl Default for BackgroundWriteTracker {
 ///
 /// 去抖路径停手 1.2s 才派发一次，而一次写只要 10~30ms，正常情况永远只有一个任务在飞。
 /// 满负荷下（磁盘卡住 + 用户狂停手）最多也只是每 1.2s 多一个线程，线程写完即退，不占
-/// 常驻资源；`in_flight_writes` 用于把这个量暴露给诊断与测试。
+/// 常驻资源；`in_flight_writes` 是「已派发还没收尾」的诊断计数器（派发时 +1、
+/// 写线程退出时 -1），真正的等待判据是 `segments_write_pending`。
 #[derive(Debug)]
 struct BackgroundWrites {
     writer: Mutex<()>,
@@ -600,25 +630,30 @@ impl Default for BackgroundWrites {
     }
 }
 
-/// 后台写入期间记录「还有几个快照在飞」。
+/// 「这一份后台写还没收尾」的凭证：**派发侧**领序号时 +1，任务收尾时 -1。
+///
+/// # 为什么 +1 在派发侧，而不是线程体里
+///
+/// 线程体里 +1 的写法有一个致命窗口：从派发返回到线程真正开跑之间，`pending` 还是 0。
+/// 同步落库（关窗 / 换工程 / 导出）等的就是它——被这个窗口骗到就会「以为没有在飞的写」
+/// 直接往下写，随后那条更旧的后台快照才落地，把新内容盖回去（旧快照的写序号比水位旧，
+/// 本该被拦住）。计数点放在派发侧之后，`pending == 0` 才真的等于
+/// 「没有已派发未收尾的写」。
 ///
 /// 计数在**结果投递成功之后**才归零（`disarm`），所以 `pending == 0` 的含义是
-/// 「结果已经在通道里」——同步落库靠这个等待，弱化成「线程已 spawn」就会等成早了。
-/// 剩下那些「没走到投递」的结局（提前放弃、panic、发送失败）由 `Drop` 兜底 -1，
-/// 免得每个 return 分支都得记得递减（漏一处，计数就永远回不了零）。
-struct WriteInFlight(Arc<AtomicUsize>);
+/// 「结果已经在通道里」。剩下那些「没走到投递」的结局（提前放弃、panic、发送失败）
+/// 由 `Drop` 兜底 -1，免得每个 return 分支都得记得递减（漏一处，计数就永远回不了零）。
+///
+/// 派发失败（线程都起不来）时没有线程来持有这份凭证，由派发侧自己 -1——见
+/// `dispatch_segment_write` 的失败分支。
+struct InFlightGuard(Arc<AtomicUsize>);
 
-impl WriteInFlight {
-    fn new(counter: Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
-        Self(counter)
-    }
-
+impl InFlightGuard {
     /// 结果已经交给通道：可以安全地报告「这一份不在飞了」。
     fn disarm(self) {}
 }
 
-impl Drop for WriteInFlight {
+impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
@@ -635,43 +670,31 @@ impl BackgroundWrites {
         self.writer.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 排空后台结果通道：只留「必须回到界面」的那些回报。
+    /// 排空后台结果通道：只留「还没有结论」的那些回报。
     ///
     /// # 这里丢掉的是什么（防回退的一部分）
     ///
-    /// - `error_at_dispatch` 与**本轮排空之前**的 `db_write_error` 不一致：派发之后提示条被
-    ///   别的写库改动过（用户另一次操作失败 / 成功），本次结局不再代表当前状态，不能拿它回写。
-    ///   这一条必须在**排水位之前**判：成功回报也要参与「把提示条清空」的竞价。
+    /// `seq` 已被 `completed_floor` 越过：更晚的写入（比如一次同步落库）已经有结论，
+    /// 这条迟到的回报描述的是一个**已经被覆盖**的快照，再挂提示只会让用户以为
+    /// 「刚存好的东西又坏了」。留日志即可。
     ///
-    ///   注意比较对象是 `pre_drain_error`（调用方在调用本方法**之前**取的一份快照），
-    ///   不是「处理到一半时的 `db_write_error`」：同一轮里可能同时收到一条失败与一条成功
-    ///   （比如先写的失败、后写的成功在轮询窗口里一起到达），若拿已被前一条改过的字段去
-    ///   比后一条的派发快照，后一条会被误判成「别人改过」而整条丢掉——用户看到的就是
-    ///   「明明写成功了，提示条还挂着失败」。
-    /// - `seq` 已被 `completed_floor` 越过：更晚的写入（比如一次同步落库）已经有结论，这条
-    ///   迟到的失败描述的是一个**已经被覆盖**的快照，再挂提示只会让用户以为「刚存好的东西
-    ///   又坏了」。留日志即可。
+    /// 提示条的竞价（`error_at_dispatch` 与排空前快照不一致就整条不回写）**不在这里做**，
+    /// 而是留给 [`drain_segment_writes`]：那里除了提示条，还要处理「这条失败描述的内容
+    /// 到底还该不该重试」。判定只留一处，免得两处漂移成两个答案。
     ///
     /// 与 `lock_writer` 同策略容忍中毒：`results` 里装的是一次性判定用的值，没有半截状态；
     /// 而这里一旦 panic，界面就再也收不到写库失败的提示（错误被静默）。
-    fn drain_results(&self, pre_drain_error: Option<&str>) -> Vec<SegmentWriteDone> {
-        let floor = self.tracker.completed_floor.load(Ordering::SeqCst);
+    fn drain_results(&self) -> Vec<SegmentWriteDone> {
         let receiver = self.results.lock().unwrap_or_else(|e| e.into_inner());
         let mut kept = Vec::new();
         for done in receiver.try_iter() {
-            if done.error_at_dispatch.as_deref() != pre_drain_error {
-                tracing::debug!(
-                    seq = done.seq,
-                    "派发之后提示条已被别的写库改动过，丢弃这条后台写回报"
-                );
-                continue;
-            }
-            if done.seq <= floor {
+            if self.tracker.applied_seq(done.task_id) > done.seq {
                 if let Err(err) = &done.result {
                     tracing::debug!(
                         seq = done.seq,
+                        task_id = done.task_id,
                         error = %err,
-                        "已被更新的写入越过，丢弃过期的后台写失败"
+                        "同工程已有更新的写落库，丢弃过期的后台写失败"
                     );
                 }
                 continue;
@@ -2317,32 +2340,20 @@ impl AppState {
     /// 登记待落库时（`defer_segments_flush`：高频编辑也会顺手把结果收掉，
     /// 失败提示因此最迟在下一次交互就出现，不必等 1.2s 的定时器）。
     pub fn poll_background_writes(&mut self) {
-        // 快照必须在排空之前取：`drain_results` 用它与每条回报的「派发时提示条」比对，
-        // 判定这条回报是否已经被别的写库改动过（见该方法文档）。
+        // 快照必须在排空之前取：`drain_segment_writes` 用它与每条回报的「派发时提示条」
+        // 比对，判定这条回报是否已经被别的写库改动过（见该方法文档）。
         let pre_drain_error = self.db_write_error.clone();
-        let done = self
-            .segments_writes
-            .drain_results(pre_drain_error.as_deref());
+        let done = self.segments_writes.drain_results();
         if done.is_empty() {
             return;
         }
-        let completed_floor = self
-            .segments_writes
-            .tracker
-            .completed_floor
-            .load(Ordering::SeqCst);
-        let floor = drain_segment_writes(
+        drain_segment_writes(
             &mut self.db_write_error,
             &mut self.segments_dirty,
             self.segments_revision,
-            completed_floor,
             pre_drain_error.as_deref(),
             &done,
         );
-        self.segments_writes
-            .tracker
-            .completed_floor
-            .fetch_max(floor, Ordering::SeqCst);
     }
 
     /// 是否还有后台字幕写在飞（诊断 / 测试用；关窗守卫看的是 `segments_dirty`）。
@@ -2412,41 +2423,51 @@ impl AppState {
         }
     }
 
-    /// 把一份字幕快照交给后台写线程；返回「是否真的派出去了」。
+    /// 把一份字幕快照交给后台写线程；返回「是否已经保存了这份内容」。
     ///
-    /// # 防回退：派发前先领序号并检查同步水位
+    /// # 防回退：派发前先按**同工程水位**检查
     ///
-    /// 领序号与查水位都在 `db_write_writer` 锁里完成，和**同步**落库（也持有这把锁）
-    /// 是互斥的，于是两种派发顺序都自洽：
+    /// 查水位、领序号都在 `db_write_writer` 锁里完成，和同步落库（也持有这把锁）
+    /// 是互斥的，于是各种顺序都自洽：
     ///
-    /// - 同步写先完成（水位被推高）：本任务序号更旧，直接不派发——它带的快照是
-    ///   同步写之前取下的，写进去就是**回退**；
-    /// - 本任务先派发：序号比水位新，正常入队（后台线程写库前会再查一次水位，
-    ///   挡住「排队等锁期间同步写插进来」那种情形）。
+    /// - 同步写先完成（水位被推高）：本快照的序号比水位旧，直接不派发——它写进去
+    ///   就是**回退**，而库里已经有更新的版本；
+    /// - 本快照先派发：序号比水位新，正常入队（后台线程写库前会再查一次水位，
+    ///   挡住「排队等闸期间同步写 / 更新的后台写插进来」那种情形，见
+    ///   [`write_snapshot_under_gate`]）。
     ///
-    /// 派发失败（线程起不来 / 通道断了）不静默：挂提示条并把脏标记放回，
-    /// 下一次去抖（或关窗守卫的同步落库）会重试。
+    /// 派发失败（线程起不来）不静默：退回**过闸的同步写**，写不进去才挂提示条并把
+    /// 脏标记放回，下一次去抖（或关窗守卫的同步落库）会重试。
     fn dispatch_segment_write(&mut self, snapshot: SegmentWriteSnapshot) -> bool {
         let writes = Arc::clone(&self.segments_writes);
+        // 派发侧与写线程各持一份：`pending` 归派发侧记账（见 `InFlightGuard`），
+        // `worker_pending` 交给线程在收尾时 -1。失败分支没有线程，还得自己还回去。
         let pending = Arc::clone(&self.segments_write_pending);
+        let worker_pending = Arc::clone(&self.segments_write_pending);
         // 写线程自己再拿一份 `Arc`：`writes` 会被 move 进闭包，派发侧的失败分支还要用。
         let worker_writes = Arc::clone(&self.segments_writes);
         let db = self.db.clone();
+        // 快照会被 move 进闭包，失败分支只剩「当前渲染线程上的内容」可写；
+        // 把主键先抄出来，兜底分支同样要按工程记水位。
+        let task_id = snapshot.task_id;
         let seq = {
             let _guard = writes.lock_writer();
-            let watermark = writes.tracker.sync_watermark.load(Ordering::SeqCst);
             let next = writes.tracker.next_seq.load(Ordering::SeqCst);
-            if watermark >= next {
-                // 同步写已经写过更新的快照：这份快照写进去就是回退。直接算「已保存」——
-                // 它的内容本来就来自水位之前的状态，库里已经有更新的版本了。
-                tracing::debug!(
-                    task_id = snapshot.task_id,
-                    "同步落库已经写过更新的快照，放弃派发这次后台写"
-                );
+            if writes.tracker.applied_seq(task_id) >= next {
+                // 同一工程已经有更新的内容落库：这份快照写进去就是回退。直接算
+                // 「已保存」——它描述的内容本来就来自水位之前的状态。
+                //
+                // 老实说：在「领号只在渲染线程、且严格单调」的现状下这条判据**不会**
+                // 触发（水位一定小于下一个待发号）。留着它是因为它是「同工程不许回退」
+                // 这条规则的完整表述：以后若有人再加一条派发路径，这里就是派发侧唯一
+                // 的拦截点；真正兜底的是落库时的 `write_snapshot_under_gate`。
+                tracing::debug!(task_id, "同工程已有更新的写落库，放弃派发这次后台写");
                 return true;
             }
-            let seq = writes.tracker.next_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let seq = writes.tracker.next_seq.fetch_add(1, Ordering::SeqCst);
             writes.in_flight_writes.fetch_add(1, Ordering::SeqCst);
+            // 「在飞」从**派发**这一刻算起：线程还没开跑时结算方也不能漏掉它。
+            pending.fetch_add(1, Ordering::SeqCst);
             seq
         };
         let done = SegmentWriteDone {
@@ -2459,60 +2480,73 @@ impl AppState {
         let spawn = std::thread::Builder::new()
             .name("voice2word-segments-write".to_string())
             .spawn(move || {
-                // 计数器在闭包退出时自动 -1（`WriteInFlight` 的 Drop）：
+                // 计数器在闭包退出时自动 -1（`InFlightGuard` 的 Drop）：
                 // 正常返回 / 提前放弃 / panic 三种结局都不会把它挂住。
-                let in_flight = WriteInFlight::new(pending);
+                let in_flight = InFlightGuard(worker_pending);
                 let write_guard = worker_writes.lock_writer();
-                if worker_writes.tracker.sync_watermark.load(Ordering::SeqCst) >= seq {
-                    // 同步写（关窗 / 换工程 / 导出 / 翻译收尾）已经写过**更新**的快照：
-                    // 本次不写（写进去就是回退），但这不是失败——把结局报成成功，
-                    // 否则界面会把一份已经写完的最新内容重新标脏、再派发一轮。
-                    tracing::debug!(seq, "同步落库已越过这份快照，后台放弃写入");
-                    let _ = worker_writes.submit.send(SegmentWriteDone {
-                        result: Ok(()),
-                        ..done
-                    });
-                    in_flight.disarm();
-                    return;
-                }
-                // 真正的 sqlite 写：序列化 + UPDATE 都在这条后台路径上，渲染线程不等它。
-                let result =
-                    Self::write_segments_to_db(&db, snapshot).map_err(|err| err.to_string());
+                // 持闸写库：闸里一次完成「查同工程水位 -> 写 -> 记水位」，
+                // 因此不可能出现「更旧的快照在更新的内容之后落地」这种回退。
+                let result = write_snapshot_under_gate(&worker_writes, &db, &snapshot, seq)
+                    .map(|_| ())
+                    .map_err(|err| err.to_string());
                 drop(write_guard);
-                if worker_writes
+                let sent = worker_writes
                     .submit
                     .send(SegmentWriteDone { result, ..done })
-                    .is_ok()
-                {
+                    .is_ok();
+                // 诊断计数器（在飞快照数）这次写已经结束，无论结果有没有送出去都 -1：
+                // 它只用于观测，不能像 `pending` 那样把「结果已进通道」当成归零条件
+                // ——那会让它随着使用时长单调上涨，变成一个骗人的数。
+                worker_writes
+                    .in_flight_writes
+                    .fetch_sub(1, Ordering::SeqCst);
+                if sent {
                     // 结果已进通道：这一份可以算「不在飞」了（同步落库等的是它落地）。
                     in_flight.disarm();
                 }
             });
         match spawn {
             Ok(_handle) => true,
-            Err(err) => {
-                // 线程都没起来：退回同步写（旧路径），失败同样记成可见提示。
-                tracing::warn!(error = %err, "后台写线程启动失败，改为同步写库");
+            Err(spawn_err) => {
+                // 线程都没起来：退回同步写（写的是渲染线程上这份最新内容）。
+                // 退路也必须过闸、也要记水位——否则这次「成功」在账本上不存在，
+                // 更旧的在飞快照醒来后照样能把新内容盖回去。
+                tracing::warn!(error = %spawn_err, "后台写线程启动失败，改为同步写库");
+                // 没有线程来收尾：派发时记的那两个「在飞」计数都由这里还回去，
+                // 否则关窗守卫会一直以为有一份写没落地。
+                pending.fetch_sub(1, Ordering::SeqCst);
                 writes.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
-                let _ = self.sync_segments_to_db();
-                self.segments_dirty = true;
-                self.record_db_write_error(format!("字幕保存失败（后台写线程启动失败）：{err}"));
-                false
+                let fallback = {
+                    let _guard = writes.lock_writer();
+                    if writes.tracker.applied_seq(task_id) >= seq {
+                        Ok(())
+                    } else {
+                        match self.sync_segments_to_db() {
+                            Ok(()) => {
+                                writes.tracker.note_applied(task_id, seq);
+                                writes
+                                    .tracker
+                                    .completed_floor
+                                    .fetch_max(seq, Ordering::SeqCst);
+                                Ok(())
+                            }
+                            Err(err) => Err(err),
+                        }
+                    }
+                };
+                match fallback {
+                    // 兜底已经写进去了：脏标记交给调用方按「已保存」清掉，不再谎报失败。
+                    Ok(()) => true,
+                    Err(err) => {
+                        self.segments_dirty = true;
+                        self.record_db_write_error(format!(
+                            "字幕保存失败：{err}（后台写线程启动失败：{spawn_err}）"
+                        ));
+                        false
+                    }
+                }
             }
         }
-    }
-
-    /// 后台线程写库的落地调用（这一段就是被挪出渲染线程的 sqlite 写）。
-    ///
-    /// 只用 `Database` 已有的入口：`update_task_segments_json` 接收已经序列化好的
-    /// `segments_json`，自己解析一次算派生列（样例文本 / 句数 / 有无译文）并刷新 `duration`，
-    /// 本次不允许改 db.rs，所以这里不重复造轮子。后台线程因此不需要 `Vec<Segment>` 的所有权，
-    /// 快照可以是纯 String。
-    ///
-    /// 只拿到 `Database`（内部是 `Arc<Mutex<Connection>>`，天生可跨线程）与一个纯值快照、
-    /// 拿不到 `AppState`，所以这必须是**关联函数**而不是 `&self` 方法。
-    fn write_segments_to_db(db: &Database, snapshot: SegmentWriteSnapshot) -> anyhow::Result<()> {
-        db.update_task_segments_json(snapshot.task_id, &snapshot.json)
     }
 
     /// 将编辑产生的脏字幕落库（同步；幂等，未脏时零开销）
@@ -2525,14 +2559,21 @@ impl AppState {
     ///
     /// 调用点要的是「**返回时数据已经在库里**」。后台路径（去抖）只负责派发，返回时写
     /// 可能还在飞——所以这里先等它们落地（上限 `SEGMENTS_SYNC_FLUSH_WAIT`），再自己写
-    /// 当前快照。等待超时不会丢东西：还在飞的旧快照写完就写完了，本次的同步写是更新的
-    /// 内容，它一定是最后落地的（两者共用同一把写入闸，见 `BackgroundWrites`）。
+    /// 当前快照。
+    ///
+    /// 等待超时也**不会丢写、不会回退**：本次写和后台写共用同一把写入闸，且都按
+    /// **同工程水位**收口（见 [`Self::sync_segments_gated`] 与 [`write_snapshot_under_gate`]）。
+    /// 超时只决定「什么时候拿到闸」，不决定最终库里是谁的内容——拿到闸更晚的那一份
+    /// 一定更新，更旧的快照醒来后会看到水位比自己新而直接放弃。
     ///
     /// 顺手作废「待落库」登记：登记留着的话，定时器稍后还会把同一份（或更旧的）内容再写一遍。
     pub fn flush_segments_if_dirty(&mut self) {
         // 先把后台的回报收进 `db_write_error`：另一条入口只是定时器去抖，界面上就指望
         // 这里把「后台写失败」变成可见提示。不收的话一次失败要等到下一次交互才显示。
         self.poll_background_writes();
+        // 等待是**优化**，不是顺序保证：计数从派发那一刻算起（见 `InFlightGuard`），
+        // 所以这里等的是「已派发还没收尾」的写；即便超过上限不再等，最终顺序仍由
+        // 写入闸 + 同工程水位决定（旧快照醒来会看到水位比自己新而放弃）。
         let pending = Arc::clone(&self.segments_write_pending);
         if pending.load(Ordering::SeqCst) > 0 {
             let deadline = std::time::Instant::now() + SEGMENTS_SYNC_FLUSH_WAIT;
@@ -2541,7 +2582,10 @@ impl AppState {
             }
             let still = pending.load(Ordering::SeqCst);
             if still > 0 {
-                tracing::warn!(pending = still, "后台字幕写未在期限内收尾，同步落库先行");
+                tracing::warn!(
+                    pending = still,
+                    "后台字幕写未在期限内收尾，同步落库不再等它（写入闸会保证落地顺序）"
+                );
             }
         }
         self.segments_flush_due = None;
@@ -2549,7 +2593,12 @@ impl AppState {
             self.segments_dirty = false;
             // 写库失败不能静默：用户以为改动已保存，重启后却发现全丢了。
             // 记进 `db_write_error`，界面把它渲染成可见的提示条。
-            match self.sync_segments_to_db() {
+            let result = match self.active_task_id {
+                Some(task_id) => self.sync_segments_gated(task_id),
+                // 没有主键（尚未落库）：没有可写回的行，等同已保存。
+                None => Ok(()),
+            };
+            match result {
                 Ok(()) => self.db_write_error = None,
                 Err(err) => {
                     tracing::warn!(error = %err, "字幕写库失败，改动尚未持久化");
@@ -2562,6 +2611,31 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// 同步落库的「过闸」版本：领号 -> 写 -> 记水位，全程持有写入闸。
+    ///
+    /// 为什么必须持闸写完：后台写线程也是在持闸期间写库的（见 `dispatch_segment_write`
+    /// 里的 worker）。两者合起来让「谁更晚拿到闸」成为唯一顺序；配合同工程水位
+    /// （[`BackgroundWriteTracker::applied`]），任意交错下库里留下的都是序号最大的那份，
+    /// 不会出现「更旧的快照后落地」把新内容盖掉。
+    fn sync_segments_gated(&self, task_id: i64) -> anyhow::Result<()> {
+        let writes = &self.segments_writes;
+        let _guard = writes.lock_writer();
+        let seq = writes.tracker.next_seq.fetch_add(1, Ordering::SeqCst);
+        if writes.tracker.applied_seq(task_id) >= seq {
+            // 同一工程已经有更新的写落库（理论上到不了：同步写总是领最新的号），
+            // 本次要写的内容反而更旧，放弃——算成功，绝不拿旧内容回退。
+            tracing::debug!(task_id, seq, "同工程已有更新的写落库，放弃这次同步写");
+            return Ok(());
+        }
+        // 写的是 `self.segments`（渲染线程上这份最新内容），与快照路径同源。
+        self.sync_segments_to_db()?;
+        // 记水位就够了：同工程里更早派发的回报会在 `drain_results` 看到
+        // `applied > seq` 而被当成过期结论丢掉——用户刚存好的东西不该被一条
+        // 迟到的旧失败说成「又坏了」。
+        writes.tracker.note_applied(task_id, seq);
+        Ok(())
     }
 
     /// 登记「稍后落库」：高频交互节点用它代替立刻写库（见 [`SEGMENTS_FLUSH_IDLE`]）。
@@ -2588,27 +2662,45 @@ impl AppState {
     /// 需要「写完才继续」的调用点走的是同步版 [`Self::flush_segments_if_dirty`]。
     ///
     /// 写失败时后台回报会在 `poll_background_writes` 里把 `segments_dirty` 置回
-    /// （提示条同时挂上 `db_write_error`），这里再登记一次，于是定时器下一个窗口会重试
-    /// ——写库失败有提示条，但不该要求用户再点一下才重试。
+    /// （提示条同时挂上 `db_write_error`）。
+    ///
+    /// # 失败**不会**被这条定时器自动重试（现状，别被旧注释骗了）
+    ///
+    /// 派发之后登记位已经被本函数清掉，而这里只有「这次没派发出去（序列化失败）」
+    /// 才会重新登记——后台线程写失败**不会**重新登记。也就是说：一份内容写库失败后，
+    /// 下一次重试发生在**用户下一次编辑**（`defer_segments_flush` 会重新登记）或
+    /// 下一次同步落库（关窗守卫 / 换工程 / 导出）时。这是刻意的取舍：自动重试要
+    /// 每秒重试一次，而提示条是按「；」追加的，持久性故障（磁盘满 / 库被外部进程锁住）
+    /// 会把提示条刷成几百条重复文案，还会让渲染线程每分钟白付几十次整份序列化。
+    /// 关窗守卫仍然拦着「脏着退出」，所以失败不会静默地丢数据。
     pub fn flush_segments_if_due(&mut self) -> bool {
         self.flush_segments_if_due_at(std::time::Instant::now())
     }
 
     /// [`Self::flush_segments_if_due`] 的可注入时钟版本（单测直接给时刻，不睡真实时间）。
+    ///
+    /// 返回值除了「这次真的派发了一次写」，还包括「后台回报刚刚改动了要显示的字段」
+    /// （提示条 / 脏标记）：调用方（界面定时器）只按这个返回值决定要不要重绘，
+    /// 而失败提示正是在这里被收进来的——不把这种变化报出去，用户不碰鼠标就看不到
+    /// 「保存失败」的提示（状态早就更新了，界面却一直没重画）。
     pub fn flush_segments_if_due_at(&mut self, now: std::time::Instant) -> bool {
+        let error_before_poll = self.db_write_error.clone();
+        let dirty_before_poll = self.segments_dirty;
         // 到点与否都得先把后台回报收掉：否则失败置回的脏标记要等到下一个窗口才看得到，
         // 而那个窗口又可能因为「还没到点」直接返回，白拖一轮。
         self.poll_background_writes();
+        let poll_changed_ui =
+            self.db_write_error != error_before_poll || self.segments_dirty != dirty_before_poll;
         let Some(due) = self.segments_flush_due else {
-            return false;
+            return poll_changed_ui;
         };
         if now.saturating_duration_since(due) < SEGMENTS_FLUSH_IDLE {
-            return false;
+            return poll_changed_ui;
         }
         if !self.segments_dirty {
             // 期间已经被别的路（换工程 / 关窗 / 导出 / 后台写已完成）写过：登记作废，别一直挂着。
             self.segments_flush_due = None;
-            return false;
+            return poll_changed_ui;
         }
         self.flush_segments_if_dirty_async();
         if self.segments_dirty {
@@ -3279,6 +3371,45 @@ fn merge_concat_translations(
     }
 }
 
+/// 在**已持有写入闸**的前提下把一份快照写进库（防回退的最后一道）。
+///
+/// 只用 `Database` 已有的入口：`update_task_segments_json` 接收已经序列化好的
+/// `segments_json`，自己解析一次算派生列（样例文本 / 句数 / 有无译文）并刷新 `duration`，
+/// 所以这里不重复造轮子。后台线程因此不需要 `Vec<Segment>` 的所有权，快照可以是纯 String。
+///
+/// 本函数只拿到 `Database`（内部是 `Arc<Mutex<Connection>>`，天生可跨线程）与一个纯值快照，
+/// 拿不到 `AppState`；调用方负责持闸，因此它同时被后台写线程与同步落库复用。
+///
+/// 顺序判定只用一个事实：`applied`（每个工程已经真正落库的最大写序号）。
+/// 闸里先查后写，所以「查」与「写」之间不可能插进另一份写：
+///
+/// - `applied[task] >= seq`：同一工程已经有更新的快照落库，本次写进去就是**回退**，
+///   直接放弃并返回 `false`。返回成功而不是错误：库里确实有更新的内容，
+///   报错只会让界面把一份已经写完的最新内容重新标脏、再派发一轮；
+/// - 否则真写，并在**写成功之后**把水位推到自己：失败时水位不动，后面那份更新的
+///   快照照样会写。
+///
+/// 调用方必须持有 `BackgroundWrites::lock_writer()`（本函数要用这把锁保证
+/// 「查水位 + 写 + 记水位」是一个原子段）。
+fn write_snapshot_under_gate(
+    writes: &BackgroundWrites,
+    db: &Database,
+    snapshot: &SegmentWriteSnapshot,
+    seq: u64,
+) -> anyhow::Result<bool> {
+    if writes.tracker.applied_seq(snapshot.task_id) >= seq {
+        tracing::debug!(
+            task_id = snapshot.task_id,
+            seq,
+            "同工程已有更新的写落库，放弃这次写入"
+        );
+        return Ok(false);
+    }
+    db.update_task_segments_json(snapshot.task_id, &snapshot.json)?;
+    writes.tracker.note_applied(snapshot.task_id, seq);
+    Ok(true)
+}
+
 /// 把后台写线程的回报并进 UI 状态（**纯函数**，只在渲染线程上跑，便于单测钉死判定）。
 ///
 /// # 判定规则（防回退的核心）
@@ -3290,10 +3421,10 @@ fn merge_concat_translations(
 ///    纯函数自己就是完整的，单测不必构造排水位的现场）；
 /// 2. `pre_drain_error`（**本轮排空之前**的 `db_write_error`；调用方在调用前取快照）
 ///    与这条回报的「派发时提示条」一致——否则说明后台写这段时间里用户别的落库也
-///    失败 / 成功过，那是**更新**的事实，不能被这次结局回写。用调用方给的快照而不是
-///    `db_write_error` 的当前值：同一轮里可能同时收到失败与成功两条，若拿已被前一条
-///    改过的字段去比后一条的派发快照，后一条会被误判成「别人改过」整条丢掉；
-/// 2. 这份快照仍然是当前内容（`revision` 没变）或者这次写**成功**。旧快照的失败
+///    失败 / 成功过，那是**更新**的事实，不能被这次结局回写提示条。用调用方给的快照
+///    而不是 `db_write_error` 的当前值：同一轮里可能同时收到失败与成功两条，若拿已被
+///    前一条改过的字段去比后一条的派发快照，后一条会被误判成「别人改过」整条丢掉；
+/// 3. 这份快照仍然是当前内容（`revision` 没变）或者这次写**成功**。旧快照的失败
 ///    不再置脏：用户已经又改过，新的内容会自己走一遍落库，置脏只会让定时器把那份
 ///    旧内容再派发一次（而它注定写不进最新状态）。
 ///
@@ -3308,37 +3439,41 @@ fn merge_concat_translations(
 /// 置回，界面会显示「有未保存改动」并要求再写一遍——而库里那一段内容其实已经被
 /// 更新的成功写进去了。这与「旧快照的失败不回写当前状态」是同一条原则。
 ///
-/// 返回参与判定的最大写序号，供调用方推进 `completed_floor`。
+/// # 提示条竞价输了的失败：提示条不动，但脏标记必须补上
+///
+/// 第 2 条只否定「提示条该不该回写」，不该顺手否定「这份内容还没落库」这个事实。
+/// 一条落在**当前修订**上的失败如果既不挂提示、也不置脏，用户就永远看不到它、也不会
+/// 有任何一条路径去重试——用户改的东西一直躺在内存里，等到关窗时的同步落库来救。
+/// 所以竞价输了的失败仍然按修订号补脏（只补脏，不碰提示条）。
+///
+/// 「同工程已经有更新的写落库」这种过期回报由调用方（`drain_results`）先筛掉；本函数
+/// 只判「这条回报该不该回写界面状态」，因此不需要再去比一个全局水位。
 fn drain_segment_writes(
     db_write_error: &mut Option<String>,
     segments_dirty: &mut bool,
     current_revision: u64,
-    completed_floor: u64,
     pre_drain_error: Option<&str>,
     done: &[SegmentWriteDone],
-) -> u64 {
-    let floor = done
-        .iter()
-        .map(|write| write.seq)
-        .max()
-        .unwrap_or(0)
-        .max(completed_floor);
+) {
+    // 「本批里每个工程最新的一条」：脏标记只在**同工程**没有更新的结论时才补。
+    // 写序号是跨工程共用的，但两个工程的内容互不覆盖——拿 A 的新序号去压 B 的失败，
+    // 会让 B 的失败既不提示也不重试，而 B 的当前修订其实还没落库。
+    let mut newest_by_task: HashMap<i64, u64> = HashMap::new();
     for write in done {
-        if write.seq <= completed_floor {
-            // 更晚的写入已经有结论了：这条描述的快照**已经被覆盖**，再挂结果只会回退。
-            // （`drain_results` 已经按同一条件筛过一轮，这里再判一次让本函数自洽。）
-            tracing::debug!(
-                seq = write.seq,
-                floor = completed_floor,
-                "回报比已完成水位更旧，丢弃"
-            );
-            continue;
-        }
+        let slot = newest_by_task.entry(write.task_id).or_insert(write.seq);
+        *slot = (*slot).max(write.seq);
+    }
+    for write in done {
         if pre_drain_error != write.error_at_dispatch.as_deref() {
-            // 派发之后又发生过别的失败 / 成功：本次结局不再代表当前状态，丢弃。
+            // 派发之后又发生过别的失败 / 成功：**提示条**不能按这条回写（更新的事实
+            // 已经占位）。但失败意味着这份内容确实没落库，脏标记要照修订号补上——
+            // 见函数文档「提示条竞价输了的失败」。
+            if write.result.is_err() {
+                mark_segments_dirty_for_revision(segments_dirty, write.revision, current_revision);
+            }
             tracing::debug!(
                 seq = write.seq,
-                "派发之后提示条已被别的写库改动过，本次后台写结局不再回写"
+                "派发之后提示条已被别的写库改动过，本次后台写结局不再回写提示条"
             );
             continue;
         }
@@ -3347,20 +3482,25 @@ fn drain_segment_writes(
             segments_dirty,
             write,
             current_revision,
-            write.seq == floor,
+            newest_by_task
+                .get(&write.task_id)
+                .is_some_and(|newest| *newest == write.seq),
         );
     }
-    floor
 }
 
 /// 一条后台写结局落到状态上的**唯一入口**（纯函数，供 `poll_background_writes` 与测试复用）。
 ///
 /// `newest`：这条回报是不是同一轮里的最新一条（调用方按 `seq == floor` 判定）。
 ///
-/// # 错误通道永远不静默
+/// # 错误通道不静默（唯一的例外在调用方）
 ///
-/// 失败一定写进 `db_write_error`（与同步版同文案、同「；」拼接规则），界面提示条读的
+/// 失败会写进 `db_write_error`（与同步版同文案、同「；」拼接规则），界面提示条读的
 /// 就是这个字段——后台线程与渲染线程之间没有任何别的错误通路。
+///
+/// 唯一的例外是「提示条竞价输给更新事实」的失败：调用方（[`drain_segment_writes`]）
+/// 不会把它的文案挂上去，但会保留「这份内容还没落库」的脏标记。宁可少一条过期文案，
+/// 也不能没有重试信号。
 ///
 /// # 为什么「置脏」必须看修订号
 ///
@@ -3418,8 +3558,8 @@ fn mark_segments_dirty_for_revision(
 mod tests {
     use super::{
         apply_segment_write_result, drain_segment_writes, mark_segments_dirty_for_revision,
-        AppState, PolishMode, ProcessStatus, SegmentWriteDone, WhisperModelTier,
-        SEGMENTS_FLUSH_IDLE,
+        write_snapshot_under_gate, AppState, BackgroundWrites, PolishMode, ProcessStatus,
+        SegmentWriteDone, SegmentWriteSnapshot, WhisperModelTier, SEGMENTS_FLUSH_IDLE,
     };
     use crate::subtitle::Segment;
 
@@ -5923,5 +6063,248 @@ mod tests {
         assert_eq!(state.fold_duplicate_segments(), 0);
         assert!(!state.can_undo());
         assert_eq!(state.segments.len(), 2);
+    }
+    /// 同工程的写按序号收口：更新的内容落库后，更旧的快照必须被跳过而不是盖回去。
+    ///
+    /// 回归护栏：写入闸只保证「不交错」，普通 `Mutex` 不保证先到先得——没有按工程的
+    /// 水位，两个在飞的写完全可能「新的先写、旧的后写」，库里留下旧内容却没有任何提示。
+    #[test]
+    fn stale_snapshot_is_skipped_after_a_newer_write_landed() {
+        use crate::storage::Database;
+        let db = Database::open(":memory:").expect("内存库应能打开");
+        let id = db
+            .insert_task(
+                "floor.mp4",
+                "floor.mp4",
+                3.0,
+                "completed",
+                &[Segment::new(1, 0.0, 3.0, "新内容")],
+                None,
+            )
+            .expect("先插一条带内容的工程");
+        let writes = BackgroundWrites::default();
+        // 模拟「更新的写已经落库」：同工程水位已经是 7。
+        writes.tracker.note_applied(id, 7);
+
+        let stale = SegmentWriteSnapshot {
+            task_id: id,
+            revision: 3,
+            json: serde_json::to_string(&vec![Segment::new(1, 0.0, 3.0, "旧内容")]).unwrap(),
+        };
+        let guard = writes.lock_writer();
+        let wrote = write_snapshot_under_gate(&writes, &db, &stale, 5).expect("跳过不是失败");
+        drop(guard);
+        assert!(!wrote, "更旧的快照必须被跳过");
+        assert_eq!(
+            db.load_task_segments(id).expect("读回字幕")[0].text,
+            "新内容",
+            "旧内容不许盖掉新内容"
+        );
+
+        // 反例：序号比水位新时照常写入——水位不是「一写就锁死」的开关。
+        let newer = SegmentWriteSnapshot {
+            task_id: id,
+            revision: 4,
+            json: serde_json::to_string(&vec![Segment::new(1, 0.0, 3.0, "更新内容")]).unwrap(),
+        };
+        let guard = writes.lock_writer();
+        let wrote = write_snapshot_under_gate(&writes, &db, &newer, 9).expect("写入应成功");
+        drop(guard);
+        assert!(wrote);
+        assert_eq!(
+            db.load_task_segments(id).expect("读回字幕")[0].text,
+            "更新内容"
+        );
+    }
+
+    /// 同步落库要把「同工程水位」推到自己领的序号上：落后于它的旧回报不许再回写状态。
+    ///
+    /// 回归护栏：水位原先只有「读」没有「写」（全代码库没有一处 store），两条判据永远
+    /// 不成立——同步写完成后，一条迟到的旧失败照样会把「字幕保存失败」挂上提示条，
+    /// 而那份内容其实已经写进库了。
+    #[test]
+    fn sync_flush_advances_floor_and_drops_late_stale_failure() {
+        let mut state = test_state(Vec::new());
+        let id = state
+            .db
+            .insert_task("sync.mp4", "sync.mp4", 2.0, "completed", &[], None)
+            .expect("插一条工程");
+        state.active_task_id = Some(id);
+        state.segments = vec![Segment::new(1, 0.0, 2.0, "最新内容")];
+        state.bump_segments_revision();
+        state.segments_dirty = true;
+
+        state.flush_segments_if_dirty();
+
+        assert_eq!(
+            state
+                .segments_writes
+                .tracker
+                .next_seq
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "第一次写（同步）领到 1 号，下一个待发号是 2"
+        );
+        assert_eq!(
+            state.segments_writes.tracker.applied_seq(id),
+            1,
+            "同步写要按工程记水位"
+        );
+        assert_eq!(
+            state
+                .segments_writes
+                .tracker
+                .completed_floor
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "同步写完成的序号要推进已完成水位"
+        );
+        assert!(state.db_write_error.is_none());
+        assert!(!state.segments_dirty, "同步写完就是干净状态");
+
+        // 一条「派发时间早于这次同步写、结果现在才回来」的失败：它描述的是一份已经被
+        // 同步写覆盖的旧快照，既不许挂提示条，也不许把内容标脏。
+        state
+            .segments_writes
+            .submit
+            .send(SegmentWriteDone {
+                seq: 1,
+                task_id: id,
+                revision: state.segments_revision,
+                error_at_dispatch: None,
+                result: Err("库被锁".to_string()),
+            })
+            .expect("投递回报");
+        state.poll_background_writes();
+        assert!(
+            state.db_write_error.is_none(),
+            "被同步写越过的迟到失败不许挂提示条：{:?}",
+            state.db_write_error
+        );
+        assert!(!state.segments_dirty, "内容已经在库里，不许再标脏");
+    }
+
+    /// 提示条竞价输了的失败：提示条不动，但当前内容必须补上脏标记（否则没有重试）。
+    #[test]
+    fn banner_suppressed_failure_still_marks_current_revision_dirty() {
+        let pre_drain = Some("历史记录保存失败：库被锁".to_string());
+        let mut error = pre_drain.clone();
+        let mut dirty = false;
+        // 派发时提示条是干净的（synthetic_write 的 error_at_dispatch 为 None），
+        // 之后别的落库挂上了更新的事实 → 这条失败失去回写提示条的资格。
+        let failure = synthetic_write(4, 9, Err("磁盘已满".to_string()));
+        let floor = drain_segment_writes(
+            &mut error,
+            &mut dirty,
+            9,
+            0,
+            pre_drain.as_deref(),
+            &[failure],
+        );
+        assert_eq!(floor, 4);
+        assert_eq!(
+            error.as_deref(),
+            Some("历史记录保存失败：库被锁"),
+            "更新的提示条不许被旧失败覆盖"
+        );
+        assert!(
+            dirty,
+            "失败描述的正是当前内容：必须置脏，否则这次失败既不提示也不重试"
+        );
+
+        // 落在旧修订上的同类失败仍然不许置脏（原有边界保持不变）。
+        let pre_drain = Some("别的错误".to_string());
+        let mut error = pre_drain.clone();
+        let mut dirty = false;
+        let stale = synthetic_write(5, 3, Err("磁盘已满".to_string()));
+        drain_segment_writes(&mut error, &mut dirty, 9, 4, pre_drain.as_deref(), &[stale]);
+        assert!(!dirty, "旧修订的失败不许把当前内容标脏");
+        assert_eq!(error.as_deref(), Some("别的错误"));
+    }
+
+    /// 派发前的「同工程水位」判据：已经被更新的写覆盖的快照不再派发，也不算失败。
+    ///
+    /// 「水位 ≥ 待发号」这个输入是**人工构造**的（生产中领号只在渲染线程且单调递增，
+    /// 走不到这条分支）。这里钉的是分支语义本身：以后若把判据改成 `>`、或者把
+    /// 「跳过」改成「报失败 / 照样起线程」，这条测试会立刻红。
+    #[test]
+    fn dispatch_skips_snapshot_already_covered_by_task_floor() {
+        let mut state = test_state(Vec::new());
+        state.active_task_id = Some(42);
+        state.segments = vec![Segment::new(1, 0.0, 1.0, "内容")];
+        state.segments_dirty = true;
+        let next = state
+            .segments_writes
+            .tracker
+            .next_seq
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(next, 1, "写序号从 1 开始（0 是「还没写过」的哨兵）");
+        // 模拟：同工程的同步写（或更新的后台写）已经完成，水位 = 下一个待发号。
+        state.segments_writes.tracker.note_applied(42, next);
+        let snapshot = state.segments_write_snapshot().expect("有主键就有快照");
+        assert!(
+            state.dispatch_segment_write(snapshot),
+            "被更新的写覆盖时必须按「已保存」处理，不能报失败"
+        );
+        assert_eq!(
+            state.background_segments_write_pending(),
+            0,
+            "跳过的派发不许起线程"
+        );
+        assert_eq!(
+            state
+                .segments_writes
+                .tracker
+                .next_seq
+                .load(std::sync::atomic::Ordering::SeqCst),
+            next,
+            "跳过的派发不领号（否则水位相对序号就错位了）"
+        );
+    }
+    /// 诊断计数器（在飞快照数）必须有去有回：只加不减会让它随使用时长单调上涨，
+    /// 变成一个骗人的数（旧实现只在「线程起不来」那条路上减过一次）。
+    #[test]
+    fn in_flight_write_gauge_returns_to_zero_after_completion() {
+        let mut state = test_state(Vec::new());
+        let id = state
+            .db
+            .insert_task("gauge.mp4", "gauge.mp4", 1.0, "completed", &[], None)
+            .expect("插一条工程");
+        state.active_task_id = Some(id);
+        state.segments = vec![Segment::new(1, 0.0, 1.0, "内容")];
+        state.bump_segments_revision();
+        state.segments_dirty = true;
+        state.flush_segments_if_dirty_async();
+
+        // 派发那一刻就要能看到「有一份在飞」——这正是旧实现的坑：计数跑到线程体里，
+        // 派发返回到线程开跑之间它是 0，同步落库会以为自己可以走了。
+        assert!(
+            state.background_segments_write_pending() >= 1,
+            "派发之后「在飞」计数必须立刻可见"
+        );
+
+        // 等「结果真的进通道」（pending 归零）+ 水位落下来，不是瞎睡。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (state.background_segments_write_pending() > 0
+            || state.segments_writes.tracker.applied_seq(id) == 0)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        state.poll_background_writes();
+
+        assert_eq!(
+            state.background_segments_write_pending(),
+            0,
+            "后台写应在期限内收尾"
+        );
+        assert_eq!(
+            state
+                .segments_writes
+                .in_flight_writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "写结束后在飞计数必须归零（只增不减的诊断数字会骗人）"
+        );
     }
 }

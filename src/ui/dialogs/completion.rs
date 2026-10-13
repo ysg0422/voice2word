@@ -113,7 +113,7 @@ impl MainWindow {
                                                 .font_weight(FontWeight::BOLD)
                                                 .text_color(Theme::text_primary())
                                                 .child(format!(
-                                                    "全链路耗时: {:.1} 秒",
+                                                    "全链路耗时：{:.1} 秒",
                                                     m.total_elapsed_sec
                                                 )),
                                         ),
@@ -226,7 +226,6 @@ impl MainWindow {
                                         )
                                         .id("modal-goto-editor-btn")
                                         .px(px(Theme::SPACE_8))
-                                        .rounded(px(Theme::RADIUS_XL))
                                         .font_weight(FontWeight::BOLD)
                                         .on_click(
                                             cx.listener(|this, _, _, cx| {
@@ -246,7 +245,6 @@ impl MainWindow {
                                                 primitives::BtnVariant::Secondary,
                                             )
                                             .id("modal-clear-batch-btn")
-                                            .rounded(px(Theme::RADIUS_XL))
                                             .on_click(
                                                 cx.listener(|this, _, _, cx| {
                                                     this.completion_dialog = None;

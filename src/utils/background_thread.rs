@@ -65,6 +65,22 @@ where
 }
 
 /// 起一条专用线程跑长任务，不要结果（fire-and-forget）。
+///
+/// # 没有全局去重 / 上限（去重归调用方）
+///
+/// 每次调用都真起一条线程；这里只做三件事：登记名字、降优先级、把「起不来 / panic」
+/// 变成对方可见的结局。**不做**「同名任务已在跑就跳过」的合并：返回类型由调用方定义，
+/// 被合并掉的那一次没有一个合理的值可回（强行返回会让「跳过」看起来像失败，
+/// 调用方反而把界面标成错误态）。按目前四个登记项的现状：
+///
+/// - `v2w-preview-proxy`：调用点用 `proxy_busy` 挡住重复点击；
+/// - `v2w-waveform-extract`：调用点用 `waveform_busy_for` 按素材挡住重复；
+/// - `v2w-frame-prefetch`：**任务内部**有单飞（`FrameCache` 的 `prefetch_busy`），
+///   拖动时每提交一帧仍会起一条线程，但后起的那条会立刻退出——代价是线程 churn
+///   （拖动期间量级 = 提交频率），不是并发抽帧；
+/// - `v2w-model-presence-scan`：**目前没有去重**。下载完成 / 删除 / 恢复都会触发，
+///   连点几次就会同时跑几条全文件哈希线程（结果幂等、最后完成的那条生效，
+///   代价是重复读盘）。修法应在调用点加 busy 标志。
 pub(crate) fn spawn_detached_long_task<F>(thread_name: &str, job: F)
 where
     F: FnOnce() + Send + 'static,
@@ -145,6 +161,22 @@ mod tests {
         let (name, value) = rx.blocking_recv().expect("长任务结果应回传");
         assert_eq!(name.as_deref(), Some("v2w-waveform-extract"));
         assert_eq!(value, 42);
+    }
+
+    /// 任务 panic 时结果接收端必须立刻 `Err`，不许把等待方永久挂住。
+    ///
+    /// 依据是所有权而不是超时：闭包持有发送端，解栈时它随闭包一起被丢弃，
+    /// 接收端于是以 `Err(RecvError)` 结束等待。调用点（预览代理 / 波形 / 模型扫描）
+    /// 都是按「线程异常退出」处理的，所以不会卡死在 `rx.await` 上。
+    #[test]
+    fn spawn_long_task_reports_err_instead_of_hanging_when_job_panics() {
+        let rx = spawn_long_task("v2w-preview-proxy", || -> u32 {
+            panic!("模拟任务体内的 panic");
+        });
+        assert!(
+            rx.blocking_recv().is_err(),
+            "panic 必须让等待方拿到 Err，否则调用方会永久挂起"
+        );
     }
 
     /// Windows 上专用线程必须真的降到 BELOW_NORMAL（对界面/转写让路）。

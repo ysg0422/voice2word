@@ -1,4 +1,4 @@
-//! 模型与外部组件管理面板（首次使用引导与模型库）。
+//! 模型与组件管理面板（首次使用引导与模型库）。
 //!
 //! # 架构设计
 //!
@@ -138,20 +138,20 @@ impl MainWindow {
 
         let missing_badge = if missing == 0 {
             primitives::badge_accent(match current_tab {
-                ModelManagerTab::SenseVoice => "SenseVoice 组件已就绪 (推荐引擎)",
-                ModelManagerTab::Whisper => "Whisper 所需组件已就绪",
-                ModelManagerTab::Common => "公用支撑组件已就绪",
+                ModelManagerTab::SenseVoice => "SenseVoice 组件已就位（推荐引擎）",
+                ModelManagerTab::Whisper => "Whisper 所需组件已就位",
+                ModelManagerTab::Common => "公用支撑组件已就位",
             })
         } else if missing == 1 {
             let item = active_missing_items[0];
-            primitives::badge_danger(format!("缺组件: {}", item.label))
+            primitives::badge_danger(format!("缺组件：{}", item.label))
         } else if missing <= 3 {
             let names = active_missing_items
                 .iter()
                 .map(|i| i.label)
                 .collect::<Vec<_>>()
                 .join("、");
-            primitives::badge_danger(format!("缺 {missing} 项: {names}"))
+            primitives::badge_danger(format!("缺 {missing} 项：{names}"))
         } else {
             primitives::badge_danger(format!("缺 {missing} 项"))
         };
@@ -160,7 +160,7 @@ impl MainWindow {
         let view_toggle = primitives::segmented_cluster()
             .child(
                 primitives::segmented(
-                    "SenseVoice (推荐)",
+                    "SenseVoice（推荐）",
                     current_tab == ModelManagerTab::SenseVoice,
                     false,
                 )
@@ -213,7 +213,7 @@ impl MainWindow {
                     .flex()
                     .items_center()
                     .gap(px(Theme::SPACE_2_5))
-                    .child(primitives::section_title("模型与执行组件"))
+                    .child(primitives::section_title("模型与组件"))
                     .child(missing_badge)
                     .when(used_count > 0, |d| {
                         d.child(
@@ -256,13 +256,13 @@ impl MainWindow {
                     primitives::btn_clickable(
                         match current_tab {
                             ModelManagerTab::SenseVoice => {
-                                format!("补齐 SenseVoice 所需 ({missing} 项)")
+                                format!("补齐 SenseVoice 所需（{missing} 项）")
                             }
                             ModelManagerTab::Whisper => {
-                                format!("补齐 Whisper 所需 ({missing} 项)")
+                                format!("补齐 Whisper 所需（{missing} 项）")
                             }
                             ModelManagerTab::Common => {
-                                format!("补齐公用组件 ({missing} 项)")
+                                format!("补齐公用组件（{missing} 项）")
                             }
                         },
                         primitives::BtnSize::Sm,
@@ -345,7 +345,7 @@ impl MainWindow {
 
         let categories = match current_tab {
             ModelManagerTab::SenseVoice => vec![ModelCategory {
-                title: "SenseVoice 极速语音识别 (推荐)",
+                title: "SenseVoice 极速语音识别（推荐）",
                 item_ids: &["sensevoice-model", "sensevoice-tokens", "sensevoice-vad"],
             }],
             ModelManagerTab::Whisper => vec![
@@ -591,11 +591,11 @@ impl MainWindow {
         let status_badge = if is_current && is_downloading {
             primitives::badge_accent("下载中")
         } else if custom {
-            primitives::badge_accent("已就位 (自编译)")
+            primitives::badge_accent("已就位（自编译）")
         } else if present {
             primitives::badge_accent("已就位")
         } else if !is_needed {
-            primitives::badge("未下载 (当前模式无需)")
+            primitives::badge("未下载（当前模式无需）")
         } else if item.required {
             primitives::badge_danger("核心依赖 · 待补齐")
         } else {

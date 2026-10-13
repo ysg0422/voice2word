@@ -26,6 +26,15 @@ const DISK_KEEP_FILES: usize = 400;
 /// 扫描需要 `read_dir` + 每个文件的 metadata，不能每抽一帧都做一遍。
 const PRUNE_EVERY: usize = 32;
 
+/// 中间产物（`.part.jpg`）超过这个年龄就当作「上一次运行留下的尸体」删掉。
+///
+/// 为什么不能一律不删：抽帧中途失败的那条路会自己清临时文件，但**进程被强杀 /
+/// 崩溃**时没人收尾，这些半截文件会永远留在 %TEMP% 里（`clear()` 全项目没有调用点，
+/// 系统也不会帮你清）。为什么不能一律删：另一个线程可能正在写它（另一个实例也可能），
+/// 删了会让那次抽帧白跑。6 小时是个很宽的分界——真在跑的 ffmpeg 每次写盘都会刷新
+/// mtime，只有没人管的尸体才会老成这样。
+const PARTIAL_STALE_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
 /// 时间量化精度（秒）——每秒 10 格，即拖动时最高 10 帧/秒的画面更新粒度。
 ///
 /// 这里过去是 0.5s：拖动时间轴时 100~400ms 的位移会算出同一个缓存键，命中同一张
@@ -49,25 +58,33 @@ const NEIGHBOR_TICKS: i64 = 1;
 /// **只删真正的帧文件**：抽帧的中间产物形如 `<key>.<pid>-<seq>.part.jpg`，
 /// 但 `Path::extension()` 对它是 `"jpg"`。若把它一起算进候选并按「最旧」删掉，
 /// 就可能在另一个线程刚写完、正要做 rename 时被本函数删除，导致该次抽帧
-/// 白跑一趟（rename 失败）。因此这里显式排除 `.part.jpg` 中间名。
+/// 白跑一趟（rename 失败）。因此这里显式排除 `.part.jpg` 中间名；
+/// 但排除不等于不管——见 [`PARTIAL_STALE_AGE`]：过期的中间产物在这里单独收尸，
+/// 否则崩溃留下的半截文件会永久占着 %TEMP%。
 fn prune_disk_dir(dir: &Path, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("jpg") {
-                return None;
+    let now = std::time::SystemTime::now();
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jpg") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            // 读不到时间戳就不动它：宁可留下一个文件，也不能误删正在写的中间产物。
+            continue;
+        };
+        if is_partial_frame_name(&entry.file_name().to_string_lossy()) {
+            // `unwrap_or_default` 把「时间戳在未来」也当成 0（不删），时钟回拨时更安全。
+            if now.duration_since(modified).unwrap_or_default() >= PARTIAL_STALE_AGE {
+                let _ = std::fs::remove_file(&path);
             }
-            if is_partial_frame_name(&e.file_name().to_string_lossy()) {
-                return None;
-            }
-            let modified = e.metadata().and_then(|m| m.modified()).ok()?;
-            Some((modified, path))
-        })
-        .collect();
+            continue;
+        }
+        files.push((modified, path));
+    }
 
     if files.len() <= keep {
         return;
@@ -412,7 +429,7 @@ impl Drop for PrefetchGuard<'_> {
 mod tests {
     // 刻意**不写** `use super::*`：本组只依赖显式列出的名字，父模块增删私有项不会
     // 悄悄改变这里的解析结果（与 `ui/views/library.rs`、`engines/whisper.rs` 单测同规）。
-    use super::{prune_disk_dir, FrameCache};
+    use super::{prune_disk_dir, FrameCache, PARTIAL_STALE_AGE};
     use std::path::{Path, PathBuf};
 
     fn key_for(path: &str, t: f64) -> String {
@@ -683,5 +700,37 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             "失败路径必须放行，否则预取永久卡死"
         );
+    }
+    /// 过期的中间产物必须收尸：崩溃 / 强杀留下的 `.part.jpg` 没有任何别的路径会清
+    /// （`clear()` 全项目没有调用点），只排除不清就会在 %TEMP% 里永久堆积。
+    #[test]
+    fn prune_disk_dir_deletes_only_stale_partials() {
+        let dir = std::env::temp_dir().join(format!("v2w_prune_stale_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = dir.join("aaa.111-0.part.jpg");
+        let stale = dir.join("bbb.111-1.part.jpg");
+        let frame = dir.join("ccc.jpg");
+        std::fs::write(&fresh, b"inflight").unwrap();
+        std::fs::write(&stale, b"corpse").unwrap();
+        std::fs::write(&frame, b"jpg").unwrap();
+        // 把「尸体」的 mtime 拨到阈值之外，模拟上一次运行崩溃留下的文件
+        let old = std::time::SystemTime::now()
+            .checked_sub(PARTIAL_STALE_AGE * 2)
+            .expect("时间减法不该溢出");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        prune_disk_dir(&dir, 400);
+
+        assert!(fresh.exists(), "刚写的中间产物可能还在被写，绝不能删");
+        assert!(!stale.exists(), "过期的中间产物必须清掉");
+        assert!(frame.exists(), "正式帧不受影响");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

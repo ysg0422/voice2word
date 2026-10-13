@@ -167,7 +167,7 @@ impl MainWindow {
                                                             .text_size(px(Theme::TEXT_BODY_LG))
                                                             .font_weight(FontWeight::BOLD)
                                                             .text_color(Theme::text_primary())
-                                                            .child("无独立显卡 (纯 CPU)"),
+                                                            .child("无独立显卡（纯 CPU 模式）"),
                                                     )
                                                     .child(primitives::badge("纯 CPU 优化")),
                                             )

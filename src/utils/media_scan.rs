@@ -666,6 +666,14 @@ pub enum MediaLoadAdvice {
 ///
 /// `duration_secs` 传 0.0 表示还没探到时长（例如刚导入还没跑 ffprobe）：这时
 /// 只按体积判断，绝不因为「时长未知」就当正常放行到拒绝那档。
+///
+/// `size_bytes` 传 0 同样只能理解成「不知道」（或确实空文件），而不是「确认很小」：
+/// 拖放体检的调用点就是在 `metadata` 失败时这么传的（网络盘掉线 / 权限被临时收回 /
+/// 文件刚被删）。这是**有意的降级**——体检只负责提前提醒代价，真正的读盘失败会由
+/// ffmpeg 探测那条路给出明确报错；反过来「拿不到大小就一律拦下」会把共享盘的瞬时
+/// 抖动变成用户眼里的「拖进去没反应」。要更保守也应在**调用点**把「读不到元数据」
+/// 变成一条可见提示，而不是在这里编一个假体积：本函数只拿到一个数字，分不出
+/// 「0 字节」和「未知」。
 pub fn assess_media_load(size_bytes: u64, duration_secs: f64) -> MediaLoadAdvice {
     let hours = duration_secs / 3600.0;
     let gib = size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -704,7 +712,10 @@ pub fn assess_media_load(size_bytes: u64, duration_secs: f64) -> MediaLoadAdvice
 
 #[cfg(test)]
 mod media_load_advice_tests {
-    use super::{assess_media_load, MediaLoadAdvice, MEDIA_SIZE_WARN_BYTES};
+    use super::{
+        assess_media_load, MediaLoadAdvice, MEDIA_DURATION_REFUSE_SECS, MEDIA_SIZE_REFUSE_BYTES,
+        MEDIA_SIZE_WARN_BYTES,
+    };
 
     /// 正常素材必须走 Ok：阈值只用来兜极端情况，不能把普通长课/会议挡下来。
     #[test]
@@ -743,6 +754,49 @@ mod media_load_advice_tests {
         ));
         assert!(matches!(
             assess_media_load(64 * 1024 * 1024 * 1024, 0.0),
+            MediaLoadAdvice::Refuse(_)
+        ));
+    }
+
+    /// 硬上限线同样是「含等号」的：正好 24 小时 / 正好 64 GiB 都拒绝，
+    /// 差一点就落回提醒档——边界两侧各钉一个，免得以后有人把 `>=` 改成 `>`。
+    #[test]
+    fn refuse_thresholds_are_inclusive_and_one_below_stay_warn() {
+        assert!(matches!(
+            assess_media_load(1024, MEDIA_DURATION_REFUSE_SECS),
+            MediaLoadAdvice::Refuse(_)
+        ));
+        assert!(matches!(
+            assess_media_load(1024, MEDIA_DURATION_REFUSE_SECS - 1.0),
+            MediaLoadAdvice::Warn(_)
+        ));
+        assert!(matches!(
+            assess_media_load(MEDIA_SIZE_REFUSE_BYTES - 1, 0.0),
+            MediaLoadAdvice::Warn(_)
+        ));
+        assert!(matches!(
+            assess_media_load(MEDIA_SIZE_REFUSE_BYTES, 0.0),
+            MediaLoadAdvice::Refuse(_)
+        ));
+    }
+
+    /// 时长不是有限正数时不许参与判定（0 = 还没探到、NaN / 负数 = 脏数据）：
+    /// 全部退化成「只看体积」，绝不能让脏时长把小文件误判成超限。
+    #[test]
+    fn non_positive_or_nan_duration_falls_back_to_size_only() {
+        assert!(matches!(
+            assess_media_load(1024, f64::NAN),
+            MediaLoadAdvice::Ok
+        ));
+        assert!(matches!(assess_media_load(1024, -1.0), MediaLoadAdvice::Ok));
+        // 正无穷是「明确的超长」，照拒绝走
+        assert!(matches!(
+            assess_media_load(1024, f64::INFINITY),
+            MediaLoadAdvice::Refuse(_)
+        ));
+        // 体积已经超限时，脏时长也不能把它洗成 Ok
+        assert!(matches!(
+            assess_media_load(MEDIA_SIZE_REFUSE_BYTES, f64::NAN),
             MediaLoadAdvice::Refuse(_)
         ));
     }
