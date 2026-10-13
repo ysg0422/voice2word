@@ -29,6 +29,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tracing::info;
 
+use crate::subtitle::{Segment, MIN_EDIT_DUR};
 use crate::utils::TempPathGuard;
 
 /// 为自动生成的整轨临时 WAV 取一个并发唯一的路径。
@@ -244,6 +245,145 @@ impl Default for BurnOptions {
         }
     }
 }
+
+/// 按句导出片段的产物类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipKind {
+    /// 视频片段（`.mp4`）：H.264 + AAC，可直接发给别人或当素材用。
+    Video,
+    /// 音频片段（`.wav`）：16kHz 单声道 s16le，与识别输入同规格，便于复用/复听。
+    Audio,
+}
+
+impl ClipKind {
+    /// 保存对话框使用的默认扩展名。
+    pub fn extension(self) -> &'static str {
+        match self {
+            ClipKind::Video => "mp4",
+            ClipKind::Audio => "wav",
+        }
+    }
+}
+
+/// 片段两侧默认留的余量（秒）。
+///
+/// 字幕时间戳标的是**语音起止**，不是设备意义上的片段边界：直接按 `start`/`end`
+/// 切会把开头的字头与结尾的字尾削掉，听感上像被掐了半口气。前后各补 0.25s
+/// 既能把整句话完整包住，又短到不会把邻居的字带进来。
+pub const DEFAULT_CLIP_PAD: f64 = 0.25;
+
+/// 「选中句 → 片段」的纯规划结果：只描述「从哪一刻切、切多长、切什么」。
+///
+/// 不含输入/输出路径——路径由保存对话框决定，规划只依赖句子的时间轴，因此这个
+/// 结构可以由单测在无子进程、无文件系统的情况下直接断言。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipPlan {
+    /// 片段起点（秒，已夹到 >= 0）。
+    pub start_sec: f64,
+    /// 片段时长（秒，恒 > 0）。
+    pub duration_sec: f64,
+    /// 产物类型，决定编码参数。
+    pub kind: ClipKind,
+}
+
+impl ClipPlan {
+    /// 组装交给 FFmpeg 的**逐项 argv**（绝不拼接 shell 字符串，交给 `Command` 逐项传参）。
+    ///
+    /// `-ss` 放在 `-i` **之前**做输入侧快速定位：FFmpeg 只解码目标窗口，不必为了
+    /// 切一句话把整段素材解一遍。
+    ///
+    /// 覆盖策略：**由保存对话框负责**。原生保存对话框在目标文件已存在时会先弹
+    /// 「是否覆盖」并等用户确认，所以这里带上 `-y` 只是让 FFmpeg 不再二次提问
+    /// （无人应答的 stdin 会让它挂住），并不是「静默覆盖」。
+    pub fn argv(&self, input: &Path, output: &Path) -> Vec<std::ffi::OsString> {
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-y".into(),
+            // 输入侧快速定位：-ss/-t 都在 -i 之前。
+            "-ss".into(),
+            format!("{:.3}", self.start_sec).into(),
+            "-i".into(),
+            input.as_os_str().to_os_string(),
+            "-t".into(),
+            format!("{:.3}", self.duration_sec).into(),
+        ];
+        let codec_args: &[&str] = match self.kind {
+            ClipKind::Video => &[
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+            ],
+            ClipKind::Audio => &["-vn", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000"],
+        };
+        args.extend(codec_args.iter().copied().map(std::ffi::OsString::from));
+        args.push(output.as_os_str().to_os_string());
+        args
+    }
+}
+
+/// 把选中句的时间轴规划成一段可切的片段（纯函数，便于脱开 FFmpeg 单测）。
+///
+/// # 边界规则
+/// - `start < 0`：夹到 0（负起点喂给 `-ss` 无意义）；
+/// - `end <= start`（零长 / 倒挂）：先兜底到 [`MIN_EDIT_DUR`]，避免 `-t 0` 让 FFmpeg 直接失败；
+/// - 两侧各留 `pad`（负数/非有限按 0 处理），余量把起点压到 0 以下时夹回 0；
+/// - 总时长已知（`> 0` 且有限）时，终点不超过它；总时长未知（`0.0`）时视作 +∞，不夹取；
+/// - 夹取后仍可能倒挂（起点已落在片尾），再保一次最短时长，保证 `duration_sec > 0`。
+pub fn plan_segment_clip(
+    segment: &Segment,
+    total_duration: f64,
+    pad: f64,
+    kind: ClipKind,
+) -> Result<ClipPlan> {
+    anyhow::ensure!(
+        segment.start.is_finite() && segment.end.is_finite(),
+        "字幕时间戳非法（非有限值），无法规划片段"
+    );
+    // 负余量没有意义，非有限余量同样归零，避免把区间算成 NaN。
+    let pad = if pad.is_finite() && pad > 0.0 {
+        pad
+    } else {
+        0.0
+    };
+    // 总时长未知（0.0 / 非法）用 +∞ 兜底：下面的夹取自动变成空操作，因此「未知总长」
+    // 不需要单独一条分支，也不会把终点误夹成 0。
+    let total = if total_duration.is_finite() && total_duration > 0.0 {
+        total_duration
+    } else {
+        f64::INFINITY
+    };
+
+    let mut start = segment.start.max(0.0);
+    let mut end = segment.end;
+    if end <= start {
+        end = start + MIN_EDIT_DUR;
+    }
+    // 两侧补余量：字幕时间戳是语音起止，直接切会把字头字尾削掉。
+    start = (start - pad).max(0.0);
+    end += pad;
+    // 不越界：终点/起点都不超过媒体总长（总长未知时 total 为 +∞，等于不夹）。
+    end = end.min(total);
+    start = start.min(total);
+    // 夹取后仍可能倒挂：再保一次最短时长，别把 `-t <= 0` 丢给 FFmpeg。
+    if end <= start {
+        end = start + MIN_EDIT_DUR;
+    }
+    Ok(ClipPlan {
+        start_sec: start,
+        duration_sec: end - start,
+        kind,
+    })
+}
+
 pub struct FFmpegEngine {
     ffmpeg_path: PathBuf,
 }
@@ -389,6 +529,48 @@ impl FFmpegEngine {
             anyhow::bail!("FFmpeg 窗口抽音频返回非零退出码");
         }
         Ok(out_wav)
+    }
+
+    /// 按 [`ClipPlan`] 切出一段视频 / 音频片段并写到 `out_path`。
+    ///
+    /// 与通用的窗口抽音频共用同一套「输入侧 `-ss` + 带截止期」范式：只解码目标
+    /// 窗口。退出码非零时把 FFmpeg 的 stderr 尾部（经 [`format_stderr_tail`] 去噪
+    /// 截断）带进错误信息，失败原因不必再靠复现去猜。
+    pub fn export_clip<P1: AsRef<Path>, P2: AsRef<Path>>(
+        &self,
+        input_path: P1,
+        plan: &ClipPlan,
+        out_path: P2,
+    ) -> Result<PathBuf> {
+        let input_path = input_path.as_ref();
+        let out_path = out_path.as_ref().to_path_buf();
+        if let Some(parent) = out_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).ok();
+            }
+        }
+
+        info!(
+            "FFmpeg 切片导出({:?}): {:?} -> {:?} ({:.3}s + {:.3}s)",
+            plan.kind,
+            input_path.file_name().unwrap_or_default(),
+            out_path.file_name().unwrap_or_default(),
+            plan.start_sec,
+            plan.duration_sec
+        );
+
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        // 跟随全局让路设置（与其余 FFmpeg 子进程一致）。
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
+        cmd.args(plan.argv(input_path, &out_path));
+
+        let output = run_with_deadline(&mut cmd, SUBPROCESS_LONG_TIMEOUT)
+            .with_context(|| format!("执行 FFmpeg 切片导出失败: {:?}", self.ffmpeg_path))?;
+        if !output.status.success() {
+            let detail = format_stderr_tail(&output.stderr, STDERR_MESSAGE_CAP);
+            anyhow::bail!("FFmpeg 切片导出返回非零退出码：{detail}");
+        }
+        Ok(out_path)
     }
 
     /// 纯内存管道推流：以 16kHz 单声道 s16le PCM WAV 格式将音频输出到 stdout 匿名管道 (0 磁盘 I/O)
@@ -1204,5 +1386,146 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("{prefix}_{}_{nanos}", std::process::id())
+    }
+}
+
+/// 按句切片规划的测试。
+///
+/// 刻意**不用** `use super::*`：只用全限定路径引入被测的规划接口与最小依赖，
+/// 让测试与实现之间保持一条清晰的「公开接口」边界，而不是把整个模块的私有细节
+/// 拉进命名空间。规划是纯函数，全部用例无需真起 FFmpeg。
+#[cfg(test)]
+mod clip_tests {
+    use crate::engines::ffmpeg::{plan_segment_clip, ClipKind, DEFAULT_CLIP_PAD};
+    use crate::subtitle::{Segment, MIN_EDIT_DUR};
+
+    fn seg(start: f64, end: f64) -> Segment {
+        Segment::new(1, start, end, "测试句")
+    }
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// 默认余量与需求一致：前后各 0.25s。
+    #[test]
+    fn default_clip_pad_is_a_quarter_second() {
+        assert!(approx(DEFAULT_CLIP_PAD, 0.25), "{DEFAULT_CLIP_PAD}");
+    }
+
+    /// 正常句：两侧各补余量，起止都应外扩 pad。
+    #[test]
+    fn clip_plan_pads_both_sides_around_sentence() {
+        let plan = plan_segment_clip(&seg(10.0, 12.0), 60.0, DEFAULT_CLIP_PAD, ClipKind::Video)
+            .expect("正常句必须规划成功");
+        assert!(approx(plan.start_sec, 9.75), "{}", plan.start_sec);
+        assert!(approx(plan.duration_sec, 2.5), "{}", plan.duration_sec);
+        assert_eq!(plan.kind, ClipKind::Video);
+    }
+
+    /// 零长度句（end == start）：兜底到 MIN_EDIT_DUR，绝不产出 -t 0 给 FFmpeg。
+    #[test]
+    fn clip_plan_zero_length_sentence_falls_back_to_min_edit_dur() {
+        let plan = plan_segment_clip(&seg(5.0, 5.0), 60.0, 0.0, ClipKind::Audio)
+            .expect("零长度句也要给出兜底片段");
+        assert!(
+            approx(plan.duration_sec, MIN_EDIT_DUR),
+            "{}",
+            plan.duration_sec
+        );
+        assert!(plan.duration_sec > 0.0);
+    }
+
+    /// end 超出媒体总长：终点必须夹回总长，不能向 FFmpeg 要一段不存在的画面。
+    #[test]
+    fn clip_plan_clamps_end_to_total_duration() {
+        let plan = plan_segment_clip(&seg(59.0, 59.9), 60.0, DEFAULT_CLIP_PAD, ClipKind::Video)
+            .expect("越界终点必须能夹回");
+        assert!(approx(plan.start_sec, 58.75), "{}", plan.start_sec);
+        // 终点本应 59.9 + 0.25 = 60.15，被总长 60 夹住 → 时长 60 - 58.75。
+        assert!(approx(plan.duration_sec, 1.25), "{}", plan.duration_sec);
+    }
+
+    /// 余量把起点压到 0 以下：夹到 0，不能把负时间喂给 -ss。
+    #[test]
+    fn clip_plan_pad_never_pushes_start_below_zero() {
+        let plan = plan_segment_clip(&seg(0.1, 1.0), 60.0, DEFAULT_CLIP_PAD, ClipKind::Video)
+            .expect("贴头句必须能规划");
+        assert!(approx(plan.start_sec, 0.0), "{}", plan.start_sec);
+        assert!(approx(plan.duration_sec, 1.25), "{}", plan.duration_sec);
+    }
+
+    /// 起点本身为负也要夹到 0。
+    #[test]
+    fn clip_plan_clamps_negative_start_to_zero() {
+        let plan = plan_segment_clip(&seg(-2.0, 1.0), 60.0, 0.0, ClipKind::Audio)
+            .expect("负起点必须能规划");
+        assert!(approx(plan.start_sec, 0.0), "{}", plan.start_sec);
+        assert!(approx(plan.duration_sec, 1.0), "{}", plan.duration_sec);
+    }
+
+    /// 总时长未知（0.0）：不做任何上限夹取，末句的余量不能被误裁成 0。
+    #[test]
+    fn clip_plan_keeps_unknown_total_duration_unclamped() {
+        let plan = plan_segment_clip(&seg(10.0, 12.0), 0.0, DEFAULT_CLIP_PAD, ClipKind::Audio)
+            .expect("总长未知也要能规划");
+        assert!(approx(plan.start_sec, 9.75), "{}", plan.start_sec);
+        assert!(approx(plan.duration_sec, 2.5), "{}", plan.duration_sec);
+    }
+
+    /// argv 必须逐项、且 -ss 在 -i 之前；两种产物各带自己的编码参数。
+    #[test]
+    fn clip_argv_places_seek_before_input_and_picks_codecs() {
+        let input = std::path::Path::new("in.mp4");
+        let output = std::path::Path::new("out.mp4");
+
+        let video = plan_segment_clip(&seg(10.0, 12.0), 60.0, DEFAULT_CLIP_PAD, ClipKind::Video)
+            .expect("规划成功");
+        let vargs: Vec<String> = video
+            .argv(input, output)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let pos = |needle: &str| vargs.iter().position(|a| a == needle);
+        assert!(
+            pos("-ss").unwrap() < pos("-i").unwrap(),
+            "输入侧定位: {vargs:?}"
+        );
+        assert!(
+            pos("-i").unwrap() < pos("-t").unwrap(),
+            "时长在输入之后: {vargs:?}"
+        );
+        assert!(vargs.contains(&"9.750".to_string()), "{vargs:?}");
+        assert!(vargs.contains(&"2.500".to_string()), "{vargs:?}");
+        for want in ["libx264", "veryfast", "20", "aac", "+faststart"] {
+            assert!(vargs.contains(&want.to_string()), "缺 {want}: {vargs:?}");
+        }
+        assert!(
+            !vargs.contains(&"-vn".to_string()),
+            "视频片段不该 -vn: {vargs:?}"
+        );
+
+        let audio = plan_segment_clip(&seg(10.0, 12.0), 60.0, DEFAULT_CLIP_PAD, ClipKind::Audio)
+            .expect("规划成功");
+        let aargs: Vec<String> = audio
+            .argv(input, output)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for want in ["-vn", "pcm_s16le", "1", "16000"] {
+            assert!(aargs.contains(&want.to_string()), "缺 {want}: {aargs:?}");
+        }
+        assert!(
+            !aargs.contains(&"libx264".to_string()),
+            "音频片段不该带视频编码: {aargs:?}"
+        );
+    }
+
+    /// 非有限时间戳（NaN）无法规划：必须报错而不是算出一段假片段。
+    #[test]
+    fn clip_plan_rejects_non_finite_timestamps() {
+        let err = plan_segment_clip(&seg(f64::NAN, 1.0), 60.0, DEFAULT_CLIP_PAD, ClipKind::Video)
+            .expect_err("NaN 起点必须报错");
+        assert!(err.to_string().contains("非法"), "{err}");
     }
 }

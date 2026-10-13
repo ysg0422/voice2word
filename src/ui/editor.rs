@@ -1817,6 +1817,10 @@ impl MainWindow {
                             // 单字无法拆分；最后一句没有下一句可合并，按钮置灰而不是点了没反应
                             let can_split = seg.display_text().chars().count() > 1;
                             let can_merge = seg_idx < self.state.segments.len();
+                            // 正在导出片段时把两个导出按钮一并置灰：导出是后台任务，
+                            // 重复点击会被忽略，显式不可点比「点了没反应」更清楚。
+                            let clip_idle = !super::actions::CLIP_EXPORT_BUSY
+                                .load(std::sync::atomic::Ordering::Relaxed);
 
                             primitives::card_sm()
                                 .flex_none()
@@ -1995,6 +1999,24 @@ impl MainWindow {
                                             |this, cx| {
                                                 this.state.merge_selected_with_next();
                                                 this.trigger_extract_frame(cx);
+                                            },
+                                        ))
+                                        .child(Self::render_mini_btn(
+                                            "btn-export-clip",
+                                            "导出片段",
+                                            clip_idle,
+                                            cx,
+                                            |this, cx| {
+                                                this.export_selected_clip(cx);
+                                            },
+                                        ))
+                                        .child(Self::render_mini_btn(
+                                            "btn-export-clip-audio",
+                                            "导出音频",
+                                            clip_idle,
+                                            cx,
+                                            |this, cx| {
+                                                this.export_selected_clip_audio(cx);
                                             },
                                         )),
                                 )

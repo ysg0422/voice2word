@@ -65,6 +65,16 @@ fn burn_temp_seq() -> u64 {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
+
+/// 「按句导出片段」是否正在进行。
+///
+/// 用模块内的原子量而不是 `MainWindow` 字段：既有的忙标志（代理转码 / 波形 /
+/// 更新下载）都各自绑定在别的子系统的语义上，借来用会把「正在导出片段」误报成
+/// 那些状态。这个自包含的标志只做两件事——挡住重复点击、让入口按钮在导出期间
+/// 置灰，不触碰既有状态机。
+pub(crate) static CLIP_EXPORT_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn editor_export_format_string(fmt: EditorExportFormat) -> &'static str {
     match fmt {
         EditorExportFormat::Srt => "srt",
@@ -3282,6 +3292,136 @@ impl MainWindow {
         })
         .detach();
     }
+
+    /// 「导出片段」：把当前选中句切成一段视频（`.mp4`）。
+    pub(crate) fn export_selected_clip(&mut self, cx: &mut Context<Self>) {
+        self.export_segment_clip(crate::engines::ffmpeg::ClipKind::Video, cx);
+    }
+
+    /// 「导出音频」：把当前选中句切成 16kHz 单声道 WAV（与识别输入同规格，便于复用/复听）。
+    pub(crate) fn export_selected_clip_audio(&mut self, cx: &mut Context<Self>) {
+        self.export_segment_clip(crate::engines::ffmpeg::ClipKind::Audio, cx);
+    }
+
+    /// 「选中句 → 片段」的共享实现：纯函数规划 → 保存对话框 → 后台切片 → 一次性提示。
+    ///
+    /// 覆盖策略由保存对话框负责：原生对话框在目标文件已存在时会先弹「是否覆盖」，
+    /// 用户确认后才返回路径，因此 FFmpeg 那边只是带上 `-y` 免得无人应答的 stdin
+    /// 把它挂住，不是静默覆盖。
+    fn export_segment_clip(
+        &mut self,
+        kind: crate::engines::ffmpeg::ClipKind,
+        cx: &mut Context<Self>,
+    ) {
+        use std::sync::atomic::Ordering;
+        if CLIP_EXPORT_BUSY.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(input) = self.state.selected_file.clone() else {
+            self.notice = Some("请先打开一个媒体文件，再导出片段".to_string());
+            cx.notify();
+            return;
+        };
+        // 先把编辑缓冲落进 segments，再取选中句，避免用到过期的时间轴。
+        self.state.flush_segments_if_dirty();
+        let Some(segment) = self
+            .state
+            .selected_segment_index
+            .and_then(|idx| self.state.segments.iter().find(|s| s.index == idx))
+            .cloned()
+        else {
+            self.notice = Some("请先选中一句字幕，再导出片段".to_string());
+            cx.notify();
+            return;
+        };
+
+        // 规划失败（时间戳非法）在这里就定性，不弹保存对话框。
+        let plan = match crate::engines::ffmpeg::plan_segment_clip(
+            &segment,
+            self.state.total_duration,
+            crate::engines::ffmpeg::DEFAULT_CLIP_PAD,
+            kind,
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.notice = Some(format!("片段导出失败：{e}"));
+                cx.notify();
+                return;
+            }
+        };
+        // 该句时间轴无效（end <= start）时规划会兜底到 MIN_EDIT_DUR，提示里说明，
+        // 免得用户以为导出的是一段正常时长的话。
+        let degenerate = segment.end <= segment.start;
+
+        let ffmpeg_path = crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
+        let stem = input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("clip")
+            .to_string();
+        let ext = kind.extension();
+        let default_name = format!("{stem}_line{:03}.{ext}", segment.index);
+        let start_sec = plan.start_sec;
+        let end_sec = plan.start_sec + plan.duration_sec;
+        let audio = matches!(kind, crate::engines::ffmpeg::ClipKind::Audio);
+
+        CLIP_EXPORT_BUSY.store(true, Ordering::Relaxed);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("选择片段保存位置")
+                .set_file_name(&default_name)
+                .add_filter(if audio { "WAV 音频" } else { "MP4 视频" }, &[ext])
+                .save_file()
+                .await;
+            let Some(save_handle) = handle else {
+                // 用户取消：复位忙标志，不打扰。
+                let _ = this.update(cx, |_this, cx| {
+                    CLIP_EXPORT_BUSY.store(false, Ordering::Relaxed);
+                    cx.notify();
+                });
+                return;
+            };
+            let output = save_handle.path().to_path_buf();
+
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
+                    ffmpeg.export_clip(&input, &plan, &output)
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                CLIP_EXPORT_BUSY.store(false, Ordering::Relaxed);
+                match res {
+                    Ok(path) => {
+                        info!("片段导出成功: {:?}", path);
+                        let note = if degenerate {
+                            "（原句时间轴无效，已按最短片段兜底）"
+                        } else {
+                            ""
+                        };
+                        this.notice = Some(format!(
+                            "已导出片段{note}：{}（{:.2}s → {:.2}s）",
+                            path.display(),
+                            start_sec,
+                            end_sec
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::error!("片段导出失败: {:?}", e);
+                        // 失败不静默：错误里已带 FFmpeg 的 stderr 尾部，直接进提示。
+                        this.notice = Some(format!("片段导出失败：{e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 根据当前剪辑工作台选中的格式执行统一导出
     pub(crate) fn perform_editor_export(&mut self, cx: &mut Context<Self>) {
         self.state.flush_segments_if_dirty();
