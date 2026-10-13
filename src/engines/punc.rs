@@ -227,9 +227,11 @@ impl PunctuationEngine {
         super::media_pipeline::apply_default_child_flags(&mut cmd);
         // 与 SenseVoice 同因同治：找不到解释器时把「缺 Python」讲明白，
         // 而不是把 OS 的「系统找不到指定的文件」原样丢给用户。
+        let program = cmd.get_program().to_os_string();
+        let python_hint = (std::path::Path::new(&program) == self.python_path.as_path())
+            .then_some(self.python_path.as_path());
         let child = cmd.spawn().map_err(|err| {
-            // 与 SenseVoice 同因同治：缺解释器时把「该装 Python」讲明白。
-            super::python_spawn_error(&err, &self.python_path, "标点恢复")
+            super::spawn_failure_message(&err, &program, " 标点恢复进程", python_hint)
         })?;
         crate::utils::child_registry::adopt(&child);
         // 从这里到 wait_with_output() 之间的任何提前退出都由守卫兜底回收子进程

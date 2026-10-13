@@ -508,9 +508,13 @@ impl SenseVoiceEngine {
         // 找不到解释器是最常见的一种失败：报错原文（Windows 上是「系统找不到指定的文件。」）
         // 完全没提 Python，用户只会以为程序坏了。这里翻成可操作的中文指引——
         // 与 ffmpeg 那条「找不到就告诉用户放哪」的经验同源。
+        let program = cmd.get_program().to_os_string();
+        // 只有待启动的确实是本引擎配置的解释器时，才给「装 Python / 改 [paths] python」
+        // 这条指引；否则如实报那条命令的路径（见 `spawn_failure_message` 的说明）。
+        let python_hint = (std::path::Path::new(&program) == self.python_path.as_path())
+            .then_some(self.python_path.as_path());
         let mut child = cmd.spawn().map_err(|err| {
-            // 缺解释器时把「该装 Python」讲明白（见 `python_spawn_error` 的说明）。
-            super::python_spawn_error(&err, &self.python_path, "SenseVoice 识别")
+            super::spawn_failure_message(&err, &program, " SenseVoice 进程", python_hint)
         })?;
         crate::utils::child_registry::adopt(&child);
 
