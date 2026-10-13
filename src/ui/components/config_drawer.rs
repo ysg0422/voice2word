@@ -1021,7 +1021,15 @@ impl MainWindow {
             .child(self.render_hotwords_row(cx))
     }
 
-    /// 参数分组：小标题 + 分段选择器行
+    /// 参数分组：小标题 + 分段选择器行。
+    ///
+    /// # 为什么标题在上、控件在下，而不是左右两端对齐
+    ///
+    /// 抽屉宽度是固定的（350px），而控件本身有最小宽度：线程档位要显示「8 线程」、
+    /// 说话人要显示「3 人」、字幕格式甚至有「EBU-TT-D」这种长标签。左右对齐时
+    /// 标签越短，中间的空隙越大——窗口一拉宽，空隙跟着变大，看起来就是「两边分家」。
+    /// 上下堆叠后，控件始终贴着自己的标签，且**天然占满可用宽度**：窗口变宽只会
+    /// 让控件变宽，不会凭空多出一条缝。
     fn param_group<K, L>(
         &mut self,
         label: &'static str,
@@ -1038,8 +1046,19 @@ impl MainWindow {
             .flex()
             .flex_col()
             .gap(px(Theme::SPACE_1))
+            // 每个分组自带一块面板：分组之间用底色 + 圆角分隔，而不是靠空白距离。
+            // 这样窗口拉宽时「缝」被面板吃掉，视觉上是一列对齐的块。
             .child(primitives::field_label(label))
-            .child(self.pill_row(options, selected, on_select, cx))
+            .child(
+                div()
+                    .w_full()
+                    .p(px(Theme::SPACE_1_5))
+                    .rounded(px(Theme::RADIUS_MD))
+                    .bg(Theme::bg_raised())
+                    .border_1()
+                    .border_color(Theme::border_subtle())
+                    .child(self.pill_row(options, selected, on_select, cx)),
+            )
     }
 
     /// 通用分段选择器：一行等宽胶囊，单击切换（多于4项时自适应换行，避免溢出重叠）
@@ -1063,6 +1082,8 @@ impl MainWindow {
             let key: SharedString = key.into();
             let is_sel = key.as_str() == selected;
             let pill_id = key.clone();
+            // `full_width = !is_wrap` 由 primitives 负责等分（内部就是 flex_1 + min_w_0）；
+            // 换行的行按内容自适应，否则最后一行会被拉成长短不一的胶囊。
             row = row.child(
                 primitives::segmented(label, is_sel, !is_wrap)
                     .id(pill_id)
@@ -1170,6 +1191,12 @@ impl MainWindow {
             .child(primitives::field_label("热词提示词"))
             .child(
                 div()
+                    .w_full()
+                    .p(px(Theme::SPACE_1_5))
+                    .rounded(px(Theme::RADIUS_MD))
+                    .bg(Theme::bg_raised())
+                    .border_1()
+                    .border_color(Theme::border_subtle())
                     .flex()
                     .items_center()
                     .gap(px(Theme::SPACE_1_5))
