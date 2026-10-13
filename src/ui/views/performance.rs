@@ -813,6 +813,23 @@ impl MainWindow {
                         this.apply_glossary_from_file(cx);
                     })),
             )
+            // 导入 / 导出：术语表在本页（翻译配置区）才有归属，转写页不重复放一份，
+            // 免得两处入口行为不一致。导入走异步文件对话框（`.txt` / `.csv`），
+            // 导出复用「另存为 + 后台写盘」那一条出口，这里只挂点击。
+            .child(
+                primitives::chip_clickable("导入", false, false)
+                    .id("glossary-import-btn")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.import_glossary_dialog(cx);
+                    })),
+            )
+            .child(
+                primitives::chip_clickable("导出", false, false)
+                    .id("glossary-export-btn")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.export_glossary_csv(cx);
+                    })),
+            )
             .children(glossary_status.map(|msg| {
                 div()
                     .text_size(px(Theme::TEXT_CAPTION))

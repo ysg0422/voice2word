@@ -18,6 +18,7 @@ use crate::subtitle::audit::{EditKind, EditRecord};
 use crate::subtitle::writer::export_spec_for;
 use crate::subtitle::Segment;
 use crate::subtitle::SubtitleWriter;
+use crate::subtitle::{CpsFixPlan, DEFAULT_MAX_CPS, MIN_EDIT_DUR};
 
 /// 导入字幕成功后的提示文案（**纯函数**，便于单测）。
 ///
@@ -41,6 +42,36 @@ fn import_notice(stem: &str, count: usize, is_txt: bool, is_lrc: bool) -> String
         format!("已导入「{stem}」{count} 句；最后一句的结束时间为按字数估算，导出前请核对")
     } else {
         format!("已导入「{stem}」{count} 句字幕")
+    }
+}
+
+/// 术语表导入结果的提示文案（**纯函数**，便于单测）。
+///
+/// 三条分支：文件里一个条目都没解析出来（空提示，告诉用户检查格式）、
+/// 条目全都已存在（新增 0 / 覆盖 0）、以及有增有改的正常情况。
+fn glossary_import_notice(added: usize, overwritten: usize, unchanged: usize) -> String {
+    if added == 0 && overwritten == 0 {
+        if unchanged == 0 {
+            "导入的术语表里没有条目，请检查文件格式（每行「原文=译文」）".to_string()
+        } else {
+            format!("术语表已是最新：未变 {unchanged} 条，没有新增或覆盖")
+        }
+    } else {
+        format!("已导入术语表：新增 {added} / 覆盖 {overwritten} / 未变 {unchanged}")
+    }
+}
+
+/// 阅读速度一键修正的结果提示文案（**纯函数**，便于单测）。
+///
+/// 四条分支：整体无需改动、只延长成功、延长了一部分且仍有延不了的、以及
+/// 一句都没延长（`extended` 为空但 `unresolved` 非空）——最后一种不能当成
+/// 「都在合理范围内」蒙混过去，否则用户看到「没问题」却仍有一屏读不完的字幕。
+fn cps_fix_notice(plan: &CpsFixPlan) -> String {
+    match (plan.extended.len(), plan.unresolved.len()) {
+        (0, 0) => "语速都在合理范围内".to_string(),
+        (0, n) => format!("有 {n} 句时长不够、但后一句贴得太近延不开；请压后一句或把这句改短"),
+        (e, 0) => format!("已延长 {e} 句，阅读速度回到合理范围"),
+        (e, n) => format!("已延长 {e} 句，另有 {n} 句因后一句贴得太近未能延到位，请手动调整"),
     }
 }
 
@@ -3812,6 +3843,7 @@ impl MainWindow {
         let options = crate::subtitle::edit::ReplaceOptions {
             case_sensitive: self.replace_case_sensitive,
             include_translation: self.replace_include_translation,
+            ..Default::default()
         };
         // 只有「选中句」需要目标下标表；「全部句」走整表入口，不必先铺出一个几万
         // 元素的下标表（点了没用，纯属白分配）。
@@ -4170,6 +4202,73 @@ impl MainWindow {
                 ));
             }
         }
+        cx.notify();
+    }
+
+    /// 从磁盘导入术语表（`.txt` / `.csv`），成功后按「新增 / 覆盖 / 未变」报告。
+    ///
+    /// 走**异步**文件对话框（`cx.spawn` + `rfd::AsyncFileDialog`），与
+    /// `MainWindow::choose_llm_model_file` 同一套写法：同步的 `FileDialog` 会起
+    /// Win32 模态循环，而 GPUI 在渲染回调里正持有 RefCell 借用，模态循环会把界面
+    /// 卡死。合并 / 去重 / 落盘都交给 `state.import_glossary_file`，这里只负责取
+    /// 路径与落一条中性提示；文件里没解析出条目时由 `glossary_import_notice` 给出
+    /// 可操作的格式提示，不静默。
+    pub(crate) fn import_glossary_dialog(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("导入术语表")
+                .add_filter("术语表", &["txt", "csv"])
+                .add_filter("所有文件", &["*"])
+                .pick_file()
+                .await;
+            let Some(handle) = handle else { return };
+            let path = handle.path().to_path_buf();
+            let _ = this.update(cx, |this, cx| {
+                match this.state.import_glossary_file(&path) {
+                    Ok((added, overwritten, unchanged)) => {
+                        this.notice = Some(glossary_import_notice(added, overwritten, unchanged));
+                    }
+                    Err(e) => {
+                        this.notice = Some(format!("导入术语表失败：{e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 把当前术语表导出成 CSV（默认名 `glossary.csv`）。
+    ///
+    /// 读取走 `state.export_glossary_csv_text`，写出复用同文件的
+    /// `MainWindow::export_text_content`（另存为 + 后台写盘 + 选中文件那一条共用
+    /// 出口），不另写一份写盘逻辑。空表时提前返回：导出一个只有表头的空文件没有
+    /// 意义，直接给一句可操作提示。
+    pub(crate) fn export_glossary_csv(&mut self, cx: &mut Context<Self>) {
+        let count = self.state.glossary_entries().len();
+        if count == 0 {
+            self.notice = Some("术语表还是空的，先导入或编辑出条目再导出".to_string());
+            cx.notify();
+            return;
+        }
+        let content = self.state.export_glossary_csv_text();
+        self.notice = Some(format!("已导出术语表（{count} 条）"));
+        self.export_text_content(cx, "glossary.csv".to_string(), content, "术语表");
+    }
+
+    /// 一键把阅读速度超限的句子延长到「读得完」，只改时间、不改文本。
+    ///
+    /// 快照与落盘都在 `state.apply_cps_fix` 内部完成，这里只调用并按返回的
+    /// `CpsFixPlan` 给出结果提示——在外面再写一次盘会把撤销栈推乱，也会让
+    /// 「一键修正」变成两个数据版本的来源。空工程直接给一句可操作提示，不静默。
+    pub(crate) fn apply_cps_fix_action(&mut self, cx: &mut Context<Self>) {
+        if self.state.segments.is_empty() {
+            self.notice = Some("还没有字幕，先转写或导入字幕后才能修正语速".to_string());
+            cx.notify();
+            return;
+        }
+        let plan = self.state.apply_cps_fix(DEFAULT_MAX_CPS, MIN_EDIT_DUR);
+        self.notice = Some(cps_fix_notice(&plan));
         cx.notify();
     }
 
@@ -4773,8 +4872,9 @@ fn finish_db_work(
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_translations_with_undo, copied_translation_positions, editor_export_format_string,
-        export_spec_for, finish_db_write_error, flush_outcome_to_apply, frame_failure_notice,
+        clear_translations_with_undo, copied_translation_positions, cps_fix_notice,
+        editor_export_format_string, export_spec_for, finish_db_write_error,
+        flush_outcome_to_apply, frame_failure_notice, glossary_import_notice,
         has_copied_translations, is_copied_translation, presence_scan_still_current,
         replace_rule_report_message, rule_set_name_for, still_same_document, DocumentIdentity,
         SegmentFlushOutcome, IMPORT_SUBTITLE_EXTS, SUBTITLE_EXTS,
@@ -5263,6 +5363,51 @@ mod tests {
             name.chars().count(),
             "规则：".chars().count() + 20 + 1,
             "截断到 20 个字符 + 省略号：{name}"
+        );
+    }
+
+    /// 术语表导入提示：空文件 / 全部未变 / 有增有改三条分支。
+    #[test]
+    fn glossary_import_notice_covers_all_branches() {
+        assert!(
+            glossary_import_notice(0, 0, 0).contains("没有条目"),
+            "空文件要给可操作的格式提示"
+        );
+        assert_eq!(
+            glossary_import_notice(0, 0, 7),
+            "术语表已是最新：未变 7 条，没有新增或覆盖"
+        );
+        assert_eq!(
+            glossary_import_notice(3, 2, 7),
+            "已导入术语表：新增 3 / 覆盖 2 / 未变 7"
+        );
+    }
+
+    /// CPS 修正提示：无改动 / 只延长 / 部分延不了 / 全部延不了四条分支。
+    ///
+    /// 「全部延不了」（`extended` 为空、`unresolved` 非空）必须与「无改动」分开：
+    /// 两者 `has_changes()` 都是 false，但一个有话要说、一个是真的不用动。
+    #[test]
+    fn cps_fix_notice_covers_all_branches() {
+        let plan = |extended: Vec<usize>, unresolved: Vec<usize>| crate::subtitle::CpsFixPlan {
+            times: Vec::new(),
+            extended,
+            unresolved,
+        };
+        assert_eq!(cps_fix_notice(&plan(vec![], vec![])), "语速都在合理范围内");
+        assert_eq!(
+            cps_fix_notice(&plan(vec![2, 5], vec![])),
+            "已延长 2 句，阅读速度回到合理范围"
+        );
+        let partial = cps_fix_notice(&plan(vec![2, 5], vec![5]));
+        assert!(
+            partial.contains("已延长 2 句") && partial.contains("另有 1 句"),
+            "{partial}"
+        );
+        let none = cps_fix_notice(&plan(vec![], vec![4, 9]));
+        assert!(
+            none.contains("2 句") && none.contains("延不开"),
+            "全部 unresolved 不能被当成「都在合理范围内」：{none}"
         );
     }
 }

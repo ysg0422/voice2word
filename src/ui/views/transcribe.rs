@@ -14,6 +14,7 @@ use crate::ui::format_mm_ss;
 use crate::subtitle::cleanup::{CleanupPlan, CleanupRules, DuplicateGroup};
 // 质检报告是 `segment.rs` 里的纯逻辑：这里只把结果画出来，不在界面层重算判据。
 use crate::subtitle::segment::{QualityCategory, QualityReport};
+use crate::subtitle::DEFAULT_MAX_CPS;
 use crate::utils::time::format_duration_short;
 use std::sync::Arc;
 
@@ -746,28 +747,32 @@ impl MainWindow {
         Some(self.derived_snapshot().quality_report.clone())
     }
 
-    /// 「下一处」的落点：当前选中句之后的第一处待复核；已是最后一处则回卷到第一处。
-    /// 一处待复核都没有时返回 `None`（`jump_to_quality_issue` 会安全忽略）。
-    ///
-    /// `category` 为 `None` 时跨全部四类翻查（原有的「下一处」语义）；
-    /// 为 `Some(cat)` 时**只在该类内**推进——用户往往只在意某一类问题
+    /// 「只看这类」的落点：**只在该类内**推进——用户往往只在意某一类问题
     /// （例如只盯低置信句），跨类跳会把他引到不关心的行上。
     ///
     /// 边界（空类、当前句本身是问题、越过末尾回卷）全部交给纯函数
     /// [`crate::subtitle::segment::next_issue_in`]，界面层不重复实现一遍。
-    fn quality_next_issue_in(&mut self, category: Option<QualityCategory>) -> Option<usize> {
+    fn quality_next_in_category(&mut self, category: QualityCategory) -> Option<usize> {
         let report = self.quality_report_snapshot()?;
-        let current = self.state.selected_segment_index;
-        match category {
-            Some(cat) => {
-                let indices = cat.indices(&report);
-                crate::subtitle::segment::next_issue_in(current, &indices)
-            }
-            None => {
-                let all = report.all_issues();
-                crate::subtitle::segment::next_issue_in(current, &all)
-            }
-        }
+        let indices = category.indices(&report);
+        crate::subtitle::segment::next_issue_in(self.state.selected_segment_index, &indices)
+    }
+
+    /// 「下一处」的落点：当前选中句之后的第一处待复核；已是最后一处则回卷到第一处。
+    /// 一处待复核都没有时返回 `None`（`jump_to_quality_issue` 会安全忽略）。
+    ///
+    /// 跨四类 + 两项扩展翻查：扩展项（语速超限 / 句尾标点）与四类判据无关，可能
+    /// **独自**存在（四类全通过、只有语速超限），只翻四类的话「下一处」点了不动。
+    /// 合并后的列表由 `next_issue_in` 消费，而它约定升序，所以这里排一次
+    /// （两个扩展桶各自升序、彼此无序）。
+    fn quality_next_issue_any(&mut self, extras: &QualityExtras) -> Option<usize> {
+        let report = self.quality_report_snapshot()?;
+        let mut all = report.all_issues();
+        all.extend(extras.cps.iter().copied());
+        all.extend(extras.punctuation.iter().copied());
+        all.sort_unstable();
+        all.dedup();
+        crate::subtitle::segment::next_issue_in(self.state.selected_segment_index, &all)
     }
 
     /// 一键定位：切回剪辑台 + 选中目标句 + 让字幕清单重新跟随滚动。
@@ -789,6 +794,28 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// 两项质检扩展（语速超限 / 句尾标点）的句下标快照。
+    ///
+    /// 缓存挂在 GPUI 全局的 [`TranscribeDerivedCache`] 上（`MainWindow` 的结构体定义在
+    /// `ui/mod.rs`，不在本轮改动范围内），失效键见 [`QualityExtrasKey`]：
+    /// `segments_revision` + 语速上限的位模式。
+    ///
+    /// 为什么必须缓存：两项判据都是 O(句数) 全量扫描，而这张卡片在转写完成后每帧
+    /// 都会被重建一次，逐帧直算等于每帧两次整表遍历。
+    fn quality_extras_snapshot(&self, cx: &mut Context<Self>) -> Arc<QualityExtras> {
+        let key = QualityExtrasKey {
+            revision: self.state.segments_revision,
+            max_cps_bits: DEFAULT_MAX_CPS.to_bits(),
+        };
+        let state = &self.state;
+        cx.update_default_global::<TranscribeDerivedCache, _>(|cache, _| {
+            quality_extras_cached(&mut cache.quality_extras, key, || QualityExtras {
+                cps: state.cps_violation_indices(DEFAULT_MAX_CPS),
+                punctuation: state.punctuation_plan().indices,
+            })
+        })
+    }
+
     /// 质检摘要卡片。返回 `None` 表示这一帧不加任何东西（无字幕 / 不属于转写完成态）。
     ///
     /// 只由「转写完成后的看板」调用（文件就绪卡与空闲引导卡），转写进行中走的是
@@ -797,10 +824,26 @@ impl MainWindow {
         let report = self.quality_report_snapshot()?;
         let total = report.total_issues();
         let scored = report.confidence_scored;
+        // 两项扩展（语速超限 / 句尾标点）走本文件内的跨帧缓存，判据与失效键见
+        // `QualityExtras` / `QualityExtrasKey`：都是 O(句数) 全量扫描，不能每帧直算。
+        let extras = self.quality_extras_snapshot(cx);
+        // 「待质检 N 项」把扩展项一起算进来：它们同样要点进剪辑台复核，分开算会出现
+        // 「胶囊写着有 3 句要改、右上角药丸却说质检通过」。
+        let pending_total = total + extras.cps.len() + extras.punctuation.len();
         // 「开始复核」的第一跳落点。必须在这里算好：下面给每个胶囊挂 `cx.listener`
         // 时要可变借用 `this`，闭包里再读 `report` 就与借用打架
         // （与 `render_batch_queue_panel` 先抽纯值是同一个处理）。
-        let first_issue = report.first_issue();
+        // 扩展项可能**独自**存在问题（四类判据全通过、但语速超限），只取
+        // `report.first_issue()` 会让这个按钮点了不动，所以两边取更靠前的那一处。
+        let extra_first = [extras.cps.first(), extras.punctuation.first()]
+            .into_iter()
+            .flatten()
+            .copied()
+            .min();
+        let first_issue = match (report.first_issue(), extra_first) {
+            (Some(reported), Some(extra)) => Some(reported.min(extra)),
+            (reported, extra) => reported.or(extra),
+        };
 
         // 四类判据的展示配置：低置信走玫红、术语违规走琥珀（与剪辑台的琥珀色行提示同色）、
         // 未翻译走蓝、空/超短句走中性灰。配色全部取自 Theme 的 tint_* / accent_* 阶梯，
@@ -859,16 +902,74 @@ impl MainWindow {
                     .text_color(Theme::text_primary())
                     .child("转写质检"),
             )
-            .child(if total == 0 {
+            .child(if pending_total == 0 {
                 primitives::badge_accent("质检通过")
             } else {
-                primitives::badge_danger(format!("待质检 {total} 项"))
+                primitives::badge_danger(format!("待质检 {pending_total} 项"))
             });
 
         // 判据胶囊行：非零项按类着色并可点击定位；零项**保留计数但置灰不可点**——
         // 用户要看得出「这一项确实检查过、结果是 0」，而不是被悄悄藏掉。
         // 唯一的例外是低置信判据**全无置信度数据**时：那时「0 句」是把「没测」说成了
         // 「通过」，文案改由 `quality_chip_label` 给「未评估」（判据见 `QualityReport`）。
+        // 扩展项胶囊（语速超限 / 句尾标点）：与上面四类共用 `tag_tinted` 的样式与
+        // Theme 配色阶梯，区别只在 0 句时**不生成元素**（`extra_quality_chip_text`
+        // 返回 `None`，见其文档）。两项点下去都只是跳到第一处让用户自己判断，
+        // 所以这里不接任何改文本的动作，文案里也没有「修复」二字。
+        let mut extra_chips: Vec<AnyElement> = Vec::new();
+        for kind in ExtraQuality::ALL {
+            let (count, first) = match kind {
+                ExtraQuality::CpsOverLimit => (extras.cps.len(), extras.cps.first().copied()),
+                ExtraQuality::MissingTerminalPunctuation => (
+                    extras.punctuation.len(),
+                    extras.punctuation.first().copied(),
+                ),
+            };
+            let Some(label) = extra_quality_chip_text(kind, count) else {
+                continue;
+            };
+            let (soft, border, text) = match kind {
+                ExtraQuality::CpsOverLimit => (
+                    Theme::tint_warn_soft(),
+                    Theme::tint_warn_border(),
+                    Theme::accent_orange(),
+                ),
+                ExtraQuality::MissingTerminalPunctuation => (
+                    Theme::tint_primary_soft(),
+                    Theme::tint_primary_border(),
+                    Theme::accent_primary(),
+                ),
+            };
+            extra_chips.push(
+                primitives::tag_tinted(label, soft, border, text)
+                    .id(("quality-chip-extra", kind as usize))
+                    .cursor_pointer()
+                    .hover(|s| s.opacity(0.85))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.jump_to_quality_issue(cx, first);
+                    }))
+                    .into_any_element(),
+            );
+            // 语速超限胶囊后面紧跟「一键修正语速」：它只把过短的句子**延长**到读得完，
+            // 一个字都不改。判据与胶囊同一条（`count > 0`）——没有超限句时胶囊本就不
+            // 生成，按钮自然也不显示，不另算一遍。
+            if kind == ExtraQuality::CpsOverLimit {
+                extra_chips.push(
+                    primitives::btn(
+                        "一键修正语速",
+                        primitives::BtnSize::Sm,
+                        primitives::BtnVariant::Secondary,
+                    )
+                    .id("quality-cps-fix")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.apply_cps_fix_action(cx);
+                    }))
+                    .into_any_element(),
+                );
+            }
+        }
+
         let confidence_unavailable = report.confidence_unavailable();
         let chips = div()
             .w_full()
@@ -899,7 +1000,8 @@ impl MainWindow {
                         }))
                         .into_any_element()
                 },
-            ));
+            ))
+            .children(extra_chips);
 
         let coverage = if scored > 0 {
             format!("置信度已评估 {scored} 句")
@@ -926,14 +1028,17 @@ impl MainWindow {
                 .id(("quality-jump-cat", cat as usize))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    let next = this.quality_next_issue_in(Some(cat));
+                    let next = this.quality_next_in_category(cat);
                     this.jump_to_quality_issue(cx, next);
                 }))
                 .into_any_element()
             })
             .collect();
 
-        let body: AnyElement = if total == 0 {
+        // 「下一处」的监听器要 `move` 进闭包，这里先把快照的引用计数复制一份
+        // （克隆 `Arc` 只加计数，不复制两个 `Vec`）。
+        let extras_for_next = Arc::clone(&extras);
+        let body: AnyElement = if pending_total == 0 {
             // 零问题：给正向状态，而不是一排 0/0/0 的空壳。
             div()
                 .w_full()
@@ -983,10 +1088,15 @@ impl MainWindow {
                             )
                             .id("quality-review-next")
                             .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let next = this.quality_next_issue_in(None);
-                                this.jump_to_quality_issue(cx, next);
-                            })),
+                            // 「下一处」也把两项扩展算进翻查队列（见
+                            // `quality_next_issue_any`）：只翻四类的话，
+                            // 「四类全通过、只有语速超限」时这个按钮点了不动。
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    let next = this.quality_next_issue_any(&extras_for_next);
+                                    this.jump_to_quality_issue(cx, next);
+                                },
+                            )),
                         )
                         // 导出质检表：质检结论此前只活在界面里，没法交给别人复核。
                         // 放在这一排而不是塞进导出栏，是因为它属于「质检」这个动作的
@@ -1903,6 +2013,97 @@ fn category_has_issues(report: &QualityReport, category: QualityCategory) -> boo
     }
 }
 
+// ==================== 质检扩展项（语速超限 / 句尾标点） ====================
+
+/// 质检扩展项：不属于 [`QualityCategory`] 四类、但同样值得复核的两项。
+///
+/// 为什么不是新的 `QualityCategory` 变体：那四类的判据与桶都在
+/// `subtitle::segment`（另一个文件的改动范围），这里的两个判据来自
+/// `subtitle::timing::cps_violations` 与 `subtitle::qc::plan_punctuation_fix`，
+/// 只在界面层合成。展示语义与四类一致：给句数 + 点击跳到第一处。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtraQuality {
+    /// 阅读速度超限（`VisibleChars / 时长` 超过上限）。
+    CpsOverLimit,
+    /// 句尾缺收尾标点（**只报告、绝不改文本**）。
+    MissingTerminalPunctuation,
+}
+
+impl ExtraQuality {
+    /// 全部扩展项，顺序即胶囊展示顺序。
+    const ALL: [ExtraQuality; 2] = [
+        ExtraQuality::CpsOverLimit,
+        ExtraQuality::MissingTerminalPunctuation,
+    ];
+}
+
+/// 扩展项胶囊的文案（纯函数，便于单测）：**0 句返回 `None`**。
+///
+/// 四类判据即使为 0 也保留一枚置灰胶囊（「检查过、结果是 0」是信息）；这两项不同：
+/// 它们不在报告里，挂一枚恒为 0 的胶囊只会稀释真问题的信号，所以 0 句直接不显示。
+///
+/// 文案里**不出现「修复」**：两项的点击行为都只是跳到那一句让用户自己判断
+/// （补标点必须猜语气，工具不替用户改正文），写成「修复」就是误导。
+fn extra_quality_chip_text(kind: ExtraQuality, count: usize) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    Some(match kind {
+        ExtraQuality::CpsOverLimit => format!("语速超限 {count} 句"),
+        ExtraQuality::MissingTerminalPunctuation => format!("句尾标点 {count} 句"),
+    })
+}
+
+/// 两项扩展的句下标快照（按类分桶，桶内升序）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct QualityExtras {
+    /// 语速超限的句下标。
+    cps: Vec<usize>,
+    /// 句尾缺标点的句下标。
+    punctuation: Vec<usize>,
+}
+
+/// [`QualityExtras`] 快照的失效键：`(segments_revision, 语速上限的位模式)`。
+///
+/// # 为什么是这两个键
+///
+/// - `segments_revision`：两项判据都只读字幕文本与时间（`display_text()` / `duration()`），
+///   而**任何**改字幕的入口都必须递增它（编辑 / 拆分合并 / 应用修复 / 换工程 / 载入缓存，
+///   见 `AppState::bump_segments_revision`），所以它是内容变化的唯一失效依据。
+/// - `max_cps_bits`：语速上限不随 revision 变化（改配置不碰字幕），漏进键就是
+///   「调了上限、句数不动」。用 `to_bits` 而不是裸 `f64`：浮点直接进 `PartialEq`
+///   会踩 `-0.0 == 0.0` 与 `NaN != NaN` 两种反直觉语义（与 `DerivedSnapshotKey`
+///   的 `low_confidence_bits` 同法）。
+///
+/// 句尾标点没有额外配置输入（判据只看文本），所以不进键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QualityExtrasKey {
+    /// 字幕内容的修订号。
+    revision: u64,
+    /// 语速上限（[`DEFAULT_MAX_CPS`]）的位模式。
+    max_cps_bits: u64,
+}
+
+/// 扩展项快照的取数：键一致直接复用上次那个 `Arc`，否则现算并换入。
+///
+/// 抽成自由函数（不吃 `AppState` / GUI 上下文）是为了能在单测里钉死两条性质：
+/// 「同键命中不重算、复用同一个 `Arc`」与「revision 或语速上限变了必重算」。
+/// 存 `Arc` 而不是裸结构体：命中路径只加一次引用计数，不 clone 两个 `Vec`。
+fn quality_extras_cached(
+    cache: &mut Option<(QualityExtrasKey, Arc<QualityExtras>)>,
+    key: QualityExtrasKey,
+    build: impl FnOnce() -> QualityExtras,
+) -> Arc<QualityExtras> {
+    if let Some((cached_key, value)) = cache.as_ref() {
+        if *cached_key == key {
+            return Arc::clone(value);
+        }
+    }
+    let value = Arc::new(build());
+    *cache = Some((key, Arc::clone(&value)));
+    value
+}
+
 // ==================== 「修复常见错误」快照缓存 ====================
 
 /// 「修复常见错误」区块的现值：一次整表扫描的命中清单 + 相邻重复句分组。
@@ -1935,6 +2136,8 @@ struct TranscribeDerivedCache {
     progress_detail: Option<SharedString>,
     /// 批量队列每行的文件名 / 阶段名
     queue_text: QueueTextCache,
+    /// 质检扩展项（语速超限 / 句尾标点）的句下标快照，键见 [`QualityExtrasKey`]
+    quality_extras: Option<(QualityExtrasKey, Arc<QualityExtras>)>,
 }
 
 impl Global for TranscribeDerivedCache {}
@@ -2019,9 +2222,10 @@ fn queue_text_cached(
 #[cfg(test)]
 mod tests {
     use super::{
-        category_has_issues, cleanup_preview_cached, cleanup_sample, is_last_stream_row,
-        quality_chip_label, queue_progress_view, queue_text_cached, shared_string_cached,
-        transcribe_status_pill, truncate_for_ui, CleanupPreview, CleanupPreviewKey,
+        category_has_issues, cleanup_preview_cached, cleanup_sample, extra_quality_chip_text,
+        is_last_stream_row, quality_chip_label, quality_extras_cached, queue_progress_view,
+        queue_text_cached, shared_string_cached, transcribe_status_pill, truncate_for_ui,
+        CleanupPreview, CleanupPreviewKey, ExtraQuality, QualityExtras, QualityExtrasKey,
         QueueProgressView, QueueTextCache, StatusPill, StepChain, StepPhase,
     };
     use crate::app::state::{QueueItem, QueueState};
@@ -2276,6 +2480,125 @@ mod tests {
         ));
         assert!(category_has_issues(&report, QualityCategory::Untranslated));
         assert!(!category_has_issues(&report, QualityCategory::EmptyOrShort));
+    }
+
+    /// 扩展项胶囊：0 句**不显示**（返回 `None`），非零给出「N 句」计数。
+    #[test]
+    fn extra_quality_chip_hidden_at_zero_and_counted_when_positive() {
+        assert_eq!(
+            extra_quality_chip_text(ExtraQuality::CpsOverLimit, 0),
+            None,
+            "0 句不挂胶囊：恒为 0 的胶囊只会稀释真问题的信号"
+        );
+        assert_eq!(
+            extra_quality_chip_text(ExtraQuality::MissingTerminalPunctuation, 0),
+            None
+        );
+        assert_eq!(
+            extra_quality_chip_text(ExtraQuality::CpsOverLimit, 3).as_deref(),
+            Some("语速超限 3 句")
+        );
+        assert_eq!(
+            extra_quality_chip_text(ExtraQuality::MissingTerminalPunctuation, 12).as_deref(),
+            Some("句尾标点 12 句")
+        );
+    }
+
+    /// 两项的点击行为都只是「跳过去看一眼」，文案不许出现「修复」这类承诺改文本的
+    /// 字眼（补标点必须猜语气，工具不替用户改正文），且统一以「N 句」收尾。
+    #[test]
+    fn extra_quality_chip_copy_never_promises_a_fix() {
+        for kind in ExtraQuality::ALL {
+            let text = extra_quality_chip_text(kind, 2).expect("非零必须有文案");
+            assert!(!text.contains("修复"), "文案不得承诺修复：{text}");
+            assert!(text.ends_with("句"), "统一以「N 句」收尾：{text}");
+        }
+    }
+
+    /// 扩展项快照的缓存键：同一 `(revision, 语速上限)` 只建一次，并复用同一个 `Arc`。
+    #[test]
+    fn quality_extras_cache_reuses_same_key() {
+        let key = QualityExtrasKey {
+            revision: 7,
+            max_cps_bits: 9.0f64.to_bits(),
+        };
+        let mut cache: Option<(QualityExtrasKey, Arc<QualityExtras>)> = None;
+        let builds = std::cell::Cell::new(0u32);
+        let first = quality_extras_cached(&mut cache, key, || {
+            builds.set(builds.get() + 1);
+            QualityExtras {
+                cps: vec![2, 5],
+                punctuation: vec![9],
+            }
+        });
+        let second = quality_extras_cached(&mut cache, key, || {
+            builds.set(builds.get() + 1);
+            QualityExtras::default()
+        });
+        assert_eq!(builds.get(), 1, "同键必须命中，不得重算");
+        assert!(Arc::ptr_eq(&first, &second), "同键必须复用同一个 Arc");
+        assert_eq!(second.cps, vec![2, 5]);
+        assert_eq!(second.punctuation, vec![9]);
+    }
+
+    /// 失效键之一：`segments_revision` 变了（任何改字幕的入口都会推进它）必须重算。
+    #[test]
+    fn quality_extras_cache_recomputes_after_revision_bump() {
+        let key = |revision: u64| QualityExtrasKey {
+            revision,
+            max_cps_bits: 9.0f64.to_bits(),
+        };
+        let mut cache: Option<(QualityExtrasKey, Arc<QualityExtras>)> = None;
+        let builds = std::cell::Cell::new(0u32);
+        let first = quality_extras_cached(&mut cache, key(1), || {
+            builds.set(builds.get() + 1);
+            QualityExtras::default()
+        });
+        let second = quality_extras_cached(&mut cache, key(1), || {
+            builds.set(builds.get() + 1);
+            QualityExtras::default()
+        });
+        assert_eq!(builds.get(), 1, "同 revision 只建一次");
+        assert!(Arc::ptr_eq(&first, &second));
+        let third = quality_extras_cached(&mut cache, key(2), || {
+            builds.set(builds.get() + 1);
+            QualityExtras {
+                cps: vec![4],
+                punctuation: vec![],
+            }
+        });
+        assert_eq!(builds.get(), 2, "revision 变了必须重算");
+        assert_eq!(third.cps, vec![4], "换键必须拿到新结果");
+    }
+
+    /// 失效键之二：语速上限变了必须重算（它不进 `segments_revision`——改配置不碰字幕）。
+    #[test]
+    fn quality_extras_cache_recomputes_after_cps_limit_change() {
+        let key = |max_cps: f64| QualityExtrasKey {
+            revision: 5,
+            max_cps_bits: max_cps.to_bits(),
+        };
+        let mut cache: Option<(QualityExtrasKey, Arc<QualityExtras>)> = None;
+        let builds = std::cell::Cell::new(0u32);
+        quality_extras_cached(&mut cache, key(9.0), || {
+            builds.set(builds.get() + 1);
+            QualityExtras::default()
+        });
+        let strict = quality_extras_cached(&mut cache, key(9.0), || {
+            builds.set(builds.get() + 1);
+            QualityExtras::default()
+        });
+        assert_eq!(builds.get(), 1, "同一上限命中缓存");
+        assert!(strict.cps.is_empty());
+        let loose = quality_extras_cached(&mut cache, key(17.0), || {
+            builds.set(builds.get() + 1);
+            QualityExtras {
+                cps: vec![1, 3],
+                punctuation: vec![],
+            }
+        });
+        assert_eq!(builds.get(), 2, "上限变了必须重算（revision 没变）");
+        assert_eq!(loose.cps, vec![1, 3]);
     }
 
     /// 「修复常见错误」快照缓存的两条性质：同键命中不重算且复用同一个 `Arc`，

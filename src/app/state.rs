@@ -1520,6 +1520,61 @@ impl AppState {
         Ok(self.config.translate.glossary_entries().len())
     }
 
+    /// 从 `.txt` / `.csv` 导入术语表并与现有表合并（同名以导入的为准）。
+    ///
+    /// 解析规则见 `utils::glossary`：`.csv`（不分大小写）走 `glossary::from_csv`，
+    /// 其余扩展名一律按「一行一条 `原文=译文`」走 `glossary::parse`。合并用
+    /// `glossary::merge`（`incoming` 覆盖同名、忽略大小写、空来源跳过），结果以
+    /// `glossary::to_text` 写回**当前的术语表字段** `config.translate.glossary`，
+    /// 再走既有落盘入口 [`Self::persist_config_to`]。
+    ///
+    /// 返回 `(新增, 覆盖, 未变)`——三个数都来自 `glossary::MergeReport`，界面直接引用
+    /// 即可，不要自己再数一遍（两处口径迟早分叉）。
+    pub fn import_glossary_file(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::io::Result<(usize, usize, usize)> {
+        self.import_glossary_file_to(path, "config.toml")
+    }
+
+    /// [`Self::import_glossary_file`] 的可注入落盘路径版本（单测用）。
+    ///
+    /// 与 [`Self::persist_config_to`] 同一套路：单测调用导入时不能去写仓库根的
+    /// `config.toml`（那会覆盖开发机上的真实配置）。
+    fn import_glossary_file_to(
+        &mut self,
+        path: &std::path::Path,
+        config_path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<(usize, usize, usize)> {
+        let text = std::fs::read_to_string(path)?;
+        // 表格软件「另存为 UTF-8」几乎都会带 BOM；这里统一吃掉，`from_csv` 自己也认。
+        let body = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
+        let is_csv = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"));
+        let incoming = if is_csv {
+            crate::utils::glossary::from_csv(body)
+        } else {
+            crate::utils::glossary::parse(body)
+        };
+        // base 取现有那份文本的解析结果：合并发生在**结构层**，文本只是存储表示。
+        let base = crate::utils::glossary::parse(&self.config.translate.glossary);
+        let (merged, report) = crate::utils::glossary::merge(&base, &incoming);
+        self.config.translate.glossary = crate::utils::glossary::to_text(&merged);
+        self.persist_config_to(config_path);
+        Ok((report.added, report.overwritten, report.unchanged))
+    }
+
+    /// 把当前术语表导出成 CSV 文本（不落盘，交给调用方选路径）。
+    ///
+    /// 走 `glossary::to_csv`：首行表头 `source,target`，字段按最小 RFC4180 规则转义。
+    /// 与 [`Self::import_glossary_file`] 共用同一套结构层，导出再导入逐条往返不丢内容。
+    pub fn export_glossary_csv_text(&self) -> String {
+        let entries = crate::utils::glossary::parse(&self.config.translate.glossary);
+        crate::utils::glossary::to_csv(&entries)
+    }
+
     /// 已有多少条字幕带译文（不论目标语言）。
     ///
     /// 用于**导出模式判定**（有译文就默认走双语导出）——那个场景不该关心译文是哪国语言。
@@ -1619,6 +1674,96 @@ impl AppState {
     }
     pub fn set_selected_file(&mut self, path: PathBuf) {
         self.selected_file = Some(path);
+    }
+
+    // ─────────── 阶段产物目录（GUI 断点续跑）───────────
+
+    /// 阶段产物根目录名（与 CLI 的 `resolve_artifact_root` 同一约定）。
+    const STAGE_DIR_NAME: &str = ".voice2word-stages";
+
+    /// 同一个产物根下最多保留几个子目录（按 mtime 从新到旧），更旧的在开工时清掉。
+    ///
+    /// 缓存是「跑崩了不用从头来」的兜底，不是资产；留最近几支片子的中间结果足够用，
+    /// 无上限地堆积只会把素材目录越撑越大。
+    const STAGE_KEEP_RECENT: usize = 8;
+
+    /// `媒体文件 → 阶段产物目录`：`<文件所在目录>/.voice2word-stages/<文件 stem>`。
+    ///
+    /// 口径与 CLI 的 `resolve_artifact_root` + `file_stem` **逐字一致**（见 `cli.rs`）：
+    /// 桌面端与命令行跑同一支片子时必须命中同一份缓存，绝不能各写一套——两套口径意味着
+    /// 同一个文件在 CLI 能续跑、在界面里却从头再来。取不到 stem 时回落 `"output"`，
+    /// 无父目录时回落当前目录 `"."`，同样与 CLI 一致。
+    pub fn stage_artifact_dir(media: &std::path::Path) -> std::path::PathBuf {
+        let stem = media
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "output".to_string());
+        let base = match media.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        };
+        base.join(Self::STAGE_DIR_NAME).join(stem)
+    }
+
+    /// 为即将开工的媒体铺好阶段产物目录并挂到管线（桌面端断点续跑的入口）。
+    ///
+    /// # 三条口径
+    ///
+    /// - **只在真正开工时创建**：本方法由开工路径调用；程序启动、仅仅在文件对话框里
+    ///   选一圈文件都**不碰磁盘**，否则用户每浏览一次素材就在每个目录里撒一个空目录。
+    /// - **换文件不读别人的产物**：目录按「文件 stem」分家；即使两支片子同名共用一个根，
+    ///   管线读取时还有归属信封（`core::pipeline` 的 `StageArtifacts::owned_by`）核对
+    ///   产出它的输入媒体，不符就当没有产物重算。这里只要保证传对目录。
+    /// - **旧产物会被清掉**：同根下按 mtime 只保留最近 [`Self::STAGE_KEEP_RECENT`] 个
+    ///   子目录，更旧的整体删除（best-effort，失败只记日志，绝不让开工失败）。
+    ///
+    /// # 回退开关
+    ///
+    /// 「目录不存在就不续跑」即是天然开关：只要管线 `artifact_dir` 还是 `None`，落盘与
+    /// 续跑都关闭，行为与历史版本逐字一致。本轮**不改 `config.rs`**，因此不做持久化开关；
+    /// 要让某次转写不续跑，删掉该目录或用 [`Self::disable_stage_artifacts`]。
+    ///
+    /// `media` 的父目录必须真实存在（GUI 里是文件对话框选出的绝对路径）。测试与
+    /// 相对路径（如 `"a.mp4"`）会在这里被挡下，避免在仓库根散落 `.voice2word-stages`。
+    pub fn prepare_stage_artifacts(
+        &self,
+        media: &std::path::Path,
+    ) -> std::io::Result<std::path::PathBuf> {
+        let Some(parent) = media
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "媒体路径没有所在目录，无法放置阶段产物: {}",
+                    media.display()
+                ),
+            ));
+        };
+        if !parent.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("媒体所在目录不存在: {}", parent.display()),
+            ));
+        }
+        let dir = Self::stage_artifact_dir(media);
+        if let Some(root) = dir.parent() {
+            prune_stale_stage_dirs(root, Self::STAGE_KEEP_RECENT);
+        }
+        std::fs::create_dir_all(&dir)?;
+        self.pipeline.set_artifact_dir(Some(dir.clone()));
+        Ok(dir)
+    }
+
+    /// 关闭阶段产物落盘与断点续跑（管线行为回到历史默认：不写、不读）。
+    pub fn disable_stage_artifacts(&self) {
+        self.pipeline.set_artifact_dir(None);
+    }
+
+    /// 当前生效的阶段产物目录（`None` = 未开启落盘 / 续跑）。
+    pub fn stage_artifacts_dir(&self) -> Option<std::path::PathBuf> {
+        self.pipeline.artifact_dir()
     }
 
     /// 重新读取历史库列表并替换内存缓存。
@@ -2015,11 +2160,29 @@ impl AppState {
     /// 顺带把本条进度清零：条目重跑（失败重排、或用户再点一次「开始全部」）时，
     /// 不清就会带着上一轮残留的百分比进新任务——第一批进度事件到达前它一直挂在
     /// 卡片上，看起来就像「刚开始就已经跑到 80%」。
+    ///
+    /// 真正开工：铺好这一条的阶段产物目录，桌面端批量跑崩了可从产物续跑。
+    ///
+    /// 放在这里的理由：这是**批量模式**里「开始跑某一条」的唯一状态入口（`ui/actions.rs`
+    /// 的 `start_processing_for` 在标记转写中时调用）。单文件模式不走队列，由开工路径直接
+    /// 调 [`Self::prepare_stage_artifacts`]（同一支片子的同一口径，桌面端与 CLI 共用缓存）。
+    /// 目录建不起来只记一条日志：续跑是加速手段，不能反过来挡住转写。
     pub fn mark_queue_running(&mut self, idx: usize) {
-        if let Some(item) = self.batch_queue.get_mut(idx) {
-            item.state = QueueState::Running;
-            item.progress = 0.0;
-            item.stage = None;
+        let path = match self.batch_queue.get_mut(idx) {
+            Some(item) => {
+                item.state = QueueState::Running;
+                item.progress = 0.0;
+                item.stage = None;
+                item.path.clone()
+            }
+            None => return,
+        };
+        if let Err(err) = self.prepare_stage_artifacts(&path) {
+            tracing::warn!(
+                error = %err,
+                path = %path.display(),
+                "阶段产物目录不可用，本次不落盘 / 不续跑"
+            );
         }
     }
 
@@ -3275,6 +3438,47 @@ impl AppState {
         plan
     }
 
+    /// 阅读速度超限的句下标（上限见 [`crate::subtitle::DEFAULT_MAX_CPS`]）。
+    ///
+    /// 薄封装 [`crate::subtitle::cps_violations`]：可见字符数与统计面板同一口径，
+    /// 上限非法 / 非正时按字符集分档回落，零长与倒挂句也入列。只读 `segments`。
+    pub fn cps_violation_indices(&self, max_cps: f64) -> Vec<usize> {
+        crate::subtitle::cps_violations(&self.segments, max_cps)
+    }
+
+    /// 句尾标点缺失的复核计划（只报告，不改文本）。
+    ///
+    /// 薄封装 [`crate::subtitle::plan_punctuation_fix`]：补标点必须猜语气，工具不替用户
+    /// 改正文，这里只产出「哪几句值得看一眼」。只读 `segments`。
+    pub fn punctuation_plan(&self) -> crate::subtitle::PunctuationPlan {
+        crate::subtitle::plan_punctuation_fix(&self.segments)
+    }
+
+    /// 按 [`crate::subtitle::plan_cps_fix`] 延长过短句的终点（只动时间、不动文本）。
+    ///
+    /// 写回口径与 [`Self::apply_cleanup`] 逐条一致：有改动时先
+    /// [`Self::snapshot_for_undo`] 压快照，再改 `segments`、置脏、递增修订号、落库；
+    /// **无改动不压撤销点**（空操作占掉一层 Ctrl+Z 会让用户觉得「撤销坏了」）。
+    ///
+    /// `plan_cps_fix` 保证 `plan.times` 与输入等长同序，因此这里按下标逐条写回即可；
+    /// 上限 / 时长下限的默认值分别为 [`crate::subtitle::DEFAULT_MAX_CPS`] 与
+    /// [`crate::subtitle::MIN_EDIT_DUR`]，界面传参不要硬编码这两个数字。
+    pub fn apply_cps_fix(&mut self, max_cps: f64, min_dur: f64) -> crate::subtitle::CpsFixPlan {
+        let plan = crate::subtitle::plan_cps_fix(&self.segments, max_cps, min_dur);
+        if !plan.has_changes() {
+            return plan;
+        }
+        self.snapshot_for_undo();
+        for (seg, (start, end)) in self.segments.iter_mut().zip(plan.times.iter()) {
+            seg.start = *start;
+            seg.end = *end;
+        }
+        self.segments_dirty = true;
+        self.bump_segments_revision();
+        self.flush_segments_if_dirty();
+        plan
+    }
+
     /// 相邻重复句的预览（界面据此显示「N 组重复、可删 M 句」）。
     pub fn duplicate_cue_groups(&self) -> Vec<crate::subtitle::cleanup::DuplicateGroup> {
         crate::subtitle::cleanup::duplicate_groups(&self.segments)
@@ -3450,6 +3654,41 @@ impl AppState {
 ///
 /// 编辑日志是有界的、还要整份进导出，把整句（甚至整段）塞进 before/after 会让
 /// 日志体积随素材长度线性膨胀；而审计要回答的是「改过什么」，一句样例就够。
+/// 只保留 `root` 下最近 `keep` 个子目录（按 mtime 从新到旧），其余尽力删除，返回删除数。
+///
+/// 纯 best-effort：读目录失败、条目不是目录、取不到 mtime、删除失败都静默跳过——清缓存
+/// 绝不能反过来挡住一次转写开工。只删 `root` 的**子目录**，不碰 `root` 自身，也不删文件
+/// （阶段产物是「一阶段一文件」放在子目录里）。`root` 不存在时直接返回 0。
+fn prune_stale_stage_dirs(root: &std::path::Path, keep: usize) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut dirs: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        dirs.push((modified, entry.path()));
+    }
+    if dirs.len() <= keep {
+        return 0;
+    }
+    // 新的在前；越界的那批就是「最旧且超出保留额度」的。
+    dirs.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let mut removed = 0usize;
+    for (_, path) in dirs.into_iter().skip(keep) {
+        if std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
 fn audit_snippet(text: &str) -> String {
     const MAX_CHARS: usize = 40;
     let flat = text.replace(['\r', '\n'], " ");
@@ -6658,5 +6897,232 @@ mod tests {
         assert!(state.db_write_error.is_none(), "这条路径不该产生写库错误");
         let loaded = state.db.load_task_segments(id).expect("读回后台写的字幕");
         assert_eq!(loaded[0].text, "改动", "内容必须真的落库");
+    }
+}
+
+/// 新增接口（术语导入导出 / CPS 修正 / 阶段产物目录）的定向单测。
+///
+/// 刻意不写 `use super::…` 这种通配导入：只显式引入被测项，把实现细节挡在测试命名空间之外——
+/// 断言写出来是什么就是什么，不会因一条新增的私有 helper 而悄悄改义。
+#[cfg(test)]
+mod glossary_cps_and_stage_artifacts {
+    use super::AppState;
+    use crate::subtitle::Segment;
+    use std::path::{Path, PathBuf};
+
+    /// 造一个不碰显卡 / 真实 `config.toml` 的最小 AppState。
+    fn fresh_state(segments: Vec<Segment>) -> AppState {
+        use crate::engines::{FFmpegEngine, HardwareProfile, LLMEngine, WhisperEngine};
+        use crate::storage::Database;
+        use crate::utils::AppConfig;
+        use std::sync::Arc;
+
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let pipeline = Arc::new(crate::core::TaskPipeline::new(
+            Arc::new(FFmpegEngine::new("ffmpeg")),
+            Arc::new(WhisperEngine::new("whisper-cli", "ggml-small.bin", 4, 1)),
+            None,
+            Arc::new(LLMEngine::new("llama-cli", "model.gguf", 2048, 4)),
+            None,
+        ));
+        let mut state = AppState::with_hardware(
+            AppConfig::default(),
+            db,
+            pipeline,
+            HardwareProfile::cpu_only(),
+        );
+        state.segments = segments;
+        state
+    }
+
+    /// 临时目录里的唯一名字（避免同批测试互相踩）。
+    fn unique(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("v2w_{tag}_{nanos}"))
+    }
+
+    /// 导入 `.txt`：新增 / 覆盖 / 未变三个数必须如实分桶，且合并结果写回术语表字段。
+    #[test]
+    fn import_glossary_file_counts_added_overwritten_unchanged() {
+        let dir = unique("gloss_txt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("incoming.txt");
+        // b / C 命中已有条目（b 换了译法、C 逐字相同），D 是新的。
+        std::fs::write(&src, "b=B2\nC=丙\nD=丁\n").unwrap();
+
+        let cfg = dir.join("config.toml");
+        let mut state = fresh_state(Vec::new());
+        state.config.translate.glossary = "A=甲\nB=乙\nC=丙\n".to_string();
+
+        let (added, overwritten, unchanged) = state
+            .import_glossary_file_to(&src, &cfg)
+            .expect("导入应成功");
+
+        assert_eq!((added, overwritten, unchanged), (1, 1, 1));
+        // 覆盖留在原位、新增追加在后：b 的译法已更新、D 已写入、A 一字未动。
+        let text = state.config.translate.glossary.clone();
+        assert!(text.contains("b=B2"), "覆盖后译文应更新: {text}");
+        assert!(text.contains("D=丁"), "新增条目应写回: {text}");
+        assert!(text.contains("A=甲"), "未命中的旧条目必须保留: {text}");
+        assert_eq!(
+            text.lines().next(),
+            Some("A=甲"),
+            "覆盖应留在原位，不挪到末尾"
+        );
+        assert!(cfg.is_file(), "必须走既有落盘入口写出配置文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 导入 `.csv`：按扩展名选 `from_csv`，带 BOM 与表头也能读。
+    #[test]
+    fn import_glossary_file_reads_csv_by_extension() {
+        let dir = unique("gloss_csv");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("incoming.csv");
+        std::fs::write(&src, "\u{FEFF}source,target\nOBS,obs studio\n").unwrap();
+
+        let cfg = dir.join("config.toml");
+        let mut state = fresh_state(Vec::new());
+        let (added, overwritten, unchanged) = state
+            .import_glossary_file_to(&src, &cfg)
+            .expect("导入应成功");
+
+        assert_eq!((added, overwritten, unchanged), (1, 0, 0));
+        assert!(state.config.translate.glossary.contains("OBS=obs studio"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 导出 CSV：表头固定，含逗号的字段按 RFC4180 加引号。
+    #[test]
+    fn export_glossary_csv_text_writes_header_and_escapes() {
+        let mut state = fresh_state(Vec::new());
+        state.config.translate.glossary = "苹果=apple\na,b=c\n".to_string();
+
+        let csv = state.export_glossary_csv_text();
+        assert!(csv.starts_with("source,target\n"), "首行必须是表头: {csv}");
+        assert!(csv.contains("苹果,apple\n"));
+        assert!(csv.contains("\"a,b\",c\n"), "含逗号字段必须加引号: {csv}");
+    }
+
+    /// CPS 修正：有改动压撤销点且可撤销；无改动一个撤销点都不许压。
+    #[test]
+    fn apply_cps_fix_is_undoable_and_noop_pushes_nothing() {
+        // 10 个汉字塞进 1 秒 = 10 字/秒 > 默认上限 9 → 必然被延长。
+        let mut state = fresh_state(vec![Segment::new(1, 0.0, 1.0, "一二三四五六七八九十")]);
+        let plan = state.apply_cps_fix(crate::subtitle::DEFAULT_MAX_CPS, 0.0);
+
+        assert!(plan.has_changes(), "超速句必须被规划进改动");
+        assert!(state.can_undo(), "有改动必须压一层撤销点");
+        assert!(
+            state.segments[0].end > 1.0,
+            "终点应被延长: {:?}",
+            state.segments[0]
+        );
+
+        assert!(state.undo(), "撤销应成功");
+        assert!(
+            (state.segments[0].end - 1.0).abs() < 1e-9,
+            "撤销后终点回到原值: {:?}",
+            state.segments[0]
+        );
+
+        // 已经读得完的句子：无改动，不许占撤销栈、不许动时间。
+        let mut calm = fresh_state(vec![Segment::new(1, 0.0, 5.0, "短句")]);
+        let before = calm.can_undo();
+        let plan = calm.apply_cps_fix(crate::subtitle::DEFAULT_MAX_CPS, 0.0);
+        assert!(!plan.has_changes());
+        assert_eq!(calm.can_undo(), before, "无改动不许压撤销点");
+        assert!(!calm.can_undo());
+        assert!(
+            (calm.segments[0].end - 5.0).abs() < 1e-9,
+            "无改动不许动时间"
+        );
+    }
+
+    /// 只读薄封装：CPS 违规下标与标点复核都按 `segments` 现算。
+    #[test]
+    fn cps_and_punctuation_wrappers_report_without_mutating() {
+        let state = fresh_state(vec![
+            Segment::new(1, 0.0, 1.0, "一二三四五六七八九十"),
+            Segment::new(2, 2.0, 6.0, "没问题。"),
+        ]);
+        assert_eq!(
+            state.cps_violation_indices(crate::subtitle::DEFAULT_MAX_CPS),
+            vec![1]
+        );
+        let plan = state.punctuation_plan();
+        assert_eq!(plan.indices, vec![1], "第一句没有句尾标点");
+        assert_eq!(plan.skipped, 0);
+    }
+
+    /// 续跑目录口径：桌面端与 CLI 必须算出同一个目录（同级 `.voice2word-stages/<stem>`）。
+    #[test]
+    fn stage_artifact_dir_matches_cli_convention() {
+        let media = Path::new("media").join("clips").join("talk.mp4");
+        let got = AppState::stage_artifact_dir(&media);
+        let want = Path::new("media")
+            .join("clips")
+            .join(".voice2word-stages")
+            .join("talk");
+        assert_eq!(got, want);
+
+        // 无父目录时与 CLI 一样回落到当前目录。
+        assert_eq!(
+            AppState::stage_artifact_dir(Path::new("talk.mp4")),
+            Path::new(".").join(".voice2word-stages").join("talk")
+        );
+    }
+
+    /// 开工时建目录并挂到管线；可一键关掉；相对路径不会被误当作可续跑位置。
+    #[test]
+    fn prepare_stage_artifacts_creates_dir_and_attaches_then_can_be_disabled() {
+        let root = unique("stage_prepare");
+        std::fs::create_dir_all(&root).unwrap();
+        let media = root.join("talk.mp4");
+        std::fs::write(&media, b"x").unwrap();
+
+        let state = fresh_state(Vec::new());
+        assert_eq!(state.stage_artifacts_dir(), None, "开局必须是关闭状态");
+
+        let dir = state.prepare_stage_artifacts(&media).expect("应能建目录");
+        assert_eq!(dir, root.join(".voice2word-stages").join("talk"));
+        assert!(dir.is_dir(), "真正开工时才创建目录");
+        assert_eq!(state.stage_artifacts_dir(), Some(dir));
+
+        state.disable_stage_artifacts();
+        assert_eq!(state.stage_artifacts_dir(), None);
+
+        // 相对路径（没有真实父目录）必须被挡下：不许在仓库根散落 `.voice2word-stages`。
+        assert!(state
+            .prepare_stage_artifacts(Path::new("talk.mp4"))
+            .is_err());
+        assert_eq!(state.stage_artifacts_dir(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 旧产物清理：超出保留额度的最旧子目录被整体删除，额度内一个都不动。
+    #[test]
+    fn prune_stale_stage_dirs_keeps_only_recent() {
+        use super::prune_stale_stage_dirs;
+
+        let root = unique("stage_prune");
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("01_extract_audio.json"), b"{}").unwrap();
+        }
+
+        // keep = 0：三个子目录都超出额度、理应全被清掉（与 mtime 顺序无关，断言稳定）。
+        assert_eq!(prune_stale_stage_dirs(&root, 0), 3);
+        for name in ["a", "b", "c"] {
+            assert!(!root.join(name).exists(), "{name} 应被删掉");
+        }
+        // 根目录自身留着；空目录上再跑一次不 panic。
+        assert!(root.is_dir());
+        assert_eq!(prune_stale_stage_dirs(&root, 8), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
