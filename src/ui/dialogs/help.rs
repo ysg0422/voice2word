@@ -4,8 +4,9 @@
 //!
 //! 快捷键此前只有散落在界面各处的零碎提示（状态栏、按钮 title），用户在剪辑台里
 //! 想确认「删除当前句到底是哪个键」时无处可查；键位表 [`shortcuts::SHORTCUT_SPECS`]
-//! 又只活在代码里。F1 面板把那张表整块摊开给用户，且**内容与分组直接由键位表推导**
-//! （见 [`shortcuts::grouped_shortcut_rows`]），所以面板上写的就是真正注册的键位，
+//! 又只活在代码里。F1 面板把那张表整块摊开给用户，且**内容与分组直接由合成后的绑定
+//! 推导**（见 [`shortcuts::resolve_bindings`] / [`shortcuts::resolved_shortcut_rows`]），
+//! 所以面板上写的就是真正注册的键位——用户在设置里改过键位也照样如实显示，
 //! 不会出现「照着面板按却没反应」。
 //!
 //! 本文件只做排版：分组、顺序、去重都在 `shortcuts` 模块里（纯函数、有单测覆盖）。
@@ -44,11 +45,18 @@ impl MainWindow {
             cx,
         );
 
-        let groups = shortcuts::grouped_shortcut_rows();
+        // 渲染源是「默认表 + 用户覆盖」的合成结果：设置里改过的键位，面板上显示的就是
+        // 改后的键位，与真正注册的绑定一致。
+        let overrides = crate::utils::AppConfig::load_from_file("config.toml")
+            .map(|config| config.shortcuts.overrides)
+            .unwrap_or_default();
+        let (resolved, _conflicts) =
+            shortcuts::resolve_bindings(&shortcuts::SHORTCUT_SPECS, &overrides);
+        let groups = shortcuts::resolved_shortcut_rows(&resolved);
         let mid = groups.len().div_ceil(2);
         let (left_groups, right_groups) = groups.split_at(mid);
 
-        let column = |entries: &[shortcuts::ShortcutGroup]| -> Div {
+        let column = |entries: &[shortcuts::ResolvedShortcutGroup]| -> Div {
             div()
                 .flex()
                 .flex_col()
@@ -60,7 +68,7 @@ impl MainWindow {
                         .flex()
                         .flex_col()
                         .gap(px(Theme::SPACE_1))
-                        .child(primitives::section_title(*group))
+                        .child(primitives::section_title(group.clone()))
                         .children(rows.iter().map(|(key, hint)| {
                             div()
                                 .flex()
@@ -74,7 +82,7 @@ impl MainWindow {
                                         // 键位用主文字色、说明用次级色：扫一眼面板时
                                         // 视线落在键位上，说明只是注解。
                                         .text_color(Theme::text_primary())
-                                        .child(*key),
+                                        .child(key.clone()),
                                 )
                                 .child(
                                     div()
@@ -82,7 +90,7 @@ impl MainWindow {
                                         .min_w(px(0.0))
                                         .text_size(px(Theme::TEXT_SMALL))
                                         .text_color(Theme::text_secondary())
-                                        .child(*hint),
+                                        .child(hint.clone()),
                                 )
                         }))
                 }))
