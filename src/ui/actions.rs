@@ -854,9 +854,13 @@ impl MainWindow {
     /// 删不删、删哪条由用户决定——`suggested_keeper` 给出建议（保留最早那条，
     /// 它可能已经人工校对过），但按钮不会替他按下。
     pub(crate) fn report_library_duplicates(&mut self, cx: &mut Context<Self>) {
-        use crate::utils::duplicates::{describe, group_by_fingerprint, suggested_removals};
+        use crate::utils::duplicates::{
+            describe_scan, fingerprinted_count, group_by_fingerprint, suggested_removals,
+        };
         let groups = group_by_fingerprint(&self.state.recent_tasks);
-        let mut msg = describe(&groups);
+        // 一条指纹都没有时，「没有发现重复记录」是假阴性（没测 ≠ 通过），
+        // 由 `describe_scan` 统一区分，见那里的说明。
+        let mut msg = describe_scan(&groups, fingerprinted_count(&self.state.recent_tasks));
         if let Some(first) = groups.first() {
             // 附一个具体例子：只说「有 3 组重复」用户不知道从哪下手。
             let sample: Vec<String> = first.names.clone();

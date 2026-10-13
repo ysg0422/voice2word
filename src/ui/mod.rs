@@ -1443,7 +1443,12 @@ impl MainWindow {
         let log_dir = crate::utils::AppConfig::resolve_path("logs");
         let record = crate::utils::crash_report::detect_previous_crash(&log_dir)?;
         Some(format!(
-            "{}　（「性能设置 → 模型与组件 → 导出诊断」可一并附上日志）",
+            // 这里以前写「导出诊断可一并附上日志」，但诊断报告里**并不含日志正文**
+            // （它只采环境/路径/可写性，且有「同样输入 → 逐字节相同输出」的契约，
+            // 塞进日志就破坏了可复现性）。用户照着那句话去导出，拿到的报告里没有堆栈
+            // ——报障时最关键的那段恰好缺了。所以改成把两个东西分开说清：
+            // 堆栈在 logs 目录，诊断导出是另一份环境快照。
+            "{}　（崩溃堆栈在程序目录的 logs 文件夹里；「性能设置 → 模型与组件」可导出环境诊断）",
             crate::utils::crash_report::short_summary(&record)
         ))
     }

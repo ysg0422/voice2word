@@ -130,6 +130,34 @@ pub fn group_by_fingerprint<T: TaskRecordLike>(records: &[T]) -> Vec<DuplicateGr
 /// - 可清理数 = 每组留一条之后剩余的总数（= 总记录数 − 组数）。
 ///
 /// 空输入返回固定文案「没有发现重复记录」，界面可直接用它判断要不要显示提示条。
+/// 这批记录里有几条带指纹——也就是**真正参与比对**的条数。
+///
+/// 为什么要单独暴露它：`describe` 只会说「有没有重复」，而「一条都没比过」与
+/// 「比过了、没重复」在用户看来必须区分开。库里的老记录（或文件已不可读的记录）
+/// 指纹为 `None`，会被 [`group_by_fingerprint`] 跳过；此时若照直说「没有发现重复
+/// 记录」，就是在把**没测**说成**通过**——用户会以为自己的重复项目已经被确认过。
+pub fn fingerprinted_count<T: TaskRecordLike>(records: &[T]) -> usize {
+    records
+        .iter()
+        .filter(|record| {
+            record
+                .content_hash()
+                .is_some_and(|fingerprint| !fingerprint.is_empty())
+        })
+        .count()
+}
+
+/// 查重的用户可见结论（纯函数，便于单测）。
+///
+/// 与 [`describe`] 的区别：先回答「这次到底比没比过」。`fingerprinted` 为 0 时
+/// 绝不能给出「没有重复」这种像结论的话。
+pub fn describe_scan(groups: &[DuplicateGroup], fingerprinted: usize) -> String {
+    if fingerprinted == 0 {
+        return "库里还没有可供比对的指纹（老记录没有指纹，或文件已不可读），暂时无法查重"
+            .to_string();
+    }
+    describe(groups)
+}
 pub fn describe(groups: &[DuplicateGroup]) -> String {
     if groups.is_empty() {
         return "没有发现重复记录".to_string();
@@ -186,6 +214,51 @@ pub fn suggested_removals(group: &DuplicateGroup) -> Vec<i64> {
         .collect()
 }
 
+/// 查重结论的「没测 ≠ 通过」判据。
+#[cfg(test)]
+mod describe_scan_tests {
+    use super::{describe_scan, fingerprinted_count};
+    use crate::storage::TaskRecord;
+
+    fn task(id: i64, fingerprint: Option<&str>) -> TaskRecord {
+        TaskRecord {
+            id,
+            file_path: format!("D:/media/{id}.mp4"),
+            file_name: format!("{id}.mp4"),
+            duration: 1.0,
+            status: "completed".to_string(),
+            created_at: "2026-01-01 00:00:00".to_string(),
+            segments: Vec::new(),
+            segment_count: 0,
+            sample_text: String::new(),
+            segments_loaded: false,
+            has_translation: false,
+            content_hash: fingerprint.map(str::to_string),
+            metrics: None,
+        }
+    }
+
+    /// 一条指纹都没有：结论必须说「无法查重」，绝不能说「没有重复」。
+    #[test]
+    fn no_fingerprints_is_not_a_clean_bill() {
+        let rows = vec![task(1, None), task(2, Some("")), task(3, None)];
+        assert_eq!(fingerprinted_count(&rows), 0);
+        let msg = describe_scan(&[], fingerprinted_count(&rows));
+        assert!(msg.contains("无法查重"), "{msg}");
+        assert!(!msg.contains("没有发现重复"), "不能说成结论：{msg}");
+    }
+
+    /// 比过了、没重复：这时「没有发现重复记录」才是真话。
+    #[test]
+    fn scanned_and_clean_says_no_duplicates() {
+        let rows = vec![task(1, Some("aaa")), task(2, Some("bbb"))];
+        assert_eq!(fingerprinted_count(&rows), 2);
+        assert_eq!(
+            describe_scan(&[], fingerprinted_count(&rows)),
+            "没有发现重复记录"
+        );
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
