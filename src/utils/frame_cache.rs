@@ -89,6 +89,13 @@ pub struct FrameCache {
     max_size: usize,
     /// 距上次磁盘裁剪新增的帧数，攒够 [`PRUNE_EVERY`] 才触发一次目录扫描。
     since_prune: AtomicUsize,
+    /// 预取是否已有一次在跑。
+    ///
+    /// 预取是「发射后不管」的，而在快速拖动时间轴时**每提交一帧就会请求一次预取**：
+    /// 没有这层单飞，拖动几秒就能同时起十几个 FFmpeg，反过来把正在等画面的那次
+    /// 抽帧挤慢——本来是为了更跟手，结果更卡。同一时刻只留一次预取即可：
+    /// 它只负责「下一格」，而下一格在拖动过程中会被随后的请求覆盖。
+    prefetch_busy: std::sync::atomic::AtomicBool,
 }
 
 struct FrameCacheInner {
@@ -137,6 +144,7 @@ impl FrameCache {
             })),
             max_size: max_size.max(1),
             since_prune: AtomicUsize::new(0),
+            prefetch_busy: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -300,6 +308,23 @@ impl FrameCache {
         time_sec: f64,
         ffmpeg: &FFmpegEngine,
     ) -> Result<PathBuf> {
+        // 单飞：已有预取在跑就立刻返回。预取只是「提前把下一格做好」，
+        // 拖动过程中下一次请求很快就会来，重复起 FFmpeg 只会互相抢 CPU。
+        if self
+            .prefetch_busy
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            anyhow::bail!("已有预取在进行中");
+        }
+        // 无论下面哪条 return/早退路径，都要把标志放回去（含 `?` 提前返回）。
+        let _guard = PrefetchGuard(&self.prefetch_busy);
+
         let next_time = Self::next_tick_time(time_sec);
         let sig = Self::signature(video_path);
         let tick = Self::tick_of(next_time);
@@ -371,6 +396,15 @@ impl FrameCache {
     /// 获取当前缓存大小
     pub fn size(&self) -> usize {
         self.lock_cache().map.len()
+    }
+}
+
+/// 预取单飞标志的 RAII 放行器：函数从任何路径返回（含 `?` 传播错误）都会复位。
+struct PrefetchGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for PrefetchGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -614,5 +648,40 @@ mod tests {
         let _ = std::fs::remove_file(&disk_frame);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// 预取必须单飞：已经有一次在跑时，再请求要**立刻**返回 Err。
+    ///
+    /// 回归护栏：快速拖动时每提交一帧都会请求一次预取，没有单飞就会同时起十几个
+    /// FFmpeg，反过来把正在等画面那次抽帧挤慢——为了更跟手反而更卡。
+    #[test]
+    fn prefetch_is_single_flight() {
+        let cache = FrameCache::new(4);
+        cache
+            .prefetch_busy
+            .store(true, std::sync::atomic::Ordering::Release);
+        let ffmpeg = crate::engines::FFmpegEngine::new("ffmpeg-does-not-exist");
+        let err = cache
+            .prefetch_next_tick(std::path::Path::new("C:/v.mp4"), 1.0, &ffmpeg)
+            .expect_err("已有预取在跑时必须被挡下")
+            .to_string();
+        assert!(err.contains("已有预取"), "错误文案要说清原因：{err}");
+        cache
+            .prefetch_busy
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 预取失败也必须把单飞标志放回去：否则一次失败就把预取永久卡死。
+    #[test]
+    fn prefetch_releases_single_flight_flag_after_failure() {
+        let cache = FrameCache::new(4);
+        let ffmpeg = crate::engines::FFmpegEngine::new("definitely-not-a-real-ffmpeg");
+        let _ =
+            cache.prefetch_next_tick(std::path::Path::new("C:/no-such-video.mp4"), 0.0, &ffmpeg);
+        assert!(
+            !cache
+                .prefetch_busy
+                .load(std::sync::atomic::Ordering::Acquire),
+            "失败路径必须放行，否则预取永久卡死"
+        );
     }
 }
