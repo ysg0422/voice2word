@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use super::segment::{ExportMode, Segment};
+use super::segment::{ExportMode, Segment, WordTiming};
 use crate::utils::time::{seconds_to_ass_time, seconds_to_srt_time};
 use crate::utils::SubtitleStyleConfig;
 
@@ -437,6 +437,10 @@ Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bol
         // 颜色只改 PrimaryColour，其余（描边/阴影/边距）沿用当前预设，保持视觉一致。
         let mut speaker_styles: std::collections::BTreeMap<u32, String> =
             std::collections::BTreeMap::new();
+        // 说话人 → 该说话人样式的主色：带逐词标签的行要用它声明「未读」颜色
+        //（`\kf` 只负责时间，颜色得在行内声明，见 `ass_karaoke_text`）。
+        let mut speaker_colors: std::collections::BTreeMap<u32, &'static str> =
+            std::collections::BTreeMap::new();
         if super::segment::has_speaker_labels(segments) {
             for seg in segments {
                 if let Some(spk) = seg.speaker {
@@ -446,8 +450,9 @@ Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bol
                 }
             }
             // 逐个写出说话人样式行
-            for (idx, name) in speaker_styles.values().enumerate() {
+            for (idx, (spk, name)) in speaker_styles.iter().enumerate() {
                 let color = speaker_ass_color(idx);
+                speaker_colors.insert(*spk, color);
                 writeln!(
                     file,
                     "Style: {name},Microsoft YaHei,{size},{color},&H000000FF,{outline},{back},{bold_flag},0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow},{alignment},{margin_lr},{margin_lr},{margin_v},1",
@@ -468,12 +473,38 @@ Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bol
         for seg in segments {
             let start = seconds_to_ass_time(seg.start);
             let end = seconds_to_ass_time(seg.end);
-            // 顺序固定为「先在原文上折行、再转义、最后套本格式自己的标记」：
+            // 顺序固定为「先折行、再插逐词标签、最后转义 + 套本格式自己的标记」：
             // 折行产出的 `\n` 与原文里已有的 `\n`（双语两行）在**同一次**转换里
-            // 变成 ASS 的硬换行 `\N`，折行不会破坏既有的换行标记。
+            // 变成 ASS 的硬换行 `\N`；插标签必须发生在折行**之后**——折行会加换行、
+            // 会在断点吃掉空格，先插标签再折行会数错字数甚至把标签劈成两半。
             let raw = super::segment::export_text_for(seg, mode, with_speaker);
-            let text =
-                escape_ass_text(&wrap_text_capped(&raw, wrap, WRAP_MAX_LINES)).replace('\n', "\\N");
+            let wrapped = wrap_text_capped(&raw, wrap, WRAP_MAX_LINES);
+            // 逐词卡拉OK：只在**原文行**插 `{\kfN}`（N = 厘秒）。没有词级数据、
+            // 词与文本对不上、开关关闭、或这一条正文里只有译文时，一律原样输出。
+            let text = if style.karaoke_word_highlight
+                && !seg.words.is_empty()
+                && karaoke_line_is_source(seg, mode)
+            {
+                // 未读色 = 当前样式这一行的主色（默认样式用配置主色，说话人样式用该
+                // 说话人的颜色），已读色 = 高亮色；两个颜色都只在这条带标签的行里声明。
+                let base_color = match seg.speaker.and_then(|s| speaker_colors.get(&s).copied()) {
+                    Some(color) => color,
+                    None => primary.as_str(),
+                };
+                let lead = format!("\\1c{KARAOKE_SUNG_COLOR}&\\2c{base_color}&");
+                match ass_karaoke_text(seg.display_text(), &seg.words, &raw, &wrapped, &lead) {
+                    Some(annotated) => annotated,
+                    None => {
+                        tracing::warn!(
+                            index = seg.index,
+                            "词级时间戳与当前文本对不上，本句导出不做逐词高亮"
+                        );
+                        ass_plain_text(&wrapped)
+                    }
+                }
+            } else {
+                ass_plain_text(&wrapped)
+            };
             // 有说话人样式就引用它，否则用默认样式
             let style_name = seg
                 .speaker
@@ -680,6 +711,189 @@ fn escape_ass_text(text: &str) -> String {
         }
     }
     out
+}
+
+/// 卡拉OK「已唱」高亮色（`&HAABBGGRR`）。
+///
+/// 与主界面逐词预览的「当前词」强调色同源（薄荷绿）：导出后跟着语音变色的就是这一档。
+/// 「未读」色不写死，用当前样式这一行的主色（换预设 / 换说话人配色都跟着走）。
+const KARAOKE_SUNG_COLOR: &str = "&H0081B910";
+
+/// 保留字符：覆盖码括号（`{` `}`）、转义前缀（`\`）与 Dialogue 行的字段分隔符（`,`）。
+///
+/// 逐词标签只允许插在**普通文本之间**。紧贴这些字符时，不同实现可能把标签当成
+/// 覆盖码的开头、转义序列的一部分、或字段分隔符来处理。碰到这类边界就不插标签
+/// （该词的时长并入上一段），绝不为了多一个标签去赌阅读器的解析差异。
+const KARAOKE_RESERVED_CHARS: [char; 4] = ['\\', '{', '}', ','];
+
+/// 逐词卡拉OK标签：`{\kfN}`，N 为**厘秒**（ASS 卡拉OK时间单位，1/100 秒）。
+///
+/// 用 `\kf`（填充式）而不是 `\k`（整块切换）：一个词往往跨越几百毫秒，`\kf` 在词
+/// 时长内平滑扫过，「跟着声音逐词点亮」的观感更贴合。做不到 `\kf` 的阅读器只会
+/// 忽略这个标签、退回整行静态渲染——不会错位，也不会把文字弄乱。
+/// `lead` 只给首个标签块带属性（颜色声明），后续标签保持最短形式。
+fn karaoke_tag(cs: u32, lead: &str) -> String {
+    format!("{{{lead}\\kf{cs}}}")
+}
+
+/// 折行后的正文 → ASS 最终文本（转义覆盖码 + 把换行换成硬换行 `\N`）。
+fn ass_plain_text(wrapped: &str) -> String {
+    escape_ass_text(wrapped).replace('\n', "\\N")
+}
+
+/// 这一条字幕的正文里是否有「原文行」（逐词标签只插在原文行上）。
+///
+/// - 原文 / 双语：正文一定有原文行（双语时译文在前、原文在最后一行）；
+/// - 仅译文：只有**没有**可用译文时正文才回退成原文，这时才谈得上插标签；
+///   一旦有译文，正文就是译文本身——拿原文的词去标译文只会标错地方。
+fn karaoke_line_is_source(seg: &Segment, mode: ExportMode) -> bool {
+    match mode {
+        ExportMode::RawOnly | ExportMode::Bilingual => true,
+        ExportMode::TranslationOnly => !seg.has_translation(),
+    }
+}
+
+/// 规划逐词卡拉OK标签：返回 `(词首字节偏移, 厘秒时长)`，偏移相对 `text`。
+///
+/// 对齐口径与界面逐词预览同源：按词序在 `text` 里**顺序查找** `word.trim()`。
+/// - 词文本可能带前导空格（识别器逐 token 产出），所以比对用 trim 后的内容；
+/// - 标点恢复 / 润色会往原文里补标点（`今天天气` → `今天，天气。`），因此不能要求
+///   「词拼起来逐字节等于文本」——那会让最常见的工程全部退化成没有高亮；
+/// - 但顺序查找依然要求每个词按顺序出现：改字、删词、词表来自旧识别结果都会在
+///   某一步找不到词 → 返回 `None`，调用方整句降级、不插任何标签。
+///
+/// 时长取「本词结束 − 本词开始」的厘秒，**词间与句尾的静音不摊给任何词**：
+/// 识别器给的是真实发声区间，把静音摊进词里会让高亮提前于声音；跨句衔接的静音
+/// 更不能被上一句的最后一个词吞掉，否则一句说完后字幕还会继续「点亮」到下一句。
+fn plan_karaoke_tags(words: &[WordTiming], text: &str) -> Option<Vec<(usize, u32)>> {
+    if words.is_empty() || text.is_empty() {
+        return None;
+    }
+    let mut plan: Vec<(usize, u32)> = Vec::with_capacity(words.len());
+    let mut cursor = 0usize;
+    for w in words {
+        let needle = w.word.trim();
+        // 纯空白词元、时间非有限的词：与界面逐词预览同一口径，跳过（本就没有可用的
+        // 时间），也不当成「对不上」的证据。
+        if needle.is_empty() || !w.start.is_finite() || !w.end.is_finite() {
+            continue;
+        }
+        let rel = text[cursor..].find(needle)?;
+        let start = cursor + rel;
+        cursor = start + needle.len();
+        // 时间倒挂（end < start）按 0 处理：`\kf0` 合法，绝不会出现负的厘秒值。
+        plan.push((start, ((w.end - w.start).max(0.0) * 100.0).round() as u32));
+    }
+    if plan.is_empty() {
+        None
+    } else {
+        Some(plan)
+    }
+}
+
+/// `at` 这个插入位置是否安全：前一个字符与后一个字符都不能是保留字符。
+fn karaoke_boundary_is_safe(wrapped: &str, at: usize) -> bool {
+    let prev = wrapped[..at].chars().next_back();
+    let next = wrapped[at..].chars().next();
+    let reserved = |c: char| KARAOKE_RESERVED_CHARS.contains(&c);
+    !prev.is_some_and(reserved) && !next.is_some_and(reserved)
+}
+
+/// 把 `raw` 上的字节偏移映射到折行后 `wrapped` 上的偏移（长度 `raw.len() + 1`）。
+///
+/// 折行只做两件事：在断点插入 `\n`、把断点处的空格吃掉；除此之外逐字节保留。
+/// 这里用双指针走一遍，既验证这个前提、又顺便算出整张偏移表；一旦发现别的差异
+/// （万一折行逻辑将来改了）就返回 `None`，调用方放弃插标签——宁可没有高亮，
+/// 也不能把标签插到错的位置上。
+fn map_folded_offsets(raw: &str, wrapped: &str) -> Option<Vec<usize>> {
+    let rb = raw.as_bytes();
+    let wb = wrapped.as_bytes();
+    let mut map = vec![0usize; rb.len() + 1];
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < rb.len() {
+        map[i] = j;
+        if j < wb.len() && rb[i] == wb[j] {
+            i += 1;
+            j += 1;
+        } else if j < wb.len() && wb[j] == b'\n' {
+            // 折行插入的换行：只前进 wrapped 一侧
+            j += 1;
+        } else if rb[i] == b' ' {
+            // 折行在断点吃掉的空格：只前进 raw 一侧
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    if j != wb.len() {
+        return None;
+    }
+    map[rb.len()] = j;
+    Some(map)
+}
+
+/// 给一条 ASS 正文插逐词卡拉OK标签；`None` = 保持原样输出（不插任何标签）。
+///
+/// `text` 是原文行本身（`Segment::display_text()`），`raw` / `wrapped` 分别是折行前、
+/// 折行后的整条正文。
+///
+/// `lead` 是首个标签块里要带上的内联属性（卡拉OK颜色声明）。`\kf` 本身不带颜色，
+/// 它依赖「未读 = SecondaryColour、已读 = PrimaryColour」这套状态机，而样式表里的
+/// SecondaryColour 是没有任何标签时的占位值（红色）。所以在**带标签的这一行**里
+/// 就地声明「已读 = 高亮色、未读 = 当前样式主色」：不动样式表，也不影响同文件里
+/// 没有标签的行（没有标签就没有状态机，行仍按样式主色渲染）。
+fn ass_karaoke_text(
+    text: &str,
+    words: &[WordTiming],
+    raw: &str,
+    wrapped: &str,
+    lead: &str,
+) -> Option<String> {
+    if text.is_empty() || words.is_empty() {
+        return None;
+    }
+    // 原文行必须是正文的后缀：原文 / 双语 / 回退原文三种形态都满足（双语时译文在前、
+    // 原文在最后一行）。不满足说明正文结构和预期不符，直接放弃，绝不按猜出来的位置切文本。
+    let text_at = raw.len().checked_sub(text.len())?;
+    if !raw.ends_with(text) {
+        return None;
+    }
+    let plan = plan_karaoke_tags(words, text)?;
+    let offsets = map_folded_offsets(raw, wrapped)?;
+
+    // 词首位置 → 折行后的插入位置。贴着保留字符的边界不插标签：该词的时长并入
+    // 上一段计时区间（时间不会被吞掉，只是那一个词跟着上一段一起点亮）。
+    let mut inserts: Vec<(usize, u32)> = Vec::with_capacity(plan.len());
+    for (off, cs) in plan {
+        let at = *offsets.get(text_at + off)?;
+        if inserts.is_empty() {
+            if !karaoke_boundary_is_safe(wrapped, at) {
+                continue;
+            }
+            inserts.push((at, cs));
+        } else if karaoke_boundary_is_safe(wrapped, at) {
+            inserts.push((at, cs));
+        } else if let Some(last) = inserts.last_mut() {
+            last.1 = last.1.saturating_add(cs);
+        }
+    }
+    if inserts.is_empty() {
+        return None;
+    }
+
+    // 分段转义再拼标签：转义是逐字符替换，分段转义与整段转义逐字节等价，
+    // 因此标签本身不会被转义，文本也不会被拆坏。
+    let mut out = String::with_capacity(wrapped.len() + inserts.len() * 12);
+    let mut prev = 0usize;
+    let mut first = true;
+    for (at, cs) in inserts {
+        out.push_str(&escape_ass_text(&wrapped[prev..at]));
+        out.push_str(&karaoke_tag(cs, if first { lead } else { "" }));
+        first = false;
+        prev = at;
+    }
+    out.push_str(&escape_ass_text(&wrapped[prev..]));
+    Some(out.replace('\n', "\\N"))
 }
 
 /// 单条字幕最多折成几行（导出侧的折行入口统一走 [wrap_text_capped]）。
@@ -2102,5 +2316,488 @@ mod tests {
         for line in &lines {
             assert!(line.chars().count() <= 12, "行超长: {line:?} / {out:?}");
         }
+    }
+
+    /// 无词级数据（老工程 / 非 Whisper 引擎）时的 ASS 期望值：取自加逐词高亮之前的
+    /// 导出器输出，转成字面量后钉死在这里。
+    const GOLDEN_ASS: &str = "[Script Info]\nTitle: Voice2Word Subtitle\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nTimer: 100.0000\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Microsoft YaHei,40,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,1,0,1,2,1,2,20,20,40,1\nStyle: Speaker1,Microsoft YaHei,40,&H00D1B110,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,1,0,1,2,1,2,20,20,40,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.50,Speaker1,,0,0,0,,说话人 1: First line\\N第一句\nDialogue: 0,0:00:01.50,0:00:03.00,Default,,0,0,0,,第二句\n";
+    ///
+    /// 回归：没有词级时间戳时输出必须与加这个功能之前**逐字节一致**——不插标签、
+    /// 不声明颜色、不多任何前缀。逐词高亮是「有数据才生效」的增强，不许动老工程。
+    #[test]
+    fn ass_without_word_timings_is_byte_identical() {
+        let mut first = Segment::new(1, 0.0, 1.5, "第一句");
+        first.translation = Some("First line".to_string());
+        first.speaker = Some(0);
+        let second = Segment::new(2, 1.5, 3.0, "第二句");
+        let segs = vec![first, second];
+        let temp = std::env::temp_dir().join("test_v2w_karaoke_golden.ass");
+        SubtitleWriter::write_to_file(&segs, &temp, "ass").unwrap();
+        let content = std::fs::read_to_string(&temp).unwrap();
+        assert_eq!(
+            content, GOLDEN_ASS,
+            "无词级数据时 ASS 必须逐字节不变（开关默认开启也不得影响）"
+        );
+        let _ = std::fs::remove_file(temp);
+
+        // 带样式的入口（不折行）同样逐字节一致：两条导出入口都不许无中生有。
+        let styled = write_ass_text(&segs, ExportMode::Bilingual, &karaoke_test_style());
+        assert_eq!(
+            styled, GOLDEN_ASS,
+            "带样式入口在无词级数据时也必须逐字节一致"
+        );
+    }
+
+    /// 逐词标签回归用：把一批片段按给定样式导出成 ASS 并读回文本。
+    ///
+    /// 临时文件名带 pid + 序号，避免并发跑测试时几个用例抢同一个文件。
+    fn write_ass_text(segs: &[Segment], mode: ExportMode, style: &SubtitleStyleConfig) -> String {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temp = std::env::temp_dir().join(format!(
+            "test_v2w_karaoke_{}_{}.ass",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        SubtitleWriter::write_ass_with_style(segs, &temp, mode, style).unwrap();
+        let content = std::fs::read_to_string(&temp).unwrap();
+        let _ = std::fs::remove_file(&temp);
+        content
+    }
+
+    /// 逐词标签回归用：取回每条 Dialogue 的正文（第 10 个字段，允许含逗号）。
+    fn ass_dialogue_texts(content: &str) -> Vec<String> {
+        content
+            .lines()
+            .filter(|l| l.starts_with("Dialogue:"))
+            .map(|l| l.splitn(10, ',').nth(9).unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// 逐词标签回归用：取出正文里所有 `\kfN` 的 N（按出现顺序）。
+    fn karaoke_centiseconds(body: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut rest = body;
+        while let Some(pos) = rest.find("\\kf") {
+            let tail = &rest[pos + 3..];
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = digits.parse::<u32>() {
+                out.push(v);
+            }
+            rest = &tail[digits.len()..];
+        }
+        out
+    }
+
+    /// 逐词标签回归用：去掉所有 `{...}` 覆盖块，只留字幕文字。
+    ///
+    /// 用来核对「插标签不改动文字」：标签以外的字符必须与不插标签时逐字节相同。
+    fn strip_override_blocks(body: &str) -> String {
+        let mut out = String::new();
+        let mut depth = 0usize;
+        for c in body.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' if depth > 0 => depth -= 1,
+                _ if depth == 0 => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// 无折行的样式（测试里只看正文，不掺排版差异）。
+    fn karaoke_test_style() -> SubtitleStyleConfig {
+        SubtitleStyleConfig {
+            max_chars_per_line: 0,
+            ..SubtitleStyleConfig::default()
+        }
+    }
+
+    /// 词级时间戳与文本对齐时：每个词一个 `\kf` 标签，厘秒值 = 本词时长，顺序与文本
+    /// 一致；首个标签块带上颜色声明（已读 = 高亮色，未读 = 当前样式主色）。
+    #[test]
+    fn ass_karaoke_tags_follow_word_timings() {
+        let mut seg = Segment::new(1, 0.0, 2.0, "今天天气很好");
+        seg.words = vec![
+            WordTiming {
+                word: " 今天".to_string(),
+                start: 0.0,
+                end: 1.0,
+            },
+            WordTiming {
+                word: "天气".to_string(),
+                start: 1.0,
+                end: 1.25,
+            },
+            WordTiming {
+                word: " 很好".to_string(),
+                start: 1.25,
+                end: 2.0,
+            },
+        ];
+        let content = write_ass_text(&[seg], ExportMode::RawOnly, &karaoke_test_style());
+        let body = &ass_dialogue_texts(&content)[0];
+
+        assert_eq!(
+            karaoke_centiseconds(body),
+            vec![100, 25, 75],
+            "厘秒值与顺序都要对: {body}"
+        );
+        assert!(
+            body.contains("{\\1c&H0081B910&\\2c&H00FFFFFF&\\kf100}今天{\\kf25}天气{\\kf75}很好"),
+            "标签应紧贴各词、首个块声明颜色: {body}"
+        );
+        assert_eq!(
+            body.matches("\\1c").count(),
+            1,
+            "颜色声明只应出现一次: {body}"
+        );
+    }
+
+    /// 词级时间戳与当前文本对不上（改过原文 / 词表来自旧识别结果）：整句降级、
+    /// 不插任何标签，输出与「本来就没有词级数据」逐字节一致——宁可没有高亮，
+    /// 也不能把文字切错。
+    #[test]
+    fn ass_karaoke_degrades_when_words_do_not_match_text() {
+        let mut mismatched = Segment::new(1, 0.0, 2.0, "今天天气很好");
+        mismatched.words = vec![
+            WordTiming {
+                word: " 昨天".to_string(),
+                start: 0.0,
+                end: 1.0,
+            },
+            WordTiming {
+                word: "不错".to_string(),
+                start: 1.0,
+                end: 2.0,
+            },
+        ];
+        let plain = Segment::new(1, 0.0, 2.0, "今天天气很好");
+        let style = karaoke_test_style();
+
+        let degraded = write_ass_text(&[mismatched], ExportMode::RawOnly, &style);
+        let no_words = write_ass_text(&[plain], ExportMode::RawOnly, &style);
+        assert!(!degraded.contains("\\kf"), "对不上时不得插标签: {degraded}");
+        assert_eq!(degraded, no_words, "降级输出必须与无词级数据完全一致");
+    }
+
+    /// 仅译文模式：正文就是译文本身，绝不拿原文的词去标译文行；译文为空回退原文时照插。
+    #[test]
+    fn ass_karaoke_skips_translation_only_output() {
+        let mut seg = Segment::new(1, 0.0, 2.0, "你好世界");
+        seg.translation = Some("Hello world".to_string());
+        seg.words = vec![
+            WordTiming {
+                word: "你好".to_string(),
+                start: 0.0,
+                end: 1.0,
+            },
+            WordTiming {
+                word: "世界".to_string(),
+                start: 1.0,
+                end: 2.0,
+            },
+        ];
+        let style = karaoke_test_style();
+
+        let content = write_ass_text(
+            std::slice::from_ref(&seg),
+            ExportMode::TranslationOnly,
+            &style,
+        );
+        let body = &ass_dialogue_texts(&content)[0];
+        assert_eq!(body, "Hello world", "仅译文模式不得改动正文: {body}");
+
+        let mut fallback = seg;
+        fallback.translation = None;
+        let content = write_ass_text(&[fallback], ExportMode::TranslationOnly, &style);
+        let body = &ass_dialogue_texts(&content)[0];
+        assert!(
+            body.contains("\\kf100}你好"),
+            "译文回退原文时应照常插标签: {body}"
+        );
+    }
+
+    /// 双语导出：只在原文行（第二行）插标签，译文行一个标签都不插。
+    #[test]
+    fn ass_karaoke_bilingual_tags_source_line_only() {
+        let mut seg = Segment::new(1, 0.0, 2.0, "你好世界");
+        seg.translation = Some("Hello world".to_string());
+        seg.words = vec![
+            WordTiming {
+                word: "你好".to_string(),
+                start: 0.0,
+                end: 1.0,
+            },
+            WordTiming {
+                word: "世界".to_string(),
+                start: 1.0,
+                end: 2.0,
+            },
+        ];
+        let content = write_ass_text(&[seg], ExportMode::Bilingual, &karaoke_test_style());
+        let body = &ass_dialogue_texts(&content)[0];
+        let (trans_line, source_line) = body.split_once("\\N").expect("双语应折成两行");
+
+        assert_eq!(trans_line, "Hello world");
+        assert!(!trans_line.contains("\\kf"), "译文行不得插标签: {body}");
+        assert_eq!(karaoke_centiseconds(source_line), vec![100, 100]);
+        assert!(
+            source_line.contains("{\\1c&H0081B910&\\2c&H00FFFFFF&\\kf100}你好{\\kf100}世界"),
+            "原文行应逐词插标签: {body}"
+        );
+    }
+
+    /// 保留字符净化：标签只允许插在普通文本之间。紧贴 `\` / `{` / `}` / `,`
+    /// 的边界一律不插标签，该词的时长并入上一段（时间不丢，只是跟着上一段一起点亮）。
+    #[test]
+    fn ass_karaoke_sanitizes_reserved_char_boundaries() {
+        let style = karaoke_test_style();
+
+        // ① 第二个词紧接一个字面反斜杠：`\` + `{` 会被当成转义序列，标签必须让开。
+        let mut backslash = Segment::new(1, 0.0, 2.0, "a\\b");
+        backslash.words = vec![
+            WordTiming {
+                word: "a\\".to_string(),
+                start: 0.0,
+                end: 1.0,
+            },
+            WordTiming {
+                word: "b".to_string(),
+                start: 1.0,
+                end: 1.5,
+            },
+        ];
+        let body =
+            &ass_dialogue_texts(&write_ass_text(&[backslash], ExportMode::RawOnly, &style))[0];
+        assert_eq!(
+            karaoke_centiseconds(body),
+            vec![150],
+            "时长应并入上一段: {body}"
+        );
+        assert!(body.contains("}a\\b"), "原文不得被改动: {body}");
+
+        // ② 第二个词以 `{` 开头（正文里会被转义成 `\{`）：标签让开，转义照旧。
+        let mut braces = Segment::new(1, 0.0, 2.0, "费用{固定}");
+        braces.words = vec![
+            WordTiming {
+                word: "费用".to_string(),
+                start: 0.0,
+                end: 0.5,
+            },
+            WordTiming {
+                word: "{固定}".to_string(),
+                start: 0.5,
+                end: 1.5,
+            },
+        ];
+        let body = &ass_dialogue_texts(&write_ass_text(&[braces], ExportMode::RawOnly, &style))[0];
+        assert_eq!(karaoke_centiseconds(body), vec![150]);
+        assert!(
+            body.contains("费用\\{固定\\}"),
+            "花括号必须保持转义: {body}"
+        );
+
+        // ③ 逗号紧贴词首（Dialogue 的字段分隔符）：同样让开。
+        let mut comma = Segment::new(1, 0.0, 2.0, "你好,世界");
+        comma.words = vec![
+            WordTiming {
+                word: "你好,".to_string(),
+                start: 0.0,
+                end: 0.6,
+            },
+            WordTiming {
+                word: "世界".to_string(),
+                start: 0.6,
+                end: 1.0,
+            },
+        ];
+        let body = &ass_dialogue_texts(&write_ass_text(&[comma], ExportMode::RawOnly, &style))[0];
+        assert_eq!(karaoke_centiseconds(body), vec![100]);
+        assert!(body.ends_with("你好,世界"), "文本不得被改动: {body}");
+    }
+
+    /// 折行 + 逐词标签：标签按折行**之后**的位置插入，不劈标签、不丢字；
+    /// 去掉标签后与「没有词级数据」的同一份输出逐字节相同。
+    #[test]
+    fn ass_karaoke_survives_wrapping() {
+        let text = "今天天气很好我们去公园散步然后回家吃饭";
+        let mut seg = Segment::new(1, 0.0, 4.0, text);
+        seg.words = text
+            .chars()
+            .enumerate()
+            .map(|(i, c)| WordTiming {
+                word: c.to_string(),
+                start: i as f64 * 0.2,
+                end: i as f64 * 0.2 + 0.2,
+            })
+            .collect();
+        let style = SubtitleStyleConfig {
+            max_chars_per_line: 8,
+            ..SubtitleStyleConfig::default()
+        };
+
+        let body = &ass_dialogue_texts(&write_ass_text(
+            std::slice::from_ref(&seg),
+            ExportMode::RawOnly,
+            &style,
+        ))[0];
+
+        assert!(body.contains("\\N"), "这条用例必须先触发折行: {body}");
+        assert_eq!(
+            karaoke_centiseconds(body).len(),
+            text.chars().count(),
+            "每个字都该有自己的标签: {body}"
+        );
+        assert!(
+            karaoke_centiseconds(body).iter().all(|cs| *cs == 20),
+            "厘秒值错误: {body}"
+        );
+
+        let mut plain = seg;
+        plain.words.clear();
+        let plain_body = &ass_dialogue_texts(&write_ass_text(
+            std::slice::from_ref(&plain),
+            ExportMode::RawOnly,
+            &style,
+        ))[0];
+        assert_eq!(
+            strip_override_blocks(body),
+            *plain_body,
+            "插标签不得改变文字与折行结果"
+        );
+    }
+
+    /// 开关关闭：即便有词级数据，输出也与「没有词级数据」逐字节一致（老用户兼容开关）。
+    #[test]
+    fn ass_karaoke_disabled_matches_plain_output() {
+        let mut seg = Segment::new(1, 0.0, 2.0, "今天天气很好");
+        seg.words = vec![WordTiming {
+            word: " 今天".to_string(),
+            start: 0.0,
+            end: 1.0,
+        }];
+        let off = SubtitleStyleConfig {
+            karaoke_word_highlight: false,
+            ..karaoke_test_style()
+        };
+        let on = karaoke_test_style();
+
+        let mut plain = seg.clone();
+        plain.words.clear();
+
+        let with_words_off = write_ass_text(&[seg], ExportMode::RawOnly, &off);
+        let plain_on = write_ass_text(&[plain], ExportMode::RawOnly, &on);
+        assert!(
+            !with_words_off.contains("\\kf"),
+            "关闭时不得插标签: {with_words_off}"
+        );
+        assert_eq!(with_words_off, plain_on, "关闭开关 = 回到导入前的输出");
+    }
+
+    /// 句尾静音不摊给最后一个词：`\kf` 之和 = 各词自身时长之和，句尾（以及跨句）
+    /// 的静音不产生任何标签，也不会被最后一个词吞掉。
+    #[test]
+    fn ass_karaoke_silence_is_not_folded_into_words() {
+        let mut seg = Segment::new(1, 10.0, 12.0, "说完就走");
+        seg.words = vec![
+            WordTiming {
+                word: "说完".to_string(),
+                start: 10.0,
+                end: 10.3,
+            },
+            WordTiming {
+                word: "就走".to_string(),
+                start: 10.3,
+                end: 10.5,
+            },
+        ];
+        let body = &ass_dialogue_texts(&write_ass_text(
+            &[seg],
+            ExportMode::RawOnly,
+            &karaoke_test_style(),
+        ))[0];
+        assert_eq!(karaoke_centiseconds(body), vec![30, 20]);
+        assert_eq!(
+            karaoke_centiseconds(body).iter().sum::<u32>(),
+            50,
+            "1.5 秒句尾静音不得计入任何一个词: {body}"
+        );
+    }
+
+    /// 对齐口径：容忍前导空格与后补的标点；顺序错 / 缺词 / 改字一律判为对不上。
+    #[test]
+    fn plan_karaoke_tags_alignment_rules() {
+        let words = vec![
+            WordTiming {
+                word: " 今天".to_string(),
+                start: 0.0,
+                end: 1.0,
+            },
+            WordTiming {
+                word: "天气".to_string(),
+                start: 1.0,
+                end: 1.5,
+            },
+            WordTiming {
+                word: " 很好".to_string(),
+                start: 1.5,
+                end: 2.0,
+            },
+        ];
+        // 标点恢复补的标点、识别器的前导空格都不影响对齐（偏移按字节算）。
+        let plan = plan_karaoke_tags(&words, "今天，天气很好。").expect("应能对齐");
+        assert_eq!(
+            plan,
+            vec![(0usize, 100u32), (9, 50), (15, 50)],
+            "词首偏移与厘秒时长不对"
+        );
+
+        // 顺序错 / 缺词 / 改字：整句判为对不上。
+        let reversed = vec![words[2].clone(), words[1].clone(), words[0].clone()];
+        assert!(plan_karaoke_tags(&reversed, "今天天气很好").is_none());
+        let missing = vec![WordTiming {
+            word: "世界".to_string(),
+            start: 0.0,
+            end: 1.0,
+        }];
+        assert!(plan_karaoke_tags(&missing, "今天天气很好").is_none());
+        let edited = vec![
+            WordTiming {
+                word: "今天".to_string(),
+                start: 0.0,
+                end: 1.0,
+            },
+            WordTiming {
+                word: "世界".to_string(),
+                start: 1.0,
+                end: 2.0,
+            },
+        ];
+        assert!(plan_karaoke_tags(&edited, "今天天气很好").is_none());
+
+        // 纯空白词元与非有限时间的词只被跳过，不拖累整句。
+        let noisy = vec![
+            WordTiming {
+                word: "  ".to_string(),
+                start: 0.0,
+                end: 0.1,
+            },
+            WordTiming {
+                word: "今天".to_string(),
+                start: 0.1,
+                end: 0.2,
+            },
+            WordTiming {
+                word: "天气".to_string(),
+                start: 0.2,
+                end: f64::NAN,
+            },
+        ];
+        assert_eq!(
+            plan_karaoke_tags(&noisy, "今天天气"),
+            Some(vec![(0, 10)]),
+            "空白词元与 NaN 只跳过，不拖累整句"
+        );
     }
 }

@@ -399,7 +399,7 @@ impl MainWindow {
                                     div()
                                         .text_size(px(Theme::TEXT_SMALL))
                                         .text_color(Theme::accent_mint())
-                                        .child(format!("时长: {}", dur_str)),
+                                        .child(format!("时长：{}", dur_str)),
                                 )
                             } else {
                                 None
@@ -804,6 +804,12 @@ impl MainWindow {
             "ttal" => "ttal",
             _ => "srt",
         };
+        // 逐词卡拉OK开关（落盘键：`[subtitle_style] karaoke_word_highlight`）。
+        let karaoke_sel = if self.state.config.subtitle_style.karaoke_word_highlight {
+            "on"
+        } else {
+            "off"
+        };
         let polish_sel = if !self.state.enable_polish {
             "off"
         } else if self.state.polish_mode == PolishMode::PuncFast {
@@ -924,6 +930,22 @@ impl MainWindow {
                     // 同上：不落盘的话，重启后配置里的旧格式会把这次选择覆盖掉
                     this.state.config.pipeline.output_format = sel.to_string();
                     this.state.persist_config();
+                    cx.notify();
+                },
+                cx,
+            ))
+            // 逐词卡拉OK高亮：只影响 ASS 原文行的逐词点亮（`{\kfN}`），放在「字幕输出格式」
+            // 之后——格式选 ASS 才有它，两个控件是同一件事的两面。默认开启；没有词级数据
+            // 的老工程一个标签都不会插，导出结果与关闭时逐字节一致。
+            .child(self.param_group(
+                "逐词卡拉OK高亮",
+                vec![("on", "开启"), ("off", "关闭")],
+                karaoke_sel,
+                |this, sel, cx| {
+                    this.state.config.subtitle_style.karaoke_word_highlight = sel == "on";
+                    // 与样式面板同源：样式类改动一律走 save_subtitle_style（落盘 + 同步给管线），
+                    // 否则重启后配置里的旧值会把这次选择覆盖掉。
+                    this.state.save_subtitle_style();
                     cx.notify();
                 },
                 cx,
@@ -1356,9 +1378,9 @@ impl MainWindow {
                                     .gap_1()
                                     .child(div().text_color(Theme::text_muted()).child(
                                         if m.is_model_running {
-                                            "CPU (大模型):"
+                                            "CPU（大模型）："
                                         } else {
-                                            "CPU (应用待机):"
+                                            "CPU（应用待机）："
                                         },
                                     ))
                                     .child(
@@ -1371,7 +1393,7 @@ impl MainWindow {
                             .child(
                                 div()
                                     .text_color(Theme::text_muted())
-                                    .child(format!("系统: {:.1}%", sys_cpu_pct)),
+                                    .child(format!("系统：{:.1}%", sys_cpu_pct)),
                             ),
                     )
                     // 双层条
@@ -1400,9 +1422,9 @@ impl MainWindow {
                                     .gap_1()
                                     .child(div().text_color(Theme::text_muted()).child(
                                         if m.is_model_running {
-                                            "内存 (大模型):"
+                                            "内存（大模型）："
                                         } else {
-                                            "内存 (应用待机):"
+                                            "内存（应用待机）："
                                         },
                                     ))
                                     .child(

@@ -632,6 +632,18 @@ pub struct SubtitleStyleConfig {
     /// 水平对齐方式："left" | "center" | "right"
     #[serde(default = "default_alignment")]
     pub alignment: String,
+    /// 导出 ASS 时给原文行加逐词卡拉OK高亮（`{\kfN}`，N 为厘秒）。
+    ///
+    /// 默认开启。逐词时间戳是识别阶段的高价值产物，界面里早已逐词高亮、导出却不跟着
+    /// 点亮，是最直白的一条缺口。这项增强对下游也是**安全**的：
+    /// - 没有词级数据的工程一个标签都不会插，输出与关闭时逐字节一致；
+    /// - 支持卡拉OK的播放器 / 剪辑软件看到跟读点亮；
+    /// - 不支持的阅读器只会忽略这些标签、退回原来的静态字幕，文字与排版都不变。
+    ///
+    /// 用户如果要把 ASS 交给更老或更原始的解析工具，可以在这里关掉。
+    #[serde(default = "default_karaoke_word_highlight")]
+    pub karaoke_word_highlight: bool,
+
     /// 用户自定义样式预设（命名保存 / 删除 / 导入导出 JSON，见 [`NamedStylePreset`]）。
     ///
     /// 单条坏数据（缺字段 / 类型不对）只丢这一条，不能让整份配置读不进来。
@@ -659,6 +671,10 @@ fn default_is_bold() -> bool {
 }
 fn default_alignment() -> String {
     "center".to_string()
+}
+/// 逐词卡拉OK高亮的默认值：开启（理由见 `SubtitleStyleConfig::karaoke_word_highlight`）。
+fn default_karaoke_word_highlight() -> bool {
+    true
 }
 /// 左右安全边距默认值（px @1080p）：与旧版硬编码在 ASS 里的 `20,20` 一致，
 /// 老用户升级后画面对齐不会突然变化。
@@ -702,6 +718,7 @@ impl Default for SubtitleStyleConfig {
             bg_opacity: default_bg_opacity(),
             is_bold: default_is_bold(),
             alignment: default_alignment(),
+            karaoke_word_highlight: default_karaoke_word_highlight(),
             custom_presets: Vec::new(),
         }
     }
@@ -930,6 +947,7 @@ impl SubtitleStyleConfig {
         self.bg_opacity = src.bg_opacity;
         self.is_bold = src.is_bold;
         self.alignment = src.alignment.clone();
+        self.karaoke_word_highlight = src.karaoke_word_highlight;
     }
 
     /// 取一份「样式参数快照」：清掉预设库与预览框宽度，避免预设里再套预设。
@@ -3895,6 +3913,122 @@ llm_ctx = 2048
         assert_eq!(
             back.pipeline.asr_hotwords, hotwords,
             "热词要逐字节往返：转义交给 TOML 序列化，清洗是转写侧的事"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+/// `[subtitle_style] karaoke_word_highlight`（逐词卡拉OK开关）的配置层回归。
+///
+/// 刻意**不写** `use super::*`：本组只依赖下面显式列出的名字，改名时会在这里直接编译失败。
+#[cfg(test)]
+mod karaoke_switch_config_tests {
+    use super::AppConfig;
+
+    /// 「加这个字段之前」的一份 config.toml：整个 `[subtitle_style]` 段都不存在。
+    const LEGACY_CONFIG: &str = r#"
+[paths]
+ffmpeg = "tools/ffmpeg.exe"
+whisper_cli = "tools/whisper-cli.exe"
+whisper_model = "models/whisper/ggml-small-q5_0.bin"
+llama_cli = "tools/llama-completion.exe"
+llm_model = "models/llm/qwen.gguf"
+
+[pipeline]
+language = "zh"
+output_format = "ass"
+enable_polish = false
+whisper_threads = 12
+llm_threads = 4
+llm_ctx = 2048
+"#;
+
+    /// 又一份旧配置：`[subtitle_style]` 段在，但没有这次新增的键。
+    const LEGACY_STYLE_CONFIG: &str = r#"
+[paths]
+ffmpeg = "tools/ffmpeg.exe"
+whisper_cli = "tools/whisper-cli.exe"
+whisper_model = "models/whisper/ggml-small-q5_0.bin"
+llama_cli = "tools/llama-completion.exe"
+llm_model = "models/llm/qwen.gguf"
+
+[pipeline]
+language = "zh"
+output_format = "ass"
+enable_polish = false
+whisper_threads = 12
+llm_threads = 4
+llm_ctx = 2048
+
+[subtitle_style]
+font_size = 42
+letter_spacing = 2
+line_spacing = 1.3
+max_chars_per_line = 18
+bottom_margin = 52
+preset_name = "黄字黑边"
+"#;
+
+    /// 临时目录 + 一份写好的 config.toml（沿用本文件既有测试的写法，用完由调用方删）。
+    fn write_config(text: &str, tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("v2w_karaoke_cfg_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, text).expect("write config");
+        (dir, path)
+    }
+
+    /// 旧配置（没有样式段）：照旧读得进来，新开关落成默认的「开启」。
+    #[test]
+    fn legacy_config_without_style_section_defaults_karaoke_on() {
+        let (dir, path) = write_config(LEGACY_CONFIG, "nostyle");
+        let cfg = AppConfig::load_from_file(&path).expect("旧配置必须照旧能读");
+        assert!(
+            cfg.subtitle_style.karaoke_word_highlight,
+            "缺失该键应回落默认值 true"
+        );
+        assert_eq!(
+            cfg.subtitle_style.font_size, 40,
+            "样式段缺省时其它字段走默认值"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧配置（有样式段、没有这个键）：其它样式值一个都不许动，新开关回落默认值。
+    #[test]
+    fn legacy_style_section_without_karaoke_key_keeps_other_fields() {
+        let (dir, path) = write_config(LEGACY_STYLE_CONFIG, "oldstyle");
+        let cfg = AppConfig::load_from_file(&path).expect("旧配置必须照旧能读");
+        assert_eq!(cfg.subtitle_style.font_size, 42, "旧字段必须原样读回");
+        assert_eq!(cfg.subtitle_style.preset_name, "黄字黑边");
+        assert!(
+            cfg.subtitle_style.karaoke_word_highlight,
+            "缺失该键应回落默认值 true"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 关掉 → 落盘 → 读回：开关必须真实持久化，不存在「存了却读回默认值」。
+    #[test]
+    fn karaoke_switch_round_trips_through_disk() {
+        let (dir, path) = write_config(LEGACY_CONFIG, "roundtrip");
+        let mut cfg = AppConfig::load_from_file(&path).expect("load");
+        cfg.subtitle_style.karaoke_word_highlight = false;
+        cfg.save_to_file(&path).expect("save");
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("karaoke_word_highlight"),
+            "开关必须落盘: {text}"
+        );
+        let back = AppConfig::load_from_file(&path).expect("load");
+        assert!(
+            !back.subtitle_style.karaoke_word_highlight,
+            "关掉的开关读回来还得是关的"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
