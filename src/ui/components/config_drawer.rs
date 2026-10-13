@@ -75,10 +75,7 @@ fn thread_presets(current: u32, cores: u32) -> Vec<u32> {
 /// （`utils::model_download`），两处都是唯一实现——同一档位在抽屉和性能页显示成
 /// 不同的名字或数字是很容易出现的分叉，这里从源头避免。
 const TIER_TAGLINES: [(WhisperModelTier, &str); 5] = [
-    (
-        WhisperModelTier::SenseVoice,
-        "中文首选 · 不用显卡也能飞快出字",
-    ),
+    (WhisperModelTier::SenseVoice, "中文首选 · 不吃显卡也飞快"),
     (WhisperModelTier::Fast, "最快 · 低配机器也跑得动"),
     (WhisperModelTier::Balanced, "均衡 · 出厂默认，多数视频够用"),
     (
@@ -95,14 +92,14 @@ const SENSEVOICE_ITEM_IDS: [&str; 3] = ["sensevoice-model", "sensevoice-tokens",
 ///
 /// 用静态变量而不是给 `MainWindow` 加字段：那个结构定义在 `ui/mod.rs`，是并行改动
 /// 最集中的文件；而这里是纯界面开合态，程序重启后默认收起完全可以接受。
-static HOW_TO_CHOOSE_OPEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static HOW_TO_CHOOSE_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// 「怎么选？」的三行结论。抽屉只有 350px 宽，只讲「选哪个」，不讲原理。
-const HOW_TO_CHOOSE_LINES: [&str; 3] = [
+const HOW_TO_CHOOSE_LINES: [&str; 4] = [
     "中文播客、短视频：SenseVoice 极速，快且够用",
     "要双语字幕或更准的断句：Whisper Turbo Q5",
     "机器一般：先下 Whisper Base / Small 跑通再升级",
+    "内存吃紧就选小的：档位越大越占内存，也越慢",
 ];
 
 /// 读取「怎么选？」的展开态。
@@ -595,6 +592,8 @@ impl MainWindow {
     /// （`MainWindow::missing_engine_reason`），一句明确提示比偷偷换档可操作得多。
     fn render_engine_card(&mut self, cx: &mut Context<Self>) -> Div {
         let open = how_to_choose_open();
+        // 默认展开：这三行就是「每张卡片上那句小字」的用法说明——收起来时用户
+        // 只看到五句互不衔接的定位句，仍然不知道该选哪档。
         let mut cards = div().flex().flex_col().gap(px(Theme::SPACE_1_5));
         for (index, (tier, tagline)) in TIER_TAGLINES.into_iter().enumerate() {
             cards = cards.child(self.tier_card(index, tier, tagline, cx));
@@ -666,8 +665,12 @@ impl MainWindow {
         let busy = self.state.is_downloading;
         let size_text = tier_size_text(tier);
 
+        // 名字允许被压缩并省略（`min_w_0` + `truncate`）：这一行同时要放「当前」徽标、
+        // 状态徽标和下载按钮，固定宽度下若不让名字收缩，长档位名会把按钮挤出可见区域。
         let mut head = div().flex().items_center().gap(px(Theme::SPACE_2)).child(
             div()
+                .min_w(px(0.0))
+                .truncate()
                 .text_size(px(Theme::TEXT_BODY_LG))
                 .font_weight(if is_sel {
                     FontWeight::BOLD
@@ -724,28 +727,39 @@ impl MainWindow {
             }
         }
 
+        // 定位句与体积并成一行：抽屉只有 350px，两者各占一头比上下两行更紧凑，
+        // 也少占一行高度——五张卡片一屏能多看一张。体积用弱化色并固定不换行，
+        // 不与定位句抢注意力：它是「要不要下载」的参考，不是选型依据。
         let body = div()
             .flex()
             .flex_col()
-            .gap(px(Theme::SPACE_0_5))
+            .gap(px(Theme::SPACE_1))
             .child(head)
             .child(
                 div()
-                    .text_size(px(Theme::TEXT_SMALL))
-                    .text_color(Theme::text_secondary())
-                    .child(tagline),
-            )
-            .child(
-                div()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(Theme::text_muted())
-                    .child(size_text),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(Theme::SPACE_2))
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_SMALL))
+                            .text_color(Theme::text_secondary())
+                            .child(tagline),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child(size_text),
+                    ),
             );
 
         div()
             .id(("engine-tier-card", index))
             .w_full()
-            .px(px(Theme::SPACE_2_5))
+            .px(px(Theme::SPACE_2))
             .py(px(Theme::SPACE_2))
             .rounded(px(Theme::RADIUS_LG))
             .border_1()
