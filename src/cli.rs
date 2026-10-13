@@ -1145,6 +1145,14 @@ fn push_root_deepest_existing(roots: &mut Vec<PathBuf>, path: &Path) {
     push_root(roots, &probe);
 }
 
+/// 规范化路径的展示形式：去掉 Windows 的 `\\?\` 前缀（只影响显示，不影响比较）。
+fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    text.strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or(text)
+}
+
 /// 逐组件比较前缀（Windows 下大小写不敏感），用于「是否落在根目录内」。
 fn is_within(child: &Path, root: &Path) -> bool {
     let child_parts: Vec<String> = child
@@ -1194,7 +1202,7 @@ fn ensure_resolved_within(
     let roots = policy
         .roots
         .iter()
-        .map(|root| root.display().to_string())
+        .map(|root| display_path(root))
         .collect::<Vec<_>>()
         .join("；");
     bail!(
@@ -2271,7 +2279,7 @@ fn summarise_tool_call(
         ],
         "temperature": 0,
         "stream": false,
-        "max_tokens": 512
+        "max_tokens": 1024
     });
     let response = post_chat_completions(cfg, &payload)?;
     Ok(extract_message_content(&response))

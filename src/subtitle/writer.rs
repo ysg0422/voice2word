@@ -275,7 +275,7 @@ impl SubtitleWriter {
             let raw = super::segment::export_text_for(seg, mode, with_speaker);
             // 用户文本是直接拼进 SRT 的，出现在里面的 `<`/`&` 会被播放器当成标记
             // 解析（吞掉文本，甚至吃掉后面的字幕块），所以写盘前统一走实体转义。
-            let text = escape_srt_text(&wrap_text(&raw, wrap));
+            let text = escape_srt_text(&wrap_text_capped(&raw, wrap, WRAP_MAX_LINES));
             writeln!(file, "{}", i + 1)?;
             writeln!(file, "{} --> {}", start, end)?;
             writeln!(file, "{}", text)?;
@@ -472,7 +472,8 @@ Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bol
             // 折行产出的 `\n` 与原文里已有的 `\n`（双语两行）在**同一次**转换里
             // 变成 ASS 的硬换行 `\N`，折行不会破坏既有的换行标记。
             let raw = super::segment::export_text_for(seg, mode, with_speaker);
-            let text = escape_ass_text(&wrap_text(&raw, wrap)).replace('\n', "\\N");
+            let text =
+                escape_ass_text(&wrap_text_capped(&raw, wrap, WRAP_MAX_LINES)).replace('\n', "\\N");
             // 有说话人样式就引用它，否则用默认样式
             let style_name = seg
                 .speaker
@@ -517,7 +518,7 @@ Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bol
             // WebVTT 规范明确要求实体（`&amp;`/`&lt;`/`&gt;`），且 `<` 会被当作
             // cue 里的标签起始；与 SRT 共用同一份转义实现。
             let raw = super::segment::export_text_for(seg, mode, with_speaker);
-            let text = escape_vtt_text(&wrap_text(&raw, wrap));
+            let text = escape_vtt_text(&wrap_text_capped(&raw, wrap, WRAP_MAX_LINES));
             writeln!(file, "{} --> {}", start, end)?;
             writeln!(file, "{}", text)?;
             writeln!(file)?;
@@ -681,10 +682,174 @@ fn escape_ass_text(text: &str) -> String {
     out
 }
 
-/// 折行：把文本按「每行最多 `max_chars` 个字符」切开，行间用 `\n` 连接。
+/// 单条字幕最多折成几行（导出侧的折行入口统一走 [wrap_text_capped]）。
 ///
-/// 供 SRT / VTT / ASS 导出使用（按 [`SubtitleStyleConfig::max_chars_per_line`] 生效）；
-/// TXT **不折行**（理由见 `write_txt_with_mode` 的说明）。
+/// 取 2：一条字幕折成三行以上会盖掉小半个画面、也更容易和台标/进度条打架，
+/// 观众反而更难看全。两行是短横屏与竖屏都能稳定容纳的排版；内容真的塞不下
+/// 时 [wrap_text_capped] 会继续往下切，这里的上限不影响完整性。
+const WRAP_MAX_LINES: usize = 2;
+/// [`wrap_text`] 的带行数上限版本：单行不超过 `max_chars`，且连折不超过
+/// `max_lines` 行（塞不进时才继续切）。
+///
+/// 为什么存在：一条字幕折成四五行会盖掉小半个画面。用户配「每行 N 字」的
+/// 本意是「别让一行太长、别让整段冒到画面正中」，所以行数上限只是**不主动
+/// 多切**——内容确实塞不进上限时照旧切满，宁可行数超一点，也绝不丢字、
+/// 不做截断，更不把单词从中间劈开。
+fn wrap_text_capped(text: &str, max_chars: usize, max_lines: usize) -> String {
+    if max_chars == 0 || max_lines == 0 || text.is_empty() {
+        return text.to_string();
+    }
+    text.split('\n')
+        .map(|line| wrap_line_capped(line, max_chars, max_lines))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+/// [`wrap_line`] 的带行数上限版本：`max_lines` 之后不再切分。
+///
+/// 为什么要有上限：一条字幕折成四五行会盖掉小半个画面，远不如「两行塞满」
+/// 好读；用户真正在意的是「别冒到画面正中」，而不是每行都短。上限只是**不
+/// 主动多切**——内容确实塞不进 `max_lines` 时照旧切满所有行，绝不为了凑行数
+/// 丢字或把单词劈开（宁可超行数，也不超字数上限）。
+fn wrap_line_capped(line: &str, max_chars: usize, max_lines: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= max_chars || max_chars == 0 || max_lines == 0 {
+        return line.to_string();
+    }
+    let candidates = candidate_breaks(&chars, max_chars);
+    // 行数越少越清爽：从 1 行开始试，第一个「塞得下」的行数就是排版用的行数；
+    // 断点在候选里按均衡目标重新分配，行尾标点与单词边界仍然沿用候选的口径。
+    let balanced = assign_breaks(&chars, &candidates, max_chars, max_lines);
+    render_breaks(&chars, &balanced)
+}
+
+/// 所有**合法断点位置**，递增排列。
+///
+/// `c[0] == 1`（第一行至少要有一个字符），`c[k-1] == chars.len()`（最后一段
+/// 收尾），中间每个 `c[i]` 都是「从 `c[i-1]` 起、在 `max_chars` 内能找到的
+/// 最靠右断点」。长度即贪心排版所需的行数。
+fn candidate_breaks(chars: &[char], max_chars: usize) -> Vec<usize> {
+    let n = chars.len();
+    let mut out = Vec::with_capacity(n / max_chars + 1);
+    let mut start = 0usize;
+    while start < n {
+        let end = best_wrap_break(chars, start, max_chars);
+        debug_assert!(end > start && end <= n);
+        out.push(end);
+        // 断点之后的空格不进下一行（行首不留空格）。`canonical_start` 只会
+        // 前进，且最多推进到 `n`，因此 `end` 严格递增、不会出现空行。
+        start = canonical_start(chars, end);
+    }
+    out
+}
+
+/// 从断点位置出发、跳过紧跟的空格后的「下一行起点」。
+///
+/// 与 [`best_wrap_break`] 的收尾一致：行首不允许出现空格，所以断点后的空格
+/// 既不落在下一行行首，也不必再回吐到本行行尾（本行由 [`render_breaks`] 收尾）。
+fn canonical_start(chars: &[char], mut idx: usize) -> usize {
+    while idx < chars.len() && chars[idx] == ' ' {
+        idx += 1;
+    }
+    idx
+}
+
+fn distribute_breaks(
+    chars: &[char],
+    candidates: &[usize],
+    max_chars: usize,
+    k: usize,
+) -> Vec<usize> {
+    let n = chars.len();
+    let mut out = Vec::with_capacity(k);
+    let mut start = 0usize;
+    while out.len() < k {
+        // 余下的字全部塞得进本行：收尾，不再多切。
+        if n - start <= max_chars {
+            out.push(n);
+            break;
+        }
+        let remaining = k - out.len();
+        let window = start + max_chars;
+        let mut chosen = None;
+        for &end in candidates.iter().filter(|&&c| c > start) {
+            if end > window {
+                break;
+            }
+            if ends_are_feasible(chars, end, max_chars, remaining - 1) {
+                chosen = Some(end);
+                break;
+            }
+        }
+        let Some(end) = chosen else {
+            // 这一行数分配不出来（余量不够）：退回贪心排版，绝不丢内容。
+            return candidates.to_vec();
+        };
+        out.push(end);
+        start = end;
+    }
+    out
+}
+
+/// 「从 `from` 到串尾的文本还能塞进 `lines` 行」的粗粒度可行性判定。
+///
+/// 只做字符数上界（`剩余字符数 <= 行数 × 每行上限`）：这正是选点需要的余量
+/// 信息，而且是 O(1)。它故意**不**考虑断点必须落在标点/空格上的约束——那是
+/// [`best_wrap_break`] 的职责，这里只回答「还剩多少余量」。
+fn ends_are_feasible(chars: &[char], from: usize, max_chars: usize, lines: usize) -> bool {
+    chars.len() - from <= max_chars * lines
+}
+/// 在贪心行数不变的前提下，找「行数不变但各行更长 / 更短」的最均衡排版。
+///
+/// 逐步增大目标长度：目标变大只会把断点往右推，因此行数单调不增——循环要么
+/// 在 `candidates.len()` 步内耗尽（目标已经推到最长行，不能再均衡），要么
+/// 提前拿到「行数更少」的排版直接返回。不会死循环。
+fn assign_breaks(
+    chars: &[char],
+    candidates: &[usize],
+    max_chars: usize,
+    max_lines: usize,
+) -> Vec<usize> {
+    let limit = max_lines.min(candidates.len());
+    for k in 1..=limit {
+        let distributed = distribute_breaks(chars, candidates, max_chars, k);
+        if distributed.len() <= k {
+            return distributed;
+        }
+    }
+    candidates.to_vec()
+}
+
+/// 把断点还原成文本：每段之间插一个 `\n`。
+///
+/// 断点语义：`breaks[i]` 是第 `i` 行的**结束位置**，且已经保证「断点之后的
+/// 空格不进下一行」（见 [`canonical_start`]）。这里只做两件收尾：
+/// 1. 打印的行内容从上一个断点开始——断点落在空格上时，那个空格既不留在
+///    行尾（行尾空格回退）、也不丢（它属于上一行末尾的那一段空白）；
+/// 2. 下一行从下一个断点开始。
+///
+/// 渲染只负责排版，**绝不能增删字符**：回退掉的空格一定落在某一行里。
+fn render_breaks(chars: &[char], breaks: &[usize]) -> String {
+    let mut out = String::with_capacity(chars.len() + breaks.len());
+    let mut start = 0usize;
+    for &brk in breaks.iter() {
+        // 行尾空格回退掉再输出（行首空格由断点本身保证不会出现）。
+        let mut end = brk;
+        while end > start && chars[end - 1] == ' ' {
+            end -= 1;
+        }
+        out.extend(chars[start..end].iter());
+        if end < chars.len() {
+            out.push('\n');
+        }
+        // 断点落在空格上时 `end` 会比 `brk` 小一点：多出来的空格留在上一行的
+        // 行尾（上面那段回退），下一行从断点之后**跳掉连续空格**再开始，
+        // 整串字符既不丢也不重复。
+        start = canonical_start(chars, brk);
+    }
+    out
+}
+
+/// 从 `start` 起、单行不超过 `max_chars` 时，最靠右的合法断点位置（即下一行的起点）。
 ///
 /// 断点优先级（都在「尽量让本行更长」的前提下选择）：
 /// 1. **标点**：逗号 / 句号 / 顿号 / 分号 / 冒号 / 问叹号 / 破折号 / 省略号 /
@@ -693,85 +858,50 @@ fn escape_ass_text(text: &str) -> String {
 /// 2. **空格**：英文按词断行，断点处的空格按惯例**被吞掉**（不留在行尾、
 ///    也不落到行首），因此 **不会把一个单词切成两半**，行首行尾也不会出现空格；
 /// 3. 两者都没有（例如一长串无空格无标点的英文单词）才按字符数**硬切**。
-///
-/// 实现：在「本行还能容纳的字符窗口」内**从右往左**找第一个候选断点，
-/// 于是每行取到允许范围内最靠右的断点（行尽量长）；同一位置既有标点又有空格时
-/// 标点优先。中文 / 日文 / 韩文没有词间空格，自然退化为「按字符数切、
-/// 优先在标点处断」。
-///
-/// 约定：
-/// - `max_chars == 0`、`text` 为空、或每一行都不足 `max_chars` 时**原样返回**
-///   ——老配置 / 未显式传入样式时保持历史导出**逐字节一致**；
-/// - 原文里**已有的 `\n`**（双语的第二行、用户手打的换行）逐行独立折行，
-///   不会被当成一个长串重排；
-/// - 一律按 **Unicode 标量（`char`）** 计数：一个汉字、一个英文字母都算 1，
-///   与预览侧 `preview_font_px() * max_chars_per_line` 的「单行最大字数」口径一致。
-fn wrap_text(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 || text.is_empty() {
-        return text.to_string();
+fn best_wrap_break(chars: &[char], start: usize, max_chars: usize) -> usize {
+    let n = chars.len();
+    if n - start <= max_chars {
+        return n;
     }
-    text.split('\n')
-        .map(|line| wrap_line(line, max_chars))
-        .collect::<Vec<_>>()
-        .join("\n")
+    // `limit` 是本行最多能放下的字符数；由上面的分支可知 `limit < n`，
+    // 因此下面读 `chars[limit]` 不会越界。
+    let limit = start + max_chars;
+    // 从右往左找最靠右的候选断点；同一位置标点优先于空格。
+    let mut brk = None;
+    let mut drop_space = false;
+    for p in (start + 1..=limit).rev() {
+        if is_wrap_break_after(chars[p - 1]) {
+            brk = Some(p); // 断在标点「之后」
+            break;
+        }
+        if chars[p] == ' ' {
+            brk = Some(p); // 断在空格处（空格归入断点，不回吐到行首）
+            drop_space = true;
+            break;
+        }
+    }
+    let mut next = match brk {
+        // 断在空格处：空格归入断点本身，下一行从它之后开始（行首不留空格）。
+        Some(p) if drop_space => p + 1,
+        Some(p) => p,
+        // 窗口内既无标点也无空格：只能硬切
+        None => limit,
+    };
+    // 收尾标点不能被挤到下一行行首：把它们并回本行（连排最多 2 个）。
+    // 这会让本行最多**超出 `max_chars` 两个字符**——刻意接受的取舍：
+    // 硬切（窗口内既无标点也无空格）本就少见，而「下一行以句号/逗号开头」
+    // 是肉眼可见的排版缺陷，宁可让本行多收一个标点。
+    let mut merged = 0;
+    while next < n && merged < 2 && is_wrap_break_after(chars[next]) {
+        next += 1;
+        merged += 1;
+    }
+    // 下一行开头若是空白，一并跳过，避免行首出现空格。
+    while next < n && chars[next] == ' ' {
+        next += 1;
+    }
+    next
 }
-
-/// [`wrap_text`] 的单行实现（入参不含 `\n`）。
-fn wrap_line(line: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    if chars.len() <= max_chars {
-        return line.to_string();
-    }
-    let mut out = String::with_capacity(line.len() + 16);
-    let mut start = 0usize;
-    while chars.len() - start > max_chars {
-        // `limit` 是本行最多能放下的字符数；由循环条件可知 `limit < chars.len()`，
-        // 因此下面读 `chars[limit]` 不会越界。
-        let limit = start + max_chars;
-        // 从右往左找最靠右的候选断点；同一位置标点优先于空格。
-        let mut brk = None;
-        let mut drop_space = false;
-        for p in (start + 1..=limit).rev() {
-            if is_wrap_break_after(chars[p - 1]) {
-                brk = Some(p); // 断在标点「之后」
-                break;
-            }
-            if chars[p] == ' ' {
-                brk = Some(p); // 断在空格处（空格归入断点，不回吐到行首）
-                drop_space = true;
-                break;
-            }
-        }
-        let (mut line_end, mut next) = match brk {
-            Some(p) if drop_space => (p, p + 1),
-            Some(p) => (p, p),
-            // 窗口内既无标点也无空格：只能硬切
-            None => (limit, limit),
-        };
-        // 收尾标点不能被挤到下一行行首：把它们并回本行（连排最多 2 个）。
-        // 这会让本行最多**超出 `max_chars` 两个字符**——刻意接受的取舍：
-        // 硬切（窗口内既无标点也无空格）本就少见，而「下一行以句号/逗号开头」
-        // 是肉眼可见的排版缺陷，宁可让本行多收一个标点。
-        let mut merged = 0;
-        while next < chars.len() && merged < 2 && is_wrap_break_after(chars[next]) {
-            next += 1;
-            merged += 1;
-        }
-        if merged > 0 {
-            line_end = next;
-        }
-        // 下一行开头若是空白，一并跳过，避免行首出现空格。
-        while next < chars.len() && chars[next] == ' ' {
-            next += 1;
-        }
-        out.extend(chars[start..line_end].iter());
-        out.push('\n');
-        start = next;
-    }
-    out.extend(chars[start..].iter());
-    out
-}
-
 /// 可作为折行断点的标点（断点落在它**之后**：标点留在行尾）。
 ///
 /// 只收「句读 / 收尾」类标点：**不含**左括号与左引号（它们后面断行没意义，
@@ -1431,7 +1561,7 @@ mod tests {
     #[test]
     fn wrap_chinese_prefers_punctuation() {
         let text = "今天天气很好，我们一起去公园散步，然后回家吃饭。";
-        let out = wrap_text(text, 10);
+        let out = wrap_text_capped(text, 10, usize::MAX);
         // 每个断点都落在标点之后：逗号/句号绝不出现在行首
         for line in out.split('\n') {
             assert!(
@@ -1453,7 +1583,7 @@ mod tests {
     #[test]
     fn wrap_english_breaks_at_spaces_not_mid_word() {
         let text = "The quick brown fox jumps over the lazy dog near the river bank";
-        let out = wrap_text(text, 20);
+        let out = wrap_text_capped(text, 20, usize::MAX);
         for line in out.split('\n') {
             assert!(line.chars().count() <= 20, "行超长: {line:?} / {out:?}");
             for word in line.split(' ') {
@@ -1474,7 +1604,7 @@ mod tests {
     fn wrap_never_starts_line_with_punctuation() {
         // 前 10 个汉字正好填满一行，逗号紧随其后（正是会被挤到下一行行首的位置）
         let text = "甲乙丙丁戊己庚辛壬癸，后续还有很多内容需要继续折行处理";
-        let out = wrap_text(text, 10);
+        let out = wrap_text_capped(text, 10, usize::MAX);
         for line in out.split('\n') {
             assert!(
                 !line.starts_with(['，', '。', '、', '；', '：', '！', '？', ',', '.', ';']),
@@ -1488,7 +1618,7 @@ mod tests {
 
         // 英文同理：句号/逗号不能落到行首
         let en = "abcdefghij, klmnopqrst. uvwxyz";
-        let out_en = wrap_text(en, 10);
+        let out_en = wrap_text_capped(en, 10, usize::MAX);
         for line in out_en.split('\n') {
             assert!(
                 !line.starts_with([',', '.', ';', ':', '!', '?', '，', '。']),
@@ -1501,7 +1631,7 @@ mod tests {
     #[test]
     fn wrap_unbreakable_token_hard_cuts() {
         let text = "aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd";
-        let out = wrap_text(text, 7);
+        let out = wrap_text_capped(text, 7, usize::MAX);
         for line in out.split('\n') {
             assert!(line.chars().count() <= 7, "行超长: {line:?}");
         }
@@ -1512,7 +1642,7 @@ mod tests {
     #[test]
     fn wrap_preserves_existing_newlines_per_line() {
         let text = "这是一句很长很长的中文原文字幕内容\nHello there this is a rather long translated subtitle line";
-        let out = wrap_text(text, 12);
+        let out = wrap_text_capped(text, 12, usize::MAX);
         // 原文里的 1 个换行必须保留，且在它两侧各自继续折行（换行数 ≥ 原换行数）
         assert!(
             out.matches('\n').count() > text.matches('\n').count(),
@@ -1539,16 +1669,23 @@ mod tests {
     #[test]
     fn wrap_is_noop_when_disabled_or_text_fits() {
         let long = "今天天气很好，我们一起去公园散步，然后回家吃饭。";
-        assert_eq!(wrap_text(long, 0), long, "0 表示不折行");
-        assert_eq!(wrap_text(long, 100), long, "文本短于阈值应原样返回");
+        assert_eq!(wrap_text_capped(long, 0, usize::MAX), long, "0 表示不折行");
         assert_eq!(
-            wrap_text(long, long.chars().count()),
+            wrap_text_capped(long, 100, usize::MAX),
+            long,
+            "文本短于阈值应原样返回"
+        );
+        assert_eq!(
+            wrap_text_capped(long, long.chars().count(), usize::MAX),
             long,
             "恰好等长不折行"
         );
-        assert_eq!(wrap_text("", 10), "");
+        assert_eq!(wrap_text_capped("", 10, usize::MAX), "");
         // 每一行都不超限时也不应插入多余换行
-        assert_eq!(wrap_text("短句\n另一短句", 10), "短句\n另一短句");
+        assert_eq!(
+            wrap_text_capped("短句\n另一短句", 10, usize::MAX),
+            "短句\n另一短句"
+        );
     }
 
     /// ASS 路径：折行后仍用硬换行 `\N`，且原有 `\N` 转换不受影响。
@@ -1829,5 +1966,135 @@ mod tests {
             super::export_file_name("{name}-{lang}.{ext}", "n", "srt", "20261009"),
             "n-{lang}.srt"
         );
+    }
+
+    /// 均衡折行：各行长度接近，且行数不超贪心排版的上限。
+    ///
+    /// 这是产品级的排版诉求——一行 26 字、一行 2 字的字幕，观众读到第二行会
+    /// 以为字幕已经结束。这里锁住「没有哪一行明显比别的行长」。
+    #[test]
+    fn wrap_balances_line_widths_on_long_cjk() {
+        let text = "今天天气很好，我们一起去公园散步，然后回家吃饭，最后各自回家睡觉。";
+        let out = wrap_text_capped(text, 8, usize::MAX);
+        let lengths: Vec<usize> = out.split('\n').map(|l| l.chars().count()).collect();
+
+        // 折行不能比贪心排版切出更多行（每行上限 8 的贪心结果就该是上界）
+        assert!(
+            lengths.len() <= 5,
+            "行数不应超过贪心排版: {lengths:?} / {out:?}"
+        );
+        for line in out.split('\n') {
+            assert!(line.chars().count() <= 10, "行超长: {line:?} / {out:?}");
+        }
+        // 均衡的判据：最宽与最窄的差不超过一行上限（30 字 5 行时最宽 9、
+        // 最窄 2；贪心填满会在末尾留下更差的参差）。
+        let widest = lengths.iter().copied().max().unwrap();
+        let narrowest = lengths.iter().copied().min().unwrap();
+        assert!(
+            widest - narrowest <= 7,
+            "不允许出现极端参差（最宽与最窄差 <= 一行上限）: {lengths:?} / {out:?}"
+        );
+        assert_eq!(out.replace('\n', ""), text, "折行不得增删字符: {out:?}");
+    }
+
+    /// 均衡折行不许改字：断行只允许吞掉断点处的空格，非空白字符一个不丢。
+    ///
+    /// 「断点吞空格」是折行的既有惯例（英文单词不能连着换行符，否则播放器会把
+    /// `fox` 和 `jumps` 粘成一个词）；本条用「去掉所有空白后逐字相等」锁住它。
+    #[test]
+    fn wrap_balanced_never_drops_or_duplicates_chars() {
+        let cases = [
+            (
+                "The quick brown fox jumps over the lazy dog near the river bank",
+                20usize,
+            ),
+            ("今天天气很好，我们一起去公园散步，然后回家吃饭。", 10),
+            ("aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd", 7),
+            ("Mixing 中英文 and punctuation, 一起 break 这行文字", 9),
+        ];
+        let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        for (text, max_chars) in cases {
+            let out = wrap_text_capped(text, max_chars, usize::MAX);
+            assert_eq!(
+                strip(&out),
+                strip(text),
+                "折行不得增删非空白字符: {out:?} (max={max_chars})"
+            );
+            assert!(
+                !out.is_empty() && out.split('\n').all(|l| !l.is_empty()),
+                "不允许出现空行: {out:?}"
+            );
+            for line in out.split('\n') {
+                assert!(
+                    line.chars().count() <= max_chars + 2,
+                    "行超长（允许并回标点 +2）: {line:?} / {out:?}"
+                );
+            }
+        }
+    }
+
+    /// 行数上限：塞得进两行的长句折成两行，别把画面盖掉大半。
+    #[test]
+    fn wrap_capped_keeps_long_segments_within_two_lines() {
+        // 24 字（汉字算 1）：每行上限 12 时两行就够（12 + 12）。
+        let text = "今天天气很好我们一起去看电影然后回家吃饭睡觉吧";
+        let out = wrap_text_capped(text, 12, 2);
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "24 字在每行 12 字的约束下塞得进两行，不该折三行以上: {out:?}"
+        );
+        for line in &lines {
+            assert!(line.chars().count() <= 14, "行超长: {line:?} / {out:?}");
+        }
+        assert_eq!(out.replace('\n', ""), text, "上限不得丢字: {out:?}");
+    }
+
+    /// 上限只是「不主动多切」：真的塞不进两行时照旧切满，绝不截断。
+    #[test]
+    fn wrap_capped_never_truncates_when_two_lines_are_not_enough() {
+        let text = "abcdefghijklmnopqrstuvwxyz0123456789"; // 36 字
+        let out = wrap_text_capped(text, 8, 2);
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert!(lines.len() > 2, "塞不下时必须继续切而不是截断: {out:?}");
+        assert_eq!(out.replace('\n', ""), text, "上限不得丢字: {out:?}");
+        for line in &lines {
+            assert!(line.chars().count() <= 10, "行超长: {line:?} / {out:?}");
+        }
+    }
+
+    /// `wrap_text_capped` 的边界：0 上限 / 0 宽度 / 空串都原样返回，不 panic。
+    #[test]
+    fn wrap_capped_is_noop_for_degenerate_limits() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(wrap_text_capped(text, 8, 0), text, "行数上限为 0 = 不折");
+        assert_eq!(wrap_text_capped(text, 0, 2), text, "宽度为 0 = 不折");
+        assert_eq!(wrap_text_capped("", 8, 2), "");
+        assert_eq!(wrap_text_capped("短句\n另一短句", 10, 2), "短句\n另一短句");
+    }
+
+    /// 上限按**每一行**分别计算：原文里的换行先按段切开，再各自折行，互不挤占。
+    ///
+    /// 这里是双语字幕的排版：中文一行、英文一行，两行各自成段，各自的折行结果
+    /// 都受同一个「每行 N 字」约束，但行数上限不会把两段合起来算。
+    #[test]
+    fn wrap_capped_applies_per_existing_line() {
+        let zh = "今天天气很好，我们一起去公园散步，然后回家吃饭。";
+        let en = "The quick brown fox jumps over the lazy dog and keeps running";
+        let text = format!("{zh}\n{en}");
+        let out = wrap_text_capped(&text, 10, 2);
+        let lines: Vec<&str> = out.split('\n').collect();
+        // 每段至少折成两行（每行 10 字的约束下中英都放不下），但两段的合计
+        // 行数不能超过「各自至少两行」太多——合并计算会把这个数压到 2。
+        assert!(lines.len() >= 4, "两段都要各自折行，不能合并计算: {out:?}");
+        // 两段的最后一行必须来自各自的内容（英文段尾词在最后）。
+        assert!(
+            lines.last().is_some_and(|l| l.contains("running")),
+            "英文段应完整保留到结尾: {out:?}"
+        );
+        for line in &lines {
+            assert!(line.chars().count() <= 12, "行超长: {line:?} / {out:?}");
+        }
     }
 }
