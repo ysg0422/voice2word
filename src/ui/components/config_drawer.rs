@@ -108,6 +108,55 @@ const TIER_TAGLINES: [(WhisperModelTier, &str); 5] = [
     (WhisperModelTier::Precise, "最准 · 抗口音吞音，也最慢"),
 ];
 
+/// 「识别引擎」档位的相对性能元数据：`(档位, 速度星级, 精度星级)`。
+///
+/// 星级是产品定位的相对值，不是跑分：只在同一列里横向比较，换台机器或换个模型
+/// 版本数字就全变，所以这里钉的是「谁比谁快、谁比谁准」的相对口径——SenseVoice
+/// 最快但精度中上，Q8 最准也最慢。取值 0..=5，5 表示该列最强。
+const TIER_METRICS: [(WhisperModelTier, u8, u8); 5] = [
+    (WhisperModelTier::SenseVoice, 5, 3),
+    (WhisperModelTier::Fast, 4, 1),
+    (WhisperModelTier::Balanced, 3, 2),
+    (WhisperModelTier::TurboSpeed, 2, 4),
+    (WhisperModelTier::Precise, 1, 5),
+];
+
+/// 星级上限：满格 5 颗。
+const STAR_MAX: u8 = 5;
+
+/// 档位的 `(速度星级, 精度星级)`。
+///
+/// 表与档位枚举脱节时给中位兜底而不是 panic：漏一档最多显示得不准，
+/// 渲染期 panic 却会让整个抽屉打不开。
+fn tier_metrics(tier: WhisperModelTier) -> (u8, u8) {
+    TIER_METRICS
+        .iter()
+        .find(|(t, _, _)| *t == tier)
+        .map(|(_, speed, accuracy)| (*speed, *accuracy))
+        .unwrap_or((3, 3))
+}
+
+/// 星级文案：`★★★☆☆`，实心 = 得分，恒 5 颗。
+///
+/// 超界输入夹到 `0..=STAR_MAX`，让渲染函数本身全定义，改表写错数也不会崩界面。
+fn star_text(stars: u8) -> String {
+    let filled = stars.min(STAR_MAX) as usize;
+    let mut text = String::with_capacity(STAR_MAX as usize * 3);
+    for _ in 0..filled {
+        text.push('★');
+    }
+    for _ in filled..STAR_MAX as usize {
+        text.push('☆');
+    }
+    text
+}
+
+/// 速度 / 精度两段星级文案：`★★★☆☆ 快 · ★★★★☆ 准`。
+fn tier_metrics_text(tier: WhisperModelTier) -> String {
+    let (speed, accuracy) = tier_metrics(tier);
+    format!("{} 快 · {} 准", star_text(speed), star_text(accuracy))
+}
+
 /// SenseVoice 档对应的一组下载条目：模型 + 词表 + VAD，三个文件缺一不可。
 const SENSEVOICE_ITEM_IDS: [&str; 3] = ["sensevoice-model", "sensevoice-tokens", "sensevoice-vad"];
 
@@ -599,7 +648,7 @@ impl MainWindow {
             .child(cards)
     }
 
-    /// 单个档位卡片：名字 + 定位句 + 体积 + 状态徽标，选中 / 未下载 / 下载中各有样式。
+    /// 单个档位卡片：名字 + 状态徽标 + 速度/精度星级 + 体积，选中 / 未下载 / 下载中各有样式。
     ///
     /// 点击整卡 = 选中该档位（语义与老胶囊一致：写配置 + 把「模型与组件」页切到
     /// 对应分栏）；未下载时行内多一个动作按钮，点它不会顺带改档位。
@@ -681,22 +730,34 @@ impl MainWindow {
             }
         }
 
-        // 卡片只保留「名字 + 状态徽标 + 体积」：定位句这类小字说明按用户要求去掉，
-        // 五张卡片因此能从五行文字压到三行，抽屉里一屏能看全。
-        // 体积仍是唯一保留的辅助信息——它决定「要不要下载」，是选型时必须的。
+        // 卡片只保留「名字 + 状态徽标 + 速度/精度 + 体积」：定位句这类小字说明按用户
+        // 要求去掉，五张卡片因此能从五行文字压到三行，抽屉里一屏能看全。
+        // 速度/精度星级与体积挤在同一行：选型要权衡的就是这三项，横向一眼可比。
         let body = div()
             .flex()
             .flex_col()
             .gap(px(Theme::SPACE_1))
             .child(head)
             .child(
-                div().flex().items_center().justify_between().child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .text_color(Theme::text_muted())
-                        .child(size_text),
-                ),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(Theme::SPACE_1_5))
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_secondary())
+                            .child(tier_metrics_text(tier)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child(size_text),
+                    ),
             );
 
         div()
@@ -1381,8 +1442,9 @@ mod tests {
     // `test` 属性宏带进来，遮蔽内建的 `#[test]`，导致展开递归超限。
     use super::{
         apply_hotwords_bare_key, bundle_size_text, hotwords_display_window, speaker_options,
-        tier_downloading, tier_size_text, tier_status_text, HOTWORDS_VIEW_CHARS,
-        OUTPUT_FORMAT_CHOICES, TIER_TAGLINES,
+        star_text, tier_downloading, tier_metrics, tier_metrics_text, tier_size_text,
+        tier_status_text, HOTWORDS_VIEW_CHARS, OUTPUT_FORMAT_CHOICES, STAR_MAX, TIER_METRICS,
+        TIER_TAGLINES,
     };
     use crate::app::WhisperModelTier;
     use crate::engines::MAX_SPEAKERS;
@@ -1596,5 +1658,61 @@ mod tests {
             crate::subtitle::writer::export_spec_for("txt").0,
             crate::subtitle::writer::export_spec_for("txt-ts").0,
         );
+    }
+
+    /// 元数据表必须与档位枚举一一对应：漏一档就只能落到 `tier_metrics` 的中位兜底，
+    /// 用户看到的星级与选型建议就对不上了；多一档说明枚举改过而表没跟着改。
+    #[test]
+    fn tier_metrics_cover_every_tier_once() {
+        let mut covered: Vec<WhisperModelTier> =
+            TIER_METRICS.iter().map(|(tier, _, _)| *tier).collect();
+        let count = covered.len();
+        covered.sort_by_key(|tier| *tier as u8);
+        covered.dedup();
+
+        assert_eq!(count, 5, "五档都要有元数据");
+        assert_eq!(covered.len(), count, "档位不能重复登记");
+
+        // 与定位句表覆盖同一组档位：两表脱节时卡片会一半有星级一半没有。
+        let taglined: Vec<WhisperModelTier> = TIER_TAGLINES.iter().map(|(tier, _)| *tier).collect();
+        for tier in taglined {
+            assert!(
+                TIER_METRICS.iter().any(|(t, _, _)| *t == tier),
+                "{tier:?} 有定位句却没有星级"
+            );
+        }
+    }
+
+    /// 星级必须在 `0..=STAR_MAX`：写超了会在卡片上画出 6 颗星，写 0 会让「快」那一列
+    /// 变成空白，两种都是肉眼可见的错。
+    #[test]
+    fn tier_metrics_stars_within_range() {
+        for (tier, speed, accuracy) in TIER_METRICS {
+            assert!(speed <= STAR_MAX, "{tier:?} 速度星级超界：{speed}");
+            assert!(accuracy <= STAR_MAX, "{tier:?} 精度星级超界：{accuracy}");
+        }
+    }
+
+    /// 星级文案恒为 `STAR_MAX` 颗：0 星 / 满星 / 超界都不 panic，且长度稳定，
+    /// 卡片上的两段星级才会对齐成一条竖线。
+    #[test]
+    fn star_text_is_fixed_width_and_clamped() {
+        let empty = star_text(0);
+        let full = star_text(STAR_MAX);
+        let over = star_text(STAR_MAX + 3);
+
+        assert_eq!(empty.chars().count(), STAR_MAX as usize);
+        assert_eq!(full, "★".repeat(STAR_MAX as usize));
+        assert_eq!(over, full, "超界按满格渲染，不能画出多余的星");
+        assert!(empty.starts_with('☆'));
+    }
+
+    /// 渲染文案的同时包含速度与精度两段：只写一段就没法横向比较了。
+    #[test]
+    fn tier_metrics_text_carries_both_axes() {
+        let text = tier_metrics_text(WhisperModelTier::SenseVoice);
+        assert!(text.contains("快"), "缺速度段：{text}");
+        assert!(text.contains("准"), "缺精度段：{text}");
+        assert_eq!(tier_metrics(WhisperModelTier::SenseVoice), (5, 3));
     }
 }
