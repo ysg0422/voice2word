@@ -124,6 +124,36 @@ fn summarize_segments(segments: &[Segment]) -> (usize, String, bool) {
     (segments.len(), sample_text, has_translation)
 }
 
+/// 迁移回填 `sample_text` 时 `TRIM(X, …)` 用的字符集：**ASCII 空白**。
+///
+/// 与写入侧同口径：`summarize_segments` 判 `polished` 是否为空用的是
+/// `char::is_ascii_whitespace`，所以这里只能给 ASCII 空白集（`TRIM(X)` 默认只去半角空格，
+/// 连 `\n` 都删不掉，必须显式列出）。
+const SQL_ASCII_WHITESPACE_SET: &str =
+    "' ' || char(9) || char(10) || char(11) || char(12) || char(13)";
+
+/// 迁移回填 `has_translation` 时 `TRIM(X, …)` 用的字符集：**Unicode White_Space**。
+///
+/// # 为什么不能用 ASCII 集（本轮修的不一致）
+///
+/// `has_translation` 的口径是 [`Segment::has_translation`]（`str::trim`，按 Unicode
+/// White_Space 属性判空）。若回填只去 ASCII 空白，那么「只由 NBSP(U+00A0) / 全角空格
+/// (U+3000) / 行分隔符(U+2028) 这类**非 ASCII 空白**组成的译文」会被回填成 `1`（已翻译），
+/// 而任何一次写入（`summarize_segments`）或装载（`normalize_segment_blanks` +
+/// `hydrate_task` 重算）都会把它算成 `0`——同一份 `segments_json` 在两个口径下给出相反
+/// 答案，列表页的「已翻译」徽标与打开工程后的实际状态对不上。
+///
+/// 集合逐字对应 Rust `char::is_whitespace` 覆盖的码点；SQLite 的 `char()` 接受码点、
+/// `TRIM(X, Y)` 的 Y 按字符集处理，因此多字节字符不会被按字节误删。
+const SQL_UNICODE_WHITESPACE_SET: &str = concat!(
+    "' ' || char(9) || char(10) || char(11) || char(12) || char(13)",
+    " || char(133) || char(160) || char(5760)",
+    " || char(8192) || char(8193) || char(8194) || char(8195) || char(8196)",
+    " || char(8197) || char(8198) || char(8199) || char(8200) || char(8201)",
+    " || char(8202) || char(8232) || char(8233) || char(8239) || char(8287)",
+    " || char(12288)",
+);
+
 #[derive(Debug, Clone)]
 pub struct TaskRecord {
     pub id: i64,
@@ -572,24 +602,26 @@ impl Database {
                         .with_context(|| format!("v3→v4：补 {name} 列失败"))?;
                 }
             }
-            tx.execute(
+            let backfill = format!(
                 "UPDATE tasks SET
                      segment_count = CASE WHEN json_valid(segments_json)
                                           THEN COALESCE(json_array_length(segments_json), 0) ELSE 0 END,
                      sample_text = CASE WHEN json_valid(segments_json)
                                         THEN COALESCE(NULLIF(TRIM(json_extract(segments_json, '$[0].polished'),
-                                                                 ' ' || char(9) || char(10) || char(11) || char(12) || char(13)), ''),
+                                                                 {ascii_ws}), ''),
                                                      json_extract(segments_json, '$[0].text'), '') ELSE '' END,
                      has_translation = CASE WHEN json_valid(segments_json)
                                             THEN CASE WHEN EXISTS (
                                                      SELECT 1 FROM json_each(segments_json) AS seg
                                                      WHERE TRIM(COALESCE(json_extract(seg.value, '$.translation'), ''),
-                                                                ' ' || char(9) || char(10) || char(11) || char(12) || char(13)) <> ''
+                                                                {unicode_ws}) <> ''
                                                  ) THEN 1 ELSE 0 END
                                             ELSE 0 END",
-                [],
-            )
-            .context("v3→v4：回填列表摘要列失败")?;
+                ascii_ws = SQL_ASCII_WHITESPACE_SET,
+                unicode_ws = SQL_UNICODE_WHITESPACE_SET,
+            );
+            tx.execute(&backfill, [])
+                .context("v3→v4：回填列表摘要列失败")?;
         }
 
         // 版本号与上面的 DDL 在同一个事务里提交：要么一起生效，要么一起回滚。
@@ -2700,5 +2732,107 @@ mod tests {
             "新句",
             "写失败时不得改动库里已有的字幕"
         );
+    }
+}
+
+/// 派生列一致性回归：**迁移回填**与**写入路径**对同一份 `segments_json` 必须给出同一个
+/// `segment_count` / `sample_text` / `has_translation`。
+///
+/// 钉住的是「只由非 ASCII 空白（NBSP / 全角空格 / 行分隔符…）组成的译文」这个入口：写入路径
+/// 走 `Segment::has_translation`（`str::trim`，Unicode White_Space）算「没译文」，而迁移回填
+/// 若用 ASCII 空白集 `TRIM` 就会把它算成「已翻译」——同一份字幕，列表页徽标与实际状态分叉。
+///
+/// 测试模块刻意不用 `use super::*`：只显式取用需要的两个内部符号，避免把整层私有项拉进作用域。
+#[cfg(test)]
+mod derived_column_consistency {
+    use super::{summarize_segments, Database};
+    use crate::subtitle::Segment;
+    use rusqlite::{params, Connection};
+
+    fn read_summary(db: &Database, id: i64) -> (i64, String, i64) {
+        db.lock_conn()
+            .query_row(
+                "SELECT segment_count, sample_text, has_translation FROM tasks WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// 在 v3 库（缺三个派生列）里塞一行，再让 `Database::open` 触发迁移回填。
+    fn migrated_summary(tag: &str, segments_json: &str) -> (i64, String, i64) {
+        let dir = std::env::temp_dir().join(format!("v2w_uni_ws_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v3.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     file_path TEXT NOT NULL,
+                     file_name TEXT NOT NULL,
+                     duration REAL DEFAULT 0.0,
+                     status TEXT NOT NULL,
+                     segments_json TEXT NOT NULL,
+                     metrics_json TEXT,
+                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                     content_hash TEXT
+                 );
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (file_path, file_name, duration, status, segments_json, created_at)
+                 VALUES (?1, ?2, 1.0, 'completed', ?3, '2026-10-01 00:00:00')",
+                params![format!("D:/u/{tag}.mp4"), "u.mp4", segments_json],
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).expect("v3 库应能迁移后打开");
+        let summary = read_summary(&db, 1);
+        drop(db);
+        // 收尾：连带 -wal / -shm 一起删，不给下一次测试留垃圾。
+        let _ = std::fs::remove_dir_all(&dir);
+        summary
+    }
+
+    /// 纯空白译文（含非 ASCII 空白）在两条路径下都必须算「未翻译」，且逐字相等。
+    #[test]
+    fn blank_translations_agree_between_migration_and_write_path() {
+        // 前三个是 ASCII 空白（旧口径也判空）；后三个是 NBSP / 全角空格 / 行分隔符——
+        // 正是旧 ASCII 口径会误判成「已翻译」的那类。
+        let cases = ["   ", "\t", "\n", "\u{00A0}", "\u{3000}", "\u{2028}"];
+        for (i, translation) in cases.iter().enumerate() {
+            let mut seg = Segment::new(1, 0.0, 1.0, "正文");
+            seg.translation = Some((*translation).to_string());
+            let segments = vec![seg];
+
+            // 写入路径：`insert_task` 物化出来的派生列。
+            let mem = Database::open(":memory:").expect("内存库应能打开");
+            let id = mem
+                .insert_task(
+                    &format!("D:/u/{i}.mp4"),
+                    "u.mp4",
+                    1.0,
+                    "completed",
+                    &segments,
+                    None,
+                )
+                .expect("插入应成功");
+            let written = read_summary(&mem, id);
+
+            // 迁移回填路径：同一份 JSON 装进 v3 库再升级。
+            let json = serde_json::to_string(&segments).unwrap();
+            let backfilled = migrated_summary(&format!("case{i}"), &json);
+
+            assert_eq!(
+                backfilled, written,
+                "译文 {translation:?} 的派生列在迁移回填与写入路径下必须逐字相等"
+            );
+            assert_eq!(written.2, 0, "纯空白译文 {translation:?} 不该算已翻译");
+            // 交叉验证：写入路径的答案就是 `summarize_segments` 的答案（唯一口径）。
+            assert_eq!(i64::from(summarize_segments(&segments).2), written.2);
+        }
     }
 }
