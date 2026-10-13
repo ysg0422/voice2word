@@ -7,8 +7,11 @@
 //! 2. **镜像加速**：优先直连阿里云魔搭社区（ModelScope CDN，实测 10MB/s+），自动回落 HuggingFace 镜像。
 //! 3. **视觉层次优化**：核心模型与底层执行程序分流展示，系统维护工具独立沉底。
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use gpui::prelude::*;
-use gpui::{div, px, AnyElement, FontWeight, IntoElement, ParentElement, Styled};
+use gpui::{div, px, AnyElement, FontWeight, Global, IntoElement, ParentElement, Styled};
 
 use crate::ui::primitives;
 use crate::ui::theme::Theme;
@@ -105,7 +108,130 @@ pub fn is_item_needed_by_current_config(item_id: &str, state: &crate::app::AppSt
     }
 }
 
+/// 「模型与组件」卡的磁盘快照：条目体积 / 是否在磁盘。
+///
+/// 面板此前每帧对每个条目做一次磁盘探测（`presence.is_present` + `disk_size`，
+/// 10 个条目 = 每帧 10+ 次 stat；声明了 `sha256` 的条目还要整文件重算哈希），
+/// 而结果只用来显示一行「已就位 N 项 · 占 X」。这里照 `views/library.rs` 的
+/// `ensure_library_sizes` 范式收口：后台探一次写进 GPUI 全局，渲染只读快照。
+///
+/// 存在 GPUI 全局（`App::update_default_global`）而不是 `MainWindow` 字段里：
+/// 字段定义在并发改动中的 `ui/mod.rs`，本模块无权改；全局随 App 生命周期存活，
+/// 等价于视图级状态。
+#[derive(Default)]
+struct ModelDiskSnapshot {
+    /// 快照基于哪个键算出（`None` = 还没算过）
+    key: Option<ModelDiskKey>,
+    /// 条目 id → 磁盘占用字节（`None` = 未就位 / 探测失败）
+    sizes: HashMap<String, Option<u64>>,
+    /// 后台探测进行中：避免每帧重复派发
+    inflight: bool,
+}
+
+impl Global for ModelDiskSnapshot {}
+
+/// 快照失效键：键变了才重扫（判定抽成纯函数 [`model_disk_snapshot_stale`]）。
+///
+/// - `entries`：要探测的条目 (id, 生效路径)。条目集合或生效路径变化（改了配置）
+///   必须重扫；
+/// - `downloading`：下载在跑时体积一直在变，下载完成 true→false 就是「立刻刷新」
+///   的信号——下载完成回调在别的文件里（本模块无权改），靠键自动失效即可；
+/// - `presence`：各条目就位快照（按 `ITEMS` 稳定顺序）。删除 / 补齐后
+///   `AppState::refresh_model_presence` 会改它，保证「删掉模型」也自动刷新统计。
+#[derive(Clone, PartialEq, Eq)]
+struct ModelDiskKey {
+    entries: Vec<(String, PathBuf)>,
+    downloading: bool,
+    presence: Vec<bool>,
+}
+
+/// 快照是否需要重扫（纯函数，便于单测）：键变了 → 重扫；键不变 → 复用。
+fn model_disk_snapshot_stale(cached: Option<&ModelDiskKey>, current: &ModelDiskKey) -> bool {
+    cached != Some(current)
+}
+
+/// 后台探测所有条目的磁盘占用，返回 `id → 体积`（未就位 / 探测失败为 `None`）。
+///
+/// 与旧渲染路径逐字同源：先 `is_present` 判定就位，再对就位项 `disk_size`，
+/// 区别只是整段搬到了后台线程（`fs::metadata` 在机械盘 / 网络盘上可能卡住）。
+fn scan_model_disk_usage(cfg: &crate::utils::AppConfig) -> HashMap<String, Option<u64>> {
+    use crate::utils::model_download::{disk_size, item_effective_path, PresenceContextRef};
+    let presence = PresenceContextRef::new(cfg);
+    ITEMS
+        .iter()
+        .map(|item| {
+            let size = if presence.is_present(item) {
+                disk_size(&item_effective_path(item, cfg))
+            } else {
+                None
+            };
+            (item.id.to_string(), size)
+        })
+        .collect()
+}
+
 impl MainWindow {
+    /// 当前快照失效键：条目集合 + 生效路径 + 下载中标志 + 就位快照。
+    fn model_disk_key(&self) -> ModelDiskKey {
+        let cfg = &self.state.config;
+        ModelDiskKey {
+            entries: ITEMS
+                .iter()
+                .map(|item| {
+                    (
+                        item.id.to_string(),
+                        crate::utils::model_download::item_effective_path(item, cfg),
+                    )
+                })
+                .collect(),
+            downloading: self.state.is_downloading,
+            presence: ITEMS
+                .iter()
+                .map(|item| self.state.model_is_present(item.id))
+                .collect(),
+        }
+    }
+
+    /// 读「已就位条目体积 / 条数」快照；失效时在后台重扫一次。
+    ///
+    /// 渲染路径只读内存：键不变就直接复用，键变了（下载完成 / 删除 / 改路径）
+    /// 才派发一次后台探测，完成后 `cx.notify()` 自动刷新。
+    fn model_disk_usage(&self, cx: &mut gpui::Context<Self>) -> (u64, usize) {
+        let key = self.model_disk_key();
+        let stale = cx.update_default_global::<ModelDiskSnapshot, _>(|state, _| {
+            model_disk_snapshot_stale(state.key.as_ref(), &key) && !state.inflight
+        });
+        if stale {
+            let cfg = self.state.config.clone();
+            let key_for_store = key;
+            cx.update_default_global::<ModelDiskSnapshot, _>(|state, _| state.inflight = true);
+            cx.spawn(async move |this, cx| {
+                let sizes = cx
+                    .background_executor()
+                    .spawn(async move { scan_model_disk_usage(&cfg) })
+                    .await;
+                let _ = this.update(cx, |_this, cx| {
+                    cx.update_default_global::<ModelDiskSnapshot, _>(|state, _| {
+                        state.sizes = sizes;
+                        state.key = Some(key_for_store);
+                        state.inflight = false;
+                    });
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        cx.update_default_global::<ModelDiskSnapshot, _>(|state, _| {
+            state
+                .sizes
+                .values()
+                .copied()
+                .flatten()
+                .fold((0u64, 0usize), |(bytes, count), size| {
+                    (bytes + size, count + 1)
+                })
+        })
+    }
     /// 模型管理卡片。`compact` 为真时只显示缺失项与一个「一键补齐」按钮
     /// （用于侧栏），否则显示完整清单（用于独立页面）。
     pub(crate) fn render_model_manager(
@@ -191,16 +317,8 @@ impl MainWindow {
                     })),
             );
 
-        // 占用统计
-        let presence = crate::utils::model_download::PresenceContextRef::new(&self.state.config);
-        let (used_bytes, used_count) = ITEMS
-            .iter()
-            .filter(|i| presence.is_present(i))
-            .filter_map(|i| {
-                let p = crate::utils::model_download::item_effective_path(i, &self.state.config);
-                crate::utils::model_download::disk_size(&p)
-            })
-            .fold((0u64, 0usize), |(bytes, n), sz| (bytes + sz, n + 1));
+        // 占用统计：读后台快照，渲染路径不碰磁盘（见 [`ModelDiskSnapshot`]）
+        let (used_bytes, used_count) = self.model_disk_usage(cx);
 
         let header = div()
             .w_full()
@@ -731,5 +849,68 @@ impl MainWindow {
             )
             .child(right_actions)
             .into_any_element()
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::{model_disk_snapshot_stale, ModelDiskKey};
+    use std::path::PathBuf;
+
+    fn key(entries: &[(&str, &str)], downloading: bool, presence: &[bool]) -> ModelDiskKey {
+        ModelDiskKey {
+            entries: entries
+                .iter()
+                .map(|&(id, path)| (id.to_string(), PathBuf::from(path)))
+                .collect(),
+            downloading,
+            presence: presence.to_vec(),
+        }
+    }
+
+    /// 键完全一致 → 复用旧快照，不重扫（这是「渲染路径不再碰磁盘」的前提）。
+    #[test]
+    fn model_disk_snapshot_reuses_when_key_unchanged() {
+        let k = key(&[("a", "x.bin")], false, &[true]);
+        assert!(!model_disk_snapshot_stale(Some(&k), &k), "键不变时不该重扫");
+    }
+
+    /// 从没算过（无缓存）→ 必须重扫一次。
+    #[test]
+    fn model_disk_snapshot_scans_when_never_computed() {
+        let k = key(&[("a", "x.bin")], false, &[true]);
+        assert!(model_disk_snapshot_stale(None, &k), "首次必须扫一次");
+    }
+
+    /// 下载完成（downloading true→false）→ 键变化 → 重扫，统计自动刷新。
+    #[test]
+    fn model_disk_snapshot_rescans_when_download_finishes() {
+        let cached = key(&[("a", "x.bin")], true, &[false]);
+        let current = key(&[("a", "x.bin")], false, &[true]);
+        assert!(
+            model_disk_snapshot_stale(Some(&cached), &current),
+            "下载完成必须触发重扫"
+        );
+    }
+
+    /// 生效路径变化（改配置）→ 键变化 → 重扫。
+    #[test]
+    fn model_disk_snapshot_rescans_when_path_changes() {
+        let cached = key(&[("a", "x.bin")], false, &[true]);
+        let current = key(&[("a", "y.bin")], false, &[true]);
+        assert!(
+            model_disk_snapshot_stale(Some(&cached), &current),
+            "路径变了必须重扫"
+        );
+    }
+
+    /// 就位快照变化（删除 / 补齐）→ 键变化 → 重扫。
+    #[test]
+    fn model_disk_snapshot_rescans_when_presence_changes() {
+        let cached = key(&[("a", "x.bin")], false, &[true]);
+        let current = key(&[("a", "x.bin")], false, &[false]);
+        assert!(
+            model_disk_snapshot_stale(Some(&cached), &current),
+            "就位状态变了必须重扫"
+        );
     }
 }

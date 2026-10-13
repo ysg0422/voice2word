@@ -5,6 +5,7 @@
 
 use gpui::prelude::*;
 use gpui::*;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -159,6 +160,17 @@ fn model_cache_snapshot(cfg: &TranslateConfig) -> (bool, Option<(bool, String)>,
             (cache.loading, cache.status.clone(), cache.models.clone())
         }
         _ => (false, None, Vec::new()),
+    })
+}
+/// 取当前配置下的缓存**元信息** `(loading, status)`，不克隆模型列表。
+///
+/// `model_cache_snapshot` 连整个 `Vec<ModelInfo>` 一起深拷贝，而「获取模型列表」行
+/// 只用 loading / status：列表长（网关可返回上百条）时，逐帧白拷一份纯属浪费。
+fn model_cache_status(cfg: &TranslateConfig) -> (bool, Option<(bool, String)>) {
+    let fingerprint = model_cache_fingerprint(cfg);
+    with_model_cache(|slot| match slot.as_ref() {
+        Some(cache) if cache.fingerprint == fingerprint => (cache.loading, cache.status.clone()),
+        _ => (false, None),
     })
 }
 
@@ -423,6 +435,75 @@ impl Default for ModelPoolScroll {
 }
 
 impl Global for ModelPoolScroll {}
+
+/// Whisper 档位的磁盘快照：每个档位「引擎实际会加载的文件」及其占用。
+///
+/// 档位触发器每帧调 `installed_path()`（`exists()` + `is_file()` 两次 stat），
+/// 展开的档位菜单又对每个档位再调一次 `installed_path()` + `disk_size()`——都不该
+/// 出现在渲染路径上。照 `views/library.rs` 的 `ensure_library_sizes` 范式：
+/// 后台探一次写进 GPUI 全局，渲染只读快照。
+///
+/// 存在 GPUI 全局而不是 `MainWindow` 字段里：字段定义在并发改动中的 `ui/mod.rs`，
+/// 本模块无权改。
+#[derive(Default)]
+struct TierDiskSnapshot {
+    /// 快照基于哪个键算出（`None` = 还没算过）
+    key: Option<TierDiskKey>,
+    /// (档位, 引擎实际加载的文件, 该文件字节数)——只放已就位的档位
+    entries: Vec<(crate::app::WhisperModelTier, PathBuf, u64)>,
+    /// 后台探测进行中：避免每帧重复派发
+    inflight: bool,
+}
+
+impl TierDiskSnapshot {
+    /// 该档位引擎实际会加载的文件；`None` = 未就位。
+    fn path(&self, tier: crate::app::WhisperModelTier) -> Option<&Path> {
+        self.entries
+            .iter()
+            .find(|(t, _, _)| *t == tier)
+            .map(|(_, path, _)| path.as_path())
+    }
+
+    /// 该档位已就位文件的磁盘占用；`None` = 未就位。
+    fn size(&self, tier: crate::app::WhisperModelTier) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|(t, _, _)| *t == tier)
+            .map(|(_, _, size)| *size)
+    }
+}
+
+impl Global for TierDiskSnapshot {}
+
+/// 档位磁盘快照的失效键（判定抽成纯函数 [`tier_disk_snapshot_stale`]）。
+#[derive(Clone, PartialEq, Eq)]
+struct TierDiskKey {
+    /// 下载在跑：下载完成 true→false 是「立刻刷新」信号（完成回调在别的文件里）
+    downloading: bool,
+    /// 各条目就位快照（按 `ITEMS` 稳定顺序）：删除 / 补齐后
+    /// `AppState::refresh_model_presence` 会改它，从而自动重扫
+    presence: Vec<bool>,
+}
+
+/// 档位快照是否需要重扫（纯函数，便于单测）：键变了 → 重扫；键不变 → 复用。
+fn tier_disk_snapshot_stale(cached: Option<&TierDiskKey>, current: &TierDiskKey) -> bool {
+    cached != Some(current)
+}
+
+/// 后台探测各档位「实际会加载的文件」及占用（只在快照失效时跑一次）。
+fn scan_tier_disk() -> Vec<(crate::app::WhisperModelTier, PathBuf, u64)> {
+    use crate::app::WhisperModelTier;
+    use crate::utils::model_download::disk_size;
+    WhisperModelTier::WHISPER_TIERS
+        .iter()
+        .copied()
+        .filter_map(|tier| {
+            let path = tier.installed_path()?;
+            let size = disk_size(&path).unwrap_or(0);
+            Some((tier, path, size))
+        })
+        .collect()
+}
 
 impl MainWindow {
     /// 渲染性能设置工作台
@@ -778,6 +859,42 @@ impl MainWindow {
             .child(Self::render_setting_row("术语表", glossary_control))
     }
 
+    /// 刷新「Whisper 档位磁盘快照」：键变化时后台重扫一次（见 [`TierDiskSnapshot`]）。
+    ///
+    /// 渲染路径只读内存：键不变就复用，键变了（下载完成 / 删除 / 补齐）才派发一次
+    /// 后台探测，完成后 `cx.notify()` 自动刷新。
+    fn ensure_tier_disk_snapshot(&self, cx: &mut Context<Self>) {
+        let key = TierDiskKey {
+            downloading: self.state.is_downloading,
+            presence: crate::utils::ITEMS
+                .iter()
+                .map(|item| self.state.model_is_present(item.id))
+                .collect(),
+        };
+        let stale = cx.update_default_global::<TierDiskSnapshot, _>(|state, _| {
+            tier_disk_snapshot_stale(state.key.as_ref(), &key) && !state.inflight
+        });
+        if !stale {
+            return;
+        }
+        let key_for_store = key;
+        cx.update_default_global::<TierDiskSnapshot, _>(|state, _| state.inflight = true);
+        cx.spawn(async move |this, cx| {
+            let entries = cx
+                .background_executor()
+                .spawn(async move { scan_tier_disk() })
+                .await;
+            let _ = this.update(cx, |_this, cx| {
+                cx.update_default_global::<TierDiskSnapshot, _>(|state, _| {
+                    state.entries = entries;
+                    state.key = Some(key_for_store);
+                    state.inflight = false;
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
     /// 页头：标题 + 帮助按钮 (简约，无徽标)
     fn render_page_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let show_help = self.state.show_perf_help;
@@ -1269,8 +1386,7 @@ impl MainWindow {
     /// 模型下拉所在行的「行尾」内容：高亮绿色的 [获取模型列表] 按钮 + 结果状态。
     fn render_model_fetch_row(&self, is_online: bool, cx: &mut Context<Self>) -> AnyElement {
         const MODEL_FETCH_MSG_MAX_W: f32 = 520.0;
-        let cfg = self.state.config.translate.clone();
-        let (loading, status, _models) = model_cache_snapshot(&cfg);
+        let (loading, status) = model_cache_status(&self.state.config.translate);
 
         // 1. 高亮绿色的 [获取模型列表] 按钮
         let mut button = div()
@@ -1705,8 +1821,12 @@ impl MainWindow {
     /// 档位能不能用——否则他选完一档、菜单一收，界面又变回「只显示一个档位名」，
     /// 没下过也看不出来，直到点「开始转写」才被告知。
     fn render_tier_trigger(&self, disabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_tier_disk_snapshot(cx);
         let open = self.whisper_dropdown_open && !disabled;
-        let ready = self.state.whisper_model_tier.installed_path().is_some();
+        // 就位判定走后台快照：`installed_path()` 每帧要两次 stat（见 [`TierDiskSnapshot`]）
+        let tier = self.state.whisper_model_tier;
+        let ready =
+            cx.update_default_global::<TierDiskSnapshot, _>(|state, _| state.path(tier).is_some());
         div()
             .id("perf-tier-dropdown-trigger")
             .min_w(px(210.0))
@@ -1773,6 +1893,8 @@ impl MainWindow {
         {
             return None;
         }
+        // 就位 / 占用一律读后台快照，渲染路径不再逐档 stat（见 [`TierDiskSnapshot`]）
+        self.ensure_tier_disk_snapshot(cx);
         let cur = self.state.whisper_model_tier;
         let downloading = self.state.is_downloading;
         let mut menu = div()
@@ -1790,34 +1912,34 @@ impl MainWindow {
         for (ti, tier) in WhisperModelTier::WHISPER_TIERS.iter().copied().enumerate() {
             let canonical_id: Option<&'static str> = tier.download_item_id();
             let item = canonical_id.and_then(crate::utils::model_download::item_by_id);
-            // 「是否可用」一律取 `installed_path()`（= 引擎真正会加载的文件，
-            // 含档位内量化回退），而不是 `model_is_present(canonical_id)`——
-            // 后者按条目登记的精确文件名判定，会在「Turbo 用 q8 兜底 / Balanced
+            // 「是否可用」一律取档位后台快照里的 `installed_path()`（= 引擎真正会
+            // 加载的文件，含档位内量化回退），而不是 `model_is_present(canonical_id)`
+            // ——后者按条目登记的精确文件名判定，会在「Turbo 用 q8 兜底 / Balanced
             // 用 ggml-small 兜底」时判为未下载，与触发器上的徽标自相矛盾。
-            let loaded = tier.installed_path();
-            let present = loaded.is_some();
-            // 删除目标由**实际文件**反查条目：引擎在用的若是 `ggml-small.bin`
-            // 这类没有条目的回退文件，反查得 `None` → 不渲染删除按钮（它不在
-            // 可下载清单里，本就不该由我们代删）。
-            let deletable_id: Option<&'static str> = loaded
-                .as_deref()
-                .and_then(crate::utils::model_download::item_id_for_path)
-                .filter(|id| crate::utils::model_download::item_is_deletable(id));
+            let (present, deletable_id, actual_size) = cx
+                .update_default_global::<TierDiskSnapshot, _>(|state, _| match state.path(tier) {
+                    Some(path) => (
+                        true,
+                        // 删除目标由**实际文件**反查条目：引擎在用的若是
+                        // `ggml-small.bin` 这类没有条目的回退文件，反查得 `None`
+                        // → 不渲染删除按钮（它不在可下载清单里，本就不该由我们代删）。
+                        crate::utils::model_download::item_id_for_path(path)
+                            .filter(|id| crate::utils::model_download::item_is_deletable(id)),
+                        state.size(tier),
+                    ),
+                    None => (false, None, None),
+                });
             let is_sel = tier == cur;
 
             // 说明与体积都取「唯一实现处」：说明走 `tier_menu_desc`（纯函数，
-            // 有单测），体积走清单里的期望值（只读常量，不碰磁盘）——
-            // 实际磁盘占用在每一行按需 stat（见下），但那是有文件时才做的一次调用，
-            // 不是逐帧全量扫描。
+            // 有单测），体积走清单里的期望值（只读常量，不碰磁盘）。已下载时
+            // 优先显示**实际**占用（与清单里的期望值可能不同：本机可能是 q5_1
+            // 或用户自己的量化），用户才知道删这个能腾多少空间——实际值同样来自
+            // 后台快照，不再逐帧 stat。
             let size_text = item
                 .map(|i| crate::utils::model_download::human_size(i.size))
                 .unwrap_or_default();
-            // 已下载时显示**实际**占用（与清单里的期望值可能不同：本机可能是
-            // q5_1 或用户自己的量化），用户才知道删这个能腾多少空间。
-            let actual = loaded
-                .as_deref()
-                .and_then(crate::utils::model_download::disk_size)
-                .map(crate::utils::model_download::human_size);
+            let actual = actual_size.map(crate::utils::model_download::human_size);
 
             // 左列：名称 + 选中标记；右列：状态 + 下载/删除
             let mut info = div()
@@ -1837,7 +1959,7 @@ impl MainWindow {
                         .child(tier.label()),
                 );
             if present {
-                if let Some(actual) = actual.clone() {
+                if let Some(actual) = actual {
                     info = info.child(
                         div()
                             .text_size(px(Theme::TEXT_CAPTION))
@@ -2594,8 +2716,8 @@ impl MainWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_glossary_count, local_model_status, probe_button_label, tier_menu_desc,
-        vad_slider_value,
+        effective_glossary_count, local_model_status, probe_button_label, tier_disk_snapshot_stale,
+        tier_menu_desc, vad_slider_value, TierDiskKey,
     };
     use crate::utils::config::TranslateConfig;
 
@@ -2933,5 +3055,59 @@ mod tests {
         assert_eq!(vad_slider_value(0.95), 80);
         // 区间内：原样换算
         assert_eq!(vad_slider_value(0.5), 50);
+    }
+
+    /// 档位磁盘快照的失效判定：键不变 → 复用（这是「渲染路径不再逐档 stat」的前提）。
+    #[test]
+    fn tier_disk_snapshot_reuses_when_key_unchanged() {
+        let k = TierDiskKey {
+            downloading: false,
+            presence: vec![true, false],
+        };
+        assert!(!tier_disk_snapshot_stale(Some(&k), &k), "键不变时不该重扫");
+    }
+
+    /// 无缓存（首次渲染）→ 必须重扫一次。
+    #[test]
+    fn tier_disk_snapshot_scans_when_never_computed() {
+        let k = TierDiskKey {
+            downloading: false,
+            presence: vec![true],
+        };
+        assert!(tier_disk_snapshot_stale(None, &k), "首次必须扫一次");
+    }
+
+    /// 下载完成（downloading true→false）→ 键变化 → 重扫，档位就位徽标自动刷新。
+    #[test]
+    fn tier_disk_snapshot_rescans_after_download_finishes() {
+        let cached = TierDiskKey {
+            downloading: true,
+            presence: vec![false, false],
+        };
+        let current = TierDiskKey {
+            downloading: false,
+            presence: vec![true, false],
+        };
+        assert!(
+            tier_disk_snapshot_stale(Some(&cached), &current),
+            "下载完成必须触发重扫"
+        );
+    }
+
+    /// 就位快照变化（删除 / 补齐）→ 键变化 → 重扫。
+    #[test]
+    fn tier_disk_snapshot_rescans_when_presence_changes() {
+        let cached = TierDiskKey {
+            downloading: false,
+            presence: vec![true, true],
+        };
+        let current = TierDiskKey {
+            downloading: false,
+            presence: vec![true, false],
+        };
+        assert!(
+            tier_disk_snapshot_stale(Some(&cached), &current),
+            "就位状态变了必须重扫"
+        );
     }
 }
