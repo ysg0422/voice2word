@@ -3110,6 +3110,11 @@ impl MainWindow {
             let tick_gen = self.state.video_player.generation();
             self.play_tick_generation = tick_gen;
 
+            // 起播失败（ffmpeg/ffplay 起不来、文件不可读…）以前**没有任何人读**这个错误：
+            // 界面表现就是「点了播放没反应」。这里先同步收一次（覆盖起播即失败的路径），
+            // 循环结束时再收一次（覆盖解码线程稍后报错的路径）。
+            self.surface_playback_error();
+
             let player = self.state.video_player.clone();
             cx.spawn(async move |this, cx| loop {
                 cx.background_executor()
@@ -3151,12 +3156,35 @@ impl MainWindow {
                     .unwrap_or(false);
 
                 if !should_continue {
+                    // 停下来的原因可能是「解码线程报了错并把 is_playing 复位」，
+                    // 那种情况必须把原因讲给用户，否则同样是「点了没反应」。
+                    let _ = this.update(cx, |this, cx| {
+                        if this.surface_playback_error() {
+                            cx.notify();
+                        }
+                    });
                     break;
                 }
             })
             .detach();
             cx.notify();
         }
+    }
+
+    /// 把播放器的失败原因挂到一次性提示上；返回「这次确实有东西要显示」。
+    ///
+    /// 判据是「用户能不能自己修」：播放失败几乎总是环境问题（ffmpeg 不可用、
+    /// 文件损坏/被占用），错误文本里已经带了具体做法（见 `PlaybackFailure` 的 Display），
+    /// 所以原样转达即可；这里不再加工或缩写，免得把可操作的信息磨没。
+    ///
+    /// 取走即清空（`take_playback_error`）：用户看到一次就够了，反复弹同一句是噪音。
+    fn surface_playback_error(&mut self) -> bool {
+        let Some(failure) = self.state.video_player.take_playback_error() else {
+            return false;
+        };
+        tracing::warn!(stage = ?failure.stage, path = %failure.path, "预览播放失败");
+        self.notice = Some(failure.to_string());
+        true
     }
 
     /// 把当前字幕**烧录**（硬字幕合成）进视频，导出一个自带字幕的新 mp4。
