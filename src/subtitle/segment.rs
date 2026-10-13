@@ -2,6 +2,25 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 容忍 `null` 的反序列化：把 `null` 当成「用默认值」，而不是让整份 JSON 解析失败。
+///
+/// # 为什么需要它
+///
+/// 这些字段的历史形态里出现过 `null`（例如 `words` 早年很可能就是
+/// `Option<Vec<..>>`，外部工具照着自己的模型写出的 JSON 里也常见 `"words": null`）。
+/// 而字段现在是非 Option 的 `Vec` / `String`，默认 serde 遇到 `null` 会**硬失败**——
+/// 后果不是「这个字段是空的」，而是 **整条 `segments_json` 被判为坏数据**：
+/// 用户看到的是「这个工程的字幕无法装载」，一整份工程就此打不开。
+///
+/// 只多接受 `null` 这一种写法：类型不对（数字、字符串）仍然照常报错，
+/// 不会把真正的脏数据当成默认值吞掉。
+fn null_is_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Segment {
     pub index: usize,
@@ -10,6 +29,7 @@ pub struct Segment {
     /// 结束时间 (秒)
     pub end: f64,
     /// 原始转写识别文本 (原声识别内容，直接声音是啥就是啥)
+    #[serde(default, deserialize_with = "null_is_default")]
     pub text: String,
     /// 翻译字幕 (其他语言对中文的翻译，无翻译时为 None)
     #[serde(default)]
@@ -23,7 +43,7 @@ pub struct Segment {
     #[serde(default)]
     pub translation_lang: Option<String>,
     /// LLM 润色文本 (保留字段兼容)
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_is_default")]
     pub polished: String,
     /// 语种 (zh, en 等)
     pub language: Option<String>,
@@ -35,7 +55,9 @@ pub struct Segment {
     #[serde(default)]
     pub speaker: Option<u32>,
     /// 词级时间戳（秒）。空表示该段没有词级信息（旧记录 / 非 Whisper 引擎）。
-    #[serde(default)]
+    ///
+    /// 容忍 `null`（老库与外部工具写出过 `"words": null`），见 [`null_is_default`]。
+    #[serde(default, deserialize_with = "null_is_default")]
     pub words: Vec<WordTiming>,
 }
 
@@ -1065,6 +1087,40 @@ pub fn plan_time_edit(
     }
 }
 
+/// 老库 / 外部工具写出的 `"words": null` 必须仍然能装载。
+///
+/// 回归护栏：字段类型是非 Option 的 `Vec`，serde 默认遇到 `null` 会**整份 JSON 解析失败**——
+/// 用户看到的是「这个工程的字幕无法装载」，而不是「只有一个字段是空的」。
+/// 同一份工程在旧版本里能打开、升级后打不开，是最难解释的一类回归。
+#[cfg(test)]
+mod null_tolerance_tests {
+    use super::Segment;
+
+    /// `null` 落到 text / polished / words 上都按默认值处理，其余字段照常解析。
+    #[test]
+    fn null_fields_fall_back_to_defaults() {
+        let json = r#"[
+            {"index":1,"start":0.0,"end":1.0,"text":null,"polished":null,"words":null},
+            {"index":2,"start":1.0,"end":2.0,"text":"正常","words":[]}
+        ]"#;
+        let segs: Vec<Segment> = serde_json::from_str(json).expect("null 不应导致整份解析失败");
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "", "null 的正文按空串");
+        assert_eq!(segs[0].polished, "");
+        assert!(segs[0].words.is_empty(), "null 的词级时间戳按空表");
+        assert_eq!(segs[1].text, "正常");
+    }
+
+    /// 只多接受 `null`：类型真不对（数字当文本、字符串当数组）仍然要报错——
+    /// 否则会把真正的脏数据当成默认值吞掉。
+    #[test]
+    fn wrong_types_still_fail() {
+        let bad_text = r#"[{"index":1,"start":0.0,"end":1.0,"text":123}]"#;
+        assert!(serde_json::from_str::<Vec<Segment>>(bad_text).is_err());
+        let bad_words = r#"[{"index":1,"start":0.0,"end":1.0,"text":"a","words":"不是数组"}]"#;
+        assert!(serde_json::from_str::<Vec<Segment>>(bad_words).is_err());
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
