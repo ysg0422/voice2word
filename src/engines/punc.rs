@@ -225,9 +225,12 @@ impl PunctuationEngine {
 
         // 让路模式：标点恢复也是 Python 子进程，同样要跟随用户的开关
         super::media_pipeline::apply_default_child_flags(&mut cmd);
-        let child = cmd
-            .spawn()
-            .context("启动 CT-Transformer 标点恢复子进程失败")?;
+        // 与 SenseVoice 同因同治：找不到解释器时把「缺 Python」讲明白，
+        // 而不是把 OS 的「系统找不到指定的文件」原样丢给用户。
+        let child = cmd.spawn().map_err(|err| {
+            // 与 SenseVoice 同因同治：缺解释器时把「该装 Python」讲明白。
+            super::python_spawn_error(&err, &self.python_path, "标点恢复")
+        })?;
         crate::utils::child_registry::adopt(&child);
         // 从这里到 wait_with_output() 之间的任何提前退出都由守卫兜底回收子进程
         let mut reaper = ChildReaper::new(child);

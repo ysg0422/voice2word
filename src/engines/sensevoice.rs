@@ -505,9 +505,13 @@ impl SenseVoiceEngine {
             return Ok((Vec::new(), 0.0));
         }
 
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("启动 SenseVoice 进程失败: {:?}", self.runner_path))?;
+        // 找不到解释器是最常见的一种失败：报错原文（Windows 上是「系统找不到指定的文件。」）
+        // 完全没提 Python，用户只会以为程序坏了。这里翻成可操作的中文指引——
+        // 与 ffmpeg 那条「找不到就告诉用户放哪」的经验同源。
+        let mut child = cmd.spawn().map_err(|err| {
+            // 缺解释器时把「该装 Python」讲明白（见 `python_spawn_error` 的说明）。
+            super::python_spawn_error(&err, &self.python_path, "SenseVoice 识别")
+        })?;
         crate::utils::child_registry::adopt(&child);
 
         // 登记子进程 PID，供用户「终止转写」时强杀。
