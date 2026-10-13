@@ -88,33 +88,6 @@ const TIER_TAGLINES: [(WhisperModelTier, &str); 5] = [
 /// SenseVoice 档对应的一组下载条目：模型 + 词表 + VAD，三个文件缺一不可。
 const SENSEVOICE_ITEM_IDS: [&str; 3] = ["sensevoice-model", "sensevoice-tokens", "sensevoice-vad"];
 
-/// 「怎么选？」提示条的展开态。
-///
-/// 用静态变量而不是给 `MainWindow` 加字段：那个结构定义在 `ui/mod.rs`，是并行改动
-/// 最集中的文件；而这里是纯界面开合态，程序重启后默认收起完全可以接受。
-static HOW_TO_CHOOSE_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// 「怎么选？」的三行结论。抽屉只有 350px 宽，只讲「选哪个」，不讲原理。
-const HOW_TO_CHOOSE_LINES: [&str; 4] = [
-    "中文播客、短视频：SenseVoice 极速，快且够用",
-    "要双语字幕或更准的断句：Whisper Turbo Q5",
-    "机器一般：先下 Whisper Base / Small 跑通再升级",
-    "内存吃紧就选小的：档位越大越占内存，也越慢",
-];
-
-/// 读取「怎么选？」的展开态。
-///
-/// 读写都收在这两个小函数里，是为了不用在文件顶部 glob 引入 `Ordering`——
-/// 本文件有 `use gpui::*`，裸名 `Ordering` 是否与 gpui 的重名要靠编译才知道。
-fn how_to_choose_open() -> bool {
-    HOW_TO_CHOOSE_OPEN.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// 切换「怎么选？」的展开态。
-fn toggle_how_to_choose() {
-    HOW_TO_CHOOSE_OPEN.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// 一组下载条目的合计体积文案：`约 229 MB`。
 ///
 /// 一个条目都查不到时返回「体积未知」，而不是隐藏整块或 panic：清单里改了 id、
@@ -591,9 +564,6 @@ impl MainWindow {
     /// 「需下载」并在行内给下载入口：真正拦住开始转写的是开工守卫
     /// （`MainWindow::missing_engine_reason`），一句明确提示比偷偷换档可操作得多。
     fn render_engine_card(&mut self, cx: &mut Context<Self>) -> Div {
-        let open = how_to_choose_open();
-        // 默认展开：这三行就是「每张卡片上那句小字」的用法说明——收起来时用户
-        // 只看到五句互不衔接的定位句，仍然不知道该选哪档。
         let mut cards = div().flex().flex_col().gap(px(Theme::SPACE_1_5));
         for (index, (tier, tagline)) in TIER_TAGLINES.into_iter().enumerate() {
             cards = cards.child(self.tier_card(index, tier, tagline, cx));
@@ -601,47 +571,7 @@ impl MainWindow {
 
         primitives::card_sm()
             .gap(px(Theme::SPACE_2))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(primitives::section_title("识别引擎"))
-                    // 「怎么选？」只放三行结论，不解释原理：抽屉宽 350px，
-                    // 用户在这里要的是「选哪个」，不是「为什么」。
-                    .child(
-                        div()
-                            .id("engine-how-to-choose")
-                            .flex()
-                            .items_center()
-                            .gap(px(Theme::SPACE_1))
-                            .text_size(px(Theme::TEXT_SMALL))
-                            .text_color(Theme::text_secondary())
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(Theme::accent_blue()))
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                toggle_how_to_choose();
-                                cx.notify();
-                            }))
-                            .child("怎么选？")
-                            .child(if open { "▲" } else { "▼" }),
-                    ),
-            )
-            .children(open.then(|| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(Theme::SPACE_1))
-                    .p(px(Theme::SPACE_2))
-                    .rounded(px(Theme::RADIUS_MD))
-                    .bg(Theme::bg_inset())
-                    .children(HOW_TO_CHOOSE_LINES.map(|line| {
-                        div()
-                            .text_size(px(Theme::TEXT_SMALL))
-                            .text_color(Theme::text_secondary())
-                            .child(line)
-                    }))
-            }))
+            .child(primitives::section_title("识别引擎"))
             .child(cards)
     }
 
@@ -653,7 +583,7 @@ impl MainWindow {
         &mut self,
         index: usize,
         tier: WhisperModelTier,
-        tagline: &'static str,
+        _tagline: &'static str,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let is_sel = self.state.whisper_model_tier == tier;
@@ -727,33 +657,22 @@ impl MainWindow {
             }
         }
 
-        // 定位句与体积并成一行：抽屉只有 350px，两者各占一头比上下两行更紧凑，
-        // 也少占一行高度——五张卡片一屏能多看一张。体积用弱化色并固定不换行，
-        // 不与定位句抢注意力：它是「要不要下载」的参考，不是选型依据。
+        // 卡片只保留「名字 + 状态徽标 + 体积」：定位句这类小字说明按用户要求去掉，
+        // 五张卡片因此能从五行文字压到三行，抽屉里一屏能看全。
+        // 体积仍是唯一保留的辅助信息——它决定「要不要下载」，是选型时必须的。
         let body = div()
             .flex()
             .flex_col()
             .gap(px(Theme::SPACE_1))
             .child(head)
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(Theme::SPACE_2))
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_SMALL))
-                            .text_color(Theme::text_secondary())
-                            .child(tagline),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_muted())
-                            .child(size_text),
-                    ),
+                div().flex().items_center().justify_between().child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(Theme::text_muted())
+                        .child(size_text),
+                ),
             );
 
         div()
@@ -854,58 +773,14 @@ impl MainWindow {
                 .clamp(2, MAX_SPEAKERS)
                 .to_string()
         };
-        let gpu_sel = self.state.gpu_mode.clone();
-        let gpu_limit_sel = self.state.config.gpu.effective_gpu_limit().to_string();
 
+        // 「GPU 占用策略」与「GPU 占用上限」不在转写抽屉里：转写页回答的是「这一单
+        // 怎么转」（语言、格式、润色、说话人、线程、热词），而 GPU 档位是**机器级**
+        // 策略——它同时影响预览解码、代理转码与推理，且性能页已有同一份档位的
+        // 卡片（`render_hardware_tier_card`）。同一个开关放两处只会让人以为
+        // 「转写用 GPU 而预览不用」，实际它们是同一个配置项。
         primitives::card_sm()
             .gap(px(Theme::SPACE_2))
-            .child(self.param_group(
-                "GPU 占用策略",
-                vec![
-                    ("full", "全速 GPU"),
-                    ("balanced", "GPU 让路"),
-                    ("eco", "低占用 GPU"),
-                    ("cpu", "纯 CPU"),
-                ],
-                &gpu_sel,
-                |this, sel, cx| {
-                    this.state.gpu_mode = sel.to_string();
-                    this.state.config.gpu = crate::utils::config::GpuConfig::from_mode(sel);
-                    // 让路开关是**进程级全局量**，只在启动时下发一次。用户改档位后
-                    // 必须立即重下发，否则「保存了但本进程仍按旧值跑」，要重启才生效。
-                    crate::engines::media_pipeline::set_yield_to_desktop(
-                        this.state.config.gpu.yield_to_desktop,
-                    );
-                    // `from_mode` 会整段重写 gpu_limit_percent（如 eco 档给 60），
-                    // 因此切档位也要重下发一次，否则上限沿用上一个档位残留的值。
-                    this.state
-                        .pipeline
-                        .set_gpu_limit_percent(this.state.config.gpu.effective_gpu_limit());
-                    this.state.persist_config();
-                    cx.notify();
-                },
-                cx,
-            ))
-            .child(if gpu_sel == "eco" {
-                self.param_group(
-                    "GPU 占用上限",
-                    vec![("40", "40%"), ("60", "60%"), ("80", "80%")],
-                    &gpu_limit_sel,
-                    |this, sel, cx| {
-                        this.state.config.gpu.gpu_limit_percent = sel.parse::<u32>().unwrap_or(60);
-                        // 立即下发给引擎：GPU 限速是「子进程按占空比挂起/恢复」，
-                        // 只存配置的话本进程仍按旧档位跑，用户要重启才看到效果。
-                        this.state
-                            .pipeline
-                            .set_gpu_limit_percent(this.state.config.gpu.effective_gpu_limit());
-                        this.state.persist_config();
-                        cx.notify();
-                    },
-                    cx,
-                )
-            } else {
-                div()
-            })
             .child(self.param_group(
                 "识别语言",
                 vec![
@@ -1030,7 +905,7 @@ impl MainWindow {
                 },
                 cx,
             ))
-            // 热词 / 自定义提示词：识别相关的最后一格（人名、品牌、专业术语的音译纠正）。
+            // 热词 / 自定义提示词：识别参数的最后一格（人名、品牌、专业术语的音译纠正）。
             // 追加在末尾、不挪动任何既有条目：抽屉布局是用户肌肉记忆的一部分。
             .child(self.render_hotwords_row(cx))
     }
@@ -1185,11 +1060,9 @@ impl MainWindow {
                     .child(div().text_color(Theme::accent_blue()).child("▌"))
                     .child(after)
             } else if char_count == 0 {
+                // 占位示例也去掉：同一信息在说明段里已经讲过一遍，两处都留等于
+                // 每次打开抽屉都看同一句话。空框就是空框，点进来直接打字。
                 div()
-                    .text_size(px(Theme::TEXT_SMALL))
-                    .text_color(Theme::text_muted())
-                    .truncate()
-                    .child("例如：张三, 李四, OpenAI, 量子纠缠")
             } else {
                 div()
                     .text_size(px(Theme::TEXT_BODY))
@@ -1257,18 +1130,8 @@ impl MainWindow {
                             })),
                     ),
             )
-            .child(
-                div()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(Theme::text_muted())
-                    // 浅显说明：只讲「填什么、怎么分隔、会发生什么」。末尾一句写明仅 Whisper 生效——
-                    // SenseVoice 走 sherpa-onnx 的单次前向（CTC 类），没有 initial prompt /
-                    // 解码偏置这类接口，硬塞参数只会被 runner 忽略，不如讲清楚。
-                    .child(
-                        "填人名、品牌、专业术语，用逗号分隔；识别时会提示模型优先按这些写法输出。\
-                         仅 Whisper 引擎生效（SenseVoice 无提示词接口）。",
-                    ),
-            )
+        // 说明段按用户要求去掉：输入框自己的占位示例（「例如：张三, 李四, OpenAI, 量子纠缠」）
+        // 已经说清「填什么、怎么分隔」，再压一行小字在 350px 抽屉里只是噪音。
     }
 
     /// 热词输入框的一次性全局钩子：键盘拦截 + 失焦订阅。
