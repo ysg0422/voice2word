@@ -74,7 +74,13 @@ fn editor_export_format_string(fmt: EditorExportFormat) -> &'static str {
         EditorExportFormat::Json => "json",
         EditorExportFormat::EbuTtD => "ttml",
         EditorExportFormat::NetflixTtal => "ttal",
-        // 上面那几个是唯一会走到单文件导出的分支；其余三档在上层已分流。
+        EditorExportFormat::Sbv => "sbv",
+        EditorExportFormat::Lrc => "lrc",
+        // 注意返回的是 **writer 认的格式名** 而不是扩展名：`txt-ts` 与 `txt` 同写
+        // `.txt`，内容却不同（每行带时间码 vs 纯文本）。调用方写盘要用这个格式名，
+        // 扩展名另由 `export_spec_for` 给出（见 `perform_editor_export`）。
+        EditorExportFormat::TxtTs => "txt-ts",
+        // 上面这几个是唯一会走到单文件导出的分支；其余档位在上层已分流。
         // 真被漏到这里时给最保守的 srt（writer 一定写得出来的格式），
         // 也比 panic 掉整个 UI 线程好。
         _ => "srt",
@@ -96,8 +102,15 @@ pub(crate) const MEDIA_EXTS: [&str; 10] = [
 /// 它比「导入字幕」对话框的过滤器少了 `txt`：`.txt` 在拖放语境里意图太不确定，
 /// 随手拖进来的备忘、脚本、日志都会被当成字幕并**直接顶掉当前工程**；而在对话框
 /// 里点选文件名时用户意图明确，那边才保留 txt。
-pub(crate) const SUBTITLE_EXTS: [&str; 9] = [
-    "srt", "vtt", "json", "lrc", "ass", "ssa", "ttml", "dfxp", "ttal",
+pub(crate) const SUBTITLE_EXTS: [&str; 10] = [
+    "srt", "vtt", "json", "lrc", "ass", "ssa", "ttml", "dfxp", "ttal", "sbv",
+];
+
+/// 「导入字幕」对话框的文件过滤器：比拖拽清单多一个 `txt`——点选文件时用户意图明确，
+/// 纯文本（时间轴由导入侧按字数合成）也允许。除 `txt` 外都取自
+/// `subtitle::reader::SubtitleFormat::from_path` 认识的扩展名，两份清单必须同源。
+pub(crate) const IMPORT_SUBTITLE_EXTS: [&str; 11] = [
+    "srt", "vtt", "txt", "json", "lrc", "ass", "ssa", "ttml", "dfxp", "ttal", "sbv",
 ];
 
 /// 一次拖拽进来的内容该怎么走。
@@ -430,7 +443,10 @@ impl MainWindow {
         let export_mode = self.state.export_mode_from_config();
         // 格式在派发前就定下来：整批共用同一份 spec（同一扩展名、同一写出格式），
         // 与单条「导出字幕」走的是同一个 helper，不再各写一份字面量。
-        let (fmt_ext, _fmt_label) = export_spec_for(&self.state.output_format);
+        // 文件名后缀取**扩展名**、写盘参数取**规范格式名**：`txt-ts`（带时间码纯文本）
+        // 的扩展名就是 `txt`，拿扩展名当格式名会把「带时间码」静默写成一堆纯文本。
+        let write_fmt = crate::subtitle::writer::canonical_write_format(&self.state.output_format);
+        let (fmt_ext, _fmt_label) = export_spec_for(write_fmt);
         // 样式同样在派发前 clone 出来（与剪辑台 `perform_editor_export` 同法）：
         // 后台闭包是 `'static` 的，拿不到 `this`，必须先复制一份。此前批量导出
         // 调用的是无样式的 `write_to_file_with_mode`，用户在配置里把单行最大字数
@@ -502,7 +518,7 @@ impl MainWindow {
                         match SubtitleWriter::write_to_file_with_style(
                             &segs,
                             &out,
-                            fmt_ext,
+                            write_fmt,
                             export_mode,
                             &style,
                         ) {
@@ -1232,12 +1248,7 @@ impl MainWindow {
         cx.spawn(async move |this, cx| {
             let handle = rfd::AsyncFileDialog::new()
                 .set_title("导入字幕文件")
-                .add_filter(
-                    "字幕文件",
-                    &[
-                        "srt", "vtt", "txt", "json", "lrc", "ass", "ssa", "ttml", "dfxp", "ttal",
-                    ],
-                )
+                .add_filter("字幕文件", &IMPORT_SUBTITLE_EXTS)
                 .pick_file()
                 .await;
             let Some(handle) = handle else { return };
@@ -1498,7 +1509,7 @@ impl MainWindow {
         // 字幕是拖拽新增的旁路：用户很可能正好拖了一份字幕却看到「没有音视频文件」，
         // 所以失败提示必须把「字幕也能拖、但一次一个」讲出来，并指明 txt 的入口。
         const SUBTITLE_HINT: &str =
-            "字幕文件（srt/vtt/json/lrc/ass/ssa/ttml）也可直接拖入，一次一个；纯文本 .txt 请用「导入字幕」对话框。";
+            "字幕文件（srt/vtt/json/lrc/ass/ssa/ttml/dfxp/ttal/sbv）也可直接拖入，一次一个；纯文本 .txt 请用「导入字幕」对话框。";
         if outcome.skipped.is_empty() {
             return format!(
                 "没有找到可处理的音视频文件（支持 {SUPPORTED}）。若拖入的是文件夹，请确认里面有这些格式的文件。{SUBTITLE_HINT}"
@@ -3251,10 +3262,13 @@ impl MainWindow {
             | EditorExportFormat::Vtt
             | EditorExportFormat::Json
             | EditorExportFormat::EbuTtD
-            | EditorExportFormat::NetflixTtal => {
-                // 枚举先归一成格式字符串（`ui/mod.rs` 不动），再交给
-                // `export_spec_for` 求扩展名与对话框过滤器名——这样这两份
-                // 字面量只存在于 `writer.rs` 一处，不会再与 writer 的分派表漂移。
+            | EditorExportFormat::NetflixTtal
+            | EditorExportFormat::Sbv
+            | EditorExportFormat::Lrc
+            | EditorExportFormat::TxtTs => {
+                // 枚举只提供**格式名**，扩展名与对话框过滤器名一律交给
+                // `export_spec_for` 求——这两份字面量只存在于 `writer.rs` 一处，
+                // 不会再与 writer 的分派表漂移。
                 let fmt = editor_export_format_string(self.editor_export_format);
                 let (ext, filter_label) = export_spec_for(fmt);
                 // 直接按目标扩展名导出，不再临时改写全局 output_format（避免副作用泄漏到后续管线调用）
@@ -3272,7 +3286,10 @@ impl MainWindow {
                     filter_label,
                     ext.to_string(),
                     move |segs, path| {
-                        SubtitleWriter::write_to_file_with_style(segs, path, ext, mode, &style)
+                        // 写盘用 **格式名**（`fmt`）而不是扩展名（`ext`）：`txt` 与
+                        // `txt-ts` 同扩展名 `.txt`，只有按格式名写出才会带每行时间码。
+                        // 其余格式二者取值相同，写出字节不变。
+                        SubtitleWriter::write_to_file_with_style(segs, path, fmt, mode, &style)
                     },
                 );
             }
@@ -4572,19 +4589,18 @@ mod tests {
         export_spec_for, finish_db_write_error, flush_outcome_to_apply, frame_failure_notice,
         has_copied_translations, is_copied_translation, presence_scan_still_current,
         replace_rule_report_message, rule_set_name_for, still_same_document, DocumentIdentity,
-        SegmentFlushOutcome,
+        SegmentFlushOutcome, IMPORT_SUBTITLE_EXTS, SUBTITLE_EXTS,
     };
     use crate::subtitle::Segment;
     use crate::ui::EditorExportFormat;
     use std::path::PathBuf;
 
-    /// 回归（重构护栏）：`perform_editor_export` 里原本内联着两份 match
-    /// （枚举 -> 扩展名、枚举 -> 对话框过滤器名）。收敛成
-    /// `editor_export_format_string` + `export_spec_for` 之后，这里逐档断言
-    /// **结果与重构前的字面量完全一致**，确保这次去重没有改变任何用户可见行为。
+    /// 剪辑台导出下拉里每一档**单文件**格式都必须能算出与 writer 一致的
+    /// （扩展名, 对话框过滤器名）。新增 SBV / LRC / 带时间码纯文本后逐档钉住：
+    /// 少一档就会出现「下拉里能选、导出却写成别的格式/别的扩展名」。
     #[test]
-    fn editor_export_spec_matches_previous_inline_literals() {
-        for (fmt, ext, label) in [
+    fn editor_export_spec_covers_every_single_file_format() {
+        let cases = [
             (EditorExportFormat::Srt, "srt", "SRT 字幕"),
             (EditorExportFormat::Ass, "ass", "ASS 特效字幕"),
             (EditorExportFormat::Txt, "txt", "TXT 纯文本"),
@@ -4592,10 +4608,34 @@ mod tests {
             (EditorExportFormat::Json, "json", "JSON 结构化字幕"),
             (EditorExportFormat::EbuTtD, "ttml", "EBU-TT-D 广播字幕"),
             (EditorExportFormat::NetflixTtal, "ttal", "Netflix TTAL 字幕"),
-        ] {
+            (EditorExportFormat::Sbv, "sbv", "SBV 播放器字幕"),
+            (EditorExportFormat::Lrc, "lrc", "LRC 唱词"),
+            // 带时间码纯文本：文件扩展名仍是 .txt，但写盘用的格式名是 `txt-ts`
+            (EditorExportFormat::TxtTs, "txt", "带时间码纯文本"),
+        ];
+        for (fmt, ext, label) in cases {
             let spec = export_spec_for(editor_export_format_string(fmt));
             assert_eq!(spec.0, ext, "{fmt:?} 的扩展名变了");
             assert_eq!(spec.1, label, "{fmt:?} 的对话框过滤器名变了");
+        }
+
+        // 覆盖面：`all()` 里除「非单文件」档之外，每一档都必须在这张表里出现过，
+        // 否则新加的格式会静默走 `_ => "srt"`（导出成 SRT 却不报错）。
+        for fmt in EditorExportFormat::all() {
+            let single_file = !matches!(
+                fmt,
+                EditorExportFormat::JianYing
+                    | EditorExportFormat::JianYingFolder
+                    | EditorExportFormat::Fcpxml
+                    | EditorExportFormat::PremiereXml
+                    | EditorExportFormat::BurnVideo
+            );
+            if single_file {
+                assert!(
+                    cases.iter().any(|(f, _, _)| f == fmt),
+                    "{fmt:?} 没有对应的导出规格断言"
+                );
+            }
         }
     }
 
@@ -4616,6 +4656,43 @@ mod tests {
                 "srt",
                 "{fmt:?} 应回落 srt"
             );
+        }
+    }
+
+    /// 导入侧两份清单必须覆盖 `subtitle::reader` 真正认识的扩展名：少一项就会出现
+    /// 「reader 能解析、对话框里却选不到」，或「拖进来被当成未知文件丢掉」。同时钉住
+    /// 拖拽清单**刻意不含** `txt`（拖入意图不明，备忘/日志会顶掉当前工程）。
+    #[test]
+    fn subtitle_import_lists_cover_reader_formats() {
+        use crate::subtitle::reader::SubtitleFormat;
+        use std::path::Path;
+
+        // reader 认得的全部扩展名（含 ssa / dfxp / ttal 三个别名）
+        const READER_EXTS: [&str; 11] = [
+            "srt", "vtt", "txt", "json", "lrc", "ass", "ssa", "ttml", "dfxp", "ttal", "sbv",
+        ];
+        for ext in READER_EXTS {
+            assert!(
+                SubtitleFormat::from_path(Path::new(&format!("x.{ext}"))).is_some(),
+                "reader 不认识的扩展名：.{ext}"
+            );
+            assert!(
+                IMPORT_SUBTITLE_EXTS.contains(&ext),
+                "导入对话框过滤器漏了 .{ext}"
+            );
+        }
+
+        // 拖拽清单 = 对话框清单去掉 txt（其余必须一项不落），且必须含新增的 sbv。
+        for ext in SUBTITLE_EXTS {
+            assert!(
+                IMPORT_SUBTITLE_EXTS.contains(&ext),
+                "拖拽清单里的 .{ext} 不在导入对话框清单里"
+            );
+        }
+        assert!(!SUBTITLE_EXTS.contains(&"txt"), "拖拽清单刻意不含 txt");
+        for ext in ["sbv", "lrc"] {
+            assert!(SUBTITLE_EXTS.contains(&ext), "拖拽清单漏了 .{ext}");
+            assert!(IMPORT_SUBTITLE_EXTS.contains(&ext), "导入清单漏了 .{ext}");
         }
     }
 

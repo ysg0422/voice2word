@@ -42,6 +42,9 @@ pub enum EditorExportFormat {
     Json,           // JSON 结构化字幕（无损字段，供程序化消费 / 质检）
     EbuTtD,         // EBU-TT-D (TTML，广播分发)
     NetflixTtal,    // Netflix TTAL (TTML，流媒体交付)
+    Sbv,            // SBV 播放器字幕（SubViewer 两行式）
+    Lrc,            // LRC 唱词（每行只带起点时间）
+    TxtTs,          // 带时间码纯文本（`[00:01:23.456] 正文`，扩展名同为 .txt）
     BurnVideo,      // 字幕烧录视频（硬字幕合成，导出带字幕的新 mp4）
 }
 
@@ -59,6 +62,10 @@ impl EditorExportFormat {
             Self::Json => "JSON 结构化字幕（.json）",
             Self::EbuTtD => "EBU-TT-D 广播字幕（.ttml）",
             Self::NetflixTtal => "Netflix TTAL（.ttal）",
+            Self::Sbv => "SBV 播放器字幕（.sbv）",
+            Self::Lrc => "LRC 唱词（.lrc）",
+            // 与 `Txt` 同扩展名：显示名必须点明「带时间码」，否则用户把它当纯文本
+            Self::TxtTs => "时间码纯文本（.txt）",
             Self::BurnVideo => "烧录字幕视频（.mp4）",
         }
     }
@@ -80,6 +87,10 @@ impl EditorExportFormat {
             Self::Json => "json",
             Self::EbuTtD => "ttml",
             Self::NetflixTtal => "ttal",
+            Self::Sbv => "sbv",
+            Self::Lrc => "lrc",
+            // 下划线而非连字符：这是写进 config.toml 的持久化键，与 CLI 的 `txt-ts` 拼写分开
+            Self::TxtTs => "txt_ts",
             Self::BurnVideo => "burn_video",
         }
     }
@@ -101,6 +112,10 @@ impl EditorExportFormat {
             "json" => Self::Json,
             "ttml" | "ebu_tt_d" => Self::EbuTtD,
             "ttal" | "netflix_ttal" => Self::NetflixTtal,
+            "sbv" => Self::Sbv,
+            "lrc" => Self::Lrc,
+            // 连字符与下划线都认：config.toml 是用户可手改的文件，与 CLI 的 `txt-ts` 对齐
+            "txt_ts" | "txt-ts" => Self::TxtTs,
             "burn_video" | "burn" | "hardsub" => Self::BurnVideo,
             _ => Self::default(),
         }
@@ -119,6 +134,9 @@ impl EditorExportFormat {
             Self::Json,
             Self::EbuTtD,
             Self::NetflixTtal,
+            Self::Sbv,
+            Self::Lrc,
+            Self::TxtTs,
             Self::BurnVideo,
         ]
     }

@@ -35,6 +35,29 @@ const _: () = assert!(
     "SPEAKER_PRESETS 条目数不足以覆盖 2..=MAX_SPEAKERS，请补齐后重试"
 );
 
+/// 「字幕输出格式」分段选择器的选项表：`(配置值, 显示名)`。
+///
+/// 配置值同时是 `state.output_format` / `config.pipeline.output_format` 的取值，
+/// 也是 `writer::write_in_place` 认的规范格式名。它必须与 CLI 的
+/// `cli::SUPPORTED_FORMATS`（`--format` 与 `tools --json` 的 formats 数组的来源）
+/// 同集，否则会出现「命令行能导出、界面选不到」的落差。
+///
+/// `txt` 与 `txt-ts` **同扩展名 `.txt`**：前者是纯文本（无时间轴），后者每行带
+/// `[00:01:23.456]` 时间码。两枚胶囊相邻摆放，名字里分别写「纯文本 / 带时间码」，
+/// 免得用户在导出目录里看到两个都叫 .txt 的文件却分不清。
+const OUTPUT_FORMAT_CHOICES: [(&str, &str); 10] = [
+    ("srt", "SRT"),
+    ("vtt", "VTT"),
+    ("ass", "ASS"),
+    ("txt", "TXT 纯文本"),
+    ("txt-ts", "TXT 带时间码"),
+    ("json", "JSON"),
+    ("ttml", "EBU-TT-D"),
+    ("ttal", "Netflix TTAL"),
+    ("sbv", "SBV"),
+    ("lrc", "LRC"),
+];
+
 /// 说话人分离的选项列表：`关闭` + `2..=MAX_SPEAKERS` 人。
 fn speaker_options() -> Vec<(&'static str, &'static str)> {
     let mut options = Vec::with_capacity(MAX_SPEAKERS as usize);
@@ -732,9 +755,12 @@ impl MainWindow {
             "vtt" => "vtt",
             "ass" => "ass",
             "txt" => "txt",
+            "txt-ts" => "txt-ts",
             "json" => "json",
             "ttml" => "ttml",
             "ttal" => "ttal",
+            "sbv" => "sbv",
+            "lrc" => "lrc",
             _ => "srt",
         };
         // 逐词卡拉OK开关（落盘键：`[subtitle_style] karaoke_word_highlight`）。
@@ -804,15 +830,7 @@ impl MainWindow {
             ))
             .child(self.param_group(
                 "字幕输出格式",
-                vec![
-                    ("srt", "SRT"),
-                    ("vtt", "VTT"),
-                    ("ass", "ASS"),
-                    ("txt", "TXT"),
-                    ("json", "JSON"),
-                    ("ttml", "EBU-TT-D"),
-                    ("ttal", "Netflix TTAL"),
-                ],
+                OUTPUT_FORMAT_CHOICES.to_vec(),
                 fmt_sel,
                 |this, sel, cx| {
                     this.state.output_format = sel.to_string();
@@ -1362,7 +1380,8 @@ mod tests {
     // `test` 属性宏带进来，遮蔽内建的 `#[test]`，导致展开递归超限。
     use super::{
         apply_hotwords_bare_key, bundle_size_text, hotwords_display_window, speaker_options,
-        tier_downloading, tier_size_text, tier_status_text, HOTWORDS_VIEW_CHARS, TIER_TAGLINES,
+        tier_downloading, tier_size_text, tier_status_text, HOTWORDS_VIEW_CHARS,
+        OUTPUT_FORMAT_CHOICES, TIER_TAGLINES,
     };
     use crate::app::WhisperModelTier;
     use crate::engines::MAX_SPEAKERS;
@@ -1534,5 +1553,47 @@ mod tests {
         assert!(after.ends_with('…'));
         let (before, after) = hotwords_display_window(&long, 300);
         assert!(before.starts_with('…') && !after.ends_with('…') && after.is_empty());
+    }
+
+    /// 抽屉的「字幕输出格式」选项必须与 CLI 的 `SUPPORTED_FORMATS`（`--format` 与
+    /// `tools --json` 的 formats 数组的来源）**同集**：少一项就出现「命令行能导出、
+    /// 界面选不到」——SBV / LRC / 带时间码纯文本此前正是这种状态。
+    #[test]
+    fn output_format_choices_cover_cli_formats() {
+        use crate::cli::SUPPORTED_FORMATS;
+        use std::collections::HashSet;
+
+        let ui: HashSet<&str> = OUTPUT_FORMAT_CHOICES.iter().map(|(k, _)| *k).collect();
+        let cli: HashSet<&str> = SUPPORTED_FORMATS.iter().copied().collect();
+        assert_eq!(ui, cli, "抽屉格式清单与 CLI 的 SUPPORTED_FORMATS 不一致");
+
+        // 显示名不能空缺、不能两两重复，否则胶囊分不清哪一档是哪一档
+        let mut labels: HashSet<&str> = HashSet::new();
+        for (key, label) in OUTPUT_FORMAT_CHOICES {
+            assert!(!label.trim().is_empty(), "{key} 缺显示名");
+            assert!(labels.insert(label), "显示名重复：{label}");
+        }
+
+        // `txt` 与 `txt-ts` 同扩展名 `.txt`：两枚胶囊必须相邻，显示名分别点明
+        // 「纯文本 / 带时间码」，否则用户会以为两者没区别。
+        let txt_at = OUTPUT_FORMAT_CHOICES
+            .iter()
+            .position(|(k, _)| *k == "txt")
+            .expect("选项表必须有 txt");
+        assert_eq!(
+            OUTPUT_FORMAT_CHOICES[txt_at + 1].0,
+            "txt-ts",
+            "带时间码纯文本必须紧跟纯文本"
+        );
+        assert_ne!(
+            OUTPUT_FORMAT_CHOICES[txt_at].1,
+            OUTPUT_FORMAT_CHOICES[txt_at + 1].1,
+            "两种纯文本的显示名不能相同"
+        );
+        // 两者都是 .txt：扩展名由 writer::export_spec_for 决定，内容由格式名决定
+        assert_eq!(
+            crate::subtitle::writer::export_spec_for("txt").0,
+            crate::subtitle::writer::export_spec_for("txt-ts").0,
+        );
     }
 }
