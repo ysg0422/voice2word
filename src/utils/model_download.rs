@@ -505,17 +505,23 @@ fn configured_executable_for(cfg: &AppConfig, item: &DownloadItem) -> String {
     }
 }
 
+/// 已解析路径的可用性：文件在，或它的文件名能在 PATH 上找到。
+///
+/// 单独抽出来是因为「体检报告」与「能不能用」问的是同一件事，两处各写一遍迟早分叉
+/// ——CLI 的 `tools --json` 就曾经只按 `path.exists()` 判，于是机器上装着 ffmpeg
+/// 却报 `ready: false`。
+pub fn resolved_executable_is_usable(resolved: &std::path::Path) -> bool {
+    resolved.exists()
+        || resolved
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(is_command_available)
+}
+
 /// 某个可执行组件现在能不能用：配置里的路径在，或系统 PATH 上有同名命令。
 pub fn executable_is_usable(cfg: &AppConfig, item: &DownloadItem) -> bool {
     let configured = configured_executable_for(cfg, item);
-    let resolved = AppConfig::resolve_path(&configured);
-    if resolved.exists() {
-        return true;
-    }
-    resolved
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(is_command_available)
+    resolved_executable_is_usable(&AppConfig::resolve_path(&configured))
 }
 
 /// 「必需的可执行组件」里当前确实不可用的那些。

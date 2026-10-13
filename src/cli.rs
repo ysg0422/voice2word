@@ -2187,61 +2187,78 @@ fn tools_catalog(only: Option<&str>) -> std::result::Result<serde_json::Value, C
 fn environment_probe() -> serde_json::Value {
     let Ok(config) = AppConfig::load_from_file("config.toml") else {
         return serde_json::json!({
-            "config_file": absolute_display(Path::new("config.toml")),
+            "config_file": AppConfig::resolve_path("config.toml").display().to_string(),
             "ready": false,
             "translation_ready": false,
             "items": [],
             "error": "配置读取失败：请先启动一次图形界面生成 config.toml，或手工放置一份",
         });
     };
-    let checks: [(&str, PathBuf, bool); 5] = [
+    // 第四列 `is_executable`：可执行组件走「文件在 或 系统 PATH 上有同名命令」的判定
+    // （见 utils::model_download::resolved_executable_is_usable）；模型文件只看文件在不在。
+    // 分开的理由：机器上早装好 ffmpeg 时，程序其实完全能干活，报 `ready: false` 会误导调用方。
+    let checks: [(&str, PathBuf, bool, bool); 5] = [
         (
             "ffmpeg",
             AppConfig::resolve_path(&config.paths.ffmpeg),
+            true,
             true,
         ),
         (
             "whisper_cli",
             AppConfig::resolve_path(&config.paths.whisper_cli),
             true,
+            true,
         ),
         (
             "whisper_model",
             AppConfig::resolve_path(&config.paths.whisper_model),
             true,
+            false,
         ),
         (
             "llama_cli",
             AppConfig::resolve_path(&config.paths.llama_cli),
             false,
+            true,
         ),
         (
             "llm_model",
             AppConfig::resolve_path(&config.paths.llm_model),
             false,
+            false,
         ),
     ];
+    // 「就位」的统一判据：可执行组件允许「文件不在、但 PATH 上有同名命令」，
+    // 模型文件必须真的在磁盘上。
+    let usable = |path: &PathBuf, is_executable: bool| {
+        if is_executable {
+            crate::utils::model_download::resolved_executable_is_usable(path)
+        } else {
+            path.exists()
+        }
+    };
     let items: Vec<serde_json::Value> = checks
         .iter()
-        .map(|(name, path, required)| {
+        .map(|(name, path, required, is_executable)| {
             serde_json::json!({
                 "name": name,
                 "path": path.display().to_string(),
-                "present": path.exists(),
+                "present": usable(path, *is_executable),
                 "required": required,
             })
         })
         .collect();
     let ready = checks
         .iter()
-        .filter(|(_, _, required)| *required)
-        .all(|(_, path, _)| path.exists());
+        .filter(|(_, _, required, _)| *required)
+        .all(|(_, path, _, is_executable)| usable(path, *is_executable));
     let translation_ready = checks
         .iter()
-        .filter(|(_, _, required)| !*required)
-        .all(|(_, path, _)| path.exists());
+        .filter(|(_, _, required, _)| !*required)
+        .all(|(_, path, _, is_executable)| usable(path, *is_executable));
     serde_json::json!({
-        "config_file": absolute_display(Path::new("config.toml")),
+        "config_file": AppConfig::resolve_path("config.toml").display().to_string(),
         "ready": ready,
         "translation_ready": translation_ready,
         "items": items,
