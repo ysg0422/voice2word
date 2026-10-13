@@ -732,6 +732,9 @@ Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bol
 ///   writer 根本写不出来的格式（`write_in_place` 对未知格式是 `bail!`，会直接
 ///   报错）。剪映 / FCPXML / Premiere XML 走剪辑台的专用导出链路（整目录导出
 ///   或各自的文件对话框），不属于配置项「字幕输出格式」的取值，故同样回落 `srt`。
+///
+/// 注意这里返回的**第一个值是扩展名**（不是格式名）：`txt-ts` 的扩展名就是 `txt`。
+/// 写盘时该传哪一个见 [`canonical_write_format`]。
 pub fn export_spec_for(fmt: &str) -> (&'static str, &'static str) {
     match fmt.trim().to_lowercase().as_str() {
         "ass" => ("ass", "ASS 特效字幕"),
@@ -745,6 +748,31 @@ pub fn export_spec_for(fmt: &str) -> (&'static str, &'static str) {
         "ttal" | "netflix-ttal" => ("ttal", "Netflix TTAL 字幕"),
         // 含 "srt"、空串与任何未知值：统一按 SRT 处理
         _ => ("srt", "SRT 字幕"),
+    }
+}
+
+/// 配置值 / 别名 → writer 认得的**规范格式名**（写盘时该传的那一个）。
+///
+/// # 为什么不能拿 [`export_spec_for`] 的第一个返回值当格式名
+///
+/// 那是**扩展名**，不是格式名：`txt-ts`（带时间码纯文本）的扩展名就是 `txt`。
+/// 历史库导出曾经直接拿扩展名当写盘格式，于是用户选了「带时间码纯文本」，
+/// 导出内容却是纯文本——文件名对、内容错，而且是静默发生的。
+///
+/// 这两件事从此各归各位：**扩展名**只用于文件名与对话框过滤器，
+/// **规范格式名**只用于写盘。`txt` 与 `txt-ts` 这对同扩展名的组合就是判据。
+pub fn canonical_write_format(fmt: &str) -> &'static str {
+    match fmt.trim().to_lowercase().as_str() {
+        "ass" => "ass",
+        "vtt" => "vtt",
+        "sbv" => "sbv",
+        "lrc" => "lrc",
+        "txt-ts" | "txtts" => "txt-ts",
+        "txt" => "txt",
+        "json" => "json",
+        "ttml" | "ebu-tt-d" | "ebutt" => "ttml",
+        "ttal" | "netflix-ttal" => "ttal",
+        _ => "srt",
     }
 }
 
@@ -1581,6 +1609,36 @@ mod tests {
         ]
     }
 
+    /// `txt-ts`（带时间码纯文本）与 `txt` **共用扩展名**，但写盘格式名必须不同。
+    ///
+    /// 这条就是那个静默 bug 的判据：历史库导出曾拿 `export_spec_for().0`（扩展名）
+    /// 当写盘格式名，用户选了「带时间码纯文本」却得到一堆纯文本——文件名对、内容错。
+    /// 其余格式恰好「格式名 == 扩展名」，所以那个写法以前没暴露问题。
+    #[test]
+    fn canonical_write_format_keeps_txt_ts_distinct_from_txt() {
+        assert_eq!(canonical_write_format("txt-ts"), "txt-ts");
+        assert_eq!(canonical_write_format("txtts"), "txt-ts");
+        assert_eq!(canonical_write_format("txt"), "txt");
+        // 这两者扩展名相同、格式名不同，正是「不能拿扩展名当格式名」的原因。
+        assert_eq!(export_spec_for("txt-ts").0, export_spec_for("txt").0);
+        assert_ne!(
+            canonical_write_format("txt-ts"),
+            canonical_write_format("txt")
+        );
+        // 其余格式：格式名 == 扩展名。
+        for fmt in ["srt", "ass", "vtt", "sbv", "lrc", "json", "ttml", "ttal"] {
+            assert_eq!(canonical_write_format(fmt), fmt);
+            assert_eq!(
+                export_spec_for(fmt).0,
+                fmt,
+                "{fmt} 的扩展名与格式名恰好相同"
+            );
+        }
+        // 别名、大小写、空白与未知值：与 `export_spec_for` 同一套归一规则。
+        assert_eq!(canonical_write_format("EBU-TT-D"), "ttml");
+        assert_eq!(canonical_write_format("  SRT  "), "srt");
+        assert_eq!(canonical_write_format("不存在的格式"), "srt");
+    }
     /// `export_spec_for` 是「格式字符串 -> (扩展名, 对话框过滤器名)」的唯一来源，
     /// 必须与 `write_in_place` 的分派表逐一对齐。这里不满足于比对字面量：
     /// **真的按返回的扩展名写一遍**，断言 writer 接受该格式名且产出非空文件，

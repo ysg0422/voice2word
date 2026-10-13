@@ -12,7 +12,7 @@ use super::super::theme::Theme;
 use super::super::types::{ConfirmAction, ConfirmDialogInfo};
 use super::super::MainWindow;
 use crate::app::state::{ProcessStatus, WorkspaceTab};
-use crate::subtitle::writer::export_spec_for;
+use crate::subtitle::writer::{canonical_write_format, export_spec_for};
 use crate::subtitle::SubtitleWriter;
 use crate::ui::apply_line_edit;
 use crate::utils::time::format_duration_short;
@@ -1145,7 +1145,11 @@ impl MainWindow {
                             // 扩展名 / 对话框过滤器 / 写出格式三者同源（都来自
                             // `writer::export_spec_for`），否则会出现「文件叫 .json、
                             // 里面却是 SRT」这类不一致。
-                            let (fmt_ext, fmt_label) = export_spec_for(&this.state.output_format);
+                            // 文件名后缀取**扩展名**，写盘参数取**规范格式名**：两者不是
+                            // 一回事——`txt-ts`（带时间码纯文本）的扩展名就是 `txt`，拿扩展名
+                            // 当格式名会把「带时间码」静默写成一堆纯文本。
+                            let write_fmt = canonical_write_format(&this.state.output_format);
+                            let (fmt_ext, fmt_label) = export_spec_for(write_fmt);
                             // 与剪辑台同源：把主界面配置的字幕样式一并带进写出链路，
                             // 否则 SRT/VTT/ASS 不会按「单行最大字数」折行，同一份字幕
                             // 从剪辑台导出会折行、从历史库单条导出却不折，两处不一致。
@@ -1166,7 +1170,7 @@ impl MainWindow {
                                     if let Err(err) = SubtitleWriter::write_to_file_with_style(
                                         &segs,
                                         &save_path,
-                                        fmt_ext,
+                                        write_fmt,
                                         export_mode,
                                         &style,
                                     ) {
