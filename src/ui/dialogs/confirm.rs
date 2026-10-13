@@ -8,6 +8,13 @@
 //! 与其给每个调用点各写一个弹窗，不如把「标题 + 正文 + 确认键」这套外壳收敛到
 //! [`ConfirmDialogInfo`]（见 `types.rs`），确认后要执行什么用 [`ConfirmAction`]
 //! 编码——枚举可 `Clone + PartialEq`，能存进 `MainWindow` 状态，而闭包不能。
+//!
+//! # 键盘
+//!
+//! 回车 = 点「确认」，Tab / Shift+Tab 在「取消」「确认」之间挪焦点（见 [`keyboard`]）。
+//! Esc **不在本文件处理**：`ui/mod.rs` 的 `CancelOrClose` 优先级链第一刀就是
+//! `this.confirm_dialog.take()`（链里「确认弹窗排在最前」那段注释即为此），本框
+//! 已被它覆盖，这里再挂一个 Esc 分支只会让同一个键跑两遍。
 
 use gpui::prelude::*;
 use gpui::*;
@@ -16,6 +23,7 @@ use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::types::{ConfirmAction, ConfirmDialogInfo};
 use super::super::MainWindow;
+use super::keyboard;
 
 /// 把确认框正文里的 `**强调**` 标记拆成「纯文本 + 强调区间」。
 ///
@@ -59,17 +67,33 @@ impl MainWindow {
         info: ConfirmDialogInfo,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let action = info.action.clone();
+        // 键盘支持：注册全局按键拦截（幂等，只有第一次真的干活），再取回本框的
+        // 焦点句柄（`thread_local` 里跨帧复用）并挂到卡片和两个按钮上。
+        keyboard::ensure_handler(cx);
+        let panel_focus = keyboard::panel_focus(keyboard::DialogKind::Confirm, cx);
+        let cancel_focus = keyboard::button_focus(
+            keyboard::DialogKind::Confirm,
+            0,
+            keyboard::DialogAction::ConfirmCancel,
+            cx,
+        );
+        let accept_focus = keyboard::button_focus(
+            keyboard::DialogKind::Confirm,
+            1,
+            keyboard::DialogAction::ConfirmAccept,
+            cx,
+        );
+
         primitives::modal_scrim()
             .id("confirm-dialog-backdrop")
             // 点遮罩 = 取消（与点「取消」同义，符合直觉）
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.confirm_dialog = None;
-                cx.notify();
-            }))
+            .on_click(cx.listener(|this, _, _, cx| this.cancel_confirm_dialog(cx)))
             .child(
                 primitives::modal_card(Theme::DIALOG_W, Theme::PAGE_PAD)
                     .id("confirm-dialog-card")
+                    // 卡片是这个弹窗的焦点容器：Tab 进来先落到它，再按 GPUI 的 Tab
+                    // 顺序走到两个按钮上（按钮句柄带 `tab_stop`）。
+                    .track_focus(&panel_focus)
                     // 面板自身吞掉点击，否则点正文也会被遮罩当作「取消」。
                     //
                     // 光挂一个空的 on_click 是不够的：GPUI 的点击沿命中链冒泡，
@@ -114,10 +138,11 @@ impl MainWindow {
                                     primitives::BtnVariant::Secondary,
                                 )
                                 .id("confirm-dialog-cancel")
+                                .track_focus(&cancel_focus)
+                                .focus(|s| s.border_1().border_color(Theme::accent_blue()))
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
-                                        this.confirm_dialog = None;
-                                        cx.notify();
+                                        this.cancel_confirm_dialog(cx);
                                     },
                                 )),
                             )
@@ -130,13 +155,32 @@ impl MainWindow {
                                 };
                                 primitives::btn_clickable(label, primitives::BtnSize::Md, variant)
                                     .id("confirm-dialog-accept")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.confirm_dialog = None;
-                                        this.run_confirm_action(action.clone(), cx);
+                                    .track_focus(&accept_focus)
+                                    .focus(|s| s.border_1().border_color(Theme::accent_blue()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.accept_confirm_dialog(cx);
                                     }))
                             }),
                     ),
             )
+    }
+
+    /// 执行「确认」。
+    ///
+    /// 鼠标点「确认」按钮与键盘按回车都调它，所以两条路径永远一致：动作从**当前**
+    /// 弹窗状态里取，不在这里另存一份。
+    pub(crate) fn accept_confirm_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(info) = self.confirm_dialog.take() else {
+            return;
+        };
+        self.run_confirm_action(info.action.clone(), cx);
+    }
+
+    /// 执行「取消」（点遮罩、点「取消」按钮共用）。
+    pub(crate) fn cancel_confirm_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.confirm_dialog.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// 执行确认后的动作。与会话状态一起收口，避免 action 的执行逻辑散落在两个渲染文件里。

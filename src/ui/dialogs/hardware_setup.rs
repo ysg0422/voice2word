@@ -3,6 +3,7 @@
 use gpui::prelude::*;
 use gpui::*;
 
+use super::keyboard;
 use crate::ui::primitives;
 use crate::ui::theme::Theme;
 use crate::ui::MainWindow;
@@ -15,12 +16,39 @@ impl MainWindow {
     ) -> impl IntoElement {
         let is_gpu = self.state.config.gpu.is_gpu_tier();
 
+        // 键盘支持：注册全局按键拦截（幂等），取回面板 + 三个按钮的焦点句柄。
+        // 回车 = 确认当前高亮的那一档（见 `keyboard::primary_action`）；
+        // Esc 由 `ui/mod.rs` 的 `CancelOrClose` 链覆盖（未完成引导那一刀，与
+        // 「稍后再说」同义），所以下面不挂 Esc 分支。
+        keyboard::ensure_handler(cx);
+        let panel_focus = keyboard::panel_focus(keyboard::DialogKind::HardwareSetup, cx);
+        let gpu_focus = keyboard::button_focus(
+            keyboard::DialogKind::HardwareSetup,
+            0,
+            keyboard::DialogAction::HardwareSelectGpu,
+            cx,
+        );
+        let cpu_focus = keyboard::button_focus(
+            keyboard::DialogKind::HardwareSetup,
+            1,
+            keyboard::DialogAction::HardwareSelectCpu,
+            cx,
+        );
+        let later_focus = keyboard::button_focus(
+            keyboard::DialogKind::HardwareSetup,
+            2,
+            keyboard::DialogAction::HardwareDefer,
+            cx,
+        );
+
         primitives::modal_scrim()
             .id("hardware-setup-scrim")
             .occlude()
             .child(
                 primitives::modal_card(680.0, Theme::PAGE_PAD)
                     .id("hardware-setup-card")
+                    // 焦点容器：Tab 先落到卡片，再在三个按钮之间循环。
+                    .track_focus(&panel_focus)
                     .gap(px(Theme::SPACE_4))
                     .child(
                         div()
@@ -71,8 +99,7 @@ impl MainWindow {
                                     .cursor_pointer()
                                     .hover(|s| s.border_color(Theme::accent_mint()).bg(Theme::tint_mint_badge()))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.state.set_hardware_tier(true);
-                                        cx.notify();
+                                        this.choose_gpu_tier(cx);
                                     }))
                                     .child(
                                         div()
@@ -117,10 +144,13 @@ impl MainWindow {
                                                     primitives::BtnVariant::Primary,
                                                 )
                                                 .id("hardware-setup-btn-gpu")
+                                                .track_focus(&gpu_focus)
+                                                .focus(|s| {
+                                                    s.border_1().border_color(Theme::accent_blue())
+                                                })
                                                 .w_full()
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.set_hardware_tier(true);
-                                                    cx.notify();
+                                                    this.choose_gpu_tier(cx);
                                                 })),
                                             ),
                                     ),
@@ -149,8 +179,7 @@ impl MainWindow {
                                     .cursor_pointer()
                                     .hover(|s| s.border_color(Theme::accent_blue()).bg(Theme::bg_hover()))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.state.set_hardware_tier(false);
-                                        cx.notify();
+                                        this.choose_cpu_tier(cx);
                                     }))
                                     .child(
                                         div()
@@ -195,10 +224,13 @@ impl MainWindow {
                                                     primitives::BtnVariant::Secondary,
                                                 )
                                                 .id("hardware-setup-btn-cpu")
+                                                .track_focus(&cpu_focus)
+                                                .focus(|s| {
+                                                    s.border_1().border_color(Theme::accent_blue())
+                                                })
                                                 .w_full()
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.set_hardware_tier(false);
-                                                    cx.notify();
+                                                    this.choose_cpu_tier(cx);
                                                 })),
                                             ),
                                     ),
@@ -227,13 +259,31 @@ impl MainWindow {
                                     primitives::BtnVariant::Secondary,
                                 )
                                 .id("hardware-setup-btn-later")
+                                .track_focus(&later_focus)
+                                .focus(|s| s.border_1().border_color(Theme::accent_blue()))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    // 只关框：不动硬件档位、不跑检测、不改任何推理策略。
-                                    this.state.defer_hardware_setup();
-                                    cx.notify();
+                                    this.defer_hardware_setup_dialog(cx);
                                 })),
                             ),
                     ),
             )
+    }
+
+    /// 选中「我有 GPU」：两张选择卡片与各自的按钮都调它，键盘回车也调它。
+    pub(crate) fn choose_gpu_tier(&mut self, cx: &mut Context<Self>) {
+        self.state.set_hardware_tier(true);
+        cx.notify();
+    }
+
+    /// 选中「我没有 GPU」：同 [`Self::choose_gpu_tier`]。
+    pub(crate) fn choose_cpu_tier(&mut self, cx: &mut Context<Self>) {
+        self.state.set_hardware_tier(false);
+        cx.notify();
+    }
+
+    /// 「稍后再说」：只关框，不动硬件档位、不跑检测、不改任何推理策略。
+    pub(crate) fn defer_hardware_setup_dialog(&mut self, cx: &mut Context<Self>) {
+        self.state.defer_hardware_setup();
+        cx.notify();
     }
 }

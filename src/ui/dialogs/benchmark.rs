@@ -7,6 +7,7 @@ use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::types::BenchmarkDialogInfo;
 use super::super::MainWindow;
+use super::keyboard;
 use crate::utils::time::format_duration_short;
 
 impl MainWindow {
@@ -18,6 +19,22 @@ impl MainWindow {
         let m = &info.metrics;
         let dur_str = format_duration_short(m.video_duration);
 
+        // 键盘支持：注册全局按键拦截（幂等），取回面板 + 两个按钮的焦点句柄。
+        keyboard::ensure_handler(cx);
+        let panel_focus = keyboard::panel_focus(keyboard::DialogKind::Benchmark, cx);
+        let close_focus = keyboard::button_focus(
+            keyboard::DialogKind::Benchmark,
+            0,
+            keyboard::DialogAction::BenchmarkClose,
+            cx,
+        );
+        let dismiss_focus = keyboard::button_focus(
+            keyboard::DialogKind::Benchmark,
+            1,
+            keyboard::DialogAction::BenchmarkClose,
+            cx,
+        );
+
         primitives::modal_scrim()
             .id("benchmark-dialog-backdrop")
             .child(
@@ -25,6 +42,7 @@ impl MainWindow {
                 // 弹窗只是底色再抬一档（bg_raised）并加投影浮起。
                 primitives::modal_card(Theme::DIALOG_W, Theme::PAGE_PAD)
                     .id("benchmark-dialog-card")
+                    .track_focus(&panel_focus)
                     .gap(px(Theme::SPACE_4))
                     .child(
                         div()
@@ -45,9 +63,10 @@ impl MainWindow {
                                 // 圆形关闭键：走 icon_close_btn 原语，与完成弹窗同源
                                 primitives::icon_close_btn()
                                     .id("benchmark-modal-close-btn")
+                                    .track_focus(&close_focus)
+                                    .focus(|s| s.border_1().border_color(Theme::accent_blue()))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.benchmark_dialog = None;
-                                        cx.notify();
+                                        this.close_benchmark_dialog(cx);
                                     })),
                             ),
                     )
@@ -155,14 +174,22 @@ impl MainWindow {
                                 primitives::BtnVariant::Primary,
                             )
                             .id("benchmark-dialog-confirm-btn")
+                            .track_focus(&dismiss_focus)
+                            .focus(|s| s.border_1().border_color(Theme::accent_blue()))
                             .px(px(Theme::SPACE_5))
                             .rounded_full()
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.benchmark_dialog = None;
-                                cx.notify();
+                                this.close_benchmark_dialog(cx);
                             })),
                         ),
                     ),
             )
+    }
+
+    /// 关闭基准弹窗：右上角 X、「知道了」按钮与键盘回车都走这一条路径。
+    pub(crate) fn close_benchmark_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.benchmark_dialog.take().is_some() {
+            cx.notify();
+        }
     }
 }

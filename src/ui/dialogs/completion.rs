@@ -7,6 +7,7 @@ use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::types::{BatchSummary, CompletionDialogInfo};
 use super::super::MainWindow;
+use super::keyboard;
 use crate::app::state::WorkspaceTab;
 use crate::utils::time::format_duration_short;
 
@@ -17,6 +18,23 @@ impl MainWindow {
         info: CompletionDialogInfo,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // 键盘支持：注册全局按键拦截（幂等），取回本框的面板 + 两个按钮的焦点句柄。
+        keyboard::ensure_handler(cx);
+        let panel_focus = keyboard::panel_focus(keyboard::DialogKind::Completion, cx);
+        // 两个按钮的句柄都先建出来（下标固定），这样「批量」与否都不会让句柄错位。
+        let goto_focus = keyboard::button_focus(
+            keyboard::DialogKind::Completion,
+            0,
+            keyboard::DialogAction::CompletionGoToEditor,
+            cx,
+        );
+        let clear_focus = keyboard::button_focus(
+            keyboard::DialogKind::Completion,
+            1,
+            keyboard::DialogAction::CompletionClearBatch,
+            cx,
+        );
+
         primitives::modal_scrim()
             .id("completion-dialog-backdrop")
             .child(
@@ -24,6 +42,8 @@ impl MainWindow {
                 // 弹窗只是底色再抬一档（bg_raised）并加投影浮起。
                 primitives::modal_card(Theme::DIALOG_W_WIDE, Theme::PAGE_PAD)
                     .id("completion-dialog-card")
+                    // 焦点容器：Tab 先落到卡片，再走到下面两个按钮（按钮是 Tab 停靠点）。
+                    .track_focus(&panel_focus)
                     .items_center()
                     .gap(px(Theme::SPACE_4))
                     .child(
@@ -225,15 +245,13 @@ impl MainWindow {
                                             primitives::BtnVariant::Primary,
                                         )
                                         .id("modal-goto-editor-btn")
+                                        .track_focus(&goto_focus)
+                                        .focus(|s| s.border_1().border_color(Theme::accent_blue()))
                                         .px(px(Theme::SPACE_8))
                                         .font_weight(FontWeight::BOLD)
                                         .on_click(
                                             cx.listener(|this, _, _, cx| {
-                                                this.completion_dialog = None;
-                                                this.state.active_tab = WorkspaceTab::Editor;
-                                                this.trigger_extract_frame(cx);
-                                                this.ensure_preview_proxy(cx);
-                                                cx.notify();
+                                                this.completion_go_to_editor(cx);
                                             }),
                                         ),
                                     )
@@ -245,11 +263,13 @@ impl MainWindow {
                                                 primitives::BtnVariant::Secondary,
                                             )
                                             .id("modal-clear-batch-btn")
+                                            .track_focus(&clear_focus)
+                                            .focus(|s| {
+                                                s.border_1().border_color(Theme::accent_blue())
+                                            })
                                             .on_click(
                                                 cx.listener(|this, _, _, cx| {
-                                                    this.completion_dialog = None;
-                                                    this.state.clear_batch_queue();
-                                                    cx.notify();
+                                                    this.completion_clear_batch(cx);
                                                 }),
                                             ),
                                         )
@@ -259,6 +279,22 @@ impl MainWindow {
                             ),
                     ),
             )
+    }
+
+    /// 主按钮「进入剪辑校对」：鼠标点击与键盘回车共用这一条路径。
+    pub(crate) fn completion_go_to_editor(&mut self, cx: &mut Context<Self>) {
+        self.completion_dialog = None;
+        self.state.active_tab = WorkspaceTab::Editor;
+        self.trigger_extract_frame(cx);
+        self.ensure_preview_proxy(cx);
+        cx.notify();
+    }
+
+    /// 批量的次按钮「关闭并清空队列」：同样鼠标与键盘共用。
+    pub(crate) fn completion_clear_batch(&mut self, cx: &mut Context<Self>) {
+        self.completion_dialog = None;
+        self.state.clear_batch_queue();
+        cx.notify();
     }
 
     /// 批量完成看板：替代单文件性能指标，把「这一批到底成了几个、败了几个」讲清楚

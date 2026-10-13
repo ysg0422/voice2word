@@ -17,6 +17,7 @@ use super::super::primitives;
 use super::super::shortcuts;
 use super::super::theme::Theme;
 use super::super::MainWindow;
+use super::keyboard;
 
 /// 键位列的宽度。
 ///
@@ -31,6 +32,18 @@ impl MainWindow {
     /// 按「前一半 / 后一半」切成两列后高度减半，同时保持分组顺序——阅读顺序是先
     /// 左列自上而下、再右列自上而下。
     pub(crate) fn render_shortcuts_help(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        // 键盘支持：注册全局按键拦截（幂等），取回面板 + 关闭按钮的焦点句柄。
+        // 本面板的 Esc 由 `ui/mod.rs` 的 `CancelOrClose` 链覆盖（`shortcuts_help_open`
+        // 那一刀，排在命令面板之后），所以下面不再挂 Esc 分支。
+        keyboard::ensure_handler(cx);
+        let panel_focus = keyboard::panel_focus(keyboard::DialogKind::ShortcutsHelp, cx);
+        let close_focus = keyboard::button_focus(
+            keyboard::DialogKind::ShortcutsHelp,
+            0,
+            keyboard::DialogAction::ShortcutsHelpClose,
+            cx,
+        );
+
         let groups = shortcuts::grouped_shortcut_rows();
         let mid = groups.len().div_ceil(2);
         let (left_groups, right_groups) = groups.split_at(mid);
@@ -82,6 +95,7 @@ impl MainWindow {
             .child(
                 primitives::modal_card(Theme::DIALOG_W_WIDE, Theme::PAGE_PAD)
                     .id("shortcuts-help-card")
+                    .track_focus(&panel_focus)
                     // 卡片必须 `occlude()`，把遮罩从命中集合里挡掉；只挂一个空的
                     // on_click 不够——GPUI 的点击会沿命中链冒泡，空回调不中断冒泡，
                     // 点正文照样会触发遮罩的「点空白关闭」（与确认框同一个坑）。
@@ -109,6 +123,8 @@ impl MainWindow {
                                 primitives::BtnVariant::Secondary,
                             )
                             .id("shortcuts-help-close")
+                            .track_focus(&close_focus)
+                            .focus(|s| s.border_1().border_color(Theme::accent_blue()))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.close_shortcuts_help(cx);
                             })),
