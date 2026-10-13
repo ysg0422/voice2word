@@ -47,12 +47,7 @@ impl ReadingSpeed {
             return None;
         }
         let cps = total as f64 / duration_secs;
-        // 用整数比较表达「CJK 占比 >= 30%」，避开浮点边界与 clippy::float_cmp。
-        let (comfortable, fast) = if cjk * 10 >= total * 3 {
-            (9.0, 12.0)
-        } else {
-            (17.0, 25.0)
-        };
+        let (comfortable, fast) = thresholds_for(total, cjk);
         Some(if cps <= comfortable {
             ReadingSpeed::Comfortable
         } else if cps <= fast {
@@ -205,6 +200,40 @@ fn is_cjk(c: char) -> bool {
         || (0x4E00..=0x9FFF).contains(&cp) // CJK 统一表意
         || (0x3400..=0x4DBF).contains(&cp) // CJK 扩展 A
         || (0xAC00..=0xD7AF).contains(&cp) // 谚文
+}
+
+/// 汉字 / 假名 / 谚文等表意文字的阅读速度阈值 `(舒适上限, 过快阈值)`（字符/秒）。
+const CJK_THRESHOLDS: (f64, f64) = (9.0, 12.0);
+
+/// 拉丁文字的阅读速度阈值 `(舒适上限, 过快阈值)`（字符/秒）。
+const LATIN_THRESHOLDS: (f64, f64) = (17.0, 25.0);
+
+/// 非空白字符数（含标点；空格与换行是排版而不是内容，不计入）。
+///
+/// 公开给质检层复用：阅读速度超限的判定必须与统计面板用**同一个**字符数口径，
+/// 两处各数一遍就会出现「面板说 18 字/秒、复核清单说没超标」的自相矛盾。
+pub fn visible_char_count(text: &str) -> usize {
+    count_visible(text).0
+}
+
+/// 阅读速度阈值 `(舒适上限, 过快阈值)`（字符/秒），按字符集分档。
+///
+/// 公开给质检层复用，避免它在别处再写一份 `9 / 12 / 17 / 25`——那种复制的数字一旦
+/// 有一处被调，界面上的「语速过快」与统计口径就会当场对不上。
+pub fn cps_thresholds(text: &str) -> (f64, f64) {
+    let (total, cjk) = count_visible(text);
+    thresholds_for(total, cjk)
+}
+
+/// 按「字符数 + 其中 CJK 数」选阈值：用整数比较表达「CJK 占比 >= 30%」，
+/// 避开浮点边界与 `clippy::float_cmp`。空文本按表意文字档（调用方本就不该拿空文本
+/// 问速度，这里只是给个确定值，不做无意义的拉丁/汉字猜测）。
+fn thresholds_for(total: usize, cjk: usize) -> (f64, f64) {
+    if total == 0 || cjk * 10 >= total * 3 {
+        CJK_THRESHOLDS
+    } else {
+        LATIN_THRESHOLDS
+    }
 }
 
 #[cfg(test)]

@@ -20,10 +20,17 @@
 //!   误差，22 分钟的片子末尾就会与画面错开，逐帧对不上。
 //! - **本层只报告不修复**：重叠/零长由 [`RetimePlan`] 的两个标志如实汇报，
 //!   要「压掉」重叠时再调用 [`resolve_overlaps`]。
+//!
+//! 除了「整轨变换」，这里还放着**逐句时长的可读性规划**：阅读速度（字符/秒）超限的
+//! 句子该延长多久、能延长到哪（[`cps_violations`] / [`plan_cps_fix`]）。它与整轨
+//! 变换共用同一套约束（不改文本、不与邻居重叠、时长下限 [`MIN_EDIT_DUR`]），放进
+//! 同一个模块是为了让「改时间」这件事只有一处口径——散成两处后，一处按 0.1 秒保底、
+//! 另一处按 0.25 秒保底，用户就会遇到「按这个按钮能修好、按那个按钮下次载入丢句」。
 
 use std::cmp::Ordering;
 
 use crate::subtitle::segment::{Segment, MIN_EDIT_DUR};
+use crate::subtitle::stats;
 
 /// 判定「起点真的变了」的浮点容差（秒）。
 const CHANGED_TOL: f64 = 1e-6;
@@ -433,6 +440,152 @@ fn has_degenerate(times: &[(f64, f64)]) -> bool {
         // 与「时长不足」一起算作退化，界面才会如实警告。
         !start.is_finite() || !end.is_finite() || end - start < MIN_EDIT_DUR - OVERLAP_TOL
     })
+}
+
+/// 阅读速度上限的**默认值**：汉字类字幕的「舒适上限」9 字符/秒。
+///
+/// 与统计面板同源（`subtitle::stats` 的舒适阈值：表意文字 9、拉丁文字 17），
+/// `default_matches_stats_thresholds` 这条单测把两个数字钉在一起——界面文案里的
+/// 「超过 9 字/秒」必须与判定用的数字是同一个，否则提示和判定会当场互相打脸。
+pub const DEFAULT_MAX_CPS: f64 = 9.0;
+
+/// 阅读速度超限的字幕下标（`cps = 可见字符数 / 时长`，严格大于上限即入列）。
+///
+/// - **可见字符数**走与统计面板同一个口径（[`stats::visible_char_count`]：去空白、含标点）。
+///   两处各数一遍，就会出现「统计卡说 3 句过快、复核清单说 0 句」的自相矛盾。
+/// - `max_cps` 非有限或 `<= 0` 时按**字符集分档**回落（汉字类 9、拉丁类 17），
+///   与 [`plan_min_gaps`] 对非法 `min_gap` 的处理同一思路：宁可回落到有依据的默认值，
+///   也不要拿 `NaN` 去比较——NaN 的比较恒为 false，会把整份清单**静默清空**。
+/// - **零长 / 倒挂**（`end <= start`）但文本非空的句子也入列：它不是「读得快」而是
+///   「根本读不到」，正是最该进复核清单的一类。统计面板跳过它是不想让 `inf`/`NaN`
+///   污染平均值，两个口径的目的不同，这里如实报出来。
+/// - 文本为空（去空白后无字符）的句子没有阅读速度可言，不入列。
+pub fn cps_violations(segments: &[Segment], max_cps: f64) -> Vec<usize> {
+    let explicit = max_cps.is_finite() && max_cps > 0.0;
+    let mut out = Vec::new();
+    for seg in segments {
+        let text = seg.display_text();
+        let chars = stats::visible_char_count(text);
+        if chars == 0 {
+            continue;
+        }
+        let limit = if explicit {
+            max_cps
+        } else {
+            stats::cps_thresholds(text).0
+        };
+        let duration = seg.duration();
+        if duration <= 0.0 || chars as f64 / duration > limit {
+            out.push(seg.index);
+        }
+    }
+    out
+}
+
+/// 阅读速度 / 最短时长的**修正计划**：只改时间，绝不改文本。
+///
+/// 为什么不是直接返回一串新 `(start, end)`：界面要能说清「哪几句被拉长、哪几句实在
+/// 拉不动（后一句贴得太近）」，用户才决定是先压后一句、还是把这句台词改短。只给一串
+/// 数字，用户看到的是「时间变了但不知道为什么」，也就无从下手。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CpsFixPlan {
+    /// 建议区间，与输入**等长同序**（没被改动的原样带回）。
+    pub times: Vec<(f64, f64)>,
+    /// 时长真的被延长的句子下标（按 `Segment::index` 升序）。
+    pub extended: Vec<usize>,
+    /// 需要延长、但没达到目标时长的句子下标（升序）。
+    ///
+    /// 可能是 [`Self::extended`] 的子集（延了一部分但顶到了下一句），也可能**完全不在**
+    /// [`Self::extended`] 里（下一句已经贴上来，一点空间都没有）。空表 = 全都够长了。
+    pub unresolved: Vec<usize>,
+}
+
+impl CpsFixPlan {
+    /// 是否有任何一句的时间需要落盘（界面据此决定「应用」按钮是否可用）。
+    pub fn has_changes(&self) -> bool {
+        !self.extended.is_empty()
+    }
+}
+
+/// 规划阅读速度修正：把**时长不够**的句子往后延长到「读得完」所需的最短时间。
+///
+/// 规则与边界：
+/// - 目标时长 `target = max(min_dur, 可见字符数 / 上限)`；上限同样在 `max_cps` 非法时
+///   按字符集分档回落（见 [`cps_violations`]）。
+/// - `min_dur` 是「一条字幕至少显示多久」的产品下限（短句保底）；非有限或负数回落到
+///   [`MIN_EDIT_DUR`]，`0.0` 是**合法值**（表示只要够读完就行，不额外保底）。
+/// - **只延长、不缩短**：终点取 `max(原终点, 目标终点)`，因此已经读得完的句子一个字节
+///   都不动——「一键修正」把用户手工调好的时间也改一遍，是这类按钮最容易挨骂的地方。
+/// - **不与后一句重叠**：终点最多顶到「按起点排序后紧邻的下一句的起点」。顶不住就延长
+///   到能到的位置，并把该句记进 [`CpsFixPlan::unresolved`]——如实说「这里差 0.8 秒」，
+///   比悄悄给一个仍然读不完的时长有用。
+/// - 起点一律不动：动起点会把后续字幕整段推走，那是整轨平移（[`plan_retime`]）的活；
+///   两件事混在一起，用户就再也说不清是哪一步改了哪一句。
+/// - 起点 / 终点非有限的句子（坏数据）不参与规划，原样带回：给一个 NaN 起点算出的
+///   「新终点」仍然是 NaN，改它只会让问题更难查。
+pub fn plan_cps_fix(segments: &[Segment], max_cps: f64, min_dur: f64) -> CpsFixPlan {
+    let explicit = max_cps.is_finite() && max_cps > 0.0;
+    let floor = if min_dur.is_finite() && min_dur >= 0.0 {
+        min_dur
+    } else {
+        MIN_EDIT_DUR
+    };
+
+    let mut times: Vec<(f64, f64)> = segments.iter().map(|s| (s.start, s.end)).collect();
+    // 按起点排序取「紧邻的下一句」：输入可能乱序（外部导入 / 手工编辑），只按数组顺序
+    // 取邻居会凭空给出一堆「空间不够」——用户看到的是一堆假的 unresolved。
+    let mut order: Vec<usize> = (0..segments.len()).collect();
+    order.sort_by(|&a, &b| {
+        times[a]
+            .0
+            .partial_cmp(&times[b].0)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    let mut extended = Vec::new();
+    let mut unresolved = Vec::new();
+    for (rank, &idx) in order.iter().enumerate() {
+        let seg = &segments[idx];
+        let text = seg.display_text();
+        let chars = stats::visible_char_count(text);
+        // 空文本没有可读内容：拉长一条空白字幕只会挡住画面。
+        if chars == 0 {
+            continue;
+        }
+        let (start, end) = times[idx];
+        if !start.is_finite() || !end.is_finite() {
+            continue;
+        }
+        let limit = if explicit {
+            max_cps
+        } else {
+            stats::cps_thresholds(text).0
+        };
+        let target_end = start + (chars as f64 / limit).max(floor);
+        // 倒挂句按零长算：它确实该被拉长，起点不动、终点照样是新的。
+        let current_end = end.max(start);
+        if target_end <= current_end + CHANGED_TOL {
+            continue;
+        }
+        let ceiling = order
+            .get(rank + 1)
+            .map(|&next| times[next].0)
+            .filter(|next_start| next_start.is_finite())
+            .unwrap_or(f64::INFINITY);
+        let new_end = target_end.min(ceiling);
+        if new_end > current_end + CHANGED_TOL {
+            times[idx].1 = new_end;
+            extended.push(seg.index);
+        }
+        if new_end + CHANGED_TOL < target_end {
+            unresolved.push(seg.index);
+        }
+    }
+    CpsFixPlan {
+        times,
+        extended,
+        unresolved,
+    }
 }
 
 #[cfg(test)]
@@ -957,5 +1110,139 @@ mod tests {
         let inf_end = [seg(1, 0.0, f64::INFINITY)];
         let plan = plan_retime(&inf_end, TimeShift::ShiftAll { delta: 1.0 });
         assert!(plan.degenerate, "inf 终点必须被标记为退化");
+    }
+}
+
+#[cfg(test)]
+mod cps_tests {
+    // 刻意不用 `use super::*`：只依赖本模块的公开接口与统计模块的公开口径，
+    // 实现细节改名不会让测试「跟着一起改」，也就不会掩盖真正的行为变化。
+    use super::{cps_violations, plan_cps_fix, DEFAULT_MAX_CPS};
+    use crate::subtitle::segment::Segment;
+    use crate::subtitle::stats;
+
+    fn seg(index: usize, start: f64, end: f64, text: &str) -> Segment {
+        Segment::new(index, start, end, text)
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// 默认上限必须与统计面板的舒适阈值是同一个数字：界面文案说「超过 9 字/秒」，
+    /// 判定就得按 9 判，两处各写一份迟早会打架。
+    #[test]
+    fn default_matches_stats_thresholds() {
+        assert!(close(DEFAULT_MAX_CPS, stats::cps_thresholds("中文").0));
+        assert_eq!(stats::cps_thresholds("中文").0, 9.0);
+        assert_eq!(stats::cps_thresholds("latin").0, 17.0);
+    }
+
+    /// 超限的进清单、够读的不进；边界（恰好等于上限）算合格。
+    #[test]
+    fn cps_violations_flags_only_over_limit() {
+        let slow = seg(1, 0.0, 1.0, "你好世"); // 3 字 / 1 秒 = 3 CPS
+        let fast = seg(2, 1.0, 1.2, "你好世界"); // 4 字 / 0.2 秒 = 20 CPS
+        let exact = seg(3, 2.0, 2.0 + 0.5, "你好"); // 2 字 / 0.5 秒 = 4 CPS
+        assert_eq!(
+            cps_violations(&[slow, fast, exact], DEFAULT_MAX_CPS),
+            vec![2]
+        );
+        assert_eq!(
+            cps_violations(&[seg(9, 0.0, 1.0, "九天玄女")], 4.0),
+            Vec::<usize>::new(),
+            "4 字 / 1 秒 = 4 CPS，恰好等于上限不算超限"
+        );
+    }
+
+    /// 零长句算超限（读不到），空文本不算（没有阅读速度可言），倒挂同理。
+    #[test]
+    fn cps_violations_treats_zero_duration_as_violation_and_skips_empty_text() {
+        let zero = seg(1, 1.0, 1.0, "你好");
+        let empty = seg(2, 2.0, 2.0, "   ");
+        let inverted = seg(3, 3.2, 3.0, "倒挂句");
+        assert_eq!(
+            cps_violations(&[zero, empty, inverted], DEFAULT_MAX_CPS),
+            vec![1, 3]
+        );
+    }
+
+    /// 上限非法（NaN / 0 / 负数）时按字符集分档回落：拉丁文字不会因为回落到汉字阈值
+    /// 而被误报。
+    #[test]
+    fn cps_violations_falls_back_to_script_threshold_for_invalid_limit() {
+        let latin = seg(1, 0.0, 0.3, "abcd"); // 4 字 / 0.3 秒 ≈ 13.3 CPS
+        assert_eq!(
+            cps_violations(std::slice::from_ref(&latin), f64::NAN),
+            Vec::<usize>::new(),
+            "拉丁档上限 17 → 13.3 不算超限"
+        );
+        assert_eq!(
+            cps_violations(std::slice::from_ref(&latin), 0.0),
+            Vec::<usize>::new(),
+            "0 视为「用默认」，不是「上限为 0」"
+        );
+        assert_eq!(cps_violations(&[latin], 9.0), vec![1], "显式给 9 就按 9 判");
+    }
+
+    /// 有空间时把终点延到「读得完」的目标时长，起点与其它字段一律不动。
+    #[test]
+    fn plan_cps_fix_extends_end_to_reach_target() {
+        let segs = [seg(1, 0.0, 0.2, "你好世界")]; // 目标 4 / 9 ≈ 0.4444 秒
+        let plan = plan_cps_fix(&segs, DEFAULT_MAX_CPS, 0.0);
+        assert_eq!(plan.extended, vec![1]);
+        assert!(plan.unresolved.is_empty());
+        assert!(plan.has_changes());
+        assert!(close(plan.times[0].0, 0.0), "起点不动");
+        assert!(close(plan.times[0].1, 4.0 / 9.0));
+    }
+
+    /// 后一句贴得太近时只延到它跟前，并如实报告 unresolved。
+    #[test]
+    fn plan_cps_fix_stops_at_next_start_and_reports_unresolved() {
+        let segs = [seg(1, 0.0, 0.2, "你好世界"), seg(2, 0.3, 1.0, "再见")];
+        let plan = plan_cps_fix(&segs, DEFAULT_MAX_CPS, 0.0);
+        assert_eq!(plan.extended, vec![1]);
+        assert_eq!(plan.unresolved, vec![1], "顶到了下一句，没能达标");
+        assert!(close(plan.times[0].1, 0.3), "终点停在下一句起点");
+        assert!(close(plan.times[1].1, 1.0), "下一句不动");
+    }
+
+    /// 只延长、不缩短；`min_dur` 是短句保底，非法时回落到最短编辑时长。
+    #[test]
+    fn plan_cps_fix_never_shortens_and_honours_min_dur() {
+        // 短句保底真的生效：0.2 秒的句子被延到 1.0 秒。
+        let short = [seg(1, 0.0, 0.2, "你")];
+        let plan = plan_cps_fix(&short, DEFAULT_MAX_CPS, 1.0);
+        assert_eq!(plan.extended, vec![1]);
+        assert!(close(plan.times[0].1, 1.0), "延到保底 1 秒");
+
+        // 已经够读的句子一个字节都不动（只延长、不缩短）。
+        let calm = [seg(1, 0.0, 2.0, "你好世界")];
+        let plan = plan_cps_fix(&calm, DEFAULT_MAX_CPS, 0.0);
+        assert!(!plan.has_changes());
+        assert!(close(plan.times[0].1, 2.0));
+
+        // min_dur 非法（NaN / 负数）→ 回落到最短编辑时长，不做无限保底。
+        let weird = [seg(1, 0.0, 0.2, "你")];
+        let plan = plan_cps_fix(&weird, DEFAULT_MAX_CPS, f64::NAN);
+        assert!(close(plan.times[0].1, 0.25), "0.25 是最短编辑时长");
+    }
+
+    /// 非有限时间的句子不参与规划，原样带回：给它算出一个 NaN 终点只会更难查。
+    #[test]
+    fn plan_cps_fix_leaves_non_finite_times_untouched() {
+        let segs = [
+            seg(1, f64::NAN, 1.0, "你好世界"),
+            seg(2, 2.0, 2.1, "你好世界"),
+        ];
+        let plan = plan_cps_fix(&segs, DEFAULT_MAX_CPS, 0.0);
+        assert!(plan.times[0].0.is_nan(), "坏数据原样带回");
+        assert_eq!(plan.extended, vec![2]);
+        assert!(plan.unresolved.is_empty());
+        assert!(
+            close(plan.times[1].1, 2.0 + 4.0 / 9.0),
+            "正常句照常延长（目标时长从起点算）"
+        );
     }
 }

@@ -7,6 +7,7 @@ pub mod diagnostics;
 pub mod duplicates;
 pub mod fingerprint;
 pub mod frame_cache;
+pub mod glossary;
 pub mod library_query;
 pub mod logger;
 pub mod media_scan;
@@ -25,6 +26,7 @@ pub use config::{
     SUBTITLE_MARGIN_LR_MAX, SUBTITLE_OUTLINE_OPTIONS, SUBTITLE_PRESETS,
 };
 pub use frame_cache::FrameCache;
+pub use glossary::{GlossaryEntry, MergeReport, ParseReport};
 pub use logger::init_logger;
 pub use model_download::{DownloadItem, ItemGroup, ITEMS};
 pub use monitor::SystemMonitor;

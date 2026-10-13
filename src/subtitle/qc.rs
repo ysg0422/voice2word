@@ -16,6 +16,11 @@
 //!   此时「置信度」一列全是占位符。只给一张表，客户会把空列读成「检查过、没问题」
 //!   ——那是把「没测」说成了「通过」。所以那份报告一旦 [`QualityReport::confidence_unavailable`]，
 //!   表尾必定追加一段明文说明。
+//!
+//! 本模块同时收着一条**不进复核表**的可读性判据：句尾标点缺失
+//! （[`missing_terminal_punctuation`] / [`plan_punctuation_fix`]）。它的输出形态与复核表
+//! 不同——给的是「哪几句值得看一眼」的下标——但同属质检，放在一起是为了让「字幕有
+//! 哪些毛病」这件事只有一处清单；它**只报告、绝不改文本**，理由见该函数的文档。
 
 use crate::subtitle::segment::{QualityCategory, QualityReport, Segment};
 use crate::utils::time::seconds_to_timestamp;
@@ -282,6 +287,84 @@ fn markdown_cell(value: &str) -> String {
         .replace('|', "\\|")
         .replace("\r\n", "<br>")
         .replace(['\r', '\n'], "<br>")
+}
+
+/// 「这一句已经说完」的句尾符号。
+///
+/// 纳入的不只是句号类：破折号（被打断的台词）、省略号、波浪号（拖长的语气）、音符
+/// （歌词行）在字幕里都是**有意**的收尾写法。把它们排除在外，一份歌词或访谈字幕会
+/// 整片飘红，复核清单立刻失去信噪比——宁可信用户，也不要把正常写法当缺陷。
+const TERMINAL_MARKS: &[char] = &[
+    '。', '．', '！', '？', '｡', '…', '‥', // 句末（汉字 / 全角 / 半角）
+    '.', '!', '?', // 拉丁句末
+    '—', '–', '―', // 破折号：被打断的台词
+    '~', '～', // 拖音 / 语气
+    '♪', '♫', // 歌词句
+];
+
+/// 句尾允许出现的**包裹符号**：先跳过它们，再看里面那个字符。
+///
+/// 不然 `他说"好。"` 会因为末尾多出一个引号而误报——引号是标点的一部分，不是
+/// 「句尾没有标点」。
+const CLOSERS: &[char] = &[
+    '"', '\'', '”', '’', '」', '』', '）', ')', '】', ']', '》', '〉', '〕', '｝', '}',
+];
+
+/// 文本「句尾有收尾标点」的判定：从后往前跳过空白与包裹符号，看第一个真字符。
+pub fn ends_with_terminal_punctuation(text: &str) -> bool {
+    for c in text.chars().rev() {
+        if c.is_whitespace() || CLOSERS.contains(&c) {
+            continue;
+        }
+        return TERMINAL_MARKS.contains(&c);
+    }
+    false
+}
+
+/// 句尾标点的复核计划。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PunctuationPlan {
+    /// 句尾没有收尾标点、值得看一眼的句子下标（按片段顺序升序；同一句只出现一次）。
+    pub indices: Vec<usize>,
+    /// 无法判定的句子数（空文本 / 纯空白 / 全标点）：它们**没有**被算成「没问题」。
+    pub skipped: usize,
+}
+
+/// 句尾标点的复核计划：只报告，绝不自动补。
+///
+/// 判定：文本里有实际内容（至少一个字母 / 汉字 / 数字），但去掉空白与句尾引号、括号后，
+/// 最后一个字符不在 [`TERMINAL_MARKS`] 里。
+///
+/// # 为什么明确**不做**自动补标点
+///
+/// 补标点必须猜这句是陈述、疑问还是感叹：`你确定` 补成 `你确定。` 与 `你确定？` 是
+/// 完全相反的语气。字幕是**交付物**，正文属于用户——工具替用户改正文，比漏报一句标点
+/// 严重得多。所以这里只产出「哪几句值得看一眼」，改法留给用户（界面可以把这些句子
+/// 一键定位过去）。
+///
+/// 空文本、纯空白、全标点（`。。。` / `♪`）不报：它们不是句子，报了只是噪声。这些
+/// 「没法判定」的句子数记在 [`PunctuationPlan::skipped`] 里如实交代，避免用户把
+/// 「没检查」读成「通过」。
+pub fn plan_punctuation_fix(segments: &[Segment]) -> PunctuationPlan {
+    let mut plan = PunctuationPlan::default();
+    for seg in segments {
+        let text = seg.display_text();
+        // 一个字都数不出字母/汉字/数字的，不是句子：空行、纯空白、以及 `♪` 这种
+        // 歌曲标记行都归到「没法判定」，而不是「句尾没标点」。
+        if !text.chars().any(char::is_alphanumeric) {
+            plan.skipped += 1;
+            continue;
+        }
+        if !ends_with_terminal_punctuation(text) && !plan.indices.contains(&seg.index) {
+            plan.indices.push(seg.index);
+        }
+    }
+    plan
+}
+
+/// 句尾标点缺失的句子下标（= [`plan_punctuation_fix`] 的下标，语义见其文档）。
+pub fn missing_terminal_punctuation(segments: &[Segment]) -> Vec<usize> {
+    plan_punctuation_fix(segments).indices
 }
 
 #[cfg(test)]
@@ -625,5 +708,88 @@ mod tests {
             sheet.contains("未发现需要复核的句子。"),
             "孤儿序号不入表：\n{sheet}"
         );
+    }
+}
+
+#[cfg(test)]
+mod punctuation_tests {
+    // 刻意不用 `use super::*`：只依赖本模块的公开接口，实现细节改名不会让测试
+    // 「跟着一起改」，也就不会掩盖真正的行为变化。
+    use super::{
+        ends_with_terminal_punctuation, missing_terminal_punctuation, plan_punctuation_fix,
+    };
+    use crate::subtitle::segment::Segment;
+
+    fn seg(index: usize, text: &str) -> Segment {
+        Segment::new(index, index as f64, index as f64 + 1.0, text)
+    }
+
+    /// 没有句末标点的句子进清单，有标点的不进。
+    #[test]
+    fn punctuation_flags_lines_without_terminal_mark() {
+        let segs = [seg(1, "这句话没写完"), seg(2, "这句话写完了。")];
+        assert_eq!(missing_terminal_punctuation(&segs), vec![1]);
+        assert!(!ends_with_terminal_punctuation("这句话没写完"));
+        assert!(ends_with_terminal_punctuation("这句话写完了。"));
+    }
+
+    /// 句尾的引号 / 括号 / 破折号 / 波浪号都不算「缺失」：跳过包裹符号看真字符。
+    #[test]
+    fn punctuation_accepts_closing_quote_dash_and_tilde() {
+        for ok in [
+            "他说\"好。\"",
+            "（真的很好。）",
+            "我本想——",
+            "等等～",
+            "真的吗？",
+            "Wait!",
+        ] {
+            assert!(
+                ends_with_terminal_punctuation(ok),
+                "「{ok}」的句尾是收尾标点或包裹符号"
+            );
+        }
+        let segs = [seg(1, "他说\"好。\""), seg(2, "他说话了")];
+        assert_eq!(missing_terminal_punctuation(&segs), vec![2]);
+    }
+
+    /// 空文本、纯空白、全标点、纯符号行都算「没法判定」，不报缺失。
+    #[test]
+    fn punctuation_skips_empty_and_symbol_only_lines() {
+        let segs = [seg(1, ""), seg(2, "   "), seg(3, "。。。"), seg(4, "♪♪")];
+        let plan = plan_punctuation_fix(&segs);
+        assert!(
+            plan.indices.is_empty(),
+            "这些都不是句子：{:?}",
+            plan.indices
+        );
+        assert_eq!(plan.skipped, 4, "四条都记在「没检查」里，而不是「通过」");
+    }
+
+    /// 中英混排与省略号：拉丁句末标点同样被接受，省略号也算说完。
+    #[test]
+    fn punctuation_handles_mixed_language_and_ellipsis() {
+        let segs = [
+            seg(1, "OK"),                 // 拉丁、没标点 → 报
+            seg(2, "OK."),                // 拉丁句末 → 不报
+            seg(3, "但……"),               // 省略号 → 不报
+            seg(4, "3.14"),               // 末尾是数字 → 报（没有句末标点）
+            seg(5, "mixed 混排没有标点"), // 混排、没标点 → 报
+        ];
+        assert_eq!(missing_terminal_punctuation(&segs), vec![1, 4, 5]);
+    }
+
+    /// 计划同时给出下标与「没法判定」的计数，且下标不重复。
+    #[test]
+    fn plan_punctuation_fix_reports_indices_and_skipped() {
+        let segs = [
+            seg(1, "你好"),
+            seg(2, "。。"),
+            seg(3, "再见。"),
+            Segment::new(7, 7.0, 8.0, ""),
+        ];
+        let plan = plan_punctuation_fix(&segs);
+        assert_eq!(plan.indices, vec![1]);
+        assert_eq!(plan.skipped, 2);
     }
 }
