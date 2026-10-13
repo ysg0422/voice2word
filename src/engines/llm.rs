@@ -209,6 +209,217 @@ pub(crate) fn is_untranslated_copy(source: &str, translation: &str) -> bool {
     normalize_for_copy_check(source) == normalize_for_copy_check(translation)
 }
 
+// ─────────── LLM 输出校验自愈闭环（相似度阈值 + 一次反思重试 + 回退） ───────────
+//
+// 既有能力只有「形式校验」：译文 == 原文拒收、截断检测、序号结构校验。缺三样：
+// ① 逐句相似度校验；② 低置信回退；③ 反思重译。这里补齐，且全部在引擎内完成：
+// 不新增第三方依赖、不联网、不动上层 UI。
+
+/// 相似度比对的最大字符数：超长文本截断到前 N 个字符再比。
+///
+/// 字幕单条通常几十字；超过这个长度的多是模型跑飞 / 复读。截断把哈希计数的常数
+/// 压住，而且对「是不是同一句」的判定没有影响（前 N 个实义字符已足够代表全句）。
+const SIMILARITY_MAX_CHARS: usize = 4_096;
+
+/// 相似度 ≥ 该值判为 [`RewriteVerdict::Echo`]——模型几乎没有改动，等于「没干活」。
+///
+/// 归一化已抹掉空白与标点，所以「只补标点」的润色相似度就是 1.0；真正动了词的润色
+/// 会掉到 0.9 以下。0.97 是「只差一两个功能字」的分界；再往高取会把「顺手改了个
+/// 错别字」的正常润色误判成没干活。
+const ECHO_SIMILARITY_THRESHOLD: f64 = 0.97;
+
+/// 相似度 < 该值判为 [`RewriteVerdict::SuspectTooDifferent`]——模型把句子重写了。
+///
+/// 同语言润色的正常相似度落在 0.7~1.0（补标点 = 1.0、改错别字 ≈ 0.85、顺句 ≈ 0.7）。
+/// 低于约 1/3 说明保留下来的实义字符不足三分之一，基本是另起一句，必须拦下。
+/// 取值刻意偏低（0.35），遵循「宁可放过、不可错杀」：错杀会把正常润色回退成原文，
+/// 而放过只是把可疑句再问模型一次，代价小得多。
+const SUSPECT_SIMILARITY_THRESHOLD: f64 = 0.35;
+
+/// 翻译「改动过大」的**长度膨胀上限**（译文归一化字符数 / 原文归一化字符数）。
+///
+/// CJK→拉丁方向字符数天然膨胀（一个汉字常对应数个拉丁字母），实测 3~5 倍都算正常；
+/// 取 8 倍只拦「模型把一句话扩写成一整段」的失控输出。
+const TRANSLATION_MAX_EXPANSION: f64 = 8.0;
+
+/// 翻译「改动过大」的**长度萎缩下限**。拉丁→CJK 会大幅缩短，实测可到 1/4~1/5；
+/// 取 1/12 只拦「模型把长句压成两三个字」的丢内容输出。
+const TRANSLATION_MIN_EXPANSION: f64 = 1.0 / 12.0;
+
+/// 触发长度失控判定的最小原文长度（归一化字符）：太短的句子长度比没有统计意义。
+const TRANSLATION_LENGTH_MIN_CHARS: usize = 8;
+
+/// 反思重试的次数上限（显式常量，避免烧钱 / 卡住）。**1** = 对可疑句只重问一次；
+/// 再不合格直接回退，不再纠缠。
+const REFLECT_MAX_ATTEMPTS: usize = 1;
+
+/// 反思重试的提示词（外置常量，便于以后统一搬迁到提示词目录）。
+///
+/// 为什么这么写：可疑句的病因是「模型擅自改写 / 扩写 / 丢内容」，所以首要指令是
+/// **约束改动幅度**（与原句严格一一对应、长度相当、语义不变、只做最小必要修改），
+/// 其次明确「本就无需修改就原样返回」——否则小模型会为了「有改动」而乱改，制造新的
+/// 可疑句。翻译场景按目标语言如实翻译，润色场景只补标点 / 纠正明显错别字。
+pub(crate) const REFLECT_PROMPT: &str = "你上一版对下面每条字幕的改动过大（明显偏离对应原句），已判定不可用。请重做：每条都必须与原句严格一一对应、长度相当、语义不变，只做最小必要的修改——翻译场景按目标语言如实翻译，润色场景只补标点并纠正明显错别字；不得重写整句、不得扩写、不得增删意思、不得合并或拆分条目。若某条本就无需修改，原样返回即可。";
+
+/// 一次输出校验的判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewriteVerdict {
+    /// 改动幅度正常，可以采纳。
+    Ok,
+    /// 与原句差别过大（疑似重写 / 扩写 / 丢内容），需要反思重试或回退。
+    SuspectTooDifferent,
+    /// 输出为空或纯空白。
+    Empty,
+    /// 与原句几乎完全相同——模型没干活（翻译场景则是复制原文）。
+    Echo,
+}
+
+/// 校验自愈的统计，供上层提示与日志；字段名即上层可直接读取的口径。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RewriteStats {
+    /// 参与校验的模型输出条数（分母）。
+    pub checked: usize,
+    /// 被判定「改动过大」且反思后仍不合格、已回退的条数。
+    pub fallback: usize,
+    /// 疑似「没干活」（与原句几乎相同）的条数。
+    pub echo: usize,
+    /// 空输出条数。
+    pub empty: usize,
+    /// 实际发起的反思重试次数（上限 [`REFLECT_MAX_ATTEMPTS`]）。
+    pub reflect_calls: usize,
+}
+
+impl RewriteStats {
+    /// 汇总另一批统计（分批循环逐批累加）。
+    fn merge(&mut self, other: RewriteStats) {
+        self.checked += other.checked;
+        self.fallback += other.fallback;
+        self.echo += other.echo;
+        self.empty += other.empty;
+        self.reflect_calls += other.reflect_calls;
+    }
+
+    /// 是否发生过自愈动作（有回退或发生过反思重试）。
+    pub(crate) fn has_selfheal(&self) -> bool {
+        self.fallback > 0 || self.reflect_calls > 0
+    }
+
+    /// 给用户的提示文案（同时用于日志与进度回调）。
+    pub(crate) fn warning_message(&self) -> String {
+        format!(
+            "检出 {} 句模型输出改动过大，已回退为原文 / 保持未译（反思重试 {} 次），可再次点击重试补做",
+            self.fallback, self.reflect_calls
+        )
+    }
+}
+
+/// 相似度用的归一化：Unicode 小写 + 丢弃所有非字母数字字符（空白、标点、符号）。
+///
+/// `char::is_alphanumeric` 对 CJK 表意字返回 true，因此汉字会被保留；中英混排时
+/// 拉丁字母与汉字一起参与计数，跨语种句子的相似度就是「共享字符占比」。
+fn similarity_chars(s: &str) -> Vec<char> {
+    s.chars()
+        .flat_map(|c| c.to_lowercase())
+        .filter(|c| c.is_alphanumeric())
+        .take(SIMILARITY_MAX_CHARS)
+        .collect()
+}
+
+/// 两段文本的字符**多重集**相似度（Dice 系数），取值 0.0~1.0。
+///
+/// 为什么用「字符多重集 Dice」而不是 LCS / 编辑距离：
+/// - 我们只判「是不是同一句话内容漂移了」，不需要逐位对齐；Dice 对语序调整、标点
+///   增删不敏感，正合这个用途；
+/// - Dice 用哈希计数实现是 O(n)，LCS 是 O(n·m)——字幕批量里 n、m 可达数百，
+///   差值不划算，也没有必要；
+/// - 只依赖标准库 `HashMap`，不引入任何新依赖。
+///
+/// 边界：两边归一化后都为空 → 1.0（都「没有实义内容」，视为一致）；仅一边为空 → 0.0。
+pub(crate) fn similarity(a: &str, b: &str) -> f64 {
+    let a = similarity_chars(a);
+    let b = similarity_chars(b);
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut counts: std::collections::HashMap<char, i64> =
+        std::collections::HashMap::with_capacity(a.len());
+    for c in &a {
+        *counts.entry(*c).or_insert(0) += 1;
+    }
+    let mut overlap = 0i64;
+    for c in &b {
+        if let Some(n) = counts.get_mut(c) {
+            if *n > 0 {
+                *n -= 1;
+                overlap += 1;
+            }
+        }
+    }
+    2.0 * overlap as f64 / (a.len() + b.len()) as f64
+}
+
+/// 校验一条**同语言改写**输出（润色 / 纠错 / 智能断句）。
+///
+/// 判据见三个阈值常量：[`ECHO_SIMILARITY_THRESHOLD`] 与
+/// [`SUSPECT_SIMILARITY_THRESHOLD`]。空输出直接判 [`RewriteVerdict::Empty`]；
+/// 原文本身没有实义内容时无从比较，按 [`RewriteVerdict::Ok`] 放行。
+pub(crate) fn validate_rewrite(original: &str, rewritten: &str) -> RewriteVerdict {
+    if rewritten.trim().is_empty() {
+        return RewriteVerdict::Empty;
+    }
+    if similarity_chars(original).is_empty() {
+        return RewriteVerdict::Ok;
+    }
+    let sim = similarity(original, rewritten);
+    if sim >= ECHO_SIMILARITY_THRESHOLD {
+        return RewriteVerdict::Echo;
+    }
+    if sim < SUSPECT_SIMILARITY_THRESHOLD {
+        return RewriteVerdict::SuspectTooDifferent;
+    }
+    RewriteVerdict::Ok
+}
+
+/// 校验一条**跨语言译文**。
+///
+/// 与 [`validate_rewrite`] 的关键区别：译文与原文本就不同语言，字符相似度天然很低，
+/// 不能拿「相似度下限」当可疑判据（否则每一句都会被误杀）。翻译场景的「改动过大」
+/// 表现为**长度失控**（一句扩写成一段 / 长句压成两个字），复制原文则表现为相似度
+/// 接近 1。三段判定与 [`is_untranslated_copy`] 的守卫同口径（短句、纯拉丁放行），
+/// 保证「OK→OK」「1.3→1.3」这类本就该原样保留的句子不被误伤。
+pub(crate) fn validate_translation(source: &str, translation: &str) -> RewriteVerdict {
+    if translation.trim().is_empty() {
+        return RewriteVerdict::Empty;
+    }
+    // ① 一字不差的复制（原判据）。
+    if is_untranslated_copy(source, translation) {
+        return RewriteVerdict::Echo;
+    }
+    let src = similarity_chars(source);
+    if src.is_empty() {
+        return RewriteVerdict::Ok;
+    }
+    // ② 含 CJK 的长句被**近乎原样**吐回（只改了个别字）——同判为复制。
+    if source.chars().count() >= 4
+        && source.chars().any(is_cjk)
+        && similarity(source, translation) >= ECHO_SIMILARITY_THRESHOLD
+    {
+        return RewriteVerdict::Echo;
+    }
+    // ③ 长度失控（扩写 / 丢内容）。仅对足够长的句子判，短句比值没有意义。
+    if src.len() >= TRANSLATION_LENGTH_MIN_CHARS {
+        let dst = similarity_chars(translation).len();
+        let ratio = dst as f64 / src.len() as f64;
+        if ratio > TRANSLATION_MAX_EXPANSION || ratio < TRANSLATION_MIN_EXPANSION {
+            return RewriteVerdict::SuspectTooDifferent;
+        }
+    }
+    RewriteVerdict::Ok
+}
+
 /// 目标语言是否是中文变体；是则返回对应的 zhconv 目标变体。
 ///
 /// 中文变体之间的转换是**确定性字符映射**，不需要（也不该）交给小模型：源字幕本来
@@ -490,6 +701,10 @@ pub struct LLMEngine {
     /// [`LLMEngine::set_glossary`] 写入；用 `Mutex<String>` 是因为引擎在 `Arc`
     /// 后面被共享、拿不到 `&mut self`（与 `cancel` 同一套理由）。
     glossary: Mutex<String>,
+    /// 最近一次润色 / 翻译的「输出校验自愈」统计（供上层提示）。
+    /// 与 `glossary` 同一套理由用 `Mutex` 持有：引擎挂在 `Arc` 后面共享、
+    /// 写回时拿不到 `&mut self`；每批写一次，开销可忽略。
+    rewrite_stats: Mutex<RewriteStats>,
 }
 
 impl LLMEngine {
@@ -506,6 +721,7 @@ impl LLMEngine {
             threads: std::sync::atomic::AtomicU32::new(threads.max(1)),
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             glossary: Mutex::new(String::new()),
+            rewrite_stats: Mutex::new(RewriteStats::default()),
         }
     }
 
@@ -552,6 +768,16 @@ impl LLMEngine {
 
     pub fn threads(&self) -> u32 {
         self.threads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 最近一次润色 / 翻译中「输出校验自愈」的统计（供上层提示用户）。
+    pub fn last_rewrite_stats(&self) -> RewriteStats {
+        *self.rewrite_stats.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 写回本次任务的校验自愈统计（任务起手与收尾各调用一次）。
+    fn store_rewrite_stats(&self, stats: RewriteStats) {
+        *self.rewrite_stats.lock().unwrap_or_else(|e| e.into_inner()) = stats;
     }
 
     /// 润色单个字符串 (采用严格的 Few-Shot 标点恢复提示词)
@@ -755,43 +981,85 @@ impl LLMEngine {
         // 先做前置检查：模型/程序缺失时立刻给出可操作的中文提示，
         // 而不是跑完一圈「0 句」让用户以为翻译成功了。
         self.ensure_ready()?;
+        self.store_rewrite_stats(RewriteStats::default());
         info!("LLM 开始润色 {} 个字幕片段", total);
         if let Some(ref cb) = progress_cb {
             cb(0.0, "正在加载 Qwen 模型，首次启动通常需要几秒...");
         }
-        let mut server = self.start_server();
+        let server = self.start_server();
         if server.is_some() {
             info!("Qwen 常驻服务已就绪，将复用已加载模型完成批量润色");
         } else {
             warn!("Qwen 常驻服务不可用，回退到命令行批量润色");
         }
 
-        // 取数与写回分离：批次循环收敛到 `polish_apply`，取数函数可替换。
-        // 生产链路走 `polish_batch`（常驻服务失败自动回退命令行）；回归测试
-        // 注入构造结果，复现「第二遍只返回部分段落」的场景。
-        self.polish_apply(&mut segments, progress_cb, |batch| {
-            self.polish_batch(batch, server.as_mut())
-        });
+        // 取数与写回分离：批次循环收敛到 `polish_apply_selfheal`，取数与反思回调都可
+        // 替换。生产链路走 `polish_batch` / `polish_reflect`（常驻服务失败自动回退
+        // 命令行）；回归测试注入构造结果，复现「第二遍只返回部分段落」的场景。
+        //
+        // 常驻服务用 `RefCell` 包一层：取数回调与反思回调都要借用同一个
+        // `Option<LlamaServer>`，裸 `&mut` 会被借用检查器拒绝；两者在运行时是**顺序**
+        // 借用（先取数、后反思），不会同时持有。
+        let server_cell = std::cell::RefCell::new(server);
+        let stats = self.polish_apply_selfheal(
+            &mut segments,
+            progress_cb,
+            |batch| self.polish_batch(batch, server_cell.borrow_mut().as_mut()),
+            |suspects| self.polish_reflect(suspects, server_cell.borrow_mut().as_mut()),
+        );
+        self.store_rewrite_stats(stats);
+        if stats.has_selfheal() {
+            warn!(
+                fallback = stats.fallback,
+                echo = stats.echo,
+                reflect_calls = stats.reflect_calls,
+                "润色输出校验自愈：{} 句改动过大已回退（含最多一次反思重试）",
+                stats.fallback
+            );
+        }
 
         info!("LLM 全部片段润色完成");
         Ok(segments)
     }
 
-    /// 润色批次循环：切批取数并写回 `segments`。
+    /// 润色批次循环的**兼容入口**：切批取数并写回 `segments`。
     ///
-    /// `fetch` 是「一批字幕 → 序号→润色文本」的取数回调，生产链路由
-    /// [`Self::polish_batch`] 承担。把这层抽出来，是为了让测试能在不启动模型的
-    /// 前提下，用假结果驱动**与生产完全一致**的切批与写回逻辑。
+    /// 保留原签名是为了让既有回归测试不必改写；内部直接走
+    /// [`Self::polish_apply_selfheal`]，但**不注入反思回调**——此时可疑句一律按
+    /// 回退处理（与「拿不到结果就保留原文」同口径）。
+    #[cfg(test)]
     fn polish_apply<F>(
         &self,
         segments: &mut [Segment],
         progress_cb: Option<crate::engines::TextProgressCb>,
-        mut fetch: F,
+        fetch: F,
     ) where
         F: FnMut(&[Segment]) -> std::collections::HashMap<usize, String>,
     {
+        let _ = self.polish_apply_selfheal(segments, progress_cb, fetch, |_| {
+            std::collections::HashMap::new()
+        });
+    }
+
+    /// 润色批次循环（含**输出校验自愈**）：切批取数、逐句校验、写回。
+    ///
+    /// `fetch` 取一批润色结果，`reflect` 对「改动过大」的可疑句做**最多一次**反思
+    /// 重试。两者都由调用方注入，测试可在不启动模型的前提下驱动**与生产完全一致**
+    /// 的切批、校验与写回逻辑（这也正是「反思只重试一次」能被断言的原因）。
+    fn polish_apply_selfheal<F, R>(
+        &self,
+        segments: &mut [Segment],
+        progress_cb: Option<crate::engines::TextProgressCb>,
+        mut fetch: F,
+        mut reflect: R,
+    ) -> RewriteStats
+    where
+        F: FnMut(&[Segment]) -> std::collections::HashMap<usize, String>,
+        R: FnMut(&[(usize, String, String)]) -> std::collections::HashMap<usize, String>,
+    {
         let total = segments.len();
         let mut completed = 0usize;
+        let mut stats = RewriteStats::default();
         for group in segments.chunks_mut(MAX_SEGMENTS_PER_BATCH) {
             if self.is_cancelled() {
                 info!("润色被取消，保留已完成的部分（{completed}/{total}）");
@@ -819,7 +1087,18 @@ impl LLMEngine {
                     end += 1;
                 }
                 let results = fetch(&group[start..end]);
-                Self::apply_polish_results(&mut group[start..end], &results);
+                // 输出校验：逐句判 Ok / SuspectTooDifferent / Empty / Echo。
+                // 「改动过大」的可疑句先做一次反思重试，仍不合格才回退——回退口径是
+                // 「accepted 里没有该序号」，`apply_polish_results` 会保留上一遍润色 /
+                // 原文，绝不会把可疑内容静默写进字幕。
+                let originals: std::collections::HashMap<usize, String> = group[start..end]
+                    .iter()
+                    .map(|seg| (seg.index, seg.text.clone()))
+                    .collect();
+                let (accepted, batch_stats) =
+                    Self::selfheal_batch(validate_rewrite, true, &originals, results, &mut reflect);
+                stats.merge(batch_stats);
+                Self::apply_polish_results(&mut group[start..end], &accepted);
                 start = end;
             }
 
@@ -832,6 +1111,198 @@ impl LLMEngine {
                 );
             }
         }
+        // 发生过自愈就通过进度回调提示上层——「不允许把可疑内容静默写进用户字幕」。
+        if stats.has_selfheal() {
+            if let Some(ref cb) = progress_cb {
+                cb(1.0, &stats.warning_message());
+            }
+        }
+        stats
+    }
+
+    /// 一批「已解析的模型输出」的校验自愈核心（纯逻辑，不做任何模型调用）。
+    ///
+    /// 流程：逐条校验 → 收集「改动过大」的可疑句 → **最多一次**反思重试（`reflect`
+    /// 回调由调用方注入真实模型，测试注入假回调）→ 重试结果再校验 → 仍不合格的回退。
+    ///
+    /// 回退口径由调用方决定（本函数只把不合格项从 `accepted` 中剔除）：
+    /// - 润色（`echo_is_accept = true`）：不采纳 → 保留上一遍润色 / 原文；Echo 视为
+    ///   正常结果采纳（「只补标点」本就是合格润色，不能算失败）；
+    /// - 翻译（`echo_is_accept = false`）：不采纳 → 保持未译；Echo 视为「没译出」剔除。
+    ///
+    /// 反思循环写成 `for _ in 0..REFLECT_MAX_ATTEMPTS` 而非「只写一遍」，是为了让
+    /// 「最多几次」由常量决定且可被测试断言（`reflect_calls`）。
+    fn selfheal_batch<G>(
+        verdict_of: fn(&str, &str) -> RewriteVerdict,
+        echo_is_accept: bool,
+        originals: &std::collections::HashMap<usize, String>,
+        first: std::collections::HashMap<usize, String>,
+        mut reflect: G,
+    ) -> (std::collections::HashMap<usize, String>, RewriteStats)
+    where
+        G: FnMut(&[(usize, String, String)]) -> std::collections::HashMap<usize, String>,
+    {
+        let mut stats = RewriteStats::default();
+        let mut accepted: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
+        let mut suspects: Vec<(usize, String, String)> = Vec::new();
+
+        for (index, text) in first {
+            let Some(original) = originals.get(&index) else {
+                continue;
+            };
+            let original = original.clone();
+            stats.checked += 1;
+            match verdict_of(&original, &text) {
+                RewriteVerdict::Ok => {
+                    accepted.insert(index, text);
+                }
+                RewriteVerdict::Echo => {
+                    stats.echo += 1;
+                    if echo_is_accept {
+                        accepted.insert(index, text);
+                    }
+                }
+                RewriteVerdict::Empty => stats.empty += 1,
+                RewriteVerdict::SuspectTooDifferent => {
+                    suspects.push((index, original, text));
+                }
+            }
+        }
+
+        if suspects.is_empty() {
+            return (accepted, stats);
+        }
+
+        let mut remaining = suspects;
+        for _ in 0..REFLECT_MAX_ATTEMPTS {
+            if remaining.is_empty() {
+                break;
+            }
+            stats.reflect_calls += 1;
+            let healed = reflect(&remaining);
+            let mut still: Vec<(usize, String, String)> = Vec::new();
+            for (index, original, _) in remaining {
+                let ok = match healed.get(&index) {
+                    Some(text) => match verdict_of(&original, text) {
+                        RewriteVerdict::Ok => {
+                            accepted.insert(index, text.clone());
+                            true
+                        }
+                        RewriteVerdict::Echo if echo_is_accept => {
+                            accepted.insert(index, text.clone());
+                            true
+                        }
+                        _ => false,
+                    },
+                    None => false,
+                };
+                if !ok {
+                    still.push((index, original, String::new()));
+                }
+            }
+            remaining = still;
+        }
+        // 反思后仍不合格：回退（不写回），计入统计。
+        stats.fallback += remaining.len();
+        (accepted, stats)
+    }
+
+    /// 组装反思重试提示词：系统段 = [`REFLECT_PROMPT`]（+ 场景补充），
+    /// 用户段**只列可疑句**（原句 + 被拒的上一版），避免让模型重复处理没问题的句子。
+    fn build_reflect_prompt(suspects: &[(usize, String, String)], system_extra: &str) -> String {
+        let mut user = String::new();
+        for (index, original, previous) in suspects {
+            user.push_str(&format!(
+                "[{index}] 原句：{original}\n上一版（改动过大，已弃用）：{previous}\n"
+            ));
+        }
+        format!(
+            "<|im_start|>system\n{REFLECT_PROMPT}{system_extra}必须逐行输出，格式严格为「[序号] 文本」，不得解释、不得合并、不得遗漏、不得改动序号。<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+        )
+    }
+
+    /// 对一批「改动过大」的可疑句做一次反思重试（润色链路）。
+    ///
+    /// 拿到结果后由 [`Self::selfheal_batch`] 再校验一遍；这里只负责「问一次」。
+    fn polish_reflect(
+        &self,
+        suspects: &[(usize, String, String)],
+        server: Option<&mut LlamaServer>,
+    ) -> std::collections::HashMap<usize, String> {
+        let prompt = Self::build_reflect_prompt(suspects, "");
+        let source_chars: usize = suspects
+            .iter()
+            .map(|(_, orig, _)| orig.chars().count())
+            .sum();
+        let max_tokens =
+            output_token_budget(source_chars, self.ctx_size, POLISH_FIXED_PROMPT_TOKENS);
+        self.run_reflect_prompt(&prompt, max_tokens, server, suspects)
+    }
+
+    /// 对一批「改动过大」的可疑句做一次反思重试（翻译链路）。
+    fn translate_reflect(
+        &self,
+        suspects: &[(usize, String, String)],
+        target_lang: &str,
+        glossary: &str,
+        server: Option<&mut LlamaServer>,
+    ) -> std::collections::HashMap<usize, String> {
+        let extra = format!(
+            "（目标语言：{target_lang}；{glossary}只翻译为{target_lang}，保持与原文长度相当。）"
+        );
+        let prompt = Self::build_reflect_prompt(suspects, &extra);
+        let source_chars: usize = suspects
+            .iter()
+            .map(|(_, orig, _)| orig.chars().count())
+            .sum();
+        let max_tokens = output_token_budget(source_chars, self.ctx_size, PROMPT_HINT_TOKENS);
+        self.run_reflect_prompt(&prompt, max_tokens, server, suspects)
+    }
+
+    /// 反思提示词的**统一调用 + 解析**：常驻服务失败自动回退命令行，解析复用
+    /// [`Self::parse_batch_response`]，并沿用与批量路径一致的「截断丢末条」策略。
+    fn run_reflect_prompt(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+        server: Option<&mut LlamaServer>,
+        suspects: &[(usize, String, String)],
+    ) -> std::collections::HashMap<usize, String> {
+        let outcome = server
+            .and_then(|server| server.complete(prompt, max_tokens))
+            .or_else(|| {
+                self.run_prompt(prompt, max_tokens)
+                    .map(|content| CompletionOutcome {
+                        content,
+                        stopped_by_limit: false,
+                    })
+            });
+        let Some(CompletionOutcome {
+            content,
+            stopped_by_limit,
+        }) = outcome
+        else {
+            return Default::default();
+        };
+        let expected: std::collections::HashSet<usize> =
+            suspects.iter().map(|(index, _, _)| *index).collect();
+        let mut result = Self::parse_batch_response(&content, &expected);
+        if stopped_by_limit {
+            let last_matched = suspects
+                .iter()
+                .rev()
+                .map(|(index, _, _)| *index)
+                .find(|index| result.contains_key(index));
+            if let Some(index) = last_matched {
+                result.remove(&index);
+                warn!(
+                    index,
+                    "反思重试输出被长度上限截断，丢弃末条（该句按回退处理）"
+                );
+            }
+        }
+        result
     }
 
     /// 把一批润色结果写回对应片段。
@@ -882,6 +1353,7 @@ impl LLMEngine {
         }
         // 同 polish：模型/程序缺失时 fail-fast，避免「翻译完成 0 句」的假成功。
         self.ensure_ready()?;
+        self.store_rewrite_stats(RewriteStats::default());
         info!("LLM 开始将 {} 个字幕片段翻译为 {}", total, target_lang);
         if let Some(ref cb) = progress_cb {
             cb(0.0, "正在加载 Qwen 翻译模型，首次启动需要几秒...");
@@ -936,6 +1408,8 @@ impl LLMEngine {
         let mut completed = 0usize;
         // P0-B：整批的「译文 == 原文」复制率统计
         let mut copy = CopyRate::default();
+        // 输出校验自愈的统计（回退 / 反思次数），收尾写回引擎供上层提示。
+        let mut heal = RewriteStats::default();
         for chunk in batches {
             if self.is_cancelled() {
                 info!("翻译被取消，保留已完成的部分（{completed}/{pending_total}）");
@@ -950,20 +1424,38 @@ impl LLMEngine {
             // 被判为「复制原文」的句子：折半重试**之后**仍未译出才计入复制率，
             // 否则「重试补回来」的好句子会被误算成复制，把复制率抬高。
             let mut copy_candidates: Vec<usize> = Vec::new();
+            // 「改动过大」的可疑句（长度失控 / 语义漂移）：先反思重试一次，仍不合格才留空。
+            let mut suspect_candidates: Vec<usize> = Vec::new();
             copy.checked += chunk.len();
+            // 校验口径与润色链路一致：`checked` = 本批实际产出、送交校验的条数。
+            heal.checked += results.len();
             for &pos in &chunk {
                 match results.get(&segments[pos].index) {
                     Some(trans) => {
-                        // P0-B：小模型「整体摆烂」时会一字不差地复制原文，绝不能当成
-                        // 成功译文写回——那正是「界面显示翻译完成、实际什么都没翻」的
-                        // 元凶。判为复制就改走**已有的折半重试**路径（小批更不容易
-                        // 摆烂）；重试仍复制则保持未译，由上层显式报「未译出」。
-                        if is_untranslated_copy(&segments[pos].translate_source(), trans) {
-                            copy_candidates.push(pos);
-                            missed.push(pos);
-                        } else {
-                            segments[pos].translation = Some(trans.clone());
-                            segments[pos].translation_lang = Some(target_lang.to_string());
+                        // P0-B + 输出校验：小模型「整体摆烂」时会一字不差地复制原文，
+                        // 也偶发把一句扩写成一整段。两者都绝不能当成成功译文写回——
+                        // 那正是「界面显示翻译完成、实际什么都没翻」的元凶。
+                        // 复制（Echo）走**已有的折半重试**路径；改动过大
+                        // （SuspectTooDifferent）走反思重试，仍不合格则保持未译。
+                        match validate_translation(&segments[pos].translate_source(), trans) {
+                            RewriteVerdict::Echo => {
+                                heal.echo += 1;
+                                copy_candidates.push(pos);
+                                missed.push(pos);
+                            }
+                            RewriteVerdict::SuspectTooDifferent => {
+                                suspect_candidates.push(pos);
+                            }
+                            // Empty：解析后基本不会出现（空正文已被解析器拒收），
+                            // 真出现就按「本批没译出」走折半重试。
+                            RewriteVerdict::Empty => {
+                                heal.empty += 1;
+                                missed.push(pos);
+                            }
+                            RewriteVerdict::Ok => {
+                                segments[pos].translation = Some(trans.clone());
+                                segments[pos].translation_lang = Some(target_lang.to_string());
+                            }
                         }
                     }
                     // 本批没译出这一句：收集起来，稍后**对半重试**。
@@ -983,6 +1475,44 @@ impl LLMEngine {
                     server.as_mut(),
                 );
             }
+
+            // 反思重试（**最多一次**）：只把「改动过大」的可疑句重问一遍，要求最小
+            // 必要改动；拿回结果后再校验一遍，仍不合格就保持未译（与既有「未翻译」
+            // 口径一致），绝不把可疑译文写进字幕。
+            if !suspect_candidates.is_empty() {
+                let triples: Vec<(usize, String, String)> = suspect_candidates
+                    .iter()
+                    .map(|&pos| {
+                        (
+                            segments[pos].index,
+                            segments[pos].translate_source(),
+                            results
+                                .get(&segments[pos].index)
+                                .cloned()
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                heal.reflect_calls += 1;
+                let healed =
+                    self.translate_reflect(&triples, target_lang, &glossary, server.as_mut());
+                for &pos in &suspect_candidates {
+                    let source = segments[pos].translate_source();
+                    match healed.get(&segments[pos].index) {
+                        Some(text) if validate_translation(&source, text) == RewriteVerdict::Ok => {
+                            segments[pos].translation = Some(text.clone());
+                            segments[pos].translation_lang = Some(target_lang.to_string());
+                        }
+                        _ => heal.fallback += 1,
+                    }
+                }
+                warn!(
+                    suspects = triples.len(),
+                    fallback = heal.fallback,
+                    "翻译输出校验自愈：{} 句改动过大，反思重试后仍不合格，保持未译",
+                    heal.fallback
+                );
+            }
             // 重试之后仍没译出的复制句，才真正计入复制率。
             copy.rejected += copy_candidates
                 .iter()
@@ -996,6 +1526,14 @@ impl LLMEngine {
                     progress,
                     &format!("Qwen 批量翻译中: {completed}/{pending_total} 句（共 {total} 句）"),
                 );
+            }
+        }
+
+        // 校验自愈统计先写回引擎：即便下面因质量异常提前返回 Err，上层也能拿到口径。
+        self.store_rewrite_stats(heal);
+        if heal.has_selfheal() {
+            if let Some(ref cb) = progress_cb {
+                cb(1.0, &heal.warning_message());
             }
         }
 
@@ -1585,8 +2123,9 @@ mod tests {
     use super::{
         batch_char_budget, chinese_variant_target, clamp_ctx_size, cli_wait_budget,
         fixed_prompt_tokens, is_untranslated_copy, llama_stop_type_is_limit, output_token_budget,
-        plan_translate_batches, CopyRate, LLMEngine, MAX_SEGMENTS_PER_BATCH,
-        OUTPUT_TOKENS_PER_CHAR, PROMPT_TOKENS_PER_CHAR,
+        plan_translate_batches, similarity, validate_rewrite, validate_translation, CopyRate,
+        LLMEngine, RewriteVerdict, MAX_SEGMENTS_PER_BATCH, OUTPUT_TOKENS_PER_CHAR,
+        PROMPT_TOKENS_PER_CHAR,
     };
     use crate::subtitle::Segment;
     use std::collections::{HashMap, HashSet};
@@ -2167,5 +2706,175 @@ mod tests {
             "下一节讲条件概率。",
             "display_text 不得回退成原文"
         );
+    }
+
+    // ─────────── 输出校验自愈：相似度 ───────────
+
+    /// 完全相同（含「只差大小写 / 标点」）→ 1.0。
+    #[test]
+    fn similarity_identical_is_one() {
+        assert!((similarity("今天讲概率不等式。", "今天讲概率不等式。") - 1.0).abs() < 1e-9);
+        assert!((similarity("Hello, World!", "hello world") - 1.0).abs() < 1e-9);
+    }
+
+    /// 没有任何共享实义字符 → 0.0。
+    #[test]
+    fn similarity_completely_different_is_zero() {
+        assert!(similarity("概率不等式", "abcxyz").abs() < 1e-9);
+        assert!(similarity("苹果香蕉", "unrelated latin words").abs() < 1e-9);
+    }
+
+    /// 空 / 纯标点的边界：两边都空 → 1.0；仅一边空 → 0.0。
+    #[test]
+    fn similarity_empty_boundaries() {
+        assert_eq!(similarity("", ""), 1.0);
+        assert_eq!(similarity("   。，", "..."), 1.0);
+        assert_eq!(similarity("", "内容"), 0.0);
+        assert_eq!(similarity("内容", ""), 0.0);
+    }
+
+    /// 仅标点差异（补标点 / 全半角混排）不算「改内容」，相似度仍是 1.0。
+    #[test]
+    fn similarity_punctuation_only_difference_is_full() {
+        assert!((similarity("今天讲概率不等式", "今天讲概率不等式。") - 1.0).abs() < 1e-9);
+        assert!((similarity("P(A+B)=P(A)+P(B)", "p(a+b) = p(a) + p(b)") - 1.0).abs() < 1e-9);
+    }
+
+    /// 中英混排：部分重叠应给出 (0,1) 之间的中间值。
+    #[test]
+    fn similarity_mixed_cjk_latin_partial() {
+        let s = similarity("确认OK，本节讲3点", "确认OK，本节讲5点");
+        assert!(s > 0.5 && s < 1.0, "中英混排部分重叠应给中间值: {s}");
+    }
+
+    /// 超长输入按 SIMILARITY_MAX_CHARS 截断：共同前缀很长时仍判「几乎相同」。
+    #[test]
+    fn similarity_truncates_very_long_input() {
+        let head = "字".repeat(5_000);
+        let a = format!("{head}甲");
+        let b = format!("{head}乙");
+        let s = similarity(&a, &b);
+        assert!(s > 0.99, "超长共同前缀应判为几乎相同: {s}");
+        assert!((s - 1.0).abs() < 0.02, "尾部差异在截断窗口外: {s}");
+    }
+
+    // ─────────── 输出校验自愈：判定与回退 ───────────
+
+    /// `validate_rewrite` 的四种判定都要能触发。
+    #[test]
+    fn validate_rewrite_reports_four_verdicts() {
+        let src = "今天讲概率不等式，其实考得不多";
+        // Ok：补标点 + 轻微改词
+        assert_eq!(
+            validate_rewrite(src, "今天讲概率不等式，其实考得并不多。"),
+            RewriteVerdict::Ok
+        );
+        // Echo：归一化后与原文一致（模型没干活）
+        assert_eq!(
+            validate_rewrite(src, "今天讲概率不等式，其实考得不多。"),
+            RewriteVerdict::Echo
+        );
+        // SuspectTooDifferent：整句被重写
+        assert_eq!(
+            validate_rewrite(src, "完全不同的另一句话内容"),
+            RewriteVerdict::SuspectTooDifferent
+        );
+        // Empty：空白输出
+        assert_eq!(validate_rewrite(src, "   "), RewriteVerdict::Empty);
+    }
+
+    /// 翻译校验：复制原文判 Echo、正常长句英译放行、长度失控判可疑、短句原样保留放行。
+    #[test]
+    fn validate_translation_detects_copy_and_runaway() {
+        let src = "那么这个概率不等式，其实整体里面考的相对来说不是很多。";
+        assert_eq!(validate_translation(src, src), RewriteVerdict::Echo);
+        assert_eq!(
+            validate_translation(
+                src,
+                "This probability inequality is not tested very much overall."
+            ),
+            RewriteVerdict::Ok
+        );
+        assert_eq!(validate_translation(src, "  "), RewriteVerdict::Empty);
+        let runaway = "这是一段".to_string() + &"扩写内容".repeat(200);
+        assert_eq!(
+            validate_translation("这句只有十几个字的一句话", &runaway),
+            RewriteVerdict::SuspectTooDifferent
+        );
+        // 短句 / 纯数字：本就该原样保留，不得误判为「没干活」
+        assert_eq!(validate_translation("OK", "OK"), RewriteVerdict::Ok);
+        assert_eq!(validate_translation("1.3", "1.3"), RewriteVerdict::Ok);
+    }
+
+    /// 回退与统计：可疑句被剔除、Echo 在润色场景被采纳，计数准确。
+    #[test]
+    fn selfheal_falls_back_suspect_and_counts() {
+        let mut originals = HashMap::new();
+        originals.insert(1usize, "今天讲概率不等式其实考得不多".to_string());
+        originals.insert(2usize, "下一节讲条件概率".to_string());
+        let first = HashMap::from([
+            (1usize, "完全不同的另一句话内容".to_string()),
+            (2usize, "下一节讲条件概率。".to_string()),
+        ]);
+        let (accepted, stats) =
+            LLMEngine::selfheal_batch(validate_rewrite, true, &originals, first, |_suspects| {
+                HashMap::new()
+            });
+        assert_eq!(stats.checked, 2);
+        assert_eq!(stats.echo, 1, "补标点属于 Echo");
+        assert_eq!(stats.fallback, 1, "可疑句应从结果中剔除");
+        assert_eq!(stats.reflect_calls, 1, "可疑句存在时应发起一次反思");
+        assert!(accepted.contains_key(&2), "Echo 在润色场景视为合格结果");
+        assert!(!accepted.contains_key(&1), "回退项不得写回");
+    }
+
+    /// 反思重试**最多一次**：假模型调用计数必须恰好为 1，且仍不合格就回退。
+    #[test]
+    fn selfheal_reflect_runs_at_most_once() {
+        let mut originals = HashMap::new();
+        originals.insert(7usize, "今天讲概率不等式其实考得不多".to_string());
+        let first = HashMap::from([(7usize, "一句毫不相干的怪话".to_string())]);
+        let calls = std::cell::Cell::new(0usize);
+        let (accepted, stats) =
+            LLMEngine::selfheal_batch(validate_rewrite, true, &originals, first, |_suspects| {
+                calls.set(calls.get() + 1);
+                // 反思结果**仍然**改动过大 → 必须回退，且不得再重试
+                HashMap::from([(7usize, "还是另一句毫不相干的话".to_string())])
+            });
+        assert_eq!(calls.get(), 1, "反思只允许重试一次");
+        assert_eq!(stats.reflect_calls, 1);
+        assert_eq!(stats.fallback, 1);
+        assert!(accepted.is_empty(), "反思仍不合格时必须回退");
+    }
+
+    /// 润色链路端到端：可疑润色回退成原文，正常补标点照常写回。
+    #[test]
+    fn polish_selfheal_falls_back_suspect_to_original() {
+        let engine = LLMEngine::new(
+            "definitely-not-a-real-cli-path.exe",
+            "definitely-not-a-real-model.gguf",
+            4096,
+            4,
+        );
+        let mut segs = vec![seg_at(1, "今天讲概率不等式"), seg_at(2, "下一节讲条件概率")];
+        let bad = HashMap::from([
+            (1usize, "一段完全不相干的内容重新写".to_string()),
+            (2usize, "下一节讲条件概率。".to_string()),
+        ]);
+        let mut reflect_calls = 0usize;
+        let stats = engine.polish_apply_selfheal(
+            &mut segs,
+            None,
+            |_batch| bad.clone(),
+            |_suspects| {
+                reflect_calls += 1;
+                HashMap::new()
+            },
+        );
+        assert_eq!(reflect_calls, 1, "反思只重试一次");
+        assert_eq!(stats.fallback, 1);
+        assert_eq!(segs[0].polished, "", "可疑润色不得写回");
+        assert_eq!(segs[0].display_text(), "今天讲概率不等式", "回退后显示原文");
+        assert_eq!(segs[1].polished, "下一节讲条件概率。", "正常润色照常写回");
     }
 }

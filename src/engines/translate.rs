@@ -7,14 +7,15 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use tracing::{debug, info, warn};
 
 use crate::engines::llm::{
-    chinese_variant_target, convert_chinese_variant, is_untranslated_copy, CopyRate,
+    chinese_variant_target, convert_chinese_variant, is_untranslated_copy, validate_translation,
+    CopyRate, RewriteStats, RewriteVerdict, REFLECT_PROMPT,
 };
 use crate::engines::LLMEngine;
 use crate::subtitle::Segment;
@@ -116,6 +117,11 @@ pub struct TranslateEngine {
     mode: TranslateMode,
     llm_engine: Option<LLMEngine>,
     online: Option<OnlineApiConfig>,
+    /// 最近一次翻译的「输出校验自愈」统计（回退条数 / 反思次数），供上层提示。
+    /// 离线链路从 [`LLMEngine::last_rewrite_stats`] 抄回，在线链路由
+    /// `translate_via_online_api_with_stats` 直接给出；用 `Mutex` 是因为引擎挂在
+    /// `Arc` 后面共享、写回时拿不到 `&mut self`。
+    rewrite_stats: Mutex<RewriteStats>,
 }
 
 impl TranslateEngine {
@@ -129,6 +135,7 @@ impl TranslateEngine {
             mode: TranslateMode::OfflineQwen,
             llm_engine: Some(llm_engine),
             online: None,
+            rewrite_stats: Mutex::new(RewriteStats::default()),
         }
     }
 
@@ -137,11 +144,22 @@ impl TranslateEngine {
             mode: TranslateMode::OnlineApi,
             llm_engine: None,
             online: Some(config),
+            rewrite_stats: Mutex::new(RewriteStats::default()),
         }
     }
 
     pub fn mode(&self) -> TranslateMode {
         self.mode
+    }
+
+    /// 最近一次翻译中「输出校验自愈」的统计（供上层提示用户）。
+    pub fn last_rewrite_stats(&self) -> RewriteStats {
+        *self.rewrite_stats.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 写回本次翻译的校验自愈统计。
+    fn store_rewrite_stats(&self, stats: RewriteStats) {
+        *self.rewrite_stats.lock().unwrap_or_else(|e| e.into_inner()) = stats;
     }
 
     /// 批量翻译字幕片段为目标语言（默认 "简体中文"）
@@ -177,6 +195,7 @@ impl TranslateEngine {
         // 这是**正确行为**（中文→简体中文本就该是原文），不是失败，因此这里照常写入
         // `translation`，不参与「译文==原文」的复制检测。
         if let Some(variant) = chinese_variant_target(target_lang) {
+            self.store_rewrite_stats(RewriteStats::default());
             return convert_chinese_variant(segments, target_lang, variant, progress_cb, &cancel);
         }
         match self.mode {
@@ -189,6 +208,7 @@ impl TranslateEngine {
                 // 公开入口，可能被直接调用，判定下沉到那里同样成立（见
                 // `LLMEngine::translate` 的短路分支）。
                 if let Some(variant) = chinese_variant_target(target_lang) {
+                    self.store_rewrite_stats(RewriteStats::default());
                     return convert_chinese_variant(
                         segments,
                         target_lang,
@@ -199,14 +219,25 @@ impl TranslateEngine {
                 }
                 // 取消标志下沉到引擎：润色/翻译都是分批长循环，取消必须能在批次之间生效
                 engine.install_cancel_flag(cancel);
-                engine.translate(segments, target_lang, progress_cb)
+                let result = engine.translate(segments, target_lang, progress_cb);
+                // 离线链路的自愈统计在引擎内累积，这里读出来统一暴露给上层。
+                self.store_rewrite_stats(engine.last_rewrite_stats());
+                result
             }
             TranslateMode::OnlineApi => {
                 let cfg = self
                     .online
                     .as_ref()
                     .ok_or_else(|| anyhow!("在线翻译接口未配置"))?;
-                translate_via_online_api(cfg, segments, target_lang, progress_cb, cancel)
+                let (translated, stats) = translate_via_online_api_with_stats(
+                    cfg,
+                    segments,
+                    target_lang,
+                    progress_cb,
+                    cancel,
+                )?;
+                self.store_rewrite_stats(stats);
+                Ok(translated)
             }
         }
     }
@@ -260,14 +291,30 @@ fn ensure_target_lang(target_lang: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
-/// 在线翻译主流程：按 `batch_size` 切片，逐批请求并回填 `segment.translation`。
+/// 在线翻译主流程的**测试兼容入口**：保留原签名，让既有回归测试不必改写；自愈统计
+/// 由 [`translate_via_online_api_with_stats`] 返回，在这里丢弃。
+/// 生产链路（[`TranslateEngine::translate_subtitles`]）直接调用带统计的版本。
+#[cfg(test)]
 fn translate_via_online_api(
+    cfg: &OnlineApiConfig,
+    segments: Vec<Segment>,
+    target_lang: &str,
+    progress_cb: Option<crate::engines::TextProgressCb>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Vec<Segment>> {
+    translate_via_online_api_with_stats(cfg, segments, target_lang, progress_cb, cancel)
+        .map(|(segments, _stats)| segments)
+}
+
+/// 在线翻译主流程：按 `batch_size` 切片，逐批请求并回填 `segment.translation`，
+/// 并返回「输出校验自愈」统计（回退条数 / 反思次数）供上层提示。
+fn translate_via_online_api_with_stats(
     cfg: &OnlineApiConfig,
     mut segments: Vec<Segment>,
     target_lang: &str,
     progress_cb: Option<crate::engines::TextProgressCb>,
     cancel: Arc<AtomicBool>,
-) -> Result<Vec<Segment>> {
+) -> Result<(Vec<Segment>, RewriteStats)> {
     if cfg.api_key.trim().is_empty() {
         return Err(anyhow!(
             "未配置在线翻译 API Key。请在「性能设置 → 在线翻译 API」中填写，\
@@ -315,7 +362,7 @@ fn translate_via_online_api(
         if let Some(ref cb) = progress_cb {
             cb(1.0, &format!("全部 {total} 句已是{target_lang}译文"));
         }
-        return Ok(segments);
+        return Ok((segments, RewriteStats::default()));
     }
     if pending_total < total {
         info!("在线增量翻译：{total} 句中有 {pending_total} 句需要翻译为 {target_lang}");
@@ -329,6 +376,8 @@ fn translate_via_online_api(
     let mut last_batch_error: Option<String> = None;
     // P0-B：整批的「译文 == 原文」复制率统计
     let mut copy = CopyRate::default();
+    // 输出校验自愈统计（回退 / 反思次数）：收尾返回给上层，并经 `TranslateEngine` 暴露。
+    let mut heal = RewriteStats::default();
 
     // P0-C：单批源文本预算必须扣掉**每批重复注入**的固定开销——system 提示词模板
     // （含源语言线索与术语表）。术语表理论上限约 9.7k 字符，不扣就会顶爆小上下文
@@ -422,17 +471,77 @@ fn translate_via_online_api(
         let mut matched = 0usize;
         // 被判为「复制原文」的句子：折半重试**之后**仍未译出才计入复制率。
         let mut copy_candidates: Vec<usize> = Vec::new();
+        // 「改动过大」的可疑译文（长度失控 / 语义漂移）：先反思重试一次，仍不合格才留空。
+        let mut suspect_candidates: Vec<usize> = Vec::new();
         copy.checked += chunk.len();
+        // 校验口径与润色链路一致：`checked` = 本批实际产出、送交校验的条数。
+        heal.checked += translations.len();
         for &pos in &chunk {
             if let Some(text) = translations.get(&segments[pos].index) {
-                // P0-B：模型把原文原样吐回来时不算译出——走已有的折半重试路径补译。
-                if is_untranslated_copy(&segments[pos].translate_source(), text) {
-                    copy_candidates.push(pos);
-                    continue;
+                // 逐句输出校验：Ok 写回；Echo（复制原文，含近似复制）走已有的折半重试
+                // 路径补译；SuspectTooDifferent（扩写/丢内容）留给反思重试；Empty 丢弃。
+                // 绝不允许把可疑译文静默写进用户字幕。
+                match validate_translation(&segments[pos].translate_source(), text) {
+                    RewriteVerdict::Ok => {
+                        segments[pos].translation = Some(text.clone());
+                        segments[pos].translation_lang = Some(target_lang.to_string());
+                        matched += 1;
+                    }
+                    RewriteVerdict::Echo => {
+                        heal.echo += 1;
+                        copy_candidates.push(pos);
+                    }
+                    RewriteVerdict::SuspectTooDifferent => suspect_candidates.push(pos),
+                    RewriteVerdict::Empty => heal.empty += 1,
                 }
-                segments[pos].translation = Some(text.clone());
-                segments[pos].translation_lang = Some(target_lang.to_string());
-                matched += 1;
+            }
+        }
+        // 反思重试（**最多一次**）：只把可疑句重问一遍，要求最小必要改动；拿回结果后
+        // 再过一遍校验，仍不合格就保持未译（与既有「未翻译」口径一致）。
+        if !suspect_candidates.is_empty() {
+            let triples: Vec<(usize, String, String)> = suspect_candidates
+                .iter()
+                .map(|&pos| {
+                    (
+                        segments[pos].index,
+                        segments[pos].translate_source(),
+                        translations
+                            .get(&segments[pos].index)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect();
+            heal.reflect_calls += 1;
+            match request_reflect_translation(cfg, &triples, target_lang, &profile) {
+                Ok(healed) => {
+                    for &pos in &suspect_candidates {
+                        let source = segments[pos].translate_source();
+                        match healed.get(&segments[pos].index) {
+                            Some(text)
+                                if validate_translation(&source, text) == RewriteVerdict::Ok =>
+                            {
+                                segments[pos].translation = Some(text.clone());
+                                segments[pos].translation_lang = Some(target_lang.to_string());
+                                matched += 1;
+                            }
+                            _ => heal.fallback += 1,
+                        }
+                    }
+                }
+                Err(err) => {
+                    // 反思请求失败：不改动任何译文，可疑句全部按「未译」处理（回退）。
+                    heal.fallback += triples.len();
+                    warn!(error = %err, "在线翻译反思重试失败，{} 句按未译处理", triples.len());
+                }
+            }
+            if heal.fallback > 0 {
+                warn!(
+                    suspects = triples.len(),
+                    fallback = heal.fallback,
+                    "在线翻译输出校验自愈：{} 句改动过大，反思后仍不合格，保持未译",
+                    heal.fallback
+                );
             }
         }
         if matched < chunk.len() {
@@ -442,6 +551,8 @@ fn translate_via_online_api(
                 .iter()
                 .copied()
                 .filter(|&pos| !segments[pos].translation_matches(target_lang))
+                // 可疑句已走过「反思重试一次」的额度，不再进入折半重试（否则等于无限重试）。
+                .filter(|pos| !suspect_candidates.contains(pos))
                 .collect();
             let recovered =
                 retry_missing_online(cfg, &mut segments, &missing, target_lang, &cancel, &profile);
@@ -521,7 +632,13 @@ fn translate_via_online_api(
     } else {
         info!("在线 API 字幕翻译完成");
     }
-    Ok(segments)
+    // 发生过自愈就通过进度回调提示上层——「不允许把可疑内容静默写进用户字幕」。
+    if heal.has_selfheal() {
+        if let Some(ref cb) = progress_cb {
+            cb(1.0, &heal.warning_message());
+        }
+    }
+    Ok((segments, heal))
 }
 
 /// 把一批里**没译出**的句子按更小的批重试，返回补回的条数。
@@ -1061,6 +1178,68 @@ fn request_batch_translation(
         }
     }
 
+    Ok(parsed)
+}
+
+/// 对一批「改动过大」的可疑译文做**一次**反思重试（在线链路）。
+///
+/// 与 [`request_batch_translation`] 的差别只在提示词：系统段换成外置常量
+/// [`REFLECT_PROMPT`]（附加目标语言），用户段**只列可疑句**（原句 + 被拒的上一版），
+/// 要求「最小必要修改、长度相当」。解析与截断处理与主链路完全一致（同一个
+/// [`LLMEngine::parse_batch_response`] 与 [`truncation_victim`]）。
+fn request_reflect_translation(
+    cfg: &OnlineApiConfig,
+    suspects: &[(usize, String, String)],
+    target_lang: &str,
+    profile: &ModelProfile,
+) -> Result<HashMap<usize, String>> {
+    let mut user = String::new();
+    for (index, original, previous) in suspects {
+        user.push_str(&format!(
+            "[{index}] 原句：{original}\n上一版（改动过大，已弃用）：{previous}\n"
+        ));
+    }
+    let source_chars: usize = suspects.iter().map(|(_, o, _)| o.chars().count()).sum();
+    let base = source_chars * OUTPUT_TOKENS_PER_CHAR;
+    let max_tokens = if profile.is_reasoning() {
+        base.saturating_add(REASONING_THINKING_TOKENS)
+            .clamp(MIN_OUTPUT_TOKENS, MAX_REASONING_OUTPUT_TOKENS)
+    } else {
+        base.clamp(MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS)
+    };
+    let payload = serde_json::json!({
+        "model": cfg.model,
+        "messages": [
+            {
+                "role": "system",
+                "content": format!(
+                    "{REFLECT_PROMPT}（目标语言：{target_lang}；只翻译为{target_lang}，保持与原文长度相当。）\
+    必须逐行输出，格式严格为「[序号] 译文」，不得解释、不得合并、不得遗漏、不得改动序号。"
+                )
+            },
+            { "role": "user", "content": user }
+        ],
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+        "stream": false,
+    });
+    let value = post_chat_completions(cfg, &payload)?;
+    let content = extract_message_content(&value).unwrap_or_default();
+    if content.trim().is_empty() {
+        return Err(anyhow!("在线接口反思重试返回了空内容"));
+    }
+    let expected: HashSet<usize> = suspects.iter().map(|(index, _, _)| *index).collect();
+    let mut parsed = LLMEngine::parse_batch_response(&content, &expected);
+    if finish_reason_is_length(&value) {
+        let order: Vec<usize> = suspects.iter().map(|(index, _, _)| *index).collect();
+        if let Some(idx) = truncation_victim(&content, &order, &parsed) {
+            parsed.remove(&idx);
+            warn!(
+                index = idx,
+                "在线反思重试输出被截断，丢弃该条（按未译处理）"
+            );
+        }
+    }
     Ok(parsed)
 }
 
@@ -1637,6 +1816,50 @@ mod tests {
         assert_eq!(out[0].translation_lang.as_deref(), Some("English"));
         assert_eq!(out[1].translation_lang.as_deref(), Some("English"));
         assert_eq!(seen.lock().unwrap().len(), 1, "只应发一次请求");
+    }
+
+    /// 输出校验自愈（在线链路）：译文「改动过大」（把一句扩写成一整段）时，先做
+    /// **一次**反思重试；仍不合格则回退成「未译」，绝不写进字幕；正常句照常写回。
+    #[test]
+    fn online_runaway_translation_falls_back_after_one_reflection() {
+        let runaway = "这是一段".to_string() + &"扩写内容".repeat(30);
+        let normal = serde_json::json!({
+            "choices": [{ "message": { "content": format!("[1] {runaway}\n[2] Hello world.") } }]
+        })
+        .to_string();
+        let reflect = serde_json::json!({
+            "choices": [{ "message": { "content": format!("[1] {runaway}") } }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![normal, reflect]);
+        let cfg = online_cfg_for(&addr);
+
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "这句只有十几个字的一句话"),
+            Segment::new(2, 1.0, 2.0, "你好世界"),
+        ];
+        let (out, stats) = translate_via_online_api_with_stats(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("mock 服务器应返回成功");
+
+        // 可疑句回退成「未译」
+        assert_eq!(out[0].translation, None, "改动过大的译文不得写回");
+        assert_eq!(out[0].translation_lang, None);
+        // 正常句照常写回
+        assert_eq!(out[1].translation.as_deref(), Some("Hello world."));
+        // 反思只重试一次，回退统计正确
+        assert_eq!(stats.reflect_calls, 1, "反思只允许重试一次");
+        assert_eq!(stats.fallback, 1);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "应为「首次 + 一次反思」共两次请求"
+        );
     }
 
     /// 术语表必须真的注入到发往接口的提示词里（而不是只在本地拼好就丢掉）。
