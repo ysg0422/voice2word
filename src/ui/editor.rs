@@ -1428,6 +1428,7 @@ impl MainWindow {
                                                             div()
                                                                 .id("btn-bold-on")
                                                                 .flex_1()
+                                                                .min_w(px(0.0))
                                                                 .py_0p5()
                                                                 .rounded_md()
                                                                 .cursor_pointer()
@@ -1438,7 +1439,7 @@ impl MainWindow {
                                                                 .justify_center()
                                                                 .bg(if is_bold { Theme::accent_mint() } else { Theme::bg_inset() })
                                                                 .border_1()
-                                                                .border_color(if is_bold { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                                .border_color(if is_bold { Theme::accent_mint() } else { Theme::border_subtle() })
                                                                 .text_color(if is_bold { Theme::text_on_accent() } else { Theme::text_secondary() })
                                                                 .child("加粗")
                                                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -1452,6 +1453,7 @@ impl MainWindow {
                                                             div()
                                                                 .id("btn-bold-off")
                                                                 .flex_1()
+                                                                .min_w(px(0.0))
                                                                 .py_0p5()
                                                                 .rounded_md()
                                                                 .cursor_pointer()
@@ -1461,7 +1463,7 @@ impl MainWindow {
                                                                 .justify_center()
                                                                 .bg(if !is_bold { Theme::accent_mint() } else { Theme::bg_inset() })
                                                                 .border_1()
-                                                                .border_color(if !is_bold { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                                .border_color(if !is_bold { Theme::accent_mint() } else { Theme::border_subtle() })
                                                                 .text_color(if !is_bold { Theme::text_on_accent() } else { Theme::text_secondary() })
                                                                 .child("常规")
                                                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -1492,7 +1494,7 @@ impl MainWindow {
                                                                 .justify_center()
                                                                 .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
                                                                 .border_1()
-                                                                .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                                .border_color(if is_sel { Theme::accent_mint() } else { Theme::border_subtle() })
                                                                 .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
                                                                 .child(label)
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1538,7 +1540,7 @@ impl MainWindow {
                                                         .justify_center()
                                                         .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
                                                         .border_1()
-                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::border_subtle() })
                                                         .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
                                                         .child(label)
                                                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1583,7 +1585,7 @@ impl MainWindow {
                                                         .justify_center()
                                                         .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
                                                         .border_1()
-                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::bg_hover_strong() })
+                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::border_subtle() })
                                                         .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
                                                         .child(label)
                                                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -5965,6 +5967,7 @@ impl MainWindow {
                                 div()
                                     .id(("preset-light", idx))
                                     .flex_1()
+                                    .min_w(px(0.0))
                                     .py_0p5()
                                     .rounded_sm()
                                     .cursor_pointer()
