@@ -9,9 +9,11 @@ use super::super::types::{ConfirmAction, ConfirmDialogInfo};
 use super::super::MainWindow;
 use crate::app::state::{ProcessStatus, QueueItem, QueueState, WorkspaceTab};
 use crate::ui::format_mm_ss;
+// 「修复常见错误」的命中清单 / 重复句分组都来自 `cleanup.rs` 的纯函数：
+// 这里只把结果画出来，并把它们按「字幕版本 + 勾选规则」缓存起来（见 `TranscribeDerivedCache`）。
+use crate::subtitle::cleanup::{CleanupPlan, CleanupRules, DuplicateGroup};
 // 质检报告是 `segment.rs` 里的纯逻辑：这里只把结果画出来，不在界面层重算判据。
 use crate::subtitle::segment::{QualityCategory, QualityReport};
-use crate::subtitle::Segment;
 use crate::utils::time::format_duration_short;
 use std::sync::Arc;
 
@@ -43,10 +45,20 @@ impl MainWindow {
 
     /// 渲染中央处理工作区：轻量化实时看板，彻底告别庞大表格卡顿
     pub(crate) fn render_main_workspace(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current_tab = self.state.active_tab;
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
         let is_sensevoice =
             self.state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
+        let file_loaded = self.state.transcribe_file.is_some();
+        // 「字幕确实属于这支媒体」的判据与质检卡片完全一致（`selected_file ==
+        // transcribe_file`）：只数 `segments` 非空的话，刚换了一支还没转写的新片，
+        // 上一支留下的字幕会把第 2 步说成「已完成」。
+        let subtitles_ready = !self.state.segments.is_empty()
+            && self.state.selected_file.as_ref() == self.state.transcribe_file.as_ref();
+        // 步骤条四步与右侧状态药丸的判定都走纯函数：它们各有四五条分支，写在渲染链里
+        // 只能用肉眼比对，而它们说的正是「现在在第几步、正在干什么」——对不上就是误导。
+        let steps = StepChain::of(file_loaded, is_processing, subtitles_ready);
+        let status_pill =
+            transcribe_status_pill(is_processing, self.state.batch_running, file_loaded);
 
         // 页面外壳统一走 primitives::page_shell：底色 / 内边距 / 分区间距与其余三个
         // 工作台页同源，切页时中央列不再横向跳动；`.flex_1()` 保留它在左右分栏里
@@ -72,148 +84,62 @@ impl MainWindow {
                             .flex()
                             .items_center()
                             .gap_4()
-                            // Step 1: 导入
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .w(px(Theme::STEP_DOT))
-                                            .h(px(Theme::STEP_DOT))
-                                            .rounded_full()
-                                            .bg(if !is_processing && self.state.transcribe_file.is_some() { Theme::accent_mint() } else { Theme::bg_hover_strong() })
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_size(px(Theme::TEXT_SMALL))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(if !is_processing && self.state.transcribe_file.is_some() { Theme::text_on_accent() } else { Theme::text_primary() })
-                                            .child("1"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(Theme::TEXT_BODY))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(if !is_processing && self.state.transcribe_file.is_some() { Theme::text_primary() } else { Theme::text_secondary() })
-                                            .child("导入媒体"),
-                                    ),
-                            )
+                            .child(step_item(
+                                "1",
+                                "导入媒体",
+                                steps.import,
+                                Theme::accent_mint(),
+                                Theme::text_on_accent(),
+                            ))
                             .child(primitives::step_connector())
-                            // Step 2: 转写
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .w(px(Theme::STEP_DOT))
-                                            .h(px(Theme::STEP_DOT))
-                                            .rounded_full()
-                                            .bg(if is_processing { Theme::accent_mint() } else { Theme::bg_hover_strong() })
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_size(px(Theme::TEXT_SMALL))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(if is_processing { Theme::text_on_accent() } else { Theme::text_primary() })
-                                            .child("2"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(Theme::TEXT_BODY))
-                                            .font_weight(if is_processing { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                            .text_color(if is_processing { Theme::accent_mint() } else { Theme::text_secondary() })
-                                            .child("语音转写"),
-                                    ),
-                            )
+                            .child(step_item(
+                                "2",
+                                "语音转写",
+                                steps.transcribe,
+                                Theme::accent_mint(),
+                                Theme::text_on_accent(),
+                            ))
                             .child(primitives::step_connector())
-                            // Step 3: 校对
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .w(px(Theme::STEP_DOT))
-                                            .h(px(Theme::STEP_DOT))
-                                            .rounded_full()
-                                            .bg(if current_tab == WorkspaceTab::Editor && !self.state.segments.is_empty() { Theme::accent_blue() } else { Theme::bg_hover_strong() })
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_size(px(Theme::TEXT_SMALL))
-                                            .font_weight(FontWeight::BOLD)
-                                            // 未选中态是**翻转**的中性底槽（浅色主题下约 0xe2e2e9），数字必须跟着
-                                            // 底色一起翻转，取 text_primary（与步骤 1/2/4 一致，依据见
-                                            // docs/UI设计规范.md §3.2「中性底槽 → text_primary（翻转）」）。
-                                            // 这里**不能**用 text_on_saturated：它是恒白 token，在深色主题的深底槽上
-                                            // 看着正常，浅色主题下却是白字压浅底，几乎不可见——正是「底翻转、字恒白」
-                                            // 这个最常见错误。只有选中态（蓝色饱和块，恒深）才配 text_on_saturated。
-                                            .text_color(if current_tab == WorkspaceTab::Editor && !self.state.segments.is_empty() { Theme::text_on_saturated() } else { Theme::text_primary() })
-                                            .child("3"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(Theme::TEXT_BODY))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(Theme::text_secondary())
-                                            .child("剪辑校对"),
-                                    ),
-                            )
+                            .child(step_item(
+                                "3",
+                                "剪辑校对",
+                                steps.edit,
+                                Theme::accent_blue(),
+                                Theme::text_on_saturated(),
+                            ))
                             .child(primitives::step_connector())
-                            // Step 4: 导出
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .w(px(Theme::STEP_DOT))
-                                            .h(px(Theme::STEP_DOT))
-                                            .rounded_full()
-                                            .bg(Theme::bg_hover_strong())
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_size(px(Theme::TEXT_SMALL))
-                                            .font_weight(FontWeight::BOLD)
-                                            // 未激活的步骤圆点是**翻转**的中性底槽，数字须用翻转文字；
-                                            // 只有激活态（薄荷/蓝实心）才用恒深 text_on_accent
-                                            .text_color(Theme::text_primary())
-                                            .child("4"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(Theme::TEXT_BODY))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(Theme::text_secondary())
-                                            .child("导出工程"),
-                                    ),
-                            ),
+                            .child(step_item(
+                                "4",
+                                "导出工程",
+                                steps.export,
+                                Theme::accent_blue(),
+                                Theme::text_on_saturated(),
+                            ))
                     )
                     .child(
-                        // 右侧状态药丸：转写中 / 文件就绪两态都收敛到 badge 原语，
-                        // 行内状态点沿用 stat_dot_sm，不再各写一份胶囊尺寸。
-                        if is_processing {
+                        // 右侧状态药丸：四态由 `transcribe_status_pill` 先判定（批量与单文件转写
+                        // 必须说两种话），外观一律走 badge / stat_dot_sm 原语。
+                        if let Some(label) = status_pill.transcribing_label() {
                             div()
                                 .flex()
                                 .items_center()
                                 .gap(px(Theme::SPACE_1))
                                 .child(primitives::stat_dot_sm(Theme::accent_mint()))
-                                .child(primitives::badge_accent("正在转写…"))
-                        } else if let Some(ref file) = self.state.transcribe_file {
+                                .child(primitives::badge_accent(label))
+                        } else if status_pill == StatusPill::FileReady {
                             div()
                                 .flex()
                                 .items_center()
                                 .gap(px(Theme::SPACE_1))
                                 .child(primitives::stat_dot_sm(Theme::accent_blue()))
                                 .child(primitives::badge(
-                                    file.file_name().and_then(|s| s.to_str()).unwrap_or("媒体文件").to_string(),
+                                    self.state
+                                        .transcribe_file
+                                        .as_ref()
+                                        .and_then(|f| f.file_name())
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("媒体文件")
+                                        .to_string(),
                                 ))
                         } else {
                             div()
@@ -379,7 +305,12 @@ impl MainWindow {
                                             })
                                             .into_any_element()
                                     } else {
-                                        let seg_list: Vec<&Segment> = self.state.streaming_segments.iter().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
+                                        // 只回显最后 `STREAM_TAIL_ROWS` 行：`streaming_segments` 是
+                                        // 按到达顺序 push 的，直接取尾部切片即可——原写法
+                                        // `rev().take(3)` 收进 `Vec` 再 `rev()` 收了第二遍，每帧两次分配。
+                                        let all = &self.state.streaming_segments;
+                                        let seg_list =
+                                            &all[all.len().saturating_sub(STREAM_TAIL_ROWS)..];
                                         let total_items = seg_list.len();
                                         div()
                                             .min_h(px(Theme::STREAM_MIN_H))
@@ -388,7 +319,7 @@ impl MainWindow {
                                             .flex_col()
                                             .justify_end()
                                             .gap_2()
-                                            .children(seg_list.into_iter().enumerate().map(|(i, seg)| {
+                                            .children(seg_list.iter().enumerate().map(|(i, seg)| {
                                                 let is_last = is_last_stream_row(i, total_items);
                                                 let time_badge = format!(
                                                     "{} - {}",
@@ -467,6 +398,9 @@ impl MainWindow {
                                 ),
                         )
                         // 3. 底部 4 宫格性能与状态仪表盘
+                        // 底部 4 宫格四格等分：`.flex_1()` 必须与 `.min_w(px(0.0))` 成对出现——
+                        // 只写 `flex_1` 时 flex 项默认的 `min-width:auto` 会按内容最小宽度顶住，
+                        // 「SenseVoice INT8」那一格会把其余三格挤窄。
                         .child(
                             div()
                                 .w_full()
@@ -479,6 +413,7 @@ impl MainWindow {
                                     // 数字用 TEXT_STAT、标签用 TEXT_SMALL 保持四格对齐。
                                     primitives::card_sm()
                                         .flex_1()
+                                        .min_w(px(0.0))
                                         .gap_0p5()
                                         .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("总体进度"))
                                         .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::accent_mint()).child(format!("{:.1}%", display_ratio * 100.0)))
@@ -487,6 +422,7 @@ impl MainWindow {
                                 .child(
                                     primitives::card_sm()
                                         .flex_1()
+                                        .min_w(px(0.0))
                                         .gap_0p5()
                                         .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("预计耗时"))
                                         .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::text_primary()).child(eta))
@@ -495,6 +431,7 @@ impl MainWindow {
                                 .child(
                                     primitives::card_sm()
                                         .flex_1()
+                                        .min_w(px(0.0))
                                         .gap_0p5()
                                         .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("音频推流"))
                                         .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::accent_blue()).child("纯内存管道"))
@@ -503,6 +440,7 @@ impl MainWindow {
                                 .child(
                                     primitives::card_sm()
                                         .flex_1()
+                                        .min_w(px(0.0))
                                         .gap_0p5()
                                         .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("推理引擎"))
                                         // 引擎名比数字短，降到 TEXT_TITLE 免得撑破磁贴宽度
@@ -853,11 +791,14 @@ impl MainWindow {
         // 未翻译走蓝、空/超短句走中性灰。配色全部取自 Theme 的 tint_* / accent_* 阶梯，
         // 调用点不出现裸色值。
         // 元组字段（用别名收窄，免得 clippy 判 `type_complexity`）：
-        // 标签 / 句数 / 该类第一处序号 / 浅底 / 描边 / 前景。
-        type QualityChip = (&'static str, usize, Option<usize>, Rgba, Rgba, Rgba);
+        // 分类 / 句数 / 该类第一处序号 / 浅底 / 描边 / 前景。
+        // 分类用枚举而不是再抄一遍中文标签：标签统一由 `QualityCategory::label()` 给出，
+        // 与下面的「只看这类」按钮同源（抄成字面量就会出现「胶囊叫空/超短句、
+        // 按钮叫碎片句」这种两处各写一份的漂移）。
+        type QualityChip = (QualityCategory, usize, Option<usize>, Rgba, Rgba, Rgba);
         let rows: [QualityChip; 4] = [
             (
-                "低置信",
+                QualityCategory::LowConfidence,
                 report.low_confidence.len(),
                 report.low_confidence.first().copied(),
                 Theme::tint_red_soft(),
@@ -865,7 +806,7 @@ impl MainWindow {
                 Theme::accent_red(),
             ),
             (
-                "术语违规",
+                QualityCategory::GlossaryViolation,
                 report.glossary_violations.len(),
                 report.glossary_violations.first().copied(),
                 Theme::tint_warn_soft(),
@@ -873,7 +814,7 @@ impl MainWindow {
                 Theme::accent_orange(),
             ),
             (
-                "未翻译",
+                QualityCategory::Untranslated,
                 report.untranslated.len(),
                 report.untranslated.first().copied(),
                 Theme::tint_blue_soft(),
@@ -881,7 +822,7 @@ impl MainWindow {
                 Theme::accent_blue(),
             ),
             (
-                "空/超短句",
+                QualityCategory::EmptyOrShort,
                 report.empty_or_short.len(),
                 report.empty_or_short.first().copied(),
                 Theme::tint_neutral(),
@@ -911,6 +852,9 @@ impl MainWindow {
 
         // 判据胶囊行：非零项按类着色并可点击定位；零项**保留计数但置灰不可点**——
         // 用户要看得出「这一项确实检查过、结果是 0」，而不是被悄悄藏掉。
+        // 唯一的例外是低置信判据**全无置信度数据**时：那时「0 句」是把「没测」说成了
+        // 「通过」，文案改由 `quality_chip_label` 给「未评估」（判据见 `QualityReport`）。
+        let confidence_unavailable = report.confidence_unavailable();
         let chips = div()
             .w_full()
             .flex()
@@ -918,17 +862,18 @@ impl MainWindow {
             .items_center()
             .gap(px(Theme::SPACE_2))
             .children(rows.into_iter().enumerate().map(
-                |(slot, (label, count, first, soft, border, text))| {
+                |(slot, (category, count, first, soft, border, text))| {
+                    let label = quality_chip_label(category, count, confidence_unavailable);
                     if count == 0 {
                         return primitives::tag_tinted(
-                            format!("{label} 0 句"),
+                            label,
                             Theme::tint_neutral(),
                             Theme::tint_neutral_border(),
                             Theme::text_muted(),
                         )
                         .into_any_element();
                     }
-                    primitives::tag_tinted(format!("{label} {count} 句"), soft, border, text)
+                    primitives::tag_tinted(label, soft, border, text)
                         // 元素 id 用「槽位序号」而不是标签：`ElementId` 只接受
                         // `&'static str` / `SharedString` / 数字，`(&str, &str)` 装不进去。
                         .id(("quality-chip", slot))
@@ -953,7 +898,9 @@ impl MainWindow {
         // 与上面的胶囊同源，不会出现「胶囊叫空/超短句、按钮叫碎片句」这种不一致。
         let category_jump_buttons: Vec<AnyElement> = QualityCategory::ALL
             .iter()
-            .filter(|cat| !cat.indices(&report).is_empty())
+            // 只问「这一类有没有条目」：`QualityCategory::indices()` 会克隆整份下标
+            // 列表再逐个去重，四个类别就是每帧四次分配 + 四次去重扫描（`category_has_issues`）。
+            .filter(|cat| category_has_issues(&report, **cat))
             .map(|cat| {
                 let cat = *cat;
                 primitives::btn(
@@ -1090,8 +1037,22 @@ impl MainWindow {
         use crate::subtitle::cleanup::CleanupRule;
 
         let rules = self.state.cleanup_rules;
-        let plan = self.state.cleanup_preview();
-        let groups = self.state.duplicate_cue_groups();
+        // 命中清单与重复句分组都是**整表扫描**（`cleanup::plan` 对每一句、每一侧都跑一遍
+        // 四条规则并各自分配字符串；`duplicate_groups` 再逐句比对），而这张卡片在就绪态
+        // 每帧都要重画。按「字幕版本 + 勾选规则」缓存成一份快照：两个入参恰好就是
+        // 结果的全部依据（`plan` 吃 segments + rules，`groups` 只吃 segments）。
+        let preview = {
+            let key = (self.state.segments_revision, rules);
+            let state = &self.state;
+            cx.update_default_global::<TranscribeDerivedCache, _>(|cache, _| {
+                cleanup_preview_cached(&mut cache.cleanup, key, || CleanupPreview {
+                    plan: state.cleanup_preview(),
+                    groups: state.duplicate_cue_groups(),
+                })
+            })
+        };
+        let plan = &preview.plan;
+        let groups = &preview.groups;
         // 每组至少 2 句，可删的是「组内除第一句以外」的那些
         let duplicate_cues: usize = groups.iter().map(|g| g.indices.len() - 1).sum();
         let note = self.state.cleanup_note.clone();
@@ -1689,12 +1650,277 @@ fn truncate_for_ui(text: &str) -> String {
     out
 }
 
+/// 流式看板回显的最近行数。
+///
+/// 够看清识别节奏，又不至于每来一句就把整列布局重排一遍。
+const STREAM_TAIL_ROWS: usize = 3;
+
+// ==================== 步骤条 / 状态药丸（纯判定） ====================
+
+/// 步骤条上一步所处的阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepPhase {
+    /// 已经完成
+    Done,
+    /// 当前所处的一步
+    Current,
+    /// 还没到
+    Upcoming,
+}
+
+/// 转写工作台顶部四步步骤条的状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StepChain {
+    import: StepPhase,
+    transcribe: StepPhase,
+    edit: StepPhase,
+    export: StepPhase,
+}
+
+impl StepChain {
+    /// 由真实状态推出四步各自处在哪一阶段（纯判定，便于单测）。
+    ///
+    /// 三个入参就是全部事实：
+    /// - `file_loaded`：`transcribe_file.is_some()`——已经导入了一支媒体；
+    /// - `processing`：`ProcessStatus::Processing`——正在转写（单文件与批量都会置位）；
+    /// - `subtitles_ready`：`!segments.is_empty() && selected_file == transcribe_file`——
+    ///   这份字幕确实属于当前这支媒体；判据与质检卡片一致，刚换了还没转写的新片时
+    ///   不会拿上一支的字幕充数。
+    ///
+    /// 抽出来的理由：旧写法有三处与真实状态对不上。
+    /// 1. 第 1 步的条件是 `!processing && transcribe_file.is_some()`——转写一开始它反而
+    ///    退回灰色，等于告诉用户「你没导入过文件」；
+    /// 2. 第 2 步只在 `processing` 时点亮——转写跑完、字幕已经出来，它立刻熄灭，
+    ///    看着像没跑成；
+    /// 3. 第 3 步的条件是 `active_tab == Editor`，而本页只在 Generate 页渲染，该条件
+    ///    恒为假——第 3 步永远灰着。
+    ///
+    /// 第 4 步（导出工程）没有任何状态源可用（`ProcessStatus` 里没有「已导出」），
+    /// 因此恒为 `Upcoming`：宁可它一直暗着，也不假装知道用户导出没导出。
+    fn of(file_loaded: bool, processing: bool, subtitles_ready: bool) -> StepChain {
+        let import = if file_loaded {
+            StepPhase::Done
+        } else {
+            StepPhase::Current
+        };
+        let transcribe = if processing {
+            StepPhase::Current
+        } else if subtitles_ready && file_loaded {
+            StepPhase::Done
+        } else if file_loaded {
+            // 已导入、还没转写：下一步就是它。
+            StepPhase::Current
+        } else {
+            StepPhase::Upcoming
+        };
+        // 第 3 步要求字幕已经在手边：正在转写时（哪怕是重转同一支）也还没轮到校对。
+        let edit = if subtitles_ready && file_loaded && !processing {
+            StepPhase::Current
+        } else {
+            StepPhase::Upcoming
+        };
+        StepChain {
+            import,
+            transcribe,
+            edit,
+            export: StepPhase::Upcoming,
+        }
+    }
+}
+
+/// 步骤条上的一步：序号圆点 + 文案。
+///
+/// 四步只有「序号 / 文案 / 强调色」不同，形状与配色必须同源——此前四份手写副本已经
+/// 漂移成「第 2 步的高亮文案是薄荷色、第 3 步却是灰字」。
+///
+/// 三态配色：
+/// - `Upcoming`：中性翻转底槽 + `text_primary` 数字（底槽是翻转的，数字必须跟着翻，
+///   不能用恒白的 `text_on_saturated`——浅色主题下那是白字压浅底）；
+/// - `Done` / `Current`：该步强调色的实心圆点。薄荷是浅底，配恒深的 `text_on_accent`；
+///   蓝（`accent_blue`）是深底，必须配恒白的 `text_on_saturated`；
+/// - `Current` 额外把文案也染成强调色并加粗，`Done` 的文案走 `text_primary`。
+fn step_item(
+    number: &'static str,
+    label: &'static str,
+    phase: StepPhase,
+    accent: Rgba,
+    on_accent: Rgba,
+) -> Div {
+    let (dot_bg, dot_fg, label_color, label_weight) = match phase {
+        StepPhase::Upcoming => (
+            Theme::bg_hover_strong(),
+            Theme::text_primary(),
+            Theme::text_secondary(),
+            FontWeight::MEDIUM,
+        ),
+        StepPhase::Done => (accent, on_accent, Theme::text_primary(), FontWeight::MEDIUM),
+        StepPhase::Current => (accent, on_accent, accent, FontWeight::BOLD),
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(Theme::STEP_DOT))
+                .h(px(Theme::STEP_DOT))
+                .rounded_full()
+                .bg(dot_bg)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(Theme::TEXT_SMALL))
+                .font_weight(FontWeight::BOLD)
+                .text_color(dot_fg)
+                .child(number),
+        )
+        .child(
+            div()
+                .text_size(px(Theme::TEXT_BODY))
+                .font_weight(label_weight)
+                .text_color(label_color)
+                .child(label),
+        )
+}
+
+/// 步骤条右侧状态药丸的形态（纯判定，便于单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusPill {
+    /// 空闲待命：没有媒体、也没有任务在跑
+    Idle,
+    /// 已导入、等转写：药丸显示文件名
+    FileReady,
+    /// 单文件转写中
+    Transcribing,
+    /// 批量转写中
+    BatchTranscribing,
+}
+
+impl StatusPill {
+    /// 进行中两态的徽标文案；`Idle` / `FileReady` 不走徽标（分别显示「就绪」与文件名）。
+    ///
+    /// 文案与底部状态栏的主按钮同词（「转写中… / 批量转写中…」）：同一件事不该在
+    /// 顶部说一套、底部说另一套。
+    fn transcribing_label(self) -> Option<&'static str> {
+        match self {
+            StatusPill::Transcribing => Some("转写中…"),
+            StatusPill::BatchTranscribing => Some("批量转写中…"),
+            StatusPill::Idle | StatusPill::FileReady => None,
+        }
+    }
+}
+
+/// 由真实状态推出状态药丸（纯判定，便于单测）。
+///
+/// `batch_running` 必须单独判：单文件转写与批量转写都会置 `is_processing`，只说
+/// 「转写中」会让用户以为整批没跑起来（队列面板也是靠这个字段区分「终止批量」与
+/// 「开始全部」的）。
+fn transcribe_status_pill(
+    is_processing: bool,
+    batch_running: bool,
+    file_loaded: bool,
+) -> StatusPill {
+    if is_processing {
+        if batch_running {
+            StatusPill::BatchTranscribing
+        } else {
+            StatusPill::Transcribing
+        }
+    } else if file_loaded {
+        StatusPill::FileReady
+    } else {
+        StatusPill::Idle
+    }
+}
+
+/// 质检胶囊的文案（纯函数，便于单测）。
+///
+/// 唯一的边界是低置信：`QualityReport::confidence_unavailable()` 表示**一句都没带置信度**，
+/// 此时「低置信 0 句」是把「没测」说成了「通过」，改说「未评估」（导出复核表用的是
+/// 同一条判据）。其余三类 0 句确实是「检查过、结果是 0」，照常保留计数。
+fn quality_chip_label(
+    category: QualityCategory,
+    count: usize,
+    confidence_unavailable: bool,
+) -> String {
+    if category == QualityCategory::LowConfidence && confidence_unavailable && count == 0 {
+        return format!("{} 未评估", category.label());
+    }
+    format!("{} {count} 句", category.label())
+}
+
+/// 某一类质检问题有没有条目（纯判定，零分配）。
+///
+/// `QualityCategory::indices()` 会克隆整份下标列表再逐个去重，而这里只问「有没有」：
+/// 去重只可能让列表变短、不会把非空变空，所以直接看分类对应的桶即可。
+fn category_has_issues(report: &QualityReport, category: QualityCategory) -> bool {
+    match category {
+        QualityCategory::LowConfidence => !report.low_confidence.is_empty(),
+        QualityCategory::GlossaryViolation => !report.glossary_violations.is_empty(),
+        QualityCategory::Untranslated => !report.untranslated.is_empty(),
+        QualityCategory::EmptyOrShort => !report.empty_or_short.is_empty(),
+    }
+}
+
+// ==================== 「修复常见错误」快照缓存 ====================
+
+/// 「修复常见错误」区块的现值：一次整表扫描的命中清单 + 相邻重复句分组。
+#[derive(Debug, Clone, PartialEq)]
+struct CleanupPreview {
+    plan: CleanupPlan,
+    groups: Vec<DuplicateGroup>,
+}
+
+/// 缓存键：`(segments_revision, cleanup_rules)`。
+///
+/// `segments_revision` 覆盖所有会改字幕的动作（编辑 / 拆分合并 / 应用修复 / 换工程 /
+/// 载入缓存）；`cleanup_rules` 覆盖勾选变化——规则变了，命中清单就变了。
+type CleanupPreviewKey = (u64, CleanupRules);
+
+/// 转写页的跨帧缓存，存在 GPUI 全局里（`App::update_default_global`）。
+///
+/// 为什么不放进 `MainWindow`：它的结构体定义在 `ui/mod.rs`，而本轮改动只碰
+/// `views/transcribe.rs`；GPUI 全局随 App 生命周期存活，等价于视图级状态
+/// （与视频库缩略图状态的做法一致）。
+#[derive(Default)]
+struct TranscribeDerivedCache {
+    cleanup: Option<(CleanupPreviewKey, Arc<CleanupPreview>)>,
+}
+
+impl Global for TranscribeDerivedCache {}
+
+/// 缓存取数：键一致直接复用上次那个 `Arc`，否则现算并换入。
+///
+/// 抽成自由函数（不吃 `AppState`）是为了能在无 GUI 上下文的单测里钉死两条性质：
+/// 「同键命中不重算、复用同一个 `Arc`」与「字幕版本或勾选规则变了必重算」。
+fn cleanup_preview_cached(
+    cache: &mut Option<(CleanupPreviewKey, Arc<CleanupPreview>)>,
+    key: CleanupPreviewKey,
+    build: impl FnOnce() -> CleanupPreview,
+) -> Arc<CleanupPreview> {
+    if let Some((cached_key, value)) = cache.as_ref() {
+        if *cached_key == key {
+            return Arc::clone(value);
+        }
+    }
+    let value = Arc::new(build());
+    *cache = Some((key, Arc::clone(&value)));
+    value
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_last_stream_row, queue_progress_view, truncate_for_ui, QueueProgressView};
+    use super::{
+        category_has_issues, cleanup_preview_cached, is_last_stream_row, quality_chip_label,
+        queue_progress_view, transcribe_status_pill, truncate_for_ui, CleanupPreview,
+        CleanupPreviewKey, QueueProgressView, StatusPill, StepChain, StepPhase,
+    };
     use crate::app::state::{QueueItem, QueueState};
+    use crate::subtitle::cleanup::{CleanupPlan, CleanupRule, CleanupRules};
+    use crate::subtitle::segment::{QualityCategory, QualityReport};
     use crate::ui::split_mm_ss;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     /// 回归（P1）：数据计数与实际渲染行数口径不一致时，流式看板不得 panic。
     /// 空窗口下「没有最后一行」是显式语义，而不是靠回绕后的比较侥幸恒假。
@@ -1809,5 +2035,171 @@ mod tests {
         assert_eq!(out.chars().count(), 25, "24 个字 + 省略号");
         assert!(out.ends_with('…'), "截断要有省略号，让用户知道还有后半句");
         assert!(long.starts_with(&out[..out.len() - '…'.len_utf8()]));
+    }
+
+    // ── 步骤条 / 状态药丸 ──────────────────────────────────────────────
+
+    /// 回归：导入完成之后开始转写，第 1 步不许退回灰色。
+    ///
+    /// 旧条件是 `!is_processing && transcribe_file.is_some()`：按下「开始转写」的那一刻
+    /// 第 1 步就暗掉，等于说用户没导入过文件。
+    #[test]
+    fn step_chain_keeps_import_done_while_transcribing() {
+        let steps = StepChain::of(true, true, false);
+        assert_eq!(steps.import, StepPhase::Done);
+        assert_eq!(steps.transcribe, StepPhase::Current);
+        assert_eq!(steps.edit, StepPhase::Upcoming);
+        assert_eq!(steps.export, StepPhase::Upcoming);
+    }
+
+    /// 转写跑完（字幕已就绪）第 2 步是「完成」、第 3 步成为当前步。
+    ///
+    /// 旧写法第 2 步只在 `is_processing` 时亮，跑完立刻熄灭；第 3 步又挂在
+    /// `active_tab == Editor` 上，而本页只在 Generate 页渲染，条件恒为假。
+    #[test]
+    fn step_chain_marks_transcribe_done_and_edit_current() {
+        let steps = StepChain::of(true, false, true);
+        assert_eq!(steps.import, StepPhase::Done);
+        assert_eq!(steps.transcribe, StepPhase::Done);
+        assert_eq!(steps.edit, StepPhase::Current);
+    }
+
+    /// 当前步永远指向「下一步该干什么」：没导入停在第 1 步，导入未转写停在第 2 步。
+    #[test]
+    fn step_chain_points_at_the_next_action() {
+        let idle = StepChain::of(false, false, false);
+        assert_eq!(idle.import, StepPhase::Current);
+        assert_eq!(idle.transcribe, StepPhase::Upcoming);
+        assert_eq!(idle.edit, StepPhase::Upcoming);
+
+        // 字幕属于另一支片子时调用点传 `subtitles_ready = false`，落到这里：
+        // 已导入、还没转写。
+        let staged = StepChain::of(true, false, false);
+        assert_eq!(staged.import, StepPhase::Done);
+        assert_eq!(staged.transcribe, StepPhase::Current);
+        assert_eq!(staged.edit, StepPhase::Upcoming);
+    }
+
+    /// 没有媒体却残留了字幕：链条不许自相矛盾（不能第 2 步「完成」而第 1 步还「当前」）。
+    #[test]
+    fn step_chain_stays_coherent_without_media() {
+        let steps = StepChain::of(false, false, true);
+        assert_eq!(steps.import, StepPhase::Current);
+        assert_eq!(steps.transcribe, StepPhase::Upcoming);
+        assert_eq!(steps.edit, StepPhase::Upcoming);
+    }
+
+    /// 状态药丸：批量与单文件转写必须说两种话（旧写法两者都只说「正在转写…」）。
+    #[test]
+    fn status_pill_separates_batch_from_single() {
+        assert_eq!(
+            transcribe_status_pill(true, false, true),
+            StatusPill::Transcribing
+        );
+        assert_eq!(
+            transcribe_status_pill(true, true, true),
+            StatusPill::BatchTranscribing
+        );
+        assert_eq!(
+            transcribe_status_pill(false, false, true),
+            StatusPill::FileReady
+        );
+        assert_eq!(
+            transcribe_status_pill(false, false, false),
+            StatusPill::Idle
+        );
+
+        // 只有进行中两态走徽标
+        assert_eq!(
+            StatusPill::Transcribing.transcribing_label(),
+            Some("转写中…")
+        );
+        assert_eq!(
+            StatusPill::BatchTranscribing.transcribing_label(),
+            Some("批量转写中…")
+        );
+        assert_eq!(StatusPill::FileReady.transcribing_label(), None);
+        assert_eq!(StatusPill::Idle.transcribing_label(), None);
+    }
+
+    // ── 质检 / 修复 ────────────────────────────────────────────────────
+
+    /// 低置信判据全无置信度数据时说「未评估」；其余三类 0 句照常保留计数。
+    #[test]
+    fn quality_chip_label_marks_missing_confidence_as_unavailable() {
+        assert_eq!(
+            quality_chip_label(QualityCategory::LowConfidence, 0, true),
+            "低置信 未评估",
+            "一句都没带置信度时，「0 句」把「没测」说成了「通过」"
+        );
+        assert_eq!(
+            quality_chip_label(QualityCategory::LowConfidence, 0, false),
+            "低置信 0 句",
+            "有置信度数据、只是没命中：这才是「检查过，结果是 0」"
+        );
+        assert_eq!(
+            quality_chip_label(QualityCategory::LowConfidence, 3, false),
+            "低置信 3 句"
+        );
+        assert_eq!(
+            quality_chip_label(QualityCategory::Untranslated, 0, true),
+            "未翻译 0 句",
+            "能力缺口只对低置信成立，别的类别不受影响"
+        );
+    }
+
+    /// 分类判空只读分类对应的桶：同一句重复出现时不能因为去重而改变「有没有」的结论。
+    #[test]
+    fn category_has_issues_reads_buckets_without_cloning() {
+        let report = QualityReport {
+            low_confidence: vec![3],
+            glossary_violations: Vec::new(),
+            untranslated: vec![1, 1],
+            empty_or_short: Vec::new(),
+            confidence_scored: 2,
+            confidence_missing: 0,
+        };
+        assert!(category_has_issues(&report, QualityCategory::LowConfidence));
+        assert!(!category_has_issues(
+            &report,
+            QualityCategory::GlossaryViolation
+        ));
+        assert!(category_has_issues(&report, QualityCategory::Untranslated));
+        assert!(!category_has_issues(&report, QualityCategory::EmptyOrShort));
+    }
+
+    /// 「修复常见错误」快照缓存的两条性质：同键命中不重算且复用同一个 `Arc`，
+    /// 字幕版本或勾选规则一变必重算。
+    #[test]
+    fn cleanup_preview_cache_hits_same_key_and_rebuilds_on_change() {
+        let rules = CleanupRules::default();
+        let mut cache: Option<(CleanupPreviewKey, Arc<CleanupPreview>)> = None;
+        let builds = std::cell::Cell::new(0u32);
+        let make = |builds: &std::cell::Cell<u32>| {
+            builds.set(builds.get() + 1);
+            CleanupPreview {
+                plan: CleanupPlan::default(),
+                groups: Vec::new(),
+            }
+        };
+
+        let first = cleanup_preview_cached(&mut cache, (7, rules), || make(&builds));
+        let second = cleanup_preview_cached(&mut cache, (7, rules), || make(&builds));
+        assert_eq!(builds.get(), 1, "同一个键第二次取数不许重算");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "命中要复用同一个 Arc，而不是重新包一份"
+        );
+
+        let third = cleanup_preview_cached(&mut cache, (8, rules), || make(&builds));
+        assert_eq!(builds.get(), 2, "字幕版本变了必重算");
+        assert!(!Arc::ptr_eq(&second, &third));
+
+        let mut toggled = CleanupRules::default();
+        toggled.toggle(CleanupRule::ALL[0]);
+        assert_ne!(toggled, rules, "前提：这一下确实改了勾选");
+        let fourth = cleanup_preview_cached(&mut cache, (8, toggled), || make(&builds));
+        assert_eq!(builds.get(), 3, "规则变了命中清单就变了，必须重算");
+        assert!(!Arc::ptr_eq(&third, &fourth));
     }
 }

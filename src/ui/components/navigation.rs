@@ -13,8 +13,17 @@ use super::super::theme::Theme;
 use super::super::MainWindow;
 use crate::app::state::WorkspaceTab;
 
-/// 顶部导航标签的高度。略低于标题栏，上下留 2px 呼吸。
+/// 顶部导航标签的高度。标题栏 38px（`Theme::TITLEBAR_H`），标签在 `.items_center()`
+/// 居中的标题栏里上下各留 5px。
 const NAV_TAB_H: f32 = 28.0;
+
+/// 顶部导航选中指示条的**厚度**（横向底边条，量的是高度）。
+///
+/// 值沿用左侧竖栏时代的那一档（2px），但那个 token 的名字是「宽度」
+/// （`Theme::NAV_INDICATOR_W`）——当时那根指示条是竖的。换成横向标签后同一根条
+/// 转成了底边横条，于是它量的是高度；这里单独立名，免得 `h(px(NAV_INDICATOR_W))`
+/// 读起来像写错了维度。
+const NAV_INDICATOR_THICKNESS: f32 = Theme::NAV_INDICATOR_W;
 
 impl MainWindow {
     /// 渲染标题栏左侧的横向导航标签条（剪辑校对 / 语音转写 / 视频库 / 性能设置）。
@@ -125,7 +134,7 @@ impl MainWindow {
                     .left(px(Theme::SPACE_2))
                     .right(px(Theme::SPACE_2))
                     .bottom(px(0.0))
-                    .h(px(Theme::NAV_INDICATOR_W))
+                    .h(px(NAV_INDICATOR_THICKNESS))
                     .rounded_full()
                     .bg(Theme::accent_mint())
                     .into_any_element()
