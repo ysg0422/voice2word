@@ -118,7 +118,7 @@ $result.status; $result.output; $result.segments
 
 | 参数 | 作用 | 默认 |
 | --- | --- | --- |
-| `--format <格式>` | `srt` / `ass` / `vtt` / `json` / `txt` / `ttml` / `ttal` | `srt` |
+| `--format <格式>` | `srt` / `ass` / `vtt` / `json` / `txt` / `txt-ts` / `ttml` / `ttal` / `sbv` / `lrc`（`txt` 是纯文本，`txt-ts` 是每行带时间码的纯文本，两者扩展名都是 `.txt`） | `srt` |
 | `--lang, --language <代码>` | 源语言（`zh` / `en` / `ja` / `auto` …） | 取 `config.toml` 的 `pipeline.language` |
 | `--hotwords "张三,某品牌"` | 热词（人名、品牌、术语），合入识别提示词 | 取 `pipeline.asr_hotwords` |
 | `--translate <语言>` | 转写完成后翻译字幕（双语导出） | 不翻译 |
@@ -127,7 +127,8 @@ $result.status; $result.output; $result.segments
 | `--polish` | 强制开启润色/标点 | 取 `pipeline.enable_polish` |
 | `--diarize` / `--speakers 2-4` | 说话人分离与人数 | 取 `pipeline.enable_diarization` |
 | `--threads <数量>` | 推理线程数（超过本机逻辑核数自动收敛） | 取 `pipeline.whisper_threads` |
-| `--model <路径>` | 覆盖识别模型文件 | 取 `paths.whisper_model` |
+| `--model <路径>` | 覆盖识别模型文件（路径里含 `sensevoice` 即走 SenseVoice 引擎） | 取 `paths.whisper_model` |
+| `--engine <名称>` | `auto` / `whisper` / `sensevoice`；`auto` 在 whisper 模型不可用而 SenseVoice 就位时自动选后者 | `auto` |
 | `--resume` | 复用阶段产物断点续跑 | 关闭 |
 | `--artifact-dir <路径>` | 阶段产物目录（给出即开启落盘） | 仅 `--resume` 时回落 `<输入目录>\.voice2word-stages\<文件名>` |
 | `--dry-run` | 只回报将要执行的动作与输出路径，不真正转写 | 关闭 |
@@ -158,7 +159,7 @@ $result.status; $result.output; $result.segments
   "summary": "本机音视频转字幕工具：一次调用把一个音视频文件或整个目录转成字幕文件，可选翻译与润色。",
   "exit_codes": { "0": "成功", "1": "运行失败", "2": "参数错误" },
   "output_streams": { "stdout": "结果（--json 时为一行 JSON）", "stderr": "进度与诊断" },
-  "formats": ["srt", "ass", "vtt", "json", "txt", "ttml", "ttal"],
+  "formats": ["srt", "ass", "vtt", "json", "txt", "ttml", "ttal", "sbv", "lrc", "txt-ts"],
   "policy": {
     "allowed_tools": ["transcribe", "transcribe_batch"],
     "allowed_roots": "默认：当前工作目录、命令行输入所在目录、--output 的父目录；用 --allow-root <目录> 追加",
@@ -182,14 +183,14 @@ $result.status; $result.output; $result.segments
   "tools": [
     {
       "name": "transcribe",
-      "description": "把单个音视频文件转成字幕文件（srt/ass/vtt/json/txt/ttml/ttal），可选翻译与润色。",
+      "description": "把单个音视频文件转成字幕文件（srt/ass/vtt/json/txt/ttml/ttal/sbv/lrc/txt-ts），可选翻译与润色。",
       "command": "voice2word run --json --input <input> [--format <format>] …",
       "parameters": {
         "type": "object",
         "properties": {
           "input": { "type": "string", "description": "音视频文件路径" },
           "output": { "type": "string" },
-          "format": { "type": "string", "enum": ["srt", "ass", "vtt", "json", "txt", "ttml", "ttal"], "default": "srt" },
+          "format": { "type": "string", "enum": ["srt", "ass", "vtt", "json", "txt", "ttml", "ttal", "sbv", "lrc", "txt-ts"], "default": "srt" },
           "language": { "type": "string" },
           "translate": { "type": "string" },
           "polish": { "type": "boolean" },

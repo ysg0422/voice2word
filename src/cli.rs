@@ -2178,6 +2178,8 @@ fn transcribe_tool_definition() -> serde_json::Value {
                     "translate": { "type": "string", "description": "翻译目标语言，如 English / 日本語 / 简体中文" },
                     "polish": { "type": "boolean", "description": "是否开启润色与标点恢复" },
                     "hotwords": { "type": "string", "description": "逗号分隔的热词（人名、品牌、专业术语）" },
+                    "glossary": { "type": "string", "description": "术语表覆盖，形如 `原文=译文`，多条用逗号/分号/换行分隔" },
+                    "engine": { "type": "string", "enum": ["auto", "whisper", "sensevoice"], "default": "auto", "description": "识别引擎；auto 会在默认引擎不可用时自动选可用的那个" },
                     "speakers": { "type": "integer", "minimum": 2, "maximum": 4, "description": "说话人数，给出即开启说话人分离" },
                     "resume": { "type": "boolean", "description": "复用已有阶段产物断点续跑" }
                 },
@@ -2208,7 +2210,7 @@ fn tool_definitions() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "transcribe_batch",
             "description": "把一个目录里的音视频批量转成字幕文件；逐文件结果在 items 数组里。",
-            "command": "voice2word run --json --input <目录> [--recursive] [--output <输出目录>] [--format <format>]",
+            "command": "voice2word run --json --input <目录> [--recursive] [--output <输出目录>] [--format <format>] [--engine <auto|whisper|sensevoice>]",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2219,7 +2221,13 @@ fn tool_definitions() -> Vec<serde_json::Value> {
                     "language": { "type": "string" },
                     "translate": { "type": "string" },
                     "polish": { "type": "boolean" },
-                    "hotwords": { "type": "string" }
+                    "hotwords": { "type": "string" },
+                    "glossary": { "type": "string" },
+                    "engine": {
+                        "type": "string",
+                        "enum": ["auto", "whisper", "sensevoice"],
+                        "default": "auto"
+                    }
                 },
                 "required": ["input"],
                 "additionalProperties": false
