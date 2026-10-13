@@ -327,21 +327,44 @@ fn run_installer() {
     }
 
     // 7. 注册 Windows 控制面板卸载项 (当前用户)
-    let reg_cmd = format!(
-        "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{app}\" /v \"DisplayName\" /d \"{app} (音视频智能字幕生成器)\" /f >nul && \
-         reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{app}\" /v \"DisplayVersion\" /d \"{ver}\" /f >nul && \
-         reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{app}\" /v \"Publisher\" /d \"Voice2Word Team\" /f >nul && \
-         reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{app}\" /v \"InstallLocation\" /d \"{dir}\" /f >nul && \
-         reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{app}\" /v \"UninstallString\" /d \"\\\"{uninst}\\\"\" /f >nul",
-        app = APP_NAME,
-        ver = APP_VERSION,
-        dir = install_dir.display(),
-        uninst = uninstall_bat.display(),
-    );
-    match Command::new("cmd").args(["/c", &reg_cmd]).status() {
-        Ok(status) if status.success() => {}
-        Ok(status) => warnings.push(format!("注册控制面板卸载项返回非零退出码：{status}")),
-        Err(e) => warnings.push(format!("注册控制面板卸载项失败：{e}")),
+    //
+    // # 为什么不再拼一条 `cmd /c reg add ... && ...`
+    //
+    // 安装目录是**用户自己选的**。以前把路径内插进一条 cmd 字符串、用双引号包裹，
+    // 而 cmd 的双引号**挡不住 `%` 展开**：装到形如 `D:\100%\app` 的目录时，注册表里的
+    // 卸载路径会变成展开后的别的字符串；路径里若含 `"`，还会直接把命令结构拆坏。
+    // 现在改成逐项调用 `reg.exe`（参数数组、不经 shell）：键与值都是独立 argv，
+    // 没有解析层需要绕过——与「媒体管线一律逐参传」同一条经验。
+    let uninstall_key =
+        format!("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_NAME}");
+    let registry_entries: [(&str, String); 5] = [
+        ("DisplayName", format!("{APP_NAME} (音视频智能字幕生成器)")),
+        ("DisplayVersion", APP_VERSION.to_string()),
+        ("Publisher", "Voice2Word Team".to_string()),
+        ("InstallLocation", install_dir.display().to_string()),
+        // 卸载串必须自带引号：控制面板会把它当命令行执行，路径含空格时不加引号会断。
+        (
+            "UninstallString",
+            format!("\"{}\"", uninstall_bat.display()),
+        ),
+    ];
+    for (name, value) in registry_entries {
+        match Command::new("reg")
+            .args(["add", &uninstall_key, "/v", name, "/d", &value, "/f"])
+            .output()
+        {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => warnings.push(format!(
+                "注册控制面板卸载项 {name} 失败：{}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => {
+                // 连 `reg.exe` 都起不来（PATH 里没有、被策略拦），后面几条必然同样失败，
+                // 报一条就够，不要把同一个原因重复五遍。
+                warnings.push(format!("注册控制面板卸载项失败：{e}"));
+                break;
+            }
+        }
     }
 
     // 8. 询问是否立即启动
