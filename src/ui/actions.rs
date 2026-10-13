@@ -1425,14 +1425,61 @@ impl MainWindow {
         outcome: &crate::utils::media_scan::ScanOutcome,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        let added = self.state.enqueue_files(outcome.files.clone());
+        // 超大素材先过一道体检。几十 GB / 几十小时的素材会把抽帧缓存、波形、切块
+        // 临时目录一起撑起来，而用户是在半小时后才看到「界面没反应」。所以：
+        // 超过硬上限的**不入队**并说明原因，偏大的照常入队但把代价讲在前面。
+        // 这里只用文件体积判断——拖入那一刻还没探时长，体积是最便宜的先手。
+        let mut accepted: Vec<PathBuf> = Vec::with_capacity(outcome.files.len());
+        let mut refused: Vec<String> = Vec::new();
+        let mut warned: Option<String> = None;
+        for path in &outcome.files {
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            match crate::utils::media_scan::assess_media_load(size, 0.0) {
+                crate::utils::media_scan::MediaLoadAdvice::Ok => accepted.push(path.clone()),
+                crate::utils::media_scan::MediaLoadAdvice::Warn(msg) => {
+                    if warned.is_none() {
+                        warned = Some(msg);
+                    }
+                    accepted.push(path.clone());
+                }
+                crate::utils::media_scan::MediaLoadAdvice::Refuse(msg) => {
+                    refused.push(format!(
+                        "{}（{msg}）",
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.display().to_string())
+                    ));
+                }
+            }
+        }
+
+        let added = self.state.enqueue_files(accepted);
         if added == 0 {
+            // 一个都没入队且都被体积挡下：提示要直接给出原因，别退回「没找到文件」。
+            if !refused.is_empty() {
+                return Some(refused.join("；"));
+            }
             return None;
         }
         info!("批量队列新增 {} 个文件", added);
         self.state.active_tab = WorkspaceTab::Generate;
         self.probe_queue_durations(cx);
-        Some(Self::ingest_summary(added, outcome))
+        let summary = Self::ingest_summary(added, outcome);
+        Some(match (refused.is_empty(), warned) {
+            (true, None) => summary,
+            (true, Some(w)) => format!("{summary}；{w}"),
+            (false, w) => {
+                let base = format!(
+                    "{summary}；已跳过 {} 个超大文件：{}",
+                    refused.len(),
+                    refused.join("；")
+                );
+                match w {
+                    Some(w) => format!("{base}；{w}"),
+                    None => base,
+                }
+            }
+        })
     }
 
     /// 一个文件都没收到时，把「为什么」拼成可操作的中文提示。
