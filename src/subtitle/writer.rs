@@ -688,7 +688,7 @@ fn escape_ass_text(text: &str) -> String {
 /// 观众反而更难看全。两行是短横屏与竖屏都能稳定容纳的排版；内容真的塞不下
 /// 时 [wrap_text_capped] 会继续往下切，这里的上限不影响完整性。
 const WRAP_MAX_LINES: usize = 2;
-/// [`wrap_text`] 的带行数上限版本：单行不超过 `max_chars`，且连折不超过
+/// 文本折行：单行不超过 `max_chars`，且连折不超过
 /// `max_lines` 行（塞不进时才继续切）。
 ///
 /// 为什么存在：一条字幕折成四五行会盖掉小半个画面。用户配「每行 N 字」的
@@ -704,7 +704,7 @@ fn wrap_text_capped(text: &str, max_chars: usize, max_lines: usize) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-/// [`wrap_line`] 的带行数上限版本：`max_lines` 之后不再切分。
+/// 单行折行：`max_lines` 是「不主动多切」的上限，不是硬截断。
 ///
 /// 为什么要有上限：一条字幕折成四五行会盖掉小半个画面，远不如「两行塞满」
 /// 好读；用户真正在意的是「别冒到画面正中」，而不是每行都短。上限只是**不
@@ -753,6 +753,12 @@ fn canonical_start(chars: &[char], mut idx: usize) -> usize {
     idx
 }
 
+/// 把候选断点重新分配给 k 行：每行不超过 max_chars，且切完剩下的字
+/// 仍能塞进剩余行数（先保证填得下，再谈均衡，否则会留下排不下的孤行）。
+/// 任何一步找不到可行断点就原样返回候选，由调用方退回贪心排版，绝不丢内容。
+/// 把候选断点重新分配给 `k` 行：每行不超过 `max_chars`，且切完剩下的字
+/// 仍能塞进剩余行数（先保证填得下，再谈均衡，否则会留下排不下的孤行）。
+/// 任何一步找不到可行断点就原样返回候选，由调用方退回贪心排版，绝不丢内容。
 fn distribute_breaks(
     chars: &[char],
     candidates: &[usize],
