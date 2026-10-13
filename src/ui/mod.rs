@@ -227,13 +227,73 @@ pub enum PaletteCommand {
     ExportQcSheet,
     /// 导出诊断报告
     ExportDiagnostics,
+    /// 把当前选中句拆成前后两段（剪辑台）
+    SplitSegment,
+    /// 把当前选中句与下一句合并（剪辑台）
+    MergeWithNext,
+    /// 清空当前选中句的译文（剪辑台）
+    ClearTranslation,
+    /// 按当前勾选应用一键清理规则（剪辑台）
+    ApplyCleanup,
+    /// 用当前选中的规则集替换全部句（剪辑台）
+    ApplyReplaceRuleSet,
+    /// 导出当前选中句为视频片段（剪辑台）
+    ExportSelectedClip,
+    /// 导出当前选中句为音频片段（剪辑台）
+    ExportSelectedClipAudio,
+    /// 整轨后移 1 秒（剪辑台重定时）
+    ShiftTrackForward,
+    /// 整轨前移 1 秒（剪辑台重定时）
+    ShiftTrackBackward,
+    /// 把整轨时间轴铺满媒体总时长（剪辑台重定时）
+    FitTrackToMedia,
+    /// 按默认间隔消除相邻字幕相贴（剪辑台重定时）
+    ApplyMinGap,
 }
 
-/// 命令面板里一条命令的展示信息。
+/// 命令面板可用性判据的输入快照。
+///
+/// 只装「判据真正要看的那几个状态位」，不塞进整个 `AppState`：判据因此能脱开 GPUI
+/// 与数据库单测（见 `mod tests`），新增判据时也一眼看得出它依赖哪些状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteContext {
+    /// 当前工作区页签
+    pub active_tab: WorkspaceTab,
+    /// 正在转写
+    pub processing: bool,
+    /// 已选定待转写媒体
+    pub has_source_file: bool,
+    /// 有字幕片段
+    pub has_segments: bool,
+    /// 正在翻译
+    pub translating: bool,
+    /// 可以撤销
+    pub can_undo: bool,
+    /// 可以重做
+    pub can_redo: bool,
+    /// 选中了某一句
+    pub has_selection: bool,
+    /// 选中句可拆分（可见文本长度 > 1）
+    pub selection_splittable: bool,
+    /// 选中句后面还有下一句（可合并）
+    pub selection_has_next: bool,
+    /// 选中句有译文（可清除）
+    pub selection_has_translation: bool,
+    /// 已选中一个替换规则集
+    pub has_replace_rule_set: bool,
+    /// 已打开媒体文件（片段导出需要源文件）
+    pub has_media_file: bool,
+    /// 片段导出空闲（正在导出时两条片段命令置灰）
+    pub clip_export_idle: bool,
+}
+
+/// 命令面板里一条命令的注册项：展示信息 + **自带**的可用性判据。
 ///
 /// `zh` / `en` 都参与搜索：中文用户按「导出」找，英文习惯的用户按 `export` 找，
 /// 只认一种别名就会有一半人搜不到。`hint` 是右侧的键位提示，没有独立键位的命令留空。
-pub struct PaletteCommandSpec {
+/// `available` 是**纯函数指针**：判据只读 [`PaletteContext`]，所以在无 GUI 的单测里
+/// 能直接调（见 `mod tests`）；判据与命令写在同一条注册项里，新增命令时不会漏。
+pub struct PaletteActionSpec {
     pub command: PaletteCommand,
     /// 中文名
     pub zh: &'static str,
@@ -241,102 +301,203 @@ pub struct PaletteCommandSpec {
     pub en: &'static str,
     /// 右侧键位提示；空串表示这条命令只有面板入口
     pub hint: &'static str,
+    /// 当前是否可用：不可用时面板里置灰（不隐藏）
+    pub available: fn(&PaletteContext) -> bool,
 }
 
-/// 命令面板的命令集。
+/// 命令面板的命令注册表：**唯一事实来源**。
 ///
-/// 每条命令都直接复用 `MainWindow` 上已有的方法（见 `run_palette_command`），
-/// 这里只做「名字 → 已有入口」的映射，不重写任何业务逻辑。
-pub const PALETTE_COMMANDS: [PaletteCommandSpec; 15] = [
-    PaletteCommandSpec {
+/// 面板清单（[`filter_commands`]）、可用性（[`PaletteActionSpec::available`]）与执行
+/// （`run_palette_command`）都以这张表为准——不再有「清单在一处、可用性在另一处」的
+/// 漂移。每条命令都只复用 `MainWindow` 上已有的方法，这里不写业务逻辑。
+/// 数组顺序即面板顺序；剪辑台那批命令追加在基础命令之后。
+pub const PALETTE_ACTIONS: [PaletteActionSpec; 26] = [
+    PaletteActionSpec {
         command: PaletteCommand::OpenFile,
         zh: "打开文件",
         en: "open file",
         hint: "",
+        available: |_: &PaletteContext| true,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::StartTranscription,
         zh: "开始转写",
         en: "start transcription",
         hint: "Ctrl+Enter",
+        available: |ctx: &PaletteContext| !ctx.processing && ctx.has_source_file,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::CancelTranscription,
         zh: "终止转写",
         en: "stop transcription",
         hint: "Esc",
+        available: |ctx: &PaletteContext| ctx.processing,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::ExportCurrentFormat,
         zh: "导出（当前格式）",
         en: "export subtitle",
         hint: "Ctrl+E",
+        available: |ctx: &PaletteContext| ctx.has_segments,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::StartTranslation,
         zh: "开始翻译",
         en: "start translation",
         hint: "",
+        available: |ctx: &PaletteContext| ctx.has_segments && !ctx.translating,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::CancelTranslation,
         zh: "取消翻译",
         en: "cancel translation",
         hint: "",
+        available: |ctx: &PaletteContext| ctx.translating,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::SwitchToEditor,
         zh: "切到剪辑校对",
         en: "editor tab",
         hint: "",
+        available: |ctx: &PaletteContext| ctx.active_tab != WorkspaceTab::Editor,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::SwitchToGenerate,
         zh: "切到语音转写",
         en: "transcribe tab",
         hint: "",
+        available: |ctx: &PaletteContext| ctx.active_tab != WorkspaceTab::Generate,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::SwitchToLibrary,
         zh: "切到视频库",
         en: "library tab",
         hint: "",
+        available: |ctx: &PaletteContext| ctx.active_tab != WorkspaceTab::Library,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::SwitchToPerformance,
         zh: "切到性能设置",
         en: "performance tab",
         hint: "",
+        available: |ctx: &PaletteContext| ctx.active_tab != WorkspaceTab::Performance,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::Undo,
         zh: "撤销",
         en: "undo",
         hint: "Ctrl+Z",
+        available: |ctx: &PaletteContext| ctx.can_undo,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::Redo,
         zh: "重做",
         en: "redo",
         hint: "Ctrl+Y",
+        available: |ctx: &PaletteContext| ctx.can_redo,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::OpenReplace,
         zh: "查找替换",
         en: "find replace",
         hint: "Ctrl+H",
+        available: |ctx: &PaletteContext| ctx.has_segments,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::ExportQcSheet,
         zh: "导出质检表",
         en: "export qc review sheet",
         hint: "",
+        available: |ctx: &PaletteContext| ctx.has_segments,
     },
-    PaletteCommandSpec {
+    PaletteActionSpec {
         command: PaletteCommand::ExportDiagnostics,
         zh: "导出诊断报告",
         en: "export diagnostics",
         hint: "",
+        // 诊断报告不看字幕——环境坏了、连字幕都没有的时候，恰恰最需要它。
+        available: |_: &PaletteContext| true,
+    },
+    PaletteActionSpec {
+        command: PaletteCommand::SplitSegment,
+        zh: "拆分当前句",
+        en: "split segment",
+        hint: "",
+        available: |ctx: &PaletteContext| ctx.has_selection && ctx.selection_splittable,
+    },
+    PaletteActionSpec {
+        command: PaletteCommand::MergeWithNext,
+        zh: "合并下句",
+        en: "merge with next",
+        hint: "",
+        available: |ctx: &PaletteContext| ctx.has_selection && ctx.selection_has_next,
+    },
+    PaletteActionSpec {
+        command: PaletteCommand::ClearTranslation,
+        zh: "清除当前句译文",
+        en: "clear translation",
+        hint: "",
+        available: |ctx: &PaletteContext| ctx.has_selection && ctx.selection_has_translation,
+    },
+    PaletteActionSpec {
+        command: PaletteCommand::ApplyCleanup,
+        zh: "应用清理规则",
+        en: "apply cleanup",
+        hint: "",
+        available: |ctx: &PaletteContext| ctx.has_segments,
+    },
+    PaletteActionSpec {
+        command: PaletteCommand::ApplyReplaceRuleSet,
+        zh: "应用替换规则集（全部句）",
+        en: "apply replace rules",
+        hint: "",
+        available: |ctx: &PaletteContext| ctx.has_segments && ctx.has_replace_rule_set,
+    },
+    PaletteActionSpec {
+        command: PaletteCommand::ExportSelectedClip,
+        zh: "导出当前句片段",
+        en: "export clip",
+        hint: "",
+        available: |ctx: &PaletteContext| {
+            ctx.has_selection && ctx.has_media_file && ctx.clip_export_idle
+        },
+    },
+    PaletteActionSpec {
+        command: PaletteCommand::ExportSelectedClipAudio,
+        zh: "导出当前句音频",
+        en: "export clip audio",
+        hint: "",
+        available: |ctx: &PaletteContext| {
+            ctx.has_selection && ctx.has_media_file && ctx.clip_export_idle
+        },
+    },
+    PaletteActionSpec {
+        command: PaletteCommand::ShiftTrackForward,
+        zh: "整轨后移 1 秒",
+        en: "shift track forward",
+        hint: "",
+        available: |ctx: &PaletteContext| ctx.has_segments,
+    },
+    PaletteActionSpec {
+        command: PaletteCommand::ShiftTrackBackward,
+        zh: "整轨前移 1 秒",
+        en: "shift track backward",
+        hint: "",
+        available: |ctx: &PaletteContext| ctx.has_segments,
+    },
+    PaletteActionSpec {
+        command: PaletteCommand::FitTrackToMedia,
+        zh: "铺满媒体总时长",
+        en: "fit track to media",
+        hint: "",
+        available: |ctx: &PaletteContext| ctx.has_segments,
+    },
+    PaletteActionSpec {
+        command: PaletteCommand::ApplyMinGap,
+        zh: "应用句间最小间隔",
+        en: "apply min gap",
+        hint: "",
+        available: |ctx: &PaletteContext| ctx.has_segments,
     },
 ];
 
@@ -349,7 +510,7 @@ pub struct CommandPaletteState {
     pub(crate) query: String,
     /// 搜索框光标（字符下标，非字节）
     pub(crate) cursor: usize,
-    /// 结果列表里的选中行号（不是 `PALETTE_COMMANDS` 的下标）
+    /// 结果列表里的选中行号（不是 `PALETTE_ACTIONS` 的下标）
     pub(crate) selected: usize,
     /// 搜索框的焦点句柄；面板关闭时随之丢弃
     pub(crate) focus: FocusHandle,
@@ -360,7 +521,7 @@ pub struct CommandPaletteState {
 /// 命令面板结果列表的最大高度：超过就滚动，避免十几条命令把面板撑满整屏。
 const COMMAND_PALETTE_LIST_H: f32 = 280.0;
 
-/// 按查询词过滤命令面板条目，返回 [`PALETTE_COMMANDS`] 里的下标序列。
+/// 按查询词过滤命令面板条目，返回 [`PALETTE_ACTIONS`] 里的下标序列。
 ///
 /// 纯函数（不读 `MainWindow` / `AppState`），所以可以直接单测。规则：
 /// - 空查询（含纯空白）返回全部，方便用户先看一眼有什么；
@@ -371,9 +532,9 @@ const COMMAND_PALETTE_LIST_H: f32 = 280.0;
 fn filter_commands(query: &str) -> Vec<usize> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
-        return (0..PALETTE_COMMANDS.len()).collect();
+        return (0..PALETTE_ACTIONS.len()).collect();
     }
-    PALETTE_COMMANDS
+    PALETTE_ACTIONS
         .iter()
         .enumerate()
         .filter(|(_, spec)| {
@@ -2027,47 +2188,51 @@ impl MainWindow {
         self.command_palette.is_some() || self.shortcuts_help_open
     }
 
-    /// 命令面板里当前是否还有可用的命令（供状态置灰与 Enter 判定复用）。
+    /// 采集一份 [`PaletteContext`]：判据需要的状态位都在这里集中读取。
     ///
-    /// 只读 `AppState` 上已有的状态位，不引入新的状态字段——面板只是「换个入口」
-    /// 去调已有的方法，可用性判断必须和界面上那些按钮一致。
-    fn palette_command_enabled(&self, command: PaletteCommand) -> bool {
-        match command {
-            // 打开文件与切主题没有任何前置条件
-            PaletteCommand::OpenFile => true,
-            // 与 `shortcuts::StartTranscription` 的挂载点同一套判断
-            PaletteCommand::StartTranscription => {
-                !matches!(self.state.status, ProcessStatus::Processing { .. })
-                    && self.state.transcribe_file.is_some()
-            }
-            // 与 `request_cancel_processing` 的首行守卫一致
-            PaletteCommand::CancelTranscription => {
-                matches!(self.state.status, ProcessStatus::Processing { .. })
-            }
-            // 与 `perform_editor_export` 的守卫一致
-            PaletteCommand::ExportCurrentFormat => !self.state.segments.is_empty(),
-            // 与 `trigger_llm_translation` 的守卫一致
-            PaletteCommand::StartTranslation => {
-                !self.state.segments.is_empty() && !self.state.is_translating
-            }
-            // 与 `cancel_llm_translation` 的守卫一致
-            PaletteCommand::CancelTranslation => self.state.is_translating,
-            // 已经在这一页时不再重复切换，避免命令面板成了「无操作入口」
-            PaletteCommand::SwitchToEditor => self.state.active_tab != WorkspaceTab::Editor,
-            PaletteCommand::SwitchToGenerate => self.state.active_tab != WorkspaceTab::Generate,
-            PaletteCommand::SwitchToLibrary => self.state.active_tab != WorkspaceTab::Library,
-            PaletteCommand::SwitchToPerformance => {
-                self.state.active_tab != WorkspaceTab::Performance
-            }
-            PaletteCommand::Undo => self.state.can_undo(),
-            PaletteCommand::Redo => self.state.can_redo(),
-            // 「查找替换」要切到剪辑台并展开面板：没有字幕时无事可做，置灰。
-            PaletteCommand::OpenReplace => !self.state.segments.is_empty(),
-            // 两个导出都产出「当前字幕的衍生文件」：没字幕就没内容可导。
-            PaletteCommand::ExportQcSheet => !self.state.segments.is_empty(),
-            // 诊断报告不看字幕——环境坏了、连字幕都没有的时候，恰恰最需要它。
-            PaletteCommand::ExportDiagnostics => true,
+    /// 判据本身是纯函数（见 [`PaletteActionSpec::available`]），这里只负责把 `AppState`
+    /// 上的状态位照原样搬过去，不参与任何判断，避免「界面按钮看一个条件、面板看另一个」。
+    fn palette_context(&self) -> PaletteContext {
+        let selected_pos = self.state.selected_segment_index.and_then(|index| {
+            self.state
+                .segments
+                .iter()
+                .position(|seg| seg.index == index)
+        });
+        let selected = selected_pos.and_then(|pos| self.state.segments.get(pos));
+        PaletteContext {
+            active_tab: self.state.active_tab,
+            processing: matches!(self.state.status, ProcessStatus::Processing { .. }),
+            has_source_file: self.state.transcribe_file.is_some(),
+            has_segments: !self.state.segments.is_empty(),
+            translating: self.state.is_translating,
+            can_undo: self.state.can_undo(),
+            can_redo: self.state.can_redo(),
+            has_selection: selected.is_some(),
+            selection_splittable: selected
+                .is_some_and(|seg| seg.display_text().chars().count() > 1),
+            selection_has_next: selected_pos.is_some_and(|pos| pos + 1 < self.state.segments.len()),
+            selection_has_translation: selected.is_some_and(|seg| seg.has_translation()),
+            has_replace_rule_set: self
+                .replace_rule_selected
+                .is_some_and(|pos| pos < self.replace_rule_sets.len()),
+            has_media_file: self.state.selected_file.is_some(),
+            clip_export_idle: !crate::ui::actions::CLIP_EXPORT_BUSY
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// 命令面板里这条命令当前是否可用。
+    ///
+    /// 判据来自注册表（[`PaletteActionSpec::available`]）：命令与它的可用条件写在同一条
+    /// 注册项里，新增命令时不会出现「界面加了、判据忘了」。注册表里查不到时返回 `false`
+    /// （安全侧：宁可不给入口，也不放行一条没有判据的命令）。
+    fn palette_command_enabled(&self, command: PaletteCommand) -> bool {
+        let ctx = self.palette_context();
+        PALETTE_ACTIONS
+            .iter()
+            .find(|spec| spec.command == command)
+            .is_some_and(|spec| (spec.available)(&ctx))
     }
 
     /// 执行一条命令面板命令。
@@ -2075,6 +2240,9 @@ impl MainWindow {
     /// 每个分支都只调用 `MainWindow` 上已有的方法（与对应按钮/快捷键完全同源），
     /// 因此这里没有任何业务逻辑，也不该长出业务逻辑——新增命令时若发现需要在这里
     /// 写判断，说明缺的是 `actions.rs` 里的一个方法，而不是面板里的一段代码。
+    ///
+    /// 唯一的例外是整轨重定时的两条固定预设（±1 秒 / 铺满）：剪辑台那两个入口是
+    /// 私有方法，命令面板复用同一份 `subtitle::timing` 纯函数，参数写死（面板没有滑条）。
     fn run_palette_command(&mut self, command: PaletteCommand, cx: &mut Context<Self>) {
         if !self.palette_command_enabled(command) {
             // 置灰命令被 Enter/点击触发时什么都不做，也不收起面板：
@@ -2131,7 +2299,117 @@ impl MainWindow {
                 self.export_review_sheet(crate::subtitle::qc::QcFormat::Csv, cx)
             }
             PaletteCommand::ExportDiagnostics => self.export_diagnostics(cx),
+            // ── 剪辑台动作：与剪辑台里的按钮/入口走同一批方法，不另写业务逻辑 ──
+            PaletteCommand::SplitSegment => {
+                // `None`：命令面板没有「光标位置」概念，按中点劈开（与剪辑台未定位光标时一致）。
+                self.state.split_selected_segment(None);
+                self.trigger_extract_frame(cx);
+            }
+            PaletteCommand::MergeWithNext => {
+                self.state.merge_selected_with_next();
+                self.trigger_extract_frame(cx);
+            }
+            PaletteCommand::ClearTranslation => self.state.set_selected_translation(""),
+            PaletteCommand::ApplyCleanup => {
+                self.state.apply_cleanup();
+            }
+            PaletteCommand::ApplyReplaceRuleSet => {
+                self.apply_selected_replace_rule_set(ReplaceRuleScope::AllSegments, cx)
+            }
+            PaletteCommand::ExportSelectedClip => self.export_selected_clip(cx),
+            PaletteCommand::ExportSelectedClipAudio => self.export_selected_clip_audio(cx),
+            PaletteCommand::ShiftTrackForward => self.apply_track_shift(
+                crate::subtitle::timing::TimeShift::ShiftAll { delta: 1.0 },
+                cx,
+            ),
+            PaletteCommand::ShiftTrackBackward => self.apply_track_shift(
+                crate::subtitle::timing::TimeShift::ShiftAll { delta: -1.0 },
+                cx,
+            ),
+            PaletteCommand::FitTrackToMedia => {
+                let target_secs = self.state.total_duration;
+                self.apply_track_shift(
+                    crate::subtitle::timing::TimeShift::FitToDuration { target_secs },
+                    cx,
+                )
+            }
+            PaletteCommand::ApplyMinGap => self.apply_default_min_gap(cx),
         }
+        cx.notify();
+    }
+
+    /// 命令面板的整轨重定时入口：把 `shift` 应用到整条时间轴。
+    ///
+    /// 写回步骤与剪辑台的整轨变换同源（记撤销快照 → 自纠重叠 → 置脏 → 递增修订号
+    /// → 落库 → 清派生缓存键 → 给提示），但参数是**固定的预设**：命令面板没有滑条可拖，
+    /// 只能给明确的「±1 秒 / 铺满」。无变动时不压撤销点，免得空操作占掉一层 `Ctrl+Z`。
+    fn apply_track_shift(
+        &mut self,
+        shift: crate::subtitle::timing::TimeShift,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::subtitle::timing::{plan_retime, resolve_overlaps};
+        if self.state.segments.is_empty() {
+            return;
+        }
+        let plan = plan_retime(&self.state.segments, shift);
+        if plan.changed == 0 && !plan.overlaps {
+            self.notice = Some("整轨时间轴无需调整".to_string());
+            cx.notify();
+            return;
+        }
+        self.state.snapshot_for_undo();
+        let resolved = resolve_overlaps(&plan.times);
+        for (seg, (start, end)) in self.state.segments.iter_mut().zip(resolved) {
+            seg.start = start;
+            seg.end = end;
+        }
+        // 改的是 `segments`，必须置脏才会落库（`bump_segments_revision` 只驱动清单缓存失效）。
+        self.state.segments_dirty = true;
+        self.state.bump_segments_revision();
+        self.state.flush_segments_if_dirty();
+        // 时间轴变了：波形/监视器的定位与质检缓存都要跟着重算。
+        self.subtitle_filter_key = None;
+        self.notice = Some(format!(
+            "已调整整轨时间轴（{} 句变动{}）",
+            plan.changed,
+            if plan.overlaps {
+                "，重叠已压平"
+            } else {
+                ""
+            }
+        ));
+        cx.notify();
+    }
+
+    /// 命令面板的「句间最小间隔」入口：用默认间隔（40ms）消除相邻字幕相贴。
+    ///
+    /// 与 [`MainWindow::apply_track_shift`] 同源的写回口径；命中为 0 时不压撤销点。
+    fn apply_default_min_gap(&mut self, cx: &mut Context<Self>) {
+        use crate::subtitle::timing::{plan_min_gaps, DEFAULT_MIN_GAP_SECS};
+        if self.state.segments.is_empty() {
+            return;
+        }
+        let plan = plan_min_gaps(&self.state.segments, DEFAULT_MIN_GAP_SECS);
+        if plan.changed == 0 && plan.shortened == 0 {
+            self.notice = Some("相邻字幕间隔已满足，无需调整".to_string());
+            cx.notify();
+            return;
+        }
+        let changed = plan.changed;
+        let shortened = plan.shortened;
+        self.state.snapshot_for_undo();
+        for (seg, (start, end)) in self.state.segments.iter_mut().zip(plan.times) {
+            seg.start = start;
+            seg.end = end;
+        }
+        self.state.segments_dirty = true;
+        self.state.bump_segments_revision();
+        self.state.flush_segments_if_dirty();
+        self.subtitle_filter_key = None;
+        self.notice = Some(format!(
+            "已应用句间最小间隔（{changed} 句起点后移，{shortened} 句收短）"
+        ));
         cx.notify();
     }
 
@@ -2167,7 +2445,7 @@ impl MainWindow {
             cx.notify();
             return;
         };
-        let command = PALETTE_COMMANDS[index].command;
+        let command = PALETTE_ACTIONS[index].command;
         self.run_palette_command(command, cx);
     }
 
@@ -2194,14 +2472,15 @@ impl MainWindow {
             None => (String::new(), 0, 0, cx.focus_handle(), ScrollHandle::new()),
         };
         let is_focused = focus.contains_focused(window, cx);
-        // 名字过滤是纯函数（见 `filter_commands`，有单测）；状态过滤在这里做，
-        // 因为「哪条命令当前可用」要读 `AppState`，抽不进纯函数。
+        // 名字过滤与可用性判据都是纯函数（见 `filter_commands` 与
+        // `PaletteActionSpec::available`，都有单测）；这里只负责把状态搬进判据，
+        // 不可用的命令**照常显示**、置灰，而不是从列表里消失。
         let entries: Vec<(usize, bool)> = filter_commands(&query)
             .into_iter()
             .map(|index| {
                 (
                     index,
-                    self.palette_command_enabled(PALETTE_COMMANDS[index].command),
+                    self.palette_command_enabled(PALETTE_ACTIONS[index].command),
                 )
             })
             .collect();
@@ -2284,7 +2563,7 @@ impl MainWindow {
             .gap(px(Theme::SPACE_0_5))
             .track_scroll(&scroll)
             .children(entries.iter().enumerate().map(|(row, &(index, enabled))| {
-                let spec = &PALETTE_COMMANDS[index];
+                let spec = &PALETTE_ACTIONS[index];
                 let command = spec.command;
                 let is_sel = row == selected;
                 let title_color = if !enabled {
@@ -3379,9 +3658,10 @@ mod tests {
         normalize_search_needle, remove_replace_rule_set, replace_rule_sets_from_json,
         replace_rule_sets_to_json, save_replace_rule_sets, should_ignore_delete_in_status,
         timeline_visible_positions, translated_other_lang_count, upsert_replace_rule_set,
-        DerivedSnapshot, DerivedSnapshotKey, GlossaryBadCache, GlossaryFingerprint, ReplaceRule,
-        ReplaceRuleSet, SubtitleSearchCache, PALETTE_COMMANDS,
+        DerivedSnapshot, DerivedSnapshotKey, GlossaryBadCache, GlossaryFingerprint, PaletteCommand,
+        PaletteContext, ReplaceRule, ReplaceRuleSet, SubtitleSearchCache, PALETTE_ACTIONS,
     };
+    use crate::app::state::WorkspaceTab;
     /// 崩溃横幅那句话要同时说清「发生了什么」与「去哪拿堆栈」。
     ///
     /// 回归护栏：这里以前写「导出诊断可一并附上日志」，而诊断报告里并没有日志正文
@@ -3435,9 +3715,9 @@ mod tests {
     /// 有哪些命令，再决定搜什么。
     #[test]
     fn empty_query_lists_every_command() {
-        assert_eq!(filter_commands("").len(), PALETTE_COMMANDS.len());
+        assert_eq!(filter_commands("").len(), PALETTE_ACTIONS.len());
         // 纯空白等价于空查询：面板里多敲了几个空格不该把列表清空
-        assert_eq!(filter_commands("   ").len(), PALETTE_COMMANDS.len());
+        assert_eq!(filter_commands("   ").len(), PALETTE_ACTIONS.len());
     }
 
     /// 大小写不敏感：`EXPORT` / `export` / `Export` 都必须命中「导出」，
@@ -3459,7 +3739,7 @@ mod tests {
         assert!(!zh.is_empty(), "中文名「导出」应当命中");
         assert!(!en.is_empty(), "英文别名 export 应当命中");
         // 同一条命令的两个别名：两个查询都得包含「导出（当前格式）」
-        let export_index = PALETTE_COMMANDS
+        let export_index = PALETTE_ACTIONS
             .iter()
             .position(|spec| spec.zh == "导出（当前格式）")
             .expect("命令集里必须有导出");
@@ -3475,28 +3755,28 @@ mod tests {
         assert!(filter_commands("转写一下这个根本不存在的命令").is_empty());
     }
 
-    /// 返回的是 `PALETTE_COMMANDS` 的下标，且严格保持命令集顺序：
+    /// 返回的是 `PALETTE_ACTIONS` 的下标，且严格保持命令集顺序：
     /// 面板的选中行按该序列索引，顺序错乱会让 Enter 执行到另一条命令。
     #[test]
     fn filter_preserves_catalog_order_and_indices() {
         let all = filter_commands("");
         assert!(all.windows(2).all(|w| w[0] < w[1]), "下标必须递增");
-        assert!(all.iter().all(|&i| i < PALETTE_COMMANDS.len()));
+        assert!(all.iter().all(|&i| i < PALETTE_ACTIONS.len()));
 
         let undo = filter_commands("undo");
         let redo = filter_commands("redo");
-        let undo_index = PALETTE_COMMANDS
+        let undo_index = PALETTE_ACTIONS
             .iter()
             .position(|spec| spec.zh == "撤销")
             .unwrap();
-        let redo_index = PALETTE_COMMANDS
+        let redo_index = PALETTE_ACTIONS
             .iter()
             .position(|spec| spec.zh == "重做")
             .unwrap();
         assert!(undo.contains(&undo_index));
         assert!(redo.contains(&redo_index));
         // 「undo」不该顺带把「重做」也匹配进来（别名没有互相包含）
-        assert!(!undo.iter().any(|&i| PALETTE_COMMANDS[i].zh == "重做"));
+        assert!(!undo.iter().any(|&i| PALETTE_ACTIONS[i].zh == "重做"));
     }
 
     /// 命令集本身的自洽性：英文别名一律小写（匹配前统一 `to_lowercase`，
@@ -3504,7 +3784,7 @@ mod tests {
     #[test]
     fn catalog_aliases_are_wellformed() {
         let mut seen = std::collections::HashSet::new();
-        for spec in PALETTE_COMMANDS {
+        for spec in PALETTE_ACTIONS {
             assert_eq!(
                 spec.en,
                 spec.en.to_lowercase(),
@@ -3513,6 +3793,189 @@ mod tests {
             );
             assert!(seen.insert(spec.zh), "中文名重复: {}", spec.zh);
         }
+    }
+
+    /// 一份「空工程」的判据快照：没有文件、没有字幕、没有选中。
+    fn empty_context() -> PaletteContext {
+        PaletteContext {
+            active_tab: WorkspaceTab::Editor,
+            processing: false,
+            has_source_file: false,
+            has_segments: false,
+            translating: false,
+            can_undo: false,
+            can_redo: false,
+            has_selection: false,
+            selection_splittable: false,
+            selection_has_next: false,
+            selection_has_translation: false,
+            has_replace_rule_set: false,
+            has_media_file: false,
+            clip_export_idle: true,
+        }
+    }
+
+    /// 取某条命令在注册表里自带的可用性判据。
+    fn available(command: PaletteCommand, ctx: &PaletteContext) -> bool {
+        (PALETTE_ACTIONS
+            .iter()
+            .find(|spec| spec.command == command)
+            .expect("命令必须在注册表里")
+            .available)(ctx)
+    }
+
+    /// 注册表是唯一事实来源：每条命令都必须**恰好登记一次**，不多不少。
+    #[test]
+    fn every_palette_command_variant_is_registered() {
+        let all = [
+            PaletteCommand::OpenFile,
+            PaletteCommand::StartTranscription,
+            PaletteCommand::CancelTranscription,
+            PaletteCommand::ExportCurrentFormat,
+            PaletteCommand::StartTranslation,
+            PaletteCommand::CancelTranslation,
+            PaletteCommand::SwitchToEditor,
+            PaletteCommand::SwitchToGenerate,
+            PaletteCommand::SwitchToLibrary,
+            PaletteCommand::SwitchToPerformance,
+            PaletteCommand::Undo,
+            PaletteCommand::Redo,
+            PaletteCommand::OpenReplace,
+            PaletteCommand::ExportQcSheet,
+            PaletteCommand::ExportDiagnostics,
+            PaletteCommand::SplitSegment,
+            PaletteCommand::MergeWithNext,
+            PaletteCommand::ClearTranslation,
+            PaletteCommand::ApplyCleanup,
+            PaletteCommand::ApplyReplaceRuleSet,
+            PaletteCommand::ExportSelectedClip,
+            PaletteCommand::ExportSelectedClipAudio,
+            PaletteCommand::ShiftTrackForward,
+            PaletteCommand::ShiftTrackBackward,
+            PaletteCommand::FitTrackToMedia,
+            PaletteCommand::ApplyMinGap,
+        ];
+        for command in all {
+            let count = PALETTE_ACTIONS
+                .iter()
+                .filter(|spec| spec.command == command)
+                .count();
+            assert_eq!(count, 1, "命令 {command:?} 注册了 {count} 次");
+        }
+        assert_eq!(PALETTE_ACTIONS.len(), all.len(), "注册表里有未列出的命令");
+    }
+
+    /// 面板清单必须把剪辑台那批动作纳入（按中文名断言）。
+    #[test]
+    fn palette_includes_editor_station_actions() {
+        let names = [
+            "拆分当前句",
+            "合并下句",
+            "清除当前句译文",
+            "应用清理规则",
+            "应用替换规则集（全部句）",
+            "导出当前句片段",
+            "导出当前句音频",
+            "整轨后移 1 秒",
+            "整轨前移 1 秒",
+            "铺满媒体总时长",
+            "应用句间最小间隔",
+        ];
+        for name in names {
+            assert!(
+                PALETTE_ACTIONS.iter().any(|spec| spec.zh == name),
+                "面板缺少剪辑台命令「{name}」"
+            );
+        }
+    }
+
+    /// 拆分 / 合并的可用性边界：没有选中、选中句太短、已是末句都不能选。
+    #[test]
+    fn split_and_merge_availability_boundaries() {
+        let mut ctx = empty_context();
+        assert!(
+            !available(PaletteCommand::SplitSegment, &ctx),
+            "无选中不可拆"
+        );
+        assert!(
+            !available(PaletteCommand::MergeWithNext, &ctx),
+            "无选中不可合并"
+        );
+
+        ctx.has_segments = true;
+        ctx.has_selection = true;
+        ctx.selection_splittable = false;
+        assert!(
+            !available(PaletteCommand::SplitSegment, &ctx),
+            "单字句不可拆"
+        );
+        assert!(
+            !available(PaletteCommand::MergeWithNext, &ctx),
+            "末句不可合并"
+        );
+
+        ctx.selection_splittable = true;
+        ctx.selection_has_next = true;
+        assert!(available(PaletteCommand::SplitSegment, &ctx));
+        assert!(available(PaletteCommand::MergeWithNext, &ctx));
+    }
+
+    /// 剪辑台其它命令各有前置条件：清理、替换、片段导出、重定时分别验证边界。
+    #[test]
+    fn editor_action_availability_requires_their_preconditions() {
+        let mut ctx = empty_context();
+        assert!(!available(PaletteCommand::ApplyCleanup, &ctx));
+        assert!(!available(PaletteCommand::ApplyReplaceRuleSet, &ctx));
+        assert!(!available(PaletteCommand::ExportSelectedClip, &ctx));
+        assert!(!available(PaletteCommand::ApplyMinGap, &ctx));
+
+        ctx.has_segments = true;
+        assert!(
+            available(PaletteCommand::ApplyCleanup, &ctx),
+            "有字幕就能清理"
+        );
+        assert!(
+            !available(PaletteCommand::ApplyReplaceRuleSet, &ctx),
+            "没选规则集不能替换"
+        );
+
+        ctx.has_replace_rule_set = true;
+        assert!(available(PaletteCommand::ApplyReplaceRuleSet, &ctx));
+
+        // 片段导出还要「有选中 + 有源文件 + 导出空闲」
+        ctx.has_selection = true;
+        assert!(
+            !available(PaletteCommand::ExportSelectedClip, &ctx),
+            "没有源文件不能切片"
+        );
+        ctx.has_media_file = true;
+        assert!(available(PaletteCommand::ExportSelectedClip, &ctx));
+        ctx.clip_export_idle = false;
+        assert!(
+            !available(PaletteCommand::ExportSelectedClip, &ctx),
+            "正在导出时置灰"
+        );
+
+        // 重定时只看有没有字幕
+        assert!(available(PaletteCommand::ShiftTrackForward, &ctx));
+        assert!(available(PaletteCommand::FitTrackToMedia, &ctx));
+    }
+
+    /// 不可用只是**置灰**，不从列表里消失：命令仍在全集里、仍能被搜索命中。
+    #[test]
+    fn unavailable_commands_stay_visible_in_the_list() {
+        let split_index = PALETTE_ACTIONS
+            .iter()
+            .position(|spec| spec.command == PaletteCommand::SplitSegment)
+            .expect("拆分命令必须登记");
+        assert!(
+            filter_commands("").contains(&split_index),
+            "不可用的命令也必须留在清单里（置灰而非隐藏）"
+        );
+        assert!(
+            filter_commands("拆分").contains(&split_index),
+            "不可用的命令同样要能被搜到"
+        );
     }
 
     /// 导出格式的持久化字符串必须**可往返**：`as_str` 写进 config.toml，

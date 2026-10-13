@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,40 @@ pub struct AppConfig {
     /// 界面外观（深浅主题）
     #[serde(default)]
     pub ui: UiConfig,
+    /// 用户自定义快捷键覆盖（动作名 → 键位描述）。
+    ///
+    /// 默认整段缺失：`overrides` 为空时这一段不序列化，`config.toml` 的字节与加这个
+    /// 功能之前完全一致——不配的用户感知不到它的存在。写了才生效，未写的动作一律
+    /// 沿用内置默认键位，因此老配置读取行为逐字节不变。
+    #[serde(default, skip_serializing_if = "ShortcutsConfig::is_empty")]
+    pub shortcuts: ShortcutsConfig,
+}
+
+/// 快捷键自定义配置段 `[shortcuts]`。
+///
+/// ```toml
+/// [shortcuts]
+/// overrides = { toggle_play = "ctrl-space", export_subtitle = "ctrl-shift-e" }
+/// ```
+///
+/// `overrides` 的键是**动作名**（见 `ui::shortcuts` 里每条 `ShortcutSpec.action`），
+/// 值是键位描述（如 `ctrl-space`）。用 `BTreeMap` 而不是 `HashMap`：序列化顺序稳定，
+/// 落盘 diff 干净，测试也能逐字节比对。
+///
+/// 「可空」体现在默认值上：整段缺失、或 `overrides` 为空，都等价于「没有覆盖」，
+/// 内置键位表原样生效；未知动作名与非法键串在合成阶段被忽略并告警，不会让程序起不来。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ShortcutsConfig {
+    /// 动作名 → 键位描述。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub overrides: BTreeMap<String, String>,
+}
+
+impl ShortcutsConfig {
+    /// 没有任何覆盖。为真时整个 `[shortcuts]` 段不落盘（保证旧配置字节不变）。
+    pub fn is_empty(&self) -> bool {
+        self.overrides.is_empty()
+    }
 }
 
 /// 界面外观配置。主题是长期偏好，落盘避免每次启动都要重选。
@@ -1648,6 +1683,7 @@ impl Default for AppConfig {
             subtitle_style: SubtitleStyleConfig::default(),
             translate: TranslateConfig::default(),
             ui: UiConfig::default(),
+            shortcuts: ShortcutsConfig::default(),
         }
     }
 }
@@ -1766,13 +1802,14 @@ impl LocalOverride {
 /// 整段参数会被静默丢弃，用户只会看到「配置没生效」。这里列一份白名单，
 /// 只做日志提示，**不**改成硬错误——前向兼容（新版本写的段被旧版本读到）
 /// 仍然要能启动。
-const SHARED_CONFIG_SECTIONS: [&str; 6] = [
+const SHARED_CONFIG_SECTIONS: [&str; 7] = [
     "paths",
     "pipeline",
     "gpu",
     "subtitle_style",
     "translate",
     "ui",
+    "shortcuts",
 ];
 
 /// 解析 `config.toml` 里不认识的顶层键（段名），供忽略前的显式告警。
@@ -3676,7 +3713,7 @@ bar = "x"
             vec!["nonsense".to_string(), "nonsense_more".to_string()]
         );
 
-        // 六个认识段各出现一次时不应有任何告警。
+        // 七个认识段各出现一次时不应有任何告警。
         let clean = r#"
 [paths]
 
@@ -3689,6 +3726,8 @@ bar = "x"
 [translate]
 
 [ui]
+
+[shortcuts]
 "#;
         assert!(
             super::unknown_shared_config_keys(clean).is_empty(),
@@ -4029,6 +4068,110 @@ preset_name = "黄字黑边"
         assert!(
             !back.subtitle_style.karaoke_word_highlight,
             "关掉的开关读回来还得是关的"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `[shortcuts] overrides`（用户自定义键位）的配置层回归。
+///
+/// 刻意**不写** `use super::*`：本组只依赖下面显式列出的名字，改名时会在这里直接编译失败。
+#[cfg(test)]
+mod shortcuts_config_tests {
+    use super::AppConfig;
+
+    /// 「加 `[shortcuts]` 之前」的一份 config.toml：段完全不在一份配置里。
+    const LEGACY_CONFIG: &str = r#"
+[paths]
+ffmpeg = "tools/ffmpeg.exe"
+whisper_cli = "tools/whisper-cli.exe"
+whisper_model = "models/whisper/ggml-small-q5_0.bin"
+llama_cli = "tools/llama-completion.exe"
+llm_model = "models/llm/qwen.gguf"
+
+[pipeline]
+language = "zh"
+output_format = "srt"
+enable_polish = false
+whisper_threads = 12
+llm_threads = 4
+llm_ctx = 2048
+"#;
+
+    /// 临时目录 + 一份写好的 config.toml，返回 `(目录, 文件路径)`，用完由调用方删。
+    fn write_config(text: &str, tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("v2w_shortcuts_cfg_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, text).expect("write config");
+        (dir, path)
+    }
+
+    /// 默认没有任何覆盖：出厂配置＝「行为与加这个段之前一致」。
+    #[test]
+    fn default_has_no_shortcut_overrides() {
+        assert!(
+            AppConfig::default().shortcuts.is_empty(),
+            "默认不能凭空产生覆盖，否则内置键位表会被悄悄改掉"
+        );
+    }
+
+    /// 旧配置（整段缺失）必须照旧能读：不报错，覆盖落成空表，其它字段不受影响。
+    #[test]
+    fn legacy_config_without_shortcuts_loads_as_empty() {
+        let (dir, path) = write_config(LEGACY_CONFIG, "legacy");
+        let cfg = AppConfig::load_from_file(&path).expect("旧配置必须照旧能读");
+        assert!(cfg.shortcuts.overrides.is_empty(), "缺失该段必须落成空覆盖");
+        assert_eq!(cfg.pipeline.whisper_threads, 12, "其它字段不受影响");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 没有覆盖时 `[shortcuts]` 段**不落盘**：`config.toml` 的字节与加这个功能之前
+    /// 完全一致，不配的用户不该看到多出来的一段。
+    #[test]
+    fn empty_overrides_are_not_serialized() {
+        let text = toml::to_string_pretty(&AppConfig::default()).expect("serialize");
+        assert!(
+            !text.contains("[shortcuts]"),
+            "空覆盖不该写出 [shortcuts] 段: {text}"
+        );
+    }
+
+    /// 写了覆盖才出现 `[shortcuts]`，且必须原样落盘、原样读回。
+    #[test]
+    fn overrides_round_trip_through_disk() {
+        let (dir, path) = write_config(LEGACY_CONFIG, "roundtrip");
+        let mut cfg = AppConfig::load_from_file(&path).expect("load");
+        cfg.shortcuts
+            .overrides
+            .insert("toggle_play".to_string(), "ctrl-space".to_string());
+        cfg.shortcuts
+            .overrides
+            .insert("export_subtitle".to_string(), "ctrl-shift-e".to_string());
+        cfg.save_to_file(&path).expect("save");
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("[shortcuts"), "有覆盖时必须落盘: {text}");
+        assert!(text.contains("toggle_play"), "覆盖项要落盘: {text}");
+
+        let back = AppConfig::load_from_file(&path).expect("load");
+        assert_eq!(
+            back.shortcuts
+                .overrides
+                .get("toggle_play")
+                .map(String::as_str),
+            Some("ctrl-space")
+        );
+        assert_eq!(
+            back.shortcuts
+                .overrides
+                .get("export_subtitle")
+                .map(String::as_str),
+            Some("ctrl-shift-e")
         );
 
         let _ = std::fs::remove_dir_all(&dir);
