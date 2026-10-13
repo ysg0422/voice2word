@@ -65,6 +65,52 @@ impl WaveformData {
         lo..hi.min(self.peaks.len())
     }
 
+    /// 把可视窗口内的峰值**聚合**成固定数量的柱子，供时间轴按视口宽度绘制。
+    ///
+    /// # 为什么要「聚合」而不是「取子集」
+    ///
+    /// 时间轴过去把柱数写死在 200，缩放只能靠取 `peaks` 的一段切片：切出来多少桶就画多少柱，
+    /// 于是放大后柱子数骤减、疏密跳变，缩小时又挤成一团。这里改成**按窗口重采样**：
+    /// 无论窗口多宽多窄，都固定给出 `bars` 根柱子，每根取该段内所有桶的**最大值**。
+    ///
+    /// 取最大值而不是平均值：峰值的两级累积（槽峰值 → 桶峰值）用的就是 max，max 满足结合律，
+    /// 所以「先聚合再取最大」与「直接对原始样本取最大」等价；换成平均值会让放大后的波形
+    /// 整体矮一截（与实际响度不符）。
+    ///
+    /// `bars` 大于窗口内的桶数时会出现同一桶被多根柱子采样（放大到比数据还细）：刻意如此——
+    /// 缩放不该凭空造出细节，重复采样表现为「平顶」，比插值造假更诚实。
+    ///
+    /// 边界：`bars == 0`、没有峰值、时长为 0、`start/end` 非有限、窗口反向或完全落在
+    /// 音频之外，都返回空表（调用方据此不画波形，而不是画一根假的）。
+    pub fn peaks_in_window(&self, start_sec: f64, end_sec: f64, bars: usize) -> Vec<f32> {
+        if bars == 0 || self.peaks.is_empty() || self.duration <= 0.0 {
+            return Vec::new();
+        }
+        if !start_sec.is_finite() || !end_sec.is_finite() {
+            return Vec::new();
+        }
+        // 窗口先夹到音频范围内：视口可以被拖到音频之外（前后留白），那不是错误。
+        let start = start_sec.clamp(0.0, self.duration);
+        let end = end_sec.clamp(0.0, self.duration);
+        if end <= start {
+            return Vec::new();
+        }
+        let span = self.bucket_range(start, end);
+        if span.is_empty() {
+            return Vec::new();
+        }
+        let total = span.len();
+        (0..bars)
+            .map(|bar| {
+                // 每根柱子覆盖的桶区间：用整数乘除分配，保证不重不漏、最后一根一定收到末尾。
+                let lo = span.start + total * bar / bars;
+                let hi = (span.start + total * (bar + 1) / bars)
+                    .max(lo + 1)
+                    .min(span.end);
+                self.peaks[lo..hi].iter().copied().fold(0.0f32, f32::max)
+            })
+            .collect()
+    }
     /// 指定时间处的峰值（用于播放游标处的电平读数）
     pub fn peak_at(&self, time_sec: f64) -> f32 {
         let r = self.bucket_range(time_sec, time_sec + 0.001);
@@ -336,6 +382,65 @@ mod tests {
         samples.extend(pcm(4_000, 100)); // 后 0.5 秒很轻
         let data = build(&PathBuf::from("a.wav"), &samples, 8_000, 2);
         assert!(data.peaks[0] > data.peaks[1] * 10.0, "{:?}", data.peaks);
+    }
+
+    /// 窗口重采样：柱子数恒定；整段窗口取全量；窗口内取的是 max（放大不矮化）。
+    #[test]
+    fn peaks_in_window_resamples_to_fixed_bar_count() {
+        let data = WaveformData {
+            peaks: vec![0.1, 0.9, 0.2, 0.8, 0.3, 0.7],
+            duration: 6.0,
+            source: PathBuf::from("D:/m.mp4"),
+        };
+        // 整段窗口、3 根柱子 → 每根吃 2 个桶，取 max
+        let bars = data.peaks_in_window(0.0, 6.0, 3);
+        assert_eq!(bars.len(), 3);
+        assert_eq!(bars, vec![0.9, 0.8, 0.7]);
+        // 只放大到前半段：仍然给固定柱数，值取该段内的 max
+        // 放大到前 2 个桶（窗口 0~2s）：仍然给固定柱数。桶数少于柱数时按整数分配，
+        // 前两根落在第 0 个桶上（平顶），第三根落在第 1 个桶——刻意不插值。
+        let zoomed = data.peaks_in_window(0.0, 2.0, 3);
+        assert_eq!(zoomed.len(), 3, "放大后柱子数不许变");
+        assert_eq!(zoomed, vec![0.1, 0.1, 0.9]);
+        // 反向：整段窗口的柱数也一样是 3（缩放不改变柱数，只改变每根覆盖的范围）
+        assert_eq!(data.peaks_in_window(0.0, 6.0, 3).len(), 3);
+    }
+
+    /// bars 多于桶数时重复采样同一桶（表现为平顶），不插值、不造假。
+    #[test]
+    fn peaks_in_window_repeats_buckets_when_bars_exceed_data() {
+        let data = WaveformData {
+            peaks: vec![0.5],
+            duration: 1.0,
+            source: PathBuf::from("D:/m.mp4"),
+        };
+        assert_eq!(data.peaks_in_window(0.0, 1.0, 4), vec![0.5, 0.5, 0.5, 0.5]);
+    }
+
+    /// 退化输入一律返回空表：调用方据此不画波形，而不是画一根假的。
+    #[test]
+    fn peaks_in_window_degenerate_inputs_are_empty() {
+        let data = WaveformData {
+            peaks: vec![0.4, 0.6],
+            duration: 2.0,
+            source: PathBuf::from("D:/m.mp4"),
+        };
+        assert!(data.peaks_in_window(0.0, 2.0, 0).is_empty(), "0 根柱子");
+        assert!(data.peaks_in_window(1.5, 0.5, 8).is_empty(), "窗口反向");
+        assert!(
+            data.peaks_in_window(f64::NAN, 1.0, 8).is_empty(),
+            "NaN 起点"
+        );
+        assert!(
+            data.peaks_in_window(5.0, 9.0, 8).is_empty(),
+            "窗口在音频之外"
+        );
+        let empty = WaveformData {
+            peaks: Vec::new(),
+            duration: 2.0,
+            source: PathBuf::from("D:/m.mp4"),
+        };
+        assert!(empty.peaks_in_window(0.0, 2.0, 8).is_empty(), "没有峰值");
     }
 
     #[test]
