@@ -144,7 +144,7 @@ cargo run                 # 开发模式运行
 cargo build --release     # 发布版构建
 ```
 
-发布产物位于 `target/release/voice2word.exe`。直接双击运行时，请确保工作目录为项目根目录（程序依赖当前目录下的 `models/` 定位项目根），或直接使用 `cargo run` 启动。
+发布产物位于 `target/release/voice2word.exe`。程序按「可执行文件所在目录 → 其上级目录 → 当前工作目录」的顺序寻找含 `models/` 的那一级作为项目根，所以**双击运行、从任意目录运行都行**；找不到 `models/` 时会退回以可执行文件所在目录为根。
 
 ### 模型与组件
 
@@ -179,7 +179,7 @@ models/
     qwen2.5-0.5b-instruct-q4_k_m.gguf         # 本地润色 / 翻译用的 Qwen 模型
 ```
 
-- **FFmpeg**：从 [ffmpeg.org](https://ffmpeg.org/download.html) 下载 Windows 版，取 `ffmpeg.exe`。
+- **FFmpeg**：三种来源都行，按顺序取第一个可用的——① 上面 `tools/ffmpeg.exe`；② **系统 PATH 上的 `ffmpeg`**（自己装过或 scoop/winget 装的都能直接用）；③ 都没有时，程序启动后会自动把它下载到 `tools/ffmpeg.exe`。手动下载见 [ffmpeg.org](https://ffmpeg.org/download.html)。
 - **whisper.cpp**：内置一键下载（官方 CPU 构建，自动解压）。需要 GPU 加速时，运行 `scripts/build_whisper_msvc_vulkan.bat`（MSVC + Vulkan 一键编译并部署到 `tools/whisper-vulkan/`），产物自带 `ggml-vulkan.dll`，程序识别为自编译构建后不会再被 CPU 包覆盖。
 - **llama.cpp**：内置一键下载；手动准备时下载预编译包，取 `llama-completion.exe` 与 `llama-server.exe`（需与各 DLL 同目录）。
 - **模型**：Whisper 系列取自 [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp)，Qwen 取自 [Qwen2.5 GGUF](https://huggingface.co/Qwen)，SenseVoice / CT-Punc 的 ONNX 模型可从 ModelScope 获取（`tools/download_sensevoice.py` 提供 SenseVoice 下载脚本）。
