@@ -1391,6 +1391,13 @@ impl MainWindow {
                                         })
                                 })
                                 // 2) 字重与水平对齐
+                                //
+                                // 本行起的三组选项（字重对齐 / 文字描边 / 背景底框）都是
+                                // 「固定宽标签 + 一排等分按钮」。按钮上必须同时写
+                                // `flex_1()` 与 `min_w(px(0.0))`：只写 `flex_1` 时，
+                                // flex 项的默认 `min-width:auto` 会按**内容最小宽度**顶住，
+                                // 于是「细边 1.5」比「无描边」宽、整排参差不齐。
+                                // 补上 `min_w(0)` 后三者才真正等分。
                                 .child(
                                     div()
                                         .flex()
@@ -1475,6 +1482,7 @@ impl MainWindow {
                                                             div()
                                                                 .id(("align-btn", idx))
                                                                 .flex_1()
+                                                                .min_w(px(0.0))
                                                                 .py_0p5()
                                                                 .rounded_md()
                                                                 .cursor_pointer()
@@ -1520,6 +1528,7 @@ impl MainWindow {
                                                     div()
                                                         .id(("outline-w", idx))
                                                         .flex_1()
+                                                        .min_w(px(0.0))
                                                         .py_0p5()
                                                         .rounded_md()
                                                         .cursor_pointer()
@@ -1564,6 +1573,7 @@ impl MainWindow {
                                                     div()
                                                         .id(("bg-mode", idx))
                                                         .flex_1()
+                                                        .min_w(px(0.0))
                                                         .py_0p5()
                                                         .rounded_md()
                                                         .cursor_pointer()
