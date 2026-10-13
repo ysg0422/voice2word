@@ -402,6 +402,7 @@ impl MainWindow {
         // 宫格统计块：card_sm 提供内边距与圆角，这里只把内容居中并改用凹槽底色
         primitives::card_sm()
             .flex_1()
+            .min_w(px(0.0))
             .bg(Theme::bg_inset())
             .border_color(Theme::border_mid())
             .items_center()

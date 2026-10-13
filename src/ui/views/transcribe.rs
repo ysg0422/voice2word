@@ -24,6 +24,7 @@ impl MainWindow {
             .flex()
             .flex_row()
             .flex_1()
+            .min_w(px(0.0))
             .w_full()
             .h_full()
             .overflow_hidden()
@@ -65,7 +66,7 @@ impl MainWindow {
         // 撑满剩余宽度的职责。
         primitives::page_shell("transcribe-main-workspace")
             .flex_1()
-            // ── 顶部步骤流式导航栏：转写是一条「导入媒体 → 语音转写 → 剪辑校对 → 导出工程」的直线，
+            // ── 顶部步骤流式导航栏：转写是一条「导入音视频 → 语音转写 → 剪辑校对 → 导出工程」的直线，
 // 步骤常驻在顶部，用户随时知道自己在第几步、下一步该干什么 ──
             .child(
                 div()
@@ -83,10 +84,10 @@ impl MainWindow {
                         div()
                             .flex()
                             .items_center()
-                            .gap_4()
+                            .gap(px(Theme::SPACE_4))
                             .child(step_item(
                                 "1",
-                                "导入媒体",
+                                "导入音视频",
                                 steps.import,
                                 Theme::accent_mint(),
                                 Theme::text_on_accent(),
@@ -138,7 +139,7 @@ impl MainWindow {
                                         .as_ref()
                                         .and_then(|f| f.file_name())
                                         .and_then(|s| s.to_str())
-                                        .unwrap_or("媒体文件")
+            .unwrap_or("音视频文件")
                                         .to_string(),
                                 ))
                         } else {
@@ -159,13 +160,22 @@ impl MainWindow {
             .child(
                 if is_processing {
                     // GPUI 的 `Div::child` 要求文本是 `'static`（内部转 `SharedString`），
-                    // 无法借用 `self.state.status` 里的 `&str`，因此这里必须 clone 出所有权。
-                    let (stage, progress, detail) = match &self.state.status {
-                        ProcessStatus::Processing { stage, progress, detail } => {
-                            (stage.clone(), *progress, detail.clone())
-                        }
-                        _ => ("正在全速转写中…".to_string(), 0.0, String::new()),
-                    };
+                    // 借不到 `self.state.status` 里的 `&str`。但也不必每帧 clone 两份 `String`：
+                    // 阶段名与详情与上一帧一致时直接复用缓存里的那份（引用计数 +1）。
+                    let (stage_ref, progress, detail_ref): (&str, f64, &str) =
+                        match &self.state.status {
+                            ProcessStatus::Processing { stage, progress, detail } => {
+                                (stage.as_str(), *progress, detail.as_str())
+                            }
+                            _ => ("正在全速转写中…", 0.0, ""),
+                        };
+                    let (stage, detail) =
+                        cx.update_default_global::<TranscribeDerivedCache, _>(|cache, _| {
+                            (
+                                shared_string_cached(&mut cache.progress_stage, stage_ref),
+                                shared_string_cached(&mut cache.progress_detail, detail_ref),
+                            )
+                        });
                     let total_dur = self.state.transcribe_duration;
                     let cur_sec = self.state.streaming_current_sec;
                     // `mm:ss` 换算统一走 `ui::format_mm_ss`：本文件此前手写的三份
@@ -225,7 +235,12 @@ impl MainWindow {
                                                         .text_size(px(Theme::TEXT_SMALL))
                                                         .text_color(Theme::text_muted())
                                                         .child(if detail.trim().is_empty() {
-                                                            if is_sensevoice { "SenseVoice 正在通过纯内存音频管道极速识别…".to_string() } else { "Whisper 模型正在转写音频流…".to_string() }
+                                                            let fallback = if is_sensevoice {
+                                                                "SenseVoice 正在通过纯内存音频管道极速识别…"
+                                                            } else {
+                                                                "Whisper 模型正在转写音频流…"
+                                                            };
+                                                            SharedString::from(fallback)
                                                         } else {
                                                             detail
                                                         }),
@@ -239,9 +254,9 @@ impl MainWindow {
                                         .gap(px(Theme::SPACE_1_5))
                                         // 引擎标签与总时长都是元信息，统一走徽标原语
                                         .child(if is_sensevoice {
-                                            primitives::badge_accent("SenseVoice INT8 (14x 极速)")
+                                            primitives::badge_accent("SenseVoice INT8（14x 极速）")
                                         } else {
-                                            primitives::badge("Whisper Turbo (GPU加速)")
+                                            primitives::badge("Whisper Turbo（GPU 加速）")
                                         })
                                         .child(primitives::badge(format_mm_ss(total_dur))),
                                 ),
@@ -318,7 +333,7 @@ impl MainWindow {
                                             .flex()
                                             .flex_col()
                                             .justify_end()
-                                            .gap_2()
+                                            .gap(px(Theme::SPACE_2))
                                             .children(seg_list.iter().enumerate().map(|(i, seg)| {
                                                 let is_last = is_last_stream_row(i, total_items);
                                                 let time_badge = format!(
@@ -407,14 +422,14 @@ impl MainWindow {
                                 .max_w(px(Theme::CONTENT_MAX_W))
                                 .flex()
                                 .items_center()
-                                .gap_3()
+                                .gap(px(Theme::SPACE_3))
                                 .child(
                                     // 统计磁贴外壳统一走 card_sm()：内边距 / 圆角 / 描边同源，
                                     // 数字用 TEXT_STAT、标签用 TEXT_SMALL 保持四格对齐。
                                     primitives::card_sm()
                                         .flex_1()
                                         .min_w(px(0.0))
-                                        .gap_0p5()
+                                        .gap(px(Theme::SPACE_0_5))
                                         .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("总体进度"))
                                         .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::accent_mint()).child(format!("{:.1}%", display_ratio * 100.0)))
                                         .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child(format!("{} / {}", format_mm_ss(cur_sec), format_mm_ss(total_dur)))),
@@ -423,7 +438,7 @@ impl MainWindow {
                                     primitives::card_sm()
                                         .flex_1()
                                         .min_w(px(0.0))
-                                        .gap_0p5()
+                                        .gap(px(Theme::SPACE_0_5))
                                         .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("预计耗时"))
                                         .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::text_primary()).child(eta))
                                         .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child(if is_sensevoice { "极速 14.5x 实时倍速" } else { "Whisper 并行解码" })),
@@ -432,7 +447,7 @@ impl MainWindow {
                                     primitives::card_sm()
                                         .flex_1()
                                         .min_w(px(0.0))
-                                        .gap_0p5()
+                                        .gap(px(Theme::SPACE_0_5))
                                         .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("音频推流"))
                                         .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::accent_blue()).child("纯内存管道"))
                                         .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child("0 磁盘 I/O · 0 磨损")),
@@ -441,7 +456,7 @@ impl MainWindow {
                                     primitives::card_sm()
                                         .flex_1()
                                         .min_w(px(0.0))
-                                        .gap_0p5()
+                                        .gap(px(Theme::SPACE_0_5))
                                         .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("推理引擎"))
                                         // 引擎名比数字短，降到 TEXT_TITLE 免得撑破磁贴宽度
                                         .child(div().text_size(px(Theme::TEXT_TITLE)).font_weight(FontWeight::BOLD).text_color(if is_sensevoice { Theme::accent_mint() } else { Theme::accent_blue() }).child(if is_sensevoice { "SenseVoice INT8" } else { "Whisper Turbo" }))
@@ -847,7 +862,7 @@ impl MainWindow {
             .child(if total == 0 {
                 primitives::badge_accent("质检通过")
             } else {
-                primitives::badge_danger(format!("待复核 {total} 项"))
+                primitives::badge_danger(format!("待质检 {total} 项"))
             });
 
         // 判据胶囊行：非零项按类着色并可点击定位；零项**保留计数但置灰不可点**——
@@ -948,7 +963,7 @@ impl MainWindow {
                         .gap(px(Theme::SPACE_2))
                         .child(
                             primitives::btn(
-                                "开始复核",
+                                "开始质检",
                                 primitives::BtnSize::Sm,
                                 primitives::BtnVariant::Primary,
                             )
@@ -973,12 +988,12 @@ impl MainWindow {
                                 this.jump_to_quality_issue(cx, next);
                             })),
                         )
-                        // 导出复核表：质检结论此前只活在界面里，没法交给别人复核。
+                        // 导出质检表：质检结论此前只活在界面里，没法交给别人复核。
                         // 放在这一排而不是塞进导出栏，是因为它属于「质检」这个动作的
                         // 收尾，用户在这里刚看完结论、顺手导出最自然。
                         .child(
                             primitives::btn(
-                                "导出复核表 CSV",
+                                "导出质检表 CSV",
                                 primitives::BtnSize::Sm,
                                 primitives::BtnVariant::Secondary,
                             )
@@ -1041,37 +1056,34 @@ impl MainWindow {
         // 四条规则并各自分配字符串；`duplicate_groups` 再逐句比对），而这张卡片在就绪态
         // 每帧都要重画。按「字幕版本 + 勾选规则」缓存成一份快照：两个入参恰好就是
         // 结果的全部依据（`plan` 吃 segments + rules，`groups` 只吃 segments）。
-        let preview = {
+        // 样例串（压行 + 两处截断 + 拼接）与结果提示串也一并按内容复用：前者只随
+        // `plan` 变，后者只在点过修复后变，逐帧重算就是白付一次 `join` 与一次拼接。
+        let (preview, note) = {
             let key = (self.state.segments_revision, rules);
             let state = &self.state;
             cx.update_default_global::<TranscribeDerivedCache, _>(|cache, _| {
-                cleanup_preview_cached(&mut cache.cleanup, key, || CleanupPreview {
-                    plan: state.cleanup_preview(),
-                    groups: state.duplicate_cue_groups(),
-                })
+                let preview = cleanup_preview_cached(&mut cache.cleanup, key, || {
+                    let plan = state.cleanup_preview();
+                    CleanupPreview {
+                        sample: cleanup_sample(&plan),
+                        plan,
+                        groups: state.duplicate_cue_groups(),
+                    }
+                });
+                let note = state
+                    .cleanup_note
+                    .as_deref()
+                    .map(|text| shared_string_cached(&mut cache.cleanup_note, text));
+                (preview, note)
             })
         };
         let plan = &preview.plan;
         let groups = &preview.groups;
         // 每组至少 2 句，可删的是「组内除第一句以外」的那些
         let duplicate_cues: usize = groups.iter().map(|g| g.indices.len() - 1).sum();
-        let note = self.state.cleanup_note.clone();
-        // 样例先算成 String：下面给按钮挂监听时要可变借用 `this`，闭包里再读 plan
-        // 就与借用打架（与质检胶囊同一种处理）。
-        let sample = plan.first().map(|hit| {
-            let after = if hit.after.trim().is_empty() {
-                "（清空）".to_string()
-            } else {
-                truncate_for_ui(&hit.after)
-            };
-            format!(
-                "例（{}·{}）：{} → {}",
-                hit.target.label(),
-                hit.rule.label(),
-                truncate_for_ui(&hit.before),
-                after
-            )
-        });
+        // 样例与提示串都是 `SharedString`（`Arc` 克隆）：下面给按钮挂监听时要可变借用
+        // `this`，闭包里再读 `plan` 就与借用打架（与质检胶囊同一种处理）。
+        let sample = preview.sample.clone();
 
         let chips = div()
             .w_full()
@@ -1207,6 +1219,15 @@ impl MainWindow {
         // 先把要渲染的数据抽成纯值。下面给「移除」按钮挂 cx.listener 需要可变借用
         // 上下文，如果行内容还借着 self.state，两个借用会打架。
         // kind: 0 等待 / 1 转写中 / 2 已完成 / 3 失败
+        // 文件名 / 阶段名走内容校验快照：队列长度是用户可控的（一次拖进几百个文件很常见），
+        // 逐帧按行 clone 一遍是这一页唯一「随数据规模增长」的重复分配。
+        let (names, stages) = {
+            let items = &self.state.batch_queue;
+            cx.update_default_global::<TranscribeDerivedCache, _>(|cache, _| {
+                queue_text_cached(&mut cache.queue_text, items)
+            })
+        };
+
         let rows: Vec<QueueRow> = self
             .state
             .batch_queue
@@ -1221,12 +1242,12 @@ impl MainWindow {
                 };
                 QueueRow {
                     idx,
-                    name: item.name.clone(),
+                    name: names[idx].clone(),
                     label: item.state.label(),
                     duration: item.duration,
                     kind,
                     progress: queue_progress_view(item),
-                    stage: item.stage.clone(),
+                    stage: stages[idx].clone(),
                 }
             })
             .collect();
@@ -1412,7 +1433,7 @@ impl MainWindow {
                         // 原来的单行卡片：排序、间距、圆角、描边一律走同一套值，
                         // 只是外层从「一行」变成「一列」，不改既有布局体系。
                         let progress_line = progress
-                            .map(|p| render_queue_progress(p, stage.as_deref()));
+                            .map(|p| render_queue_progress(p, stage.as_ref().map(|s| s.as_str())));
                         let has_progress = progress_line.is_some();
                         div()
                             .id(("batch-queue-row", idx))
@@ -1533,7 +1554,7 @@ impl MainWindow {
 #[derive(Debug)]
 struct QueueRow {
     idx: usize,
-    name: String,
+    name: SharedString,
     label: String,
     duration: f64,
     /// 0 等待 / 1 转写中 / 2 已完成 / 3 失败
@@ -1541,7 +1562,7 @@ struct QueueRow {
     /// 本条进度（`None` = 还没开始跑，不画进度）
     progress: Option<QueueProgressView>,
     /// 管线给的阶段名，仅「转写中」时非空
-    stage: Option<String>,
+    stage: Option<SharedString>,
 }
 
 /// 「本条进度」在队列卡片上的呈现取值（**纯数据**，便于单测）。
@@ -1648,6 +1669,26 @@ fn truncate_for_ui(text: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// 「修复常见错误」区块的样例行：取第一处命中，压单行 + 截断后拼成一句话。
+///
+/// 只在快照重建时算一次（存进 [`CleanupPreview::sample`]），不放在渲染路径上现算——
+/// 它要跑一次 `join`、两处截断与一次拼接，而这张卡片是每帧重画的。
+fn cleanup_sample(plan: &CleanupPlan) -> Option<SharedString> {
+    let hit = plan.first()?;
+    let after = if hit.after.trim().is_empty() {
+        "（清空）".to_string()
+    } else {
+        truncate_for_ui(&hit.after)
+    };
+    Some(SharedString::new(format!(
+        "例（{} · {}）：{} → {}",
+        hit.target.label(),
+        hit.rule.label(),
+        truncate_for_ui(&hit.before),
+        after
+    )))
 }
 
 /// 流式看板回显的最近行数。
@@ -1759,7 +1800,7 @@ fn step_item(
     div()
         .flex()
         .items_center()
-        .gap_2()
+        .gap(px(Theme::SPACE_2))
         .child(
             div()
                 .w(px(Theme::STEP_DOT))
@@ -1867,6 +1908,8 @@ fn category_has_issues(report: &QualityReport, category: QualityCategory) -> boo
 /// 「修复常见错误」区块的现值：一次整表扫描的命中清单 + 相邻重复句分组。
 #[derive(Debug, Clone, PartialEq)]
 struct CleanupPreview {
+    /// 「例（…）：改前 → 改后」这一行（只在重建快照时拼一次）
+    sample: Option<SharedString>,
     plan: CleanupPlan,
     groups: Vec<DuplicateGroup>,
 }
@@ -1885,6 +1928,13 @@ type CleanupPreviewKey = (u64, CleanupRules);
 #[derive(Default)]
 struct TranscribeDerivedCache {
     cleanup: Option<(CleanupPreviewKey, Arc<CleanupPreview>)>,
+    /// 「修复常见错误」的结果提示串
+    cleanup_note: Option<SharedString>,
+    /// 转写看板的阶段名 / 详情
+    progress_stage: Option<SharedString>,
+    progress_detail: Option<SharedString>,
+    /// 批量队列每行的文件名 / 阶段名
+    queue_text: QueueTextCache,
 }
 
 impl Global for TranscribeDerivedCache {}
@@ -1908,17 +1958,77 @@ fn cleanup_preview_cached(
     value
 }
 
+/// 内容校验的文本复用：与缓存里那份内容一致就直接复用（`SharedString` 是 `Arc<str>`，
+/// 克隆只加引用计数）。
+///
+/// 校验的是**内容**而不是某个版本号，所以不存在「数据变了还显示旧的」这种风险：
+/// 不一致就重算并换入。
+fn shared_string_cached(cache: &mut Option<SharedString>, text: &str) -> SharedString {
+    if let Some(cached) = cache.as_ref() {
+        if cached.as_str() == text {
+            return cached.clone();
+        }
+    }
+    let value = SharedString::new(text);
+    *cache = Some(value.clone());
+    value
+}
+
+/// 批量队列每行的文本快照（文件名 / 阶段名）。
+#[derive(Default)]
+struct QueueTextCache {
+    names: Vec<SharedString>,
+    stages: Vec<Option<SharedString>>,
+}
+
+/// 队列行文本快照：整表与源逐项比对，全一致就复用（每行只剩一次引用计数增加），
+/// 有任何一处不同（增删文件、换名、阶段推进）就整表重建。
+///
+/// 为什么值得单独缓存：队列长度由用户决定（一次拖进几百个文件），而
+/// `render_batch_queue_panel` 每帧都要为每一行克隆一次文件名与阶段名——这是本页
+/// 唯一随数据规模增长的逐帧克隆。
+fn queue_text_cached(
+    cache: &mut QueueTextCache,
+    items: &[QueueItem],
+) -> (Vec<SharedString>, Vec<Option<SharedString>>) {
+    let same = cache.names.len() == items.len()
+        && cache.stages.len() == items.len()
+        && cache
+            .names
+            .iter()
+            .zip(items)
+            .all(|(cached, item)| cached.as_str() == item.name.as_str())
+        && cache
+            .stages
+            .iter()
+            .zip(items)
+            .all(|(cached, item)| cached.as_ref().map(|s| s.as_str()) == item.stage.as_deref());
+    if !same {
+        cache.names = items
+            .iter()
+            .map(|item| SharedString::new(item.name.as_str()))
+            .collect();
+        cache.stages = items
+            .iter()
+            .map(|item| item.stage.as_deref().map(SharedString::new))
+            .collect();
+    }
+    (cache.names.clone(), cache.stages.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        category_has_issues, cleanup_preview_cached, is_last_stream_row, quality_chip_label,
-        queue_progress_view, transcribe_status_pill, truncate_for_ui, CleanupPreview,
-        CleanupPreviewKey, QueueProgressView, StatusPill, StepChain, StepPhase,
+        category_has_issues, cleanup_preview_cached, cleanup_sample, is_last_stream_row,
+        quality_chip_label, queue_progress_view, queue_text_cached, shared_string_cached,
+        transcribe_status_pill, truncate_for_ui, CleanupPreview, CleanupPreviewKey,
+        QueueProgressView, QueueTextCache, StatusPill, StepChain, StepPhase,
     };
     use crate::app::state::{QueueItem, QueueState};
     use crate::subtitle::cleanup::{CleanupPlan, CleanupRule, CleanupRules};
     use crate::subtitle::segment::{QualityCategory, QualityReport};
     use crate::ui::split_mm_ss;
+    use gpui::SharedString;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -2178,6 +2288,7 @@ mod tests {
         let make = |builds: &std::cell::Cell<u32>| {
             builds.set(builds.get() + 1);
             CleanupPreview {
+                sample: None,
                 plan: CleanupPlan::default(),
                 groups: Vec::new(),
             }
@@ -2201,5 +2312,74 @@ mod tests {
         let fourth = cleanup_preview_cached(&mut cache, (8, toggled), || make(&builds));
         assert_eq!(builds.get(), 3, "规则变了命中清单就变了，必须重算");
         assert!(!Arc::ptr_eq(&third, &fourth));
+    }
+
+    /// 样例串只在快照重建时算一次：没有命中就不产生样例；有命中就是
+    /// 「例（…）：改前 → 改后」这一行。
+    #[test]
+    fn cleanup_sample_line_comes_from_the_first_hit() {
+        assert!(
+            cleanup_sample(&CleanupPlan::default()).is_none(),
+            "没有命中就没有样例"
+        );
+
+        let segments = vec![crate::subtitle::Segment::new(1, 0.0, 1.0, "你好  世界")];
+        let plan = crate::subtitle::cleanup::plan(&segments, CleanupRules::default());
+        assert!(!plan.is_empty(), "前提：默认规则会命中多余空格");
+        let sample = cleanup_sample(&plan).expect("有命中就要有样例");
+        assert!(sample.starts_with("例（"), "样例要带前缀：{sample}");
+        assert!(sample.contains('→'), "样例要说清改前改后：{sample}");
+    }
+
+    /// 内容校验的文本复用：一致就复用同一份（`Arc` 指针相同 = 没重新分配），
+    /// 不一致必须换新值。
+    #[test]
+    fn shared_string_cache_reuses_same_text_and_rebuilds_on_change() {
+        let mut cache: Option<SharedString> = None;
+        let first = shared_string_cached(&mut cache, "正在识别");
+        let again = shared_string_cached(&mut cache, "正在识别");
+        let a: Arc<str> = first.clone().into();
+        let b: Arc<str> = again.clone().into();
+        assert!(Arc::ptr_eq(&a, &b), "内容一致要复用同一份文本");
+
+        let changed = shared_string_cached(&mut cache, "正在润色");
+        assert_eq!(changed.as_str(), "正在润色");
+        let c: Arc<str> = changed.into();
+        assert!(!Arc::ptr_eq(&a, &c), "内容变了必须换新值");
+    }
+
+    /// 队列行文本快照：整表一致时复用同一份文本，阶段推进 / 增删行都必须跟着变。
+    #[test]
+    fn queue_text_cache_reuses_identical_rows_and_rebuilds_on_change() {
+        let mut cache = QueueTextCache::default();
+        let mut items = vec![
+            queue_item(QueueState::Running, 10.0),
+            queue_item(QueueState::Pending, 0.0),
+        ];
+        items[0].name = "第一支.mp4".to_string();
+        items[1].name = "第二支.mp4".to_string();
+        items[0].stage = Some("语音识别".to_string());
+
+        let (names, stages) = queue_text_cached(&mut cache, &items);
+        assert_eq!(names[0].as_str(), "第一支.mp4");
+        assert_eq!(stages[0].as_ref().map(|s| s.as_str()), Some("语音识别"));
+        assert!(stages[1].is_none(), "等待中的条目还没有阶段名");
+
+        // 一模一样的一帧：复用同一份文本，不重新分配
+        let (again, _) = queue_text_cached(&mut cache, &items);
+        let first_ptr: Arc<str> = names[0].clone().into();
+        let again_ptr: Arc<str> = again[0].clone().into();
+        assert!(Arc::ptr_eq(&first_ptr, &again_ptr), "命中要复用同一份文本");
+
+        // 阶段推进：值必须跟着走，不许拿旧的顶上
+        items[0].stage = Some("润色".to_string());
+        let (_, stages) = queue_text_cached(&mut cache, &items);
+        assert_eq!(stages[0].as_ref().map(|s| s.as_str()), Some("润色"));
+
+        // 少一行：整表重建，长度跟着走
+        items.pop();
+        let (names, stages) = queue_text_cached(&mut cache, &items);
+        assert_eq!(names.len(), 1);
+        assert_eq!(stages.len(), 1);
     }
 }

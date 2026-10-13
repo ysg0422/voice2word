@@ -240,7 +240,7 @@ impl MainWindow {
         let sort_row = div()
             .flex()
             .items_center()
-            .gap_1()
+            .gap(px(Theme::SPACE_1))
             .child(
                 div()
                     .text_size(px(Theme::TEXT_CAPTION))
@@ -289,7 +289,7 @@ impl MainWindow {
                 cx,
             ))
             .children(filtering.then(|| {
-                primitives::chip_clickable("清除筛选", false, false)
+                primitives::chip_clickable("清空筛选", false, false)
                     .id("library-clear-filter")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.clear_library_filter(cx);
@@ -336,8 +336,8 @@ impl MainWindow {
         div()
             .id("library-batch-bar")
             .w_full()
-            .px_4()
-            .py_2()
+            .px(px(Theme::SPACE_4))
+            .py(px(Theme::SPACE_2))
             .mb(px(Theme::SPACE_3))
             .rounded_lg()
             .bg(Theme::bg_raised())
@@ -347,7 +347,7 @@ impl MainWindow {
             .items_center()
             .justify_between()
             .child(
-                div().flex().items_center().gap_2().child(
+                div().flex().items_center().gap(px(Theme::SPACE_2)).child(
                     div()
                         .text_size(px(Theme::TEXT_BODY))
                         .font_weight(FontWeight::BOLD)
@@ -359,9 +359,9 @@ impl MainWindow {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap(px(Theme::SPACE_2))
                     .child(
-                        primitives::chip_clickable("取消选择", false, false)
+                        primitives::chip_clickable("取消全选", false, false)
                             .id("lib-clear-sel-btn")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.library_selected.clear();
@@ -411,7 +411,7 @@ impl MainWindow {
             .child(
                 // 空态主行动按钮走 btn 原语，与其余页面的 CTA 同高同色
                 primitives::btn_clickable(
-                    "导入视频开始转写",
+                    "导入音视频开始转写",
                     primitives::BtnSize::Lg,
                     primitives::BtnVariant::Primary,
                 )
@@ -449,7 +449,7 @@ impl MainWindow {
                         .child("没有符合筛选条件的记录"),
                 )
                 .child(
-                    primitives::chip_clickable("清除筛选", false, false)
+                    primitives::chip_clickable("清空筛选", false, false)
                         .id("library-clear-filter-empty")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.clear_library_filter(cx);
@@ -835,7 +835,7 @@ impl MainWindow {
         div()
             .id(("lib-card", task_id as usize))
             .w_full()
-            .p_4()
+            .p(px(Theme::SPACE_4))
             .rounded_xl()
             .bg(Theme::bg_card())
             .border_1()
@@ -851,7 +851,7 @@ impl MainWindow {
             .flex()
             .flex_row()
             .items_center()
-            .gap_4()
+            .gap(px(Theme::SPACE_4))
             // ── 最左：勾选框（批量导出用） ──
             .child(
                 div()
@@ -934,8 +934,8 @@ impl MainWindow {
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .px_2()
-                                .py_0p5()
+                                .px(px(Theme::SPACE_2))
+                                .py(px(Theme::SPACE_0_5))
                                 // 角标条压在缩略图上，底色恒为深色，文字必须用媒体区浅色 token
                                 // （浅色主题下 text_muted 会变深，压在深底上直接糊掉）
                                 .bg(Theme::bg_overlay())
@@ -959,12 +959,12 @@ impl MainWindow {
                         .items_center()
                         .justify_center()
                         .flex_col()
-                        .gap_1()
+                        .gap(px(Theme::SPACE_1))
                         // 格式标识
                         .child(
                             div()
-                                .px_3()
-                                .py_1()
+                                .px(px(Theme::SPACE_3))
+                                .py(px(Theme::SPACE_1))
                                 .rounded_md()
                                 .bg(Theme::bg_raised())
                                 .border_1()
@@ -987,22 +987,22 @@ impl MainWindow {
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(0.0))
                     .flex()
                     .flex_col()
                     .justify_between()
-                    .gap_2p5()
+                    .gap(px(Theme::SPACE_2_5))
                     // 文件名 + 状态
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap_2()
+                            .gap(px(Theme::SPACE_2))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap_2p5()
+                                    .gap(px(Theme::SPACE_2_5))
                                     // 文件名 (大字)
                                     .child(
                                         div()
@@ -1020,7 +1020,7 @@ impl MainWindow {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap_2()
+                                    .gap(px(Theme::SPACE_2))
                                     .text_size(px(Theme::TEXT_SMALL))
                                     .text_color(Theme::text_muted())
                                     .child(dur_str)
@@ -1032,7 +1032,7 @@ impl MainWindow {
                                         div()
                                             .flex()
                                             .items_center()
-                                            .gap_2()
+                                            .gap(px(Theme::SPACE_2))
                                             .child("·")
                                             .child(format!("{:.1}s", m.total_elapsed_sec))
                                     }))
@@ -1055,7 +1055,7 @@ impl MainWindow {
                     .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap(px(Theme::SPACE_2))
                     // 耗时详情 (if metrics)
                     // 与「校对 / 导出」同法：渲染期只判断「有没有指标」，点开那一刻才把
                     // 那一条的指标取出来。这里原先每帧对每张卡片 `clone()` 一次 metrics
@@ -1178,7 +1178,7 @@ impl MainWindow {
                                         // 文件已经写出去了，回头找不到又无从排查。
                                         let _ = this.update(cx, |this, cx| {
                                             this.state.status =
-                                                ProcessStatus::Failed(format!("导出失败: {err}"));
+                                                ProcessStatus::Failed(format!("导出失败：{err}"));
                                             cx.notify();
                                         });
                                     }

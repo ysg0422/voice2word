@@ -123,7 +123,7 @@ impl MainWindow {
     /// 用户在剪辑台点「导出」失败、在视频库删记录失败时，错误串确实写进了
     /// `state.status`，却没有任何控件能显示它——界面一片安静，用户只会认为按钮坏了。
     ///
-    /// 这里把失败态提升为一条**跨页常驻**的错误条，挂在标题栏正下方。点「关闭」
+    /// 这里把失败态提升为一条**跨页常驻**的错误条，挂在标题栏正下方。点「知道了」
     /// 把状态复位为 `Idle`（与「文件已就绪」等常规态一致），错误串随之消失。
     /// 只渲染 `Failed` 一种，不影响其余状态在转写页的正常展示。
     /// 字幕写库失败横幅。
@@ -166,7 +166,7 @@ impl MainWindow {
                     .id("db-error-banner-dismiss")
                     .flex_shrink_0()
                     .px(px(Theme::SPACE_2))
-                    .py_0p5()
+                    .py(px(Theme::SPACE_0_5))
                     .rounded(px(Theme::RADIUS_SM))
                     .cursor_pointer()
                     .text_size(px(Theme::TEXT_SMALL))
@@ -221,7 +221,7 @@ impl MainWindow {
                     .id("config-error-banner-dismiss")
                     .flex_shrink_0()
                     .px(px(Theme::SPACE_2))
-                    .py_0p5()
+                    .py(px(Theme::SPACE_0_5))
                     .rounded(px(Theme::RADIUS_SM))
                     .cursor_pointer()
                     .text_size(px(Theme::TEXT_SMALL))
@@ -267,7 +267,7 @@ impl MainWindow {
                     .id("global-error-banner-dismiss")
                     .flex_shrink_0()
                     .px(px(Theme::SPACE_2))
-                    .py_0p5()
+                    .py(px(Theme::SPACE_0_5))
                     .rounded(px(Theme::RADIUS_SM))
                     .cursor_pointer()
                     .text_size(px(Theme::TEXT_SMALL))
@@ -277,7 +277,7 @@ impl MainWindow {
                         this.state.status = ProcessStatus::Idle;
                         cx.notify();
                     }))
-                    .child("关闭"),
+                    .child("知道了"),
             )
             .into_any_element()
     }
@@ -318,7 +318,7 @@ impl MainWindow {
                     .id("global-notice-banner-dismiss")
                     .flex_shrink_0()
                     .px(px(Theme::SPACE_2))
-                    .py_0p5()
+                    .py(px(Theme::SPACE_0_5))
                     .rounded(px(Theme::RADIUS_SM))
                     .cursor_pointer()
                     .text_size(px(Theme::TEXT_SMALL))
@@ -389,7 +389,7 @@ impl MainWindow {
                     .id("crash-banner-dismiss")
                     .flex_shrink_0()
                     .px(px(Theme::SPACE_2))
-                    .py_0p5()
+                    .py(px(Theme::SPACE_0_5))
                     .rounded(px(Theme::RADIUS_SM))
                     .cursor_pointer()
                     .text_size(px(Theme::TEXT_SMALL))
@@ -460,7 +460,7 @@ impl MainWindow {
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .gap(px(Theme::SPACE_3))
                     .flex_1()
                     .min_w(px(0.0))
                     .child(if is_processing {
@@ -477,12 +477,12 @@ impl MainWindow {
                         div()
                             .flex()
                             .flex_col()
-                            .gap_1()
+                            .gap(px(Theme::SPACE_1))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap_2()
+                                    .gap(px(Theme::SPACE_2))
                                     .child(
                                         div()
                                             .text_size(px(Theme::TEXT_BODY))
@@ -516,7 +516,7 @@ impl MainWindow {
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap(px(Theme::SPACE_2))
                             .min_w(px(0.0))
                             .child(primitives::stat_dot_sm(Theme::accent_red()))
                             .child(
@@ -537,7 +537,7 @@ impl MainWindow {
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap(px(Theme::SPACE_2))
                             .child(primitives::stat_dot_sm(Theme::accent_blue()))
                             .child(
                                 div()
@@ -549,7 +549,7 @@ impl MainWindow {
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap(px(Theme::SPACE_2))
                             .child(primitives::stat_dot_sm(Theme::accent_mint()))
                             .child(
                                 div()
@@ -564,7 +564,7 @@ impl MainWindow {
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap(px(Theme::SPACE_2))
                             .child(primitives::stat_dot_sm(Theme::bg_dot_idle()))
                             .child(
                                 div()
@@ -579,7 +579,7 @@ impl MainWindow {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2p5()
+                    .gap(px(Theme::SPACE_2_5))
                     .flex_shrink_0()
                     .child(
                         // 「播放预览」：禁用态只置灰不接交互，形状不变

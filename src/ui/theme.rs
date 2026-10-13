@@ -419,10 +419,11 @@ impl Theme {
     // 8/10/12/14/16 五种。这里定一条 4 的倍数阶梯，所有布局间距只允许取阶梯值，
     // 于是「对齐」变成可推导的，而不是逐个文件比对。
     //
-    // GPUI 的 tailwind 数值助手（`gap_2` = 8px、`px_4` = 16px…）与这条阶梯一一对应：
+    // GPUI 的 tailwind 数值助手（`gap_2` = 8px、`px_4` = 16px…）与这条阶梯同值：
     // `gap_0p5`↔`SPACE_0_5`、`gap_1`↔`SPACE_1`、`gap_1p5`↔`SPACE_1_5`、
     // `gap_2`↔`SPACE_2`、`gap_2p5`↔`SPACE_2_5`、`gap_3`↔`SPACE_3`、`gap_4`↔`SPACE_4`、
-    // `gap_6`↔`SPACE_6`。用助手或常量都可以，两者取同一个值，不会出现第三种间距。
+    // `gap_6`↔`SPACE_6`。间距一律写成 `gap(px(Theme::SPACE_N))` / `px(px(Theme::SPACE_N))`
+    // 走 token，同值不留第二种写法。
     pub const SPACE_0_5: f32 = 2.0;
     pub const SPACE_1: f32 = 4.0;
     /// 半步（6px）：成组小胶囊之间的间隙，比 SPACE_1 松、比 SPACE_2 紧。
@@ -506,8 +507,6 @@ impl Theme {
     pub const SECTION_TITLE: f32 = 12.0;
 
     // ==================== 骨架尺寸 ====================
-    /// 左侧主导航宽度
-    pub const NAV_W: f32 = 180.0;
     /// 标题栏高度
     pub const TITLEBAR_H: f32 = 38.0;
     /// 标题栏系统按钮宽度（最小化 / 最大化 / 关闭）。
@@ -580,8 +579,8 @@ impl Theme {
     pub const PROBE_MSG_MAX_W: f32 = 320.0;
     /// 非撑满的分段胶囊的最小宽度（成组排布时不被文字压塌）
     pub const SEG_PILL_MIN_W: f32 = 140.0;
-    /// 左侧导航选中指示条宽度
-    pub const NAV_INDICATOR_W: f32 = 2.0;
+    /// 顶部导航选中指示条高度（压在标签底边的横向细条）
+    pub const NAV_INDICATOR_H: f32 = 2.0;
     /// 编辑器视频监视器的最小高度
     pub const MONITOR_MIN_H: f32 = 280.0;
     /// 监视器视口屏幕的最小高度

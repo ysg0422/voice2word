@@ -56,7 +56,7 @@ impl MainWindow {
                                     .gap(px(Theme::SPACE_2))
                                     .child(primitives::stat_dot(Theme::accent_mint()))
                                     .child(primitives::page_title(
-                                        "全流程性能统计与基准 (Benchmark)",
+                                        "全流程性能统计与基准（Benchmark）",
                                     )),
                             )
                             .child(

@@ -5,6 +5,8 @@
 
 use gpui::prelude::*;
 use gpui::*;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -22,6 +24,36 @@ use crate::utils::config::{ModelInfo, TranslateConfig};
 /// 会让用户以为全部生效——这里统一按实际生效数展示，超限时另行提示。
 pub(crate) fn effective_glossary_count(parsed: usize, limit: usize) -> usize {
     parsed.min(limit)
+}
+
+/// 术语表**解析条数**的跨帧缓存：`glossary_entries()` 会把整段文本解析成
+/// `Vec<(String, String)>`（每个合法条目两次分配），而设置卡每帧都要显示这个数字。
+///
+/// 键 = 「原文长度 + 原文哈希」：原文一改键就变，不会显示陈旧条数；键不变时只付一次
+/// 哈希（零分配），省掉每帧一次整表解析。放在进程级静态量里：`MainWindow` 字段定义在
+/// `ui/mod.rs`（本模块无权改），与 [`MODEL_LIST`] 同一套「只在主线程触碰 + 中毒可用」写法。
+static GLOSSARY_COUNT: Mutex<Option<((usize, u64), usize)>> = Mutex::new(None);
+
+/// 术语表解析出的条目数（带跨帧缓存，见 [`GLOSSARY_COUNT`]）。
+fn glossary_count_cached(cfg: &TranslateConfig) -> usize {
+    let mut hasher = DefaultHasher::new();
+    cfg.glossary.hash(&mut hasher);
+    let key = (cfg.glossary.len(), hasher.finish());
+
+    let mut slot = match GLOSSARY_COUNT.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let cached = slot
+        .as_ref()
+        .filter(|(cached_key, _)| *cached_key == key)
+        .map(|(_, count)| *count);
+    if let Some(count) = cached {
+        return count;
+    }
+    let count = cfg.glossary_entries().len();
+    *slot = Some((key, count));
+    count
 }
 
 /// 离线模型路径行的状态提示：把「手动编辑的校验结果」与「`qwen-llm` 是否就位」
@@ -174,6 +206,26 @@ fn model_cache_status(cfg: &TranslateConfig) -> (bool, Option<(bool, String)>) {
     })
 }
 
+/// 在当前配置下**借用**模型列表调用 `f`；指纹不匹配一律按「没拉过」（`None`）。
+///
+/// 与 [`model_cache_snapshot`] 的区别是**不深拷贝** `Vec<ModelInfo>`：「可用模型池」
+/// 在在线档下逐帧渲染，而网关能返回上百条（每条还带 `name` / 上下文长度等字段），
+/// 每帧为取几个 id 白拷一整份表是纯浪费。锁只在本（主）线程被触碰，持锁构建元素
+/// 不会与谁争用。
+fn with_fresh_model_cache<R>(
+    cfg: &TranslateConfig,
+    f: impl FnOnce(Option<&ModelListCache>) -> R,
+) -> R {
+    let fingerprint = model_cache_fingerprint(cfg);
+    with_model_cache(|slot| {
+        let fresh = match slot.as_ref() {
+            Some(cache) if cache.fingerprint == fingerprint => Some(cache),
+            _ => None,
+        };
+        f(fresh)
+    })
+}
+
 /// 拉取模型列表的失败信息。`raw` 是 `HTTP {code}: {响应体}` 原文，用来匹配
 /// [`crate::utils::config::online_error_hint`]。
 struct ModelFetchError {
@@ -209,7 +261,7 @@ struct ModelFetchOutcome {
 fn body_snippet(body: &str) -> String {
     let snippet: String = body.chars().take(300).collect();
     if snippet.trim().is_empty() {
-        "(空响应体)".to_string()
+        "（空响应体）".to_string()
     } else {
         snippet
     }
@@ -542,7 +594,7 @@ impl MainWindow {
         let tier_control = primitives::segmented_cluster()
             .child(self.seg_option(
                 "perf-tier-gpu",
-                "独立显卡 (GPU 加速)",
+                "独立显卡（GPU 加速）",
                 is_gpu,
                 cx,
                 |this, cx| {
@@ -637,7 +689,7 @@ impl MainWindow {
         let key_control = div()
             .flex()
             .items_center()
-            .gap_2()
+            .gap(px(Theme::SPACE_2))
             .w_full()
             .child(key_input)
             .child(
@@ -723,7 +775,7 @@ impl MainWindow {
         // `TranslateConfig::MAX_GLOSSARY_ENTRIES` 条（见 `utils::config::glossary_prompt`）。
         // 显示解析条数会让用户以为「120 条全在生效」，实际只有前 80 条——
         // 这里按实际生效数显示，并在触到上限时明确提示被截断。
-        let glossary_count = self.state.config.translate.glossary_entries().len();
+        let glossary_count = glossary_count_cached(&self.state.config.translate);
         let glossary_limit = self.state.config.translate.effective_glossary_limit();
         let glossary_effective = effective_glossary_count(glossary_count, glossary_limit);
         let glossary_status = self.glossary_status.clone();
@@ -1150,7 +1202,7 @@ impl MainWindow {
                 div()
                     .flex()
                     .items_baseline()
-                    .gap_2()
+                    .gap(px(Theme::SPACE_2))
                     .child(
                         div()
                             .flex_shrink_0()
@@ -1458,14 +1510,27 @@ impl MainWindow {
 
     /// 服务端模型的规整选择区（支持分类Tab过滤、滚动容器防撑屏、纯净ID展示）。
     fn render_model_choice_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (loading, _, models) = model_cache_snapshot(&self.state.config.translate);
-        let selected = self.state.config.translate.api_model.trim().to_string();
-
-        if models.is_empty() || loading {
-            return div().into_any_element();
-        }
-
         let cat = MODEL_CATEGORY.lock().map(|g| g.clone()).unwrap_or_default();
+        let selected = self.state.config.translate.api_model.trim().to_string();
+        // 借用式读取：只需要 id、分类计数与总数，不再逐帧深拷整份模型表
+        with_fresh_model_cache(&self.state.config.translate, |cache| match cache {
+            Some(cache) if !cache.loading && !cache.models.is_empty() => {
+                self.render_model_pool(&cache.models, &cat, &selected, cx)
+            }
+            _ => div().into_any_element(),
+        })
+    }
+
+    /// 「可用模型池」的实际内容（见 [`Self::render_model_choice_row`]）。
+    ///
+    /// 模型表 / 分类 / 当前选中 id 全部按借用传入，渲染期不复制模型表。
+    fn render_model_pool(
+        &self,
+        models: &[ModelInfo],
+        cat: &str,
+        selected: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let cn_count = models.iter().filter(|m| m.id.starts_with("cn:")).count();
         let global_count = models
             .iter()
@@ -1474,7 +1539,7 @@ impl MainWindow {
 
         let filtered_models: Vec<&ModelInfo> = models
             .iter()
-            .filter(|m| match cat.as_str() {
+            .filter(|m| match cat {
                 "cn" => m.id.starts_with("cn:"),
                 "global" => m.id.starts_with("global:"),
                 _ => true,
@@ -1501,7 +1566,7 @@ impl MainWindow {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap(px(Theme::SPACE_2))
                     .child(
                         div()
                             .text_size(px(Theme::TEXT_CAPTION))
@@ -1512,7 +1577,7 @@ impl MainWindow {
                     .child(if !selected.is_empty() {
                         div()
                             .px(px(Theme::SPACE_1_5))
-                            .py(px(2.0))
+                            .py(px(Theme::SPACE_0_5))
                             .rounded(px(Theme::RADIUS_SM))
                             .bg(Theme::tint_mint_soft())
                             .border_1()
@@ -2114,6 +2179,55 @@ impl MainWindow {
         }))
         .into_any_element();
 
+        let mut card = primitives::card_rows().child(
+            div()
+                .w_full()
+                .py(px(Theme::SPACE_2))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(Theme::SPACE_3))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(Theme::SPACE_0_5))
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_BODY_LG))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(Theme::text_primary())
+                                .child("音频预处理与救场"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(Theme::text_muted())
+                                .child("默认已是最优组合；弱语音 / 远场素材可在此微调"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(Theme::SPACE_2))
+                        .child(master)
+                        .child(
+                            primitives::mini_btn(if open { "收起" } else { "展开" }, true)
+                                .id("perf-audio-advanced-toggle")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.show_audio_advanced =
+                                        !this.state.show_audio_advanced;
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+        );
+
+        if !open {
+            return card;
+        }
+
         // 三个增强开关：走同一个小胶囊工厂，选中态用薄荷色（与全局导航一致）。
         let toggle = |id: &'static str,
                       label: &'static str,
@@ -2251,55 +2365,6 @@ impl MainWindow {
                     .child("对低置信窗口重新解码一遍（更准但明显更慢，长片慎用）"),
             )
             .into_any_element();
-
-        let mut card = primitives::card_rows().child(
-            div()
-                .w_full()
-                .py(px(Theme::SPACE_2))
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(Theme::SPACE_3))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(Theme::SPACE_0_5))
-                        .child(
-                            div()
-                                .text_size(px(Theme::TEXT_BODY_LG))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(Theme::text_primary())
-                                .child("音频预处理与救场"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(Theme::TEXT_CAPTION))
-                                .text_color(Theme::text_muted())
-                                .child("默认已是最优组合；弱语音 / 远场素材可在此微调"),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(Theme::SPACE_2))
-                        .child(master)
-                        .child(
-                            primitives::mini_btn(if open { "收起" } else { "展开" }, true)
-                                .id("perf-audio-advanced-toggle")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.state.show_audio_advanced =
-                                        !this.state.show_audio_advanced;
-                                    cx.notify();
-                                })),
-                        ),
-                ),
-        );
-
-        if !open {
-            return card;
-        }
 
         // 总开关关闭时把增强项整块调暗：仍可见可改（便于提前配好），但明确未生效。
         let dim = move |el: AnyElement| -> AnyElement {
@@ -2500,6 +2565,7 @@ impl MainWindow {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
                     .flex()
                     .flex_col()
                     .gap(px(Theme::SPACE_1))
@@ -2617,6 +2683,7 @@ impl MainWindow {
                                     .children((min..=max).map(|v| {
                                         div()
                                             .flex_1()
+                                            .min_w(px(0.0))
                                             .h_full()
                                             .on_mouse_down(
                                                 MouseButton::Left,
@@ -2716,8 +2783,8 @@ impl MainWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_glossary_count, local_model_status, probe_button_label, tier_disk_snapshot_stale,
-        tier_menu_desc, vad_slider_value, TierDiskKey,
+        effective_glossary_count, glossary_count_cached, local_model_status, probe_button_label,
+        tier_disk_snapshot_stale, tier_menu_desc, vad_slider_value, TierDiskKey,
     };
     use crate::utils::config::TranslateConfig;
 
@@ -2748,6 +2815,31 @@ mod tests {
         assert_eq!(effective_glossary_count(cap + 40, cap), cap);
         // 上限放宽后不该再截断（配置项生效的证据）
         assert_eq!(effective_glossary_count(cap + 40, cap + 100), cap + 40);
+    }
+
+    /// 术语表条数缓存的失效判据：同一份原文命中缓存，原文一改必须重算
+    /// （否则用户改完术语表，界面上的条数会停在旧值）。
+    #[test]
+    fn glossary_count_cache_follows_content_and_reuses_within_same_content() {
+        let two_entries = TranslateConfig {
+            glossary: "a=b\nc=d\n".to_string(),
+            ..TranslateConfig::default()
+        };
+        // 与上一份**字节等长**但只有一条合法条目：只按长度做键的实现会在这里返回 2
+        let one_entry = TranslateConfig {
+            glossary: "aa=bcd=\n".to_string(),
+            ..TranslateConfig::default()
+        };
+        assert_eq!(
+            two_entries.glossary.len(),
+            one_entry.glossary.len(),
+            "用例前提：两份原文长度相同"
+        );
+
+        assert_eq!(glossary_count_cached(&two_entries), 2);
+        assert_eq!(glossary_count_cached(&one_entry), 1, "原文变了必须重算");
+        assert_eq!(glossary_count_cached(&two_entries), 2, "换回原文也要重算");
+        assert_eq!(glossary_count_cached(&two_entries), 2, "同内容复用缓存");
     }
 
     /// 回归：VAD 滑条量程必须落在引擎的有效区间内。

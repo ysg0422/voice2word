@@ -631,36 +631,42 @@ impl MainWindow {
                                 text
                             }),
                     )
-                    .child(div().flex().items_center().gap_2().children(if downloaded {
-                        Some(
-                            primitives::chip_clickable("打开新版本", true, false)
-                                .id("update-open-file-btn")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.open_downloaded_update(cx);
-                                })),
-                        )
-                    } else if is_downloading {
-                        Some(
-                            primitives::chip_clickable("正在下载…", false, false)
-                                .id("update-downloading-btn"),
-                        )
-                    } else if has_target {
-                        Some(
-                            primitives::chip_clickable("直接下载更新", true, false)
-                                .id("update-direct-download-btn")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.download_app_update(cx);
-                                })),
-                        )
-                    } else {
-                        Some(
-                            primitives::chip_clickable("前往下载", false, false)
-                                .id("update-open-page-btn")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.open_release_page(cx);
-                                })),
-                        )
-                    })),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(Theme::SPACE_2))
+                            .children(if downloaded {
+                                Some(
+                                    primitives::chip_clickable("打开新版本", true, false)
+                                        .id("update-open-file-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_downloaded_update(cx);
+                                        })),
+                                )
+                            } else if is_downloading {
+                                Some(
+                                    primitives::chip_clickable("正在下载…", false, false)
+                                        .id("update-downloading-btn"),
+                                )
+                            } else if has_target {
+                                Some(
+                                    primitives::chip_clickable("直接下载更新", true, false)
+                                        .id("update-direct-download-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.download_app_update(cx);
+                                        })),
+                                )
+                            } else {
+                                Some(
+                                    primitives::chip_clickable("前往下载", false, false)
+                                        .id("update-open-page-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_release_page(cx);
+                                        })),
+                                )
+                            }),
+                    ),
             );
         }
 
@@ -732,10 +738,8 @@ impl MainWindow {
                     primitives::btn_clickable(
                         if downloading_this {
                             "正在下载…"
-                        } else if is_needed {
-                            "立即下载"
                         } else {
-                            "下载备用"
+                            "下载"
                         },
                         primitives::BtnSize::Sm,
                         if is_needed {

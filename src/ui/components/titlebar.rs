@@ -68,12 +68,12 @@ impl MainWindow {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap(px(Theme::SPACE_2))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_1p5()
+                            .gap(px(Theme::SPACE_1_5))
                             .child(
                                 div()
                                     .w(px(Theme::BADGE_H))
@@ -109,6 +109,7 @@ impl MainWindow {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
                     .h_full()
                     .flex()
                     .items_center()
@@ -189,7 +190,7 @@ impl MainWindow {
             })
             .flex()
             .items_center()
-            .gap_2()
+            .gap(px(Theme::SPACE_2))
             .cursor_text()
             .track_focus(&focus)
             .on_mouse_down(
@@ -231,6 +232,7 @@ impl MainWindow {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
                     .h_full()
                     .flex()
                     .items_center()
@@ -261,7 +263,7 @@ impl MainWindow {
                 div()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap(px(Theme::SPACE_1))
                     .child(
                         div()
                             .font_family("Consolas")
@@ -276,7 +278,7 @@ impl MainWindow {
                     .child(
                         div()
                             .id("top-search-clear-btn")
-                            .px_1()
+                            .px(px(Theme::SPACE_1))
                             .rounded_sm()
                             .cursor_pointer()
                             .text_size(px(Theme::TEXT_CAPTION))
@@ -292,8 +294,8 @@ impl MainWindow {
                     .into_any_element()
             } else {
                 div()
-                    .px_1p5()
-                    .py_0p5()
+                    .px(px(Theme::SPACE_1_5))
+                    .py(px(Theme::SPACE_0_5))
                     .rounded_sm()
                     .bg(Theme::bg_raised())
                     .border_1()
@@ -317,8 +319,8 @@ impl MainWindow {
         div()
             .flex()
             .items_center()
-            .gap_1()
-            .pr_2()
+            .gap(px(Theme::SPACE_1))
+            .pr(px(Theme::SPACE_2))
             .child(if downloaded {
                 primitives::chip_clickable("新版本就绪（打开）", true, false)
                     .id("titlebar-update-open-btn")
@@ -333,8 +335,8 @@ impl MainWindow {
             } else if has_new_version {
                 div()
                     .id("titlebar-update-direct-btn")
-                    .px_2()
-                    .py_0p5()
+                    .px(px(Theme::SPACE_2))
+                    .py(px(Theme::SPACE_0_5))
                     .rounded_md()
                     .bg(Theme::accent_mint())
                     .text_size(px(Theme::TEXT_SMALL))
@@ -350,8 +352,8 @@ impl MainWindow {
             } else if is_latest {
                 div()
                     .id("titlebar-latest-btn")
-                    .px_2()
-                    .py_0p5()
+                    .px(px(Theme::SPACE_2))
+                    .py(px(Theme::SPACE_0_5))
                     .rounded_md()
                     .bg(Theme::bg_inset())
                     .border_1()

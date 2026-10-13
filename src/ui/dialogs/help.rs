@@ -53,6 +53,7 @@ impl MainWindow {
                 .flex()
                 .flex_col()
                 .flex_1()
+                .min_w(px(0.0))
                 .gap(px(Theme::SPACE_3))
                 .children(entries.iter().map(|(group, rows)| {
                     div()
@@ -78,6 +79,7 @@ impl MainWindow {
                                 .child(
                                     div()
                                         .flex_1()
+                                        .min_w(px(0.0))
                                         .text_size(px(Theme::TEXT_SMALL))
                                         .text_color(Theme::text_secondary())
                                         .child(*hint),

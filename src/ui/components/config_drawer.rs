@@ -301,12 +301,12 @@ impl MainWindow {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .pb_0p5()
+                    .pb(px(Theme::SPACE_0_5))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap(px(Theme::SPACE_2))
                             .child(primitives::stat_dot(if is_processing {
                                 Theme::accent_orange()
                             } else {
@@ -375,6 +375,7 @@ impl MainWindow {
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(0.0))
                             .overflow_hidden()
                             .child(
                                 div()
@@ -642,7 +643,7 @@ impl MainWindow {
             // 用户因此能看懂「我选的这档还没下」，而不会以为选择没生效。
             head = head.child(primitives::badge_accent("当前"));
         }
-        head = head.child(div().flex_1()).child(if present {
+        head = head.child(div().flex_1().min_w(px(0.0))).child(if present {
             primitives::badge(tier_status_text(present, downloading))
         } else if downloading {
             primitives::badge_accent(tier_status_text(present, downloading))
@@ -1262,7 +1263,7 @@ impl MainWindow {
                         div()
                             .flex()
                             .items_center()
-                            .gap_1()
+                            .gap(px(Theme::SPACE_1))
                             .child(primitives::stat_dot_sm(if m.is_model_running {
                                 Theme::accent_mint()
                             } else {
@@ -1286,7 +1287,7 @@ impl MainWindow {
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap(px(Theme::SPACE_1))
                     .child(
                         div()
                             .flex()
@@ -1297,7 +1298,7 @@ impl MainWindow {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap_1()
+                                    .gap(px(Theme::SPACE_1))
                                     .child(div().text_color(Theme::text_muted()).child(
                                         if m.is_model_running {
                                             "CPU（大模型）："
@@ -1330,7 +1331,7 @@ impl MainWindow {
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap(px(Theme::SPACE_1))
                     .child(
                         div()
                             .flex()
@@ -1341,7 +1342,7 @@ impl MainWindow {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap_1()
+                                    .gap(px(Theme::SPACE_1))
                                     .child(div().text_color(Theme::text_muted()).child(
                                         if m.is_model_running {
                                             "内存（大模型）："
