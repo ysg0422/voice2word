@@ -50,6 +50,7 @@
 //! `.part`；近期残留会保留，因此断点续传在**跨进程**（崩溃 / 强杀后重启）场景
 //! 也能真正生效，而不只是同一次运行内的换源重试。
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -503,6 +504,25 @@ impl<'a> PresenceContextRef<'a> {
         // 同上：借用配置，避免每个条目每帧白拷贝一份 `AppConfig`。
         is_custom_build_with_opt(item, Some(self.cfg))
     }
+}
+
+/// 一次扫描得到两张缓存快照：`(model_present, model_custom_build)`。
+///
+/// `AppState::refresh_model_presence` 是同一套判定的「直接写状态」版本；这里
+/// 返回结果而不碰状态，是为了让调用方能把**扫描本身**丢到专用线程上执行：
+/// 声明了 `sha256` 的条目要全文件重算哈希（几百 MB 的顺序读），在 UI 线程
+/// 同步跑会卡帧（见 `utils::background_thread` 的 DEDICATED_LONG_TASKS）。
+pub fn scan_presence(cfg: &AppConfig) -> (HashMap<String, bool>, HashMap<String, bool>) {
+    let ctx = PresenceContextRef::new(cfg);
+    let present = ITEMS
+        .iter()
+        .map(|i| (i.id.to_string(), ctx.is_present(i)))
+        .collect();
+    let custom_build = ITEMS
+        .iter()
+        .map(|i| (i.id.to_string(), ctx.is_custom_build(i)))
+        .collect();
+    (present, custom_build)
 }
 
 /// 判断某个条目是否已就位（内部使用：允许传入已读好的配置）。

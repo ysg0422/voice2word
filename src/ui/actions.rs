@@ -560,11 +560,20 @@ impl MainWindow {
         self.state.proxy_busy = true;
         let proxy = self.state.proxy_manager.clone();
         info!(path = %source.display(), height, "后台生成 H.264 预览代理");
+        // 预览代理是**整片** FFmpeg 转码，耗时随视频时长线性增长（分钟级），
+        // 属于任务清单里的长任务 v2w-preview-proxy（见 utils::background_thread）。
+        // 不能走 `background_executor`：Windows 上 GPUI 把每个后台任务都按 High
+        // 派发，会和转写中的 whisper 抢 CPU。改走专用线程 + BELOW_NORMAL。
+        let result_rx =
+            crate::utils::background_thread::spawn_long_task("v2w-preview-proxy", move || {
+                proxy.ensure_proxy(&source, height)
+            });
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { proxy.ensure_proxy(&source, height) })
-                .await;
+            let result = match result_rx.await {
+                Ok(result) => result,
+                // 线程起不来 / panic：按「代理生成失败」处理，预览回退原片。
+                Err(_) => Err(anyhow::anyhow!("预览代理线程异常退出")),
+            };
             let _ = this.update(cx, |this, cx| {
                 this.state.proxy_busy = false;
                 match result {
@@ -627,12 +636,14 @@ impl MainWindow {
                     .unwrap_or_else(|| path.display().to_string());
                 self.state.download_status_msg = format!("已删除 {name}，可重新下载");
                 // 删完立刻重扫就位状态：徽标要从「已就位」翻回「下载」，
-                // 否则用户会以为没删掉（卡片还显示已就位）。
-                self.state.refresh_model_presence();
+                // 否则用户会以为没删掉（卡片还显示已就位）。重扫对声明了 sha256
+                // 的条目会全文件哈希（同样是长任务），走专用线程。
+                self.refresh_model_presence_offloaded(cx);
             }
             Ok(None) => {
                 self.state.download_status_msg = format!("{label}：磁盘上没有对应文件，无需删除");
-                self.state.refresh_model_presence();
+                // 同「删除成功」分支：重扫走专用线程（见上）。
+                self.refresh_model_presence_offloaded(cx);
             }
             Err(e) => {
                 self.state.download_status_msg = format!("删除失败：{e}");
@@ -749,7 +760,8 @@ impl MainWindow {
                 }
                 self.state.download_status_msg = msg;
                 // 恢复的是库与配置：下次启动才读，这里只刷新界面上的就位/库视图。
-                self.state.refresh_model_presence();
+                // 重扫同样可能触发 sha256 全文件读（长任务），走专用线程。
+                self.refresh_model_presence_offloaded(cx);
             }
             Err(e) => {
                 self.state.download_status_msg = format!("恢复失败：{e}");
@@ -2727,13 +2739,20 @@ impl MainWindow {
         ));
         let buckets = crate::engines::waveform::MAX_WAVEFORM_BUCKETS;
         let extract_target = media.clone();
+        // 波形提取要把**整段**音轨解码成 PCM 再分桶聚合：长视频是几十秒级
+        // 的 CPU 活（见 `utils::background_thread` 的 DEDICATED_LONG_TASKS）。
+        // 不能走 `background_executor`（Windows 上 GPUI 一律按 High 派发，
+        // 会和转写抢 CPU），改走专用线程 + BELOW_NORMAL；结果照旧回 UI 写状态。
+        let result_rx =
+            crate::utils::background_thread::spawn_long_task("v2w-waveform-extract", move || {
+                crate::engines::waveform::extract(&ffmpeg, &extract_target, buckets)
+            });
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    crate::engines::waveform::extract(&ffmpeg, &extract_target, buckets)
-                })
-                .await;
+            let result = match result_rx.await {
+                Ok(result) => result,
+                // 线程起不来 / panic：按「提取失败」处理，时间轴不显示波形轨。
+                Err(_) => Err(anyhow::anyhow!("波形提取线程异常退出")),
+            };
             let _ = this.update(cx, |this, cx| {
                 if this.state.waveform_busy_for.as_ref() == Some(&media) {
                     this.state.waveform_busy_for = None;
@@ -2883,6 +2902,27 @@ impl MainWindow {
                                     };
                                 cx.notify();
                             });
+                        }
+                        // 预取「下一格」：命中缓存立即返回，未命中才真起一次 FFmpeg。
+                        // 用它自己的专用线程、不 await——它属于「提前做」的活，放在
+                        // 提交本帧之前等它会拖慢本帧（见 utils::background_thread）。
+                        // 只在本帧已是最新位置时预取：不是最新说明用户已经拖到别处，
+                        // worker 立刻要去处理新请求，预取只会和它抢 CPU。
+                        if is_latest {
+                            let prefetch_cache = cache.clone();
+                            let prefetch_video = video_path.clone();
+                            let prefetch_ffmpeg = ffmpeg.clone();
+                            let prefetch_time = time;
+                            crate::utils::background_thread::spawn_detached_long_task(
+                                "v2w-frame-prefetch",
+                                move || {
+                                    let _ = prefetch_cache.prefetch_next_tick(
+                                        &prefetch_video,
+                                        prefetch_time,
+                                        &prefetch_ffmpeg,
+                                    );
+                                },
+                            );
                         }
                     }
                     Err(err) => {
@@ -3916,6 +3956,40 @@ impl MainWindow {
 // ─────────── 模型下载（首次使用引导）───────────
 
 impl MainWindow {
+    /// 后台重扫模型就位状态，结果回 UI 写入 `model_present` / `model_custom_build`。
+    ///
+    /// # 为什么这个任务必须离开 UI 线程（也不能塞给 `background_executor`）
+    ///
+    /// `AppState::refresh_model_presence` 的判定里，凡声明了 sha256 的条目都要
+    /// **全文件重算哈希**（主模型几百 MB 的顺序读）——这就是任务清单里的长任务
+    /// `v2w-model-presence-scan`。下载完成回调原先在 `this.update` 里同步跑它，
+    /// 正好把刚转写完的界面卡住；这里把扫描移到专用线程（`utils::background_thread`，
+    /// Windows 下 BELOW_NORMAL），UI 线程只做一次 map 赋值 + 通知，结果与同步
+    /// 版本逐个字段一致。
+    pub(crate) fn refresh_model_presence_offloaded(&mut self, cx: &mut Context<Self>) {
+        let cfg = self.state.config.clone();
+        let result_rx = crate::utils::background_thread::spawn_long_task(
+            "v2w-model-presence-scan",
+            move || crate::utils::model_download::scan_presence(&cfg),
+        );
+        cx.spawn(async move |this, cx| {
+            let scanned = result_rx.await;
+            let _ = this.update(cx, |this, cx| {
+                match scanned {
+                    Ok((present, custom_build)) => {
+                        this.state.model_present = present;
+                        this.state.model_custom_build = custom_build;
+                    }
+                    // 线程起不来 / panic：退回同步扫描，结果语义不变，只是这一次
+                    // 会吃 UI 线程——宁慢勿错（扫描必须发生，否则徽标停在旧态）。
+                    Err(_) => this.state.refresh_model_presence(),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 下载一个模型 / 组件。
     ///
     /// 在**后台线程**执行：最大 833 MB 的文件在慢网下要几十分钟，绝不能在
@@ -3989,8 +4063,11 @@ impl MainWindow {
                             this.state.config.paths.whisper_cli = item.dest.to_string();
                             this.state.persist_config();
                         }
-                        // 重新扫描：新文件就位后界面上的「缺失」标记要立即消失
-                        this.state.refresh_model_presence();
+                        // 重新扫描：新文件就位后界面上的「缺失」标记要立即消失。
+                        // 声明了 sha256 的条目要全文件重算哈希（主模型几百 MB），
+                        // 属任务清单里的长任务 v2w-model-presence-scan：扫描放到
+                        // 专用线程、结果回 UI 写缓存（见 utils::background_thread）。
+                        this.refresh_model_presence_offloaded(cx);
                         // 模型换了，硬件档案里的推荐配置与预览代理可能要重算
                         this.state.refresh_hardware_recommendation();
                     }
@@ -4103,7 +4180,9 @@ impl MainWindow {
                 this.state.download_current = None;
                 this.state.download_done_bytes = 0;
                 this.state.download_total_bytes = 0;
-                this.state.refresh_model_presence();
+                // 与单条目下载完成同源：重扫（含 sha256 全文件读）走专用线程，
+                // 理由见 `refresh_model_presence_offloaded` 的文档注释。
+                this.refresh_model_presence_offloaded(cx);
                 this.state.refresh_hardware_recommendation();
                 this.state.download_status_msg = if !last_msg.is_empty() {
                     last_msg

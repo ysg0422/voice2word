@@ -494,6 +494,25 @@ impl Default for DiarizationOptions {
     }
 }
 
+/// 收尾统计块写到哪里：`false` = stdout（默认，图形界面与人用终端），`true` = stderr。
+///
+/// 无头模式必须把 stdout 让给结果：`--json` 时 stdout 只有一行 JSON，混进多行统计块
+/// 会让调用方解析失败。统计块仍要打给人看，于是改道 stderr，而不是干脆不打。
+/// 用进程级开关而不是参数：管线由库内多处构造，且这个决定对一次进程运行是常量。
+///
+/// 插在这里（而不是 metrics.rs）是因为只有管线收尾这一处会真的打印它。
+static SUMMARY_TO_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// 把收尾统计块改写到 stderr（命令行入口在开始任务前调用一次）。
+pub fn set_summary_to_stderr(enabled: bool) {
+    SUMMARY_TO_STDERR.store(enabled, Ordering::Relaxed);
+}
+
+/// 当前统计块去向（测试与调用方自查用）。
+pub fn summary_to_stderr() -> bool {
+    SUMMARY_TO_STDERR.load(Ordering::Relaxed)
+}
+
 pub struct TaskPipeline {
     ffmpeg: Arc<FFmpegEngine>,
     whisper: Arc<WhisperEngine>,
@@ -1799,7 +1818,11 @@ impl TaskPipeline {
         // 结果同一条多行统计在控制台出现两遍、日志文件里也占两份，批量转写时刷屏。
         // 两条路径共用一次「打印名额」判定：先到的打印、后到的丢弃，始终只出现一份。
         if metrics.take_print_slot() {
-            println!("{summary}");
+            if summary_to_stderr() {
+                eprintln!("{summary}");
+            } else {
+                println!("{summary}");
+            }
             info!("{}", summary);
         }
 
@@ -2486,6 +2509,17 @@ mod tests {
 
     /// 场景一：先取消、后启动。上一轮留下的取消位必须被派发前的 `begin_task()` 作废，
     /// 否则新任务一开跑就自杀（进度条一闪、报「已取消」）。
+    /// 统计块去向开关：必须可切换，且切换后立刻生效（调用方在任务起手前设置一次）。
+    #[test]
+    fn summary_destination_can_be_redirected_to_stderr() {
+        let before = summary_to_stderr();
+        set_summary_to_stderr(true);
+        assert!(summary_to_stderr());
+        set_summary_to_stderr(false);
+        assert!(!summary_to_stderr());
+        set_summary_to_stderr(before);
+    }
+
     #[test]
     fn begin_task_clears_stale_cancel_so_new_task_is_not_instantly_cancelled() {
         let pipeline = test_pipeline();

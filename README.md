@@ -258,6 +258,8 @@ docs/         优化记录与设计规范
 除图形界面外，Voice2Word 提供无头命令行（CLI），并附带 Claude Code / Codex Skill 与 MCP 服务器，便于脚本化与 AI 工具调用：
 
 - 完整说明见 [集成说明：CLI 与 MCP](docs/集成说明-CLI与MCP.md)。
+- 面向机器调用的命令与 JSON 契约见 [无头模式与机器调用](docs/headless.md)。
+- 单次调用：`voice2word run --json --input talk.mp4`（stdout 恒为一行 JSON）；可用工具清单：`voice2word tools --json`。
 - 集成资产位于 [integrations/](integrations/)：
   - [integrations/voice2word-skill/](integrations/voice2word-skill/)：Skill（`SKILL.md` + `scripts/transcribe.ps1`）。
   - [integrations/mcp-server/](integrations/mcp-server/)：MCP stdio 服务器（`voice2word_mcp.py` + 协议测试）。

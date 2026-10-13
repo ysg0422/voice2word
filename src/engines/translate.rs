@@ -1030,7 +1030,10 @@ fn finish_reason_is_length(value: &serde_json::Value) -> bool {
 }
 
 /// 统一 POST 到 `/chat/completions` 并解析 JSON 响应体
-fn post_chat_completions(
+///
+/// 除翻译链路外，无头模式的「工具调用」入口也复用它：超时、鉴权、错误文案
+/// 因此只有一份实现，外部调用方看到的失败原因与界面里完全一致。
+pub(crate) fn post_chat_completions(
     cfg: &OnlineApiConfig,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value> {
@@ -1081,7 +1084,7 @@ fn post_chat_completions(
 /// 「或…」「带"呢"语气：…」这类模型自问自答。正确行为是：`content` 为空时
 /// 返回 `None`，让上层走「空内容 / 输出被思考吃光」的错误分支（可重试或提示用户），
 /// 而不是把思考当译文静默吞下。思考文本只允许进日志（见 [`reasoning_content_len`]）。
-fn extract_message_content(value: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_message_content(value: &serde_json::Value) -> Option<String> {
     let choice = value.get("choices")?.get(0)?;
     let direct = choice
         .get("message")

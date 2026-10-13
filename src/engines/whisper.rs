@@ -88,6 +88,15 @@ pub struct WhisperEngine {
     /// 「字幕可能不完整（输出管道中断）」提示给用户。用 Arc 是因为 stdout 读取
     /// 线程（`'static`）也要置位它。
     output_truncated: Arc<AtomicBool>,
+    /// 热词覆盖（命令行 / 外部脚本一次性指定）。
+    ///
+    /// `None` = 未覆盖，照旧读 `config.toml` 的 `[pipeline] asr_hotwords`；
+    /// `Some(text)` = 本次进程内所有转写都用这个文本当热词，其中**空串是合法取值**，
+    /// 语义是「本次不要热词」——不能再回落到配置文件，否则清空热词这个动作会失效。
+    ///
+    /// 用 `Mutex<Option<String>>` 是照 `llm.rs` 里术语表字段的先例：写入方（命令行）
+    /// 与读取方（转写线程拼参数）不在同一层，且读取发生在每次拼参数时，用户改了立刻生效。
+    hotwords_override: Mutex<Option<String>>,
 }
 
 /// 子进程登记表里的一行：`(pid, 本次登记的单调序号)`。
@@ -300,6 +309,7 @@ impl WhisperEngine {
             cancel: Arc::new(AtomicBool::new(false)),
             active_children: Arc::new(Mutex::new(Vec::new())),
             output_truncated: Arc::new(AtomicBool::new(false)),
+            hotwords_override: Mutex::new(None),
         }
     }
 
@@ -333,6 +343,31 @@ impl WhisperEngine {
         };
         self.vad_threshold_bits
             .store(valid.to_bits(), Ordering::SeqCst);
+    }
+
+    /// 覆盖本次运行的热词（`None` = 清除覆盖，回到 `config.toml`）。
+    ///
+    /// 供命令行等外部入口调用：不改配置文件就能给单次转写指定人名、品牌、专业术语。
+    /// 覆盖值走与配置值**完全相同**的清洗、截断与锚点拼接（见 `initial_prompt_args`），
+    /// 因此不会因为来源不同而产生第二套解析规则。
+    pub fn set_hotwords_override(&self, hotwords: Option<String>) {
+        let mut slot = self
+            .hotwords_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *slot = hotwords;
+    }
+
+    /// 本次转写生效的热词：命令行覆盖优先，其次 `config.toml`。
+    fn resolved_hotwords(&self) -> String {
+        let slot = self
+            .hotwords_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match slot.as_ref() {
+            Some(value) => value.clone(),
+            None => asr_hotwords_from_config(),
+        }
     }
 
     /// 运行期改写 GPU 占用上限（百分比，100 = 不限速）。
@@ -755,7 +790,7 @@ impl WhisperEngine {
         // 清洗（NUL / 控制字符 / `"` / `<|...|>`）与 200 字符上限都在 `initial_prompt_args`
         // 与 `normalize_hotwords` 里，拼参数这一层只负责把结果逐项交给 `Command::arg`
         //（逐项传参不经过 shell，因此这里不加引号，见 `normalize_hotwords` 的文档）。
-        let hotwords = asr_hotwords_from_config();
+        let hotwords = self.resolved_hotwords();
         if !hotwords.trim().is_empty() {
             info!(
                 configured_chars = hotwords.trim().chars().count(),
@@ -2510,7 +2545,7 @@ fn output_truncated_flag_is_readable_take_once_and_cleared_by_reset() {
 #[cfg(test)]
 mod hotwords_tests {
     use super::{
-        asr_hotwords_from_config_path, initial_prompt_args, DEFAULT_INITIAL_PROMPT,
+        asr_hotwords_from_config_path, initial_prompt_args, WhisperEngine, DEFAULT_INITIAL_PROMPT,
         MAX_ASR_HOTWORDS_CHARS,
     };
 
@@ -2663,5 +2698,46 @@ mod hotwords_tests {
         assert!(!missing.exists(), "读热词不得创建配置文件");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 命令行覆盖：`set_hotwords_override` 必须压过配置文件里的值，
+    /// 且被清除后回到「读配置」这条路径。
+    #[test]
+    fn hotwords_override_wins_over_config_and_clears_back() {
+        let engine = WhisperEngine::with_device(
+            std::path::PathBuf::from("missing-whisper-cli.exe"),
+            std::path::PathBuf::from("missing-model.bin"),
+            None,
+            4,
+            1,
+            false,
+            true,
+            32,
+            100,
+        );
+
+        // 覆盖值优先，且与配置值走同一套清洗/截断/锚点拼接。
+        engine.set_hotwords_override(Some("李四,某品牌".to_string()));
+        assert_eq!(engine.resolved_hotwords(), "李四,某品牌");
+        assert_eq!(
+            initial_prompt_args("zh", &engine.resolved_hotwords()),
+            vec![
+                "--prompt".to_string(),
+                format!("{DEFAULT_INITIAL_PROMPT} 李四,某品牌")
+            ]
+        );
+
+        // 空串是「本次不要热词」：必须短路到默认行为，不能回落到配置文件。
+        engine.set_hotwords_override(Some(String::new()));
+        assert!(engine.resolved_hotwords().is_empty());
+        assert_eq!(
+            initial_prompt_args("zh", &engine.resolved_hotwords()),
+            initial_prompt_args("zh", "")
+        );
+
+        // 清除覆盖后不再返回覆盖值（此处 cwd 下不保证有 config.toml，
+        // 因此只校验「覆盖已失效」这一条可判定事实）。
+        engine.set_hotwords_override(None);
+        assert_ne!(engine.resolved_hotwords(), "李四,某品牌");
     }
 }

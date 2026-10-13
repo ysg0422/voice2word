@@ -1,3 +1,4 @@
+pub mod background_thread;
 pub mod backup;
 pub mod child_registry;
 pub mod config;

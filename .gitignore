@@ -101,3 +101,9 @@ glossary.txt
 
 # CLI 阶段产物 / 断点续跑缓存目录（--resume / --artifact-dir 的默认落点）
 .voice2word-stages/
+
+# 替换规则集（用户/工具本地维护的新增规则文件，不进版本库）
+replace_rules.json
+
+# 研究 / 隔离实验临时目录（子智能体实验产物，别入库）
+_research_tmp/

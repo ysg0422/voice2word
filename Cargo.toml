@@ -44,6 +44,12 @@ flate2 = { version = "1.1.10", default-features = false, features = ["rust_backe
 sha2 = "0.10"
 regex = "1.10"
 
+# 长任务专用线程的优先级控制：Windows 下把当前线程降到 BELOW_NORMAL
+# （见 src/utils/background_thread.rs）。必须显式直接依赖——gpui 的传递依赖
+# 不构成可直接 use 的依赖项；版本对齐 gpui 0.2.2 用的 windows 0.61，不引入第二份。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [profile.dev]
 # Keep debug symbols and fast incremental builds, while giving the UI,
 # JSON parsing, and subtitle pipeline basic optimization in the debug exe.

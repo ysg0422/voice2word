@@ -637,3 +637,126 @@ mod tests {
         assert_eq!(got, vec![missing]);
     }
 }
+
+/// 超大 / 超长素材的提前提醒阈值（不是安全漏洞，是「别把用户拖死」）。
+///
+/// 抽帧缓存、波形、切块临时目录都会随片长线性变大：一个 8 小时 4K 素材能让磁盘
+/// 和内存同时吃紧，用户看到的却是「界面没反应」。所以**先算一遍账再问一句**，
+/// 而不是等它跑半小时才发现。阈值取「正常课程/会议素材的上限」再留一倍余量。
+pub const MEDIA_SIZE_WARN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// 时长的提醒线（秒）：6 小时。
+pub const MEDIA_DURATION_WARN_SECS: f64 = 6.0 * 3600.0;
+/// 硬上限：超过就拒绝开工（磁盘/内存风险已经不是「慢一点」的量级了）。
+pub const MEDIA_SIZE_REFUSE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// 时长的硬上限（秒）：24 小时。
+pub const MEDIA_DURATION_REFUSE_SECS: f64 = 24.0 * 3600.0;
+
+/// 素材载入前的体检结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaLoadAdvice {
+    /// 正常大小，直接开工。
+    Ok,
+    /// 偏大，问一句再继续（文案直接给用户看）。
+    Warn(String),
+    /// 超出硬上限，拒绝开工（文案直接给用户看）。
+    Refuse(String),
+}
+
+/// 按文件大小与时长给出「提醒 / 拒绝」的结论。
+///
+/// `duration_secs` 传 0.0 表示还没探到时长（例如刚导入还没跑 ffprobe）：这时
+/// 只按体积判断，绝不因为「时长未知」就当正常放行到拒绝那档。
+pub fn assess_media_load(size_bytes: u64, duration_secs: f64) -> MediaLoadAdvice {
+    let hours = duration_secs / 3600.0;
+    let gib = size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let has_duration = duration_secs > 0.0;
+
+    if size_bytes >= MEDIA_SIZE_REFUSE_BYTES
+        || (has_duration && duration_secs >= MEDIA_DURATION_REFUSE_SECS)
+    {
+        return MediaLoadAdvice::Refuse(format!(
+            "这个素材约 {gib:.1} GB{}，超出了本工具的处理上限（{:.0} GB / {:.0} 小时）。请先切片再导入。",
+            if has_duration {
+                format!("、{hours:.1} 小时")
+            } else {
+                String::new()
+            },
+            MEDIA_SIZE_REFUSE_BYTES as f64 / (1024.0 * 1024.0 * 1024.0),
+            MEDIA_DURATION_REFUSE_SECS / 3600.0,
+        ));
+    }
+
+    if size_bytes >= MEDIA_SIZE_WARN_BYTES
+        || (has_duration && duration_secs >= MEDIA_DURATION_WARN_SECS)
+    {
+        return MediaLoadAdvice::Warn(format!(
+            "这个素材约 {gib:.1} GB{}，转写与预览会明显变慢，临时文件也会占不少磁盘。可以继续，也可以先切片。",
+            if has_duration {
+                format!("、{hours:.1} 小时")
+            } else {
+                String::new()
+            },
+        ));
+    }
+
+    MediaLoadAdvice::Ok
+}
+
+#[cfg(test)]
+mod media_load_advice_tests {
+    use super::{assess_media_load, MediaLoadAdvice, MEDIA_SIZE_WARN_BYTES};
+
+    /// 正常素材必须走 Ok：阈值只用来兜极端情况，不能把普通长课/会议挡下来。
+    #[test]
+    fn ordinary_length_media_passes_without_questions() {
+        // 3 小时 2 GB：典型的网课/会议录屏
+        assert_eq!(
+            assess_media_load(2 * 1024 * 1024 * 1024, 3.0 * 3600.0),
+            MediaLoadAdvice::Ok
+        );
+        assert_eq!(assess_media_load(0, 0.0), MediaLoadAdvice::Ok);
+    }
+
+    /// 提醒线是「含等号」的：正好 8 GiB / 正好 6 小时都要问一句。
+    #[test]
+    fn warn_thresholds_are_inclusive() {
+        assert!(matches!(
+            assess_media_load(MEDIA_SIZE_WARN_BYTES, 0.0),
+            MediaLoadAdvice::Warn(_)
+        ));
+        assert!(matches!(
+            assess_media_load(1024, 6.0 * 3600.0),
+            MediaLoadAdvice::Warn(_)
+        ));
+        assert!(matches!(
+            assess_media_load(MEDIA_SIZE_WARN_BYTES - 1, 6.0 * 3600.0 - 1.0),
+            MediaLoadAdvice::Ok
+        ));
+    }
+
+    /// 时长未知（0.0）时只按体积判断，不能因为「不知道多长」就放过超大文件。
+    #[test]
+    fn unknown_duration_still_uses_size() {
+        assert!(matches!(
+            assess_media_load(MEDIA_SIZE_WARN_BYTES, 0.0),
+            MediaLoadAdvice::Warn(_)
+        ));
+        assert!(matches!(
+            assess_media_load(64 * 1024 * 1024 * 1024, 0.0),
+            MediaLoadAdvice::Refuse(_)
+        ));
+    }
+
+    /// 硬上限以上直接拒绝，且文案里带得出实际体量（用户得知道为什么被挡）。
+    #[test]
+    fn extreme_media_is_refused_with_numbers() {
+        match assess_media_load(80 * 1024 * 1024 * 1024, 30.0 * 3600.0) {
+            MediaLoadAdvice::Refuse(msg) => {
+                assert!(msg.contains("80.0 GB"), "文案要给出实际体量：{msg}");
+                assert!(msg.contains("30.0 小时"), "文案要给出实际时长：{msg}");
+                assert!(msg.contains("切片"), "要给出可行做法：{msg}");
+            }
+            other => panic!("超限素材必须拒绝，实际：{other:?}"),
+        }
+    }
+}

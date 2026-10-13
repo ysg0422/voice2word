@@ -6552,6 +6552,7 @@ dependencies = [
  "ureq",
  "uuid",
  "wgpu",
+ "windows 0.61.3",
  "zhconv",
 ]
 
