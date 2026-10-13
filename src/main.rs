@@ -37,7 +37,15 @@ fn main() -> Result<()> {
     let mut startup = StartupTimer::new();
 
     // 1. 初始化双写日志系统 (同时输出至控制台与 logs/ 文本文件，并拦截记录 panic 堆栈)
-    let _log_file = utils::init_logger()?;
+    let _log_file = match utils::init_logger() {
+        Ok(path) => path,
+        Err(err) => {
+            // 日志系统都没起来，这条错误连 `logs/` 都写不进去——只能弹窗，否则
+            // 用户面对的是一个「双击没反应」的进程。
+            report_startup_failure("初始化日志系统（创建 logs 目录）", &format!("{err:#}"));
+            return Err(err);
+        }
+    };
     startup.mark("logger_init");
 
     info!("==========================================");
@@ -60,7 +68,13 @@ fn main() -> Result<()> {
     startup.mark("startup_sweep");
 
     // 2. 加载配置文件
-    let config = AppConfig::load_from_file("config.toml")?;
+    let config = match AppConfig::load_from_file("config.toml") {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            report_startup_failure("读取配置文件 config.toml", &format!("{err:#}"));
+            return Err(err);
+        }
+    };
     info!("配置加载成功: {:?}", config);
     startup.mark("config_load");
     // 主题必须在任何界面构建之前设定：颜色 token 在渲染时才读取全局开关。
@@ -133,7 +147,16 @@ fn main() -> Result<()> {
     // **用户连界面都看不到**（实测报错：`unable to open database file`）。
     // 库仍然留在项目根（与旧行为一致），只是不再随 cwd 漂移。
     let db_path = AppConfig::resolve_path("voice2word.db");
-    let db = Database::open(&db_path)?;
+    let db = match Database::open(&db_path) {
+        Ok(db) => db,
+        Err(err) => {
+            report_startup_failure(
+                "打开 SQLite 数据库",
+                &format!("路径：{}\n{err:#}", db_path.display()),
+            );
+            return Err(err);
+        }
+    };
     info!(db = %db_path.display(), "SQLite 数据库已连接");
     startup.mark("db_open");
 
@@ -372,6 +395,66 @@ fn main() -> Result<()> {
     db_for_shutdown.maintain_on_shutdown();
 
     Ok(())
+}
+
+/// 启动关键路径的**致命**错误出口：写日志 + 原生弹窗。
+///
+/// 这些错误一旦发生，`main` 就在建窗之前返回、进程直接退出。此前它们只经 `?`
+/// 冒泡到 `main` 的 `Result`：Release 版是 Windows GUI 子系统、没有控制台，Rust
+/// 默认把 `Error: …` 写到 stderr，随进程一起被丢弃；`tracing` 也拿不到（`?` 不落
+/// 日志）。三种最常见的启动失败——安装目录只读（写不了 `logs/` 或 `voice2word.db`）、
+/// 配置写坏、数据库打不开——用户看到的都是「双击没反应」，连日志文件都没有。
+///
+/// 这里统一处理：能记就记进日志（日志订阅者已就绪时），再弹一个原生错误框，
+/// 让桌面用户至少看到「哪一步失败、为什么、怎么办」。
+fn report_startup_failure(stage: &str, detail: &str) {
+    tracing::error!(stage, detail, "启动致命错误");
+    let message = voice2word::app::format_startup_failure(stage, detail);
+    show_startup_error_dialog(&message);
+}
+
+/// 弹出启动失败对话框。
+///
+/// Windows 走原生 `MessageBoxW`（与安装程序同一条路）：GUI 子系统下没有控制台，
+/// 这是唯一能被用户看到的出口。它自带模态消息循环，可在 GPUI 起来之前的主线程调用。
+#[cfg(windows)]
+fn show_startup_error_dialog(message: &str) {
+    // MessageBoxW 的 uType：MB_OK(=0) | MB_ICONERROR(=0x10)
+    const MB_OK_ICONERROR: u32 = 0x0000_0010;
+
+    let title = to_wide("Voice2Word 启动失败");
+    let body = to_wide(message);
+    // 只关心「用户看到了」；按钮返回值（恒为 IDOK）不参与流程。
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_OK_ICONERROR,
+        );
+    }
+}
+
+/// 非 Windows 平台没有原生弹窗可用，退回标准错误输出（有终端时可见）。
+#[cfg(not(windows))]
+fn show_startup_error_dialog(message: &str) {
+    eprintln!("{message}");
+}
+
+#[cfg(windows)]
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+extern "system" {
+    fn MessageBoxW(
+        hwnd: *mut std::ffi::c_void,
+        text: *const u16,
+        caption: *const u16,
+        u_type: u32,
+    ) -> i32;
 }
 
 /// 启动阶段耗时打点器：`mark()` 打印「上一阶段 → 此刻」与「进程入口 → 此刻」的

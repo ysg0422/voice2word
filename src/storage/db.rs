@@ -438,10 +438,15 @@ impl Database {
             "#,
             [],
         )?;
-        // 兼容老数据库自动增加 metrics_json 列
-        if !Database::column_exists(&conn, "metrics_json")? {
-            conn.execute("ALTER TABLE tasks ADD COLUMN metrics_json TEXT;", [])?;
-        }
+        // 历史补列（`metrics_json` 等）**不在这里做**：补列属于 schema 迁移，统一由
+        // `apply_migrations` 在 `BEGIN IMMEDIATE` 事务里完成。
+        //
+        // 为什么不能顺手在这里 `column_exists` + `ALTER TABLE ADD COLUMN`：那是
+        // 事务外的 check-then-act。两个实例同时打开同一个**老库**时，双方都可能探到
+        // 「列不存在」，随后各发一条 ALTER，后到的那条以 `duplicate column name`
+        // 失败——它是逻辑错误、不触发 busy 重试，`open` 于是返回 Err，程序连界面都
+        // 进不去。放进迁移事务后，先拿锁的一方改完，另一方等锁、拿锁后重新探列，
+        // 看到列已在即跳过，天然无竞态（单进程行为不变：老库仍由 v0→v1 补齐）。
 
         // ── 索引 ──
         //
@@ -1824,6 +1829,57 @@ mod tests {
         assert_eq!(user_version(&third), Database::SCHEMA_VERSION);
         drop(second);
         drop(third);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 多实例**并发**打开同一个老库时，两边都必须成功。
+    ///
+    /// 复现的是「补列」这一步的 check-then-act 竞态：早期 `init_tables` 在事务外
+    /// 先 `column_exists(metrics_json)` 再 `ALTER TABLE ADD COLUMN`。两个实例若在
+    /// 同一窗口里都走这步，后到的那次会以 `duplicate column name` 失败——那是逻辑
+    /// 错误、不触发 busy 重试，`open` 直接返回 Err，程序连界面都进不去。
+    /// 现在补列只发生在 `apply_migrations` 的 `BEGIN IMMEDIATE` 事务里：抢到锁的
+    /// 一方先改，另一方等锁、拿锁后重新探列、看到列已在即跳过。
+    ///
+    /// 用 `Barrier` 让两个线程尽量同时进入 `open`，并把该动作重复几轮来提高触发
+    /// 概率；断言两轮都成功、且最终 schema 完整（`metrics_json` 已由迁移补上）。
+    #[test]
+    fn concurrent_open_of_legacy_db_both_succeed() {
+        let dir = tmp_dir("mig_race");
+        for round in 0..5 {
+            let path = dir.join(format!("legacy_race_{round}.db"));
+            create_v0_db(&path);
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    Database::open(&path).map(|db| user_version(&db))
+                }));
+            }
+            for handle in handles {
+                let version = handle
+                    .join()
+                    .expect("打开线程不应 panic")
+                    .expect("并发打开同一老库都应成功");
+                assert_eq!(version, Database::SCHEMA_VERSION);
+            }
+
+            // 迁移结果完整：老库缺的 metrics_json 已由迁移补齐。
+            let db = Database::open(&path).expect("串行重开也应成功");
+            assert!(
+                Database::column_exists(&db.lock_conn(), "metrics_json").unwrap(),
+                "并发迁移后 metrics_json 列必须存在"
+            );
+            let n: i64 = db
+                .lock_conn()
+                .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 2, "并发打开不应丢行");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

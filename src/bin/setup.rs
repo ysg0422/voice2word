@@ -106,6 +106,30 @@ fn select_install_dir(default_dir: &Path) -> Option<PathBuf> {
     );
 
     if confirm == IDOK {
+        // 目标目录已存在、非空、且不像本程序的旧安装时，再确认一次。
+        //
+        // 卸载脚本会 `rmdir /s /q` 整个安装目录。若用户把一个「已经装了别的
+        // 东西」的目录选成安装位置，卸载就会连带删掉那些文件——而安装当时只
+        // 提示过一次「含其中的用户数据」，用户很容易忽略。这里用客观判据
+        // （目录里有没有本程序 exe）区分「旧安装」与「别人的目录」。
+        if is_existing_foreign_dir(&install_dir) {
+            let proceed = message_box(
+                &title,
+                &format!(
+                    "所选目录已存在，且里面没有 {app}（{exe}）：\n{dir}\n\n\
+                     它可能是您自己的目录。{app} 只写入自己的文件，但「卸载时会删除\n\
+                     整个目录」，其中原有文件也会一并消失，且不可恢复。\n\n\
+                     确定仍要安装到这个目录吗？",
+                    app = APP_NAME,
+                    exe = APP_EXE_NAME,
+                    dir = install_dir.display()
+                ),
+                MB_YESNO | MB_ICONQUESTION,
+            );
+            if proceed != IDYES {
+                return None;
+            }
+        }
         Some(install_dir)
     } else {
         None
@@ -117,6 +141,26 @@ fn resolve_install_dir(parent: &Path) -> PathBuf {
     match parent.file_name() {
         Some(name) if name.to_string_lossy().eq_ignore_ascii_case(APP_NAME) => parent.to_path_buf(),
         _ => parent.join(APP_NAME),
+    }
+}
+
+/// 目标目录是否「已存在、非空、且不像本程序的历史安装目录」。
+///
+/// 只认客观事实：目录里有没有 `voice2word.exe`。卸载脚本会 `rmdir /s /q` 整个安装
+/// 目录，因此把一个「已经装了别的东西」的目录当安装位置，卸载就会连带删掉那些文件。
+/// 抽成纯函数是为了能对着临时目录单测，不必真去弹窗。
+fn is_existing_foreign_dir(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    // 里面已有本程序 exe → 大概率是自己的旧安装（会被覆盖），不算陌生目录。
+    if dir.join(APP_EXE_NAME).is_file() {
+        return false;
+    }
+    match fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_some(),
+        // 读不到目录内容（权限等）就不臆断，按「不陌生」处理，不额外拦用户。
+        Err(_) => false,
     }
 }
 
@@ -187,6 +231,60 @@ fn create_shortcut(
     }
 }
 
+/// 批处理里 `%` 的**唯一**转义方式：写两遍（`%%`）。
+///
+/// cmd 即使把路径放在双引号里也照样展开 `%VAR%` 与批处理参数 `%1`／`%*`——
+/// 双引号挡不住 `%`。安装目录是用户自选的，完全可能含 `%`（例如
+/// `D:\100%\Voice2Word`）；不转义的话，卸载脚本去 `echo`／`msg`／`rmdir`
+/// 的是展开后的**另一个路径**。
+fn escape_batch_percent(s: &str) -> String {
+    s.replace('%', "%%")
+}
+
+/// 生成卸载脚本内容。抽成纯函数是为了让「路径转义」这一处能被单测钉死。
+fn build_uninstall_script(app: &str, exe: &str, install_dir: &Path) -> String {
+    let dir = escape_batch_percent(&install_dir.display().to_string());
+    format!(
+        "@echo off\r\n\
+        chcp 65001 >nul\r\n\
+        echo 正在卸载 {app}...\r\n\
+        taskkill /f /im {exe} >nul 2>&1\r\n\
+        timeout /t 1 /nobreak >nul\r\n\
+        reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{app}\" /f >nul 2>&1\r\n\
+        del /f /q \"%USERPROFILE%\\Desktop\\{app}.lnk\" >nul 2>&1\r\n\
+        del /f /q \"%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\{app}.lnk\" >nul 2>&1\r\n\
+        echo 即将删除 {app} 的安装目录（其中包含您的用户数据）：\"{dir}\"\r\n\
+        msg * \"{app} 卸载即将完成：将删除以下目录（其中包含您的用户数据），删除后不可恢复：{dir}\"\r\n\
+        timeout /t 5 /nobreak >nul\r\n\
+        rmdir /s /q \"{dir}\" >nul 2>&1\r\n\
+        echo {app} 已从您的电脑中卸载。\r\n",
+        app = app,
+        exe = exe,
+        dir = dir,
+    )
+}
+
+/// 「写入目标 exe 失败」时的可操作解释。
+///
+/// 覆盖安装最常见的失败不是磁盘满，而是**目标程序正在运行**：Windows 下已被加载
+/// 的 exe 会被加锁，`fs::write` 直接返回共享冲突。原来的提示只有系统原文
+/// （「另一个程序正在使用此文件」），用户不知道该关哪个东西，只能干瞪眼。
+/// 这里按 Win32 错误码把话讲清楚。其它错误码保持原文，不臆测原因。
+fn write_failure_hint(err: &std::io::Error) -> String {
+    match err.raw_os_error() {
+        // ERROR_SHARING_VIOLATION(32) / ERROR_LOCK_VIOLATION(33)
+        Some(32) | Some(33) => format!(
+            "{APP_NAME} 正在运行，安装程序无法覆盖它的 exe。\n\
+             请先退出正在运行的 {APP_NAME}（含任务栏/托盘里没关掉的窗口），再重新运行安装程序。"
+        ),
+        // ERROR_ACCESS_DENIED(5)
+        Some(5) => "没有写入权限。请改选有写权限的目录（默认的「用户目录」位置无需管理员权限），\
+             或以管理员身份运行安装程序。"
+            .to_string(),
+        _ => "写入程序文件失败".to_string(),
+    }
+}
+
 fn run_installer() {
     let default_dir = get_install_dir();
     // 步骤 1：选择安装位置（默认目录，或由用户自定义）。
@@ -224,7 +322,12 @@ fn run_installer() {
     if let Err(e) = fs::write(&target_exe, MAIN_EXE_BYTES) {
         message_box(
             "安装失败",
-            &format!("写入程序文件失败:\n{}\n\n错误: {}", target_exe.display(), e),
+            &format!(
+                "{}\n\n文件: {}\n错误: {}",
+                write_failure_hint(&e),
+                target_exe.display(),
+                e
+            ),
             MB_OK | MB_ICONERROR,
         );
         return;
@@ -266,24 +369,7 @@ fn run_installer() {
 
     // 4. 生成卸载脚本
     let uninstall_bat = install_dir.join("uninstall.bat");
-    let bat_content = format!(
-        "@echo off\r\n\
-        chcp 65001 >nul\r\n\
-        echo 正在卸载 {app}...\r\n\
-        taskkill /f /im {exe} >nul 2>&1\r\n\
-        timeout /t 1 /nobreak >nul\r\n\
-        reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{app}\" /f >nul 2>&1\r\n\
-        del /f /q \"%USERPROFILE%\\Desktop\\{app}.lnk\" >nul 2>&1\r\n\
-        del /f /q \"%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\{app}.lnk\" >nul 2>&1\r\n\
-        echo 即将删除 {app} 的安装目录（其中包含您的用户数据）：\"{dir}\"\r\n\
-        msg * \"{app} 卸载即将完成：将删除以下目录（其中包含您的用户数据），删除后不可恢复：{dir}\"\r\n\
-        timeout /t 5 /nobreak >nul\r\n\
-        rmdir /s /q \"{dir}\" >nul 2>&1\r\n\
-        echo {app} 已从您的电脑中卸载。\r\n",
-        app = APP_NAME,
-        exe = APP_EXE_NAME,
-        dir = install_dir.display(),
-    );
+    let bat_content = build_uninstall_script(APP_NAME, APP_EXE_NAME, &install_dir);
     if let Err(e) = fs::write(&uninstall_bat, bat_content) {
         warnings.push(format!("卸载脚本 uninstall.bat 写入失败：{e}"));
     }
@@ -454,5 +540,108 @@ mod tests {
     fn default_install_dir_is_dedicated_app_folder() {
         let dir = get_install_dir();
         assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some(APP_NAME));
+    }
+}
+
+/// 安装器健壮性回归：路径转义与「写入被占用」的提示。
+///
+/// 刻意与上面的向导测试分开、且不 `use super::*`：只显式引入被测函数，
+/// 这样新增的依赖不会悄悄把整份模块塞进来。
+#[cfg(test)]
+mod robustness_tests {
+    use super::{
+        build_uninstall_script, escape_batch_percent, is_existing_foreign_dir, write_failure_hint,
+    };
+    use super::{APP_EXE_NAME, APP_NAME};
+    use std::path::Path;
+
+    #[test]
+    fn foreign_dir_detected_when_nonempty_without_our_exe() {
+        let dir = std::env::temp_dir().join(format!("v2w_setup_foreign_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 空目录：正常安装路径，不算陌生
+        assert!(!is_existing_foreign_dir(&dir));
+        // 放了用户自己的文件：陌生，卸载会连它一起删 → 必须拦
+        std::fs::write(dir.join("my_notes.txt"), b"keep me").unwrap();
+        assert!(is_existing_foreign_dir(&dir));
+        // 放进本程序 exe：视作旧安装（覆盖安装场景），不再拦
+        std::fs::write(dir.join(APP_EXE_NAME), b"exe").unwrap();
+        assert!(!is_existing_foreign_dir(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nonexistent_dir_is_not_foreign() {
+        let dir = std::env::temp_dir().join(format!("v2w_setup_absent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!is_existing_foreign_dir(&dir));
+    }
+
+    #[test]
+    fn escape_batch_percent_doubles_every_percent() {
+        assert_eq!(escape_batch_percent("a%b%c"), "a%%b%%c");
+        assert_eq!(escape_batch_percent("no percent"), "no percent");
+        // 参数与变量引用同样要被转义，否则脚本会展开成别的东西
+        assert_eq!(escape_batch_percent("%1 %* %PATH%"), "%%1 %%* %%PATH%%");
+    }
+
+    #[test]
+    fn uninstall_script_escapes_percent_in_install_dir() {
+        let script = build_uninstall_script(
+            APP_NAME,
+            APP_EXE_NAME,
+            Path::new(r"D:\100% done\Voice2Word"),
+        );
+        // cmd 运行时会把 %% 还原成一个 %，所以脚本里必须写两个
+        assert!(
+            script.contains(r#""D:\100%% done\Voice2Word""#),
+            "路径里的 % 必须转义成 %%：{script}"
+        );
+        // 绝不能残留未转义的单个 % —— 那会让 cmd 去操作另一个路径
+        assert!(
+            !script.contains("100% done"),
+            "存在未转义的 %，卸载会指向错误目录：{script}"
+        );
+    }
+
+    #[test]
+    fn uninstall_script_keeps_plain_path_intact() {
+        let script =
+            build_uninstall_script(APP_NAME, APP_EXE_NAME, Path::new(r"C:\Apps\Voice2Word"));
+        assert!(
+            script.contains(r#"rmdir /s /q "C:\Apps\Voice2Word""#),
+            "无 % 的路径不得被改动或被引号破坏：{script}"
+        );
+    }
+
+    #[test]
+    fn write_failure_hint_explains_locked_target() {
+        // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION
+        for code in [32, 33] {
+            let err = std::io::Error::from_raw_os_error(code);
+            let hint = write_failure_hint(&err);
+            assert!(
+                hint.contains("正在运行"),
+                "占用错误应提示先关闭程序：{hint}"
+            );
+            assert!(hint.contains(APP_NAME));
+        }
+    }
+
+    #[test]
+    fn write_failure_hint_explains_access_denied() {
+        // ERROR_ACCESS_DENIED
+        let hint = write_failure_hint(&std::io::Error::from_raw_os_error(5));
+        assert!(hint.contains("权限"), "拒绝访问应提示权限/换目录：{hint}");
+    }
+
+    #[test]
+    fn write_failure_hint_keeps_unknown_cause_plain() {
+        // 其它错误码不臆测原因，保持中性措辞
+        let hint = write_failure_hint(&std::io::Error::from_raw_os_error(1));
+        assert_eq!(hint, "写入程序文件失败");
     }
 }
