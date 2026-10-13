@@ -526,24 +526,24 @@ struct SegmentWriteDone {
     result: Result<(), String>,
 }
 
-/// 后台写线程的共享账本：单调序号、已完成水位、按工程的落库水位。
+/// 后台写线程的共享账本：单调写序号 + 按工程的落库水位。
 ///
-/// 这三样东西共同实现「防回退」——旧快照的结局不许覆盖新状态：
+/// 这两样东西共同实现「防回退」——旧快照的结局不许覆盖新状态：
 ///
 /// - `next_seq`：派发序号只增不减，后台结果自带「我是哪一代」；同步写也从同一
 ///   序列领号，因此同步写与后台写在序号上可以直接比较先后；
 /// - `applied`：**每个工程已经真正落库**的最大写序号。同步写与后台写都在写入闸
 ///   （[`BackgroundWrites::lock_writer`]）里先查它再写，于是更旧的快照不可能在
 ///   更新的内容之后落地——不依赖线程调度的先后（[`write_snapshot_under_gate`]）；
-/// （结果本身走 `submit` / `drain_results` 的通道，不在这里囤，所以不设失败队列：
-/// 一条回报该不该算数，只看同工程的 `applied` 与它自己的结局。）
+///   结果通道（`submit` / `drain_results`）也按它判断一条回报是不是已经被同工程
+///   更新的写覆盖，因此不在这里囤失败队列。
 ///
 /// `applied` 按**工程**分开记而不是记一个全局水位：全局水位会让「B 工程的新写」
 /// 把「A 工程还没落地的最新快照」也一起吞掉，那是最难排查的一种丢写。
 #[derive(Debug)]
 struct BackgroundWriteTracker {
     /// 下一个要发放的写序号。从 **1** 开始：0 专门表示「还没写过」，
-    /// 于是「水位 >= 待发序号」这条判据不会被第一次派发误命中。
+    /// 于是「同工程水位 >= 待发序号」这条判据不会被第一次派发误命中。
     next_seq: AtomicU64,
     /// 每个工程已经真正落库的最大写序号（`tasks.id` → seq）。
     ///
@@ -674,9 +674,12 @@ impl BackgroundWrites {
     ///
     /// # 这里丢掉的是什么（防回退的一部分）
     ///
-    /// `seq` 已被 `completed_floor` 越过：更晚的写入（比如一次同步落库）已经有结论，
-    /// 这条迟到的回报描述的是一个**已经被覆盖**的快照，再挂提示只会让用户以为
-    /// 「刚存好的东西又坏了」。留日志即可。
+    /// **同一个工程**已经有更新的写落库（`applied[task] > seq`）：这条迟到的回报描述的
+    /// 是一个**已经被覆盖**的快照，再挂提示只会让用户以为「刚存好的东西又坏了」。留日志即可。
+    ///
+    /// 判据必须按工程比水位、不能拿全局最大写序号：写序号是跨工程共用的，但两个工程的
+    /// 内容互不覆盖——拿 A 的新序号压 B 的迟到失败，会让 B 的失败既不提示、也不置脏，
+    /// 而 B 当前修订其实还没落库（静默丢写，正是这条通道最不该发生的事）。
     ///
     /// 提示条的竞价（`error_at_dispatch` 与排空前快照不一致就整条不回写）**不在这里做**，
     /// 而是留给 [`drain_segment_writes`]：那里除了提示条，还要处理「这条失败描述的内容
@@ -2524,10 +2527,6 @@ impl AppState {
                         match self.sync_segments_to_db() {
                             Ok(()) => {
                                 writes.tracker.note_applied(task_id, seq);
-                                writes
-                                    .tracker
-                                    .completed_floor
-                                    .fetch_max(seq, Ordering::SeqCst);
                                 Ok(())
                             }
                             Err(err) => Err(err),
@@ -3416,9 +3415,8 @@ fn write_snapshot_under_gate(
 ///
 /// 一条回报只有在**两件事同时成立**时才算数：
 ///
-/// 1. `seq > completed_floor`——更晚的写入已经有结论了，这条描述的是**已经被覆盖**的
-///    快照（`BackgroundWrites::drain_results` 已经按它筛过一轮，这里再判一次是为了让
-///    纯函数自己就是完整的，单测不必构造排水位的现场）；
+/// （调用方 `BackgroundWrites::drain_results` 已经先筛掉「同工程已有更新的写落库」的
+/// 过期回报，这里不再重复判水位——水位是按工程算的，判定只留一处，免得两处漂移。）
 /// 2. `pre_drain_error`（**本轮排空之前**的 `db_write_error`；调用方在调用前取快照）
 ///    与这条回报的「派发时提示条」一致——否则说明后台写这段时间里用户别的落库也
 ///    失败 / 成功过，那是**更新**的事实，不能被这次结局回写提示条。用调用方给的快照
@@ -3429,8 +3427,8 @@ fn write_snapshot_under_gate(
 ///    旧内容再派发一次（而它注定写不进最新状态）。
 ///
 /// 成功：把提示条清空（与同步版 flush 成功一致）。
-/// 失败：追加「字幕保存失败：…」；**只有**这条回报本身就是最新的一条
-/// （`seq == floor`）**且** `revision` 还是当前的才把 `segments_dirty` 置回，
+/// 失败：追加「字幕保存失败：…」；**只有**这条回报本身就是**同工程**最新的一条
+/// **且** `revision` 还是当前的才把 `segments_dirty` 置回，
 /// 让定时器 / 关窗守卫重试。
 ///
 /// # 为什么置脏还要看「是不是最新一条」
@@ -3491,7 +3489,7 @@ fn drain_segment_writes(
 
 /// 一条后台写结局落到状态上的**唯一入口**（纯函数，供 `poll_background_writes` 与测试复用）。
 ///
-/// `newest`：这条回报是不是同一轮里的最新一条（调用方按 `seq == floor` 判定）。
+/// `newest`：这条回报是不是同一轮里**同一个工程**的最新一条（调用方按工程分别取 max 判定）。
 ///
 /// # 错误通道不静默（唯一的例外在调用方）
 ///
@@ -5797,40 +5795,42 @@ mod tests {
         let mut error = None;
         let old_failure = synthetic_write(1, 7, Err("库被锁".to_string()));
         let newer_success = synthetic_write(2, 7, Ok(()));
-        let floor = drain_segment_writes(
+        drain_segment_writes(
             &mut error,
             &mut dirty,
             7,
-            0,
             None,
             &[old_failure, newer_success],
         );
-        assert_eq!(floor, 2, "水位要推进到最大写序号");
         assert!(error.is_none(), "更新的成功之后不许再挂旧失败");
         assert!(
             !dirty,
-            "旧失败被同轮更新的成功越过，不许再标脏（否则界面会要求重写一遍）"
+            "旧失败被同工程更新的成功越过，不许再标脏（否则界面会要求重写一遍）"
         );
 
-        // 换到「更新的成功在前、更旧的失败在后」（乱序到达）：失败已经被水位越过，
-        // 它描述的是一份被覆盖掉的快照——提示灯与脏标记都不许回退。
-        let stale_failure = synthetic_write(1, 7, Err("旧快照写失败".to_string()));
-        let newest_success = synthetic_write(3, 7, Ok(()));
-        let floor = drain_segment_writes(
-            &mut error,
-            &mut dirty,
-            7,
-            // 水位已经推进到 2（第二次写有结论了）：seq=1 的迟到失败属于「已被覆盖」。
-            2,
-            None,
-            &[newest_success, stale_failure],
-        );
-        assert_eq!(floor, 3);
+        // 换到「更新的成功在前、更旧的失败在后」（乱序到达）：失败描述的是一份被同工程
+        // 更新的写覆盖掉的快照——提示灯与脏标记都不许回退。过期筛选在 `drain_results`
+        // 里按**同工程水位**做（不是全局写序号），所以这里走真实通道验证。
+        state.segments_writes.tracker.note_applied(1, 3);
+        state
+            .segments_writes
+            .submit
+            .send(synthetic_write(
+                1,
+                state.segments_revision,
+                Err("旧快照写失败".to_string()),
+            ))
+            .expect("投递回报");
+        let dirty_before = state.segments_dirty;
+        state.poll_background_writes();
         assert!(
-            error.is_none(),
-            "被水位越过的迟到失败不许覆盖更新的成功结局"
+            state.db_write_error.is_none(),
+            "同工程已有更新结论的迟到失败不许挂提示条"
         );
-        assert!(!dirty, "迟到的旧失败不许把当前内容标脏");
+        assert_eq!(
+            state.segments_dirty, dirty_before,
+            "迟到的旧失败不许改脏标记"
+        );
 
         // 最新一条失败 + 旧修订：错误挂上（不许静默），但不置脏——交给更新的那份编辑去落库
         error = None;
@@ -6122,53 +6122,44 @@ mod tests {
     /// 回归护栏：水位原先只有「读」没有「写」（全代码库没有一处 store），两条判据永远
     /// 不成立——同步写完成后，一条迟到的旧失败照样会把「字幕保存失败」挂上提示条，
     /// 而那份内容其实已经写进库了。
+    ///
+    /// 交错序列完全按真实链路摆：旧快照先派发（不 await）→ 用户又改一版 → 同步落库
+    /// （换工程 / 导出 / 关窗）把它写掉 → 旧快照的失败结局这时才回来。
     #[test]
-    fn sync_flush_advances_floor_and_drops_late_stale_failure() {
+    fn sync_flush_records_task_watermark_and_drops_late_stale_failure() {
         let mut state = test_state(Vec::new());
         let id = state
             .db
             .insert_task("sync.mp4", "sync.mp4", 2.0, "completed", &[], None)
             .expect("插一条工程");
         state.active_task_id = Some(id);
+
+        // 第一代：派发出去（seq 1），但先不让它收尾。
+        state.segments = vec![Segment::new(1, 0.0, 2.0, "旧内容")];
+        state.bump_segments_revision();
+        state.segments_dirty = true;
+        state.flush_segments_if_dirty_async();
+        let stale_seq = 1;
+
+        // 用户又改一版，然后走同步落库：它领到更大的写序号。
         state.segments = vec![Segment::new(1, 0.0, 2.0, "最新内容")];
         state.bump_segments_revision();
         state.segments_dirty = true;
-
         state.flush_segments_if_dirty();
 
-        assert_eq!(
-            state
-                .segments_writes
-                .tracker
-                .next_seq
-                .load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "第一次写（同步）领到 1 号，下一个待发号是 2"
+        assert!(
+            state.segments_writes.tracker.applied_seq(id) > stale_seq,
+            "同步写必须把同工程水位推到自己领的号上"
         );
-        assert_eq!(
-            state.segments_writes.tracker.applied_seq(id),
-            1,
-            "同步写要按工程记水位"
-        );
-        assert_eq!(
-            state
-                .segments_writes
-                .tracker
-                .completed_floor
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "同步写完成的序号要推进已完成水位"
-        );
-        assert!(state.db_write_error.is_none());
         assert!(!state.segments_dirty, "同步写完就是干净状态");
 
-        // 一条「派发时间早于这次同步写、结果现在才回来」的失败：它描述的是一份已经被
-        // 同步写覆盖的旧快照，既不许挂提示条，也不许把内容标脏。
+        // 旧快照的失败结局现在才回来（乱序到达）：它描述的内容已经被同步写覆盖，
+        // 既不许挂提示条，也不许把内容标脏。
         state
             .segments_writes
             .submit
             .send(SegmentWriteDone {
-                seq: 1,
+                seq: stale_seq,
                 task_id: id,
                 revision: state.segments_revision,
                 error_at_dispatch: None,
@@ -6182,6 +6173,11 @@ mod tests {
             state.db_write_error
         );
         assert!(!state.segments_dirty, "内容已经在库里，不许再标脏");
+        assert_eq!(
+            state.db.load_task_segments(id).expect("读回字幕")[0].text,
+            "最新内容",
+            "库里必须是同步写那一版"
+        );
     }
 
     /// 提示条竞价输了的失败：提示条不动，但当前内容必须补上脏标记（否则没有重试）。
@@ -6193,15 +6189,7 @@ mod tests {
         // 派发时提示条是干净的（synthetic_write 的 error_at_dispatch 为 None），
         // 之后别的落库挂上了更新的事实 → 这条失败失去回写提示条的资格。
         let failure = synthetic_write(4, 9, Err("磁盘已满".to_string()));
-        let floor = drain_segment_writes(
-            &mut error,
-            &mut dirty,
-            9,
-            0,
-            pre_drain.as_deref(),
-            &[failure],
-        );
-        assert_eq!(floor, 4);
+        drain_segment_writes(&mut error, &mut dirty, 9, pre_drain.as_deref(), &[failure]);
         assert_eq!(
             error.as_deref(),
             Some("历史记录保存失败：库被锁"),
@@ -6217,7 +6205,7 @@ mod tests {
         let mut error = pre_drain.clone();
         let mut dirty = false;
         let stale = synthetic_write(5, 3, Err("磁盘已满".to_string()));
-        drain_segment_writes(&mut error, &mut dirty, 9, 4, pre_drain.as_deref(), &[stale]);
+        drain_segment_writes(&mut error, &mut dirty, 9, pre_drain.as_deref(), &[stale]);
         assert!(!dirty, "旧修订的失败不许把当前内容标脏");
         assert_eq!(error.as_deref(), Some("别的错误"));
     }
