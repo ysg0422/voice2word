@@ -2905,6 +2905,10 @@ impl MainWindow {
                 let ffmpeg_clone = ffmpeg.clone();
                 let cache_clone = cache.clone();
 
+                // 抽帧是「每次拖动都要等」的短任务（几十到几百毫秒）且单飞串行，
+                // 留在后台执行器即可；该走专用低优先级线程的是「整片代理转码 / 整段
+                // 波形解码 / 全文件哈希」这类几十秒起步的长活（见
+                // `utils::background_thread` 的 `DEDICATED_LONG_TASKS`）。
                 let frame_result =
                     cx.background_executor()
                         .spawn(async move {

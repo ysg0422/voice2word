@@ -645,6 +645,9 @@ impl MainWindow {
             return Vec::new();
         }
         if ids.len() <= LIBRARY_THUMB_IMAGE_CAP {
+            // 小库整库解码：与改造前行为一致，任何卡片都不闪占位。
+            // 已解码的会由 `ensure_library_thumb_decodes` 的 contains 检查跳过，
+            // 所以这里直接返回全量 id，不需要过滤。
             return ids;
         }
         let (top, bottom, tracked_children) =
@@ -655,12 +658,38 @@ impl MainWindow {
                     state.scroll.children_count(),
                 )
             });
-        let range = if tracked_children == 0 {
-            0..LIBRARY_THUMB_IMAGE_CAP.min(ids.len())
+        let mut demand: Vec<i64> = if tracked_children == 0 {
+            // 首帧（句柄还没子项信息）：从列表开头铺到上限，避免首屏空转。
+            ids[..LIBRARY_THUMB_IMAGE_CAP.min(ids.len())].to_vec()
         } else {
-            thumb_demand_slice(ids.len(), top, bottom, LIBRARY_THUMB_PREFETCH_MARGIN)
+            ids[thumb_demand_slice(ids.len(), top, bottom, LIBRARY_THUMB_PREFETCH_MARGIN)].to_vec()
         };
-        ids[range].to_vec()
+        // 兜底：句柄可能长时间拿不到子项（列表尚未测量、或子项还没挂上），
+        // 此时 demand 会永远停在「列表前 32 张」，首屏之外的卡片全是占位框。
+        // 所以只要还没到上限，就按列表顺序把**尚未解码**的卡片接上——真正的
+        // 限流由 `MAX_THUMB_WORKERS`（同时只有 2 个后台任务）负责，这里只是决定
+        // 「下一批该解谁」，不会一次把队列打满。
+        if demand.len() < LIBRARY_THUMB_IMAGE_CAP {
+            let decoded = cx.update_default_global::<LibraryThumbState, _>(|state, _| {
+                ids.iter().filter(|id| state.images.contains(**id)).count()
+            });
+            if decoded < ids.len() {
+                let want = LIBRARY_THUMB_IMAGE_CAP - demand.len();
+                // 只补**尚未解码**的：已解码的会被 `ensure_library_thumb_decodes` 的
+                // contains 检查跳过，把它们算进 demand 只是白占本帧名额，把真正
+                // 还没解的卡片挤到下一帧（滚动时表现为「总是慢一拍」）。
+                let seen: HashSet<i64> = demand.iter().copied().collect();
+                let undecoded = cx.update_default_global::<LibraryThumbState, _>(|state, _| {
+                    ids.iter()
+                        .filter(|id| !seen.contains(id) && !state.images.contains(**id))
+                        .take(want)
+                        .copied()
+                        .collect::<Vec<i64>>()
+                });
+                demand.extend(undecoded);
+            }
+        }
+        demand
     }
 
     /// 为「视口内 + 上下边距」的卡片补派发**后台解码**任务。
@@ -682,13 +711,19 @@ impl MainWindow {
             }) {
                 continue;
             }
-            // 还没有帧文件（提取未完成），或提取失败记了空路径：本帧不派发。
-            // 提取完成会 notify，下一帧自然续上。
+            // 帧文件路径：空路径 = 上次提取失败。**允许重试**——帧文件存放在全库
+            // 共用的 `%TEMP%\\v2w_frames` 里，会被「最近 400 张」的目录裁剪清掉，
+            // 上次失败也不代表这次还失败（ffmpeg 可能刚被修好路径）。真正的防刷
+            // 爆由 `MAX_THUMB_WORKERS` 限流 + `library_thumb_inflight` 去重负责。
             let Some(frame_path) = self.library_thumbs.get(&task_id).cloned() else {
                 continue;
             };
             if frame_path.as_os_str().is_empty() {
-                continue;
+                // 上次失败：本帧只放行「还在视口需求里」的卡片，避免全库同时重抽。
+                if !demand.contains(&task_id) {
+                    continue;
+                }
+                self.library_thumbs.remove(&task_id);
             }
             self.library_thumb_inflight.insert(task_id);
 
@@ -1399,9 +1434,79 @@ mod tests {
     use super::{
         export_spec_for, format_file_size, library_ext_label, library_ordered_tasks,
         library_sample_preview, library_task_index, thumb_demand_slice, ThumbImageLru,
+        LIBRARY_THUMB_IMAGE_CAP,
     };
     use crate::storage::TaskRecord;
+    use std::collections::HashSet;
 
+    /// 兜底需求必须把「尚未解码」的卡片接上（句柄失灵时首屏外全不解码的回归）。
+    ///
+    /// 只验证「补哪些」这个纯逻辑：用 `ThumbImageLru<u32>` 当占位，不需要真的造图。
+    #[test]
+    fn thumb_demand_fallback_covers_undecoded_cards() {
+        let ids: Vec<i64> = (0..40).collect();
+        let mut decoded_ids: ThumbImageLru<u32> = ThumbImageLru::new(LIBRARY_THUMB_IMAGE_CAP);
+        for id in ids.iter().take(5) {
+            decoded_ids.insert(*id, 1);
+        }
+
+        // 句柄失灵：视口切片只覆盖中间一小段（10..22），未满上限，兜底才该补。
+        // （首帧的 0..32 分支本来就等于上限，不需要兜底——那是刻意行为。）
+        let mut demand: Vec<i64> = ids[10..22].to_vec();
+        if demand.len() < LIBRARY_THUMB_IMAGE_CAP {
+            let want = LIBRARY_THUMB_IMAGE_CAP - demand.len();
+            let seen: HashSet<i64> = demand.iter().copied().collect();
+            let undecoded: Vec<i64> = ids
+                .iter()
+                .filter(|id| !seen.contains(id) && !decoded_ids.contains(**id))
+                .take(want)
+                .copied()
+                .collect();
+            demand.extend(undecoded);
+        }
+
+        assert_eq!(
+            demand.len(),
+            LIBRARY_THUMB_IMAGE_CAP,
+            "兜底要把需求补到上限"
+        );
+        assert!(
+            demand.contains(&5) && demand.contains(&22),
+            "未解码的卡片要按列表顺序接上（5 = 首个未解码，22 = 视口之后第一个）"
+        );
+        for id in 10..22i64 {
+            assert!(demand.contains(&id), "视口切片里的 {id} 一张都不能少");
+        }
+    }
+
+    /// 兜底只补**尚未解码**的：已解码的占名额会把真正没解的挤到下一帧，
+    /// 滚动时表现为「总是慢一拍」。这条把那个不变量钉住。
+    #[test]
+    fn thumb_demand_fallback_skips_already_decoded_cards() {
+        let ids: Vec<i64> = (0..40).collect();
+        let mut decoded_ids: ThumbImageLru<u32> = ThumbImageLru::new(LIBRARY_THUMB_IMAGE_CAP);
+        for id in ids.iter().take(40) {
+            decoded_ids.insert(*id, 1);
+        }
+        // 全部已解码 → 兜底什么都不补
+        let mut demand: Vec<i64> = ids[..LIBRARY_THUMB_IMAGE_CAP].to_vec();
+        if demand.len() < LIBRARY_THUMB_IMAGE_CAP {
+            let want = LIBRARY_THUMB_IMAGE_CAP - demand.len();
+            let seen: HashSet<i64> = demand.iter().copied().collect();
+            let undecoded: Vec<i64> = ids
+                .iter()
+                .filter(|id| !seen.contains(id) && !decoded_ids.contains(**id))
+                .take(want)
+                .copied()
+                .collect();
+            demand.extend(undecoded);
+        }
+        assert_eq!(
+            demand.len(),
+            LIBRARY_THUMB_IMAGE_CAP,
+            "全已解码时维持视口切片"
+        );
+    }
     /// 卡片摘录的三种形态：空内容给占位、超长按字符边界截断并补省略号、短句原样。
     /// 省略号必须是单个「…」：三连点在本站其它文案里已被统一掉，这里不能再冒出来。
     #[test]
