@@ -12,6 +12,9 @@
 //! - 压缩方法：**存储(0)** 与 **deflate(8)**——llama.cpp 的官方 zip 只用这两种。
 //! - 不做 Zip64、加密、多卷；遇到这些（或超 4GB）一律返回错误而不是猜。
 //! - 拒绝路径穿越（含 `..`、绝对路径、盘符）的条目名，只写普通文件名。
+//!   同时拒绝 Win32 保留设备名（`NUL` / `CON` …）、名字里带 `:` 的 NTFS 数据流、
+//!   以及会被系统改名（尾随点 / 空格）的形状——它们要么让文件被静默丢弃，
+//!   要么让落盘名与判定名不一致（见 [`is_safe_name`]）。
 //! - 若整个包被套在一个顶层目录下（HuggingFace 仓库打包很常见），
 //!   解压时自动剥掉这层前缀，文件直接落在 `dest_dir`。
 //!
@@ -85,12 +88,50 @@ fn is_safe_name(name: &str) -> bool {
     if name.starts_with('/') || name.starts_with('\\') {
         return false;
     }
-    if name.len() >= 2 && name.as_bytes()[1] == b':' {
+    // 任何位置的 `:` 一律拒绝，而不是只看「第二个字符是不是盘符」：
+    // `ab:stream.exe` 会被 Win32 解释成 NTFS 备用数据流（ADS），内容落进 `ab` 的
+    // 隐藏流里——`exists()` 为真、目录列表里却看不到，等于绕过了「只在目标目录里写
+    // 扁平常规文件」这条设计，写出的东西用户既看不见也删不干净。
+    if name.contains(':') {
+        return false;
+    }
+    // 尾随的点 / 空格在 Windows 上会被归一化掉：`a.dll.` 实际落盘成 `a.dll`，
+    // 于是「判定用的名字」和「真实文件」不是同一个，两个条目会互相覆盖，
+    // 覆盖与否还取决于中央目录顺序。直接拒绝这种会被改名的形状。
+    if name.ends_with('.') || name.ends_with(' ') {
+        return false;
+    }
+    // Windows 保留设备名：见 [`RESERVED_DEVICE_NAMES`]。
+    if is_reserved_device_name(name) {
         return false;
     }
     // 禁止内嵌目录分隔（llama.cpp 的 zip 是扁平结构，内嵌目录一律拒绝，
     // 既简化实现又避免「写到子目录里」这种没被校验覆盖的情况）
     !name.contains('/') && !name.contains('\\')
+}
+
+/// Windows 保留设备名（大小写不敏感）。
+///
+/// 为什么必须拒绝：这些名字在 Win32 路径解析里指向**设备**而不是文件，后果
+/// 与「普通坏名」不同——
+/// - 裸 `NUL` / `nul`：`File::create` 与 `write_all` 都返回 `Ok`，但磁盘上
+///   **没有文件**、`exists()` 为假 → 条目被静默丢弃，写出的文件数还被虚报。
+///   丢的若是入口文件，调用方只会报「解压完成但缺少入口文件」，把人带偏。
+/// - `CON` / `AUX` / `COM1`…：在部分 Windows 版本上打开会阻塞或直接失败。
+///
+/// 组件压缩包里不可能出现这些名字，拒绝它们不会误伤正常下载。
+const RESERVED_DEVICE_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// 名字（去掉扩展名，再去掉尾随点/空格）是否命中保留设备名。
+fn is_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    let stem = stem.trim_end_matches([' ', '.']);
+    RESERVED_DEVICE_NAMES
+        .iter()
+        .any(|device| stem.eq_ignore_ascii_case(device))
 }
 
 /// 单个条目解压后的**硬上限**。中央目录声明的 `uncomp_size` 是攻击者可控的
@@ -547,6 +588,93 @@ mod tests {
         for good in ["llama.dll", "whisper-cli.exe", "ggml-base.bin"] {
             assert!(is_safe_name(good), "应接受普通文件名: {good:?}");
         }
+    }
+
+    /// 保留设备名 / NTFS 数据流 / 会被系统改名的形状：这些名字不会「写到别处」，
+    /// 但会让**文件被静默丢弃**（裸 `NUL`：`File::create` 返回 Ok 却没有文件）
+    /// 或**落盘名与判定名不一致**（`a.dll.` → `a.dll`、`ab:stream.exe` → `ab` 的
+    /// 隐藏流），同样必须拒绝。
+    #[test]
+    fn safe_name_rejects_device_ads_and_normalized_forms() {
+        for bad in [
+            "NUL",     // 裸设备名：写成功但磁盘上没有文件
+            "nul",     // 大小写不敏感
+            "NUL.txt", // 带扩展名同样是设备名
+            "nul.dll", //
+            "CON",
+            "con", // 控制台设备
+            "AUX",
+            "PRN", //
+            "COM1",
+            "com9", // 串口
+            "LPT1",
+            "lpt1.log",      // 并口
+            "ab:stream.exe", // NTFS 备用数据流
+            "a.txt:stream",  //
+            "ab:",           //
+            "a.dll.",        // 尾随点：落盘时被系统吃掉
+            "a.dll ",        // 尾随空格
+            "trailing.",     //
+        ] {
+            assert!(
+                !is_safe_name(bad),
+                "应拒绝会被系统改写/丢弃的条目名: {bad:?}"
+            );
+        }
+        // 正常组件名不能被误伤（含「名字里出现设备名子串」的情况）
+        for good in [
+            "llama.dll",
+            "ggml-cpu.dll",
+            "whisper-cli.exe",
+            "nulify.dll",
+            "console.exe",
+            "com10.dll",
+            ".gitignore",
+        ] {
+            assert!(is_safe_name(good), "不应拒绝正常文件名: {good:?}");
+        }
+    }
+
+    /// 端到端反例：条目名是保留设备名时不许落盘，也不许把它算进「已写出文件数」。
+    ///
+    /// 旧实现对裸 `NUL` 会走到 `File::create`（返回 `Ok`）、`written += 1`，
+    /// 但磁盘上什么都不存在——调用方拿到的「解压成功 1 个文件」是假的。
+    #[test]
+    fn extract_skips_reserved_device_entry_without_counting_it() {
+        let dir = tmp_dir("device_name");
+        let zip = build_stored_zip(&[("NUL", b"payload")]);
+        assert_eq!(
+            extract_zip(&zip, &dir).unwrap(),
+            0,
+            "保留设备名条目不能被算作已写出"
+        );
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(names.is_empty(), "不该落盘任何文件: {names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 端到端反例：`a.dll.` 与 `a.dll` 在 Windows 上是**同一个文件**。
+    /// 不拒绝前者时，后写的条目会覆盖前一个（顺序由中央目录决定），最终用户拿到
+    /// 哪个版本不可预期——正常下载的文件可能被同包里一个畸形条目顶掉。
+    #[test]
+    fn extract_does_not_let_normalized_name_overwrite_real_entry() {
+        let dir = tmp_dir("norm_collision");
+        let zip = build_stored_zip(&[("a.dll.", b"DECOY"), ("a.dll", b"REAL")]);
+        assert_eq!(
+            extract_zip(&zip, &dir).unwrap(),
+            1,
+            "被系统改名的条目不该被写出"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("a.dll")).unwrap(),
+            b"REAL",
+            "正常条目必须原样落盘"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 目录穿越条目在真实解压流程里也必须被跳过（端到端，而不只是单测判定函数）。

@@ -19,7 +19,8 @@
 //! # 设计约束
 //!
 //! - **纯数据采集 + 格式化**：不依赖 UI、不联网、不弹窗；`build_report` 是
-//!   `(配置, 项目根) -> String` 的纯函数（只额外读磁盘元数据）。
+//!   `(配置, 项目根) -> String`，除读磁盘元数据与一次「可写性探针」
+//!   （在项目根写一个临时文件再删，见 [`probe_writable`]）外没有任何副作用。
 //! - **绝不 panic**：文件不存在、目录不可读、exe 不是 PE、根目录本身不存在……
 //!   全部退化成一条 `Fail` / `Warn` 检查项。报告是给「已经坏了」的场景用的，
 //!   它自己再崩一次毫无意义。
@@ -428,7 +429,8 @@ fn check_config_files(root: &Path) -> CheckItem {
 ///
 /// 项目根不可写时，启动路径上第一个 `?` 就会把整个应用带走，用户只看到一句
 /// 「拒绝访问」，完全不知道说的是哪个目录。这里直接实测一次写入，把「根目录 +
-/// 失败原因」明确报出来。探针文件用完即删，**绝不留残留**。
+/// 失败原因」明确报出来。探针文件用完即删（删不掉只记一条日志，不影响「可写」的
+/// 结论——写成功就已经证明可写了，见 [`writable_verdict`]）。
 fn check_data_dir_writable(root: &Path) -> CheckItem {
     let mut item = CheckItem {
         id: "data_dir_writable",
@@ -569,7 +571,21 @@ fn probe_writable(root: &Path) -> Result<(), String> {
     let probe = root.join(format!(".v2w_write_probe_{}", std::process::id()));
     let write = std::fs::write(&probe, b"voice2word-diagnostics").map_err(|e| e.to_string());
     let cleanup = std::fs::remove_file(&probe).map_err(|e| e.to_string());
-    write.and(cleanup)
+    writable_verdict(write, cleanup)
+}
+
+/// 把「写探针」与「删探针」两个结果合成一个结论：**只有写失败才算不可写**。
+///
+/// 为什么不能写成 `write.and(cleanup)`：那会把「写成功、但探针删不掉」报成
+/// 「项目根不可写」并建议用户去修目录权限。可写性恰恰已经被写成功证明了——真实
+/// 原因通常是探针文件被别的进程 / 杀软临时锁住，与权限无关。把用户引向一个不存在
+/// 的权限问题，比不报这一项更糟。清理失败降级成一条日志（探针文件本身不碰用户数据）。
+fn writable_verdict(write: Result<(), String>, cleanup: Result<(), String>) -> Result<(), String> {
+    write?;
+    if let Err(e) = cleanup {
+        tracing::warn!(error = %e, "可写性探针写入成功但删除失败（目录确实可写，忽略）");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -823,5 +839,24 @@ mod tests {
         assert!(report.contains("[FAIL] 项目根: "));
         assert!(report.contains("汇总："));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「可写性」结论的真值表：**只有写失败才算不可写**。
+    ///
+    /// 关键的反例是第三行：写成功、只是探针删不掉。旧实现用 `write.and(cleanup)`，
+    /// 会把它报成「项目根不可写」并让用户去修权限——而写成功已经证明目录可写，
+    /// 真实原因多半是探针被别的进程/杀软临时锁住。
+    #[test]
+    fn writable_verdict_only_fails_when_write_fails() {
+        // 写失败（不论清理如何）→ 不可写
+        assert!(writable_verdict(Err("拒绝访问".into()), Ok(())).is_err());
+        assert!(writable_verdict(Err("拒绝访问".into()), Err("也删不掉".into())).is_err());
+        // **反例**：写成功、删失败 → 依然算可写
+        assert!(
+            writable_verdict(Ok(()), Err("文件被占用".into())).is_ok(),
+            "写成功就证明目录可写，删不掉探针不能被报成权限问题"
+        );
+        // 正常路径
+        assert!(writable_verdict(Ok(()), Ok(())).is_ok());
     }
 }

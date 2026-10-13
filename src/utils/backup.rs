@@ -176,8 +176,14 @@ pub fn create_backup(root: &Path, dest: &Path) -> Result<BackupOutcome> {
     let bytes = build_stored_zip(&entries)?;
     // 同名归档可能已经在同秒里落盘：覆盖会静默毁掉前一份，改走派生文件名。
     let (dest, mut file) = create_unique_archive_file(dest)?;
-    file.write_all(&bytes)
-        .with_context(|| format!("写入归档失败: {}", dest.display()))?;
+    if let Err(e) = file.write_all(&bytes) {
+        // 写失败（磁盘满 / 被中断）时删掉刚独占创建的半成品：留在 `backups/` 里的
+        // 0 字节或截断 `.zip` 会被用户当成一份有效备份，日后挑它恢复必然失败，
+        // 比「这次备份失败了」难排查得多。
+        drop(file);
+        let _ = std::fs::remove_file(&dest);
+        return Err(e).with_context(|| format!("写入归档失败: {}", dest.display()));
+    }
 
     info!(
         archive = %dest.display(),
@@ -200,6 +206,9 @@ pub fn create_backup(root: &Path, dest: &Path) -> Result<BackupOutcome> {
 ///   「这些文件已存在，已保留现有版本」）。理由：覆盖 `voice2word.db` 会毁掉
 ///   用户当前的全部工程，这种操作必须由用户显式先移走/重命名旧文件，
 ///   不能由一次误点触发。
+/// - **按组判断**：主库与它的 `-wal` / `-shm` 属于同一份快照，组内**任一**名字
+///   已存在就整组跳过。否则「主库已存在（跳过）+ 伴随文件不存在（写入）」会把旧
+///   快照的 WAL 留在用户当前的库旁边，下次启动由 SQLite 回放进当前主库。
 /// - 归档里不认识的条目忽略（不写入、不报错）。
 /// - 归档损坏 / 不是 zip → `Err`。
 pub fn restore_backup(archive: &Path, root: &Path) -> Result<RestoreOutcome> {
@@ -213,28 +222,95 @@ pub fn restore_backup(archive: &Path, root: &Path) -> Result<RestoreOutcome> {
     let mut restored = Vec::new();
     let mut skipped_existing = Vec::new();
 
+    // 「还原**开始前**目标目录里已存在哪些组」的快照。
+    //
+    // 必须在写任何文件之前算好：下面每写一个成员，组内其它成员就会看到它进而
+    // 误判成「该组已存在」，结果是同一组只还原了一半（先写的进、后写的被跳），
+    // 恰好制造出本函数要防的那种「混着两份快照」的局面。
+    let blocked_groups: Vec<&'static str> = BACKUP_ENTRIES
+        .iter()
+        .copied()
+        .filter(|group| group_has_existing_member(root, group))
+        .collect();
+
     for (name, data) in &files {
         // 只认自己认识的条目：归档里多出来的东西（未来版本 / 手工塞的）一律忽略，
         // 既避免往项目根里写陌生文件，也避免旧版本读到新格式时误解。
-        if !is_known_entry(name) {
+        let Some(group) = entry_group(name) else {
             continue;
-        }
-        let target = root.join(name);
-        if target.exists() {
-            // 关键安全阀：已存在就保留现有版本，绝不覆盖用户当前的库。
-            warn!(target = %target.display(), "还原目标已存在，保留现有版本");
+        };
+        // 关键安全阀（按**组**判断）：只要目标目录里已经存在组内任何一个文件名，
+        // 就整组放弃还原。
+        //
+        // 为什么不能逐个条目判断：`voice2word.db` 存在（跳过）而 `voice2word.db-wal`
+        // 不存在（当前库已 checkpoint，伴随文件被合并走了）时，逐条判断会把
+        // **旧快照的 WAL** 写进当前目录；下次启动 SQLite 会拿它回放当前主库，
+        // 轻则判损坏、重则把旧数据混进用户当前的库里。而界面此刻报的是
+        // 「已恢复 N 个文件」——一次典型的假成功。
+        if blocked_groups.contains(&group) {
+            warn!(target = %root.join(name).display(), "还原目标（或同组文件）已存在，保留现有版本");
             skipped_existing.push(name.clone());
             continue;
         }
-        std::fs::write(&target, data)
-            .with_context(|| format!("写入还原文件失败: {}", target.display()))?;
-        restored.push(name.clone());
+        // `create_new` 把「检查存在 + 创建」做成一次原子操作：`fs::write` 会**先
+        // 截断**目标，一旦与上面的检查之间存在窗口，用户的实时库就被清空了。
+        if write_new_file(&root.join(name), data)? {
+            restored.push(name.clone());
+        } else {
+            warn!(target = %root.join(name).display(), "还原目标已存在，保留现有版本");
+            skipped_existing.push(name.clone());
+        }
     }
 
     Ok(RestoreOutcome {
         restored,
         skipped_existing,
     })
+}
+
+/// 该组的**任一**成员（本体 / `-wal` / `-shm`）是否已存在于 `root` 下。
+///
+/// 刻意检查全部三个可能的名字，而不是「归档里出现过的那些」：归档只带了 `-wal`
+/// 而目标目录里已有主库时，同样属于「绝不能把两份快照混在一起」。
+fn group_has_existing_member(root: &Path, group: &str) -> bool {
+    [
+        group.to_string(),
+        format!("{group}-wal"),
+        format!("{group}-shm"),
+    ]
+    .iter()
+    .any(|member| root.join(member).exists())
+}
+
+/// 以 `create_new` 落地一个还原文件；目标已存在时返回 `Ok(false)`（绝不覆盖）。
+///
+/// 为什么不用「先 `exists` 再 `fs::write`」：两者之间隔着一个系统调用窗口，而
+/// `fs::write` 会**先截断**目标文件——正好破坏「绝不覆盖用户当前数据」这条最关键
+/// 的承诺（主库被截断即等于用户全部工程消失）。`create_new` 让「检查 + 创建」原子
+/// 完成，把这种破坏从「取决于时序」降为「不可能」。
+///
+/// 写入中途失败时不留下半截文件：目标是我们刚创建的，直接删掉远好过留一个
+/// 「看起来已还原、实际残缺」的库。
+fn write_new_file(target: &Path, data: &[u8]) -> Result<bool> {
+    use std::io::Write;
+
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => {
+            return Err(e).with_context(|| format!("创建还原文件失败: {}", target.display()));
+        }
+    };
+    if let Err(e) = file.write_all(data) {
+        drop(file);
+        let _ = std::fs::remove_file(target);
+        return Err(e).with_context(|| format!("写入还原文件失败: {}", target.display()));
+    }
+    Ok(true)
 }
 
 /// 备份文件名：`voice2word-backup-YYYYMMDD-HHMMSS.zip`（本地时间）。
@@ -247,11 +323,14 @@ pub fn backup_file_name(now: chrono::DateTime<chrono::Local>) -> String {
         .to_string()
 }
 
-/// 条目名是否属于本模块认识的范围（本体或它的 -wal/-shm 伴随文件）。
-fn is_known_entry(name: &str) -> bool {
-    BACKUP_ENTRIES
-        .iter()
-        .any(|base| name == *base || name == format!("{base}-wal") || name == format!("{base}-shm"))
+/// 条目名属于哪一组（返回组的主文件名，例如 `voice2word.db`）；不认识的条目返回
+/// `None`。主库与它的 `-wal` / `-shm` 是**同一份快照的三个部分**，还原时按组处理，
+/// 理由见 [`restore_backup`]。调用方用 `None` 表示「归档里多出来的东西」，一律忽略：
+/// 既避免往项目根里写陌生文件，也避免旧版本读到新格式时误解。
+fn entry_group(name: &str) -> Option<&'static str> {
+    BACKUP_ENTRIES.iter().copied().find(|base| {
+        name == *base || name == format!("{base}-wal") || name == format!("{base}-shm")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +378,10 @@ fn crc32(data: &[u8]) -> u32 {
 
 /// 把 `(归档内名字, 内容)` 序列化成 STORED zip 字节。
 fn build_stored_zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+    // 条目数（u16）与总长度（u32 偏移）都是格式硬上限，且必须在写头**之前**校验，
+    // 理由见 [`check_zip_limits`]。
+    check_zip_limits(0, files.len())?;
+
     let mut out: Vec<u8> = Vec::new();
     // 每个条目的 (名字, crc, 大小, 本地头偏移)，供中央目录复用。
     let mut central_meta: Vec<(String, u32, u32, u32)> = Vec::new();
@@ -311,6 +394,7 @@ fn build_stored_zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
         if name.len() > u16::MAX as usize {
             bail!("条目名过长: {name}");
         }
+        check_zip_limits(out.len(), files.len())?;
         let crc = crc32(data);
         let size = data.len() as u32;
         let offset = out.len() as u32;
@@ -334,6 +418,9 @@ fn build_stored_zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
         central_meta.push((name.clone(), crc, size, offset));
     }
 
+    // 中央目录自己的偏移也是 u32：超过 4 GiB 时 `as u32` 会回绕，产出一个能写盘、
+    // 但中央目录指向错误位置的**损坏归档**，而调用方拿到的是 `Ok`（假成功）。
+    check_zip_limits(out.len(), files.len())?;
     let central_offset = out.len() as u32;
 
     // ---- 中央目录 ----
@@ -373,6 +460,21 @@ fn build_stored_zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     out.extend_from_slice(&0u16.to_le_bytes()); // 注释长度
 
     Ok(out)
+}
+
+/// 归档尺寸与条目数的格式上限校验（STORED、非 Zip64：字段只有 u32 / u16）。
+///
+/// 必须在写出任何一个头部**之前**调用：`as u32` 对超过 4 GiB 的偏移会静默回绕，
+/// 结果是「写出了一个坏 zip，却返回成功」——用户以为备份好了，等要回退时才发现
+/// 归档指向乱处。抽成纯函数是为了能单测：真造一份 4 GiB 的归档来触发它不现实。
+fn check_zip_limits(total_bytes: usize, entry_count: usize) -> Result<()> {
+    if total_bytes as u64 > u32::MAX as u64 {
+        bail!("归档总长度超过 zip 格式上限（4 GiB），无法在不启用 Zip64 的情况下写出");
+    }
+    if entry_count > u16::MAX as usize {
+        bail!("归档条目数超过 zip 格式上限（65535）");
+    }
+    Ok(())
 }
 
 /// 从 STORED zip 字节里读回 `(名字, 内容)` 列表。
@@ -723,5 +825,120 @@ mod tests {
         assert_eq!(db_bytes(&second.archive), b"second".to_vec());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **核心反例**：当前目录里的主库还活着（且已 checkpoint，没有 `-wal`），
+    /// 归档里带着同一份旧快照的 `-wal`。还原必须**整组**放弃——绝不能把旧快照的
+    /// WAL 写进当前目录，那会让 SQLite 下次启动拿它回放当前主库。
+    ///
+    /// 逐个文件判断的旧实现会在这里失败：`voice2word.db` 被跳过，而
+    /// `voice2word.db-wal` 因为目标不存在而被写入，界面还报「已恢复 1 个文件」。
+    #[test]
+    fn restore_never_writes_stale_wal_beside_live_db() {
+        let dir = tmp_dir("wal_mix");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("voice2word.db"), b"old-db").unwrap();
+        std::fs::write(root.join("voice2word.db-wal"), b"old-wal").unwrap();
+
+        let archive = dir.join("snap.zip");
+        create_backup(&root, &archive).unwrap();
+
+        // 归档之后用户继续干活：WAL 被合并进主库，伴随文件随之消失。
+        std::fs::write(root.join("voice2word.db"), b"LIVE-CURRENT-DATA").unwrap();
+        std::fs::remove_file(root.join("voice2word.db-wal")).unwrap();
+
+        let outcome = restore_backup(&archive, &root).unwrap();
+        assert!(outcome.restored.is_empty(), "主库已存在时整组都不能还原");
+        assert!(
+            !root.join("voice2word.db-wal").exists(),
+            "绝不能把旧快照的 WAL 写到当前主库旁边"
+        );
+        assert_eq!(
+            std::fs::read(root.join("voice2word.db")).unwrap(),
+            b"LIVE-CURRENT-DATA"
+        );
+        assert_eq!(
+            outcome.skipped_existing,
+            vec!["voice2word.db".to_string(), "voice2word.db-wal".to_string()],
+            "整组被跳过的条目都要回报给界面，不能有静默部分还原"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 反例的另一半：目标目录里只有**孤立的** `-wal`（没有主库）时同样整组跳过。
+    /// 把归档里的主库写下去、旁边却躺着另一份快照的 WAL，一样是「混合两份快照」。
+    #[test]
+    fn restore_skips_group_when_only_companion_exists() {
+        let dir = tmp_dir("wal_only");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("voice2word.db"), b"old-db").unwrap();
+        std::fs::write(root.join("voice2word.db-wal"), b"old-wal").unwrap();
+
+        let archive = dir.join("snap.zip");
+        create_backup(&root, &archive).unwrap();
+
+        // 主库没了、只剩下没人认领的 WAL（手工删库 / 半途中断都会留下这种残局）。
+        std::fs::remove_file(root.join("voice2word.db")).unwrap();
+
+        let outcome = restore_backup(&archive, &root).unwrap();
+        assert!(outcome.restored.is_empty(), "同组里有残留就不能还原");
+        assert!(
+            !root.join("voice2word.db").exists(),
+            "不能把归档里的主库写到残留的 WAL 旁边"
+        );
+        assert_eq!(
+            std::fs::read(root.join("voice2word.db-wal")).unwrap(),
+            b"old-wal",
+            "残留文件必须原样保留"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 正向面：全新目录（换机器）里必须把整组都还原出来——组保护不能把正常场景
+    /// 一起挡掉。
+    #[test]
+    fn restore_writes_whole_group_on_fresh_root() {
+        let dir = tmp_dir("fresh_group");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("voice2word.db"), b"db-bytes").unwrap();
+        std::fs::write(root.join("voice2word.db-wal"), b"wal-bytes").unwrap();
+
+        let archive = dir.join("snap.zip");
+        create_backup(&root, &archive).unwrap();
+
+        let fresh = dir.join("fresh");
+        let outcome = restore_backup(&archive, &fresh).unwrap();
+        assert_eq!(
+            outcome.restored,
+            vec!["voice2word.db".to_string(), "voice2word.db-wal".to_string()]
+        );
+        assert!(outcome.skipped_existing.is_empty());
+        assert_eq!(
+            std::fs::read(fresh.join("voice2word.db")).unwrap(),
+            b"db-bytes"
+        );
+        assert_eq!(
+            std::fs::read(fresh.join("voice2word.db-wal")).unwrap(),
+            b"wal-bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 归档尺寸 / 条目数超过 zip 格式上限时必须报错，而不是让 `as u32` 回绕出一个
+    /// 「写得出来、但中央目录指向乱处」的坏归档。
+    #[test]
+    fn zip_limits_reject_over_4g_or_too_many_entries() {
+        assert!(check_zip_limits(0, 1).is_ok());
+        assert!(check_zip_limits(u32::MAX as usize, u16::MAX as usize).is_ok());
+        // 4 GiB + 1 字节：偏移会回绕
+        assert!(check_zip_limits(u32::MAX as usize + 1, 1).is_err());
+        // 65536 个条目：u16 计数会回绕
+        assert!(check_zip_limits(16, u16::MAX as usize + 1).is_err());
     }
 }

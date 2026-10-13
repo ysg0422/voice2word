@@ -121,8 +121,13 @@ pub fn load_queue(path: &Path) -> Vec<StoredQueueItem> {
         Err(_) => return Vec::new(),
     };
 
+    // 用户（或外部工具）用某些编辑器手工改过这个文件时会写入 UTF-8 BOM，
+    // 而 `serde_json` 会因此直接解析失败 → 队列**静默变空**，还没有任何报错可查。
+    // 只剥掉开头这一个 BOM，不动其余任何字节。
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+
     // 空文件、半截 JSON、形状不对的 JSON，都在这里解析失败 -> 空队列。
-    let file = match serde_json::from_str::<QueueFile>(&content) {
+    let file = match serde_json::from_str::<QueueFile>(content) {
         Ok(parsed) => parsed,
         Err(_) => return Vec::new(),
     };
@@ -226,6 +231,27 @@ mod tests {
         fs::write(&file, [0xFF, 0xFE, 0x00, 0x01, 0x80]).expect("写入垃圾字节");
 
         assert!(load_queue(&file).is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 带 UTF-8 BOM 的文件：用户用某些编辑器手工改过队列后会带上 BOM。
+    /// 若卡片式地按「BOM 就是坏文件」处理，用户排好的队列会**静默变空**——
+    /// 没有报错、没有提示，只有「重启后队列没了」。
+    #[test]
+    fn utf8_bom_file_still_loads() {
+        let dir = temp_dir("bom");
+        let file = dir.join(QUEUE_FILE_NAME);
+        let items = vec![item("bom.mp4", 7.5, "pending")];
+        save_queue(&file, &items).expect("保存队列");
+
+        // 模拟「编辑器保存时加了 BOM」：在原始 JSON 前插入 EF BB BF
+        let body = fs::read_to_string(&file).expect("读回原文件");
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(body.as_bytes());
+        fs::write(&file, &with_bom).expect("写入带 BOM 的文件");
+
+        assert_eq!(load_queue(&file), items, "BOM 不该让用户的队列丢掉");
 
         let _ = fs::remove_dir_all(&dir);
     }

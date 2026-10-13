@@ -51,6 +51,13 @@ pub const PANIC_MARKER: &str = "[CRITICAL PANIC DETECTED]";
 /// 300 足够装下一句人话，又能保证横幅/报告不被超长消息撑爆。
 pub const MAX_MESSAGE_CHARS: usize = 300;
 
+/// `at`（崩溃时间）保留的最大字符数。
+///
+/// 钩子写出的格式固定为 23 个字符（`YYYY-MM-DD HH:MM:SS.mmm`）；留到 64 已远大于
+/// 需要。上限的意义不是「够不够放」，而是日志被外部工具写坏 / 被手工改过时，
+/// 一行超长文本不会原样进入界面横幅（横幅是单行布局，会被撑爆）和导出报告。
+pub const MAX_AT_CHARS: usize = 64;
+
 /// 上一次运行留下的崩溃信息（如果检测到）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrashRecord {
@@ -66,7 +73,8 @@ pub struct CrashRecord {
 
 /// 在日志目录里找**最后一次**崩溃。
 ///
-/// - 扫 `log_dir` 下的 `.txt`（含 `latest.txt`），逐个找 `PANIC_MARKER`；
+/// - 只看**本项目日志系统产出的文件**（`latest.txt` 与
+///   `voice2word_<时间戳>.txt`，判定见 [`is_our_log_file`]），逐个找 `PANIC_MARKER`；
 /// - 返回最后一次出现的那一条（按文件内出现顺序取最后一个：一次运行可能崩多次，
 ///   用户关心的是最后一次）；
 /// - 一个都没有 → `None`。
@@ -88,11 +96,7 @@ pub fn detect_previous_crash(log_dir: &Path) -> Option<CrashRecord> {
     let mut candidates: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
-        })
+        .filter(|p| is_our_log_file(p))
         .collect();
     // 排序让「最后一个文件」可复现：目录枚举顺序在 Windows 上并不稳定。
     candidates.sort();
@@ -105,6 +109,18 @@ pub fn detect_previous_crash(log_dir: &Path) -> Option<CrashRecord> {
         }
     }
     found
+}
+
+/// 该文件是不是本项目日志系统产出的日志。
+///
+/// 只认 [`crate::utils::logger::is_project_log_name`] 判定通过的名字，而不是
+/// 「目录下所有 `.txt`」：`logs/` 就在项目根下、用户看得见也可能自己往里放文件，
+/// 把别人的文件整份读进内存既没必要，遇到一个超大文本文件还会拖慢启动、甚至把内存
+/// 吃掉。判定规则与 `logger.rs` 的轮转规则**同源**（同一个函数），不会两处漂移。
+fn is_our_log_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(crate::utils::logger::is_project_log_name)
 }
 
 /// 在单个文件里找**最后一次** `PANIC_MARKER`，并解析它后面的字段。
@@ -153,7 +169,7 @@ fn parse_block(block: &str, source: &Path) -> CrashRecord {
 
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix("时间:") {
-            at = rest.trim().to_string();
+            at = truncate_chars(rest.trim(), MAX_AT_CHARS);
         } else if let Some(rest) = trimmed.strip_prefix("详情:") {
             message = truncate_chars(rest.trim(), MAX_MESSAGE_CHARS);
         } else if let Some(rest) = trimmed.strip_prefix("堆栈:") {
@@ -477,5 +493,48 @@ mod tests {
         for field in ["时间:", "详情:", "堆栈:"] {
             assert!(logger.contains(field), "logger.rs 缺少字段前缀 {field}");
         }
+    }
+
+    /// **反例**：`logs/` 里用户自己放进来的 `.txt` 不能被当成本程序的崩溃日志。
+    ///
+    /// 只按扩展名过滤的旧实现会在这里失败：外部文件的排序若在本项目日志之后，
+    /// 里面随便一段文字就能让程序启动时报「上次异常退出」，用户被指向不存在的问题。
+    #[test]
+    fn ignores_foreign_txt_files_in_log_dir() {
+        let dir = temp_dir("foreign");
+        // 文件名排在 voice2word_* 之后，正是「取目录里最后一个文件」会选中的那个
+        std::fs::write(
+            dir.join("zzz_notes.txt"),
+            block("2026-10-09 10:31:02", "not ours", "bt"),
+        )
+        .unwrap();
+        assert!(
+            detect_previous_crash(&dir).is_none(),
+            "非本项目命名的 txt 不能被当成崩溃日志"
+        );
+
+        // 同一目录里我们自己的日志仍然必须检测到
+        let dated = dir.join("voice2word_20261009_103102.txt");
+        std::fs::write(&dated, block("2026-10-09 10:31:02", "ours", "bt")).unwrap();
+        let rec = detect_previous_crash(&dir).expect("本项目日志里的崩溃必须检测到");
+        assert_eq!(rec.message, "ours");
+        assert_eq!(rec.source, dated);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 超长的「时间」行必须按字符截断：它会直接进单行横幅与导出报告，
+    /// 不截断就会被一行坏文本撑爆。
+    #[test]
+    fn truncates_overlong_time_field() {
+        let dir = temp_dir("long_at");
+        let long_at: String = "9".repeat(MAX_AT_CHARS + 200);
+        std::fs::write(dir.join("latest.txt"), block(&long_at, "boom", "bt")).unwrap();
+
+        let rec = detect_previous_crash(&dir).expect("应检测到崩溃");
+        assert_eq!(rec.at.chars().count(), MAX_AT_CHARS);
+        assert!(rec.at.chars().all(|c| c == '9'));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

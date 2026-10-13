@@ -15,6 +15,15 @@
 //! 断电留下半个 exe、被杀软或签名校验拦下……这些失败的代价远大于「用户自己多点
 //! 一次下载页」。替换/安装由用户自己完成。
 //!
+//! # 落盘前的校验（为什么不止「大小 + 非空」）
+//!
+//! 下载走的是第三方加速镜像：镜像返回什么字节完全不受 GitHub 控制。只查长度与
+//! 「开头是不是 MZ」挡不住换包——一个带 MZ 头的陌生 exe 会被当成「新版本安装包」
+//! 落到 `updates/`，再引导用户去运行。因此除了长度与魔数，还会校验**官方 API 声明
+//! 的 sha256**（附件元数据的 `digest` 字段）：见 [`fetch_latest_release`] 的登记与
+//! [`download_update_file`] 的比对。上游没给摘要时退化为长度 + 魔数，并在日志里
+//! 明确记下「本次无从校验」。
+//!
 //! # 网络与调用时机
 //!
 //! [`fetch_latest_release`] 会发起**一次外网请求**
@@ -34,9 +43,12 @@
 //! 因此能被完整单测覆盖；碰 IO 的只有 [`fetch_latest_release`] 与
 //! [`download_update_file`]。
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use sha2::{Digest, Sha256};
+use tracing::warn;
 
 /// GitHub「最新发行版」接口地址。
 ///
@@ -78,6 +90,16 @@ pub struct LatestRelease {
     pub asset_name: String,
     /// 附件大小（字节，0 表示未知）
     pub asset_size: u64,
+    /// 附件内容的 sha256（取自 GitHub 附件元数据的 `digest` 字段，小写十六进制）。
+    ///
+    /// 这个值是用来**校验下载内容**的。下载走的是第三方加速镜像，镜像返回什么字节
+    /// 完全不受 GitHub 控制；只查「长度够不够、开头是不是 MZ」挡不住换包——一个
+    /// 带 MZ 头的陌生 exe 会被当成「新版本安装包」落到 `updates/`，再引导用户去运行。
+    /// 官方 API 直接给出的摘要把「镜像返回的字节」与「官方发布的字节」绑在一起，
+    /// 镜像中途换内容就会在落盘前被发现。
+    ///
+    /// 上游没提供 `digest` 时为 `None`：那种情况下无从校验，仍走长度 + 魔数。
+    pub asset_sha256: Option<String>,
 }
 
 /// 当前编译进二进制的版本（`CARGO_PKG_VERSION`）。
@@ -129,6 +151,7 @@ pub fn parse_latest_release(body: &str) -> Result<LatestRelease> {
     let mut download_url = String::new();
     let mut asset_name = String::new();
     let mut asset_size: u64 = 0;
+    let mut asset_sha256: Option<String> = None;
 
     if let Some(assets) = value.get("assets").and_then(|a| a.as_array()) {
         for asset in assets {
@@ -148,12 +171,18 @@ pub fn parse_latest_release(body: &str) -> Result<LatestRelease> {
                         continue;
                     }
                     let size = asset.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+                    // 官方附件元数据里的内容摘要（`sha256:<hex>`）；不认识/缺失即 None。
+                    let digest = asset
+                        .get("digest")
+                        .and_then(|d| d.as_str())
+                        .and_then(normalize_digest);
                     let is_exe = lower.ends_with(".exe");
                     // 优先选择 .exe；否则保留第一个可用的候选（zip 等）
                     if is_exe || download_url.is_empty() {
                         download_url = url;
                         asset_name = name.to_string();
                         asset_size = size;
+                        asset_sha256 = digest;
                         if is_exe {
                             break;
                         }
@@ -179,7 +208,30 @@ pub fn parse_latest_release(body: &str) -> Result<LatestRelease> {
         download_url,
         asset_name,
         asset_size,
+        asset_sha256,
     })
+}
+
+/// 归一化附件元数据里的 `digest` 字段：只接受 `sha256:<64 位十六进制>`。
+///
+/// 其它算法（`md5:` / `sha1:`）与形状不对的串一律返回 `None`——宁可不校验，也不能
+/// 拿一个没打算支持的算法假装「校验过了」。返回值统一成小写十六进制，便于与算出来的
+/// 摘要直接比较。
+fn normalize_digest(raw: &str) -> Option<String> {
+    let (algo, hex) = raw.trim().split_once(':')?;
+    if !algo.eq_ignore_ascii_case("sha256") {
+        return None;
+    }
+    let hex = hex.trim();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(hex.to_ascii_lowercase())
+}
+
+/// 摘要比对：十六进制大小写两种写法都合法，因此大小写不敏感。
+fn digests_match(expected: &str, actual: &str) -> bool {
+    expected.eq_ignore_ascii_case(actual)
 }
 
 /// 版本号里的一段：整数部分 + 可选的预发布后缀。
@@ -334,7 +386,16 @@ pub fn fetch_latest_release(timeout_secs: u64) -> Result<LatestRelease> {
     let body = response
         .into_string()
         .map_err(|e| anyhow!("检查更新失败：读取 GitHub 响应出错（{e}）"))?;
-    parse_latest_release(&body)
+    let release = parse_latest_release(&body)?;
+    // 把官方声明的内容摘要登记下来，供随后的下载校验使用（见 [`ADVERTISED_DIGESTS`]）。
+    record_advertised_digest(&release.download_url, release.asset_sha256.as_deref());
+    if release.asset_sha256.is_none() {
+        warn!(
+            asset = %release.asset_name,
+            "上游未提供附件内容摘要，本次下载只能按长度与文件头校验"
+        );
+    }
+    Ok(release)
 }
 
 /// 把非 2xx 响应变成带状态码与提示的中文错误。
@@ -445,6 +506,64 @@ fn magic_matches(name: &str, head: &[u8]) -> bool {
     }
 }
 
+// 官方 API 声明过内容摘要的下载链接 → 摘要。
+//
+// 为什么需要这个全局表：界面的「检查更新 → 下载」两步之间只传 `(URL, 文件名, 大小)`，
+// 摘要没有随参数传进来（要改这条链上的类型就得动界面层）。而官方 API 声明的摘要
+// 正是校验「第三方镜像返回的字节」的唯一可信依据，所以由 `fetch_latest_release`
+// 在拿到响应时登记，`download_update_file` 按 URL 取回。
+//
+// 只保留最近 MAX_ADVERTISED_DIGESTS 条：这是会话级缓存，不是历史记录。
+static ADVERTISED_DIGESTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// 最多记住多少条已声明的摘要。
+const MAX_ADVERTISED_DIGESTS: usize = 8;
+
+/// 登记一条「官方 API 为这个下载链接声明的内容摘要」；`sha256` 为 `None` 时不登记。
+fn record_advertised_digest(url: &str, sha256: Option<&str>) {
+    let Some(digest) = sha256 else {
+        return;
+    };
+    if url.trim().is_empty() {
+        return;
+    }
+    // 中毒只意味着这一次没登记上，绝不能因此打断「检查更新」本身。
+    let Ok(mut list) = ADVERTISED_DIGESTS.lock() else {
+        return;
+    };
+    list.retain(|(u, _)| u != url);
+    list.insert(0, (url.to_string(), digest.to_string()));
+    list.truncate(MAX_ADVERTISED_DIGESTS);
+}
+
+/// 取回某个下载链接被官方声明过的内容摘要（没有则 `None`，即「无从校验」）。
+fn advertised_digest(url: &str) -> Option<String> {
+    let list = ADVERTISED_DIGESTS.lock().ok()?;
+    list.iter().find(|(u, _)| u == url).map(|(_, d)| d.clone())
+}
+
+/// 边写盘边算 sha256 —— 校验不必为了拿摘要再把几十 MB 的文件整份读一遍。
+///
+/// `new(false)` 时所有 `update` 都是空操作、`finish_hex` 返回 `None`：上游没给摘要
+/// 时不做无谓的哈希计算。
+struct StreamingHasher(Option<Sha256>);
+
+impl StreamingHasher {
+    fn new(enabled: bool) -> Self {
+        Self(enabled.then(Sha256::new))
+    }
+
+    fn update(&mut self, buf: &[u8]) {
+        if let Some(hasher) = self.0.as_mut() {
+            hasher.update(buf);
+        }
+    }
+
+    fn finish_hex(self) -> Option<String> {
+        self.0.map(|hasher| format!("{:x}", hasher.finalize()))
+    }
+}
+
 /// 下载更新文件到 updates/ 目录，支持镜像加速与断点/临时文件保护。
 pub fn download_update_file(
     download_url: &str,
@@ -462,6 +581,9 @@ pub fn download_update_file(
     let final_name = safe_file_name(asset_name);
     let dest = updates_dir.join(&final_name);
     let part = updates_dir.join(format!("{final_name}.part"));
+    // 本次下载要校验的内容摘要：只有官方 API 为**这个** URL 声明过才有值。
+    // 有值时「镜像返回的字节」必须与官方发布的一致，否则换下一个源。
+    let expected_digest = advertised_digest(download_url);
 
     // 候选下载镜像（国内加速镜像优先，最后兜底 GitHub 直链）
     let mut candidate_urls = Vec::new();
@@ -522,6 +644,8 @@ pub fn download_update_file(
         // 几个字节，省得再把文件打开一次。
         let mut head = [0u8; 4];
         let mut head_len = 0usize;
+        // 摘要随写盘一起算：下完再整份读一遍是另一笔几十 MB 的 IO。
+        let mut hasher = StreamingHasher::new(expected_digest.is_some());
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -544,6 +668,7 @@ pub fn download_update_file(
                         break;
                     }
                     written += n as u64;
+                    hasher.update(&buf[..n]);
                     let frac = if total_size > 0 {
                         (written as f32 / total_size as f32).clamp(0.0, 1.0)
                     } else {
@@ -574,6 +699,22 @@ pub fn download_update_file(
                 "下载内容不是有效的安装包（{final_name} 的文件头不匹配），疑似下载源返回了错误页"
             ));
             download_ok = false;
+        }
+        // 内容摘要校验：只有官方 API 给过摘要时才做（没摘要 = 无从校验，不能因此
+        // 把文件判成坏的）。不匹配说明**镜像返回的字节不是官方发布的那一份**——
+        // 这正是「换包」的形态，必须换下一个下载源，绝不能让陌生内容落盘。
+        if download_ok {
+            if let (Some(expected), Some(actual)) =
+                (expected_digest.as_deref(), hasher.finish_hex())
+            {
+                if !digests_match(expected, &actual) {
+                    last_err = Some(anyhow!(
+                        "下载内容与官方声明的 sha256 不一致（疑似下载源替换了安装包）：\
+                         期望 {expected}，实际 {actual}"
+                    ));
+                    download_ok = false;
+                }
+            }
         }
 
         if download_ok {
@@ -882,5 +1023,118 @@ mod tests {
         // 未知扩展名不校验，保持既有行为。
         assert!(magic_matches("voice2word.tar.gz", b"\x1f\x8b\x08\x00"));
         assert!(!magic_matches("voice2word.exe", b""));
+    }
+
+    /// `digest` 字段的归一化：只认 `sha256:<64 位十六进制>`，大小写统一到小写。
+    /// 别的算法与形状不对的串一律 `None`——宁可不校验，也不能拿不支持的算法
+    /// 假装校验过。
+    #[test]
+    fn normalize_digest_accepts_only_sha256_hex() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            normalize_digest(&format!("sha256:{hex}")),
+            Some(hex.to_string())
+        );
+        assert_eq!(
+            normalize_digest(&format!("SHA256:{}", hex.to_uppercase())),
+            Some(hex.to_string()),
+            "算法名与十六进制都不区分大小写"
+        );
+        // 反例：不支持的算法 / 长度不对 / 含非十六进制 / 没有算法前缀
+        let short = format!("sha256:{}", &hex[..62]);
+        let long = format!("sha256:{hex}00");
+        let non_hex =
+            "sha256:zzzz456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+        for bad in [
+            "md5:0123456789abcdef0123456789abcdef",
+            short.as_str(),
+            long.as_str(),
+            non_hex.as_str(),
+            hex,
+            "",
+            "sha256:",
+        ] {
+            assert_eq!(normalize_digest(bad), None, "{bad:?} 不该被接受");
+        }
+    }
+
+    /// 摘要比对大小写不敏感（十六进制两种写法都合法）。
+    #[test]
+    fn digest_comparison_ignores_hex_case() {
+        assert!(digests_match("abc123", "ABC123"));
+        assert!(digests_match("abc123", "abc123"));
+        assert!(!digests_match("abc123", "abc124"));
+        assert!(!digests_match("abc123", "abc12"));
+    }
+
+    /// 流式摘要必须与「一次算完整内容」一致，否则校验会误报/漏报。
+    /// 用 sha256("abc") 的已知向量钉住。
+    #[test]
+    fn streaming_hasher_matches_known_vector() {
+        let mut hasher = StreamingHasher::new(true);
+        hasher.update(b"a");
+        hasher.update(b"bc");
+        assert_eq!(
+            hasher.finish_hex(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string())
+        );
+        // 未启用时不计算（上游没给摘要就不做无谓开销）
+        let mut off = StreamingHasher::new(false);
+        off.update(b"abc");
+        assert_eq!(off.finish_hex(), None);
+    }
+
+    /// 附件元数据里的 `digest` 要被解析进 `asset_sha256`，供落盘前校验使用。
+    #[test]
+    fn parse_latest_release_extracts_asset_digest() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let body = format!(
+            r#"{{
+                "tag_name": "v0.3.0",
+                "assets": [
+                    {{
+                        "name": "voice2word.exe",
+                        "browser_download_url": "https://example.com/voice2word.exe",
+                        "size": 1234,
+                        "digest": "sha256:{hex}"
+                    }}
+                ]
+            }}"#
+        );
+        let r = parse_latest_release(&body).expect("应解析成功");
+        assert_eq!(r.asset_sha256.as_deref(), Some(hex));
+
+        // 没有 digest（或是不支持的算法）→ None，表示「无从校验」
+        let no_digest = r#"{ "tag_name": "v0.3.0", "assets": [
+            { "name": "voice2word.exe", "browser_download_url": "https://e/x.exe", "digest": "md5:aa" }
+        ] }"#;
+        let r2 = parse_latest_release(no_digest).expect("应解析成功");
+        assert_eq!(r2.asset_sha256, None);
+
+        // 完全没有 assets → 回退 URL，同样没有摘要
+        let r3 = parse_latest_release(r#"{ "tag_name": "v0.3.0" }"#).expect("应解析成功");
+        assert_eq!(r3.asset_sha256, None);
+    }
+
+    /// 登记表按 URL 取回摘要：只有被官方声明过的那个 URL 才有值。
+    #[test]
+    fn advertised_digest_registry_is_url_scoped() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let url = "https://example.com/voice2word-digest-test/voice2word.exe";
+        record_advertised_digest(url, Some(hex));
+        assert_eq!(advertised_digest(url).as_deref(), Some(hex));
+        // 反例：别的 URL（包括镜像派生出来的那些前缀 URL）不会命中
+        assert_eq!(
+            advertised_digest(&format!("https://ghproxy.net/{url}")),
+            None
+        );
+        assert_eq!(advertised_digest("https://example.com/other.exe"), None);
+        // 没有摘要时不能登记（否则会误报「摘要为空」）
+        record_advertised_digest("https://example.com/no-digest.exe", None);
+        assert_eq!(advertised_digest("https://example.com/no-digest.exe"), None);
+        // 同 URL 再次登记以最新一次为准，且不会堆积重复项
+        let other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        record_advertised_digest(url, Some(other));
+        assert_eq!(advertised_digest(url).as_deref(), Some(other));
     }
 }

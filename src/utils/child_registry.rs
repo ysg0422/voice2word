@@ -105,10 +105,26 @@ mod job {
                 CloseHandle(h);
                 return None;
             }
-            let _ = JOB.set(h);
-            info!("全局作业对象已建立：本进程消失时其名下子进程会被系统连根终止");
-            Some(h)
+            match JOB.set(h) {
+                Ok(()) => {
+                    info!("全局作业对象已建立：本进程消失时其名下子进程会被系统连根终止");
+                    Some(h)
+                }
+                Err(_) => {
+                    // 另一个线程抢先建好了。本次多出来的句柄必须关掉：句柄没有
+                    // Drop，泄漏的是一个内核对象（而且它同样带 KILL_ON_JOB_CLOSE，
+                    // 留着会让「谁拥有兜底」这件事变得不明确）。
+                    CloseHandle(h);
+                    JOB.get().copied()
+                }
+            }
         }
+    }
+
+    /// 当前全局作业对象句柄（仅测试用于断言并发初始化不会产生第二个句柄）。
+    #[cfg(test)]
+    pub(super) fn current_handle() -> Option<isize> {
+        job_handle()
     }
 
     pub fn ensure() {
@@ -272,6 +288,30 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "retire_all 必须在 kill+wait 后立即返回"
+        );
+    }
+
+    /// 并发初始化只能得到**同一个**作业对象句柄：句柄一旦被建两次，多出来的那个
+    /// 就没有任何 `Drop` 去关闭（泄漏一个内核对象），而且它同样带
+    /// `KILL_ON_JOB_CLOSE`，「由谁拥有兜底」会变得不确定。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn job_object_is_created_once_under_concurrent_init() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    ensure_job_object();
+                    job::current_handle()
+                })
+            })
+            .collect();
+        let handles: Vec<Option<isize>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+
+        let first = handles[0];
+        assert!(first.is_some(), "作业对象必须真的建立起来");
+        assert!(
+            handles.iter().all(|h| *h == first),
+            "并发初始化必须复用同一个句柄，不能各自建一个：{handles:?}"
         );
     }
 }

@@ -65,9 +65,21 @@ fn parse_sections(b: &[u8], start: usize, count: usize) -> Option<Vec<Section>> 
 }
 
 /// RVA → 文件偏移。rva 落在某个节内时换算，否则 `None`。
+///
+/// 判定跨度取 `vsize` 与 `raw_size` 的**较小值**：`vsize` 是映射到内存后的虚拟
+/// 大小，`raw_size` 才是文件里真实存在的字节数。取两者的较大值（旧实现）会把
+/// `[raw_size, vsize)` 这段「未初始化 / 仅内存」的 RVA 也算成有数据可读，换算出的
+/// 偏移已越过本节末尾，读到的是下一节甚至别处的字节——结果是**凭空多出乱码 DLL 名**，
+/// 触发「运行库缺失」假阳性。
 fn rva_to_offset(sections: &[Section], rva: u32) -> Option<usize> {
     for s in sections {
-        let span = s.vsize.max(s.raw_size);
+        // `vsize == 0` 属于「没写虚拟大小」的畸形但可见于真实文件的情况，
+        // 这时退回用 `raw_size`，避免把整节判成不可映射。
+        let span = if s.vsize == 0 {
+            s.raw_size
+        } else {
+            s.vsize.min(s.raw_size)
+        };
         if rva >= s.va && rva < s.va.saturating_add(span) {
             return Some((u64::from(s.raw_ptr) + u64::from(rva - s.va)) as usize);
         }
@@ -104,13 +116,24 @@ pub fn imported_dll_names(bytes: &[u8]) -> Option<Vec<String>> {
     let sections = parse_sections(bytes, opt.checked_add(opt_size)?, num_sections)?;
 
     let mut names: Vec<String> = Vec::new();
+    // 导入目录的**声明大小**给出了描述符表的上界：每项 20 字节，最后一项是全零
+    // 终止项。没有这个上界时，目录之后残留的非零字节会被继续当成描述符解析，
+    // `Name` 字段可以指到任意 RVA，只要那里恰好有个 NUL 结尾的串就会 push 一个
+    // **不存在的 DLL 名**——启动体检随即报「运行库缺失」（假阳性），而这条路径的
+    // 全部意义就是「只报告确定的缺失」。
+    // 目录大小含末尾的全零终止项，因此合法的描述符最多就这么多（声明不足一项时
+    // 一个都不解析：宁可判「无法判定」，也不从别处读出假名字）。
+    let max_descriptors = (import_size / 20) as usize;
     let mut desc = rva_to_offset(&sections, import_rva)?;
-    // IMAGE_IMPORT_DESCRIPTOR 共 20 字节；Name 字段在 +12。
-    while let (Some(name_rva), Some(first_thunk), Some(orig_first_thunk)) = (
-        read_u32(bytes, desc + 12),
-        read_u32(bytes, desc),
-        read_u32(bytes, desc + 16),
-    ) {
+    for _ in 0..max_descriptors {
+        // IMAGE_IMPORT_DESCRIPTOR 共 20 字节；Name 字段在 +12。
+        let (Some(name_rva), Some(first_thunk), Some(orig_first_thunk)) = (
+            read_u32(bytes, desc + 12),
+            read_u32(bytes, desc),
+            read_u32(bytes, desc + 16),
+        ) else {
+            break; // 读到文件尾 / 结构越界：当作列表结束
+        };
         if name_rva == 0 && first_thunk == 0 && orig_first_thunk == 0 {
             break; // 全零描述符 = 列表结束
         }
@@ -331,6 +354,59 @@ mod tests {
             imported_dll_names(&synthetic_pe()),
             Some(vec!["test.dll".to_string()])
         );
+    }
+
+    /// **反例**：导入目录之后残留的非零字节不能被继续当成描述符解析。
+    ///
+    /// 构造：导入目录只声明一项（20 字节），紧跟着写一段「长得像描述符、Name 指向
+    /// 另一个真实字符串」的垃圾。没有上界的旧实现会把它解析出来，**凭空多出一个
+    /// DLL 名**，启动体检随即报「运行库缺失」——而这条路径的全部意义就是
+    /// 「只报告确定的缺失」。
+    #[test]
+    fn import_directory_size_bounds_descriptor_walk() {
+        let mut pe = synthetic_pe();
+        let dd = 0x58 + 112; // PE32+ 的数据目录起点
+        pe[dd + 12..dd + 16].copy_from_slice(&20u32.to_le_bytes()); // 只声明 1 项
+
+        // 把真实描述符的名字挪到 0x470，腾出 0x420（第二项的 Name 字段所在处）
+        pe[0x400 + 12..0x400 + 16].copy_from_slice(&0x1070u32.to_le_bytes());
+        for i in 0..0x1E0 {
+            pe[0x420 + i] = 0;
+        }
+        pe[0x470..0x479].copy_from_slice(b"test.dll\0");
+
+        // 越界的第二项：非零 + Name 指向 0x490 的 phantom.dll
+        // 描述符布局：0=OriginalFirstThunk，+12=Name；基址 0x414 时 Name 在 0x420。
+        pe[0x414..0x418].copy_from_slice(&0x1080u32.to_le_bytes()); // OriginalFirstThunk != 0
+        pe[0x420..0x424].copy_from_slice(&0x1090u32.to_le_bytes()); // Name RVA
+        pe[0x490..0x49c].copy_from_slice(b"phantom.dll\0");
+
+        assert_eq!(
+            imported_dll_names(&pe),
+            Some(vec!["test.dll".to_string()]),
+            "越出导入目录声明范围的描述符不能被解析成 DLL 名"
+        );
+    }
+
+    /// 只有落在本节**文件数据**内的 RVA 才能换算成偏移。
+    ///
+    /// 取 `max(vsize, raw_size)` 时，`[raw_size, vsize)` 这段（未初始化 / 仅内存）
+    /// 会被换算成越过本节末尾的偏移，读到的是下一节甚至别处的字节 → 乱码 DLL 名。
+    #[test]
+    fn rva_to_offset_requires_file_backed_span() {
+        let sections = vec![Section {
+            va: 0x1000,
+            vsize: 0x1000,
+            raw_size: 0x200,
+            raw_ptr: 0x400,
+        }];
+        assert_eq!(rva_to_offset(&sections, 0x1000), Some(0x400));
+        assert_eq!(rva_to_offset(&sections, 0x11ff), Some(0x5ff));
+        // 落在 [raw_size, vsize)：文件里没有对应字节
+        assert_eq!(rva_to_offset(&sections, 0x1200), None);
+        assert_eq!(rva_to_offset(&sections, 0x1fff), None);
+        // 完全在节外
+        assert_eq!(rva_to_offset(&sections, 0x0fff), None);
     }
 
     #[test]
