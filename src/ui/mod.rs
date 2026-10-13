@@ -636,6 +636,12 @@ pub struct MainWindow {
     /// 与 `notice` 分开：`notice` 是「刚刚做了一件事」的一次性反馈，会被后续操作
     /// 覆盖；崩溃提示要一直挂到用户点掉它，否则启动后随便点个按钮就看不见了。
     pub(crate) crash_notice: Option<String>,
+    /// 上次崩溃的完整记录（含堆栈）。
+    ///
+    /// 为什么除了展示用的 `crash_notice` 还要留原始记录：横幅上的「复制报告」要把
+    /// **堆栈**一起给出去（`crash_report::build_report`），而那需要原始字段；
+    /// 只留格式化后的摘要就得在渲染期反解析自己的输出。
+    pub(crate) crash_record: Option<crate::utils::crash_report::CrashRecord>,
     /// 视频库批量导出的选中任务 id 集合。
     ///
     /// 历史库里一条条点「导出字幕」很费手，尤其是「同一部片子重跑了几版、
@@ -1408,6 +1414,7 @@ impl MainWindow {
             library_search_cursor: 0,
             library_query_cache: None,
             crash_notice: None,
+            crash_record: None,
             library_selected: HashSet::new(),
             library_export_busy: false,
             command_palette: None,
@@ -1423,7 +1430,10 @@ impl MainWindow {
         window.state.restore_queue();
         // 检测上次运行是否崩溃过：panic 钩子只把堆栈写进日志，没有任何机制告诉用户，
         // 于是「崩了、重开、能用」的 bug 永远没人上报。
-        window.crash_notice = Self::detect_crash_notice();
+        if let Some(record) = Self::detect_crash_record() {
+            window.crash_notice = Some(Self::crash_notice_text(&record));
+            window.crash_record = Some(record);
+        }
 
         // 若启动已载入历史视频工程，立即触发首帧提取，并按硬件策略补代理
         if window.state.selected_file.is_some() {
@@ -1439,18 +1449,23 @@ impl MainWindow {
     ///
     /// 抽成关联函数而不是内联：启动路径上已经够长，而这段逻辑与窗口状态无关
     /// （只读日志目录），单独可读、也可在别处复用。
-    fn detect_crash_notice() -> Option<String> {
+    fn detect_crash_record() -> Option<crate::utils::crash_report::CrashRecord> {
         let log_dir = crate::utils::AppConfig::resolve_path("logs");
-        let record = crate::utils::crash_report::detect_previous_crash(&log_dir)?;
-        Some(format!(
-            // 这里以前写「导出诊断可一并附上日志」，但诊断报告里**并不含日志正文**
-            // （它只采环境/路径/可写性，且有「同样输入 → 逐字节相同输出」的契约，
-            // 塞进日志就破坏了可复现性）。用户照着那句话去导出，拿到的报告里没有堆栈
-            // ——报障时最关键的那段恰好缺了。所以改成把两个东西分开说清：
-            // 堆栈在 logs 目录，诊断导出是另一份环境快照。
-            "{}　（崩溃堆栈在程序目录的 logs 文件夹里；「性能设置 → 模型与组件」可导出环境诊断）",
-            crate::utils::crash_report::short_summary(&record)
-        ))
+        crate::utils::crash_report::detect_previous_crash(&log_dir)
+    }
+
+    /// 崩溃横幅上那句话。
+    ///
+    /// 这里以前写「导出诊断可一并附上日志」，但诊断报告里**并不含日志正文**
+    /// （它只采环境/路径/可写性，且有「同样输入 → 逐字节相同输出」的契约，
+    /// 塞进日志就破坏了可复现性）。用户照着那句话去导出，拿到的报告里没有堆栈
+    /// ——报障时最关键的那段恰好缺了。现在横幅自己带「复制报告」按钮（见
+    /// `status_bar::render_crash_banner`），这句话只负责说清「发生了什么、去哪找堆栈」。
+    fn crash_notice_text(record: &crate::utils::crash_report::CrashRecord) -> String {
+        format!(
+            "{}　（堆栈在程序目录的 logs 文件夹里，也可点右侧「复制报告」直接带走）",
+            crate::utils::crash_report::short_summary(record)
+        )
     }
 
     /// 关窗前的脏数据守卫（系统关窗路径 Alt+F4 / 任务栏右键 / 系统关闭按钮，
@@ -3367,6 +3382,27 @@ mod tests {
         DerivedSnapshot, DerivedSnapshotKey, GlossaryBadCache, GlossaryFingerprint, ReplaceRule,
         ReplaceRuleSet, SubtitleSearchCache, PALETTE_COMMANDS,
     };
+    /// 崩溃横幅那句话要同时说清「发生了什么」与「去哪拿堆栈」。
+    ///
+    /// 回归护栏：这里以前写「导出诊断可一并附上日志」，而诊断报告里并没有日志正文
+    /// ——用户照着去导出，拿到的报告缺了最关键的那段堆栈。
+    #[test]
+    fn crash_notice_points_at_logs_and_the_copy_button() {
+        let record = crate::utils::crash_report::CrashRecord {
+            at: "2026-10-13 10:00:00".to_string(),
+            message: "index out of bounds".to_string(),
+            backtrace: "0: voice2word::foo".to_string(),
+            source: std::path::PathBuf::from("logs/voice2word_20261013_100000.txt"),
+        };
+        let text = super::MainWindow::crash_notice_text(&record);
+        assert!(text.contains("index out of bounds"), "要有崩溃原因：{text}");
+        assert!(text.contains("logs"), "要指出堆栈在哪：{text}");
+        assert!(text.contains("复制报告"), "要指出有现成的复制入口：{text}");
+        assert!(
+            !text.contains("导出诊断可一并附上日志"),
+            "不能再说诊断导出里含日志（它不含）：{text}"
+        );
+    }
     use crate::subtitle::edit::ReplaceOptions;
     use crate::subtitle::Segment;
     use std::cell::Cell;

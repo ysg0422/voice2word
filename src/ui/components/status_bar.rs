@@ -369,6 +369,15 @@ impl MainWindow {
                     .child(msg),
             )
             .child(
+                // 「复制报告」要放在「导出诊断」前面：崩溃时用户最需要的是**堆栈**，
+                // 而导出的是环境诊断（不含日志正文），两者不是一件事。
+                primitives::chip_clickable("复制报告", false, false)
+                    .id("crash-banner-copy")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.copy_crash_report(cx);
+                    })),
+            )
+            .child(
                 primitives::chip_clickable("导出诊断", false, false)
                     .id("crash-banner-export")
                     .on_click(cx.listener(|this, _, _, cx| {

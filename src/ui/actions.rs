@@ -844,6 +844,22 @@ impl MainWindow {
         self.export_text_content(cx, file_name, sheet, format.label());
     }
 
+    /// 把「上次崩溃」的完整报告（含堆栈、版本、环境）复制到剪贴板。
+    ///
+    /// 为什么要有这个入口：崩溃横幅以前只给一行摘要 + 一个「导出诊断」，而诊断报告
+    /// 里**没有堆栈**——用户报障时最关键的那段恰好拿不到。这里直接把
+    /// `crash_report::build_report` 的产物放进剪贴板，贴进聊天窗口即可。
+    pub(crate) fn copy_crash_report(&mut self, cx: &mut Context<Self>) {
+        let Some(record) = self.crash_record.as_ref() else {
+            self.notice = Some("没有可复制的崩溃记录".to_string());
+            cx.notify();
+            return;
+        };
+        let report = crate::utils::crash_report::build_report(record, env!("CARGO_PKG_VERSION"));
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(report));
+        self.notice = Some("已复制崩溃报告（含堆栈），可直接粘贴反馈".to_string());
+        cx.notify();
+    }
     /// 检查视频库里的重复记录，并把结果作为中性提示告诉用户。
     ///
     /// # 为什么只提示、不自动清理
