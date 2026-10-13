@@ -293,9 +293,11 @@ impl SubtitleWriter {
             let stamp = seconds_to_lrc_time(seg.start);
             // 一行一句：换行一律压成空格。LRC 播放器同样把一行当一条。
             let raw = super::segment::export_text_for(seg, mode, with_speaker);
-            // 只能 trim **尾部**：行首那个空格正是「[」的隔断层，
-            // `trim()` 会把它连同隔断一起吃掉，等于没转义。
-            let text = escape_lrc_text(&raw).trim_end().to_string();
+            // 先 trim **正文**：导入侧（`reader::parse_lrc`）同样会 `trim` 正文，两侧
+            // 口径不一致会让「[00:01.00]hi」与「[00:01.00] hi」来回横跳。必须在这一步
+            // 先 trim，再交给 [`escape_lrc_text`]——它给行首 `[` 补的那个隔断空格是
+            // 转义产物，绝不能在它之后被 trim 掉。
+            let text = escape_lrc_text(raw.trim());
             writeln!(file, "[{}]{}", stamp, text)?;
         }
         Ok(())
@@ -394,7 +396,12 @@ impl SubtitleWriter {
             let raw = super::segment::export_text_for(seg, mode, with_speaker);
             // 用户文本是直接拼进 SRT 的，出现在里面的 `<`/`&` 会被播放器当成标记
             // 解析（吞掉文本，甚至吃掉后面的字幕块），所以写盘前统一走实体转义。
-            let text = escape_srt_text(&wrap_text_capped(&raw, wrap, WRAP_MAX_LINES));
+            // 空行先折掉：正文里的空行会把这条 cue 从中间切开，导出→导入就丢内容。
+            let text = escape_srt_text(&collapse_blank_lines(&wrap_text_capped(
+                &raw,
+                wrap,
+                WRAP_MAX_LINES,
+            )));
             writeln!(file, "{}", i + 1)?;
             writeln!(file, "{} --> {}", start, end)?;
             writeln!(file, "{}", text)?;
@@ -675,7 +682,12 @@ Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bol
             // WebVTT 规范明确要求实体（`&amp;`/`&lt;`/`&gt;`），且 `<` 会被当作
             // cue 里的标签起始；与 SRT 共用同一份转义实现。
             let raw = super::segment::export_text_for(seg, mode, with_speaker);
-            let text = escape_vtt_text(&wrap_text_capped(&raw, wrap, WRAP_MAX_LINES));
+            // 与 SRT 同理：空行会被当作 cue 分隔，先把正文里的空行折掉。
+            let text = escape_vtt_text(&collapse_blank_lines(&wrap_text_capped(
+                &raw,
+                wrap,
+                WRAP_MAX_LINES,
+            )));
             writeln!(file, "{} --> {}", start, end)?;
             writeln!(file, "{}", text)?;
             writeln!(file)?;
@@ -829,6 +841,28 @@ fn escape_srt_text(text: &str) -> String {
 /// WebVTT 文本转义：规则与 SRT 相同（VTT 规范就是要求实体），共用同一实现。
 fn escape_vtt_text(text: &str) -> String {
     escape_markup_entities(text)
+}
+
+/// 把正文里连续的**空行**折掉。
+///
+/// SRT / VTT 用空行分隔 cue：正文里只要出现一个空行，导出文件里的这一条就会被
+/// 一分为二，后半段没有时间轴，导入时整段丢失（用户看到「导出的字幕丢了内容」）。
+/// 折掉空行后「导出 → 导入」不再丢内容；单个换行（双语/折行的正常形态）原样保留。
+fn collapse_blank_lines(text: &str) -> String {
+    if !text.contains('\n') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for line in text.split('\n') {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// `&` `<` `>` → 对应的 HTML 实体，**一遍扫字符**完成。
@@ -3148,6 +3182,45 @@ mod tests {
         assert!(
             !text.starts_with("[00:00.00]["),
             "行首方括号必须被隔开: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LRC 正文的首尾空白必须与导入侧同口径（都 trim）：否则「写→读→写」会来回横跳。
+    #[test]
+    fn lrc_trims_body_like_the_reader_does() {
+        let segs = vec![Segment::new(1, 7.0, 9.0, "  第一句  ")];
+        let dir = tmp_dir("lrc_trim");
+        let out = dir.join("out.lrc");
+        SubtitleWriter::write_to_file(&segs, &out, "lrc").unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "[00:07.00]第一句\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 正文里的空行会被 SRT/VTT 的块分隔切开：导出前必须折掉，
+    /// 否则「导出 → 导入」会丢掉空行之后的文本。
+    #[test]
+    fn srt_and_vtt_collapse_blank_lines_inside_text() {
+        let segs = vec![Segment::new(1, 0.0, 2.0, "第一行\n\n第二行")];
+        let dir = tmp_dir("blank_lines");
+        let srt = dir.join("a.srt");
+        let vtt = dir.join("a.vtt");
+        SubtitleWriter::write_srt(&segs, &srt).unwrap();
+        SubtitleWriter::write_to_file(&segs, &vtt, "vtt").unwrap();
+
+        let srt_text = std::fs::read_to_string(&srt).unwrap();
+        assert!(
+            srt_text.contains("第一行\n第二行"),
+            "空行必须折成单个换行: {srt_text:?}"
+        );
+        assert!(
+            !srt_text.contains("\n\n\n"),
+            "不应留下连续空行: {srt_text:?}"
+        );
+        let vtt_text = std::fs::read_to_string(&vtt).unwrap();
+        assert!(
+            vtt_text.contains("第一行\n第二行"),
+            "VTT 同样要折: {vtt_text:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

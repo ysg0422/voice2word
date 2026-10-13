@@ -160,7 +160,10 @@ impl Segment {
 
     /// 说话人标签（1 起编号，供界面与导出使用）
     pub fn speaker_label(&self) -> Option<String> {
-        self.speaker.map(|s| format!("说话人 {}", s + 1))
+        // 用饱和加法：序号是外部数据，理论上可到 u32::MAX，`s + 1` 在 debug 构建
+        // 会直接 panic（release 回绕成 0），而这里只想渲染一个标签。
+        self.speaker
+            .map(|s| format!("说话人 {}", s.saturating_add(1)))
     }
 
     /// 带说话人前缀的文本（仅在该段有说话人标签时加前缀）
@@ -585,8 +588,10 @@ pub fn dominant_language<'a, I>(segments: I) -> Option<String>
 where
     I: IntoIterator<Item = &'a Segment>,
 {
-    use std::collections::HashMap;
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    // 用**有序**表而不是 HashMap：并列众数必须给出确定的结果，否则同一批字幕两次
+    // 调用可能拿到不同语言码（HashMap 迭代顺序随机），翻译的源语言提示会来回闪。
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for seg in segments {
         if let Some(lang) = seg
             .language
@@ -597,10 +602,18 @@ where
             *counts.entry(lang).or_insert(0) += 1;
         }
     }
-    counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(lang, _)| lang.to_string())
+    // 严格大于才替换：并列时保留键最小的那个（BTreeMap 升序迭代），结果与输入顺序无关。
+    let mut best: Option<(&str, usize)> = None;
+    for (lang, n) in counts {
+        let better = match best {
+            Some((_, best_n)) => n > best_n,
+            None => true,
+        };
+        if better {
+            best = Some((lang, n));
+        }
+    }
+    best.map(|(lang, _)| lang.to_string())
 }
 
 /// 按导出模式取文本，并按需带上说话人前缀。
@@ -1079,6 +1092,12 @@ pub fn plan_time_edit(
         }
     }
 
+    // 兜底之后仍可能短于下限（后一句已经贴脸、前一句也退无可退）：把终点顶回下限，
+    // 绝不交出「下次载入会被鬼影判据删掉」的短片段——拒绝一次微调，比悄悄丢一句好。
+    if new_end - new_start < MIN_EDIT_DUR {
+        new_end = new_start + MIN_EDIT_DUR;
+    }
+
     TimeEdit {
         start: new_start,
         end: new_end,
@@ -1530,6 +1549,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 微调的自身不变式：无论邻居多挤，输出区间都不得短于 [`MIN_EDIT_DUR`]——
+    /// 短片段下次载入会被鬼影判据删掉，等于丢句。
+    #[test]
+    fn test_plan_time_edit_never_outputs_degenerate_interval() {
+        let edit = plan_time_edit(0.0, 0.05, None, Some((0.1, 0.2)), -3.0, -3.0);
+        assert!(
+            edit.end - edit.start >= MIN_EDIT_DUR - 1e-9,
+            "起点被拉回时留下过短片段: {edit:?}"
+        );
+        let edit = plan_time_edit(0.0, 0.3, None, Some((0.1, 0.2)), 0.0, 0.0);
+        assert!(
+            edit.end - edit.start >= MIN_EDIT_DUR - 1e-9,
+            "终点被后一句顶回时留下过短片段: {edit:?}"
+        );
+    }
+
+    /// 并列众数必须有确定结果（HashMap 迭代顺序随机，会让翻译的源语言提示来回闪）。
+    #[test]
+    fn dominant_language_tie_is_deterministic() {
+        let mut zh = Segment::new(1, 0.0, 1.0, "甲");
+        zh.language = Some("zh".to_string());
+        let mut en = Segment::new(2, 1.0, 2.0, "乙");
+        en.language = Some("en".to_string());
+        let segs = [zh, en];
+        // 各出现一次时取键最小者，且与传入顺序无关。
+        assert_eq!(dominant_language(segs.iter()).as_deref(), Some("en"));
+        assert_eq!(dominant_language(segs.iter().rev()).as_deref(), Some("en"));
+    }
+
+    /// 极端序号（u32::MAX）下渲染说话人标签不得 panic 或回绕成 0。
+    #[test]
+    fn speaker_label_saturates_instead_of_overflowing() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "文本");
+        seg.speaker = Some(u32::MAX);
+        assert_eq!(
+            seg.speaker_label().as_deref(),
+            Some("说话人 4294967295"),
+            "饱和加法不该回绕"
+        );
     }
     // ─────────── 翻译相关的取值与判定 ───────────
 

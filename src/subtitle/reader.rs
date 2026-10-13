@@ -128,7 +128,13 @@ pub fn parse_vtt(content: &str) -> Result<Vec<Segment>> {
     for block in split_blocks(body) {
         let first = block[0].trim_start();
         // NOTE / STYLE / REGION 是 VTT 的元数据块，不是字幕；整块跳过。
-        if first.starts_with("NOTE") || first.starts_with("STYLE") || first.starts_with("REGION") {
+        // 关键字必须是**独立词**（后面跟空白或行尾）：`NOTE1` / `STYLE2` 这类是合法的
+        // cue 标识行，按前缀匹配会把整条 cue 当注释丢掉。
+        let head = first.split_whitespace().next().unwrap_or("");
+        if ["NOTE", "STYLE", "REGION"]
+            .iter()
+            .any(|kw| head.eq_ignore_ascii_case(kw))
+        {
             continue;
         }
         // cue 可以有可选的标识行，真正的分界仍是含 `-->` 的时间轴行。
@@ -141,7 +147,8 @@ pub fn parse_vtt(content: &str) -> Result<Vec<Segment>> {
         if end < start {
             continue;
         }
-        let text = join_text_lines(&block[timing_at + 1..]);
+        // 与 SRT 同口径：还原导出侧写出的实体（WebVTT 也走同一套转义）。
+        let text = decode_markup_entities(&join_text_lines(&block[timing_at + 1..]));
         segments.push(Segment::new(0, start, end, text));
     }
     finalize_segments(segments, "WebVTT")
@@ -189,7 +196,8 @@ pub fn parse(content: &str, format: SubtitleFormat) -> Result<Vec<Segment>> {
 /// 读文件并按扩展名解析。
 ///
 /// **编码兜底**：先按 UTF-8 解码，失败则按 GBK 解码（中文字幕常见来源：老播放器
-/// 导出、记事本另存、论坛下载的 SRT 都可能是 GBK），两条都失败才报错。
+/// 导出、记事本另存、论坛下载的 SRT 都可能是 GBK），两条都解不干净时再用 lossy
+/// 兜底：个别坏字节不该让整份字幕报废。
 pub fn read_subtitle_file(path: &Path) -> Result<Vec<Segment>> {
     let format = SubtitleFormat::from_path(path).with_context(|| {
         format!(
@@ -203,7 +211,8 @@ pub fn read_subtitle_file(path: &Path) -> Result<Vec<Segment>> {
     parse(&text, format)
 }
 
-/// 编码兜底：先按 BOM 嗅探 UTF-16，再当 UTF-8 解，失败再当 GBK 解，都失败才报错。
+/// 编码兜底：先按 BOM 嗅探 UTF-16，再当 UTF-8 解，失败再当 GBK 解，都解不干净时
+/// 用 lossy 兜底（坏字节变 U+FFFD），不整份报错。
 ///
 /// Windows 记事本「Unicode」另存出来的字幕是 UTF-16LE/BE 带 BOM：UTF-8 解码必然
 /// 失败，落到 GBK 分支又几乎必然 `had_errors`，于是报出「既不是 UTF-8 也不是 GBK」
@@ -219,10 +228,13 @@ fn decode_subtitle_bytes(bytes: &[u8]) -> Result<String> {
         return Ok(text.to_string());
     }
     let (text, _, had_errors) = encoding_rs::GBK.decode(bytes);
-    if had_errors {
-        bail!("字幕文件既不是 UTF-8 也不是 GBK 编码，无法解码");
+    if !had_errors {
+        return Ok(text.into_owned());
     }
-    Ok(text.into_owned())
+    // 严格 UTF-8 与 GBK 都没解干净：多半是某几处坏字节（拉丁编码、截断的下载文件、
+    // 混入的二进制片段）。为几个坏字节放弃整份字幕代价太大，用 lossy 兜底把坏字节
+    // 换成 U+FFFD，其余内容照常交给解析器——能救回多少是多少。
+    Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// 把去掉 BOM 的 UTF-16 负载按给定字节序解成字符串。
@@ -286,7 +298,8 @@ fn parse_srt_block(block: &[&str]) -> Option<Segment> {
     if end < start {
         return None;
     }
-    let text = join_text_lines(&block[timing_at + 1..]);
+    // 正文要还原导出侧写出的实体，保证「导出 → 导入 → 再导出」不逐层叠加转义。
+    let text = decode_markup_entities(&join_text_lines(&block[timing_at + 1..]));
     Some(Segment::new(0, start, end, text))
 }
 
@@ -371,6 +384,43 @@ fn join_text_lines(lines: &[&str]) -> String {
         .map(|l| l.trim_end())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 还原导出侧写进纯文本格式的实体（`&amp;` / `&lt;` / `&gt;`）。
+///
+/// 导出时 `&`/`<`/`>` 会被写成实体（见 writer 的 `escape_markup_entities`）：SRT/VTT/SBV
+/// 的正文是纯文本，未转义的 `<` 会被播放器当标签吃掉。导入若不还原，用户重新导入
+/// 自己导出的字幕就会看到字面量 `&amp;`，而且每经历一次「导出 → 导入 → 导出」就多叠
+/// 一层（`a & b` → `a &amp; b` → `a &amp;amp; b`）。
+///
+/// **一遍扫字符**，与导出侧的单遍实现对称：产出的 `&` 不会再被回头识别，因此
+/// `&amp;lt;` 只会还原成 `&lt;`（导出时的原文），不会被二次解码成 `<`。只认导出侧
+/// 会产出的三个实体；其余 `&xxx;`（如 `&nbsp;`）原样保留，不猜。
+fn decode_markup_entities(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        if let Some(t) = tail.strip_prefix("&amp;") {
+            out.push('&');
+            rest = t;
+        } else if let Some(t) = tail.strip_prefix("&lt;") {
+            out.push('<');
+            rest = t;
+        } else if let Some(t) = tail.strip_prefix("&gt;") {
+            out.push('>');
+            rest = t;
+        } else {
+            out.push('&');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// 收尾：空结果报错，否则把序号重排为 1..n。
@@ -543,7 +593,9 @@ fn opt_identifier(value: Option<&serde_json::Value>) -> Option<String> {
 /// 其余类型（布尔 / 数组 / 对象 / null）按缺失处理，由调用方跳过该块。
 fn json_timestamp(value: Option<&serde_json::Value>) -> Option<f64> {
     match value? {
-        serde_json::Value::Number(n) => n.as_f64(),
+        // 负时间戳会让下游算出负时长（播放器/剪辑软件直接崩），夹到 0 至少保住
+        // 这一句的文本与结束时刻；非有限值（极端字面量）没法夹，按缺失处理。
+        serde_json::Value::Number(n) => n.as_f64().filter(|v| v.is_finite()).map(|v| v.max(0.0)),
         serde_json::Value::String(s) => parse_timestamp(s),
         _ => None,
     }
@@ -659,7 +711,8 @@ pub fn parse_sbv(content: &str) -> Result<Vec<Segment>> {
             // 正文行：无论上一条是否完整，都消费掉 pending。
             // 时间轴行丢了正文、或正文行没有对应的头，都只影响这一条。
             if !line.is_empty() && seg.end >= seg.start {
-                seg.text = line.to_string();
+                // 与 SRT/VTT 同口径：还原导出侧写出的实体，避免反复导出叠加转义。
+                seg.text = decode_markup_entities(line);
                 segments.push(seg);
             }
         }
@@ -674,6 +727,11 @@ fn parse_sbv_timing_line(line: &str) -> Option<(f64, f64)> {
     // 时间轴行只有两个字段：多一个逗号说明这是正文（正文里逗号极常见），
     // 因此字段数不对就整行当正文，而不是硬解前半段。
     if line.matches(',').count() != 1 {
+        return None;
+    }
+    // 两侧都必须含 `:`（SBV 的时间至少是 `M:SS.mmm`）：否则形如 `10,20` / `1,000`
+    // 的**正文行**会被误判成时间轴，把上一条 pending 覆盖掉、整块内容错位或消失。
+    if !left.contains(':') || !right.contains(':') {
         return None;
     }
     let start = parse_timestamp(left)?;
@@ -758,10 +816,28 @@ pub fn parse_ass(content: &str) -> Result<Vec<Segment>> {
 /// `{` 到 `}` 之间的内容（`{\i1}`、`{\pos(10,10)}`）是排版指令，不是字幕文本。未闭合的
 /// `{` 之后的整段一并丢弃：既然分不清指令到哪里结束，留下来只会把半截指令混进字幕，
 /// 宁可让这一行少一截，也不污染文本。
+///
+/// `\{` / `\}` / `\\` 是转义序列（导出侧正是用 `\{` / `\}` 表达字面花括号），必须
+/// 逐个跳过、不能触发覆盖块状态：否则 `x\{a\}b` 会被当成「`{` 开、`}` 关」的覆盖块，
+/// 把 `a` 连同转义前缀一起吞掉，读回来只剩 `x\b`。
 fn strip_ass_override_blocks(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut in_brace = false;
-    for ch in raw.chars() {
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        // 覆盖块之外的 `\`：`\{` / `\}` / `\\` 是导出侧写出的**字面量**（本例的
+        // 转义规则），原样留给 [`decode_ass_text_markers`] 还原。绝不能让 `\{` 里的
+        // `{` 打开覆盖块——否则它后面直到下一个 `}` 的正文会被整段吞掉。
+        if ch == '\\' && !in_brace {
+            out.push('\\');
+            if let Some(&next) = chars.peek() {
+                if matches!(next, '{' | '}' | '\\') {
+                    out.push(next);
+                    chars.next();
+                }
+            }
+            continue;
+        }
         match ch {
             '{' => in_brace = true,
             '}' if in_brace => in_brace = false,
@@ -777,7 +853,9 @@ fn strip_ass_override_blocks(raw: &str) -> String {
 /// `\N` 是 ASS 的硬换行。`\n` 是同一语义的旧写法（SSA 时代起两种都收），本项目的导出侧
 /// 也正是用 `\N` 表达双语/折行的换行；只认 `\N` 的话，含 `\n` 的文件会把同一句的上下两
 /// 行拼成一长行，与导出语义对不上。`\h` 是不换行的硬空格（常用来保住行首空格），还原成
-/// 普通空格。其余 `\x` 原样保留：不认识的转义宁可留着，也不要凭猜测删掉用户原文里的字符。
+/// 普通空格。`\{` / `\}` / `\\` 还原成对应的单个字面字符——它们与导出侧
+/// [`strip_ass_override_blocks`] 的转义互为逆运算。其余 `\x` 原样保留：不认识的转义
+/// 宁可留着，也不要凭猜测删掉用户原文里的字符。
 fn decode_ass_text_markers(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars();
@@ -791,6 +869,9 @@ fn decode_ass_text_markers(raw: &str) -> String {
             // 只认小写 `\h`：ASS 规范里的硬空格就是 `\h`，大写 `\H` 不是合法标记，
             // 因此按未知转义原样保留，不凭猜测转换。
             Some('h') => out.push(' '),
+            // `\{` / `\}` / `\\` 是导出侧对字面花括号与反斜杠的转义，逐个还原；
+            // 不还原的话，导出再导入会把正文里的 `{`/`\` 越转越多。
+            Some(escaped @ ('{' | '}' | '\\')) => out.push(escaped),
             Some(other) => {
                 out.push('\\');
                 out.push(other);
@@ -852,7 +933,7 @@ fn ass_speaker_index(seen: &mut Vec<String>, name: &str) -> u32 {
 /// 认定是字幕会造成「导入成功但内容全乱」。安全集合是字幕专有的 `.ttml` / `.dfxp` /
 /// `.ttal`；扩展名分派由 `reader.rs` 统一维护，本文件只提供纯字符串解析。
 pub fn parse_ttml(content: &str) -> Result<Vec<Segment>> {
-    let text = normalize_newlines(strip_bom(content));
+    let text = strip_xml_comments(&normalize_newlines(strip_bom(content)));
     let doc_lang = ttml_document_lang(&text);
     let mut segments = Vec::new();
     // 字节游标顺序推进：每处理完一块就跳过它的 `</p>`，避免把同一块重复匹配。
@@ -867,16 +948,36 @@ pub fn parse_ttml(content: &str) -> Result<Vec<Segment>> {
             cursor = after_open;
             continue;
         }
-        let Some(body_len) = text[after_open..].find("</p>") else {
+        let Some((close_at, after_close)) = find_close_tag(&text, after_open, "p") else {
             break;
         };
-        let body = &text[after_open..after_open + body_len];
-        cursor = after_open + body_len + "</p>".len();
+        let body = &text[after_open..close_at];
+        cursor = after_close;
         if let Some(segment) = build_ttml_segment(&attrs, body, doc_lang.as_deref()) {
             segments.push(segment);
         }
     }
     finalize_segments(segments, "TTML")
+}
+
+/// 去掉 XML 注释（`<!-- ... -->`）。
+///
+/// 注释里被「注掉」的 `<p>...</p>` 仍是合法字节序列：不剥掉的话，注释掉的字幕会被
+/// 当成真字幕解析出来，凭空多出几句、还可能与正文重复。未闭合的注释视为文档在此
+/// 截断，后面的内容不再当正文。
+fn strip_xml_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("<!--") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + "<!--".len()..];
+        match after.find("-->") {
+            Some(end) => rest = &after[end + "-->".len()..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// 在 `text[from..]` 中寻找名为 `name` 的**开**标签，返回 `<` 的字节下标。
@@ -887,9 +988,8 @@ fn find_element_start(text: &str, from: usize, name: &str) -> Option<usize> {
     let mut cursor = from;
     while let Some(rel) = text[cursor..].find('<') {
         let at = cursor + rel;
-        let after = at + 1;
-        if text[after..].starts_with(name) {
-            let boundary = text[after + name.len()..].chars().next();
+        if let Some(name_at) = local_name_start(text, at + 1, name) {
+            let boundary = text[name_at + name.len()..].chars().next();
             let is_boundary = match boundary {
                 None => true,
                 Some(c) => c.is_whitespace() || c == '>' || c == '/',
@@ -898,7 +998,64 @@ fn find_element_start(text: &str, from: usize, name: &str) -> Option<usize> {
                 return Some(at);
             }
         }
-        cursor = after;
+        cursor = at + 1;
+    }
+    None
+}
+
+/// 元素**本地名**的起始下标：允许可选的命名空间前缀（`<tt:p>`、`<ns0:span>`）。
+///
+/// 找不到返回 `None`。前缀必须紧贴 `:` 且其后就是目标元素名，否则 `<person>` 会被
+/// 误当成 `<p>` 的同前缀元素。
+fn local_name_start(text: &str, from: usize, name: &str) -> Option<usize> {
+    if let Some(rest) = text[from..].strip_prefix(name) {
+        // 名字后紧跟 `:` 说明这里是**前缀**位置（`<tt:tt>` 里的第一个 `tt`），
+        // 不是本地名；交给下面的前缀分支从 `:` 之后再匹配一次。
+        if !rest.starts_with(':') {
+            return Some(from);
+        }
+    }
+    let mut idx = from;
+    let mut has_prefix = false;
+    for c in text[from..].chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+            idx += c.len_utf8();
+            has_prefix = true;
+            continue;
+        }
+        break;
+    }
+    if has_prefix && text[idx..].starts_with(':') {
+        let after = idx + 1;
+        if text[after..].starts_with(name) {
+            return Some(after);
+        }
+    }
+    None
+}
+
+/// 寻找闭合标签 `</name>`：允许名字后带空白（`</p >` 是合法 XML），也允许带命名
+/// 空间前缀（`</tt:p>`）。返回 `(闭合标签起始下标, 标签结束之后的下标)`。
+///
+/// 必须容忍这两种写法：硬编码 `</p>` 时，`</p >` 会让查找失败，调用方据此判定
+/// 「文档截断」而**丢掉该块及其后的所有块**。
+fn find_close_tag(text: &str, from: usize, name: &str) -> Option<(usize, usize)> {
+    let mut cursor = from;
+    while let Some(rel) = text[cursor..].find("</") {
+        let at = cursor + rel;
+        if let Some(name_at) = local_name_start(text, at + 2, name) {
+            let mut idx = name_at + name.len();
+            while let Some(c) = text[idx..].chars().next() {
+                if c == '>' {
+                    return Some((at, idx + 1));
+                }
+                if !c.is_whitespace() {
+                    break;
+                }
+                idx += c.len_utf8();
+            }
+        }
+        cursor = at + 2;
     }
     None
 }
@@ -908,7 +1065,8 @@ fn find_element_start(text: &str, from: usize, name: &str) -> Option<usize> {
 /// 引号内的 `>` 不能当作标签结束：属性值里出现 `>`（如某些 style 表达式）时，
 /// 若不做引号状态判断，标签会被从中间截断，后面所有块的解析跟着错位。
 fn scan_start_tag(text: &str, tag_at: usize, name: &str) -> Option<(String, usize, bool)> {
-    let content_start = tag_at + 1 + name.len();
+    // 命名空间前缀由 [`local_name_start`] 跳过：`<tt:p ...>` 的属性串同样从元素名之后算起。
+    let content_start = local_name_start(text, tag_at + 1, name)? + name.len();
     let mut quote: Option<char> = None;
     for (offset, ch) in text[content_start..].char_indices() {
         match ch {
@@ -1022,7 +1180,13 @@ fn parse_ttml_time(raw: &str) -> Option<f64> {
             continue;
         }
         if let Ok(value) = number.parse::<f64>() {
-            return Some(value * scale);
+            let scaled = value * scale;
+            // 位数极多的数字会溢出成 inf：放它进去会让整条时间轴变成 inf，
+            // 时长/导出全部失效。此时按坏块处理，不返回这个值。
+            if scaled.is_finite() {
+                return Some(scaled);
+            }
+            continue;
         }
     }
     None
@@ -1041,6 +1205,11 @@ fn build_ttml_segment(attrs: &str, body: &str, doc_lang: Option<&str>) -> Option
             begin + dur
         }
     };
+    // 非有限时间（位数极多的偏移量算出 inf，或 begin + dur 溢出）会让整条时间轴崩掉，
+    // 按坏块丢弃。
+    if !begin.is_finite() || !end.is_finite() {
+        return None;
+    }
     // `end < begin` 的倒挂块必须丢：留着会让播放器算出负时长。
     if end < begin {
         return None;
@@ -1100,13 +1269,13 @@ fn ttml_inline_pieces(body: &str) -> (Vec<(Option<String>, String)>, String) {
         if self_closing {
             continue;
         }
-        let Some(body_len) = body[cursor..].find("</span>") else {
+        let Some((inner_at, after_close)) = find_close_tag(body, cursor, "span") else {
             bare.push_str(&ttml_inline_text(&body[cursor..]));
             cursor = body.len();
             break;
         };
-        let inner = &body[cursor..cursor + body_len];
-        cursor += body_len + "</span>".len();
+        let inner = &body[cursor..inner_at];
+        cursor = after_close;
         let lang = ttml_attr(&attrs, "xml:lang")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -1188,6 +1357,22 @@ fn ttml_inline_text(raw: &str) -> String {
     while let Some(lt) = rest.find('<') {
         out.push_str(&decode_xml_entities(&rest[..lt]));
         let after = &rest[lt + 1..];
+        // `<![CDATA[...]]>`：内容按**字面文本**取用，不解实体、不剥标签。部分 TTML
+        // 导出器用它包正文；不认的话整段（含其中的 `<`）会被当标签吃掉，字幕直接空掉。
+        if let Some(cdata) = after.strip_prefix("![CDATA[") {
+            match cdata.find("]]>") {
+                Some(end) => {
+                    out.push_str(&cdata[..end]);
+                    rest = &cdata[end + "]]>".len()..];
+                    continue;
+                }
+                None => {
+                    // 未闭合的 CDATA：把剩余内容当文本，避免整句凭空消失。
+                    out.push_str(cdata);
+                    return out;
+                }
+            }
+        }
         let Some(gt) = after.find('>') else {
             // 没有闭合的 `<`：文档已被截断，余下内容不再当正文，避免半截标记写进字幕。
             return out;
@@ -2531,6 +2716,270 @@ Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,第一句,还有,两个逗号
             assert!((got.start - want.start).abs() < 1e-9, "起点应保真");
             assert!((got.end - want.end).abs() < 1e-9, "终点应保真");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 导入要还原导出侧写出的实体：`&amp;`/`&lt;`/`&gt;` 逐个还原，且只还原**一遍**
+    /// （`&amp;lt;` → `&lt;`），不认识的实体（`&nbsp;`）原样保留。
+    #[test]
+    fn markup_entities_are_decoded_once_on_import() {
+        let segs = parse_srt("1\n00:00:01,000 --> 00:00:02,000\nA &amp; B &lt;x&gt; C\n").unwrap();
+        assert_eq!(segs[0].text, "A & B <x> C");
+
+        let segs = parse_srt("1\n00:00:01,000 --> 00:00:02,000\n&amp;lt;\n").unwrap();
+        assert_eq!(segs[0].text, "&lt;", "只还原一遍，不得二次解码成 `<`");
+
+        let segs = parse_srt("1\n00:00:01,000 --> 00:00:02,000\n&quot;&nbsp;x\n").unwrap();
+        assert_eq!(segs[0].text, "&quot;&nbsp;x", "不认识的实体原样保留");
+    }
+
+    /// SRT / VTT / SBV 的「写 → 读 → 写」必须逐字节相等：含 `&`/`<`/`>` 的正文
+    /// 每往返一次不该多叠一层实体，也不该少还原一层。
+    #[test]
+    fn markup_entities_round_trip_is_byte_stable() {
+        use crate::subtitle::writer::SubtitleWriter;
+
+        let dir = temp_dir("entity_rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let segs = vec![Segment::new(1, 1.0, 2.0, "a & b <i>x</i> > c &amp; d")];
+
+        let first = dir.join("first.srt");
+        let second = dir.join("second.srt");
+        SubtitleWriter::write_srt(&segs, &first).unwrap();
+        let back = parse_srt(&std::fs::read_to_string(&first).unwrap()).unwrap();
+        assert_eq!(back[0].text, segs[0].text, "SRT 实体应还原回原文");
+        SubtitleWriter::write_srt(&back, &second).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            std::fs::read_to_string(&second).unwrap(),
+            "SRT 写→读→写 必须逐字节相等"
+        );
+
+        let first = dir.join("first.vtt");
+        let second = dir.join("second.vtt");
+        SubtitleWriter::write_to_file(&segs, &first, "vtt").unwrap();
+        let back = parse_vtt(&std::fs::read_to_string(&first).unwrap()).unwrap();
+        assert_eq!(back[0].text, segs[0].text, "VTT 实体应还原回原文");
+        SubtitleWriter::write_to_file(&back, &second, "vtt").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            std::fs::read_to_string(&second).unwrap(),
+            "VTT 写→读→写 必须逐字节相等"
+        );
+
+        let first = dir.join("first.sbv");
+        let second = dir.join("second.sbv");
+        SubtitleWriter::write_to_file(&segs, &first, "sbv").unwrap();
+        let back = parse_sbv(&std::fs::read_to_string(&first).unwrap()).unwrap();
+        assert_eq!(back[0].text, segs[0].text, "SBV 实体应还原回原文");
+        SubtitleWriter::write_to_file(&back, &second, "sbv").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            std::fs::read_to_string(&second).unwrap(),
+            "SBV 写→读→写 必须逐字节相等"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ASS 往返：导出侧把字面 `{`/`}` 写成 `\{`/`\}`，导入必须原样读回——
+    /// 曾经 `\{` 里的 `{` 会被当成覆盖码起始，把两花括号之间的正文连同前缀一起吞掉。
+    #[test]
+    fn ass_export_import_round_trip_keeps_literal_braces() {
+        use crate::subtitle::writer::SubtitleWriter;
+        use crate::subtitle::ExportMode;
+        use crate::utils::SubtitleStyleConfig;
+
+        let dir = temp_dir("ass_braces_rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.ass");
+        let seg = Segment::new(1, 1.0, 2.0, "原文 {A} 结束");
+        SubtitleWriter::write_ass_with_style(
+            std::slice::from_ref(&seg),
+            &path,
+            ExportMode::RawOnly,
+            &SubtitleStyleConfig::default(),
+        )
+        .unwrap();
+
+        let back = parse_ass(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            back[0].text, "原文 {A} 结束",
+            "字面花括号必须原样读回，不能被覆盖码逻辑吞掉"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LRC 往返：导出只写起点、导入按下一行起点补终点；正文首尾空白两侧同口径 trim，
+    /// 「写 → 读 → 写」必须逐字节相等。
+    #[test]
+    fn lrc_export_import_export_is_byte_stable() {
+        use crate::subtitle::writer::SubtitleWriter;
+
+        let dir = temp_dir("lrc_rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let segs = vec![
+            Segment::new(1, 7.0, 9.0, "第一句"),
+            Segment::new(2, 65.25, 66.0, "第二句"),
+        ];
+        let first = dir.join("first.lrc");
+        let second = dir.join("second.lrc");
+        SubtitleWriter::write_to_file(&segs, &first, "lrc").unwrap();
+        let back = parse_lrc(&std::fs::read_to_string(&first).unwrap()).unwrap();
+        assert_eq!(back.len(), 2, "往返后应仍是两句");
+        assert_eq!(back[0].text, "第一句");
+        assert!((back[1].start - 65.25).abs() < 1e-9, "起点应保真");
+        SubtitleWriter::write_to_file(&back, &second, "lrc").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            std::fs::read_to_string(&second).unwrap(),
+            "LRC 写→读→写 必须逐字节相等"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// VTT 的 cue 标识行可以叫 `NOTE1` / `STYLE2`：元数据关键字必须是独立词，
+    /// 按前缀匹配会把这类 cue 整条当注释丢掉；真正的 NOTE/STYLE/REGION 仍要跳过。
+    #[test]
+    fn vtt_note_like_cue_ids_are_not_swallowed() {
+        let content = "\
+WEBVTT
+
+NOTE1
+00:00:01.000 --> 00:00:02.000
+字幕一
+
+STYLE2
+00:00:03.000 --> 00:00:04.000
+字幕二
+";
+        let segs = parse_vtt(content).unwrap();
+        assert_eq!(
+            segs.len(),
+            2,
+            "`NOTE1`/`STYLE2` 是 cue 标识行，不是元数据块"
+        );
+        assert_eq!(segs[0].text, "字幕一");
+        assert_eq!(segs[1].text, "字幕二");
+
+        let metadata = "\
+WEBVTT
+
+NOTE 注释
+注释第二行
+
+STYLE
+::cue { color: white }
+
+REGION
+id:r1
+
+00:00:01.000 --> 00:00:02.000
+正文
+";
+        let segs = parse_vtt(metadata).unwrap();
+        assert_eq!(segs.len(), 1, "真正的元数据块仍要整块跳过");
+        assert_eq!(segs[0].text, "正文");
+    }
+
+    /// SBV 正文形如 `2023,2024` 时不能被当成时间轴：时间轴行两侧都必须含 `:`。
+    #[test]
+    fn sbv_text_that_looks_like_comma_times_is_kept_as_text() {
+        let content = "\
+0:00:01.000,0:00:02.000
+2023,2024 年是关键
+
+0:00:03.000,0:00:04.000
+下一句
+";
+        let segs = parse_sbv(content).unwrap();
+        assert_eq!(segs.len(), 2, "形如 `2023,2024` 的正文不能被当时间轴");
+        assert_eq!(segs[0].text, "2023,2024 年是关键");
+        assert!((segs[0].start - 1.0).abs() < 1e-9);
+        assert!((segs[0].end - 2.0).abs() < 1e-9);
+        assert_eq!(segs[1].text, "下一句");
+    }
+
+    /// TTML 注释里被注掉的 `<p>` 不该被解析成字幕（否则凭空多出几句）。
+    #[test]
+    fn ttml_ignores_commented_out_cues() {
+        let content = "\
+<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><div>
+<!-- <p begin=\"0s\" end=\"1s\">注掉的句子</p> -->
+<p begin=\"1s\" end=\"2s\">真正的句子</p>
+</div></body></tt>";
+        let segs = parse_ttml(content).unwrap();
+        assert_eq!(segs.len(), 1, "注释里的 <p> 不该变成字幕");
+        assert_eq!(segs[0].text, "真正的句子");
+    }
+
+    /// TTML：CDATA 正文按字面取用，带命名空间前缀的 `<tt:p>` 也能读；
+    /// `</p >`（名字后带空白）是合法 XML，不该让后续块全部丢失。
+    #[test]
+    fn ttml_reads_cdata_prefixed_elements_and_spaced_close_tag() {
+        let cdata = "\
+<tt:tt xmlns:tt=\"http://www.w3.org/ns/ttml\"><tt:body><tt:div>
+<tt:p begin=\"0s\" end=\"1s\"><![CDATA[a < b & c]]></tt:p>
+</tt:div></tt:body></tt:tt>";
+        let segs = parse_ttml(cdata).unwrap();
+        assert_eq!(segs.len(), 1, "带前缀的 <tt:p> 必须能读");
+        assert_eq!(segs[0].text, "a < b & c", "CDATA 内容按字面保留");
+        assert!((segs[0].end - 1.0).abs() < 1e-9);
+
+        let spaced = "\
+<tt><body><div>
+<p begin=\"0s\" end=\"1s\">第一句</p >
+<p begin=\"2s\" end=\"3s\">第二句</p>
+</div></body></tt>";
+        let segs = parse_ttml(spaced).unwrap();
+        assert_eq!(segs.len(), 2, "`</p >` 不该让后续块全部丢失");
+        assert_eq!(segs[0].text, "第一句");
+        assert_eq!(segs[1].text, "第二句");
+    }
+
+    /// TTML 偏移量位数极多时会算出 inf：这种坏块必须丢弃，不能让 inf 时间进下游。
+    #[test]
+    fn ttml_rejects_non_finite_offsets() {
+        let huge = "9".repeat(400);
+        let content =
+            format!("<tt><body><div><p begin=\"0s\" end=\"{huge}s\">哈</p></div></body></tt>");
+        assert!(
+            parse_ttml(&content).is_err(),
+            "溢出成 inf 的偏移量必须按坏块丢弃"
+        );
+    }
+
+    /// JSON 里的负时间戳会让下游算出负时长：夹到 0，而不是原样保留。
+    #[test]
+    fn json_negative_start_is_clamped() {
+        let doc = r#"[{"start":-5,"end":1,"text":"负时间"}]"#;
+        let segs = parse_json(doc).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].start, 0.0, "负起点必须夹到 0");
+        assert_eq!(segs[0].text, "负时间");
+    }
+
+    /// 编码兜底：既不是干净 UTF-8 也不是干净 GBK 的文件用 lossy 兜底，
+    /// 个别坏字节不该让整份字幕读失败，其余内容要保住。
+    #[test]
+    fn read_subtitle_file_lossy_fallback_keeps_good_bytes() {
+        let dir = temp_dir("lossy");
+        let path = dir.join("lossy.srt");
+        let mut bytes = b"1\n00:00:01,000 --> 00:00:02,000\n".to_vec();
+        bytes.extend_from_slice("你好".as_bytes());
+        bytes.push(0xFF);
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).unwrap();
+
+        let segs = read_subtitle_file(&path).expect("坏字节不该让整份文件读失败");
+        assert_eq!(segs.len(), 1);
+        assert!(
+            segs[0].text.starts_with("你好"),
+            "坏字节前后的好内容必须保住: {:?}",
+            segs[0].text
+        );
+        assert!(segs[0].text.contains('\u{FFFD}'), "坏字节应变成替换字符");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -203,7 +203,9 @@ pub fn plan_min_gaps(segments: &[Segment], min_gap: f64) -> GapPlan {
         } else {
             // 后一句本来就短：改为收前一句的 end，让它保住终点。
             let shrunk = out[next].1 - MIN_EDIT_DUR;
-            if shrunk > out[prev].0 && shrunk < out[prev].1 {
+            // 收短也有下界：前一句被收到 `MIN_EDIT_DUR` 以下就不再收——否则一条
+            // 本该几秒的句子会被压成零点几秒，下次载入直接落进鬼影判据被删掉。
+            if shrunk - out[prev].0 >= MIN_EDIT_DUR - OVERLAP_TOL && shrunk < out[prev].1 {
                 out[prev].1 = shrunk;
                 shortened += 1;
             }
@@ -290,7 +292,9 @@ fn shift_all(base: &[(f64, f64)], delta: f64) -> Vec<(f64, f64)> {
         return base.to_vec();
     }
     base.iter()
-        .map(|&(start, end)| clamp_negative(start + delta, end + delta))
+        .map(|&(start, end)| {
+            finite_or_original(clamp_negative(start + delta, end + delta), (start, end))
+        })
         .collect()
 }
 
@@ -302,12 +306,22 @@ fn shift_after(base: &[(f64, f64)], from_secs: f64, delta: f64) -> Vec<(f64, f64
     base.iter()
         .map(|&(start, end)| {
             if start >= from_secs {
-                clamp_negative(start + delta, end + delta)
+                finite_or_original(clamp_negative(start + delta, end + delta), (start, end))
             } else {
                 (start, end)
             }
         })
         .collect()
+}
+
+/// 变换结果里若出现非有限值（输入自带 inf/NaN，或加减把有限值推到了 inf），
+/// 回退到原区间：非有限时间会让片段从时间轴上彻底消失，还会顺着 DB 写进去捞不回来。
+fn finite_or_original(new: (f64, f64), original: (f64, f64)) -> (f64, f64) {
+    if new.0.is_finite() && new.1.is_finite() {
+        new
+    } else {
+        original
+    }
 }
 
 /// 把 `(start, end)` 的起点夹到 0：起点被抬多少，终点就跟着抬多少（时长不变）。
@@ -332,8 +346,13 @@ fn scale_times(base: &[(f64, f64)], source_span: f64, target_span: f64) -> Vec<(
         return base.to_vec();
     }
     let ratio = target_span / source_span;
+    // 跨度本身都有限且为正，比值仍可能溢出成 inf（如 1e-300 → 1e300）：一旦如此，
+    // 输出会全是 inf/NaN，片段从时间轴消失——比照守卫原样返回。
+    if !ratio.is_finite() {
+        return base.to_vec();
+    }
     base.iter()
-        .map(|&(start, end)| (start * ratio, end * ratio))
+        .map(|&(start, end)| finite_or_original((start * ratio, end * ratio), (start, end)))
         .collect()
 }
 
@@ -352,6 +371,10 @@ fn fit_to_duration(base: &[(f64, f64)], target_secs: f64) -> Vec<(f64, f64)> {
         return base.to_vec();
     }
     let ratio = target_secs / total;
+    // 分母是极小正数（次正规）时比值会溢出成 inf，累积求和随即把整条轨写成 inf。
+    if !ratio.is_finite() {
+        return base.to_vec();
+    }
     let mut out = Vec::with_capacity(base.len());
     // 累积求和而非「各自乘完再各自定位」：起点就是上一条的终点，逐条累加不会
     // 留下空隙或重叠，末条也只需一次钉死就能与目标严丝合缝。
@@ -361,10 +384,17 @@ fn fit_to_duration(base: &[(f64, f64)], target_secs: f64) -> Vec<(f64, f64)> {
         out.push((cursor, cursor + dur));
         cursor += dur;
     }
+    if out
+        .iter()
+        .any(|&(start, end)| !start.is_finite() || !end.is_finite())
+    {
+        return base.to_vec();
+    }
     if let Some(last) = out.last_mut() {
         // 浮点累积仍有 1 ulp 级残差；末尾必须严格等于目标值，否则导出后末句与
-        // 画面差几毫秒，逐帧对不上。
-        last.1 = target_secs;
+        // 画面差几毫秒，逐帧对不上。但钉死不能把末条钉成倒挂/零长：累积残差恰好
+        // 让 `last.0` 越过目标值时，仍要保住 `MIN_EDIT_DUR` 的最短时长。
+        last.1 = target_secs.max(last.0 + MIN_EDIT_DUR);
     }
     out
 }
@@ -398,9 +428,11 @@ fn has_overlaps(times: &[(f64, f64)]) -> bool {
 
 /// 是否存在时长不足 [`MIN_EDIT_DUR`] 的片段（含零长与倒挂）。
 fn has_degenerate(times: &[(f64, f64)]) -> bool {
-    times
-        .iter()
-        .any(|&(start, end)| end - start < MIN_EDIT_DUR - OVERLAP_TOL)
+    times.iter().any(|&(start, end)| {
+        // 非有限时间本身就是坏值（NaN 的比较恒为 false，不显式判就会漏报），
+        // 与「时长不足」一起算作退化，界面才会如实警告。
+        !start.is_finite() || !end.is_finite() || end - start < MIN_EDIT_DUR - OVERLAP_TOL
+    })
 }
 
 #[cfg(test)]
@@ -840,5 +872,90 @@ mod tests {
                 "片段被压过短: {start}..{end}"
             );
         }
+    }
+
+    /// 收短前一句也有下界：不能为凑空隙把一条几秒的句子压成零点几秒
+    /// （那样下次载入会被鬼影判据删掉）。无解时如实上报 `unresolved`。
+    #[test]
+    fn min_gaps_does_not_crush_a_long_previous_cue() {
+        let segs = [seg(1, 5.0, 12.0), seg(2, 5.0, 5.3)];
+        let plan = plan_min_gaps(&segs, 0.04);
+        assert_eq!(plan.times[0], (5.0, 12.0), "7 秒的句子不能被压成 0.05 秒");
+        assert_eq!(plan.shortened, 0, "没有哪一条该被收短");
+        assert!(plan.unresolved, "无解时必须如实上报");
+    }
+
+    /// 缩放比值溢出（有限输入、有限跨度）时不能产出 inf/NaN，应原样返回。
+    #[test]
+    fn scale_ratio_overflow_is_inert() {
+        let segs = [seg(1, 0.0, 1.0), seg(2, 5.0, 7.0)];
+        let plan = plan_retime(
+            &segs,
+            TimeShift::Scale {
+                source_span: 1e-300,
+                target_span: 1e300,
+            },
+        );
+        assert_eq!(plan.times, vec![(0.0, 1.0), (5.0, 7.0)], "溢出时应原样返回");
+        assert_eq!(plan.changed, 0);
+        assert!(!plan.degenerate, "回退后的时间必须仍是合法的");
+    }
+
+    /// 铺满的分母是次正规极小值时比值会溢出成 inf；此时必须原样返回，
+    /// 绝不让整条轨变成 inf。
+    #[test]
+    fn fit_with_subnormal_total_is_inert() {
+        let base = [seg(1, 0.0, 5e-324)];
+        let plan = plan_retime(&base, TimeShift::FitToDuration { target_secs: 1e300 });
+        assert_eq!(plan.times, vec![(0.0, 5e-324)], "溢出时应原样返回");
+        assert!(plan
+            .times
+            .iter()
+            .all(|&(s, e)| s.is_finite() && e.is_finite()));
+    }
+
+    /// 铺满后末条终点等于目标值，且永远不短于 `MIN_EDIT_DUR`（不能倒挂）。
+    #[test]
+    fn fit_to_duration_never_ends_before_it_starts() {
+        let segs = [seg(1, 0.0, 1.0), seg(2, 1.0, 2.0)];
+        let plan = plan_retime(&segs, TimeShift::FitToDuration { target_secs: 10.0 });
+        let last = *plan.times.last().unwrap();
+        assert!((last.1 - 10.0).abs() < 1e-9, "末条终点钉在目标值");
+        assert!(last.1 - last.0 >= MIN_EDIT_DUR, "末条不得倒挂: {last:?}");
+    }
+
+    /// 有限位移撞上 f64 极值会溢出成 inf：该条必须回退原区间，而不是写进 inf。
+    #[test]
+    fn shift_overflow_falls_back_to_original_input() {
+        let big = [seg(1, 1.0, f64::MAX)];
+        let plan = plan_retime(&big, TimeShift::ShiftAll { delta: f64::MAX });
+        assert_eq!(plan.times[0], (1.0, f64::MAX), "溢出成 inf 时回退原区间");
+
+        let tiny = [seg(1, -1e308, -1e308 + 1.0)];
+        let plan = plan_retime(
+            &tiny,
+            TimeShift::ShiftAfter {
+                from_secs: -1e308,
+                delta: -1e308,
+            },
+        );
+        assert!(
+            plan.times[0].0.is_finite() && plan.times[0].1.is_finite(),
+            "下溢成 -inf/NaN 时必须回退: {:?}",
+            plan.times[0]
+        );
+    }
+
+    /// 输入自带 NaN / inf 时，`degenerate` 必须如实置位（NaN 比较恒 false，
+    /// 不显式判定就会静默漏报，界面看不到任何警告）。
+    #[test]
+    fn non_finite_input_is_reported_degenerate() {
+        let nan_start = [seg(1, f64::NAN, 1.0)];
+        let plan = plan_retime(&nan_start, TimeShift::ShiftAll { delta: 0.5 });
+        assert!(plan.degenerate, "NaN 起点必须被标记为退化");
+
+        let inf_end = [seg(1, 0.0, f64::INFINITY)];
+        let plan = plan_retime(&inf_end, TimeShift::ShiftAll { delta: 1.0 });
+        assert!(plan.degenerate, "inf 终点必须被标记为退化");
     }
 }
