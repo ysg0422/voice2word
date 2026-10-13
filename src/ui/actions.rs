@@ -469,7 +469,7 @@ impl MainWindow {
                                 continue;
                             }
                             Err(e) => {
-                                failed.push(format!("{name}（读取失败: {e}）"));
+                                failed.push(format!("{name}（读取失败：{e}）"));
                                 continue;
                             }
                         };
@@ -501,7 +501,7 @@ impl MainWindow {
                             &style,
                         ) {
                             Ok(()) => ok += 1,
-                            Err(e) => failed.push(format!("{name}（写出失败: {e}）")),
+                            Err(e) => failed.push(format!("{name}（写出失败：{e}）")),
                         }
                     }
                     (ok, failed)
@@ -2079,7 +2079,7 @@ impl MainWindow {
                     )
                     .await
                 {
-                    let _ = tx.send(PipelineEvent::Error(format!("转写失败: {err}")));
+                    let _ = tx.send(PipelineEvent::Error(format!("转写失败：{err}")));
                 }
             });
         });
@@ -2204,11 +2204,17 @@ impl MainWindow {
                                     // 即将被换掉的旧数组；脏标记也在这里就清掉，否则回写期间
                                     // 用户任何一次落库都会把**新**工程的 segments 写进**旧**
                                     // 工程的 id（静默数据损坏）。
+                                    // 序号与闸门都在派发这一刻取：收尾写跑在后台线程，
+                                    // 不能自己领号，带上这个待发号去过闸即可（水位判据
+                                    // 见 `AppState::next_write_seq`）。
+                                    let flush_gate = this.state.segments_write_gate().clone();
+                                    let flush_seq = this.state.next_write_seq();
                                     let flush_payload = if this.state.segments_dirty {
                                         this.state.segments_dirty = false;
                                         Some(DirtySegmentFlush {
                                             task_id: old_task_id,
                                             segments: this.state.segments.clone(),
+                                            seq: flush_seq,
                                         })
                                     } else {
                                         None
@@ -2272,6 +2278,7 @@ impl MainWindow {
                                             .spawn(async move {
                                                 finish_db_work(
                                                     &db,
+                                                    &flush_gate,
                                                     insert_payload,
                                                     Some(&metrics_for_db),
                                                     flush_payload,
@@ -2440,7 +2447,7 @@ impl MainWindow {
                         Err(e) => {
                             // 导出失败也要走跨页可见的提示：`ProcessStatus::Failed` 只有
                             // 转写页的底部状态栏会渲染，而导出是在剪辑台做的。
-                            this.state.status = ProcessStatus::Failed(format!("导出失败: {}", e));
+                            this.state.status = ProcessStatus::Failed(format!("导出失败：{}", e));
                             this.notice = None;
                         }
                     }
@@ -2503,7 +2510,7 @@ impl MainWindow {
                     Err(e) => {
                         tracing::error!("剪映草稿注入失败: {:?}", e);
                         this.state.status =
-                            ProcessStatus::Failed(format!("剪映草稿注入失败: {}", e));
+                            ProcessStatus::Failed(format!("剪映草稿注入失败：{}", e));
                     }
                 }
                 cx.notify();
@@ -2564,7 +2571,7 @@ impl MainWindow {
                         }
                         Err(e) => {
                             this.state.status =
-                                ProcessStatus::Failed(format!("剪映草稿导出失败: {}", e));
+                                ProcessStatus::Failed(format!("剪映草稿导出失败：{}", e));
                         }
                     }
                     cx.notify();
@@ -2664,7 +2671,7 @@ impl MainWindow {
             preview_mode,
             &preview_style,
         ) {
-            self.state.status = ProcessStatus::Failed(format!("生成预览字幕失败: {}", error));
+            self.state.status = ProcessStatus::Failed(format!("生成预览字幕失败：{}", error));
             cx.notify();
             return;
         }
@@ -2706,7 +2713,7 @@ impl MainWindow {
                 info!("已启动带字幕视频预览");
             }
             Err(error) => {
-                self.state.status = ProcessStatus::Failed(format!("启动视频预览失败: {}", error));
+                self.state.status = ProcessStatus::Failed(format!("启动视频预览失败：{}", error));
                 cx.notify();
             }
         }
@@ -3197,7 +3204,7 @@ impl MainWindow {
                     }
                     Err(e) => {
                         tracing::error!("字幕烧录失败: {:?}", e);
-                        this.state.status = ProcessStatus::Failed(format!("字幕烧录失败: {}", e));
+                        this.state.status = ProcessStatus::Failed(format!("字幕烧录失败：{}", e));
                         this.notice = None;
                     }
                 }
@@ -3298,7 +3305,7 @@ impl MainWindow {
         self.state.translate_status_msg = match mode {
             crate::engines::TranslateMode::OnlineApi => {
                 format!(
-                    "正在初始化在线翻译引擎 ({})...",
+                    "正在初始化在线翻译引擎（{}）...",
                     self.state.config.translate.api_model
                 )
             }
@@ -3445,7 +3452,7 @@ impl MainWindow {
                         // 会返回带真实原因的 Err（见 engines 的 fail-fast），这里把它
                         // 失败统一走 `note_translate_failure`：它在没有转写在跑时才占用
                         // 全局 `ProcessStatus::Failed` 横幅，避免翻译失败把转写进度态冲掉。
-                        tracing::warn!("字幕多语言翻译过程报错: {}", e);
+                        tracing::warn!("字幕多语言翻译过程报错：{}", e);
                         let msg = format!("翻译失败：{e}");
                         // 统一收口（见 AppState::note_translate_failure）：转写进行中
                         // 时只写翻译面板，绝不覆盖转写进度态。
@@ -3919,7 +3926,7 @@ impl MainWindow {
                 );
             }
             Err(e) => {
-                self.glossary_status = Some(format!("无法创建术语表文件: {e}"));
+                self.glossary_status = Some(format!("无法创建术语表文件：{e}"));
             }
         }
         cx.notify();
@@ -3944,7 +3951,7 @@ impl MainWindow {
             }
             Err(e) => {
                 self.glossary_status = Some(format!(
-                    "读取术语表失败: {e}（请先点「编辑术语表」创建文件）"
+                    "读取术语表失败：{e}（请先点「编辑术语表」创建文件）"
                 ));
             }
         }
@@ -3990,8 +3997,8 @@ impl MainWindow {
             let _ = this.update(cx, |this, cx| {
                 this.is_probing_translate = false;
                 this.translate_probe_msg = Some(match result {
-                    Ok(reply) => (true, format!("连接成功，模型回显: {}", reply.trim())),
-                    Err(e) => (false, format!("连接失败: {e}")),
+                    Ok(reply) => (true, format!("连接成功，模型回显：{}", reply.trim())),
+                    Err(e) => (false, format!("连接失败：{e}")),
                 });
                 cx.notify();
             });
@@ -4014,6 +4021,13 @@ impl MainWindow {
     /// Windows 下 BELOW_NORMAL），UI 线程只做一次 map 赋值 + 通知，结果与同步
     /// 版本逐个字段一致。
     pub(crate) fn refresh_model_presence_offloaded(&mut self, cx: &mut Context<Self>) {
+        // 每次请求领一个递增「代数」。连点删除 / 恢复 / 下载完成会并发跑多条全文件哈希
+        // （几十秒级），先起的那条后完成时若直接回写，界面徽标会跳回它那份旧配置的快照
+        // ——用户在扫描期间改的设置像被撤销了一样。用代数收口：只接受最新一代。
+        let generation = self
+            .model_presence_scan_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         let cfg = self.state.config.clone();
         let result_rx = crate::utils::background_thread::spawn_long_task(
             "v2w-model-presence-scan",
@@ -4022,10 +4036,13 @@ impl MainWindow {
         cx.spawn(async move |this, cx| {
             let scanned = result_rx.await;
             let _ = this.update(cx, |this, cx| {
+                // 判定与回写分离：纯函数先判「这条还算不算数」，回写只做赋值。
                 match scanned {
                     Ok((present, custom_build)) => {
-                        this.state.model_present = present;
-                        this.state.model_custom_build = custom_build;
+                        if presence_scan_still_current(generation, &this.model_presence_scan_gen) {
+                            this.state.model_present = present;
+                            this.state.model_custom_build = custom_build;
+                        }
                     }
                     // 线程起不来 / panic：退回同步扫描，结果语义不变，只是这一次
                     // 会吃 UI 线程——宁慢勿错（扫描必须发生，否则徽标停在旧态）。
@@ -4047,7 +4064,7 @@ impl MainWindow {
             return;
         }
         let Some(item) = crate::utils::ITEMS.iter().find(|i| i.id == item_id) else {
-            self.state.download_status_msg = format!("未知的下载项: {item_id}");
+            self.state.download_status_msg = format!("未知的下载项：{item_id}");
             cx.notify();
             return;
         };
@@ -4124,7 +4141,7 @@ impl MainWindow {
                         this.state.download_status_msg = if msg.contains("已取消") {
                             format!("{} 下载已取消", item.label)
                         } else {
-                            format!("{} 下载失败: {msg}", item.label)
+                            format!("{} 下载失败：{msg}", item.label)
                         };
                     }
                 }
@@ -4348,6 +4365,15 @@ struct DocumentIdentity {
     selected_file: Option<PathBuf>,
 }
 
+/// 这条后台扫描的结论还能不能回写界面（**纯函数**，便于单测钉死判定）。
+///
+/// 只看代数：扫的是派发那一刻的配置，而「已发放的最大代数」只增不减，所以
+/// `mine == current` 才说明这之后没有人再请求过扫描。旧的代数直接丢弃——
+/// 它的配置快照已经被更新的请求取代，写回去会让徽标回跳（界面像被撤销了设置）。
+fn presence_scan_still_current(mine: u64, current: &std::sync::atomic::AtomicU64) -> bool {
+    current.load(std::sync::atomic::Ordering::SeqCst) == mine
+}
+
 /// 延后回写落地前判一次：这份结果还属不属于当前文档（**纯函数**）。
 ///
 /// 只比 `active_task_id` 与 `selected_file`：
@@ -4380,6 +4406,12 @@ struct DirtySegmentFlush {
     task_id: Option<i64>,
     /// 当时内存里的整份字幕。
     segments: Vec<Segment>,
+    /// 派发那一刻的写序号（`AppState::next_write_seq`）。
+    ///
+    /// 收尾写在**后台线程**上跑，不能自己领号（`next_seq` 的单调性靠「领号只在渲染
+    /// 线程」这个前提），于是带上派发时的待发号去过闸：同工程已有更新的写落库时，
+    /// 这份旧字幕会被直接跳过，而不是把新内容盖掉。
+    seq: u64,
 }
 
 /// 收尾后台任务的产出。
@@ -4403,6 +4435,7 @@ struct DeferredFinishOutcome {
 /// 全是阻塞 IO，所以跑在后台线程上，返回值交给回写点落状态。
 fn finish_db_work(
     db: &crate::storage::Database,
+    gate: &crate::app::state::SegmentWriteGate,
     insert: Option<HistoryInsert>,
     metrics: Option<&crate::core::PipelinePerformanceMetrics>,
     flush: Option<DirtySegmentFlush>,
@@ -4434,12 +4467,20 @@ fn finish_db_work(
     } else {
         None
     };
-    // 与 `flush_segments_if_dirty` 等价。没有主键（尚未落库）时 `sync_segments_to_db`
-    // 直接返回 Ok，并且会清空 `db_write_error`——所以这里同样算「成功」。
+    // 与 `flush_segments_if_dirty` 等价，但**必须过写入闸**：这里是后台线程，
+    // 与去抖派发的后台写 / 同步落库可能撞同一个 task。直写 `db` 会绕过按工程水位，
+    // 旧字幕于是能把更新的内容盖掉（这次要堵的正是它）。
+    //
+    // 没有主键（尚未落库）时 `sync_segments_to_db` 直接返回 Ok，并且会清空
+    // `db_write_error`——所以这里同样算「成功」。
     let flush = match flush {
         Some(payload) => match payload.task_id {
-            Some(id) => match db.update_task_segments(id, &payload.segments) {
-                Ok(()) => SegmentFlushOutcome::Saved,
+            Some(id) => match gate.write_finished_task_segments(id, payload.seq, &payload.segments)
+            {
+                // 被水位跳过：库里已经有同一工程更新的内容。算成功——回写提示条时
+                // 不该把一份已经写完的最新内容说成「保存失败」。
+                Ok(false) => SegmentFlushOutcome::Saved,
+                Ok(true) => SegmentFlushOutcome::Saved,
                 Err(err) => {
                     tracing::warn!(error = %err, "字幕写库失败，改动尚未持久化");
                     SegmentFlushOutcome::Failed(err.to_string())
@@ -4463,8 +4504,9 @@ mod tests {
     use super::{
         clear_translations_with_undo, copied_translation_positions, editor_export_format_string,
         export_spec_for, finish_db_write_error, flush_outcome_to_apply, frame_failure_notice,
-        has_copied_translations, is_copied_translation, replace_rule_report_message,
-        rule_set_name_for, still_same_document, DocumentIdentity, SegmentFlushOutcome,
+        has_copied_translations, is_copied_translation, presence_scan_still_current,
+        replace_rule_report_message, rule_set_name_for, still_same_document, DocumentIdentity,
+        SegmentFlushOutcome,
     };
     use crate::subtitle::Segment;
     use crate::ui::EditorExportFormat;
@@ -4570,6 +4612,31 @@ mod tests {
             super::import_notice("a", 3, false, false),
             "已导入「a」3 句字幕"
         );
+    }
+
+    // ── 模型在位扫描的「代数」收口 ──────────────────────────────────────
+
+    /// 只有最新一代的扫描结论能回写界面：先起的那条后完成时，它的配置快照已经被取代，
+    /// 写回去会让徽标跳回旧态（界面像把用户的设置撤销了）。
+    #[test]
+    fn stale_model_presence_scan_result_is_discarded() {
+        use std::sync::atomic::AtomicU64;
+
+        let current = AtomicU64::new(1);
+        assert!(presence_scan_still_current(1, &current), "同一代必须放行");
+
+        // 又点了一次删除 / 恢复 / 下载完成：代数推进，先前那条的结论作废。
+        current.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !presence_scan_still_current(1, &current),
+            "旧代的结论必须被丢弃，否则徽标回跳"
+        );
+        assert!(presence_scan_still_current(2, &current), "最新一代必须放行");
+
+        // 连点多次仍然只认最后那一代（单调递增，不会回退）。
+        current.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(!presence_scan_still_current(2, &current));
+        assert!(presence_scan_still_current(3, &current));
     }
 
     // ── 转写收尾（写库后台化）：提示条折算与延后回写判定 ──────────────────

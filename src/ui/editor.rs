@@ -2204,7 +2204,7 @@ impl MainWindow {
                                                             div()
                                                                 .text_size(px(Theme::TEXT_SMALL))
                                                                 .text_color(Theme::text_muted())
-                                                                .child("起点:"),
+                                                                .child("起点："),
                                                         )
                                                         .child(Self::render_mini_btn(
                                                             "fine-tune-start-minus-500",
@@ -2244,7 +2244,7 @@ impl MainWindow {
                                                             div()
                                                                 .text_size(px(Theme::TEXT_SMALL))
                                                                 .text_color(Theme::text_muted())
-                                                                .child("终点:"),
+                                                                .child("终点："),
                                                         )
                                                         .child(Self::render_mini_btn(
                                                             "fine-tune-end-minus-500",
@@ -2286,7 +2286,7 @@ impl MainWindow {
                                                     div()
                                                         .text_size(px(Theme::TEXT_SMALL))
                                                         .text_color(Theme::text_secondary())
-                                                        .child("标点:"),
+                                                        .child("标点："),
                                                 )
                                                 .child(
                                                     div()
@@ -2452,7 +2452,7 @@ impl MainWindow {
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(Theme::text_muted())
                                             .child(if has_distinct_trans {
-                                                "字幕清单 (上下并列显示)"
+                                                "字幕清单（上下并列显示）"
                                             } else {
                                                 "字幕清单"
                                             }),
@@ -2468,7 +2468,7 @@ impl MainWindow {
                                             .child(if has_distinct_trans {
                                                 "双语显示"
                                             } else if has_any_trans {
-                                                "单语显示 (译文同原文)"
+                                                "单语显示（译文同原文）"
                                             } else {
                                                 "单语显示"
                                             }),

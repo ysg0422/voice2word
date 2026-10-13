@@ -78,9 +78,10 @@ where
 /// - `v2w-frame-prefetch`：**任务内部**有单飞（`FrameCache` 的 `prefetch_busy`），
 ///   拖动时每提交一帧仍会起一条线程，但后起的那条会立刻退出——代价是线程 churn
 ///   （拖动期间量级 = 提交频率），不是并发抽帧；
-/// - `v2w-model-presence-scan`：**目前没有去重**。下载完成 / 删除 / 恢复都会触发，
-///   连点几次就会同时跑几条全文件哈希线程（结果幂等、最后完成的那条生效，
-///   代价是重复读盘）。修法应在调用点加 busy 标志。
+/// - `v2w-model-presence-scan`：调用点用**代数**去重（每次请求领一个递增号，
+///   回写前比一次，不是最新一代就整条丢弃）。选代数而不是 busy 标志，是因为它
+///   顺带解决「扫描跑着的时候用户又改了配置」——busy 只能挡重复点击，
+///   挡不住跑期间配置变化导致的旧结果回写。
 pub(crate) fn spawn_detached_long_task<F>(thread_name: &str, job: F)
 where
     F: FnOnce() + Send + 'static,

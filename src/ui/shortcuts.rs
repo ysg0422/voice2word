@@ -173,20 +173,20 @@ pub const SHORTCUT_SPECS: [ShortcutSpec; SPEC_COUNT] = [
     ShortcutSpec {
         key: "space",
         hint_key: "Space",
-        hint: "播放/暂停(裸键)",
+        hint: "播放/暂停（裸键）",
     },
     // Delete 删除当前选中句，也是剪辑台里最顺手的一键操作。
     ShortcutSpec {
         key: "delete",
         hint_key: "Delete",
-        hint: "删除当前句(裸键)",
+        hint: "删除当前句（裸键）",
     },
     // Backspace 与 Delete 同源：没有独立 Delete 键的键盘上，退格才是唯一顺手的删除键。
     // 两条裸键绑定同一个动作（`DeleteActiveSegment`），焦点在输入框时都由 `.on_action` 放行。
     ShortcutSpec {
         key: "backspace",
         hint_key: "Backspace",
-        hint: "删除当前句(裸键)",
+        hint: "删除当前句（裸键）",
     },
 ];
 
@@ -244,9 +244,9 @@ pub const SHORTCUT_HINTS: [(&str, &str); 16] = [
     ("Ctrl+Shift+Z", "重做"),
     ("Ctrl+Y", "重做"),
     ("Ctrl+H", "查找替换"),
-    ("Space", "播放/暂停(裸键)"),
-    ("Delete", "删除当前句(裸键)"),
-    ("Backspace", "删除当前句(裸键)"),
+    ("Space", "播放/暂停（裸键）"),
+    ("Delete", "删除当前句（裸键）"),
+    ("Backspace", "删除当前句（裸键）"),
     ("F1", "快捷键速查"),
 ];
 

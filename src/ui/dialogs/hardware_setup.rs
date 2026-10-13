@@ -204,11 +204,35 @@ impl MainWindow {
                                     ),
                             ),
                     )
+                    // 底部一行：「稍后再说」与提示语左右分置。
+                    // 没有这个按钮时，首次启动的用户只有「选 GPU / 选 CPU」两个出口——
+                    // 想先看看界面再决定的人被逼着表态，Esc 也关不掉，只能二选一。
                     .child(
                         div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_muted())
-                            .child("后续可在「性能设置」界面随时重新调整硬件加速模式与参数。"),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(Theme::SPACE_4))
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_muted())
+                                    .child("后续可在「性能设置」界面随时重新调整硬件加速模式与参数。"),
+                            )
+                            .child(
+                                primitives::btn_clickable(
+                                    "稍后再说",
+                                    primitives::BtnSize::Md,
+                                    primitives::BtnVariant::Secondary,
+                                )
+                                .id("hardware-setup-btn-later")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    // 只关框：不动硬件档位、不跑检测、不改任何推理策略。
+                                    this.state.defer_hardware_setup();
+                                    cx.notify();
+                                })),
+                            ),
                     ),
             )
     }

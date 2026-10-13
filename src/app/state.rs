@@ -767,6 +767,12 @@ pub struct AppState {
     /// 后台写线程的共享账本 + 串行闸（见 `BackgroundWrites`）：去抖路径
     /// （`flush_segments_if_dirty_async`）派发的写在这里排队，写库本身不占渲染线程。
     segments_writes: Arc<BackgroundWrites>,
+    /// 给后台线程用的过闸入口（转写收尾回写上一个工程的脏字幕）。
+    ///
+    /// 单独存一份而不是让调用点现拼：它必须与派发 / 同步写共用同一个
+    /// `BackgroundWrites`（同一把写入闸、同一份按工程水位），否则「收尾写的旧内容
+    /// 盖掉在飞的新内容」这条又会回来。
+    segments_write_gate: SegmentWriteGate,
 
     /// 「已派发但还没落库」的字幕快照数（含正在写与排队中的）。
     ///
@@ -1039,6 +1045,19 @@ impl AppState {
         // 后台写线程与渲染线程之间的结果通道：发送端交给后台写线程，接收端装进
         // `BackgroundWrites`（见 `BackgroundWrites::drain_results`）。
         let (segments_write_tx, segments_write_results) = std::sync::mpsc::channel();
+        // 后台写入子系统的唯一一份实例：派发 / 同步落库 / 后台过闸入口（转写收尾）
+        // 三方共用，水位与串行闸才不会各算一套。
+        let writes_arc = Arc::new(BackgroundWrites {
+            submit: segments_write_tx,
+            results: Mutex::new(segments_write_results),
+            ..BackgroundWrites::default()
+        });
+        // 过闸入口自带一份库句柄（`Database` 内部是 `Arc<Mutex<Connection>>`，克隆只是
+        // 多一个引用）：后台线程只拿它，不拿整个 `AppState`。
+        let segments_write_gate = SegmentWriteGate {
+            db: db.clone(),
+            writes: Arc::clone(&writes_arc),
+        };
         let mut state = Self {
             config,
             db,
@@ -1063,11 +1082,11 @@ impl AppState {
             segments_flush_due: None,
             active_task_id: None,
             segments_revision: 0,
-            segments_writes: Arc::new(BackgroundWrites {
-                submit: segments_write_tx,
-                results: Mutex::new(segments_write_results),
-                ..BackgroundWrites::default()
-            }),
+            segments_writes: writes_arc.clone(),
+            // 过闸入口与派发 / 同步写共用**同一个** `BackgroundWrites`（同一把写入闸、
+            // 同一份按工程水位）：另起一份账本等于给它单开一条不受水位约束的写库通道，
+            // 正是这次要堵的那类「旧内容覆盖新内容」。
+            segments_write_gate,
             segments_write_pending: Arc::new(AtomicUsize::new(0)),
             undo_stack: Vec::new(),
             edit_log: crate::subtitle::audit::EditLog::new(),
@@ -1273,6 +1292,31 @@ impl AppState {
         }
         self.persist_config();
         self.refresh_model_presence();
+    }
+
+    /// 首次启动引导框的「稍后再说」：只把向导标记为已完成，**不改任何检测结果**。
+    ///
+    /// 为什么单独一个入口而不是让界面直接写 `config.gpu.hardware_init_completed`：
+    /// 那两个选择按钮走的是 `set_hardware_tier`，它除了置完成标记还会套用一整套餐
+    /// （推理策略、模型路径、线程数、落盘）。「稍后再说」要的只是**别再弹这个框**，
+    /// 不该顺手改掉用户还没表态的硬件档位——否则用户下次启动会发现自己被默许了一个
+    /// 从没选过的模式。
+    ///
+    /// 仍然要落盘：否则每次启动都会再弹一次，等于没有关闭入口。
+    pub(crate) fn defer_hardware_setup(&mut self) {
+        self.defer_hardware_setup_to("config.toml");
+    }
+
+    /// [`Self::defer_hardware_setup`] 的可注入路径版本（单测用）。
+    ///
+    /// 与 `persist_config_to` 同一套路：单测跑 `defer_hardware_setup` 时不能去写仓库根
+    /// 的 `config.toml`（那会覆盖开发机上的真实配置）。
+    fn defer_hardware_setup_to<P: AsRef<std::path::Path>>(&mut self, path: P) {
+        if self.config.gpu.hardware_init_completed {
+            return;
+        }
+        self.config.gpu.hardware_init_completed = true;
+        self.persist_config_to(path);
     }
 
     /// 切换「标点与润色」总开关与引擎档位，并**落盘**。
@@ -2359,6 +2403,24 @@ impl AppState {
         );
     }
 
+    /// 给后台线程的过闸写字幕入口（转写收尾回写上一个工程的脏字幕）。
+    ///
+    /// 只暴露 `&SegmentWriteGate`（内部是 `Database` 的克隆 + `Arc<BackgroundWrites>`）：
+    /// 后台线程因此拿不到 `AppState` 的其它字段，也就没有「后台改界面状态」的可能。
+    /// 调用点在派发前还要拿一个「当时的序号」（`next_write_seq`）一起带过去。
+    pub(crate) fn segments_write_gate(&self) -> &SegmentWriteGate {
+        &self.segments_write_gate
+    }
+
+    /// 下一个要发放的写序号（只读快照，不领号）。
+    ///
+    /// 给转写收尾这类「在后台线程上写库」的调用点用：它不能自己 `fetch_add`
+    /// （`next_seq` 的单调性靠「领号只在渲染线程」这个前提），于是带上派发那一刻的
+    /// 待发号。过闸判定是「同工程水位 >= 该号」，因此旧收尾写遇到更新的写只会被跳过。
+    pub(crate) fn next_write_seq(&self) -> u64 {
+        self.segments_writes.tracker.next_seq.load(Ordering::SeqCst)
+    }
+
     /// 是否还有后台字幕写在飞（诊断 / 测试用；关窗守卫看的是 `segments_dirty`）。
     pub fn background_segments_write_pending(&self) -> usize {
         self.segments_write_pending.load(Ordering::SeqCst)
@@ -3409,6 +3471,61 @@ fn write_snapshot_under_gate(
     Ok(true)
 }
 
+/// 后台线程也能用的「过闸写字幕」入口（转写收尾专用）。
+///
+/// # 为什么要有这个结构，而不是让调用点传 `Arc<AppState>`
+///
+/// 转写收尾（`finish_db_work`）跑在后台线程上，它要把**上一个工程**的脏字幕写库。
+/// 那条路径过去直接 `db.update_task_segments(id, segs)`：既没领写序号、也没按工程查水位，
+/// 于是后台在飞的字幕写与它撞同一个 task 时，**旧内容可能覆盖新内容**——与写入闸要防的
+/// 正是同一件事（见 `BackgroundWrites` 的文档）。
+///
+/// 修法不是「把 `AppState` 塞进后台线程」：`AppState` 是渲染线程按帧 `&mut` 借用的，
+/// 搬进去就得给整个界面状态上锁。真正需要的只有两样东西——`Database`（内部
+/// `Arc<Mutex<Connection>>`，天生可 `Send + Sync`）与按工程的水位账本。把这两样
+/// 打成一个小句柄 `SegmentWriteGate`，后台线程只拿它，规则仍然只有一份
+/// （`write_snapshot_under_gate`），不复制一套平行实现。
+///
+/// # 序号为什么由调用方给，而不是这里领
+///
+/// 收尾路径在后台线程上，而 `next_seq` 的单调性依赖「领号只在渲染线程」这个前提
+/// （派发侧与同步写都在渲染线程上领号）。所以这里不自己 `fetch_add`，而是让调用点
+/// 带上它那份快照的序号：派发那一刻（渲染线程）从 `next_write_seq` 取一个当时值即可，
+/// 水位判定（`applied[task] >= seq`）因此照样成立——旧收尾写遇到更新的写只会被跳过。
+#[derive(Clone)]
+pub(crate) struct SegmentWriteGate {
+    db: Database,
+    writes: Arc<BackgroundWrites>,
+}
+
+impl SegmentWriteGate {
+    /// 把一份**上一工程**的脏字幕快照过闸写库；返回「这次真的写了没有」。
+    ///
+    /// 全程持有写入闸，闸里一次完成「查同工程水位 → 写 → 记水位」，与同步落库
+    /// （`AppState::sync_segments_gated`）和后台写线程共用同一把锁、同一个账本。
+    pub(crate) fn write_finished_task_segments(
+        &self,
+        task_id: i64,
+        seq: u64,
+        segments: &[crate::subtitle::Segment],
+    ) -> anyhow::Result<bool> {
+        let _guard = self.writes.lock_writer();
+        if self.writes.tracker.applied_seq(task_id) >= seq {
+            // 同一个工程已经有更新的内容落库：这次写回去就是回退。算成功——库里
+            // 那份更新的内容本来就是用户最后看到的状态。
+            tracing::debug!(
+                task_id,
+                seq,
+                "同工程已有更新的写落库，放弃转写收尾的脏字幕回写"
+            );
+            return Ok(false);
+        }
+        self.db.update_task_segments(task_id, segments)?;
+        self.writes.tracker.note_applied(task_id, seq);
+        Ok(true)
+    }
+}
+
 /// 把后台写线程的回报并进 UI 状态（**纯函数**，只在渲染线程上跑，便于单测钉死判定）。
 ///
 /// # 判定规则（防回退的核心）
@@ -3557,9 +3674,12 @@ mod tests {
     use super::{
         apply_segment_write_result, drain_segment_writes, mark_segments_dirty_for_revision,
         write_snapshot_under_gate, AppState, BackgroundWrites, PolishMode, ProcessStatus,
-        SegmentWriteDone, SegmentWriteSnapshot, WhisperModelTier, SEGMENTS_FLUSH_IDLE,
+        SegmentWriteDone, SegmentWriteGate, SegmentWriteSnapshot, WhisperModelTier,
+        SEGMENTS_FLUSH_IDLE,
     };
     use crate::subtitle::Segment;
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::Arc;
 
     /// 构造一个最小可用、不碰显卡/磁盘/子进程的 AppState：内存 SQLite + 假路径引擎，
     /// 只为验证「编辑 / 撤销」这类纯状态逻辑。
@@ -3588,6 +3708,64 @@ mod tests {
         );
         state.segments = segments;
         state
+    }
+
+    /// 测试专用：给临时文件一个不会撞名的后缀。
+    fn unique_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
+    /// 「稍后再说」只关引导框：向导标记被置完成，但**硬件档位与推理策略一动不动**。
+    ///
+    /// 回归护栏：两个选择按钮走 `set_hardware_tier`，它会顺带套用一整套餐并落盘。
+    /// 「稍后再说」若复用那条路，用户还没表态就被默许了一个从没选过的模式——
+    /// 下次启动会发现推理策略、模型路径、线程数全变了。
+    #[test]
+    fn defer_hardware_setup_only_closes_the_wizard() {
+        // 落盘目标指到临时目录：单测不许写仓库根的 `config.toml`（会覆盖真实配置）。
+        let cfg_path = std::env::temp_dir().join(format!("v2w_hw_later_{}.toml", unique_suffix()));
+        let mut state = test_state(Vec::new());
+        // 首次启动的初始状态：向导未完成（默认 cpu 档，见 `GpuConfig::default`）。
+        assert!(!state.config.gpu.hardware_init_completed);
+        let tier_before = state.config.gpu.hardware_tier.clone();
+        let offload_before = state.config.gpu.whisper_offload;
+        let decode_before = state.config.gpu.hwaccel_decode;
+        let model_before = state.config.paths.whisper_model.clone();
+        let threads_before = state.config.pipeline.whisper_threads;
+
+        state.defer_hardware_setup_to(&cfg_path);
+
+        assert!(
+            state.config.gpu.hardware_init_completed,
+            "稍后再说必须让引导框不再出现，否则等于没有关闭入口"
+        );
+        assert_eq!(
+            state.config.gpu.hardware_tier, tier_before,
+            "不许改硬件档位"
+        );
+        assert_eq!(
+            state.config.gpu.whisper_offload, offload_before,
+            "不许改推理 offload"
+        );
+        assert_eq!(
+            state.config.gpu.hwaccel_decode, decode_before,
+            "不许改硬解开关"
+        );
+        assert_eq!(
+            state.config.paths.whisper_model, model_before,
+            "不许换模型路径（那会改变用户下次转写用的档位）"
+        );
+        assert_eq!(
+            state.config.pipeline.whisper_threads, threads_before,
+            "不许改线程数"
+        );
+
+        // 幂等：重复调用（Esc + 按钮都点到）不会有第二次副作用。
+        state.defer_hardware_setup_to(&cfg_path);
+        assert_eq!(state.config.gpu.hardware_tier, tier_before);
     }
 
     /// 下载完模型后的「重算推荐」不许重新探测硬件。
@@ -6293,6 +6471,65 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0,
             "写结束后在飞计数必须归零（只增不减的诊断数字会骗人）"
+        );
+    }
+
+    /// 转写收尾的脏字幕回写必须过闸：同工程已有更新的写落库时，旧的收尾快照不许盖回去。
+    ///
+    /// 回归护栏：这条路径原先直接 `db.update_task_segments(id, segs)`，既没领号也没查水位，
+    /// 于是「后台在飞的新写」与「收尾的旧写」撞同一个 task 时，旧内容会后落地把新内容盖掉。
+    #[test]
+    fn finish_flush_write_is_gated_and_drops_stale_snapshot() {
+        use crate::storage::Database;
+
+        let db = Database::open(":memory:").expect("内存库应能打开");
+        let id = db
+            .insert_task("finish.mp4", "finish.mp4", 2.0, "completed", &[], None)
+            .expect("插一条工程");
+        // 与 AppState 内部同一个 BackgroundWrites：派发 / 同步写 / 过闸入口三方共用
+        // （AppState::new 里正是把这个 Arc 同时交给 segments_writes 与 segments_write_gate）。
+        let writes = Arc::new(BackgroundWrites::default());
+        let gate = SegmentWriteGate {
+            db: db.clone(),
+            writes: Arc::clone(&writes),
+        };
+
+        // 用户又改了一版，走同步落库（换工程 / 导出）：它领到更大的序号并把水位推高。
+        let newer = vec![Segment::new(1, 0.0, 2.0, "最新内容")];
+        let newer_seq = writes.tracker.next_seq.fetch_add(1, SeqCst);
+        {
+            let _guard = writes.lock_writer();
+            db.update_task_segments(id, &newer).expect("新内容先落库");
+            writes.tracker.note_applied(id, newer_seq);
+        }
+
+        // 转写收尾这时才带着**旧**序号回写上一个工程的脏字幕。
+        let stale = vec![Segment::new(1, 0.0, 2.0, "旧内容")];
+        let wrote = gate
+            .write_finished_task_segments(id, newer_seq.saturating_sub(1), &stale)
+            .expect("被跳过不是失败");
+        assert!(!wrote, "更旧的收尾写必须被水位挡下");
+        assert_eq!(
+            db.load_task_segments(id).expect("读回字幕")[0].text,
+            "最新内容",
+            "旧收尾快照不许盖掉更新的写"
+        );
+
+        // 反例：序号比水位新时照常写、并把水位推到自己——闸门不是「一写就锁死」。
+        let fresh = vec![Segment::new(1, 0.0, 2.0, "收尾写的内容")];
+        let fresh_seq = writes.tracker.next_seq.fetch_add(1, SeqCst);
+        let wrote = gate
+            .write_finished_task_segments(id, fresh_seq, &fresh)
+            .expect("写入应成功");
+        assert!(wrote);
+        assert_eq!(
+            db.load_task_segments(id).expect("读回字幕")[0].text,
+            "收尾写的内容"
+        );
+        assert_eq!(
+            writes.tracker.applied_seq(id),
+            fresh_seq,
+            "过闸写必须把同工程水位推到自己"
         );
     }
 }

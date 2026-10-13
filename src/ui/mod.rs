@@ -48,18 +48,18 @@ pub enum EditorExportFormat {
 impl EditorExportFormat {
     pub fn label(self) -> &'static str {
         match self {
-            Self::JianYing => "剪映草稿 (一键直出)",
-            Self::JianYingFolder => "剪映草稿 (导出到文件夹)",
-            Self::Srt => "SRT 字幕 (.srt)",
-            Self::Ass => "ASS 特效字幕 (.ass)",
-            Self::Fcpxml => "FCPXML (达芬奇 / FCP)",
-            Self::PremiereXml => "Premiere XML (.xml)",
-            Self::Txt => "TXT 纯文本 (.txt)",
-            Self::Vtt => "VTT 网页字幕 (.vtt)",
-            Self::Json => "JSON 结构化字幕 (.json)",
-            Self::EbuTtD => "EBU-TT-D 广播字幕 (.ttml)",
-            Self::NetflixTtal => "Netflix TTAL (.ttal)",
-            Self::BurnVideo => "烧录字幕视频 (.mp4)",
+            Self::JianYing => "剪映草稿（一键直出）",
+            Self::JianYingFolder => "剪映草稿（导出到文件夹）",
+            Self::Srt => "SRT 字幕（.srt）",
+            Self::Ass => "ASS 特效字幕（.ass）",
+            Self::Fcpxml => "FCPXML（达芬奇 / FCP）",
+            Self::PremiereXml => "Premiere XML（.xml）",
+            Self::Txt => "TXT 纯文本（.txt）",
+            Self::Vtt => "VTT 网页字幕（.vtt）",
+            Self::Json => "JSON 结构化字幕（.json）",
+            Self::EbuTtD => "EBU-TT-D 广播字幕（.ttml）",
+            Self::NetflixTtal => "Netflix TTAL（.ttal）",
+            Self::BurnVideo => "烧录字幕视频（.mp4）",
         }
     }
 
@@ -433,6 +433,13 @@ pub struct MainWindow {
     /// 就等于每帧常驻一张 GPU 纹理（拖动时间轴每 40ms 换一帧）。换帧时用这里的
     /// 旧引用把上一张交还，显存占用恒定在「一帧」。见 `render_monitor_picture`。
     pub(crate) cached_static_image: Option<Arc<RenderImage>>,
+    /// 模型在位扫描的「代数」：每请求一次 +1，回写只接受最新一代。
+    ///
+    /// 扫描跑的是全文件哈希（几十秒级），而删除 / 恢复 / 下载完成都会触发它。没有这个
+    /// 计数时，先起的那条后完成会用**旧配置快照**覆盖新结果——界面徽标跳回旧态，
+    /// 用户以为自己的设置被撤销了。选「代数」而不是 busy 标志：它顺带解决「扫描期间
+    /// 用户又改了配置」这一类，busy 只能挡住重复点击。
+    pub(crate) model_presence_scan_gen: std::sync::atomic::AtomicU64,
     /// 脏字幕的延迟落库定时器是否已经起过（进程内只起一次，见
     /// [`MainWindow::ensure_segments_flush_ticker`]）。
     pub(crate) segments_flush_ticker: bool,
@@ -1313,6 +1320,8 @@ impl MainWindow {
             cached_live_image: None,
             cached_static_image: None,
             segments_flush_ticker: false,
+            // 从 1 起：0 表示「还从未请求过扫描」，与派发序号同一口径。
+            model_presence_scan_gen: std::sync::atomic::AtomicU64::new(1),
             cached_fallback_frame: None,
             subtitle_list_scroll: UniformListScrollHandle::new(),
             batch_queue_scroll: ScrollHandle::new(),
@@ -2584,6 +2593,21 @@ impl Render for MainWindow {
                         cx.notify();
                         return;
                     }
+                    // 首次启动硬件引导框：它与确认框一样是**阻塞式模态**（遮罩 `occlude()`），
+                    // 但此前只有「我有 GPU / 无 GPU」两个出口，Esc 完全关不掉——想先看看
+                    // 界面再决定的用户被逼着表态。这里补一刀，与「稍后再说」按钮同义：
+                    // 只把向导标记为完成，不动硬件档位、不跑检测。
+                    //
+                    // 焦点在输入框时不生效（同裸键那套约定）：那种场合 Esc 的语义是
+                    // 「清空当前输入」，不该顺手关掉整个模态。
+                    if !this.state.config.gpu.hardware_init_completed
+                        && !this.any_input_focused(window, cx)
+                    {
+                        this.state.defer_hardware_setup();
+                        cx.notify();
+                        return;
+                    }
+
                     // 命令面板紧随其后（渲染顺序上它也在确认框之下、其它浮层之上）。
                     // 为什么不是最前：确认框是**阻塞式**的，出现时用户除了「确认/取消」
                     // 没有别的出口；面板则是随时可关的轻量浮层，而且面板打开时遮罩把

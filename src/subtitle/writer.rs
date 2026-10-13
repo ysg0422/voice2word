@@ -116,6 +116,10 @@ impl SubtitleWriter {
             "srt" => Self::write_srt_with_mode(segments, path, mode),
             "ass" => Self::write_ass_with_mode(segments, path, mode),
             "vtt" => Self::write_vtt_with_mode(segments, path, mode),
+            // ── 播放器/社区常用的小格式（P1-12）──
+            "sbv" => Self::write_sbv_with_mode(segments, path, mode),
+            "lrc" => Self::write_lrc_with_mode(segments, path, mode),
+            "txt-ts" | "txtts" => Self::write_txt_with_timecodes(segments, path, mode),
             "txt" => Self::write_txt_with_mode(segments, path, mode),
             "fcpxml" => super::fcpxml::FcpXmlExporter::write_to_file(
                 segments,
