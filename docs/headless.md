@@ -28,6 +28,7 @@ $exe = if (Test-Path .\target\release\voice2word.exe) { '.\target\release\voice2
 | `transcribe <输入>` | 转写并导出字幕（面向人） | 结果一行：`字幕已写入: <路径>（共 N 段）` |
 | `run <输入>` | 一次调用完成一次转写（面向机器） | **一行 JSON**（默认开启，等价于 `transcribe --json`） |
 | `tools` | 列出可被外部调用的工具与参数 schema | 工具一览（`--json` 时是一行 JSON 清单） |
+| `doctor` | 本机自检（只读）：配置、依赖、硬件、日志与数据库 | 每项一行 `OK/WARN/ERROR 名称 - 说明` + 末行汇总（`--json` 时是一行 JSON 报告） |
 | `--help` / `-h` | 顶层帮助 | 帮助文本 |
 | `--version` / `-V` | 版本号 | `voice2word <版本>` |
 | `--gui` | 启动图形界面（无参数时也是它） | — |
@@ -44,6 +45,8 @@ $exe = if (Test-Path .\target\release\voice2word.exe) { '.\target\release\voice2
 
 `run` 在**运行失败时同样会输出一行 JSON**（`status` = `error`，`exit_code` = `1`，`error` 写明原因），
 因此调用方可以先解析 stdout、再看进程退出码。参数错误（退出码 `2`）时 stdout 为空，原因与用法都写在 stderr。
+
+`doctor` 的退出码另有细分：没有 ERROR 就是 `0`（只有注意项也算 `0`），存在 ERROR 是 `1`，参数错误同样是 `2`（它只接受 `--json`）。
 
 ## 4. 输出约定
 
@@ -98,7 +101,57 @@ $result.status; $result.output; $result.segments
 ```json
 {"schema":"voice2word.run.v1","status":"partial","action":"transcribe","exit_code":1,"input":"D:\\media\\clips","input_kind":"directory","output":null,"format":"srt","segments":64,"duration_sec":180.0,"elapsed_sec":75.5,"polished":true,"translated_to":"English","hotwords":"张三,某品牌","speakers":null,"resumed":false,"artifact_dir":null,"dry_run":false,"error":"D:\\media\\clips\\b.mp4: 转写失败：…","items":[{"schema":"voice2word.run.v1","status":"ok","action":"transcribe","exit_code":0,"input":"D:\\media\\clips\\a.mp4","input_kind":"file","output":"D:\\media\\clips\\a.srt","format":"srt","language":null,"segments":64,"duration_sec":180.0,"elapsed_sec":61.0,"polished":true,"translated_to":"English","hotwords":"张三,某品牌","speakers":null,"resumed":false,"artifact_dir":null,"dry_run":false,"error":null,"items":[],"tool_call":null,"assistant_message":null,"model":null,"result":null},{"schema":"voice2word.run.v1","status":"error","action":"transcribe","exit_code":1,"input":"D:\\media\\clips\\b.mp4","input_kind":"file","output":"D:\\media\\clips\\b.srt","format":"srt","language":null,"segments":0,"duration_sec":0.0,"elapsed_sec":3.2,"polished":false,"translated_to":null,"hotwords":null,"speakers":null,"resumed":false,"artifact_dir":null,"dry_run":false,"error":"音频解码失败","items":[],"tool_call":null,"assistant_message":null,"model":null,"result":null}]}
 ```
-## 6. 目录批量
+
+## 6. 体检：`voice2word doctor`
+
+转写跑不起来时先跑一次体检：它把配置、依赖、硬件、日志与数据库五类判定逐项列出来，
+每项给出结论与可执行的修复建议。
+
+```powershell
+& $exe doctor            # 人用：每项一行结论，末行汇总
+& $exe doctor --json     # 机器用：stdout 恒为一行 JSON
+```
+
+人用模式的输出形状：
+
+```text
+OK 配置文件 - D:\app\config.toml 可读，无本机覆盖（便携默认，正常）
+OK 项目根 - D:\app（models/ 存在）
+WARN ffprobe - D:\app\tools\ffprobe.exe 不存在，PATH 上也没有 ffprobe
+fix: 需要外部脚本探测流信息时，把 ffprobe.exe 放到 ffmpeg 同目录或加入 PATH。
+ERROR 数据库可打开 - D:\app\voice2word.db 只读打开失败：...
+fix: 检查文件权限与磁盘状态；被其它进程独占时稍后重试。
+汇总: 正常 10 项 / 注意 1 项 / 失败 1 项，整体状态 error
+```
+
+`--json` 的字段（实际输出是一行，无换行、无缩进）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `schema` | string | 固定 `voice2word.doctor.v1`；字段语义变化时递增 |
+| `status` | string | 整体结论：`ok` / `warn` / `error` |
+| `exit_code` | number | `0`（没有 ERROR）或 `1`（存在 ERROR） |
+| `checks` | array | 逐项结果；每项含 `name`（稳定标识，如 `ffmpeg`）、`label`、`status`、`message`、`fix`（无建议时为 `null`） |
+| `summary` | string | 一行汇总，与人用模式的末行一致 |
+
+示例（实际输出是一行）：
+
+```json
+{"schema":"voice2word.doctor.v1","status":"warn","exit_code":0,"checks":[{"name":"config_readable","label":"配置文件","status":"ok","message":"D:\\app\\config.toml 可读，无本机覆盖（便携默认，正常）","fix":null},{"name":"ffprobe","label":"ffprobe","status":"warn","message":"D:\\app\\tools\\ffprobe.exe 不存在，PATH 上也没有 ffprobe","fix":"需要外部脚本探测流信息时，把 ffprobe.exe 放到 ffmpeg 同目录或加入 PATH。"}],"summary":"汇总: 正常 10 项 / 注意 1 项 / 失败 0 项，整体状态 warn"}
+```
+
+退出码：
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 没有 ERROR（只有注意项也算成功） |
+| `1` | 存在 ERROR：组件缺失、配置读不出来、日志目录不可写、数据库打不开等 |
+| `2` | 参数错误：`doctor` 只接受 `--json`，未知选项与多余参数都算 |
+
+体检是**只读**操作：不改配置、不写字幕、不访问网络。判定「目录可写」时会写入一个临时探针文件
+并立即删除（与图形界面的自检报告同一套做法），不会留下文件；数据库只做只读打开与 `quick_check`，
+建表、迁移与损坏自愈都留给程序正常启动路径。
+## 7. 目录批量
 
 输入给目录即批量：按扩展名筛选媒体文件（`mp3 wav m4a aac flac ogg opus wma amr mp4 mkv mov avi webm ts flv wmv m4v`，大小写不敏感），
 按路径排序后**逐个串行**转写（避免多个推理进程互相抢 CPU）。`--output` 此时是**输出目录**。
@@ -114,7 +167,7 @@ $result.status; $result.output; $result.segments
 - 整体 `status`：全部成功为 `ok`，全部失败为 `error`，部分失败为 `partial`（此时退出码为 `1`）。
 - 逐个文件的结果在 `items[]`，字段与顶层相同（含各自的 `output` 与 `error`）。
 
-## 7. 常用覆盖参数（不必改 config.toml）
+## 8. 常用覆盖参数（不必改 config.toml）
 
 | 参数 | 作用 | 默认 |
 | --- | --- | --- |
@@ -139,7 +192,7 @@ $result.status; $result.output; $result.segments
 `--translate` 的两种链路：`online` 走 `config.toml` 的 `[translate]`（`api_base` / `api_key` / `api_model` / `timeout_secs`），
 密钥留空时会读环境变量 `VOICE2WORD_API_KEY`；`offline` 走本机模型（`paths.llama_cli` + `paths.llm_model`）。
 
-## 8. 工具清单：`tools --json`
+## 9. 工具清单：`tools --json`
 
 外部程序第一次接入时先读这份清单，即可知道有哪些工具、参数怎么填：
 
@@ -216,7 +269,7 @@ $result.status; $result.output; $result.segments
 - `environment.ready` 为 `false` 时先看 `items[]` 里哪个 `required` 项缺文件（缺 ffmpeg / 识别程序 / 识别模型就跑不了转写）。
 - 清单里没有任何密钥：密钥只从 `config.toml` 或环境变量读。
 
-## 9. 一次函数调用触发转写：`run --tool-call`
+## 10. 一次函数调用触发转写：`run --tool-call`
 
 `--tool-call` 把「一句自然语言需求」交给**在线接口**，由模型选择并填写 `transcribe` 工具参数，本程序随即在本机执行，全程只做一次调用：
 
@@ -237,7 +290,7 @@ $result.status; $result.output; $result.segments
 命令行 `--api-base` / `--api-key` / `--api-model` / `--api-timeout` 覆盖；密钥留空时读环境变量 `VOICE2WORD_API_KEY`。
 模型没有返回工具调用、或调用了未知工具时：`status` = `error`、`exit_code` = `1`、`error` 写明原因，`assistant_message` 保留模型原话。
 
-安全约束（见第 12 节）：
+安全约束（见第 13 节）：
 
 - 模型给出的输入/输出路径必须落在**允许根目录**内。允许根只由命令行决定
   （当前目录、`--input` 所在目录、`--output` 的父目录、`--allow-root`），模型不能自己扩权；
@@ -245,7 +298,7 @@ $result.status; $result.output; $result.segments
 - 覆盖已存在的输出文件必须在命令行加 `--yes`，否则拒绝（`status` = `error`）。
 - 只放行 `transcribe` / `transcribe_batch` 两个动作，没有执行命令、读任意文件的工具。
 
-## 10. 自动化示例
+## 11. 自动化示例
 
 ```powershell
 # 1) 单文件，拿结构化结果
@@ -267,7 +320,7 @@ $batch.items | ForEach-Object { "{0} -> {1}（{2} 段）" -f $_.input, $_.output
 & $exe run --json --input .\long.mp4 --resume --artifact-dir .\.v2w-stages\long
 ```
 
-## 11. 常见错误与排查
+## 12. 常见错误与排查
 
 | 现象 | 原因与处理 |
 | --- | --- |
@@ -277,8 +330,8 @@ $batch.items | ForEach-Object { "{0} -> {1}（{2} 段）" -f $_.input, $_.output
 | 退出码 `1`，`error` 为「写入字幕失败」 | 目标目录不可写或被占用；换输出路径 |
 | `--json` 拿到的不是 JSON | 检查是否把 stderr 也并进了 stdout（`2>&1`）；正确写法是只取 stdout |
 | `--tool-call` 报「在线模型调用失败」 | 接口地址、模型名或密钥不对；先用 `run --json --input …` 验证本地转写，再单独排查在线配置 |
-| `--tool-call` 报「模型没有返回工具调用」 | 该模型/网关不支持函数调用；改用外部程序直接调 `run --json`（见第 10 节） |
-## 12. 安全边界
+| `--tool-call` 报「模型没有返回工具调用」 | 该模型/网关不支持函数调用；改用外部程序直接调 `run --json`（见第 11 节） |
+## 13. 安全边界
 
 无头模式的调用方可能是外部程序或 AI 助手，参数则可能来自模型对自然语言（含素材里的文字）的理解，
 因此这一层只做下面这些事，且每一条都能被独立校验：

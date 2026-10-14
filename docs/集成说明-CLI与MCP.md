@@ -25,12 +25,14 @@ voice2word [--gui]
 voice2word transcribe <输入文件> [-o <输出>] [--format srt|ass|vtt|json|txt|ttml|ttal]
                           [--lang <代码>] [--translate <语言>] [--model <路径>]
                           [--threads N] [--polish] [--resume] [--artifact-dir <路径>]
+voice2word doctor [--json]
 voice2word --help | -h
 voice2word --version | -V
 ```
 
 - 无参数或 `--gui`：启动图形界面（与加入 CLI 之前行为一致）。
 - `transcribe`：无头转写并导出字幕。
+- `doctor`：本机自检（只读），逐项检查依赖、硬件、日志与数据库。
 
 ### 1.3 参数表
 
@@ -75,6 +77,8 @@ voice2word --version | -V
 | `1` | 转写运行期失败（输入文件不存在、管线报错、写盘失败、未产生字幕片段等） |
 | `2` | 参数错误（缺少输入文件、未知子命令/选项、非法 `--format`、`--threads` 非正整数或为 0、选项缺少取值等） |
 
+`doctor` 的退出码另有细分：没有 ERROR 就是 `0`（只有 WARN 也算 `0`），存在 ERROR 是 `1`，参数错误同样是 `2`。
+
 ### 1.6 示例
 
 ```powershell
@@ -96,6 +100,26 @@ voice2word transcribe talk.mp4 --resume --artifact-dir .\.voice2word-stages\talk
 # 查看帮助 / 版本
 voice2word --help
 voice2word --version
+```
+
+### 1.7 体检：`voice2word doctor`
+
+环境不确定时先跑一次体检（只读操作：不改配置、不写字幕、不访问网络）：
+
+```powershell
+voice2word doctor          # 每项一行：OK|WARN|ERROR 名称 - 说明，有建议时再跟一行 fix: …
+voice2word doctor --json   # stdout 恒为一行 JSON，便于脚本判定
+```
+
+- 检查项：配置文件可读（文件在且能解析）、项目根、`ffmpeg`、`ffprobe`、识别与翻译所需的组件与模型、
+  `python`、GPU 与硬解档位、日志目录可写性、项目根可写性、数据库能否只读打开。
+- 退出码：`0` = 没有 ERROR（只有 WARN 也算 0）；`1` = 存在 ERROR；`2` = 参数错误（只接受 `--json`）。
+- 判定「目录可写」时会写入一个临时探针文件并立即删除，不会留下文件。
+
+`--json` 的输出形状（实际输出是一行）：
+
+```json
+{"schema":"voice2word.doctor.v1","status":"ok","exit_code":0,"checks":[{"name":"ffmpeg","label":"FFmpeg","status":"ok","message":"tools\\ffmpeg.exe 可用","fix":null}],"summary":"汇总: 正常 12 项 / 注意 0 项 / 失败 0 项，整体状态 ok"}
 ```
 
 ## 2. Claude Code / Codex Skill

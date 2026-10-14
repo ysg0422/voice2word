@@ -339,12 +339,19 @@ MCP 工具最终调用的是 Voice2Word 的无头模式：
 ```text
 voice2word transcribe <输入文件> [-o <输出>] [--format ...] [--lang <代码>] [--threads N] [--polish] [--resume] [--artifact-dir <路径>]
 
+# 本机自检（只读：不改配置、不写字幕、不访问网络），逐项结论 + 修复建议
+voice2word doctor [--json]
+
 # 顶层形式：voice2word [--gui] | --help/-h | --version/-V（另接受裸子命令 help / version）
 ```
 
 `transcribe` 另支持 `--translate <语言>`（目标语言，当前仅记录、翻译阶段未接入）与
 `--model <路径>`（覆盖 Whisper 模型文件）；顶层还有 `--gui`（启动图形界面，无参数时等同）、
 `--help`/`-h`、`--version`/`-V`。这些选项**不在** MCP `transcribe` 工具的入参里，需要时请直接调用 CLI。
+
+`doctor [--json]` 是 CLI 自带的本机自检：配置文件、ffmpeg / ffprobe、识别与翻译组件、GPU 与硬解、
+日志目录、数据库能否只读打开，有 ERROR 时退出码为 `1`。它**不是** MCP 工具（服务器只暴露 `transcribe` /
+`probe` / `version`），需要时在客户端之外直接跑 `voice2word doctor`。
 
 - **进度 / 诊断**由 CLI 写到它自己的 `stderr`（MCP 服务器在 stdio 模式下**不**写 `stderr`，
   这些内容会被摘要进 `tools/call` 返回的文本里）；
@@ -367,5 +374,6 @@ voice2word transcribe <输入文件> [-o <输出>] [--format ...] [--lang <代�
   或显式设置 `--exe` / `VOICE2WORD_EXE`。
 - **`probe` 显示 `ffmpeg` 不可用**：把 ffmpeg / ffprobe 加入 PATH，或按项目 `config.toml`
   的路径配置指定。
+- **不确定本机环境是否就绪**：先在命令行跑一次 `voice2word doctor`（加 `--json` 拿一行 JSON）：它逐项列出配置、ffmpeg / ffprobe、模型、GPU、日志与数据库的结论与修复建议。
 - **响应里出现 `-32700`**：说明那一行不是合法 JSON，检查是否误把多行 JSON 拆成了多行输入。
 - **配置文件路径不确定**：各客户端版本差异较大，一律**以你的客户端版本为准**。

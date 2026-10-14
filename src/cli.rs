@@ -7,6 +7,7 @@
 //! voice2word transcribe <输入文件或目录> [选项]   # 人用：进度写 stderr，结果写 stdout
 //! voice2word run <输入文件或目录> [选项] --json   # 机器用：stdout 恒为一行 JSON
 //! voice2word tools [--json]                      # 列出可被外部调用的工具与参数 schema
+//! voice2word doctor [--json]                     # 本机自检：配置 / 组件 / 硬件 / 日志 / 数据库
 //! ```
 //!
 //! 设计约束：
@@ -19,6 +20,9 @@
 //! - 落盘由管线负责；本模块在管线未产出目标文件时兜底重写一次。
 //! - 「工具调用」（`run --tool-call`）复用 `engines::translate` 里已有的在线接口客户端，
 //!   不新增 HTTP 实现。
+//! - `doctor` 是**只读**自检：不产生产物、不改配置，只复用 `utils::diagnostics` 的
+//!   检查项与引擎的硬件档案，缺的几类（ffprobe / GPU 硬解 / 日志目录 / 数据库打开）
+//!   在模块内用现有 API 组合出来。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -39,6 +43,8 @@ use crate::engines::{
     SenseVoiceEngine, TextProgressCb, TranslateEngine, TranslateMode, WhisperEngine,
 };
 use crate::subtitle::{Segment, SubtitleWriter};
+use crate::utils::diagnostics::{self, CheckItem, CheckStatus};
+use crate::utils::model_download;
 use crate::utils::AppConfig;
 
 /// 允许导出的字幕格式；顺序与帮助文本里展示的一致。
@@ -65,6 +71,21 @@ pub const EXIT_USAGE: i32 = 2;
 const RUN_SCHEMA: &str = "voice2word.run.v1";
 /// `tools --json` 清单的 schema 标识。
 const TOOLS_SCHEMA: &str = "voice2word.tools.v1";
+/// `doctor --json` 报告的 schema 标识（返回值形状变化时递增）。
+const DOCTOR_SCHEMA: &str = "voice2word.doctor.v1";
+
+/// `doctor` 里「配置文件可读」这一项的标识。
+///
+/// 自检报告里同一条信息叫 `config_files`（只看文件在不在），doctor 换成更强的
+/// 「能读出并解析」，因此把它从复用的自检项里剔除，报告里只留一份。
+const CHECK_CONFIG_READABLE: &str = "config_readable";
+/// `diagnostics` 里被 doctor 替换掉的那项（见 [`CHECK_CONFIG_READABLE`]）。
+const DIAGNOSTIC_CONFIG_ITEM: &str = "config_files";
+/// `doctor` 自己补充的检查项标识（其余项沿用 `diagnostics` 的 id）。
+const CHECK_FFPROBE: &str = "ffprobe";
+const CHECK_GPU: &str = "gpu_hwaccel";
+const CHECK_LOGS_DIR: &str = "logs_dir_writable";
+const CHECK_DATABASE_OPEN: &str = "database_open";
 
 /// 目录批量时按扩展名筛选待处理媒体（大小写不敏感）。
 const MEDIA_EXTENSIONS: [&str; 18] = [
@@ -93,6 +114,8 @@ pub enum HelpTopic {
     Run,
     /// `tools` 子命令。
     Tools,
+    /// `doctor` 子命令（本机自检）。
+    Doctor,
 }
 
 /// 转写子命令解析后的参数。
@@ -169,6 +192,13 @@ pub struct ToolsArgs {
     pub only: Option<String>,
 }
 
+/// `doctor` 子命令解析后的参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorArgs {
+    /// 输出机器可读 JSON（stdout 恒为一行）。
+    pub json: bool,
+}
+
 /// 命令行解析结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliAction {
@@ -182,6 +212,8 @@ pub enum CliAction {
     Transcribe(Box<TranscribeArgs>),
     /// 打印可被外部调用的工具清单。
     Tools(Box<ToolsArgs>),
+    /// 本机自检并打印结论（`doctor`）。
+    Doctor(Box<DoctorArgs>),
 }
 
 /// 命令行解析错误（面向用户的一段中文说明）。
@@ -287,7 +319,7 @@ const SECURITY_HELP: &str = "\
 /// 帮助文本里「退出码 / 输出约定」一节。
 const EXIT_CODE_HELP: &str = "\
 退出码:
-  0  成功（含 --help / --version / tools）
+  0  成功（含 --help / --version / tools；doctor 无 ERROR 时也是 0）
   1  运行失败（输入不存在、管线报错、写盘失败、未产生字幕片段等）
   2  参数错误（缺少输入、未知子命令或选项、非法取值、选项缺少取值等）
 
@@ -306,6 +338,7 @@ pub fn usage() -> String {
   voice2word transcribe <输入文件或目录> [选项]    人用：转写并导出字幕，进度写 stderr
   voice2word run <输入文件或目录> [选项]           机器用：单次调用，stdout 输出一行 JSON
   voice2word tools [--json]                       列出可被外部程序调用的工具与参数 schema
+  voice2word doctor [--json]                      本机自检：依赖、硬件、日志与数据库
   voice2word --help | -h                          显示本帮助
   voice2word --version | -V                       显示版本号
 
@@ -318,7 +351,8 @@ pub fn usage() -> String {
   voice2word transcribe talk.mp4 --format vtt --lang zh -o out/talk.vtt
   voice2word run --json --input talk.mp4 --hotwords "张三,某品牌" --translate English
   voice2word run --json --input clips/ --format srt --recursive
-  voice2word tools --json"#,
+  voice2word tools --json
+  voice2word doctor --json"#,
         version = env!("CARGO_PKG_VERSION"),
         common = COMMON_OPTIONS_HELP,
         run_only = RUN_ONLY_OPTIONS_HELP,
@@ -431,6 +465,56 @@ pub fn usage_tools() -> String {
     )
 }
 
+/// `doctor` 子命令帮助。
+pub fn usage_doctor() -> String {
+    format!(
+        r#"voice2word doctor — 本机自检：跑一遍依赖与运行环境检查，逐项给出结论与修复建议
+
+用法:
+  voice2word doctor [--json]
+
+      --json                输出机器可读 JSON（schema {schema}）
+  -h, --help                显示本帮助
+
+检查项（顺序即输出顺序）:
+  配置文件        config.toml 能读出并解析（config.local.toml 可选）
+  项目根          所有相对路径的锚点，判据是根下存在 models/
+  ffmpeg          FFmpeg 是否可用（配置里的路径，或 PATH 上的同名命令）
+  ffprobe         与 ffmpeg 同目录的同名工具（可选：外部脚本探测流信息时用）
+  whisper-cli / whisper 模型 / llama.cpp / 大模型 / python
+                  识别与翻译链路的组件是否就位
+  GPU / 硬解      wgpu 适配器与 FFmpeg 输入侧硬解的可用性
+  日志目录        logs/ 可写（写入一个探针文件后立即删除）
+  项目根可写性    真写一次再删，避免「启动即失败」
+  数据库          voice2word.db 的存在性，以及能否只读打开并通过 quick_check
+
+输出:
+  人用模式：每项一行「OK|WARN|ERROR 名称 - 说明」，有修复建议时多一行「fix: …」；
+            末行是一行汇总，退出码见下。
+  --json   ：stdout 恒为一行 JSON（schema {schema}），形状：
+            {{"schema":…,"status":"ok|warn|error","exit_code":0|1,
+              "checks":[{{"name":…,"label":…,"status":…,"message":…,"fix":null}}],
+              "summary":…}}
+
+退出码:
+  0  没有 ERROR（只有 WARN 也算 0：缺个可选组件不该让脚本中止）
+  1  存在 ERROR（组件缺失、配置读不出来、日志目录不可写、数据库打不开等）
+  2  参数错误（未知选项、多余参数）
+
+说明:
+  只读自检：不改配置、不写字幕、不访问网络；判定目录可写性时会创建并立即删除一个探针文件。
+  数据库只做只读打开与 quick_check；建表、迁移与损坏自愈留给程序正常启动路径。
+
+示例:
+  voice2word doctor
+  voice2word doctor --json
+
+{exit}"#,
+        schema = DOCTOR_SCHEMA,
+        exit = EXIT_CODE_HELP,
+    )
+}
+
 /// 按主题取帮助文本。
 pub fn usage_for(topic: HelpTopic) -> String {
     match topic {
@@ -438,6 +522,7 @@ pub fn usage_for(topic: HelpTopic) -> String {
         HelpTopic::Transcribe => usage_transcribe(),
         HelpTopic::Run => usage_run(),
         HelpTopic::Tools => usage_tools(),
+        HelpTopic::Doctor => usage_doctor(),
     }
 }
 
@@ -462,9 +547,10 @@ where
         "transcribe" => parse_run_like(&rest[1..], OutputMode::Human),
         "run" => parse_run_like(&rest[1..], OutputMode::Json),
         "tools" => parse_tools(&rest[1..]),
+        "doctor" => parse_doctor(&rest[1..]),
         other if other.starts_with('-') => Err(CliError::new(format!("未知选项: {other}"))),
         other => Err(CliError::new(format!(
-            "未知子命令: {other}（可用: transcribe | run | tools | --help | --version）"
+            "未知子命令: {other}（可用: transcribe | run | tools | doctor | --help | --version）"
         ))),
     }
 }
@@ -728,6 +814,32 @@ fn parse_tools(args: &[String]) -> std::result::Result<CliAction, CliError> {
     Ok(CliAction::Tools(Box::new(ToolsArgs { json, only })))
 }
 
+/// 解析 `doctor` 子命令的参数。
+///
+/// `doctor` 不接收文件路径、也没有取值型选项，因此只认 `--json` 与帮助：其余参数
+/// 一律按参数错误处理（退出码 [`EXIT_USAGE`]），**不做**静默忽略——体检命令被写错时
+/// 悄悄少跑检查比直接报错更糟。
+fn parse_doctor(args: &[String]) -> std::result::Result<CliAction, CliError> {
+    let mut json = false;
+    for arg in args {
+        let (flag, inline) = split_flag(arg);
+        match flag {
+            "-h" | "--help" => return Ok(CliAction::Help(HelpTopic::Doctor)),
+            "--json" => {
+                if inline.is_some() {
+                    return Err(CliError::new("--json 不接受取值"));
+                }
+                json = true;
+            }
+            other if other.starts_with('-') && other != "-" => {
+                return Err(CliError::new(format!("未知选项: {other}")));
+            }
+            _ => return Err(CliError::new(format!("多余的参数: {arg}"))),
+        }
+    }
+    Ok(CliAction::Doctor(Box::new(DoctorArgs { json })))
+}
+
 /// 拆出 `--opt=value` 形式里的取值；无 `=` 时取值为 `None`。
 fn split_flag(arg: &str) -> (&str, Option<&str>) {
     match arg.split_once('=') {
@@ -925,6 +1037,7 @@ where
         }
         Ok(CliAction::Transcribe(args)) => Some(run_transcribe(&args)),
         Ok(CliAction::Tools(args)) => Some(run_tools(&args)),
+        Ok(CliAction::Doctor(args)) => Some(run_doctor(&args)),
         Err(err) => {
             eprintln!("参数错误: {}", err.message());
             eprintln!();
@@ -981,6 +1094,584 @@ fn run_tools(args: &ToolsArgs) -> i32 {
     }
 }
 
+/// 执行一次体检、打印结论，返回进程退出码。
+///
+/// 「收集 → 判定 → 渲染 → 退出码」四步里只有**收集**碰文件系统与硬件
+/// （[`collect_doctor_checks`]），其余三步都是纯函数，单测不必真跑 ffmpeg 或访问网络。
+fn run_doctor(args: &DoctorArgs) -> i32 {
+    let report = DoctorReport::from_checks(collect_doctor_checks());
+    if args.json {
+        println!("{}", report.to_json_line());
+    } else {
+        print!("{}", render_doctor_human(&report));
+    }
+    report.exit_code
+}
+
+/// 单项体检结论的三态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DoctorStatus {
+    /// 一切正常。
+    Ok,
+    /// 能用，但有值得注意的地方（可选组件缺失、硬解降级等）。
+    Warn,
+    /// 不可用（组件缺失、读取失败、打不开）。
+    Error,
+}
+
+impl DoctorStatus {
+    /// 人读模式的前缀；定宽，让「名称 - 说明」对齐成一列。
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+
+    /// JSON 里的小写取值。必须与 serde 的 `rename_all = "lowercase"` 保持一致
+    /// （汇总句里要用一次，序列化走的是另一条路径，改枚举时两处一起改）。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+
+    /// 是否属于「必须处理」的结论。
+    fn is_error(self) -> bool {
+        self == Self::Error
+    }
+}
+
+/// 一项体检结果（`diagnostics::CheckItem` 的 CLI 视图：多了可打印的修复建议）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorCheck {
+    /// 稳定标识（英文、机器可读；复用项沿用 `utils::diagnostics` 的 id）。
+    pub name: String,
+    /// 人类可读名称。
+    pub label: String,
+    /// 三态结论。
+    pub status: DoctorStatus,
+    /// 说明：实际路径 / 版本 / 失败原因。
+    pub message: String,
+    /// 修复建议；不适用或已正常时为 `null`。
+    pub fix: Option<String>,
+}
+
+impl DoctorCheck {
+    /// 构造一项检查。
+    ///
+    /// `status` 为 [`DoctorStatus::Ok`] 时**丢弃**修复建议：正常项配一行建议只会把
+    /// 真正要看的那几项淹没，判定在这里收口，渲染侧就不必再判一次。
+    fn new(
+        name: impl Into<String>,
+        label: impl Into<String>,
+        status: DoctorStatus,
+        message: impl Into<String>,
+        fix: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            label: label.into(),
+            status,
+            message: message.into(),
+            fix: if status == DoctorStatus::Ok {
+                None
+            } else {
+                fix
+            },
+        }
+    }
+}
+
+/// `doctor --json` 的一行 JSON 结果。
+///
+/// 字段是稳定契约：`checks[].name` 取自检查项的稳定标识，调用方可以按名字取值；
+/// 形状变化时递增 [`DOCTOR_SCHEMA`]。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorReport {
+    /// schema 标识（见 [`DOCTOR_SCHEMA`]）。
+    pub schema: String,
+    /// 整体结论：`ok` | `warn` | `error`。
+    pub status: DoctorStatus,
+    /// 进程退出码（`0` 或 `1`；只有 ERROR 才是 1）。
+    pub exit_code: i32,
+    /// 逐项检查结果。
+    pub checks: Vec<DoctorCheck>,
+    /// 一行汇总（与人类模式末行同一句话）。
+    pub summary: String,
+}
+
+impl DoctorReport {
+    /// 由检查项汇总出报告：整体结论、退出码与汇总句都在这里定死，
+    /// 人读渲染与 `--json` 输出共用同一份判定，不会两处各判一次。
+    fn from_checks(checks: Vec<DoctorCheck>) -> Self {
+        let status = doctor_overall_status(&checks);
+        Self {
+            schema: DOCTOR_SCHEMA.to_string(),
+            status,
+            exit_code: doctor_exit_code(status),
+            summary: doctor_summary(&checks, status),
+            checks,
+        }
+    }
+
+    /// 序列化成一行 JSON；序列化失败时退回一条最小可用记录（同 `RunReport`）。
+    fn to_json_line(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|err| {
+            serde_json::json!({
+                "schema": DOCTOR_SCHEMA,
+                "status": "error",
+                "exit_code": EXIT_FAILURE,
+                "checks": [],
+                "summary": format!("体检报告序列化失败: {err}"),
+            })
+            .to_string()
+        })
+    }
+}
+
+/// 整体结论：任何一项 ERROR → `error`；否则任何一项 WARN → `warn`；否则 `ok`。
+fn doctor_overall_status(checks: &[DoctorCheck]) -> DoctorStatus {
+    if checks.iter().any(|check| check.status.is_error()) {
+        DoctorStatus::Error
+    } else if checks
+        .iter()
+        .any(|check| check.status == DoctorStatus::Warn)
+    {
+        DoctorStatus::Warn
+    } else {
+        DoctorStatus::Ok
+    }
+}
+
+/// 退出码：只有 ERROR 才算失败。
+///
+/// WARN 不影响退出码——「可选组件缺一个」不该让调用脚本整条中断，但仍会写进报告，
+/// 由调用方自己决定要不要当回事。
+fn doctor_exit_code(status: DoctorStatus) -> i32 {
+    if status.is_error() {
+        EXIT_FAILURE
+    } else {
+        EXIT_OK
+    }
+}
+
+/// 三态计数：`(Ok, Warn, Error)`。
+fn doctor_counts(checks: &[DoctorCheck]) -> (usize, usize, usize) {
+    let mut counts = (0usize, 0usize, 0usize);
+    for check in checks {
+        match check.status {
+            DoctorStatus::Ok => counts.0 += 1,
+            DoctorStatus::Warn => counts.1 += 1,
+            DoctorStatus::Error => counts.2 += 1,
+        }
+    }
+    counts
+}
+
+/// 末行汇总：数量与整体结论在同一行里给完。
+fn doctor_summary(checks: &[DoctorCheck], status: DoctorStatus) -> String {
+    let (ok, warn, error) = doctor_counts(checks);
+    format!(
+        "汇总: 正常 {ok} 项 / 注意 {warn} 项 / 失败 {error} 项，整体状态 {}",
+        status.as_str()
+    )
+}
+
+/// 人读模式：每项一行 `OK 名称 - 说明`（有 `fix` 再跟一行），末行汇总。
+fn render_doctor_human(report: &DoctorReport) -> String {
+    let mut out = String::new();
+    for check in &report.checks {
+        out.push_str(&format!(
+            "{} {} - {}\n",
+            check.status.tag(),
+            check.label,
+            check.message
+        ));
+        if let Some(fix) = &check.fix {
+            out.push_str(&format!("fix: {fix}\n"));
+        }
+    }
+    out.push_str(&report.summary);
+    out.push('\n');
+    out
+}
+/// 收集体检项——**唯一**碰文件系统与硬件探测的地方。
+///
+/// 探测本身不在这里重写：配置 / 项目根 / 组件与模型 / 数据库存在性 / 项目根可写性
+/// 直接取自 [`diagnostics::run_checks`]，硬件档位取自 [`HardwareProfile`]，PATH 上的
+/// 可执行文件判定取自 `utils::model_download`。这里只补现有检查没有覆盖的四类：
+/// ffprobe 是否可用、GPU 与硬解档位、日志目录可写性、数据库能否只读打开。
+fn collect_doctor_checks() -> Vec<DoctorCheck> {
+    let root = AppConfig::app_root_dir();
+    let loaded = load_doctor_config(&root);
+    let mut checks = vec![doctor_check_config(&root, &loaded)];
+    let Ok(cfg) = loaded else {
+        // 配置读不出来，依赖配置的判定都没有输入：GPU 档位给一条占位说明，
+        // 再把不依赖配置的两项跑完，用户至少能拿到日志与数据库的结论。
+        checks.push(DoctorCheck::new(
+            CHECK_GPU,
+            "GPU / 硬解",
+            DoctorStatus::Warn,
+            "config.toml 不可用，未探测 GPU 与硬解档位",
+            Some(
+                "先修好 config.toml；只想看显卡情况时可启动图形界面，设置页会显示硬件档位。".into(),
+            ),
+        ));
+        checks.push(doctor_check_logs_dir(&root));
+        checks.push(doctor_check_database(&root));
+        return checks;
+    };
+    checks.extend(
+        diagnostics::run_checks(&cfg, &root)
+            .iter()
+            .map(doctor_check_from_diagnostics)
+            .filter(|check| check.name != DIAGNOSTIC_CONFIG_ITEM),
+    );
+    // ffprobe 紧跟 ffmpeg：同一类外部组件摆在一起，对照着看最省事。
+    let after_ffmpeg = checks
+        .iter()
+        .position(|check| check.name == "ffmpeg")
+        .map_or(checks.len(), |index| index + 1);
+    checks.insert(after_ffmpeg, doctor_check_ffprobe(&cfg, &root));
+    checks.push(doctor_check_gpu(&cfg));
+    checks.push(doctor_check_logs_dir(&root));
+    checks.push(doctor_check_database(&root));
+    checks
+}
+
+/// 读配置；失败时给出面向用户的原因字符串。
+///
+/// 刻意**不**走 `AppConfig::load_from_file` 里「文件不存在就写一份默认配置」那条路：
+/// 体检是只读操作，不能因为跑了一次自检就凭空多出一个配置文件。
+fn load_doctor_config(root: &Path) -> std::result::Result<AppConfig, String> {
+    let path = root.join("config.toml");
+    if !path.is_file() {
+        return Err(format!("{} 不存在", path.display()));
+    }
+    AppConfig::load_from_file(&path).map_err(|err| format!("{err:#}"))
+}
+
+/// 配置文件可读性：文件在 **且**能解析成 `AppConfig`（比「文件在不在」更强的判定）。
+fn doctor_check_config(
+    root: &Path,
+    loaded: &std::result::Result<AppConfig, String>,
+) -> DoctorCheck {
+    let path = root.join("config.toml");
+    match loaded {
+        Ok(_) => {
+            let message = if root.join(AppConfig::LOCAL_OVERRIDE).is_file() {
+                format!(
+                    "{} 可读，本机覆盖 {} 生效",
+                    path.display(),
+                    AppConfig::LOCAL_OVERRIDE
+                )
+            } else {
+                format!("{} 可读，无本机覆盖（便携默认，正常）", path.display())
+            };
+            DoctorCheck::new(
+                CHECK_CONFIG_READABLE,
+                "配置文件",
+                DoctorStatus::Ok,
+                message,
+                None,
+            )
+        }
+        Err(err) => DoctorCheck::new(
+            CHECK_CONFIG_READABLE,
+            "配置文件",
+            DoctorStatus::Error,
+            format!("{} 不可用：{err}", path.display()),
+            Some("启动一次图形界面会自动生成默认 config.toml；也可从仓库取一份放到项目根。".into()),
+        ),
+    }
+}
+
+/// 把 `diagnostics` 的检查项转成 doctor 的检查项，并补上 CLI 侧的修复建议。
+///
+/// `diagnostics` 的建议文本只在它自己的整段报告里拼装、没有对外暴露，这里按
+/// 「每项一句话」的形式各自维护一份（见 [`doctor_fix`]）。
+fn doctor_check_from_diagnostics(item: &CheckItem) -> DoctorCheck {
+    let status = match item.status {
+        CheckStatus::Ok => DoctorStatus::Ok,
+        CheckStatus::Warn => DoctorStatus::Warn,
+        CheckStatus::Fail => DoctorStatus::Error,
+    };
+    DoctorCheck::new(
+        item.id,
+        item.label.clone(),
+        status,
+        item.detail.clone(),
+        doctor_fix(item.id).map(str::to_string),
+    )
+}
+
+/// 逐项修复建议；没有对应建议（或项本身正常）时为 `None`。
+fn doctor_fix(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "project_root" => "确认启动目录：项目根的判据是根下存在 models/；也可用 VOICE2WORD_HOME 指定。",
+        "ffmpeg" => "把 FFmpeg 放到 tools/ffmpeg.exe，或在 config.local.toml 里把 paths.ffmpeg 指到实际位置。",
+        "whisper_cli" => "把缺失的 DLL 放到 exe 同目录，或换用自带运行库的构建。",
+        "whisper_model" => "重新下载该模型：文件被截断要到加载时才报错，体积对比是唯一的早期信号。",
+        "llama_cpp" => "把缺失的 DLL 放到 exe 同目录；解压不完整时重新解压一次。",
+        "llm_model" => "换成 .gguf 模型文件，并把配置里的 paths.llm_model 指过去。",
+        "python" => "需要指定解释器时，在 config.local.toml 里把 paths.python 写成绝对路径。",
+        "database" => "首次运行会自动创建；已存在却报打不开时，检查文件权限与磁盘。",
+        "data_dir_writable" => "把程序（及项目根）放到当前用户可写的目录，或修复该目录的权限。",
+        _ => return None,
+    })
+}
+
+/// ffprobe：与 ffmpeg 同目录的同名工具。
+///
+/// 转写链路本身只用 ffmpeg 探测时长与流信息，ffprobe 是**可选**组件（外部脚本或
+/// MCP 的探测工具会用），因此「找不到」只报 WARN，不影响退出码。
+fn doctor_check_ffprobe(cfg: &AppConfig, root: &Path) -> DoctorCheck {
+    let candidate = ffprobe_path_for(&resolve_under(root, &cfg.paths.ffmpeg));
+    let resolved = model_download::resolve_configured_executable(&candidate);
+    if model_download::resolved_executable_is_usable(&resolved) {
+        // 配置路径不在、但 PATH 上有同名命令时，解析结果就是裸命令名——照实说明来源，
+        // 免得用户以为「配置里那个不存在的路径」居然可用了。
+        let message = if resolved == candidate {
+            format!("{} 可用", resolved.display())
+        } else {
+            format!(
+                "{} 不存在，改用 PATH 上的 {}",
+                candidate.display(),
+                resolved.display()
+            )
+        };
+        DoctorCheck::new(CHECK_FFPROBE, "ffprobe", DoctorStatus::Ok, message, None)
+    } else {
+        DoctorCheck::new(
+            CHECK_FFPROBE,
+            "ffprobe",
+            DoctorStatus::Warn,
+            format!("{} 不存在，PATH 上也没有 ffprobe", candidate.display()),
+            Some("需要外部脚本探测流信息时，把 ffprobe.exe 放到 ffmpeg 同目录或加入 PATH。".into()),
+        )
+    }
+}
+
+/// 从 ffmpeg 路径推出 ffprobe 路径：同目录、只换文件主干（`ffmpeg.exe` → `ffprobe.exe`）。
+fn ffprobe_path_for(ffmpeg: &Path) -> PathBuf {
+    let mut candidate = ffmpeg.to_path_buf();
+    candidate.set_file_name(match ffmpeg.extension() {
+        Some(ext) => format!("ffprobe.{}", ext.to_string_lossy()),
+        None => "ffprobe".to_string(),
+    });
+    candidate
+}
+
+/// 配置里的路径按 `root` 展开（绝对路径原样返回）——与自检报告里同一口径。
+fn resolve_under(root: &Path, raw: &str) -> PathBuf {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+/// GPU 与硬解档位。
+///
+/// 配置里两个 GPU 开关都关时直接取 [`HardwareProfile::cpu_only`]：与启动路径同一口径
+/// ——那种情况下适配器结果没人用，枚举一次适配器要好几秒，白等。
+fn doctor_check_gpu(cfg: &AppConfig) -> DoctorCheck {
+    if !cfg.gpu.hwaccel_decode && !cfg.gpu.whisper_offload {
+        return DoctorCheck::new(
+            CHECK_GPU,
+            "GPU / 硬解",
+            DoctorStatus::Ok,
+            format!(
+                "GPU 档已在配置里关闭（hwaccel_decode={}、whisper_offload={}），预览与识别走 CPU",
+                cfg.gpu.hwaccel_decode, cfg.gpu.whisper_offload
+            ),
+            None,
+        );
+    }
+    // 探测 panic（驱动异常等）不该把体检带崩：与启动路径一样降级成纯 CPU 档案。
+    let profile = std::panic::catch_unwind(HardwareProfile::detect)
+        .unwrap_or_else(|_| HardwareProfile::cpu_only());
+    if !profile.use_gpu_pipeline() {
+        return DoctorCheck::new(
+            CHECK_GPU,
+            "GPU / 硬解",
+            DoctorStatus::Warn,
+            format!(
+                "未探测到 GPU 适配器，wgpu 回落到软件后端（{}）",
+                profile.adapter_name
+            ),
+            Some("确认显卡驱动已安装；纯 CPU 也能跑，但预览解码与识别会明显更慢。".into()),
+        );
+    }
+    let vendor = profile
+        .vendor
+        .map(|vendor| vendor.label())
+        .unwrap_or("厂商未知");
+    let kind = if profile.is_discrete {
+        "独显"
+    } else {
+        "核显"
+    };
+    let hwaccel = if profile.hwaccel_backend().is_some() {
+        "可用"
+    } else {
+        "不可用（该适配器没有可用的硬解后端，走软解）"
+    };
+    DoctorCheck::new(
+        CHECK_GPU,
+        "GPU / 硬解",
+        DoctorStatus::Ok,
+        format!(
+            "适配器 {}（{vendor}、{kind}），输入侧硬解{hwaccel}",
+            profile.adapter_name
+        ),
+        None,
+    )
+}
+
+/// 日志目录可写性。
+///
+/// `logs/` 还不存在时只报 WARN：启动路径会自建它，首次运行前不存在是正常状态，
+/// 体检也不该为了「测一下」就凭空造目录。存在时写一个探针文件再删掉——真写一次
+/// 是唯一能确定「可写」的办法（与自检报告里项目根可写性同一套做法）。
+fn doctor_check_logs_dir(root: &Path) -> DoctorCheck {
+    let dir = root.join("logs");
+    if !dir.is_dir() {
+        return DoctorCheck::new(
+            CHECK_LOGS_DIR,
+            "日志目录",
+            DoctorStatus::Warn,
+            format!("{} 不存在（首次启动时自动创建）", dir.display()),
+            Some("启动一次图形界面即可；若一直创建不出来，检查项目根目录的权限。".into()),
+        );
+    }
+    let probe = dir.join(format!(".v2w_doctor_probe_{}", std::process::id()));
+    match std::fs::write(&probe, b"voice2word-doctor") {
+        Ok(()) => {
+            // 探针用完即删；删不掉只影响目录干净，不影响「可写」的结论。
+            if let Err(err) = std::fs::remove_file(&probe) {
+                eprintln!("提示: 体检探针写入成功但删除失败（目录确实可写，忽略）：{err}");
+            }
+            DoctorCheck::new(
+                CHECK_LOGS_DIR,
+                "日志目录",
+                DoctorStatus::Ok,
+                format!("{}（写入并删除探针文件成功）", dir.display()),
+                None,
+            )
+        }
+        Err(err) => DoctorCheck::new(
+            CHECK_LOGS_DIR,
+            "日志目录",
+            DoctorStatus::Error,
+            format!("{} 不可写：{err}", dir.display()),
+            Some("把程序放到当前用户可写的目录，或修复 logs/ 的权限；日志写不进去会让崩溃排查无从下手。".into()),
+        ),
+    }
+}
+
+/// 数据库可打开性：以**只读**方式连接并跑一次 `PRAGMA quick_check`。
+///
+/// 为什么不用 `storage::Database::open`：那个入口会建表、跑迁移、库损坏时改名留底，
+/// 全是写操作。体检只回答「现在能不能读」，写与自愈留给程序正常启动路径。
+fn doctor_check_database(root: &Path) -> DoctorCheck {
+    let path = root.join("voice2word.db");
+    if !path.is_file() {
+        return DoctorCheck::new(
+            CHECK_DATABASE_OPEN,
+            "数据库可打开",
+            DoctorStatus::Warn,
+            format!("{} 不存在（首次运行会自动创建）", path.display()),
+            None,
+        );
+    }
+    match open_database_readonly(&path) {
+        Ok(conn) => match conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0)) {
+            Ok(report) if report == "ok" => DoctorCheck::new(
+                CHECK_DATABASE_OPEN,
+                "数据库可打开",
+                DoctorStatus::Ok,
+                format!("{} 只读打开成功，quick_check 通过", path.display()),
+                None,
+            ),
+            Ok(report) => DoctorCheck::new(
+                CHECK_DATABASE_OPEN,
+                "数据库可打开",
+                DoctorStatus::Error,
+                format!("{} quick_check 未通过：{report}", path.display()),
+                Some("先备份该文件，再启动图形界面：它会先把损坏的库改名留底，然后重建一个空库继续运行。".into()),
+            ),
+            Err(err) => DoctorCheck::new(
+                CHECK_DATABASE_OPEN,
+                "数据库可打开",
+                DoctorStatus::Error,
+                format!("{} 打开成功但自检查询失败：{err}", path.display()),
+                Some("检查文件权限与磁盘状态；若另有实例正在写入，稍后重试。".into()),
+            ),
+        },
+        Err(err) => DoctorCheck::new(
+            CHECK_DATABASE_OPEN,
+            "数据库可打开",
+            DoctorStatus::Error,
+            format!("{} 只读打开失败：{err}", path.display()),
+            Some("检查文件权限与磁盘状态；被其它进程独占时稍后重试。".into()),
+        ),
+    }
+}
+
+/// 以「只读且不碰磁盘」的方式打开数据库。
+///
+/// 为什么要用 URI 形式的 `immutable=1`：库是 WAL 模式时，普通只读连接也会在同一个
+/// 目录里创建 `-wal` / `-shm` 两个伴随文件（哪怕只是查一次 `quick_check`）。体检只
+/// 回答「现在能不能读」，不该在用户目录里多出文件；`immutable=1` 表示这次打开期间
+/// 假定库文件不会被改动，SQLite 于是不建伴随文件、也不回放 WAL。
+fn open_database_readonly(
+    path: &Path,
+) -> std::result::Result<rusqlite::Connection, rusqlite::Error> {
+    rusqlite::Connection::open_with_flags(
+        sqlite_readonly_uri(path),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+}
+
+/// 把磁盘路径拼成 SQLite 的 `file:` URI。
+///
+/// - 反斜杠换成 `/`：URI 按 URL 规则解析；
+/// - `%`、`?`、`#`、空格按百分号转义——这几个字符在 URI 里有语法含义，不转义会被当成
+///   转义前缀或查询串分隔符，路径就会被截断；
+/// - 盘符路径（`A:\dir\db`）写成 `file:///A:/dir/db`，UNC 路径（`\\srv\sh\db`）写成
+///   `file://srv/sh/db`。
+fn sqlite_readonly_uri(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::with_capacity(normalized.len() + 24);
+    let prefix = if normalized.starts_with("//") {
+        "file:"
+    } else if normalized.starts_with('/') {
+        "file://"
+    } else {
+        "file:///"
+    };
+    encoded.push_str(prefix);
+    for ch in normalized.chars() {
+        match ch {
+            '%' => encoded.push_str("%25"),
+            '?' => encoded.push_str("%3F"),
+            '#' => encoded.push_str("%23"),
+            ' ' => encoded.push_str("%20"),
+            other => encoded.push(other),
+        }
+    }
+    encoded.push_str("?immutable=1");
+    encoded
+}
 /// 一次待执行的文件级任务（目录批量会展开成多条）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
@@ -2253,6 +2944,23 @@ fn tool_definitions() -> Vec<serde_json::Value> {
             "examples": ["voice2word tools --json", "voice2word tools --json --tool transcribe"],
             "result_schema": TOOLS_SCHEMA
         }),
+        serde_json::json!({
+            "name": "doctor",
+            "description": "本机自检（只读）：检查配置文件、ffmpeg / ffprobe、识别与翻译所需组件与模型、GPU 与硬解、日志目录可写性、数据库能否只读打开，逐项给出结论与修复建议。",
+            "command": "voice2word doctor [--json]",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "json": { "type": "boolean", "default": false, "description": "输出一行 JSON（schema voice2word.doctor.v1）" }
+                },
+                "required": [],
+                "additionalProperties": false
+            },
+            "read_only": true,
+            "side_effects": "无持久副作用：不改配置、不写字幕、不访问网络；判定目录可写性时创建并立即删除一个探针文件",
+            "examples": ["voice2word doctor", "voice2word doctor --json"],
+            "result_schema": DOCTOR_SCHEMA
+        }),
     ]
 }
 
@@ -3417,7 +4125,7 @@ mod tests {
     #[test]
     fn tool_definitions_expose_schema_and_examples() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
         let transcribe = tools
             .iter()
             .find(|tool| tool["name"] == TOOL_NAME_TRANSCRIBE)
@@ -3456,7 +4164,7 @@ mod tests {
             SUPPORTED_FORMATS.len()
         );
         assert!(value["environment"].is_object());
-        assert_eq!(value["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(value["tools"].as_array().unwrap().len(), 4);
 
         let args = ToolsArgs {
             json: true,
@@ -3484,9 +4192,226 @@ mod tests {
         assert!(text.contains(TOOL_NAME_TRANSCRIBE), "{text}");
         assert!(text.contains("transcribe_batch"), "{text}");
         assert!(text.contains("list_tools"), "{text}");
+        assert!(text.contains("doctor"), "{text}");
         assert!(text.contains("--json"), "{text}");
     }
 
+    /// 造一项体检结果：`status` 为 Ok 时按构造规则不带修复建议。
+    fn doctor_check(name: &str, status: DoctorStatus) -> DoctorCheck {
+        DoctorCheck::new(
+            name,
+            name,
+            status,
+            format!("{name} 说明"),
+            Some("修一下".to_string()),
+        )
+    }
+
+    #[test]
+    fn doctor_parses_json_and_help() {
+        assert_eq!(
+            parse(["voice2word", "doctor"]),
+            Ok(CliAction::Doctor(Box::new(DoctorArgs { json: false })))
+        );
+        assert_eq!(
+            parse(["voice2word", "doctor", "--json"]),
+            Ok(CliAction::Doctor(Box::new(DoctorArgs { json: true })))
+        );
+        assert_eq!(
+            parse(["voice2word", "doctor", "--help"]),
+            Ok(CliAction::Help(HelpTopic::Doctor))
+        );
+        assert_eq!(
+            parse(["voice2word", "doctor", "-h"]),
+            Ok(CliAction::Help(HelpTopic::Doctor))
+        );
+        // 帮助优先：后面的参数是否合法不影响返回帮助。
+        assert_eq!(
+            parse(["voice2word", "doctor", "--help", "--nope"]),
+            Ok(CliAction::Help(HelpTopic::Doctor))
+        );
+    }
+
+    #[test]
+    fn doctor_rejects_unknown_options_and_extra_arguments() {
+        assert!(parse_error(&["voice2word", "doctor", "--nope"]).contains("未知选项"));
+        assert!(parse_error(&["voice2word", "doctor", "extra"]).contains("多余"));
+        assert!(parse_error(&["voice2word", "doctor", "--json=true"]).contains("不接受取值"));
+        assert_eq!(run(["voice2word", "doctor", "--nope"]), Some(EXIT_USAGE));
+    }
+
+    #[test]
+    fn doctor_exit_code_follows_worst_status() {
+        let ok_only = DoctorReport::from_checks(vec![doctor_check("ffmpeg", DoctorStatus::Ok)]);
+        assert_eq!(ok_only.status, DoctorStatus::Ok);
+        assert_eq!(ok_only.exit_code, EXIT_OK);
+
+        let with_warn = DoctorReport::from_checks(vec![
+            doctor_check("ffmpeg", DoctorStatus::Ok),
+            doctor_check("ffprobe", DoctorStatus::Warn),
+        ]);
+        assert_eq!(with_warn.status, DoctorStatus::Warn);
+        assert_eq!(with_warn.exit_code, EXIT_OK, "只有注意项不算失败");
+
+        let with_error = DoctorReport::from_checks(vec![
+            doctor_check("ffprobe", DoctorStatus::Warn),
+            doctor_check("ffmpeg", DoctorStatus::Error),
+        ]);
+        assert_eq!(with_error.status, DoctorStatus::Error);
+        assert_eq!(with_error.exit_code, EXIT_FAILURE);
+        assert_eq!(doctor_exit_code(doctor_overall_status(&[])), EXIT_OK);
+    }
+
+    #[test]
+    fn doctor_json_line_is_single_line_and_parseable() {
+        let report = DoctorReport::from_checks(vec![
+            doctor_check("ffmpeg", DoctorStatus::Ok),
+            doctor_check("ffprobe", DoctorStatus::Warn),
+        ]);
+        let line = report.to_json_line();
+        assert!(!line.contains('\n'), "结果必须是一行: {line}");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("结果可解析");
+        assert_eq!(value["schema"], DOCTOR_SCHEMA);
+        assert_eq!(value["status"], "warn");
+        assert_eq!(value["exit_code"], 0);
+        let checks = value["checks"].as_array().expect("checks 是数组");
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0]["name"], "ffmpeg");
+        assert_eq!(checks[0]["status"], "ok");
+        assert!(checks[0]["message"].as_str().unwrap().contains("说明"));
+        assert!(checks[0]["fix"].is_null(), "正常项不带修复建议");
+        assert_eq!(checks[1]["name"], "ffprobe");
+        assert_eq!(checks[1]["status"], "warn");
+        assert_eq!(checks[1]["fix"], "修一下");
+        assert!(value["summary"].as_str().unwrap().contains("注意"));
+    }
+
+    #[test]
+    fn doctor_human_report_lists_every_check_and_ends_with_summary() {
+        let report = DoctorReport::from_checks(vec![
+            doctor_check("ffmpeg", DoctorStatus::Ok),
+            doctor_check("ffprobe", DoctorStatus::Warn),
+        ]);
+        let text = render_doctor_human(&report);
+        assert!(text.contains("OK ffmpeg - "), "{text}");
+        assert!(text.contains("WARN ffprobe - "), "{text}");
+        assert!(text.contains("fix: 修一下"), "{text}");
+        let last = text.lines().last().expect("末行");
+        assert!(last.starts_with("汇总:"), "末行是汇总: {last}");
+        assert!(last.contains("整体状态 warn"), "{last}");
+    }
+
+    #[test]
+    fn doctor_status_tags_and_json_values_are_stable() {
+        assert_eq!(DoctorStatus::Ok.tag(), "OK");
+        assert_eq!(DoctorStatus::Warn.tag(), "WARN");
+        assert_eq!(DoctorStatus::Error.tag(), "ERROR");
+        assert_eq!(DoctorStatus::Ok.as_str(), "ok");
+        assert_eq!(DoctorStatus::Warn.as_str(), "warn");
+        assert_eq!(DoctorStatus::Error.as_str(), "error");
+        assert_eq!(doctor_exit_code(DoctorStatus::Warn), EXIT_OK);
+        assert_eq!(doctor_exit_code(DoctorStatus::Error), EXIT_FAILURE);
+    }
+
+    #[test]
+    fn doctor_maps_diagnostics_items_and_keeps_fixes_off_ok_items() {
+        let failed = doctor_check_from_diagnostics(&CheckItem {
+            id: "ffmpeg",
+            label: "FFmpeg".to_string(),
+            status: CheckStatus::Fail,
+            detail: "缺失".to_string(),
+        });
+        assert_eq!(failed.name, "ffmpeg");
+        assert_eq!(failed.label, "FFmpeg");
+        assert_eq!(failed.status, DoctorStatus::Error);
+        assert!(failed.fix.is_some());
+
+        let ok = doctor_check_from_diagnostics(&CheckItem {
+            id: "ffmpeg",
+            label: "FFmpeg".to_string(),
+            status: CheckStatus::Ok,
+            detail: "就位".to_string(),
+        });
+        assert_eq!(ok.status, DoctorStatus::Ok);
+        assert!(ok.fix.is_none(), "正常项不带修复建议");
+        assert!(doctor_fix("不认识的 id").is_none());
+    }
+
+    #[test]
+    fn doctor_database_uri_is_read_only_and_encoded() {
+        assert_eq!(
+            sqlite_readonly_uri(Path::new("A:\\dir\\v2w.db")),
+            "file:///A:/dir/v2w.db?immutable=1"
+        );
+        // 空格与 URI 语法字符必须转义，否则路径会被当成别的位置。
+        assert_eq!(
+            sqlite_readonly_uri(Path::new("D:\\my dir\\v2w 1.db")),
+            "file:///D:/my%20dir/v2w%201.db?immutable=1"
+        );
+        assert!(sqlite_readonly_uri(Path::new("A:\\dir\\a%3Fb.db")).contains("%25"));
+    }
+
+    #[test]
+    fn ffprobe_path_follows_ffmpeg_layout() {
+        assert_eq!(
+            ffprobe_path_for(Path::new("tools/ffmpeg.exe")),
+            PathBuf::from("tools/ffprobe.exe")
+        );
+        assert_eq!(
+            ffprobe_path_for(Path::new("ffmpeg")),
+            PathBuf::from("ffprobe")
+        );
+    }
+
+    #[test]
+    fn doctor_is_registered_as_a_read_only_tool() {
+        let tools = tool_definitions();
+        let doctor = tools
+            .iter()
+            .find(|tool| tool["name"] == "doctor")
+            .expect("必须有体检工具");
+        assert_eq!(doctor["read_only"], true);
+        assert_eq!(doctor["result_schema"], DOCTOR_SCHEMA);
+        assert_eq!(
+            doctor["parameters"]["required"].as_array().unwrap().len(),
+            0
+        );
+        assert!(doctor["command"]
+            .as_str()
+            .unwrap()
+            .contains("voice2word doctor"));
+        assert!(
+            !TOOL_WHITELIST.contains(&"doctor"),
+            "体检不是可下发执行的动作"
+        );
+
+        let catalog = tools_catalog(Some("doctor")).expect("能只列 doctor");
+        assert_eq!(catalog["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(catalog["tools"][0]["name"], "doctor");
+        assert!(human_tools_summary(&catalog).contains("doctor"));
+    }
+
+    #[test]
+    fn doctor_usage_is_wired_into_top_level_help() {
+        let text = usage_doctor();
+        assert!(text.contains("--json"), "{text}");
+        assert!(text.contains(DOCTOR_SCHEMA), "{text}");
+        assert!(text.contains("退出码"), "{text}");
+        assert_eq!(usage_for(HelpTopic::Doctor), usage_doctor());
+
+        let top = usage();
+        let doctor_row = top
+            .lines()
+            .find(|line| line.starts_with("  voice2word doctor"))
+            .expect("顶层帮助要有 doctor 行");
+        let tools_row = top
+            .lines()
+            .find(|line| line.starts_with("  voice2word tools"))
+            .expect("顶层帮助要有 tools 行");
+        // 说明文字起始列必须与 tools 行一致，否则整段帮助的对齐就散了。
+        let column = |row: &str| row[28..].find(|c: char| c != ' ').map(|at| at + 28);
+        assert_eq!(column(doctor_row), column(tools_row));
+    }
     #[test]
     fn glossary_argument_is_normalized_to_lines() {
         assert_eq!(
