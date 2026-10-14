@@ -4,9 +4,10 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::subtitle::Segment;
@@ -49,6 +50,143 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
+// ───────────────────────── 有界等待、取消与输出收口 ─────────────────────────
+
+/// 有界等待的轮询间隔：50ms 是「取消 / 超时的响应延迟」与「空转开销」的折中
+/// （与 `punc.rs` 的有界等待取同一个值）。
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// 有界等待的固定开销预算（秒）：Python 冷启动 + onnxruntime / sherpa-onnx 动态库加载 +
+/// INT8 模型与 VAD 权重装载。实测「进程创建 → 能读输入」约 2~5s，首轮磁盘冷缓存与低端机
+/// 可达十几秒；120s 是宽松上限。
+const WAIT_COLD_START_SEC: f64 = 120.0;
+
+/// 每 1 秒音频容许的墙钟上限（秒）。
+///
+/// SenseVoice 是**非自回归单次前向**，官方口径比 Whisper 快 5~8 倍；即便按最保守的
+/// 「略快于实时」估计，1 秒音频也远用不到 3 秒墙钟。取 3.0 是给低端 CPU、线程数夹取、
+/// VAD 融合与磁盘抖动留的余量——量级对了，长音频才不会被误杀成「超时」。
+const WAIT_SECONDS_PER_AUDIO_SEC: f64 = 3.0;
+
+/// 时长未知（调用方拿不到媒体时长）时**假设**的音频长度（秒）。
+///
+/// 取 600s：SenseVoice 单会话推流路径的典型输入量级（切块阈值的同量级）。假设值只影响
+/// 等待预算、不影响结果；它保证「时长缺失」时仍有一个明确、可解释的上限，而不是退化成
+/// 「不设上限」。
+const WAIT_ASSUMED_AUDIO_SEC: f64 = 600.0;
+
+/// 有界等待的硬上限：无论音频多长、假设值多大，都不能让调用方无限等。
+///
+/// 1 小时。为什么不干脆不设上限：本项加固的目的就是把「runner 卡死 → 应用永久卡住、
+/// 只能杀进程」降级成「有限时间后失败并给出可读原因」。为什么不再小：SenseVoice 单会话
+/// 在 GPU 上可能一口吃掉整段长音频（推流路径不切块），2 小时素材按 5~8 倍实时也要十几到
+/// 二十分钟。
+const WAIT_BUDGET_MAX: Duration = Duration::from_secs(3600);
+
+/// 按音频时长推导有界等待预算：`冷启动 + 每秒音频 3 秒墙钟`，夹在 [`WAIT_BUDGET_MAX`] 内。
+///
+/// 为什么不能只用一个固定常量：同一个引擎既要跑十秒级短视频，也要跑几小时长音频（GPU
+/// 推流路径不切块，整个文件就是一次会话）。固定小预算会把长音频的正常推理误判成超时，
+/// 固定大预算又等于对小任务不设防。按时长缩放 + 硬上限同时解决两头；它是个纯函数，
+/// 取值理由可以在单测里直接钉住。
+fn wait_budget_for(duration_secs: Option<f64>) -> Duration {
+    let audio_sec = match duration_secs {
+        Some(d) if d.is_finite() && d > 0.0 => d,
+        _ => WAIT_ASSUMED_AUDIO_SEC,
+    };
+    let budget_sec = (WAIT_COLD_START_SEC + WAIT_SECONDS_PER_AUDIO_SEC * audio_sec)
+        .min(WAIT_BUDGET_MAX.as_secs_f64());
+    Duration::from_secs_f64(budget_sec)
+}
+
+/// 有界等待的出口（外加「等待本身失败」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    /// 子进程自行退出（退出码另行判断）。
+    Exited,
+    /// 用户点了「终止」。
+    Cancelled,
+    /// 到点仍未退出。
+    TimedOut,
+    /// `try_wait` 本身报错（句柄异常），不能死循环。
+    WaitFailed,
+}
+
+/// 本次轮询是否该退出等待；`None` = 继续等。
+///
+/// 优先级：**取消 > 超时**。两者同时成立时按「已取消」处理——用户主动终止是更强的语义，
+/// 文案也该显示「已取消」，而不是让用户以为自己撞上了超时。抽成纯函数是为了让这条优先级
+/// 能在单测里直接钉住，不必真的起子进程、等满预算。
+fn wait_outcome(cancelled: bool, past_deadline: bool) -> Option<WaitOutcome> {
+    if cancelled {
+        Some(WaitOutcome::Cancelled)
+    } else if past_deadline {
+        Some(WaitOutcome::TimedOut)
+    } else {
+        None
+    }
+}
+
+/// 有界等待子进程退出：`budget` 到点判超时，`cancelled()` 为真判取消。
+///
+/// 返回「出口 + `try_wait` 拿到的退出状态」（非正常退出时为 `None`）。抽成独立函数是为了
+/// 让三条出口都能在单测里用真实子进程 + 极小预算跑一遍，不必等满真实预算，也不依赖
+/// python 与模型文件。本函数**不**负责杀进程与收尸：那是调用方的事（先 kill 再 wait），
+/// 这样「谁在什么时候强杀」在调用点一眼可见。
+fn wait_for_child<F>(
+    child: &mut Child,
+    budget: Duration,
+    poll: Duration,
+    cancelled: F,
+) -> (WaitOutcome, Option<std::process::ExitStatus>)
+where
+    F: Fn() -> bool,
+{
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return (WaitOutcome::Exited, Some(status)),
+            Ok(None) => {}
+            Err(err) => {
+                // 等待本身出错（句柄异常）时不能死循环：按失败处理，由调用方强杀回收。
+                warn!(error = %err, "等待 SenseVoice 子进程失败，终止该进程");
+                return (WaitOutcome::WaitFailed, None);
+            }
+        }
+        // 判定抽成纯函数：让「取消优先于超时」这条语义能被单测直接钉住。
+        if let Some(outcome) = wait_outcome(cancelled(), Instant::now() >= deadline) {
+            return (outcome, None);
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// SenseVoice 阶段的可辨识失败。
+///
+/// 与 `punc::PuncStageError` 同款：调用方可以 `downcast_ref` 出具体原因，不必靠错误文案
+/// 里的关键字判断（一改文案就失效）。只有超时一个变体，是因为**取消不走错误通道**：管线
+/// 在转写返回后用自己那份 `cancelled` 标志做静默收尾，本引擎若把取消改成 `Err`，用户点
+/// 「终止」就会看到一条「转写失败」。取消仍可由 `SenseVoiceEngine::is_cancelled()` 读出，
+/// `Ok((空, 0.0))` 这个既有契约也由既有单测钉住。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenseVoiceStageError {
+    /// 超过等待上限仍未结束，已强杀进程树。
+    TimedOut,
+}
+
+impl std::fmt::Display for SenseVoiceStageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut => write!(
+                f,
+                "SenseVoice 识别超时，已终止本次转写；未产出字幕，请重试\
+                 （若反复超时，可换更小的模型或降低并行进程数）"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SenseVoiceStageError {}
 #[derive(Debug, Deserialize)]
 struct SenseVoiceStreamLine {
     event: String,
@@ -273,6 +411,14 @@ impl SenseVoiceEngine {
         }
     }
 
+    /// 用户是否已请求终止（与 whisper / punc 同名的只读入口）。
+    ///
+    /// 取消本身不走错误通道（管线按自己那份 `cancelled` 标志静默收尾，见 `cancel` 的说明），
+    /// 所以调用方要区分「已取消」与「超时 / 普通失败」时读这个，而不是去匹配错误文案。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
     /// 用户请求终止：置位取消标志并强杀正在运行的 runner 子进程
     ///
     /// 只杀 [`take_live_pids`] 交回的「尚未回收」PID：已被 `wait()` 回收的进程会在
@@ -299,9 +445,13 @@ impl SenseVoiceEngine {
 
     /// 上一次转写的 stdout 是否因**读取失败**（非 EOF）提前结束：`true` = 结果可能被截断。
     ///
-    /// `line_res.unwrap_or_default()` 的旧写法把「读到一半管道报错」变成一行空文本，
-    /// 再被 `trimmed.is_empty()` 丢掉：与「runner 正常收尾」在结果上完全同形。
-    /// 调用方（管线 / UI）读到 `true` 时应提示「字幕可能不完整」。
+    /// 置位点只有一个：`consume_stdout` 遇到**非 EOF** 的读失败（旧写法
+    /// `line_res.unwrap_or_default()` 把这种失败变成一行空文本、再被 `trimmed.is_empty()`
+    /// 丢掉，与「runner 正常收尾」在结果上完全同形）。
+    ///
+    /// 与错误**同向**：同一次转写里 `run_process_and_parse` 会返回 Err（绝不把半截结果写回），
+    /// 所以读到 `true` 只可能是「刚失败的那一轮」留下的信号，调用方（管线 / UI）据此给出
+    /// 「本次结果不可用 / 字幕可能不完整」的提示，`reset()` 会在下一轮开头清掉它。
     pub fn output_truncated(&self) -> bool {
         self.output_truncated.load(Ordering::SeqCst)
     }
@@ -371,7 +521,8 @@ impl SenseVoiceEngine {
     /// 这条时序能在单测里直接断言，不必真的拉起子进程、发系统信号。
     fn register_child(&self, pid: u32) -> (ChildPidGuard, bool) {
         let guard = ChildPidGuard::register(self.active_children.clone(), pid);
-        (guard, self.cancel.load(Ordering::SeqCst))
+        // 与 whisper / punc 的 register_child 同款：复查走同名只读入口，SeqCst 收口。
+        (guard, self.is_cancelled())
     }
 
     /// 检查 SenseVoice 所需脚本与全部模型权重是否就位
@@ -431,7 +582,7 @@ impl SenseVoiceEngine {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        self.run_process_and_parse(cmd, None, progress_cb)
+        self.run_process_and_parse(cmd, None, total_duration, progress_cb)
     }
 
     /// 纯内存管道推流转写：直接从流（Read）中泵入 PCM WAV 字节，0 磁盘 I/O 往返
@@ -477,13 +628,24 @@ impl SenseVoiceEngine {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        self.run_process_and_parse(cmd, Some(stream), progress_cb)
+        self.run_process_and_parse(cmd, Some(stream), total_duration, progress_cb)
     }
 
+    /// 跑一次 runner 子进程：抽干 stdout / stderr，解析逐行 JSON 事件流。
+    ///
+    /// 加固后的结构（与 `punc.rs` 同款）：
+    /// 1. stdin 泵送、stdout 抽干、stderr 抽干各有独立线程，**主线程只做有界等待**；
+    /// 2. 等待有明确上限（`wait_budget_for`：按时长缩放 + 硬上限），到点强杀进程树并收尸；
+    /// 3. 出口可区分：取消（既有 `Ok((空, 0.0))` 契约，管线按自己的 cancelled 标志静默收尾）、
+    ///    超时（`Err(SenseVoiceStageError::TimedOut)`，可 downcast）、普通失败（退出码非 0 /
+    ///    输出不可用）；
+    /// 4. **绝不把半截输出当结果写回**：stdout 读失败一律返回错误，而不是「少几句话的成功
+    ///    结果」。
     fn run_process_and_parse(
         &self,
         mut cmd: Command,
         input_stream: Option<Box<dyn std::io::Read + Send + 'static>>,
+        total_duration: Option<f64>,
         progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
         // 本轮结果是否被截断：必须在任何读取线程启动前清零，保证读到的永远是
@@ -492,8 +654,8 @@ impl SenseVoiceEngine {
         // spawn 前的取消早退：若取消在准备区（拼参数、选解释器…）期间就已到达，就没必要
         // 真的把 runner 拉起来再靠 register_child 的复查把它杀掉——那几毫秒里进程创建与
         // Python 解释器启动已经白做一遍，用户看到的是「点了终止却还闪了一下子进程」。
-        // 这里沿用与 `wait()` 之后取消分支完全相同的返回（空结果 + 0.0），由管线按取消
-        // 收尾，不发明新的错误类型或文案。
+        // 返回形态与 wait 之后的取消出口完全一致（空结果 + 0.0），由管线按取消收尾，
+        // 不发明新的错误类型或文案。
         //
         // run_process_and_parse 之前的准备区（`transcribe` / `transcribe_stream`）只拼了 `cmd`
         // 并已把它 move 进来，不持有需要手工清理的临时文件/JSON 守卫（SenseVoice 靠子进程
@@ -501,7 +663,7 @@ impl SenseVoiceEngine {
         //
         // 与 register_child 复查的分工：本处只覆盖「取消早于 spawn 请求」；取消落在本处与
         // register_child 之间时，仍由那处复查补杀。两者是串联的两道门，不会互相干扰。
-        if self.cancel.load(Ordering::SeqCst) {
+        if self.is_cancelled() {
             return Ok((Vec::new(), 0.0));
         }
 
@@ -523,6 +685,11 @@ impl SenseVoiceEngine {
         // 后续任何 `?` / 提前 return / 取消分支 / panic 展开都会经由 Drop 把这一行摘掉，
         // 不会留下会被 PID 复用误伤的陈旧条目。正常跑完时还要在 `wait()` 返回处
         // 主动 `disarm()`，见其文档。
+        //
+        // 声明次序是有意的：`child` 先声明、`child_guard` 后声明 ⇒ 逆序析构 ⇒ 守卫先摘登记行，
+        // `child` 的进程句柄后关闭。与 whisper / punc 的次序一致，也是「Windows 上不存在
+        // 陈旧 PID 被 cancel() 误杀」这条结论的前提：PID 只有在进程对象的最后一个句柄关闭后
+        // 才可能被复用，而那一刻登记行早已摘掉。
         let (mut child_guard, cancelled_before_register) = self.register_child(child.id());
         // 竞态收口：cancel() 可能恰好插在 spawn() 成功与上面的登记之间——那会儿本行
         // 还没进表，cancel() 的 take_live_pids() 拿到空名单，强杀信号就丢了，runner
@@ -569,140 +736,69 @@ impl SenseVoiceEngine {
             .take()
             .context("获取 SenseVoice 标准错误管道失败")?;
 
+        // stderr：独立线程抽干成**原始字节**再解码，主线程不碰管道。
+        //
+        // 为什么读字节而不是 `read_to_string`：sherpa-onnx 的 C++ 日志直写 fd 2，编码随系统
+        // 区域设置（中文 Windows 上常见 GBK），也可能在日志中途被截断成半个多字节序列。
+        // 严格解码一失败，旧代码就把整个 stderr 变成空串，于是「引擎没起来（C++ 侧日志不是
+        // UTF-8）」被报成「请检查 python / 依赖」——错误归因完全反了。这里先收全字节，再交给
+        // `decode_stderr_bytes` 做多编码兜底。
         let stderr_handle = std::thread::spawn(move || {
             use std::io::Read;
-            let mut err_str = String::new();
-            // `let _ =` 把读失败吞成空串：失败分支随后会给出「无任何输出」的误导提示
-            // （见 `stderr_str.trim().is_empty()`），而真正的事实是诊断通道断了或只读
-            // 到一半。至少留下一条带字节数的日志。
-            if let Err(err) = std::io::BufReader::new(stderr).read_to_string(&mut err_str) {
+            let mut raw: Vec<u8> = Vec::new();
+            // `let _ =` 把读失败吞成空串：失败分支随后会给出「无任何输出」的误导提示，
+            // 而真正的事实是诊断通道断了或只读到一半。至少留下一条带字节数的日志。
+            if let Err(err) = std::io::BufReader::new(stderr).read_to_end(&mut raw) {
                 warn!(
                     error = %err,
-                    bytes = err_str.len(),
+                    bytes = raw.len(),
                     "读取 SenseVoice 标准错误失败：诊断信息可能被截断"
                 );
             }
-            err_str
+            decode_stderr_bytes(&raw)
         });
 
-        let mut segments = Vec::new();
-        let mut inference_elapsed = 0.0f64;
-
-        use std::io::BufRead;
-        let reader = std::io::BufReader::new(stdout);
-        // 读失败（非 EOF）时 `drain_stdout_lines` 返回 Err：这件事必须能被带出去，
-        // 而不是像 `line_res.unwrap_or_default()` 那样变成一行空文本、再被
-        // `trimmed.is_empty()` 丢掉。
-        let mut unparsed_lines = 0usize;
-        let stdout_read = drain_stdout_lines(reader.lines(), "SenseVoice runner", |line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                // 闭包里的 `return` 等价于原 for 循环里的 `continue`。
-                return;
-            }
-
-            let parsed = serde_json::from_str::<SenseVoiceStreamLine>(trimmed);
-            if let Err(err) = &parsed {
-                // runner 协议是逐行 JSON：解不开的行以前被完全静默地丢掉，版本不匹配
-                // 时用户只会看到「一句都没有」。只报首条（带截断预览）避免刷屏，
-                // 收尾再汇总总数。
-                if unparsed_lines == 0 {
-                    let preview: String = trimmed.chars().take(160).collect();
-                    warn!(
-                        error = %err,
-                        preview = %preview,
-                        "SenseVoice runner 输出了无法解析的行：已忽略"
-                    );
-                }
-                unparsed_lines += 1;
-                return;
-            }
-            if let Ok(parsed) = parsed {
-                match parsed.event.as_str() {
-                    "segment" => {
-                        let seg = Segment {
-                            index: parsed.index,
-                            start: parsed.start,
-                            end: parsed.end,
-                            text: parsed.text.clone(),
-                            translation: None,
-                            translation_lang: None,
-                            polished: parsed.text.clone(),
-                            language: None,
-                            confidence: None,
-                            speaker: None,
-                            words: Vec::new(),
-                        };
-                        segments.push(seg.clone());
-                        if let Some(ref cb) = progress_cb {
-                            let label = format!("SenseVoice 极速转写中: 第 {} 句", parsed.index);
-                            // 与 Whisper 推流出口同源：Python runner 已按标点细切，但若某段
-                            // 仍超过 6s / 60 字（句内无可用切点），预览还得过一遍 Rust 拆分，
-                            // 否则界面实时流会比最终字幕表粗一档（最终表由 `optimize_segments`
-                            // 走同一个 `split_long_segments`）。
-                            for piece in crate::subtitle::split_long_segments(vec![seg]) {
-                                cb(parsed.progress, &label, Some(piece));
-                            }
-                        }
-                    }
-                    "finished" => {
-                        inference_elapsed = parsed.elapsed_sec;
-                        if segments.is_empty() && !parsed.segments.is_empty() {
-                            for item in parsed.segments {
-                                // runner 的 `polished` 与 `text` 目前同值，但字段是它主动
-                                // 声明的（`all_segments` 里两者并列）：直接拿 `text` 顶上
-                                // 等于把「已润色文本」这条通道静默掐掉——将来 runner 若
-                                // 输出真正的标点恢复文本，这里会一声不响地丢弃。
-                                let polished = if item.polished.trim().is_empty() {
-                                    item.text.clone()
-                                } else {
-                                    item.polished
-                                };
-                                segments.push(Segment {
-                                    index: item.index,
-                                    start: item.start,
-                                    end: item.end,
-                                    text: item.text,
-                                    translation: None,
-                                    translation_lang: None,
-                                    polished,
-                                    language: None,
-                                    confidence: None,
-                                    speaker: None,
-                                    words: Vec::new(),
-                                });
-                            }
-                        }
-                    }
-                    "provider" => {
-                        // runner 主动回报「请求 vs 实际」；比解析 stderr 文本稳。
-                        self.record_provider(&parsed.requested, &parsed.actual);
-                    }
-                    // 未知事件一律忽略：协议只增不改，旧引擎遇到新事件必须安全跳过。
-                    _ => {}
-                }
-            }
+        // stdout：独立线程抽干 + 逐行解析。**必须独立**：管道缓冲区只有几十 KB，主线程若
+        // 自己边读边等，一旦读取循环因任何原因停了（读失败、提前 return），就没人再消费
+        // 管道，runner 写满 64KB 后阻塞在 write 上，主线程的等待永不返回——这正是本项要修的
+        // 死锁。抽干线程即使掉线，主线程的有界等待也会兜底强杀。
+        //
+        // 进度回调要同时给抽干线程（流式预览）与收尾（1.0 完成）用：`Box<dyn Fn>` 不能克隆，
+        // 包一层 `Arc` 让两边共享。
+        let progress_cb = progress_cb.map(Arc::new);
+        let stdout_cb = progress_cb.clone();
+        let stdout_handle = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            consume_stdout(&mut reader, stdout_cb.as_deref())
         });
-        if unparsed_lines > 0 {
-            warn!(
-                unparsed_lines,
-                "SenseVoice runner 输出中有无法解析的行（协议版本不匹配？详见前面那条日志）"
-            );
-        }
-        if stdout_read.is_err() {
-            // 「输出被截断」的正式信号：调用方（管线 / UI）据此提示用户，
-            // 而不是把半份结果当成完整结果。
-            self.output_truncated.store(true, Ordering::SeqCst);
-        }
 
-        let wait_result = child.wait();
+        // 有界等待：正常退出 / 取消 / 超时三个出口，出口之后一律 kill + wait 回收。
+        // 旧写法直接 `child.wait()`：runner 卡死（onnxruntime 挂住、管道互等）时永不返回，
+        // 界面永远停在「正在识别」，唯一出口是关掉应用。
+        let child_pid = child.id();
+        let budget = wait_budget_for(total_duration);
+        let (outcome, status) = wait_for_child(&mut child, budget, WAIT_POLL_INTERVAL, || {
+            self.is_cancelled()
+        });
+        if !matches!(outcome, WaitOutcome::Exited) {
+            // 先按进程树强杀（与 whisper / punc 的取消路径同一套：除 Python 之外，
+            // onnxruntime 在部分后端会拉起辅助进程），再 kill 句柄兜底。句柄是我们自己
+            // spawn 的，TerminateProcess 必然成功，因此前面的 wait 不会变成第二次永久阻塞。
+            kill_process_tree(child_pid);
+            let _ = child.kill();
+        }
+        // 收尸：kill 之后必须 wait，否则句柄不释放；已自行退出的进程由 try_wait 收过尸，
+        // 这里拿到的是缓存状态，不会二次阻塞。
+        let _ = child.wait();
         // 进程已被 wait() 回收：立刻摘掉登记行，杜绝 cancel() 误杀可能复用该 PID 的
-        // 无关进程（详见 ChildPidGuard::disarm）。放在 wait() 紧后面，是为了不让
-        // 下面的线程 join 把这段窗口拉长。
+        // 无关进程（详见 ChildPidGuard::disarm）。放在 wait() 紧后面，是为了不让下面的
+        // 线程 join 把这段窗口拉长。
         child_guard.disarm();
         // 注销交给 child_guard：这里不再手写 retain，避免「新增一条提前返回路径
         // 就得记得再补一次」的维护陷阱（PID 的登记与注销由同一个栈变量负责）。
-        let status = wait_result.with_context(|| "等待 SenseVoice 进程结束失败")?;
+
+        // 进程已死 ⇒ 所有管道写端断开 ⇒ 三个抽干/泵送线程必然很快结束（超时强杀也一样），
+        // 这里的 join 不会挂。先收子线程再定性，避免半截数据参与判定。
         if let Some(h) = stream_handle {
             // 泵送线程 panic 以前被 `let _ = h.join()` 静默吞掉：这里至少留一条日志
             // （`join_or_log` 内部 error!），具体失败原因仍由 runner 退出码/stderr 兜底呈现。
@@ -717,18 +813,59 @@ impl SenseVoiceEngine {
                 Some(s) => (s, false),
                 None => (String::new(), true),
             };
+        // stdout 抽干线程掉线（panic）只可能是本文件的 bug：按「输出不可用」降级成截断信号，
+        // 绝不能当成「空结果」——那会把已经读到的片段悄无声息地吞掉。
+        let mut summary =
+            join_or_log(stdout_handle, "SenseVoice stdout 读取线程").unwrap_or_else(|| {
+                StdoutSummary {
+                    read_failed: true,
+                    ..StdoutSummary::default()
+                }
+            });
 
+        // runner 逐行回报的 provider 实况在主线程落库：`record_provider` 需要 `&self`，抽干
+        // 线程只带得回只读数据。首个回报为准的语义不变（`record_provider` 自己保证）。
+        for (requested, actual) in std::mem::take(&mut summary.provider_reports) {
+            self.record_provider(&requested, &actual);
+        }
         // 兜底通道：runner 未回传 `provider` 事件（旧版脚本）时，从 stderr 特征串识别
-        // 回落。`record_provider` 首次为准，故与事件通道同时命中也不会重复告警。
+        // 回落。判定用完整 stderr；`record_provider` 首次为准，故与事件通道同时命中也不会
+        // 重复告警。
         if stderr_provider_fallback(&stderr_str) {
             let requested = self.provider.clone();
             self.record_provider(&requested, "cpu");
         }
 
-        // 用户主动终止：被杀进程的退出码不重要，按空结果返回，由管线走取消收尾
-        if self.cancel.load(Ordering::SeqCst) {
+        // 用户主动终止：被杀进程的退出码不重要，按空结果返回，由管线走取消收尾。
+        // （这里刻意**不**返回 Err，理由见 `SenseVoiceStageError` 的说明；这也是既有契约。）
+        if self.is_cancelled() {
             return Ok((Vec::new(), 0.0));
         }
+
+        // 超时：与「用户取消」「普通失败」都不同——runner 自己卡住了，必须明确告警，而不是
+        // 静默（取消）或按退出码归因成「依赖没装好」（误导）。返回值可
+        // `downcast_ref::<SenseVoiceStageError>()` 出具体原因，调用方不必匹配文案。
+        if outcome == WaitOutcome::TimedOut {
+            warn!(
+                seconds = budget.as_secs(),
+                stderr = %stderr_str,
+                "SenseVoice 超过等待上限仍未结束，已强杀进程树"
+            );
+            return Err(anyhow::Error::new(SenseVoiceStageError::TimedOut));
+        }
+
+        // 等待本身失败（句柄异常）：`try_wait` 的 io 详情已在 `wait_for_child` 里 warn 过，
+        // 这里给上层一句可读结论；进程已按上面的强杀分支回收。
+        if outcome == WaitOutcome::WaitFailed {
+            anyhow::bail!("等待 SenseVoice 进程结束失败");
+        }
+
+        // Exited 出口必然带退出码；拿不到只可能是状态被上面的分支吃掉，保守报内部错误，
+        // 而不是继续用半截数据组装结果。
+        let status = match status {
+            Some(status) => status,
+            None => anyhow::bail!("SenseVoice 进程状态缺失：无法判断转写是否完成"),
+        };
 
         if !status.success() {
             // stderr 读取线程 panic 时 stderr_str 必为空，继续走下面「无输出＝Python 解释器或
@@ -757,16 +894,61 @@ impl SenseVoiceEngine {
             anyhow::bail!("SenseVoice 识别失败: {}", stderr_str.trim());
         }
 
+        // 结果定性：截断 / 整段不可解析 / 可用。判定是纯函数，三条方向都能直接单测。
+        let verdict = stdout_verdict(
+            summary.read_failed,
+            summary.parsed_lines,
+            summary.malformed_lines,
+        );
+
+        // 截断**优先于退出码**：读到一半报错是比「退出码非 0」更具体的信号。runner 自己崩掉时
+        // 管道写端关闭，我们拿到的是 EOF（`read_failed == false`），自然走下面的退出码分支拿到
+        // 真正的 stderr；反过来，读失败后读端关闭，runner 往往是被 EPIPE 打死的，退出码只会把
+        // 归因带偏。两条路都返回 Err、都不写回半截结果，区别只在文案方向。
+        if verdict == StdoutVerdict::Truncated {
+            // 「输出被截断」的正式信号：调用方（管线 / UI）据此提示用户。
+            // 与错误**同向**：这里返回 Err，绝不把已经读到的那半截当结果写回。
+            self.output_truncated.store(true, Ordering::SeqCst);
+            warn!(
+                code = ?status.code(),
+                stderr = %stderr_str,
+                "SenseVoice 输出被截断：读取 runner 标准输出失败（stderr 见上，供排查）"
+            );
+            anyhow::bail!(
+                "SenseVoice 输出被截断（runner 退出码 {:?}）：读取 runner 标准输出失败后中止。\
+                 已读到的内容不完整，本次结果不可用，请重试；若反复出现请保留 logs/ 中的日志。",
+                status.code()
+            );
+        }
+
+        // 有输出却一行都解不开：只在进程**正常退出**后才下这个结论——退出码非 0 时上面的
+        // 分支已经拿 stderr 给出了真正的失败原因，那时候报「协议不匹配」会把用户带偏。
+        if verdict == StdoutVerdict::Unparsable {
+            anyhow::bail!(
+                "SenseVoice runner 有输出但没有任何一行能解析成协议事件（{} 行无法解析）：\
+                 通常是 runner 脚本与引擎版本不匹配，或输出被非 UTF-8 文本污染。\
+                 请确认 tools/sensevoice_runner.py 与本程序版本一致。",
+                summary.malformed_lines
+            );
+        }
+
+        let mut segments = std::mem::take(&mut summary.segments);
+
         // 智能优化时间轴：消除 100ms 重叠鬼影、消除时间重叠冲突、广播级短句延展平滑
         crate::subtitle::optimize_segments(&mut segments);
 
-        if let Some(ref cb) = progress_cb {
+        if let Some(cb) = progress_cb.as_deref() {
             cb(
                 1.0,
                 &format!("SenseVoice 转写完成，共 {} 句", segments.len()),
                 None,
             );
         }
+
+        // 推理时长规整：`finished` 事件缺失（老 runner，或进程被杀只吐了半截协议）时它是
+        // 0.0，而调用方拿它算耗时占比会得到 0 或 inf。这里落到明确的下限常量，保证
+        // 「成功返回的时长恒 > 0」这条契约（取消出口的 0.0 是既有契约，见常量说明）。
+        let inference_elapsed = clamp_inference_elapsed(summary.inference_elapsed);
 
         info!(
             segments = segments.len(),
@@ -777,35 +959,242 @@ impl SenseVoiceEngine {
     }
 }
 
-/// 逐行消费 runner 的 stdout（逐行 JSON 流），每行解码后交给 `on_line`。
+/// `inference_elapsed` 的下限（秒）。
 ///
-/// 返回 `Ok(())` = 读到 EOF，**正常结束**；返回 `Err(..)` = **读失败**（非常 EOF）
-/// 中止，也就是「输出被截断」。
+/// `finished` 事件缺失（老版 runner，或进程被杀只吐了半截协议）时引擎记下的时长是 0.0，
+/// 而调用方（如 `core/metrics.rs` 的耗时占比）会拿它做除法：0 会让占比变成 0 或 inf。
+/// 用一个明确的小正数兜底，语义是「不足 1ms 记作 1ms」——比在调用方到处写判零清楚，且
+/// 「成功返回的 `inference_elapsed` 恒 `> 0`」这条契约可以在单测里直接钉住。
 ///
-/// 为什么要专门区分：旧写法 `let line = line_res.unwrap_or_default();` 把读错误变成
-/// 一行空文本，紧接着被 `trimmed.is_empty()` 丢掉——「管道读到一半坏了」与「runner
-/// 正常收尾」在结果上完全同形，用户只看到字幕少了一截，日志里毫无线索。
-/// 迭代器由参数注入，单测可以直接喂一条「读一半就报错」的假 stdout，不必拉起 Python。
-fn drain_stdout_lines<I>(lines: I, what: &str, mut on_line: impl FnMut(&str)) -> std::io::Result<()>
-where
-    I: IntoIterator<Item = std::io::Result<String>>,
-{
-    for line_res in lines {
-        match line_res {
-            Ok(line) => on_line(&line),
+/// 唯一的例外是**取消**：那条出口按既有契约返回 `0.0`（管线只按自己的 cancelled 标志收尾，
+/// 不会用到这个时长；既有单测也把 0.0 钉死了）。
+const INFERENCE_ELAPSED_FLOOR_SEC: f64 = 0.001;
+
+/// 把 runner 回报的推理时长规整成「调用方可以直接除」的值：非有限 / 非正 / 缺失一律落到
+/// [`INFERENCE_ELAPSED_FLOOR_SEC`]。
+fn clamp_inference_elapsed(raw: f64) -> f64 {
+    if raw.is_finite() && raw > 0.0 {
+        raw
+    } else {
+        INFERENCE_ELAPSED_FLOOR_SEC
+    }
+}
+
+/// runner stdout 抽干线程的汇总结果。
+#[derive(Debug, Default)]
+struct StdoutSummary {
+    /// 已解析出的字幕片段（`segment` 事件 + `finished.all_segments` 兜底）。
+    segments: Vec<Segment>,
+    /// `finished` 事件回报的推理时长（秒）；缺失时保持 0.0，返回前由
+    /// [`clamp_inference_elapsed`] 规整。
+    inference_elapsed: f64,
+    /// 成功解析成协议事件的行数。
+    parsed_lines: usize,
+    /// 非空但解不开的行数（半截 JSON / 非 UTF-8 乱码 / 协议不匹配）。
+    malformed_lines: usize,
+    /// `provider` 事件带回的「请求 vs 实际」，在主线程落库（见 `record_provider`）。
+    provider_reports: Vec<(String, String)>,
+    /// 是否遇到**非 EOF** 的读失败（= 输出被截断）。
+    read_failed: bool,
+}
+
+/// 一次 stdout 汇总的定性。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdoutVerdict {
+    /// 可用：解出了协议事件，或「完全空输出」（runner 静默退出，不是故障）。
+    Usable,
+    /// 读失败：结果被截断，绝不能当结果写回。
+    Truncated,
+    /// 有输出但一行都没解开：协议版本不匹配 / 非 UTF-8 乱码。
+    Unparsable,
+}
+
+/// 判定一次 stdout 汇总应当如何定性（纯函数，单测可直接钉住三个方向）。
+///
+/// 为什么「空输出」不算故障：runner 对无语音音频本来就可能一行都不吐（`segment` 事件为零），
+/// 此时退出码为 0，与「协议不匹配」必须区分开——后者一行都解析不出但**有输出**，那才是需要
+/// 用户介入的错误方向。截断（读失败）优先级最高：它意味着连「读到的是不是全部」都不成立。
+fn stdout_verdict(read_failed: bool, parsed_lines: usize, malformed_lines: usize) -> StdoutVerdict {
+    if read_failed {
+        return StdoutVerdict::Truncated;
+    }
+    if parsed_lines == 0 && malformed_lines > 0 {
+        return StdoutVerdict::Unparsable;
+    }
+    StdoutVerdict::Usable
+}
+
+/// 把 runner stdout 的一行原始字节解成文本（去首尾空白）。
+///
+/// 用 lossy 而不是严格 UTF-8：sherpa-onnx 的 C++ 日志与 python 的异常文本可能带 GBK 或半个
+/// 多字节序列，严格解码会让 `BufRead::lines()` 直接报 `InvalidData`，把「一行乱码」升级成
+/// 「管道读失败 → 输出被截断」的误判。协议行本身是 UTF-8 JSON（引擎侧日志不会混进 JSON 行），
+/// 去掉 BOM 后按 lossy 解码即可：坏字节只变成替换字符，解析失败被计入 `malformed_lines`，
+/// 归因方向正确。
+fn decode_stdout_line(raw: &[u8]) -> String {
+    let raw = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
+    String::from_utf8_lossy(raw).trim().to_string()
+}
+
+/// 把 runner stderr 的原始字节解成文本（多编码兜底，永不失败）。
+///
+/// sherpa-onnx 的 C++ 日志直接 `write(2)` 到 fd 2，编码随系统区域设置（中文 Windows 上常见
+/// GBK），也可能在日志中途被截断成半个多字节序列。以前这里用严格 UTF-8 解码：失败即返回
+/// 空串，于是「引擎根本没起来（C++ 侧日志不是 UTF-8）」被报成「请检查 python / 依赖」——
+/// 错误归因完全反了。顺序：严格 UTF-8 → GBK（`had_errors` 为假才算命中）→ lossy 兜底。
+fn decode_stderr_bytes(raw: &[u8]) -> String {
+    let raw = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
+    if let Ok(text) = std::str::from_utf8(raw) {
+        return text.to_string();
+    }
+    let (decoded, _, had_errors) = encoding_rs::GBK.decode(raw);
+    if !had_errors {
+        return decoded.into_owned();
+    }
+    String::from_utf8_lossy(raw).into_owned()
+}
+
+/// 把一条已解析的协议事件并入汇总（片段 / 进度回调 / provider 回报）。
+///
+/// 进度回调由 UI 层提供，这里用 `catch_unwind` 单独兜住：回调在 stdout 抽干线程里执行，
+/// 一旦 panic 展开，线程会直接死掉，读端随之关闭，**剩下的片段全部丢失**（用户看到「字幕
+/// 缺一半」且毫无线索），而子进程的 kill / wait 都在主线程，救不回来。代价是吞掉 UI 侧的
+/// panic——只记一条 warn 后继续消费输出；这比「一次 UI 抖动毁掉整次转写的后半段」划算。
+fn apply_stream_event(
+    summary: &mut StdoutSummary,
+    parsed: SenseVoiceStreamLine,
+    progress_cb: Option<&crate::engines::SegmentProgressCb>,
+) {
+    match parsed.event.as_str() {
+        "segment" => {
+            let seg = Segment {
+                index: parsed.index,
+                start: parsed.start,
+                end: parsed.end,
+                text: parsed.text.clone(),
+                translation: None,
+                translation_lang: None,
+                polished: parsed.text.clone(),
+                language: None,
+                confidence: None,
+                speaker: None,
+                words: Vec::new(),
+            };
+            summary.segments.push(seg.clone());
+            if let Some(cb) = progress_cb {
+                let label = format!("SenseVoice 极速转写中: 第 {} 句", parsed.index);
+                // 与 Whisper 推流出口同源：Python runner 已按标点细切，但若某段仍超过
+                // 6s / 60 字（句内无可用切点），预览还得过一遍 Rust 拆分，否则界面实时流
+                // 会比最终字幕表粗一档（最终表由 `optimize_segments` 走同一个
+                // `split_long_segments`）。
+                for piece in crate::subtitle::split_long_segments(vec![seg]) {
+                    let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(parsed.progress, &label, Some(piece));
+                    }));
+                    if called.is_err() {
+                        // 回调炸了不该拖垮识别：记一条日志，继续消费后面的输出。
+                        warn!("SenseVoice 进度回调 panic：已忽略，继续消费 runner 输出");
+                        break;
+                    }
+                }
+            }
+        }
+        "finished" => {
+            summary.inference_elapsed = parsed.elapsed_sec;
+            if summary.segments.is_empty() && !parsed.segments.is_empty() {
+                for item in parsed.segments {
+                    // runner 的 `polished` 与 `text` 目前同值，但字段是它主动声明的
+                    // （`all_segments` 里两者并列）：直接拿 `text` 顶上等于把「已润色文本」
+                    // 这条通道静默掐掉——将来 runner 若输出真正的标点恢复文本，这里会
+                    // 一声不响地丢弃。
+                    let polished = if item.polished.trim().is_empty() {
+                        item.text.clone()
+                    } else {
+                        item.polished
+                    };
+                    summary.segments.push(Segment {
+                        index: item.index,
+                        start: item.start,
+                        end: item.end,
+                        text: item.text,
+                        translation: None,
+                        translation_lang: None,
+                        polished,
+                        language: None,
+                        confidence: None,
+                        speaker: None,
+                        words: Vec::new(),
+                    });
+                }
+            }
+        }
+        "provider" => summary
+            .provider_reports
+            .push((parsed.requested.clone(), parsed.actual.clone())),
+        // 未知事件一律忽略：协议只增不改，旧引擎遇到新事件必须安全跳过。
+        _ => {}
+    }
+}
+
+/// 抽干并解析 runner 的 stdout（逐行 JSON 事件流），返回一次性汇总。
+///
+/// - 逐行按**原始字节**读入（`read_until(b'\n')`）再 lossy 解码：用 `BufRead::lines()` 的话，
+///   非 UTF-8 行会直接报 `InvalidData`，把「一行乱码」误判成「管道读失败」。
+/// - 读失败（非 EOF）只置 `read_failed` 后停止消费，不再把半截结果丢掉——出口由主线程的
+///   有界等待 + [`stdout_verdict`] 统一定性。
+/// - 泛型 `R: BufRead` 让单测能注入「空输出 / 半截 JSON / 非 UTF-8 字节 / 读到一半报错」的
+///   假管道，完全不必拉起 python 与真模型。
+fn consume_stdout<R: std::io::BufRead>(
+    reader: &mut R,
+    progress_cb: Option<&crate::engines::SegmentProgressCb>,
+) -> StdoutSummary {
+    let mut summary = StdoutSummary::default();
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        raw.clear();
+        match reader.read_until(b'\n', &mut raw) {
+            // 正常结束（EOF）。
+            Ok(0) => break,
+            Ok(_) => {
+                let line = decode_stdout_line(&raw);
+                if line.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<SenseVoiceStreamLine>(&line) {
+                    Ok(parsed) => {
+                        summary.parsed_lines += 1;
+                        apply_stream_event(&mut summary, parsed, progress_cb);
+                    }
+                    Err(err) => {
+                        // runner 协议是逐行 JSON：解不开的行以前被完全静默地丢掉，版本不匹配
+                        // 时用户只会看到「一句都没有」。只报首条（带截断预览）避免刷屏，
+                        // 收尾按 `stdout_verdict` 定性。
+                        if summary.malformed_lines == 0 {
+                            let preview: String = line.chars().take(160).collect();
+                            warn!(
+                                error = %err,
+                                preview = %preview,
+                                "SenseVoice runner 输出了无法解析的行：已忽略"
+                            );
+                        }
+                        summary.malformed_lines += 1;
+                    }
+                }
+            }
             Err(err) => {
+                // 读失败（非 EOF）：记下信号后停止消费。reader 随本函数返回被丢弃 ⇒ 管道读端
+                // 关闭 ⇒ 仍在写 stdout 的 runner 会立刻拿到写失败而不是堵在 64KB 缓冲区上。
                 warn!(
                     error = %err,
-                    stdout = what,
-                    "读取标准输出失败：转写输出被截断（这不是正常结束）"
+                    "读取 SenseVoice 标准输出失败：转写输出被截断（这不是正常结束）"
                 );
-                return Err(err);
+                summary.read_failed = true;
+                break;
             }
         }
     }
-    Ok(())
+    summary
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,7 +1309,7 @@ mod tests {
         // 注意：不设置 stdout 管道 → 触发「获取 SenseVoice 标准输出管道失败」
 
         let err = engine
-            .run_process_and_parse(cmd, None, None)
+            .run_process_and_parse(cmd, None, None, None)
             .expect_err("stdout 未接管时必须提前返回错误");
         assert!(
             err.to_string().contains("标准输出"),
@@ -944,10 +1333,16 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let (segments, _) = engine
-            .run_process_and_parse(cmd, None, None)
+        let (segments, elapsed_sec) = engine
+            .run_process_and_parse(cmd, None, None, None)
             .expect("空输出的子进程应当正常结束");
         assert!(segments.is_empty(), "没有 JSON 输出就不该有字幕片段");
+        // 没有 `finished` 事件 ⇒ 时长字段缺失。成功出口必须给出非 0 值：调用方拿它做除法
+        // （core/metrics.rs 的耗时占比），0 会变成 0 / inf。
+        assert!(
+            elapsed_sec > 0.0,
+            "成功返回的推理时长不得为 0（缺失时必须落到下限常量），实得 {elapsed_sec}"
+        );
         assert!(
             registered(&engine.active_children).is_empty(),
             "子进程结束后登记表必须为空"
@@ -1061,7 +1456,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let (segments, _) = engine
-            .run_process_and_parse(cmd, None, None)
+            .run_process_and_parse(cmd, None, None, None)
             .expect("被强杀的 runner 应当走取消路径正常返回");
         let elapsed = started.elapsed();
 
@@ -1097,7 +1492,7 @@ mod tests {
             .stderr(Stdio::piped());
 
         let (segments, elapsed_sec) = engine
-            .run_process_and_parse(cmd, None, None)
+            .run_process_and_parse(cmd, None, None, None)
             .expect("取消早退必须走既有取消路径，返回 Ok(空结果) 而不是创建失败的错误");
         assert!(segments.is_empty(), "取消后不应产出任何字幕片段");
         assert_eq!(elapsed_sec, 0.0, "取消早退沿用既有取消分支的 0.0 时长");
@@ -1122,7 +1517,7 @@ mod tests {
             .stderr(Stdio::piped());
 
         let err = engine
-            .run_process_and_parse(cmd, None, None)
+            .run_process_and_parse(cmd, None, None, None)
             .expect_err("未取消时必须真的尝试 spawn，哨兵命令创建失败应报错");
         let msg = format!("{err:#}");
         assert!(
@@ -1161,7 +1556,7 @@ mod tests {
             .stderr(Stdio::piped());
 
         let (segments, _) = engine
-            .run_process_and_parse(cmd, None, None)
+            .run_process_and_parse(cmd, None, None, None)
             .expect("取消早退应正常返回空结果");
         let traced = marker.exists();
         let _ = std::fs::remove_file(&marker);
@@ -1389,44 +1784,372 @@ mod tests {
         assert_eq!(lo.threads, MIN_THREADS, "构造器必须把 0 抬到 MIN_THREADS");
     }
 
-    // ───────── 读失败 ≠ 正常结束：管道故障不再静默变成「少了几句话」 ─────────
+    // ───────── 有界等待：三条出口都用真实子进程跑一遍 ─────────
+    //
+    // 这些用例用 cmd/ping 验证等待行为，只在 Windows 上跑（项目目标平台）。
 
-    /// 回归：stdout **读失败**必须与正常结束（EOF）区分开。
-    ///
-    /// 旧写法 `line_res.unwrap_or_default()` 把读错误变成一行空文本、再被
-    /// `trimmed.is_empty()` 丢掉，用户侧就是「字幕少了一截」；两件事必须能分开。
-    /// 迭代器由参数注入，单测不必真的拉起 Python runner。
-    #[test]
-    fn drain_stdout_lines_separates_read_failure_from_eof() {
-        // 1) 正常读完（EOF 由迭代器结束表达）：Ok(())，所有行都交付
-        let mut got = Vec::new();
-        let clean = vec![
-            Ok("{\"event\":\"segment\"}".to_string()),
-            Ok("x".to_string()),
-        ];
-        assert!(
-            drain_stdout_lines(clean, "测试", |line| got.push(line.to_string())).is_ok(),
-            "正常结束不是失败"
-        );
-        assert_eq!(
-            got,
-            vec!["{\"event\":\"segment\"}".to_string(), "x".to_string()]
-        );
-
-        // 2) 读到第二行时管道报错：必须 Err，且失败前读到的行要保留
-        let mut got = Vec::new();
-        let broken = vec![
-            Ok("first".to_string()),
-            Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "假管道：读失败",
-            )),
-        ];
-        let outcome = drain_stdout_lines(broken, "测试", |line| got.push(line.to_string()));
-        assert!(outcome.is_err(), "读失败必须与 EOF 分开表达");
-        assert_eq!(got, vec!["first".to_string()], "失败前读到的行必须保留");
+    /// ping 要跑约 30 秒，足够验证「超时 / 取消时真的强杀」。
+    #[cfg(target_os = "windows")]
+    fn spawn_long_lived() -> Child {
+        Command::new("cmd")
+            .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ping")
     }
 
+    /// 立刻以 0 退出，用来验证「正常退出」出口。
+    #[cfg(target_os = "windows")]
+    fn spawn_short_lived() -> Child {
+        Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd")
+    }
+
+    /// 判定语义：都没命中就继续等；命中就退出；两者同时成立时「取消」优先于「超时」
+    /// （用户主动终止是更强的语义）。
+    #[test]
+    fn wait_outcome_prioritises_cancel_over_timeout() {
+        assert_eq!(wait_outcome(false, false), None, "都没到点必须继续等");
+        assert_eq!(wait_outcome(true, false), Some(WaitOutcome::Cancelled));
+        assert_eq!(wait_outcome(false, true), Some(WaitOutcome::TimedOut));
+        assert_eq!(
+            wait_outcome(true, true),
+            Some(WaitOutcome::Cancelled),
+            "同时超时时按「已取消」上报"
+        );
+    }
+
+    /// 等待预算必须**随时长增长**、且始终有**硬上限**：
+    /// - 固定小预算会把长音频的正常推理误杀成「超时」；
+    /// - 没有上限就等于没把「runner 卡死 → 应用永久卡住」降级成有限失败。
+    #[test]
+    fn wait_budget_scales_with_audio_duration_and_stays_bounded() {
+        let assumed = Duration::from_secs_f64(
+            WAIT_COLD_START_SEC + WAIT_SECONDS_PER_AUDIO_SEC * WAIT_ASSUMED_AUDIO_SEC,
+        );
+        assert_eq!(wait_budget_for(None), assumed, "时长未知时用假设值");
+        // 短视频的预算必须能覆盖冷启动（模型加载比推理本身还慢）。
+        assert!(
+            wait_budget_for(Some(10.0)) >= Duration::from_secs_f64(WAIT_COLD_START_SEC),
+            "冷启动余量不得被时长缩放吃掉"
+        );
+        // 长音频：预算必须随时长单调增长，否则长素材会被误杀。
+        assert!(
+            wait_budget_for(Some(3600.0)) > wait_budget_for(Some(600.0)),
+            "预算必须随时长增长"
+        );
+        // 硬上限：再长、再离谱的时长都不能让调用方无限等。
+        assert_eq!(wait_budget_for(Some(1.0e9)), WAIT_BUDGET_MAX);
+        assert_eq!(wait_budget_for(Some(f64::MAX)), WAIT_BUDGET_MAX);
+        assert!(
+            WAIT_BUDGET_MAX <= Duration::from_secs(6 * 3600),
+            "上限不得失控"
+        );
+        // 损坏的时长字段（0 / 负数 / NaN / inf）按「未知」处理，不能让预算变成 0 或 NaN。
+        for bad in [Some(0.0), Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            assert_eq!(
+                wait_budget_for(bad),
+                assumed,
+                "非法时长 {bad:?} 必须回落到假设值"
+            );
+        }
+        assert!(WAIT_POLL_INTERVAL > Duration::ZERO, "轮询间隔不能为 0");
+        assert!(
+            WAIT_POLL_INTERVAL <= Duration::from_millis(500),
+            "轮询间隔过长会让取消 / 超时的响应明显迟滞"
+        );
+    }
+
+    /// 有界等待的三条出口都要能用**真实子进程**跑通：正常退出、超时（预算极小 + 长跑进程）、
+    /// 取消。预算与轮询间隔是参数，因此不必等满真实预算，也不依赖 python / 模型。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn bounded_wait_reports_exit_timeout_and_cancel() {
+        let short_poll = Duration::from_millis(20);
+
+        // 正常退出：立刻拿到退出码，且不判超时。
+        let mut child = spawn_short_lived();
+        let (outcome, status) =
+            wait_for_child(&mut child, Duration::from_secs(30), short_poll, || false);
+        assert_eq!(outcome, WaitOutcome::Exited);
+        assert!(status.expect("正常退出必须带退出码").success());
+
+        // 超时：ping 要跑 30 秒，预算只给 300ms，必须在预算附近返回「超时」而不是死等。
+        let mut child = spawn_long_lived();
+        let started = Instant::now();
+        let (outcome, status) =
+            wait_for_child(&mut child, Duration::from_millis(300), short_poll, || false);
+        assert_eq!(outcome, WaitOutcome::TimedOut);
+        assert!(status.is_none(), "未退出的进程不得给出退出码");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "有界等待必须在预算附近返回，绝不无限等"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // 取消：预算给到 30 秒，但取消已置位 → 立刻返回「取消」，不必等到超时。
+        let mut child = spawn_long_lived();
+        let started = Instant::now();
+        let (outcome, _) = wait_for_child(&mut child, Duration::from_secs(30), short_poll, || true);
+        assert_eq!(outcome, WaitOutcome::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "取消必须立刻生效，而不是等到超时"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// 超时必须能与「普通失败」区分开：调用方可以 downcast 出具体原因，而不是靠错误文案里的
+    /// 关键字（改文案就失效）。
+    #[test]
+    fn timeout_error_is_downcastable_and_never_claims_partial_success() {
+        let err = anyhow::Error::new(SenseVoiceStageError::TimedOut);
+        assert_eq!(
+            err.downcast_ref::<SenseVoiceStageError>(),
+            Some(&SenseVoiceStageError::TimedOut)
+        );
+        assert!(err.to_string().contains("超时"), "文案要讲清是超时: {err}");
+    }
+
+    // ───────── stdout 解析：空输出 / 半截 JSON / 非 UTF-8 都不能崩，方向要对 ─────────
+
+    /// 定性纯函数的三条方向：截断（读失败）、整段不可解析（有输出但一行都解不开）、可用。
+    /// 空输出必须归到「可用」——runner 对无语音音频本来就可能一行不吐，误报成错误方向会把
+    /// 用户引去查 python 依赖。
+    #[test]
+    fn stdout_verdict_separates_truncated_unparsable_and_usable() {
+        assert_eq!(
+            stdout_verdict(true, 3, 0),
+            StdoutVerdict::Truncated,
+            "读失败一律按截断"
+        );
+        assert_eq!(
+            stdout_verdict(true, 0, 0),
+            StdoutVerdict::Truncated,
+            "截断优先于其它判定"
+        );
+        assert_eq!(
+            stdout_verdict(false, 0, 0),
+            StdoutVerdict::Usable,
+            "空输出不是故障"
+        );
+        assert_eq!(
+            stdout_verdict(false, 0, 2),
+            StdoutVerdict::Unparsable,
+            "有输出却一行都解不开"
+        );
+        assert_eq!(
+            stdout_verdict(false, 5, 2),
+            StdoutVerdict::Usable,
+            "解出事件即可用"
+        );
+    }
+
+    /// 逐行解析对三种畸形输入都不能 panic，且计数方向正确：
+    /// - 空输出 → 无事件、无坏行（可用）；
+    /// - 半截 JSON → 记坏行、不产出片段；
+    /// - 非 UTF-8 字节（GBK「错」= B4 ED）→ 按 lossy 解码后记坏行，**不是**读失败。
+    #[test]
+    fn consume_stdout_tolerates_empty_truncated_json_and_non_utf8() {
+        // 1) 空输出
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        let summary = consume_stdout(&mut empty, None);
+        assert_eq!(summary.parsed_lines, 0);
+        assert_eq!(summary.malformed_lines, 0);
+        assert!(summary.segments.is_empty());
+        assert!(!summary.read_failed, "空输出是 EOF，不是读失败");
+        assert_eq!(
+            stdout_verdict(
+                summary.read_failed,
+                summary.parsed_lines,
+                summary.malformed_lines
+            ),
+            StdoutVerdict::Usable
+        );
+
+        // 2) 半截 JSON + 非 UTF-8 行 + 一条合法行
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"{\"event\":\"seg\n");
+        bytes.extend_from_slice(&[0xB4, 0xED, b'\n']);
+        bytes.extend_from_slice(b"{\"event\":\"finished\",\"elapsed_sec\":2.5}\n");
+        let mut broken = std::io::Cursor::new(bytes);
+        let summary = consume_stdout(&mut broken, None);
+        assert_eq!(
+            summary.malformed_lines, 2,
+            "半截 JSON 与非 UTF-8 行都必须计入坏行"
+        );
+        assert_eq!(summary.parsed_lines, 1, "后面的合法行仍要解析出来");
+        assert_eq!(summary.inference_elapsed, 2.5);
+        assert!(!summary.read_failed, "乱码不是管道故障，归因方向要正确");
+        assert_eq!(
+            stdout_verdict(
+                summary.read_failed,
+                summary.parsed_lines,
+                summary.malformed_lines
+            ),
+            StdoutVerdict::Usable
+        );
+
+        // 3) 整段都是坏行 ⇒ 判为不可解析（调用方据此报「runner 版本不匹配」，而不是「空结果」）
+        let mut junk = std::io::Cursor::new(vec![0xB4, 0xED, b'\n', b'{', b'\n']);
+        let summary = consume_stdout(&mut junk, None);
+        assert_eq!(summary.parsed_lines, 0);
+        assert_eq!(summary.malformed_lines, 2);
+        assert_eq!(
+            stdout_verdict(
+                summary.read_failed,
+                summary.parsed_lines,
+                summary.malformed_lines
+            ),
+            StdoutVerdict::Unparsable
+        );
+    }
+
+    /// 读到一半报错必须与 EOF 分开：`read_failed` 置位 ⇒ 定性为截断，调用方据此报错，绝不把
+    /// 半截输出当结果（钉住的正是原 `drain_stdout_lines` 用例的同一条契约）。
+    #[test]
+    fn consume_stdout_separates_read_failure_from_eof() {
+        /// 假管道：先交付一行合法 JSON，之后每次读都报 BrokenPipe。
+        struct FailingReader {
+            queued: Vec<u8>,
+            pos: usize,
+        }
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos < self.queued.len() {
+                    let n = (self.queued.len() - self.pos).min(buf.len());
+                    buf[..n].copy_from_slice(&self.queued[self.pos..self.pos + n]);
+                    self.pos += n;
+                    return Ok(n);
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "假管道：读失败",
+                ))
+            }
+        }
+
+        let line =
+            b"{\"event\":\"segment\",\"index\":1,\"start\":0.0,\"end\":1.0,\"text\":\"a\"}\n";
+        // 对照组：同样的字节读完后正常 EOF ⇒ 不是读失败。
+        let mut clean = std::io::Cursor::new(line.to_vec());
+        let summary = consume_stdout(&mut clean, None);
+        assert_eq!(summary.segments.len(), 1);
+        assert!(!summary.read_failed, "正常 EOF 不是读失败");
+        assert_eq!(
+            stdout_verdict(
+                summary.read_failed,
+                summary.parsed_lines,
+                summary.malformed_lines
+            ),
+            StdoutVerdict::Usable
+        );
+
+        // 主用例：读完这一行后管道报错 ⇒ 必须定性为截断。
+        let mut reader = std::io::BufReader::new(FailingReader {
+            queued: line.to_vec(),
+            pos: 0,
+        });
+        let summary = consume_stdout(&mut reader, None);
+        assert_eq!(summary.segments.len(), 1, "失败前读到的行仍要保留");
+        assert!(summary.read_failed, "读失败必须与 EOF 分开表达");
+        assert_eq!(
+            stdout_verdict(
+                summary.read_failed,
+                summary.parsed_lines,
+                summary.malformed_lines
+            ),
+            StdoutVerdict::Truncated
+        );
+    }
+
+    /// 进度回调 panic 不能毁掉输出消费：回调跑在 stdout 抽干线程里，panic 展开会让线程直接
+    /// 死掉、读端关闭，后面所有片段无声丢失。这里用一个必然 panic 的回调，断言后续行仍被
+    /// 解析出来（`catch_unwind` 兜住了它）。
+    #[test]
+    fn panicking_progress_callback_does_not_stop_stdout_consumption() {
+        let lines = concat!(
+            "{\"event\":\"segment\",\"index\":1,\"start\":0.0,\"end\":1.0,\"text\":\"a\"}\n",
+            "{\"event\":\"segment\",\"index\":2,\"start\":1.0,\"end\":2.0,\"text\":\"b\"}\n",
+            "{\"event\":\"finished\",\"elapsed_sec\":1.0}\n",
+        );
+        let mut reader = std::io::Cursor::new(lines.as_bytes().to_vec());
+        let cb: crate::engines::SegmentProgressCb = Box::new(|_, _, _| panic!("UI 回调炸了"));
+        // 静音 panic 打印，避免测试输出里出现像失败的堆栈。
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let summary = consume_stdout(&mut reader, Some(&cb));
+        std::panic::set_hook(prev);
+
+        assert_eq!(
+            summary.segments.len(),
+            2,
+            "回调 panic 后仍必须解析出全部片段"
+        );
+        assert_eq!(summary.parsed_lines, 3);
+        assert_eq!(summary.inference_elapsed, 1.0);
+        assert!(!summary.read_failed);
+    }
+
+    /// stderr 解码必须对非 UTF-8 字节有兜底：中文 Windows 上 sherpa-onnx 的 C++ 日志是 GBK，
+    /// 严格 UTF-8 解码失败会让「引擎没起来」被报成「请检查 python / 依赖」。
+    #[test]
+    fn stderr_decode_survives_non_utf8_and_truncated_bytes() {
+        // GBK「未找到模型」（同时不是合法 UTF-8）
+        let gbk = [0xCE, 0xB4, 0xD5, 0xD2, 0xB5, 0xBD, 0xC4, 0xA3, 0xD0, 0xCD];
+        let out = decode_stderr_bytes(&gbk);
+        assert!(
+            !out.is_empty(),
+            "非 UTF-8 stderr 不得变成空串（否则归因会跑偏）"
+        );
+        assert!(out.contains("未找到模型"), "GBK 应按 GBK 解出，实得: {out}");
+
+        // 日志被截断成半个多字节序列 + BOM：内容仍要保留
+        let mut truncated = vec![0xEF, 0xBB, 0xBF];
+        truncated.extend_from_slice(b"Fallback to cpu: ");
+        truncated.push(0xE4);
+        let out = decode_stderr_bytes(&truncated);
+        assert!(
+            out.contains("Fallback to cpu"),
+            "BOM 应被剥掉且内容保留: {out}"
+        );
+
+        assert_eq!(decode_stderr_bytes(b"Silero VAD ok"), "Silero VAD ok");
+    }
+
+    /// `inference_elapsed` 的契约：缺 `finished` 时必须由下限常量兜底，成功出口不得返回 0
+    /// （调用方拿它做除法，0 会变成 0 / inf）。
+    #[test]
+    fn inference_elapsed_missing_finished_falls_back_to_floor() {
+        assert_eq!(clamp_inference_elapsed(0.0), INFERENCE_ELAPSED_FLOOR_SEC);
+        assert_eq!(clamp_inference_elapsed(-1.0), INFERENCE_ELAPSED_FLOOR_SEC);
+        assert_eq!(
+            clamp_inference_elapsed(f64::NAN),
+            INFERENCE_ELAPSED_FLOOR_SEC
+        );
+        assert_eq!(
+            clamp_inference_elapsed(f64::INFINITY),
+            INFERENCE_ELAPSED_FLOOR_SEC
+        );
+        // 常量块：这条不变量在**编译期**就钉死（clippy 的 `assertions_on_constants` 也要求
+        // 常量断言走 const 块）。下限一旦被改成 0 或负数，这里直接编译失败。
+        const {
+            assert!(
+                INFERENCE_ELAPSED_FLOOR_SEC > 0.0,
+                "下限必须是正数，否则除法照样得 inf"
+            )
+        };
+        assert_eq!(clamp_inference_elapsed(2.5), 2.5, "正常值原样透出");
+    }
     /// 「输出被截断」必须能从引擎读出来，并且是**一次取走即复位**的语义：
     /// 调用方（管线 / UI）据此提示用户「字幕可能不完整」。
     #[test]
