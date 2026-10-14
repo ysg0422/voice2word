@@ -151,11 +151,11 @@ impl MainWindow {
                         }
                     ),
             )
-            // ── 批量转写队列 (F-012)：队列非空时固定在步骤流下方，随时可见 ──
-            .children(if self.state.batch_queue.is_empty() {
-                None
+            // ── 批量转写队列 (F-012)：仅在转写运行中时固定在步骤流下方作为紧凑看板 ──
+            .children(if !self.state.batch_queue.is_empty() && is_processing {
+                Some(self.render_batch_queue_panel(cx, false))
             } else {
-                Some(self.render_batch_queue_panel(cx))
+                None
             })
             // 核心工作台展示区
             .child(
@@ -636,8 +636,11 @@ impl MainWindow {
                                 ),
                         )
                         .into_any_element()
+                } else if !self.state.batch_queue.is_empty() {
+                    // 批量队列非空且不在转写时：队列直接作为主工作区核心，撑满中央视窗！彻底取消傻大空态框
+                    self.render_batch_queue_panel(cx, true)
                 } else {
-                    // 空闲就绪引导工作区 (Studio Dropzone)
+                    // 空闲就绪引导工作区 (精简精致轻量 Dropzone)
                     div()
                         .id("lightweight-idle-dashboard")
                         .flex_1()
@@ -646,41 +649,55 @@ impl MainWindow {
                         .flex_col()
                         .items_center()
                         .justify_center()
-                        .gap(px(Theme::SPACE_4))
                         .p(px(Theme::PAGE_PAD))
                         .child(
-                            primitives::card_with_pad(Theme::SPACE_6)
+                            primitives::card_with_pad(Theme::SPACE_5)
                                 .w_full()
-                                .max_w(px(Theme::CONTENT_MAX_W))
+                                .max_w(px(520.0))
+                                .border_dashed()
                                 .items_center()
-                                .gap(px(Theme::SPACE_4))
+                                .gap(px(Theme::SPACE_3))
                                 .child(
                                     div()
-                                        .w(px(Theme::ICON_BOX_LG))
-                                        .h(px(Theme::ICON_BOX_LG))
-                                        .rounded(px(Theme::CARD_RADIUS))
-                                        .bg(Theme::bg_raised())
+                                        .w(px(40.0))
+                                        .h(px(40.0))
+                                        .rounded(px(Theme::RADIUS_LG))
+                                        .bg(Theme::tint_mint_soft())
                                         .border_1()
-                                        .border_color(Theme::border_mid())
+                                        .border_color(Theme::tint_mint_border())
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .text_size(px(Theme::TEXT_DISPLAY))
+                                        .text_size(px(Theme::TEXT_HEADING))
                                         .font_weight(FontWeight::BOLD)
-                                        .text_color(Theme::accent_blue())
+                                        .text_color(Theme::accent_mint())
                                         .child("+"),
                                 )
-                                .child(primitives::page_title("导入音视频文件"))
                                 .child(
                                     div()
                                         .flex()
                                         .flex_col()
                                         .items_center()
-                                        .gap(px(Theme::SPACE_3))
-                                        .mt(px(Theme::SPACE_2))
+                                        .gap(px(Theme::SPACE_1))
+                                        .child(primitives::section_title("拖拽音视频至此，或浏览本地文件"))
                                         .child(
-                                            primitives::btn_clickable("浏览本地文件", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
+                                            div()
+                                                .text_size(px(Theme::TEXT_SMALL))
+                                                .text_color(Theme::text_muted())
+                                                .child("支持 MP4, MKV, MP3, WAV, FLAC, M4A 等主流音视频格式"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .gap(px(Theme::SPACE_2_5))
+                                        .mt(px(Theme::SPACE_1))
+                                        .child(
+                                            primitives::btn_clickable("浏览本地文件", primitives::BtnSize::Md, primitives::BtnVariant::Primary)
                                                 .id("idle-pick-file-btn")
+                                                .px(px(Theme::SPACE_5))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.choose_file(cx);
                                                 })),
@@ -1328,7 +1345,7 @@ impl MainWindow {
     ///
     /// 队列非空时常驻在工作区顶部，让用户随时看清哪些跑完了、哪些还在等，
     /// 而不是只能盯着一条进度条猜整批的进度。
-    pub(crate) fn render_batch_queue_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_batch_queue_panel(&mut self, cx: &mut Context<Self>, is_main: bool) -> AnyElement {
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
         let batch_running = self.state.batch_running;
         let total = self.state.batch_queue.len();
@@ -1374,18 +1391,35 @@ impl MainWindow {
             })
             .collect();
 
-        // 面板外壳走 card_sm()：批量队列是工作区里的次级区块，用紧凑内边距；
-        // 运行中换成薄荷描边提示「这批正在跑」。
-        primitives::card_sm()
-            .id("batch-queue-panel")
-            .w_full()
-            .flex_shrink_0()
-            .border_color(if batch_running {
-                Theme::tint_mint_border()
-            } else {
-                Theme::border()
-            })
-            .gap(px(Theme::SPACE_2))
+        // 面板外壳：主工作区模式下 flex_1 撑满并用标准卡片；顶部紧凑模式用 card_sm
+        let card = if is_main {
+            primitives::card()
+                .id("batch-queue-main-panel")
+                .flex_1()
+                .w_full()
+                .h_full()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .border_color(if batch_running {
+                    Theme::tint_mint_border()
+                } else {
+                    Theme::border()
+                })
+                .gap(px(Theme::SPACE_3))
+        } else {
+            primitives::card_sm()
+                .id("batch-queue-panel")
+                .w_full()
+                .flex_shrink_0()
+                .border_color(if batch_running {
+                    Theme::tint_mint_border()
+                } else {
+                    Theme::border()
+                })
+                .gap(px(Theme::SPACE_2))
+        };
+
+        card
             // ── 标头：统计徽章 + 操作组 ──
             .child(
                 div()
@@ -1504,12 +1538,13 @@ impl MainWindow {
                             ),
                     ),
             )
-            // ── 文件清单：超高时面板内部滚动，不把整个工作区撑开 ──
+            // ── 文件清单：主模式下自适应撑满，紧凑模式下限制高度滚动 ──
             .child(
                 div()
                     .id("batch-queue-list")
                     .w_full()
-                    .max_h(px(Theme::QUEUE_LIST_MAX_H))
+                    .when(is_main, |s| s.flex_1().min_h(px(0.0)))
+                    .when(!is_main, |s| s.max_h(px(Theme::QUEUE_LIST_MAX_H)))
                     .overflow_y_scroll()
                     .track_scroll(&self.batch_queue_scroll)
                     // 内嵌队列自己吃掉滚轮：还有余量时不让事件继续冒泡到外层页面壳，
@@ -1701,7 +1736,35 @@ impl MainWindow {
                                         .into_any_element()
                                 },
                             )
-                    })),
+                    }))
+                    .when(is_main, |s| {
+                        s.child(
+                            div()
+                                .id("batch-queue-add-more-btn")
+                                .w_full()
+                                .mt(px(Theme::SPACE_1))
+                                .py(px(Theme::SPACE_2))
+                                .border_1()
+                                .border_dashed()
+                                .border_color(Theme::border())
+                                .rounded(px(Theme::RADIUS_LG))
+                                .hover(|h| h.border_color(Theme::accent_mint()).bg(Theme::tint_mint_soft()))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(Theme::SPACE_2))
+                                .child(
+                                    div()
+                                        .text_size(px(Theme::TEXT_BODY))
+                                        .text_color(Theme::text_muted())
+                                        .child("+ 继续添加音视频文件（支持多选）"),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.choose_batch_files(cx);
+                                })),
+                        )
+                    }),
             )
             .into_any_element()
     }

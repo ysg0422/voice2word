@@ -1672,96 +1672,206 @@ impl MainWindow {
                                                 )
                                         )
                                 )
-                                // 3) 文字描边
-                                .child(
+                                // 3) 文字描边与背景底框（双列紧凑下拉选择框）
+                                .child({
+                                    let outline_open = self.outline_dropdown_open;
+                                    let bg_open = self.bg_style_dropdown_open;
+                                    let cur_outline_label = crate::utils::SUBTITLE_OUTLINE_OPTIONS
+                                        .iter()
+                                        .find(|(_, width)| (cur_style.outline_width - width).abs() < 0.1)
+                                        .map(|(label, _)| *label)
+                                        .unwrap_or("自定义");
+                                    let cur_bg_label = match cur_style.bg_style.as_str() {
+                                        "shadow" => "投影",
+                                        "box" => "黑框",
+                                        "pill" => "胶囊",
+                                        "none" => "纯净",
+                                        _ => "自定义",
+                                    };
+
                                     div()
                                         .flex()
-                                        .items_center()
-                                        .gap_1p5()
+                                        .flex_col()
+                                        .gap_1()
                                         .child(
                                             div()
-                                                .w(px(58.0))
-                                                .flex_shrink_0()
-                                                .text_size(px(Theme::TEXT_SMALL))
-                                                .text_color(Theme::text_secondary())
-                                                .child("文字描边"),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
                                                 .flex()
-                                                .gap_1()
-                                                .children(crate::utils::SUBTITLE_OUTLINE_OPTIONS.into_iter().enumerate().map(|(idx, (label, width))| {
-                                                    let is_sel = (cur_style.outline_width - width).abs() < 0.1;
+                                                .items_center()
+                                                .gap_2()
+                                                // 左列：文字描边下拉触发器
+                                                .child(
                                                     div()
-                                                        .id(("outline-w", idx))
+                                                        .id("outline-dropdown-trigger")
                                                         .flex_1()
                                                         .min_w(px(0.0))
-                                                        .py_0p5()
+                                                        .h(px(26.0))
+                                                        .px_2()
                                                         .rounded_md()
+                                                        .bg(Theme::bg_inset())
+                                                        .border_1()
+                                                        .border_color(if outline_open { Theme::accent_mint() } else { Theme::border_subtle() })
                                                         .cursor_pointer()
-                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                        .hover(|s| s.border_color(Theme::accent_mint()))
                                                         .flex()
                                                         .items_center()
-                                                        .justify_center()
-                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                        .border_1()
-                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::border_subtle() })
-                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                        .child(label)
-                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                            this.state.config.subtitle_style.outline_width = width;
-                                                            this.state.save_subtitle_style();
+                                                        .justify_between()
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.outline_dropdown_open = !this.outline_dropdown_open;
+                                                            this.bg_style_dropdown_open = false;
                                                             cx.notify();
                                                         }))
-                                                }))
-                                        )
-                                )
-                                // 4) 背景底框
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1p5()
-                                        .child(
-                                            div()
-                                                .w(px(58.0))
-                                                .flex_shrink_0()
-                                                .text_size(px(Theme::TEXT_SMALL))
-                                                .text_color(Theme::text_secondary())
-                                                .child("背景底框"),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .flex()
-                                                .gap_1()
-                                                .children([("投影", "shadow"), ("黑框", "box"), ("胶囊", "pill"), ("纯净", "none")].into_iter().enumerate().map(|(idx, (label, mode))| {
-                                                    let is_sel = cur_style.bg_style == mode;
+                                                        .child(
+                                                            div()
+                                                                 .flex()
+                                                                 .items_center()
+                                                                 .gap_1()
+                                                                 .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("描边"))
+                                                                 .child(div().text_size(px(Theme::TEXT_SMALL)).font_weight(FontWeight::MEDIUM).text_color(Theme::text_primary()).child(cur_outline_label)),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(Theme::TEXT_CAPTION))
+                                                                .text_color(Theme::text_secondary())
+                                                                .child(if outline_open { "▲" } else { "▼" }),
+                                                        ),
+                                                )
+                                                // 右列：背景底框下拉触发器
+                                                .child(
                                                     div()
-                                                        .id(("bg-mode", idx))
+                                                        .id("bg-style-dropdown-trigger")
                                                         .flex_1()
                                                         .min_w(px(0.0))
-                                                        .py_0p5()
+                                                        .h(px(26.0))
+                                                        .px_2()
                                                         .rounded_md()
+                                                        .bg(Theme::bg_inset())
+                                                        .border_1()
+                                                        .border_color(if bg_open { Theme::accent_mint() } else { Theme::border_subtle() })
                                                         .cursor_pointer()
-                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                        .hover(|s| s.border_color(Theme::accent_mint()))
                                                         .flex()
                                                         .items_center()
-                                                        .justify_center()
-                                                        .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                        .border_1()
-                                                        .border_color(if is_sel { Theme::accent_mint() } else { Theme::border_subtle() })
-                                                        .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                        .child(label)
-                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                            this.state.config.subtitle_style.bg_style = mode.to_string();
-                                                            this.state.save_subtitle_style();
+                                                        .justify_between()
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.bg_style_dropdown_open = !this.bg_style_dropdown_open;
+                                                            this.outline_dropdown_open = false;
                                                             cx.notify();
                                                         }))
-                                                }))
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap_1()
+                                                                .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("底框"))
+                                                                .child(div().text_size(px(Theme::TEXT_SMALL)).font_weight(FontWeight::MEDIUM).text_color(Theme::text_primary()).child(cur_bg_label)),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(Theme::TEXT_CAPTION))
+                                                                .text_color(Theme::text_secondary())
+                                                                .child(if bg_open { "▲" } else { "▼" }),
+                                                        ),
+                                                ),
                                         )
-                                )
+                                        // 描边下拉展开菜单
+                                        .children(if outline_open {
+                                            Some(
+                                                div()
+                                                    .id("outline-dropdown-menu")
+                                                    .rounded_md()
+                                                    .bg(Theme::bg_card())
+                                                    .border_1()
+                                                    .border_color(Theme::border())
+                                                    .p_1()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_0p5()
+                                                    .children(crate::utils::SUBTITLE_OUTLINE_OPTIONS.into_iter().enumerate().map(|(idx, (label, width))| {
+                                                        let is_sel = (cur_style.outline_width - width).abs() < 0.1;
+                                                        div()
+                                                            .id(("outline-opt", idx))
+                                                            .px_2()
+                                                            .py_1()
+                                                            .rounded_md()
+                                                            .cursor_pointer()
+                                                            .bg(if is_sel { Theme::tint_mint_badge() } else { Theme::transparent() })
+                                                            .hover(|s| s.bg(Theme::bg_hover()))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(Theme::TEXT_SMALL))
+                                                                    .font_weight(if is_sel { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                                                    .text_color(if is_sel { Theme::accent_mint() } else { Theme::text_primary() })
+                                                                    .child(label),
+                                                            )
+                                                            .children(if is_sel {
+                                                                Some(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::accent_mint()).child("✓"))
+                                                            } else {
+                                                                None
+                                                            })
+                                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                                this.state.config.subtitle_style.outline_width = width;
+                                                                this.state.save_subtitle_style();
+                                                                this.outline_dropdown_open = false;
+                                                                cx.notify();
+                                                            }))
+                                                    }))
+                                            )
+                                        } else {
+                                            None
+                                        })
+                                        // 底框下拉展开菜单
+                                        .children(if bg_open {
+                                            Some(
+                                                div()
+                                                    .id("bg-style-dropdown-menu")
+                                                    .rounded_md()
+                                                    .bg(Theme::bg_card())
+                                                    .border_1()
+                                                    .border_color(Theme::border())
+                                                    .p_1()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_0p5()
+                                                    .children([("投影", "shadow"), ("黑框", "box"), ("胶囊", "pill"), ("纯净", "none")].into_iter().enumerate().map(|(idx, (label, mode))| {
+                                                        let is_sel = cur_style.bg_style == mode;
+                                                        div()
+                                                            .id(("bg-mode-opt", idx))
+                                                            .px_2()
+                                                            .py_1()
+                                                            .rounded_md()
+                                                            .cursor_pointer()
+                                                            .bg(if is_sel { Theme::tint_mint_badge() } else { Theme::transparent() })
+                                                            .hover(|s| s.bg(Theme::bg_hover()))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(Theme::TEXT_SMALL))
+                                                                    .font_weight(if is_sel { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                                                    .text_color(if is_sel { Theme::accent_mint() } else { Theme::text_primary() })
+                                                                    .child(label),
+                                                            )
+                                                            .children(if is_sel {
+                                                                Some(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::accent_mint()).child("✓"))
+                                                            } else {
+                                                                None
+                                                            })
+                                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                                this.state.config.subtitle_style.bg_style = mode.to_string();
+                                                                this.state.save_subtitle_style();
+                                                                this.bg_style_dropdown_open = false;
+                                                                cx.notify();
+                                                            }))
+                                                    }))
+                                            )
+                                        } else {
+                                            None
+                                        })
+                                })
                                 // 5) 排版参数（双列紧凑网格：字号/字距、行距/边距、单行限制，高度砍半更紧凑）
                                 .child(
                                     div()

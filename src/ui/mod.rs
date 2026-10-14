@@ -587,6 +587,10 @@ pub struct MainWindow {
     /// 术语表编辑的最近状态提示（打开文件 / 应用结果）。`None` 表示没操作过。
     pub(crate) glossary_status: Option<String>,
     pub(crate) is_export_dropdown_open: bool,
+    /// 样式面板「文字描边」下拉是否展开
+    pub(crate) outline_dropdown_open: bool,
+    /// 样式面板「背景底框」下拉是否展开
+    pub(crate) bg_style_dropdown_open: bool,
     /// 字幕预览框的**手动**宽度（px）。`Some` 时以它为准并压过「单行最大字数」
     /// 推出的宽度；拖动预览条两侧把手会写入这里并落盘，`None` 则回到按字数自动推算。
     pub(crate) preview_box_w: Option<f32>,
@@ -1498,6 +1502,8 @@ impl MainWindow {
             editor_export_mode: export_mode_initial,
             glossary_status: None,
             is_export_dropdown_open: false,
+            outline_dropdown_open: false,
+            bg_style_dropdown_open: false,
             preview_box_w: preview_box_w_initial,
             preview_drag: None,
             editor_split_w: None,
@@ -2959,8 +2965,13 @@ impl Render for MainWindow {
                         cx.notify();
                         return;
                     }
-                    if this.is_export_dropdown_open {
+                    if this.is_export_dropdown_open
+                        || this.outline_dropdown_open
+                        || this.bg_style_dropdown_open
+                    {
                         this.is_export_dropdown_open = false;
+                        this.outline_dropdown_open = false;
+                        this.bg_style_dropdown_open = false;
                         cx.notify();
                         return;
                     }
