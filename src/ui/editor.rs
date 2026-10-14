@@ -1467,12 +1467,14 @@ impl MainWindow {
                                 })
                                 // 2) 字重与水平对齐
                                 //
-                                // 本行起的三组选项（字重对齐 / 文字描边 / 背景底框）都是
-                                // 「固定宽标签 + 一排等分按钮」。按钮上必须同时写
-                                // `flex_1()` 与 `min_w(px(0.0))`：只写 `flex_1` 时，
-                                // flex 项的默认 `min-width:auto` 会按**内容最小宽度**顶住，
-                                // 于是「细边 1.5」比「无描边」宽、整排参差不齐。
-                                // 补上 `min_w(0)` 后三者才真正等分。
+                                // 「字重对齐」这一行以前把字重（加粗/常规）与对齐（靠左/居中/靠右）
+                                // 各包成一个分组：字重那半固定 96px、对齐那半按剩余宽度三等分，
+                                // 于是同一行里五颗胶囊宽窄不一。现在五颗都是同一条 flex 行里的
+                                // 等分项，与下面「文字描边 / 背景底框」用的是同一套排版。
+                                //
+                                // 等分项必须同时写 `flex_1()` 与 `min_w(px(0.0))`：只写 `flex_1`
+                                // 时，flex 项的默认 `min-width:auto` 会按**内容最小宽度**顶住，
+                                // 于是「加粗」比「常规」窄、整排又参差不齐。
                                 .child(
                                     div()
                                         .flex()
@@ -1491,13 +1493,8 @@ impl MainWindow {
                                                 .flex_1()
                                                 .flex()
                                                 .items_center()
-                                                .gap_2()
+                                                .gap_1()
                                                 // 粗细开关
-                                                .child(
-                                                    div()
-                                                        .w(px(96.0))
-                                                        .flex()
-                                                        .gap_1()
                                                         .child({
                                                             let is_bold = cur_style.is_bold;
                                                             div()
@@ -1547,13 +1544,7 @@ impl MainWindow {
                                                                     cx.notify();
                                                                 }))
                                                         })
-                                                )
-                                                // 对齐方式 (居左/居中/居右)
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .flex()
-                                                        .gap_1()
+                                                // 对齐方式 (靠左/居中/靠右)
                                                         .children([("靠左", "left"), ("居中", "center"), ("靠右", "right")].into_iter().enumerate().map(|(idx, (label, align))| {
                                                             let is_sel = cur_style.alignment == align;
                                                             div()
@@ -1578,7 +1569,6 @@ impl MainWindow {
                                                                     cx.notify();
                                                                 }))
                                                         }))
-                                                )
                                         )
                                 )
                                 // 3) 文字描边

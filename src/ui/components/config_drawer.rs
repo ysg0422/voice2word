@@ -921,20 +921,11 @@ impl MainWindow {
             ))
             .child(self.param_group(
                 "标点与润色",
-                {
-                    // SenseVoice 原生自带标点与 ITN，管线会跳过 CT-Punc 阶段。此时
-                    // 「极速标点」是一个**无操作**档位，必须就地写明，否则用户选了
-                    // 它却什么都没发生，还以为程序没记住自己的选择。
-                    if self.state.punc_polish_is_noop() {
-                        vec![
-                            ("off", "关闭"),
-                            ("punc", "极速标点（SenseVoice 原生自带）"),
-                            ("qwen", "Qwen 润色"),
-                        ]
-                    } else {
-                        vec![("off", "关闭"), ("punc", "极速标点"), ("qwen", "Qwen 润色")]
-                    }
-                },
+                // 只写档位名，不做任何括注：文案一长就会把胶囊撑出面板（用户明确要求
+                // 「只要模型名字」）。「SenseVoice 原生自带标点、CT-Punc 是空操作」这类
+                // 信息在转写过程中由阶段名如实报出（`polish_engine_name` = 「SenseVoice
+                // 原生标点」），不需要在选项标签里重复一遍。
+                vec![("off", "关闭"), ("punc", "极速标点"), ("qwen", "Qwen 润色")],
                 polish_sel,
                 |this, sel, cx| {
                     // 统一走 `AppState::set_polish`：状态 + config.toml 双写。

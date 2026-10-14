@@ -168,6 +168,39 @@ impl ItemGroup {
 
 const MB: u64 = 1024 * 1024;
 
+/// 下载**连接**阶段的超时。
+///
+/// 镜像/代理域名解析到黑洞地址时，TCP 连接可以一直挂在 SYN 重传上；没有这条
+/// 超时就会先卡满整个请求上限（2 小时）才轮得到换源。
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 下载的**空闲**超时：多久没有新字节到达就判这条源死了。
+///
+/// 取 60 秒而不是更短：慢速线路（几十 KB/s）每 60 秒也必然有字节到达，不会被误杀；
+/// 而对端真正卡死（连接在、数据不来）时，一分钟就能判死并换下一个镜像源，
+/// 比让用户对着「下载中 … 0 B」干等两小时强得多。
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 单次下载请求的**总**上限：慢网下 800 MB 也要下得完（约 2 小时）。
+///
+/// 与 [`DOWNLOAD_IDLE_TIMEOUT`] 分工不同：这条管「整体别无限拖」，那条管
+/// 「对端不发数据就尽快判死换源」。
+const DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// 构造下载用的 HTTP agent。
+///
+/// 三条超时都做成参数（而不是直接读常量）：单测要在毫秒级验证「对端不发数据会被
+/// 判死」，生产路径又必须容忍慢网与几百 MB 的大文件，两边的取值只能分开给。
+fn build_download_agent(idle: Duration, connect: Duration, overall: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(overall)
+        .timeout_connect(connect)
+        .timeout_read(idle)
+        // 自动探测并继承环境中的 HTTP_PROXY / HTTPS_PROXY（梯子加速）
+        .try_proxy_from_env(true)
+        .build()
+}
+
 /// 全部可下载项。**每个 URL 都做过 HEAD 实测**（2026-10-05，无代理）。
 ///
 /// 说明两处与「官方文件名」不一致的地方：
@@ -1510,14 +1543,15 @@ fn fetch_to_file(
     cancel: &Arc<AtomicBool>,
     progress: Option<&ProgressFn>,
 ) -> Result<()> {
-    let agent = ureq::AgentBuilder::new()
-        // 大文件（最大 833 MB）在慢网下需要足够长的超时；
-        // 这里的 timeout 是**整个请求**的上限，不是空闲超时，
-        // 因此给足 2 小时，避免 800 MB 在 100 KB/s 的线路上被掐断。
-        .timeout(Duration::from_secs(2 * 60 * 60))
-        // 自动探测并继承环境中的 HTTP_PROXY / HTTPS_PROXY（梯子加速）
-        .try_proxy_from_env(true)
-        .build();
+    // 大文件（最大 833 MB）在慢网下需要足够长的**总**上限；但只有总上限是不够的：
+    // 连接建好之后对端不再发数据时，总超时会把界面卡在「下载中 … 0 B」上整整两小时，
+    // 既不报错也不换源，用户只能手动点取消（镜像端不响应时实测就是这样）。所以除总
+    // 上限外还有一条连接超时与一条**空闲**超时（见各自的常量文档）。
+    let agent = build_download_agent(
+        DOWNLOAD_IDLE_TIMEOUT,
+        DOWNLOAD_CONNECT_TIMEOUT,
+        DOWNLOAD_TOTAL_TIMEOUT,
+    );
 
     // `.part` 的现有大小：用于判断能否续传。
     let existing = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
@@ -1611,7 +1645,11 @@ fn fetch_to_file(
             // 保留 `.part`：用户重新点下载时可以接着下，不必从头再来。
             return Err(anyhow!("已取消"));
         }
-        let n = reader.read(&mut buf).context("读取响应流失败")?;
+        // 文案里点出「对端长时间没有数据」：这正是空闲超时最常见的原因，
+        // 比一句干巴巴的「读取失败」更能让用户知道该换源还是查网络。
+        let n = reader
+            .read(&mut buf)
+            .context("下载中断：读取响应流失败（网络中断，或对端长时间没有数据）")?;
         if n == 0 {
             break;
         }
@@ -1732,6 +1770,46 @@ mod executable_resolution_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 空闲超时必须真的生效：对端把连接接着、一个字节都不发时，请求要在空闲超时后
+    /// 报错，而不是拖到两小时的总上限。这条正是「下载中 … 0 B 卡住」的回归护栏。
+    ///
+    /// 用本地 `TcpListener` 当「连接在、数据不来」的假镜像：接住连接后既不回响应、
+    /// 也不立刻关闭，只在 1.5 秒后放手——因此即便超时全部失效，测试也只会以「连接
+    /// 被关闭」收尾，不会把整个测试进程挂住。
+    #[test]
+    fn idle_download_times_out_instead_of_hanging() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+        let addr = listener.local_addr().expect("取本地地址");
+        let holder = std::thread::spawn(move || {
+            if let Ok((sock, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_millis(1500));
+                drop(sock);
+            }
+        });
+
+        // 生产取值的相对关系：连接 < 空闲 < 总上限。三条都设成一样大就失去意义了。
+        assert!(DOWNLOAD_CONNECT_TIMEOUT < DOWNLOAD_IDLE_TIMEOUT);
+        assert!(DOWNLOAD_IDLE_TIMEOUT < DOWNLOAD_TOTAL_TIMEOUT);
+
+        let agent = build_download_agent(
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_millis(800),
+        );
+        let started = Instant::now();
+        let result = agent.get(&format!("http://{addr}/whatever")).call();
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "对端不发数据时必须报错，而不是一直等");
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "超时没生效：请求拖了 {elapsed:?} 才结束"
+        );
+        let _ = holder.join();
+    }
 
     /// 把运行时构造的临时路径变成 `'static str`，好塞进 `DownloadItem::dest`。
     /// 测试里泄漏几个短字符串无所谓，换来的是测试不再向仓库树写东西。
