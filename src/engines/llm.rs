@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::subtitle::Segment;
 use crate::utils::TempPathGuard;
@@ -29,6 +29,38 @@ const OUTPUT_TOKENS_PER_CHAR: f64 = 1.0;
 /// 上下文里留给「对话模板 + 特殊 token」的固定余量。
 const CTX_MARGIN: u32 = 192;
 
+/// 单批至少要能装下的源字符数。
+///
+/// 低于它就是「固定开销把上下文吃光了」：再往下夹只会把**必然超窗**的请求伪装成
+/// 「预算正常」——llama.cpp 会回 `EXCEED_CONTEXT_SIZE`，响应里没有 `content`，
+/// 最终被上层笼统地报成「未能译出任何一句」。
+const MIN_BATCH_CHARS: usize = 64;
+
+/// 短句也至少给这么多输出 token，避免 `n_predict` 小到把译文掐断。
+///
+/// 只作用于 `want`（生成空间），**不**用来掩盖「固定开销已超窗」的 `remaining`。
+const MIN_OUTPUT_TOKENS: u32 = 128;
+
+/// 上下文里可用的 token 数（扣掉对话模板 / 特殊 token 的固定余量 [`CTX_MARGIN`]）。
+fn usable_ctx_tokens(ctx_size: u32) -> u32 {
+    ctx_size.saturating_sub(CTX_MARGIN)
+}
+
+/// 一批源文本至少需要的 token 数（输入 + 输出，按 [`MIN_BATCH_CHARS`] 折算）。
+fn min_batch_tokens() -> u32 {
+    ((MIN_BATCH_CHARS as f64) * (PROMPT_TOKENS_PER_CHAR + OUTPUT_TOKENS_PER_CHAR)).ceil() as u32
+}
+
+/// 固定开销（系统提示词模板 + 术语表 + 源语言线索 + 对话模板）是否已经**超过可用
+/// 窗口**——即连一批最小输入都放不下。
+///
+/// 这是「术语表太长」的判定入口：判真时无论怎么缩小批次都装不下，调用方必须先裁剪
+/// 术语表或直接报错，绝不能继续发请求——`batch_char_budget` 的触底只是症状，不是
+/// 「预算正常」。
+fn fixed_overhead_exceeds_window(ctx_size: u32, fixed_tokens: u32) -> bool {
+    fixed_tokens.saturating_add(min_batch_tokens()) > usable_ctx_tokens(ctx_size)
+}
+
 /// 按上下文窗口推导「一批源文本的字符预算」。
 ///
 /// 一批要同时装下「固定开销（系统提示词模板 + 术语表 + 源语言线索 + 对话模板）」
@@ -37,14 +69,132 @@ const CTX_MARGIN: u32 = 192;
 ///
 /// `fixed_tokens` 必须包含**本次**系统提示词与术语表的实际长度：术语表理论上限
 /// 是单条左右各 60 字符 × 80 条 ≈ 9.7k 字符（≈8k+ token），已是 4096 上下文的
-/// 两倍，而且**每批重复注入**。此前只扣 `CTX_MARGIN`（192），术语表一长就撑爆
-/// 上下文——表现为译文被截断、整批只解析出前几条。
+/// 两倍，而且**每批重复注入**。
+///
+/// **返回 0 表示固定开销已超窗**（见 [`fixed_overhead_exceeds_window`]）：此前用
+/// `.max(64)` 把它夹成「一批 64 字符」，等于把必然失败的请求伪装成正常预算；现在
+/// 如实返回 0，调用方据此裁剪术语表 / 报错。
 fn batch_char_budget(ctx_size: u32, fixed_tokens: u32) -> usize {
-    let usable = ctx_size
-        .saturating_sub(CTX_MARGIN)
-        .saturating_sub(fixed_tokens) as f64;
+    if fixed_overhead_exceeds_window(ctx_size, fixed_tokens) {
+        return 0;
+    }
+    let usable = usable_ctx_tokens(ctx_size).saturating_sub(fixed_tokens) as f64;
     let per_char = PROMPT_TOKENS_PER_CHAR + OUTPUT_TOKENS_PER_CHAR;
-    ((usable / per_char) as usize).max(64)
+    (usable / per_char) as usize
+}
+
+/// 一次「术语表适配上下文」的判定结果（纯数据，供日志与单测断言）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GlossaryFit {
+    /// 本次实际注入的术语表文本（未超窗时与输入完全一致；超窗时是裁剪后的前缀）。
+    pub text: String,
+    /// 是否发生了裁剪。
+    pub trimmed: bool,
+    /// 裁剪前的词条数（按 [`GLOSSARY_ENTRY_SEP`] 切分；空表为 0）。
+    pub before_entries: usize,
+    /// 裁剪后的词条数。
+    pub after_entries: usize,
+    /// 裁剪前的字符数。
+    pub before_chars: usize,
+    /// 裁剪后的字符数。
+    pub after_chars: usize,
+}
+
+/// 术语表词条分隔符（与 `utils::config` 的 `glossary_prompt()` 拼接保持一致）。
+const GLOSSARY_ENTRY_SEP: char = '；';
+
+/// 术语表提示里的词条数（表头与首条同属一段，故非空串 ≥1；空串为 0）。仅用于日志口径。
+pub(crate) fn glossary_entry_count(glossary: &str) -> usize {
+    if glossary.trim().is_empty() {
+        0
+    } else {
+        glossary.split(GLOSSARY_ENTRY_SEP).count()
+    }
+}
+
+/// 本次允许术语表占用的 token 上限（已扣掉 `reserved_tokens` 与一批最小输入输出）。
+///
+/// 返回 `None` 表示窗口里连最小批次都放不下——调用方须报「术语表过大 / `llm_ctx`
+/// 太小」，而不是继续发请求。
+fn glossary_token_budget(ctx_size: u32, reserved_tokens: u32) -> Option<u32> {
+    usable_ctx_tokens(ctx_size)
+        .checked_sub(reserved_tokens)?
+        .checked_sub(min_batch_tokens())
+}
+
+/// 把术语表提示裁到 `max_tokens` 以内（**纯函数**：返回新串，绝不动用户配置）。
+///
+/// 优先级：表头与**靠前**的词条更重要——从尾部整条丢弃；若连第一条都放不下，退化
+/// 为对文本做前缀字符截断（保住表头与首条的开头）。返回 `None` 表示 `max_tokens`
+/// 小到放不下任何内容。
+pub(crate) fn trim_glossary_to_tokens(glossary: &str, max_tokens: u32) -> Option<String> {
+    if glossary.is_empty() {
+        return Some(String::new());
+    }
+    if fixed_prompt_tokens(glossary) <= max_tokens {
+        return Some(glossary.to_string());
+    }
+    if max_tokens == 0 {
+        return None;
+    }
+    // ① 整条保留：表头 + 靠前的词条（累积到放不下为止）。
+    let mut kept: Option<String> = None;
+    for part in glossary.split(GLOSSARY_ENTRY_SEP) {
+        let candidate = match &kept {
+            None => part.to_string(),
+            Some(prev) => format!("{prev}{GLOSSARY_ENTRY_SEP}{part}"),
+        };
+        if fixed_prompt_tokens(&candidate) > max_tokens {
+            break;
+        }
+        kept = Some(candidate);
+    }
+    if let Some(kept) = kept {
+        return Some(kept);
+    }
+    // ② 连第一条都放不下：前缀字符截断（保表头与首条开头）。
+    let char_budget = (max_tokens as f64 / PROMPT_TOKENS_PER_CHAR).floor() as usize;
+    let truncated: String = glossary.chars().take(char_budget).collect();
+    if truncated.trim().is_empty() {
+        None
+    } else {
+        Some(truncated)
+    }
+}
+
+/// 判定「本次术语表」能否放进上下文；放不下就按优先级裁剪（**纯函数**）。
+///
+/// 返回 `None` 表示连最小批次都放不下（术语表再裁也没用）——调用方须报可读错误。
+/// 返回的 [`GlossaryFit::text`] 只用于**本次提示词组装**，用户配置里的术语表原样
+/// 保留（不做任何内存改写）。
+pub(crate) fn fit_glossary_to_context(
+    glossary: &str,
+    ctx_size: u32,
+    reserved_tokens: u32,
+) -> Option<GlossaryFit> {
+    let before_chars = glossary.chars().count();
+    let before_entries = glossary_entry_count(glossary);
+    let fixed_tokens = fixed_prompt_tokens(glossary) + reserved_tokens;
+    if !fixed_overhead_exceeds_window(ctx_size, fixed_tokens) {
+        return Some(GlossaryFit {
+            text: glossary.to_string(),
+            trimmed: false,
+            before_entries,
+            after_entries: before_entries,
+            before_chars,
+            after_chars: before_chars,
+        });
+    }
+    let max_tokens = glossary_token_budget(ctx_size, reserved_tokens)?;
+    let text = trim_glossary_to_tokens(glossary, max_tokens)?;
+    Some(GlossaryFit {
+        after_entries: glossary_entry_count(&text),
+        after_chars: text.chars().count(),
+        text,
+        trimmed: true,
+        before_entries,
+        before_chars,
+    })
 }
 
 /// 一批译文的输出 token 上限（`-n` / `n_predict`）。
@@ -56,14 +206,17 @@ fn batch_char_budget(ctx_size: u32, fixed_tokens: u32) -> usize {
 ///
 /// 改为按源字符数给预算，再把「固定开销 + 本批输入」从上下文里扣掉，剩下的才是
 /// 能给输出的空间（同样保证 prompt + 输出不越界）。
+///
+/// 关键修复：不再对 `remaining` 也 `.max(128)`——那会把「固定开销已超窗」伪装成
+/// 正常预算。真没空间时如实返回 0；`want` 上的下限只保证短句也有基本生成空间。
 fn output_token_budget(source_chars: usize, ctx_size: u32, fixed_tokens: u32) -> u32 {
-    let want = (source_chars as f64 * OUTPUT_TOKENS_PER_CHAR) as u32;
+    let want = ((source_chars as f64 * OUTPUT_TOKENS_PER_CHAR) as u32).max(MIN_OUTPUT_TOKENS);
     let prompt_est = (source_chars as f64 * PROMPT_TOKENS_PER_CHAR) as u32 + CTX_MARGIN;
     let remaining = ctx_size
         .saturating_sub(prompt_est)
         .saturating_sub(fixed_tokens)
         .saturating_sub(64);
-    want.max(128).min(remaining.max(128))
+    want.min(remaining)
 }
 
 /// 把「系统提示词 + 术语表 + 源语言线索」的实际长度折算成 token 数。
@@ -89,6 +242,22 @@ fn clamp_ctx_size(ctx_size: u32) -> u32 {
         warn!("llm_ctx={ctx_size} 超出可用区间 [{MIN_CTX}, {MAX_CTX}]，已夹为 {clamped}");
     }
     clamped
+}
+
+/// LLM 推理线程数的有效区间。
+///
+/// 下界 1（0 会让 llama.cpp 拒绝启动）；上界 64：`llm_threads` 是用户可手改的全局
+/// 共享项，只夹下界时一个离谱的大值会原样透传给 llama.cpp（`-t` / 常驻服务），
+/// 线程远超物理核数只会增加同步开销、反而拖慢解码。
+const MIN_LLM_THREADS: u32 = 1;
+const MAX_LLM_THREADS: u32 = 64;
+
+/// 把线程数夹到 [`MIN_LLM_THREADS`, `MAX_LLM_THREADS`]。
+///
+/// 与同级引擎（`punc.rs` / `sensevoice.rs` 的 `clamp_threads`）保持一致：两边都得
+/// 夹，不能只有下界。
+fn clamp_threads(threads: u32) -> u32 {
+    threads.clamp(MIN_LLM_THREADS, MAX_LLM_THREADS)
 }
 
 /// 命令行回退路径（[`LLMEngine::run_prompt`]）的等待上限。
@@ -170,6 +339,45 @@ impl CopyRate {
             "检出 {}/{} 句未真正译出（模型疑似复制原文），可再次点击「开始翻译」补译",
             self.rejected, self.checked
         )
+    }
+}
+
+/// 复制率计数：候选句里**至今仍未译出**的那些才计入 `rejected`。
+///
+/// 抽成纯函数便于单测——`checked`（分母）由调用方累加。
+fn count_untranslated_copies(
+    segments: &[Segment],
+    candidates: &[usize],
+    target_lang: &str,
+) -> usize {
+    candidates
+        .iter()
+        .filter(|&&pos| !segments[pos].translation_matches(target_lang))
+        .count()
+}
+
+/// 折半重试对单条候选译文的判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryVerdict {
+    /// 通过 [`validate_translation`]，可以写回。
+    Accept,
+    /// 近似复制（`Echo`）：保持未译，并计入复制率。
+    RejectCopy,
+    /// 其他不合格（改动过大 / 空输出）：保持未译，不计入复制率。
+    RejectOther,
+}
+
+/// 折半重试写回前的判定（**纯函数**）。
+///
+/// 此前这里只判「完全等于原文」（[`is_untranslated_copy`]），于是**近似复制**
+/// （改一个功能字 / 加个标点 / 扩写）会被静默写进用户字幕，还不计入复制率、
+/// 绕过 `is_alarming` 兜底。现在与主路径**共用同一条** [`validate_translation`]：
+/// 只有 `Ok` 才写回。
+pub(crate) fn classify_retry_outcome(source: &str, translation: &str) -> RetryVerdict {
+    match validate_translation(source, translation) {
+        RewriteVerdict::Ok => RetryVerdict::Accept,
+        RewriteVerdict::Echo => RetryVerdict::RejectCopy,
+        RewriteVerdict::Empty | RewriteVerdict::SuspectTooDifferent => RetryVerdict::RejectOther,
     }
 }
 
@@ -584,27 +792,71 @@ impl LlamaServer {
             "cache_prompt": true,
         })
         .to_string();
-        let mut stream =
-            TcpStream::connect_timeout(&self.address.parse().ok()?, Duration::from_secs(2)).ok()?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(120)))
-            .ok()?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .ok()?;
+        // 六处失败路径此前都是裸 `.ok()?`：互相不可区分、函数体内零日志，于是
+        // 「术语表撑爆上下文 → 缺 content」被上层笼统地伪装成「模型没装好」。这里
+        // 逐条加**诊断日志**（只记录、不把失败改成功），便于定位真正的病因。
+        let mut stream = match self.address.parse::<std::net::SocketAddr>() {
+            Ok(address) => match TcpStream::connect_timeout(&address, Duration::from_secs(2)) {
+                Ok(stream) => stream,
+                Err(e) => {
+                    debug!(error = %e, "连接 llama-server 失败，回退命令行");
+                    return None;
+                }
+            },
+            Err(e) => {
+                debug!(error = %e, address = %self.address, "llama-server 地址解析失败，回退命令行");
+                return None;
+            }
+        };
+        if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(120))) {
+            debug!(error = %e, "设置 llama-server 读超时失败，回退命令行");
+            return None;
+        }
+        if let Err(e) = stream.set_write_timeout(Some(Duration::from_secs(5))) {
+            debug!(error = %e, "设置 llama-server 写超时失败，回退命令行");
+            return None;
+        }
         let request = format!(
             "POST /completion HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             self.address,
             body.len(),
             body
         );
-        stream.write_all(request.as_bytes()).ok()?;
+        if let Err(e) = stream.write_all(request.as_bytes()) {
+            debug!(error = %e, "发送 llama-server /completion 请求失败，回退命令行");
+            return None;
+        }
         let mut response = String::new();
-        stream.read_to_string(&mut response).ok()?;
-        let (_, payload) = response.split_once("\r\n\r\n")?;
-        let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+        if let Err(e) = stream.read_to_string(&mut response) {
+            debug!(error = %e, "读取 llama-server 响应失败（可能是读超时），回退命令行");
+            return None;
+        }
+        let Some((_, payload)) = response.split_once("\r\n\r\n") else {
+            debug!("llama-server 响应缺少 HTTP 头分隔，回退命令行");
+            return None;
+        };
+        let value = match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(value) => value,
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    head = %response_head(payload, 200),
+                    "llama-server 响应不是合法 JSON，回退命令行"
+                );
+                return None;
+            }
+        };
+        let Some(content) = value.get("content").and_then(|c| c.as_str()) else {
+            // 缺 `content` 正是 llama.cpp 在 prompt 超过 `-c` 时的响应形态
+            // （`EXCEED_CONTEXT_SIZE`）：此前静默返回 None，失败被伪装成「模型没装好」。
+            debug!(
+                head = %response_head(payload, 200),
+                "llama-server 响应缺少 content 字段（常见于 prompt 超过 -c / EXCEED_CONTEXT_SIZE），回退命令行"
+            );
+            return None;
+        };
         Some(CompletionOutcome {
-            content: value.get("content")?.as_str()?.to_owned(),
+            content: content.to_owned(),
             // P1-D：llama.cpp 的 `/completion` 在撞上 `n_predict` 时会给出
             // `stop_type: "limit"`（实测），这是「因长度截断」的可靠信号。
             // `truncated` 是「prompt 被截断」的旧字段，语义不同，不能拿来当
@@ -612,6 +864,11 @@ impl LlamaServer {
             stopped_by_limit: llama_stop_type_is_limit(&value),
         })
     }
+}
+
+/// 日志里截取响应正文开头（避免把整段响应写进日志）。
+fn response_head(payload: &str, max: usize) -> String {
+    payload.chars().take(max).collect()
 }
 
 /// llama.cpp `/completion` 是否**因达到 `n_predict` 上限**而停止。
@@ -718,7 +975,7 @@ impl LLMEngine {
             cli_path: cli_path.as_ref().to_path_buf(),
             model_path: model_path.as_ref().to_path_buf(),
             ctx_size: clamp_ctx_size(ctx_size),
-            threads: std::sync::atomic::AtomicU32::new(threads.max(1)),
+            threads: std::sync::atomic::AtomicU32::new(clamp_threads(threads)),
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             glossary: Mutex::new(String::new()),
             rewrite_stats: Mutex::new(RewriteStats::default()),
@@ -763,7 +1020,7 @@ impl LLMEngine {
     /// 运行时调整推理线程数（设置页滑条调用，对下一次润色生效）
     pub fn set_threads(&self, threads: u32) {
         self.threads
-            .store(threads.max(1), std::sync::atomic::Ordering::Relaxed);
+            .store(clamp_threads(threads), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn threads(&self) -> u32 {
@@ -1394,7 +1651,37 @@ impl LLMEngine {
 
         // 术语表 + 源语言线索是**每批重复注入**的固定开销：预算必须显式扣掉它们的
         // 真实长度，否则术语表一长就把上下文撑爆（见 `batch_char_budget`）。
-        let glossary = self.glossary_hint();
+        //
+        // 术语表超窗时**只在本次提示词里**裁剪（`fit_glossary_to_context` 是纯函数，
+        // 绝不改用户配置），且每次任务只 warn 一次；连裁都放不下就报可读错误，不再让
+        // 请求必然超窗、最后被笼统地报成「未能译出任何一句」。
+        let user_glossary = self.glossary_hint();
+        let glossary = match fit_glossary_to_context(
+            &user_glossary,
+            self.ctx_size,
+            PROMPT_HINT_TOKENS,
+        ) {
+            Some(fit) => {
+                if fit.trimmed {
+                    warn!(
+                        before_entries = fit.before_entries,
+                        after_entries = fit.after_entries,
+                        before_chars = fit.before_chars,
+                        after_chars = fit.after_chars,
+                        ctx_size = self.ctx_size,
+                        "术语表过长已超出上下文窗口，本次提示词按优先级裁剪（保留靠前条目；仅影响本次翻译，不改动用户配置）"
+                    );
+                }
+                fit.text
+            }
+            None => {
+                return Err(anyhow!(
+                    "术语表过长：术语表 + 提示词固定开销约 {} token，已超过 llm_ctx={} 的可用上下文，无法翻译。请减少术语条目（或调小 max_glossary_entries），或在「性能设置」里调大 llm_ctx。",
+                    fixed_prompt_tokens(&user_glossary) + PROMPT_HINT_TOKENS,
+                    self.ctx_size
+                ));
+            }
+        };
         let fixed_tokens = fixed_prompt_tokens(&glossary) + PROMPT_HINT_TOKENS;
         if fixed_tokens > 0 {
             info!(
@@ -1467,13 +1754,19 @@ impl LLMEngine {
             // 「翻译莫名其妙少了几句」。把漏掉的句子按更小的批（对半）再试一轮，
             // 小批更不容易撞上输出长度上限，通常一轮就能补齐。
             if !missed.is_empty() {
-                self.retry_missing(
+                let retry_rejects = self.retry_missing(
                     &mut segments,
                     &missed,
                     target_lang,
                     &glossary,
                     server.as_mut(),
                 );
+                // 折半重试里被判「近似复制」而拒收的句子也必须计入复制率，否则一条
+                // 近似复制就能绕过 `is_alarming` 兜底（主路径的复制句此前已被计入）。
+                // 与主路径的候选合并去重，避免同一句被两段逻辑各计一次。
+                copy_candidates.extend(retry_rejects);
+                copy_candidates.sort_unstable();
+                copy_candidates.dedup();
             }
 
             // 反思重试（**最多一次**）：只把「改动过大」的可疑句重问一遍，要求最小
@@ -1514,10 +1807,7 @@ impl LLMEngine {
                 );
             }
             // 重试之后仍没译出的复制句，才真正计入复制率。
-            copy.rejected += copy_candidates
-                .iter()
-                .filter(|&&pos| !segments[pos].translation_matches(target_lang))
-                .count();
+            copy.rejected += count_untranslated_copies(&segments, &copy_candidates, target_lang);
 
             completed += chunk.len();
             if let Some(ref cb) = progress_cb {
@@ -1590,6 +1880,8 @@ impl LLMEngine {
     /// 而且没有任何提示。这里把漏掉的句子折半再问一次：批越小，输出越不容易撞上
     /// 长度上限，一轮下来通常就补齐了；实在补不上的（如某个序号模型就是吐不出）
     /// 才放弃，并留一条日志。
+    ///
+    /// 返回「被判近似复制而拒收」的句子下标，供上层计入复制率。
     fn retry_missing(
         &self,
         segments: &mut [Segment],
@@ -1597,8 +1889,9 @@ impl LLMEngine {
         target_lang: &str,
         glossary: &str,
         mut server: Option<&mut LlamaServer>,
-    ) {
+    ) -> Vec<usize> {
         let mut todo: Vec<usize> = missed.to_vec();
+        let mut rejected_copy: Vec<usize> = Vec::new();
         // 每轮把待补清单**对半**拆成更小的批（单条时 half=1，即「单句重试一次」）。
         // `guard` 只防极端情况下的死循环；正常 24 条最多 5 轮就收敛。
         let mut guard = 0;
@@ -1608,7 +1901,7 @@ impl LLMEngine {
             let mut still_missing: Vec<usize> = Vec::new();
             for sub in todo.chunks(half) {
                 if self.is_cancelled() {
-                    return;
+                    return rejected_copy;
                 }
                 let batch: Vec<Segment> = sub.iter().map(|&p| segments[p].clone()).collect();
                 let results =
@@ -1616,12 +1909,17 @@ impl LLMEngine {
                 for &pos in sub {
                     match results.get(&segments[pos].index) {
                         Some(trans) => {
-                            // 折半后仍原样复制 → 就是没译出：保持未译，交给上层判定。
-                            if is_untranslated_copy(&segments[pos].translate_source(), trans) {
-                                still_missing.push(pos);
-                            } else {
-                                segments[pos].translation = Some(trans.clone());
-                                segments[pos].translation_lang = Some(target_lang.to_string());
+                            match classify_retry_outcome(&segments[pos].translate_source(), trans) {
+                                RetryVerdict::Accept => {
+                                    segments[pos].translation = Some(trans.clone());
+                                    segments[pos].translation_lang = Some(target_lang.to_string());
+                                }
+                                RetryVerdict::RejectCopy => {
+                                    // 近似复制：保持未译，并把下标交回上层计入复制率。
+                                    rejected_copy.push(pos);
+                                    still_missing.push(pos);
+                                }
+                                RetryVerdict::RejectOther => still_missing.push(pos),
                             }
                         }
                         None => still_missing.push(pos),
@@ -1642,6 +1940,7 @@ impl LLMEngine {
                 todo.len()
             );
         }
+        rejected_copy
     }
 
     fn translate_batch(
@@ -1794,8 +2093,8 @@ impl LLMEngine {
     ///
     /// 与 `translate_batch` 的截断处理对齐：信号为真就丢弃**最后一条已解析
     /// 结果**，由上层「保留原文」兜底。但**不复用** `retry_missing`——它用
-    /// `is_untranslated_copy` 判断成功，而润色后与原文相同完全正常（只加标点
-    /// 或本就无需改动），会被误判成「没润色」而反复重试 / 丢结果。
+    /// `validate_translation`（翻译口径）判断成功，而润色后与原文相同完全正常
+    /// （只加标点或本就无需改动），会被误判成「没润色」而反复重试 / 丢结果。
     fn polish_batch_finalize(
         source_segments: &[&Segment],
         output: &str,
@@ -2121,11 +2420,14 @@ impl LLMEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_char_budget, chinese_variant_target, clamp_ctx_size, cli_wait_budget,
-        fixed_prompt_tokens, is_untranslated_copy, llama_stop_type_is_limit, output_token_budget,
-        plan_translate_batches, similarity, validate_rewrite, validate_translation, CopyRate,
-        LLMEngine, RewriteVerdict, MAX_SEGMENTS_PER_BATCH, OUTPUT_TOKENS_PER_CHAR,
-        PROMPT_TOKENS_PER_CHAR,
+        batch_char_budget, chinese_variant_target, clamp_ctx_size, clamp_threads,
+        classify_retry_outcome, cli_wait_budget, count_untranslated_copies,
+        fit_glossary_to_context, fixed_overhead_exceeds_window, fixed_prompt_tokens,
+        glossary_entry_count, is_untranslated_copy, llama_stop_type_is_limit, output_token_budget,
+        plan_translate_batches, similarity, trim_glossary_to_tokens, validate_rewrite,
+        validate_translation, CopyRate, LLMEngine, RetryVerdict, RewriteVerdict, MAX_LLM_THREADS,
+        MAX_SEGMENTS_PER_BATCH, MIN_BATCH_CHARS, MIN_LLM_THREADS, OUTPUT_TOKENS_PER_CHAR,
+        PROMPT_HINT_TOKENS, PROMPT_TOKENS_PER_CHAR,
     };
     use crate::subtitle::Segment;
     use std::collections::{HashMap, HashSet};
@@ -2561,6 +2863,116 @@ mod tests {
         assert!(with >= 128, "再紧也要给最小生成空间: {with}");
     }
 
+    // ─────────── P1：术语表固定开销超过上下文窗口 ───────────
+
+    /// 「固定开销本身超过可用窗口」必须被判定函数识别，且预算函数如实返回 0
+    /// （旧实现用 `.max(64)` 把**必然超窗**伪装成「预算正常（64 字符）」）。
+    #[test]
+    fn fixed_overhead_over_window_is_detected() {
+        let ctx = 4096; // 默认 `llm_ctx`
+                        // 默认配置量级：80 条 × (60+60) 字符 ≈ 9.7k 字符 ≈ 8.2k token，已是整个窗口的两倍。
+        let default_glossary = "甲".repeat(80 * 122);
+        let fixed = fixed_prompt_tokens(&default_glossary) + PROMPT_HINT_TOKENS;
+        assert!(
+            fixed_overhead_exceeds_window(ctx, fixed),
+            "超窗必须被判定出来"
+        );
+        assert_eq!(
+            batch_char_budget(ctx, fixed),
+            0,
+            "超窗时预算必须如实归零，不得伪装成 64"
+        );
+        // 正常规模不触顶
+        assert!(!fixed_overhead_exceeds_window(ctx, 0));
+        assert!(batch_char_budget(ctx, 0) > 0);
+    }
+
+    /// 超窗时按优先级裁剪术语表：保留表头与**靠前**词条、裁掉尾部；裁剪后必须真的
+    /// 落回窗口内；且只影响本次提示词，用户术语表原样不动（纯函数）。
+    #[test]
+    fn glossary_is_trimmed_to_fit_context_without_touching_config() {
+        let ctx = 4096;
+        let glossary = "术语表（以下词条必须按给定译法翻译，不得改写）：".to_string()
+            + &(0..800)
+                .map(|i| format!("term{i}=术语{i}"))
+                .collect::<Vec<_>>()
+                .join("；")
+            + "。";
+        let original = glossary.clone();
+        let fit =
+            fit_glossary_to_context(&glossary, ctx, PROMPT_HINT_TOKENS).expect("必须能裁进窗口");
+        assert!(fit.trimmed);
+        assert!(fit.after_chars < fit.before_chars);
+        assert!(fit.after_entries < fit.before_entries);
+        assert!(fit.after_entries >= 1);
+        // 优先级：表头 + 首条保留，尾部被裁掉
+        assert!(fit.text.starts_with("术语表（"));
+        assert!(fit.text.contains("term0=术语0"));
+        assert!(!fit.text.contains("term799"));
+        // 裁完后确实落在窗口内，且仍留得下一批最小输入
+        let fixed = fixed_prompt_tokens(&fit.text) + PROMPT_HINT_TOKENS;
+        assert!(!fixed_overhead_exceeds_window(ctx, fixed));
+        assert!(batch_char_budget(ctx, fixed) >= MIN_BATCH_CHARS);
+        // 纯函数：输入（用户配置）原样未动
+        assert_eq!(glossary, original);
+    }
+
+    /// 真的一点都放不下时返回 `None`，交由上层报可读错误；空术语表永远放得下。
+    #[test]
+    fn glossary_fit_returns_none_when_nothing_fits() {
+        assert!(
+            fit_glossary_to_context("术语表：a=b", 512, 400).is_none(),
+            "固定开销已吃掉整窗口时必须返回 None"
+        );
+        let empty = fit_glossary_to_context("", 512, 0).expect("空表应放得下");
+        assert!(!empty.trimmed);
+        assert_eq!(empty.after_entries, 0);
+        assert_eq!(empty.after_chars, 0);
+    }
+
+    /// `trim_glossary_to_tokens` 边界：空表恒可放；预算为 0 且非空 → `None`；
+    /// 预算足够 → 原样返回；预算极小 → 退化为前缀截断而非空。
+    #[test]
+    fn trim_glossary_token_budget_boundaries() {
+        assert_eq!(trim_glossary_to_tokens("", 0), Some(String::new()));
+        assert_eq!(trim_glossary_to_tokens("术语表：a=b", 0), None);
+        let g = "术语表：a=b；c=d。";
+        assert_eq!(trim_glossary_to_tokens(g, 1_000), Some(g.to_string()));
+        assert_eq!(glossary_entry_count(g), 2);
+        assert_eq!(glossary_entry_count(""), 0);
+        let tiny = trim_glossary_to_tokens(g, 3).expect("小预算也应给出前缀");
+        assert!(!tiny.is_empty());
+        assert!(tiny.chars().count() < g.chars().count());
+    }
+
+    /// 输出预算在真的没空间时如实归零（不再 `.max(128)` 伪装），正常/紧张时仍给足。
+    #[test]
+    fn output_budget_is_honest_when_context_is_exhausted() {
+        let ctx = 4096;
+        let relaxed = output_token_budget(1_000, ctx, 0);
+        let tight = output_token_budget(1_000, ctx, 2_000);
+        assert!(relaxed >= 128);
+        assert!(tight >= 128 && tight < relaxed);
+        assert_eq!(
+            output_token_budget(1_000, ctx, 8_000),
+            0,
+            "固定开销超窗时如实返回 0，由上层拦截"
+        );
+    }
+
+    /// 线程数必须同时夹**上界**（同级引擎都这么做），不能只 `max(1)`。
+    #[test]
+    fn threads_are_clamped_to_sane_range() {
+        assert_eq!(clamp_threads(0), MIN_LLM_THREADS);
+        assert_eq!(clamp_threads(1), 1);
+        assert_eq!(clamp_threads(8), 8);
+        assert_eq!(clamp_threads(u32::MAX), MAX_LLM_THREADS);
+        let engine = LLMEngine::new("cli", "model.gguf", 4096, u32::MAX);
+        assert_eq!(engine.threads(), MAX_LLM_THREADS);
+        engine.set_threads(u32::MAX);
+        assert_eq!(engine.threads(), MAX_LLM_THREADS, "set_threads 也要夹上界");
+    }
+
     // ─────────── P1-D：llama-server 截断信号 ───────────
 
     /// 实测响应：`stop_type: "limit"` 表示撞上 `n_predict`；`"eos"` 表示正常收尾。
@@ -2876,5 +3288,74 @@ mod tests {
         assert_eq!(segs[0].polished, "", "可疑润色不得写回");
         assert_eq!(segs[0].display_text(), "今天讲概率不等式", "回退后显示原文");
         assert_eq!(segs[1].polished, "下一节讲条件概率。", "正常润色照常写回");
+    }
+
+    // ─────────── P1：折半重试写回必须与主路径同一条校验 ───────────
+
+    /// 折半重试写回前的判定：只有 `Ok` 才写回；近似复制（改一个功能字）判
+    /// `RejectCopy`（保持未译并计入复制率），长度失控 / 空输出判 `RejectOther`。
+    #[test]
+    fn retry_write_back_shares_main_path_validation() {
+        let source = "今天的天气非常好我们一起去公园散步吧".repeat(2);
+        // 近似复制：只改了最后一个字，相似度 ≥ 0.97 但不是完全相等。
+        let near_copy = format!("{}呀", &source[..source.len() - "吧".len()]);
+        assert!(
+            !is_untranslated_copy(&source, &near_copy),
+            "旧判据（只判完全相等）会放过近似复制"
+        );
+        let sim = similarity(&source, &near_copy);
+        assert!(
+            sim >= 0.97,
+            "测试前提：近似复制的相似度须落在 Echo 区间: {sim}"
+        );
+        assert_eq!(
+            classify_retry_outcome(&source, &near_copy),
+            RetryVerdict::RejectCopy
+        );
+        // 长度失控（长句被压成两个字）
+        assert_eq!(
+            classify_retry_outcome(&source, "好的"),
+            RetryVerdict::RejectOther
+        );
+        // 空输出
+        assert_eq!(
+            classify_retry_outcome(&source, "   "),
+            RetryVerdict::RejectOther
+        );
+        // 正常译文照旧写回
+        assert_eq!(
+            classify_retry_outcome(
+                &source,
+                "Lovely weather today, let us walk in the park together."
+            ),
+            RetryVerdict::Accept
+        );
+        // 原有放行守卫：短句 / 纯公式「译文==原文」本就正确
+        assert_eq!(classify_retry_outcome("OK", "OK"), RetryVerdict::Accept);
+    }
+
+    /// 折半重试被判「近似复制」而保持未译的句子必须计入复制率；重试补回正常译文的
+    /// 句子不得计入（否则会把好句子算成复制、抬高复制率）。
+    #[test]
+    fn retry_rejected_copies_count_toward_copy_rate() {
+        let mut segs = vec![
+            seg_at(1, "第一句源文本需要翻译"),
+            seg_at(2, "第二句源文本需要翻译"),
+        ];
+        // 句 2 折半重试后补回了正常译文；句 1 仍是「未译出」。
+        segs[1].translation = Some("The second sentence.".to_string());
+        segs[1].translation_lang = Some("English".to_string());
+        let candidates = vec![0usize, 1];
+        assert_eq!(
+            count_untranslated_copies(&segs, &candidates, "English"),
+            1,
+            "只有仍未译出的复制句计入"
+        );
+        // 折半重试拒收的复制句被并进候选后，复制率过半必须触发兜底告警
+        let copy = CopyRate {
+            rejected: 3,
+            checked: 4,
+        };
+        assert!(copy.is_alarming());
     }
 }
