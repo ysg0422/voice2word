@@ -709,6 +709,28 @@ impl WhisperEngine {
             );
         }
 
+        // 模型**类型**也要拦：whisper.cpp 只认 ggml/GGUF（`.bin` / `.gguf`）。
+        //
+        // 真实事故：用户的档位是 SenseVoice（模型是 `.onnx`），但 SenseVoice 引擎因为
+        // 缺胶水脚本 / 词表 / VAD 而建不起来，上游于是**回退到 Whisper 路由**，却仍把
+        // SenseVoice 的 `.onnx` 路径当 whisper 模型传进来 —— whisper-cli 在
+        // `whisper_init_from_file_with_params_no_state` 里直接崩溃，用户看到的是一个
+        // 系统级「whisper-cli.exe 已崩溃」弹窗，完全不知道跟档位有关。
+        // 这里提前 bail 成可读原因，把崩溃挡在进程创建之前。
+        let whisper_model_ext = effective_model
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if !matches!(whisper_model_ext.as_deref(), Some("bin") | Some("gguf")) {
+            anyhow::bail!(
+                "Whisper 引擎收到了非 Whisper 模型：{:?}（whisper.cpp 只认 .bin / .gguf；.onnx 是 SenseVoice 的模型）。\
+                 这通常意味着「选中的 SenseVoice 档位不可用、程序回退到了 Whisper」：\
+                 请到「性能设置 → 模型与组件 → SenseVoice」补齐组件（含 tools/sensevoice_runner.py），\
+                 或改选一个已下载的 Whisper 档位。",
+                effective_model
+            );
+        }
+
         if let Some(ref cb) = progress_cb {
             cb(0.0, "Whisper 正在加载模型并开始逐句识别...", None);
         }

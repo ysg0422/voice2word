@@ -161,14 +161,6 @@ jobs:
           # 否则 GPUI + wgpu + bundled SQLite 这套依赖树每次冷编会把 CI 拖到不可用。
           cache-targets: "true"
 
-      - name: Ensure installer payload placeholder
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path target/release -Force | Out-Null
-          if (-not (Test-Path target/release/voice2word.exe)) {
-            New-Item -ItemType File -Path target/release/voice2word.exe -Force | Out-Null
-          }
-
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets -- -D warnings
 

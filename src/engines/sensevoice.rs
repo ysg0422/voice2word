@@ -881,17 +881,33 @@ impl SenseVoiceEngine {
                 status.code(),
                 stderr_str
             );
-            // stderr 为空时的裸报错等于让用户猜谜：python 解释器找不到、依赖缺失
-            // 这类启动失败往往只留下退出码。按可操作的方向补一句提示。
-            if stderr_str.trim().is_empty() {
+            // 针对 Windows 应用商店 0 字节别名桩 (9009) 或依赖缺失 (10) 提供精准保姆级指引
+            let stderr_trimmed = stderr_str.trim();
+            if status.code() == Some(9009) || stderr_trimmed.contains("Python was not found") {
+                anyhow::bail!(
+                    "SenseVoice 启动失败：系统未找到真正的 Python 3 解释器（触发了 Windows 商店别名桩）。\n\
+                     请从 python.org 下载安装 Python 3 并勾选「Add Python to PATH」，或在「性能设置」手动指定 python.exe 路径。"
+                );
+            }
+            if status.code() == Some(10)
+                || stderr_trimmed.contains("缺少必需的 Python 依赖库")
+                || stderr_trimmed.contains("No module named")
+            {
+                anyhow::bail!(
+                    "SenseVoice 运行环境依赖缺失：\n{}\n\
+                     请打开终端并运行上述 pip install 命令安装所需组件。",
+                    stderr_trimmed
+                );
+            }
+            if stderr_trimmed.is_empty() {
                 anyhow::bail!(
                     "SenseVoice 识别失败：runner 退出码 {:?} 且无任何输出。\
-                     通常是 Python 解释器或依赖未就位——请确认「性能设置 → 模型与组件」里的 \
-                     python 路径正确，且已安装 sherpa-onnx / numpy（见 tools/sensevoice_runner.py 头部说明）。",
+                     通常是 Python 解释器或依赖未就位——请确认「性能设置」里的 \
+                     python 路径正确，且已安装 sherpa-onnx 与 numpy。",
                     status.code()
                 );
             }
-            anyhow::bail!("SenseVoice 识别失败: {}", stderr_str.trim());
+            anyhow::bail!("SenseVoice 识别失败: {}", stderr_trimmed);
         }
 
         // 结果定性：截断 / 整段不可解析 / 可用。判定是纯函数，三条方向都能直接单测。

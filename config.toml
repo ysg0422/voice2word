@@ -14,7 +14,7 @@ python = "python"
 [pipeline]
 language = "zh"
 output_format = "srt"
-enable_polish = false
+enable_polish = true
 polish_mode = "punc"
 enable_vad = true
 whisper_threads = 16
@@ -36,6 +36,7 @@ llm_ctx = 4096
 parallel_workers = 0
 enable_diarization = false
 speaker_count = 2
+asr_hotwords = ""
 
 [gpu]
 hardware_init_completed = true
@@ -52,15 +53,18 @@ letter_spacing = 9
 line_spacing = 2.1999998092651367
 max_chars_per_line = 25
 bottom_margin = 65
+margin_lr = 20
 preset_name = "白字黑影"
 preview_box_w = 560.0
-primary_color = "#FF0080"
+primary_color = "#FFD60A"
 outline_width = 1.5
 outline_color = "#000000"
 bg_style = "shadow"
 bg_opacity = 0.6000000238418579
 is_bold = true
 alignment = "center"
+karaoke_word_highlight = true
+custom_presets = []
 
 [translate]
 mode = "online_api"
@@ -75,6 +79,6 @@ max_glossary_entries = 80
 
 [ui]
 theme = "dark"
-export_mode = "bilingual"
+export_mode = "translation"
 export_format = "jianying"
 export_name_template = "{name}.{ext}"

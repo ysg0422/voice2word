@@ -3,16 +3,14 @@
 # =============================================================================
 # 用法：本地打一个 semver tag 并推送即可，例如
 #
-#     git tag v0.1.0
-#     git push origin v0.1.0
+#     git tag v0.2.0
+#     git push origin v0.2.0
 #
 # 触发后本工作流会：
-#   1. 在 windows-latest 上构建 release（产物为绿色便携版 exe）
+#   1. 在 windows-latest 上构建 release（产物为绿色便携版 exe 与 CLI 工具）
 #   2. 跑一次 lib 单测做最低限度的发布前验证
-#   3. 创建 GitHub Release 并直接发布 voice2word.exe（tag 带 - 的视为预发布）
-#
-# 关于权限：创建 Release 需要 contents: write（本文件显式声明）。
-# 若推送 tag 时被拒并提示 workflow scope，说明所用 PAT 缺少 workflow 权限。
+#   3. 使用 Inno Setup 编译生成标准 Windows 安装向导安装包
+#   4. 创建 GitHub Release 并发布安装包与便携版（tag 带 - 的视为预发布）
 # =============================================================================
 
 name: Release
@@ -22,7 +20,6 @@ on:
     tags:
       - 'v*'
 
-# 同一 tag 重复推送时取消在跑的旧任务。
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
@@ -47,15 +44,31 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress
+          "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Cache cargo registry / target
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: v2w-windows
           key: release
 
+      - name: Verify Tag against Cargo.toml
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $tagVersion = $tag -replace '^v', ''
+          $cargoVersion = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "Tag Version: $tagVersion, Cargo.toml Version: $cargoVersion"
+          if ($tagVersion -ne $cargoVersion) {
+            throw "版本号不匹配！Git Tag 为 $tagVersion，但 Cargo.toml 为 $cargoVersion。请统一版本号后再打 Tag 发布！"
+          }
+
       # ---------------------------------------------------------------
       # 发布前最低验证：lib 单测（单线程，规避已知 wgpu 偶发崩溃）。
-      # 集成测试需要真实模型/样片，在 CI 上不可能通过，故不在此跑。
       # ---------------------------------------------------------------
       - name: cargo test --lib
         run: cargo test --lib -- --test-threads=1
@@ -63,26 +76,35 @@ jobs:
       - name: cargo build --release (voice2word)
         run: cargo build --release --bin voice2word
 
-      - name: cargo build --release (voice2word-setup)
-        run: cargo build --release --bin voice2word-setup
-
       # 便携版里的无头入口：脚本/CI 用它（控制台子系统，shell 会同步等待，
       # 重定向与退出码可靠）。单独构建，避免与上面两步的 `--bin` 语义混淆。
       - name: cargo build --release (voice2word-cli)
         run: cargo build --release --bin voice2word-cli
 
       # ---------------------------------------------------------------
-      # 组装发布物（安装包 + 绿色便携版）
+      # 组装发布物并调用 Inno Setup 编译标准安装包
       # ---------------------------------------------------------------
-      - name: Assemble Release Assets
+      - name: Build Installer and Assemble Release Assets
         shell: pwsh
         run: |
           $tag = '${{ github.ref_name }}'
           $version = $tag -replace '^v', ''
           New-Item -ItemType Directory -Path dist -Force | Out-Null
+
+          if (-not (Test-Path target/release/voice2word.exe)) { throw "缺少 target/release/voice2word.exe" }
+          if (-not (Test-Path target/release/voice2word-cli.exe)) { throw "缺少 target/release/voice2word-cli.exe" }
+
           Copy-Item target/release/voice2word.exe dist/voice2word.exe -Force
           Copy-Item target/release/voice2word-cli.exe dist/voice2word-cli.exe -Force
-          Copy-Item target/release/voice2word-setup.exe "dist/Voice2Word-v$version-Setup.exe" -Force
+
+          Write-Host "Compiling Inno Setup Script..." -ForegroundColor Cyan
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion="$version" installer/voice2word.iss
+
+          $setupExe = "dist/Voice2Word-v$version-Setup.exe"
+          if (-not (Test-Path $setupExe)) {
+            throw "Inno Setup 编译完成但未找到产物：$setupExe"
+          }
+          Write-Host "Release Assets prepared successfully:" -ForegroundColor Green
           Get-ChildItem dist
 
       # ---------------------------------------------------------------
@@ -105,9 +127,9 @@ jobs:
             ### 下载说明
             | 文件 | 类型 | 适用场景与说明 |
             | :--- | :--- | :--- |
-            | **`Voice2Word-${{ github.ref_name }}-Setup.exe`** | **安装包（推荐）** | 打开就是安装位置，可点「选择其他位置」，点「安装」即完成；自动生成桌面快捷方式、开始菜单图标与卸载项，无控制台黑框 |
+            | **`Voice2Word-${{ github.ref_name }}-Setup.exe`** | **向导安装包（推荐）** | 标准 Windows 安装向导，可自选安装目录；自动创建开始菜单、桌面图标与卸载程序，无控制台黑框 |
             | `voice2word.exe` | 绿色便携版 | 单文件即开即用（无控制台黑框），免安装 |
-            | `voice2word-cli.exe` | 无头 / 脚本入口 | 与便携版同一套命令，但为控制台子系统：shell 会等待它，`> out.json` 重定向、管道与 `$LASTEXITCODE` 都可靠。用法见仓库 `docs/headless.md` |
+            | `voice2word-cli.exe` | 无头 / 脚本入口 | 控制台子系统程序，供自动化脚本、批处理调用，退出码与流重定向可靠 |
 
             ### 首次使用
             1. 下载安装包或便携版直接运行即可。

@@ -184,6 +184,8 @@ enum TranscribeRoute {
     WhisperStream,
     /// 临时 WAV 随机访问切块；`parallel` 为真时走 SenseVoice 多进程切块
     Chunked { parallel: bool },
+    /// 用户选了 SenseVoice 但引擎/模型未就位（禁止降级到 Whisper，避免 ONNX 模型引发 Whisper 崩溃）
+    SenseVoiceUnavailable,
 }
 
 impl EngineProfile for EngineCapabilities {
@@ -200,14 +202,15 @@ impl EngineProfile for EngineCapabilities {
     }
 
     fn transcribe_route(&self, sensevoice_ready: bool) -> TranscribeRoute {
-        if self.sensevoice() && sensevoice_ready {
-            TranscribeRoute::SenseVoiceStream
+        if self.sensevoice() {
+            if sensevoice_ready {
+                TranscribeRoute::SenseVoiceStream
+            } else {
+                TranscribeRoute::SenseVoiceUnavailable
+            }
         } else if self.can_stream() {
             TranscribeRoute::WhisperStream
         } else {
-            // 收敛前的内层判断原样保留：走到切块分支时，SenseVoice 推流已被上一条
-            // 分支拦截（并行切块本身要求 SenseVoice 已就绪），故 `parallel` 恒为
-            // false。此处只做等价改写、不改行为，可达性留给后续单独修复。
             TranscribeRoute::Chunked {
                 parallel: self.parallel(),
             }
@@ -936,11 +939,40 @@ impl TaskPipeline {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4) as u32;
+        // 动态按需探测/热装配 SenseVoice 引擎：
+        // 若启动时尚未下载模型，但用户在运行期间完成了下载，在此处就地装配，
+        // 无需强制重启应用程序即可立即享受 SenseVoice 极速转写。
+        let dynamic_sensevoice = self.sensevoice.clone().or_else(|| {
+            let runner = crate::utils::AppConfig::resolve_path("tools/sensevoice_runner.py");
+            let model = crate::utils::AppConfig::resolve_path("models/sensevoice/model.int8.onnx");
+            let tokens = crate::utils::AppConfig::resolve_path("models/sensevoice/tokens.txt");
+            let vad = crate::utils::AppConfig::resolve_path("models/sensevoice/silero_vad.onnx");
+            if runner.is_file() && model.is_file() && tokens.is_file() && vad.is_file() {
+                let py = crate::utils::AppConfig::resolve_command("python");
+                let provider = if use_gpu { "dml" } else { "cpu" };
+                info!("动态热装配 SenseVoice 极速引擎 (provider={provider})");
+                Some(Arc::new(
+                    crate::engines::SenseVoiceEngine::with_python_and_provider(
+                        runner,
+                        model,
+                        tokens,
+                        vad,
+                        threads.unwrap_or(8),
+                        py,
+                        provider,
+                    ),
+                ))
+            } else {
+                None
+            }
+        });
+        let sensevoice_available = dynamic_sensevoice.is_some();
+
         // 引擎能力一次性求解：并行切块 / 纯内存推流 / 单会话线程数的判定公式
         // 集中在 [`EngineCapabilities::plan`]，此处只读结果，下游统一经 [`EngineProfile`] 取用。
         let mut caps = EngineCapabilities::plan(
             sensevoice_selected,
-            self.sensevoice.is_some(),
+            sensevoice_available,
             use_gpu,
             audio_speed,
             duration_for_chunks,
@@ -1214,9 +1246,11 @@ impl TaskPipeline {
         } else {
             // 转写通道一次性求解：原先散落的 `is_sensevoice / can_stream / sv_parallel`
             // 三段式 if-else 链收敛到 [`EngineProfile::transcribe_route`]，此处只读结果。
-            match caps.transcribe_route(self.sensevoice.is_some()) {
+            match caps.transcribe_route(sensevoice_available) {
                 TranscribeRoute::SenseVoiceStream => {
-                    let sv_engine = self.sensevoice.clone().context("SenseVoice 引擎未就绪")?;
+                    let sv_engine = dynamic_sensevoice
+                        .clone()
+                        .context("SenseVoice 引擎未就绪：缺少核心模型或 Python 运行脚本")?;
                     let in_file_stream = input_file.clone();
                     let ffmpeg_stream = ffmpeg.clone();
                     let tx_sv = tx.clone();
@@ -1347,7 +1381,7 @@ impl TaskPipeline {
                     let wav_path = temp_wav_path.as_ref().unwrap().path().to_path_buf();
                     let ffmpeg_chunks = ffmpeg.clone();
                     let whisper_engine = whisper.clone();
-                    let sv_engine = self.sensevoice.clone();
+                    let sv_engine = dynamic_sensevoice.clone();
                     let model_override_clone = model_override.clone();
                     let chunk_threads = threads.unwrap_or(8);
                     // 压实后音频变短，切块与进度都必须按压实后的时长规划，
@@ -1371,8 +1405,8 @@ impl TaskPipeline {
                             }));
 
                         if parallel {
-                            let sv =
-                                sv_engine.context("SenseVoice 引擎未就绪，无法执行切块并行")?;
+                            let sv = sv_engine
+                                .context("SenseVoice 引擎未就绪：缺少核心模型或 Python 运行脚本")?;
                             transcribe_chunked_sensevoice(
                                 ffmpeg_chunks.as_ref(),
                                 sv.as_ref(),
@@ -1402,6 +1436,12 @@ impl TaskPipeline {
                     let total_elapsed = transcription_started.elapsed().as_secs_f64();
                     let pure_sec = (total_elapsed - v_sec).max(0.0);
                     (segs, v_sec, pure_sec)
+                }
+                TranscribeRoute::SenseVoiceUnavailable => {
+                    anyhow::bail!(
+                        "SenseVoice 极速引擎未就绪：缺少核心模型（model.int8.onnx / tokens / vad）或运行环境。\n\
+                         请在「性能设置 → 模型与组件」下载 SenseVoice 组件，或在右侧切换为 Whisper 引擎转写。"
+                    );
                 }
             }
         };

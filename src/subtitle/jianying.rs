@@ -94,12 +94,18 @@ impl JianYingExporter {
         let mut texts = Vec::new();
         let mut text_segments = Vec::new();
 
+        let mut last_end_us = 0u64;
         for (i, seg) in segments.iter().enumerate() {
             let text_id = Uuid::new_v4().to_string().to_uppercase();
             let seg_id = Uuid::new_v4().to_string().to_uppercase();
-            let start_us = (seg.start * 1_000_000.0) as u64;
-            let end_us = (seg.end * 1_000_000.0) as u64;
-            let dur_us = end_us.saturating_sub(start_us).max(100_000);
+            let mut start_us = (seg.start * 1_000_000.0) as u64;
+            if start_us < last_end_us {
+                start_us = last_end_us;
+            }
+            let raw_end_us = (seg.end * 1_000_000.0) as u64;
+            let end_us = raw_end_us.max(start_us + 100_000);
+            let dur_us = end_us - start_us;
+            last_end_us = end_us;
 
             let raw_text = Self::xml_escape(&seg.project_export_text(mode));
             let content_xml = format!(
@@ -172,7 +178,7 @@ impl JianYingExporter {
                 "text_color": "#ffffff",
                 "text_size": 30,
                 "text_to_audio_ids": [],
-                "type": "subtitle",
+                "type": "text",
                 "typesetting": 0,
                 "underline": false,
                 "use_effect_default_color": false,
@@ -183,7 +189,13 @@ impl JianYingExporter {
             text_segments.push(json!({
                 "caption_info": null,
                 "cartoon": false,
-                "clip": null,
+                "clip": {
+                    "alpha": 1.0,
+                    "flip": { "horizontal": false, "vertical": false },
+                    "rotation": 0.0,
+                    "scale": { "x": 1.0, "y": 1.0 },
+                    "transform": { "x": 0.0, "y": -0.8 }
+                },
                 "common_keyframes": [],
                 "enable_adjust": true,
                 "enable_color_curves": true,
@@ -559,7 +571,18 @@ impl JianYingExporter {
         let draft_id = Uuid::new_v4().to_string().to_uppercase();
 
         let content_json = Self::build_draft_content(segments, video_path, total_dur, mode);
-        let meta_json = Self::build_draft_meta_info(&draft_id, draft_name, duration_us);
+        let mut meta_json = Self::build_draft_meta_info(&draft_id, draft_name, duration_us);
+
+        let norm_target_dir = target_dir.to_string_lossy().replace('\\', "/");
+        let norm_content_file = format!("{}/draft_content.json", norm_target_dir);
+        let norm_root_dir = target_dir
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| norm_target_dir.clone());
+
+        meta_json["draft_fold_path"] = json!(norm_target_dir);
+        meta_json["draft_json_file"] = json!(norm_content_file);
+        meta_json["draft_root_path"] = json!(norm_root_dir);
 
         let content_path = target_dir.join("draft_content.json");
         let meta_path = target_dir.join("draft_meta_info.json");

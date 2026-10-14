@@ -1981,9 +1981,26 @@ impl MainWindow {
         use crate::app::WhisperModelTier;
         let tier = self.state.whisper_model_tier;
         if tier == WhisperModelTier::SenseVoice {
-            if !self.state.model_is_present("sensevoice-model") {
+            let model_ok = self.state.model_is_present("sensevoice-model")
+                || crate::utils::AppConfig::resolve_path("models/sensevoice/model.int8.onnx")
+                    .is_file();
+            let tokens_ok = self.state.model_is_present("sensevoice-tokens")
+                || crate::utils::AppConfig::resolve_path("models/sensevoice/tokens.txt").is_file();
+            let vad_ok = self.state.model_is_present("sensevoice-vad")
+                || crate::utils::AppConfig::resolve_path("models/sensevoice/silero_vad.onnx")
+                    .is_file();
+            let runner_ok =
+                crate::utils::AppConfig::resolve_path("tools/sensevoice_runner.py").is_file();
+
+            if !model_ok || !tokens_ok || !vad_ok {
                 return Some(
-                    "SenseVoice 模型未就位：请在「性能设置 → 模型与组件」下载，或改用 Whisper 档位"
+                    "SenseVoice 组件未就齐（需模型、词表与 VAD）：请在「性能设置 → 模型与组件」一键下载补齐，或在右侧切换为 Whisper 档位"
+                        .to_string(),
+                );
+            }
+            if !runner_ok {
+                return Some(
+                    "SenseVoice 运行脚本缺失 (tools/sensevoice_runner.py)，请检查安装包完整性"
                         .to_string(),
                 );
             }

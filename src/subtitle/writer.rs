@@ -323,7 +323,7 @@ impl SubtitleWriter {
         segments: &[Segment],
         path: P,
         mode: ExportMode,
-        wrap: usize,
+        _wrap: usize,
     ) -> Result<()> {
         let mut file = File::create(path).with_context(|| "创建 TXT 文件失败")?;
         let with_speaker = super::segment::has_speaker_labels(segments);
@@ -332,9 +332,7 @@ impl SubtitleWriter {
             let raw = super::segment::export_text_for(seg, mode, with_speaker);
             // 与 TXT 一致：一行一句；折行参数 0 表示不折。
             let flat = raw.replace(['\r', '\n'], " ");
-            let wrapped = wrap_text_capped(&flat, wrap, WRAP_MAX_LINES);
-            let text = escape_markup_entities(&wrapped).replace(['\r', '\n'], " ");
-            writeln!(file, "[{}] {}", stamp, text.trim())?;
+            writeln!(file, "[{}] {}", stamp, flat.trim())?;
         }
         Ok(())
     }
@@ -1242,14 +1240,14 @@ fn assign_breaks(
 fn render_breaks(chars: &[char], breaks: &[usize]) -> String {
     let mut out = String::with_capacity(chars.len() + breaks.len());
     let mut start = 0usize;
-    for &brk in breaks.iter() {
+    for (idx, &brk) in breaks.iter().enumerate() {
         // 行尾空格回退掉再输出（行首空格由断点本身保证不会出现）。
         let mut end = brk;
         while end > start && chars[end - 1] == ' ' {
             end -= 1;
         }
         out.extend(chars[start..end].iter());
-        if end < chars.len() {
+        if idx + 1 < breaks.len() {
             out.push('\n');
         }
         // 断点落在空格上时 `end` 会比 `brk` 小一点：多出来的空格留在上一行的
@@ -1335,7 +1333,7 @@ fn is_wrap_break_after(c: char) -> bool {
 /// 品红 / 青 / 紫 / 珊瑚 / 青柠），循环使用。数量超出时回绕，保证永远给得出颜色。
 fn speaker_ass_color(idx: usize) -> &'static str {
     const PALETTE: [&str; 8] = [
-        "&H00D1B110", // 薄荷绿（与主色一致）
+        "&H0081B910", // 薄荷绿（与主色一致）
         "&H00F8BD38", // 天蓝
         "&H000B9EF5", // 琥珀
         "&H00D64FD8", // 品红
@@ -2600,7 +2598,7 @@ mod tests {
 
     /// 无词级数据（老工程 / 非 Whisper 引擎）时的 ASS 期望值：取自加逐词高亮之前的
     /// 导出器输出，转成字面量后钉死在这里。
-    const GOLDEN_ASS: &str = "[Script Info]\nTitle: Voice2Word Subtitle\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nTimer: 100.0000\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Microsoft YaHei,40,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,1,0,1,2,1,2,20,20,40,1\nStyle: Speaker1,Microsoft YaHei,40,&H00D1B110,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,1,0,1,2,1,2,20,20,40,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.50,Speaker1,,0,0,0,,说话人 1: First line\\N第一句\nDialogue: 0,0:00:01.50,0:00:03.00,Default,,0,0,0,,第二句\n";
+    const GOLDEN_ASS: &str = "[Script Info]\nTitle: Voice2Word Subtitle\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nTimer: 100.0000\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Microsoft YaHei,40,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,1,0,1,2,1,2,20,20,40,1\nStyle: Speaker1,Microsoft YaHei,40,&H0081B910,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,1,0,1,2,1,2,20,20,40,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.50,Speaker1,,0,0,0,,说话人 1: First line\\N第一句\nDialogue: 0,0:00:01.50,0:00:03.00,Default,,0,0,0,,第二句\n";
     ///
     /// 回归：没有词级时间戳时输出必须与加这个功能之前**逐字节一致**——不插标签、
     /// 不声明颜色、不多任何前缀。逐词高亮是「有数据才生效」的增强，不许动老工程。

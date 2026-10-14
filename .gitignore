@@ -12,6 +12,8 @@ target/
 models/
 tools/*
 !tools/punc_runner.py
+!tools/sensevoice_runner.py
+!tools/download_sensevoice.py
 *.bin
 *.gguf
 *.onnx

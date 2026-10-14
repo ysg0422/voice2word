@@ -12,10 +12,6 @@ path = "src/lib.rs"
 name = "voice2word"
 path = "src/main.rs"
 
-[[bin]]
-name = "voice2word-setup"
-path = "src/bin/setup.rs"
-
 # 无头/脚本入口：控制台子系统，让 shell 同步等待（重定向、管道、退出码都正常）。
 [[bin]]
 name = "voice2word-cli"

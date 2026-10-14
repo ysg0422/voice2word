@@ -318,7 +318,7 @@ impl TranslateEngine {
             .online
             .as_ref()
             .ok_or_else(|| anyhow!("当前不是在线 API 模式"))?;
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "model": cfg.model,
             "messages": [
                 { "role": "user", "content": "只回复两个字：正常" }
@@ -329,6 +329,11 @@ impl TranslateEngine {
             "max_tokens": 512,
             "stream": false,
         });
+        if !supports_temperature(&cfg.model) {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.remove("temperature");
+            }
+        }
         let value = post_chat_completions(cfg, &payload)?;
         Ok(extract_message_content(&value)
             .unwrap_or_else(|| "(接口返回成功，但未解析到文本内容)".to_string()))
@@ -377,6 +382,23 @@ fn translate_via_online_api(
 
 /// 在线翻译主流程：按 `batch_size` 切片，逐批请求并回填 `segment.translation`，
 /// 并返回「输出校验自愈」统计（回退条数 / 反思次数）供上层提示。
+fn is_local_endpoint(endpoint: &str) -> bool {
+    let lower = endpoint.to_lowercase();
+    lower.contains("localhost")
+        || lower.contains("127.0.0.1")
+        || lower.contains("0.0.0.0")
+        || lower.contains("192.168.")
+        || lower.contains("10.")
+        || lower.contains(":11434")
+}
+
+/// 部分前沿推理模型（如 OpenAI o1 / o3-mini 等）严格禁止自定义 temperature 参数，
+/// 传入非默认值会直接报 HTTP 400 Bad Request。
+fn supports_temperature(model: &str) -> bool {
+    let m = model.to_lowercase();
+    !(m.starts_with("o1") || m.starts_with("o3") || m.contains("-o1") || m.contains("-o3"))
+}
+
 fn translate_via_online_api_with_stats(
     cfg: &OnlineApiConfig,
     mut segments: Vec<Segment>,
@@ -385,7 +407,7 @@ fn translate_via_online_api_with_stats(
     cancel: Arc<AtomicBool>,
     partial: Option<&PartialSink>,
 ) -> Result<(Vec<Segment>, RewriteStats)> {
-    if cfg.api_key.trim().is_empty() {
+    if cfg.api_key.trim().is_empty() && !is_local_endpoint(&cfg.endpoint) {
         return Err(anyhow!(
             "未配置在线翻译 API Key。请在「性能设置 → 在线翻译 API」中填写，\
              或设置环境变量 VOICE2WORD_API_KEY"
@@ -1329,7 +1351,7 @@ fn request_batch_translation(
     let src_hint = crate::subtitle::dominant_language(batch.iter().copied())
         .map(|code| format!("源语言为{}；", crate::subtitle::language_name(&code)))
         .unwrap_or_default();
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "model": cfg.model,
         "messages": [
             {
@@ -1360,6 +1382,11 @@ fn request_batch_translation(
         ),
         "stream": false,
     });
+    if !supports_temperature(&cfg.model) {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("temperature");
+        }
+    }
 
     let mut value = post_chat_completions(cfg, &payload)?;
 
@@ -1692,11 +1719,21 @@ pub(crate) fn post_chat_completions(
         .timeout(Duration::from_secs(cfg.timeout_secs.clamp(10, 600)))
         .build();
 
-    let response = agent
+    let mut req = agent
         .post(&cfg.endpoint)
-        .set("Content-Type", "application/json")
-        .set("Authorization", &format!("Bearer {}", cfg.api_key.trim()))
-        .send_json(payload.clone());
+        .set("Content-Type", "application/json");
+
+    let raw_key = cfg.api_key.trim();
+    if !raw_key.is_empty() {
+        let clean_key = raw_key
+            .strip_prefix("Bearer ")
+            .or_else(|| raw_key.strip_prefix("bearer "))
+            .unwrap_or(raw_key)
+            .trim();
+        req = req.set("Authorization", &format!("Bearer {clean_key}"));
+    }
+
+    let response = req.send_json(payload.clone());
 
     match response {
         // 拿到了响应：再读体、再解析。任何「读不出 JSON」都单独成类（可重试），
