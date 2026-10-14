@@ -142,15 +142,34 @@ fn create_safe_file_alias(src: &Path) -> Option<PathBuf> {
         .unwrap_or("bin");
 
     // 优先在源文件相同驱动器的根临时目录创建硬链接（硬链接不可跨卷）
-    let prefix = src.components().next()?;
-    let drive_root = PathBuf::from(prefix.as_os_str()).join(".v2w_alias");
-    if std::fs::create_dir_all(&drive_root).is_ok() {
-        let alias = drive_root.join(format!("m_{:x}.{}", hash, ext));
-        if alias.exists() {
-            return Some(alias);
+    // 注意：PrefixComponent.as_os_str() 返回的是 "D:"，必须显式补上 "\" 成为 "D:\" 根目录！
+    // 否则拼接出的 "D:.v2w_alias" 是驱动器相对路径，会被当成不存在的非法路径。
+    let mut components = src.components();
+    if let Some(std::path::Component::Prefix(prefix)) = components.next() {
+        let mut drive_root = PathBuf::from(prefix.as_os_str());
+        drive_root.push("\\");
+        let alias_dir = drive_root.join(".v2w_alias");
+        if std::fs::create_dir_all(&alias_dir).is_ok() {
+            let alias = alias_dir.join(format!("m_{:x}.{}", hash, ext));
+            if alias.exists() {
+                return Some(alias);
+            }
+            if std::fs::hard_link(src, &alias).is_ok() {
+                return Some(alias);
+            }
         }
-        if std::fs::hard_link(src, &alias).is_ok() {
-            return Some(alias);
+    }
+
+    // 回退策略：对于小于等于 128MB 的文件（如音频 wav 输入文件），直接安全复制到纯英文 safe_temp_dir
+    if let Ok(meta) = src.metadata() {
+        if meta.len() <= 128 * 1024 * 1024 {
+            let temp_dest = safe_temp_dir().join(format!("v2w_safe_{:x}.{}", hash, ext));
+            if temp_dest.exists() {
+                return Some(temp_dest);
+            }
+            if std::fs::copy(src, &temp_dest).is_ok() {
+                return Some(temp_dest);
+            }
         }
     }
 
@@ -173,5 +192,19 @@ mod tests {
     fn test_safe_temp_dir() {
         let temp = safe_temp_dir();
         assert!(temp.exists());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_drive_root_slash() {
+        let p = Path::new("D:\\测试目录\\model.bin");
+        let mut components = p.components();
+        if let Some(std::path::Component::Prefix(prefix)) = components.next() {
+            let mut drive_root = PathBuf::from(prefix.as_os_str());
+            drive_root.push("\\");
+            assert_eq!(drive_root.to_str().unwrap(), "D:\\");
+            let alias_dir = drive_root.join(".v2w_alias");
+            assert_eq!(alias_dir.to_str().unwrap(), "D:\\.v2w_alias");
+        }
     }
 }

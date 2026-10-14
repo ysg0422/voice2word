@@ -771,11 +771,17 @@ impl WhisperEngine {
         let safe_vad = self.vad_model_path.as_ref().map(|p| crate::utils::to_cli_safe_path(p));
 
         let mut cmd = Command::new(&effective_cli);
-        if let Some(parent) = effective_model.parent() {
-            if parent.exists() {
-                cmd.current_dir(parent);
+        let work_dir = if let Some(parent) = effective_model.parent() {
+            let p_str = parent.to_string_lossy();
+            if p_str.is_ascii() && parent.exists() {
+                parent.to_path_buf()
+            } else {
+                crate::utils::safe_temp_dir()
             }
-        }
+        } else {
+            crate::utils::safe_temp_dir()
+        };
+        cmd.current_dir(&work_dir);
         cmd.arg("-m").arg(&safe_model);
 
         match &audio_input {
