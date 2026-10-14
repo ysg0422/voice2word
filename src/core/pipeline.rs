@@ -1605,6 +1605,12 @@ impl TaskPipeline {
         // ── 阶段 3: 标点与语法润色（可跳过）──
         let mut qwen_sec = 0.0;
         let mut polish_engine_name = None;
+        // 标点/润色是否**真的把结果写回了** `segments`。
+        //
+        // 与「这一跑跑过这个阶段」分开记：超时 / 失败 / 取消时 `segments` 仍是识别
+        // 原文，此时若把 `06_polish.json` 落盘，续跑会把它当成润色成品复用（见
+        // `resume_polish_segments`），标点阶段就被永久跳过了。
+        let mut polish_applied = false;
         // Resume: only an enabled polish stage may reuse a persisted artifact;
         // a disabled run keeps its fresh segments and ignores stale files.
         let mut polish_resumed = false;
@@ -1633,6 +1639,9 @@ impl TaskPipeline {
             if caps.sensevoice() && mode == "punc" {
                 polish_engine_name = Some("SenseVoice 原生标点".to_string());
                 info!("SenseVoice 原生自带高精度标点与数字规范化(ITN)，跳过 CT-Punc 阶段以实现极致速度");
+                // 标点由识别引擎自带：这一次的 `segments` 本身就是「已标点」的结果，
+                // 落盘与续跑复用都是对的。
+                polish_applied = true;
                 let _ = tx.send(PipelineEvent::Progress {
                     stage: "极速标点".into(),
                     progress: 0.95,
@@ -1677,6 +1686,7 @@ impl TaskPipeline {
                             info!("标点完成后检测到取消，丢弃本次标点结果");
                         } else {
                             segments = polished;
+                            polish_applied = true;
                             qwen_sec = punc_started.elapsed().as_secs_f64();
                             info!(elapsed = ?punc_started.elapsed(), segments = segments.len(), "CT-Punc 极速标点完成");
                             if !skip_post {
@@ -1748,6 +1758,7 @@ impl TaskPipeline {
                 {
                     Ok(Ok(polished)) => {
                         segments = polished;
+                        polish_applied = true;
                         qwen_sec = polishing_started.elapsed().as_secs_f64();
                         info!(elapsed = ?polishing_started.elapsed(), segments = segments.len(), "Qwen 润色完成");
                     }
@@ -1776,9 +1787,17 @@ impl TaskPipeline {
             info!("已跳过标点润色");
         }
 
-        // Persist only when this run actually ran punctuation/polish.
-        let polish_ran = !polish_resumed && enable_polish && !segments.is_empty() && !skip_post;
-        if polish_ran {
+        // Persist only when the punctuation/polish result was actually applied to
+        // `segments` — a timed-out or failed stage leaves the raw ASR text in place,
+        // and saving that as `06_polish.json` would make the next resume treat it as
+        // the finished polish and skip the stage forever.
+        if should_persist_polish_artifact(
+            polish_applied,
+            polish_resumed,
+            enable_polish,
+            !segments.is_empty(),
+            skip_post,
+        ) {
             if let Some(a) = artifacts.as_ref() {
                 if let Err(e) = a.write_segments(Stage::Polish, &segments) {
                     warn!("润色产物落盘失败: {e:#}");
@@ -2219,6 +2238,22 @@ fn resume_polish_segments(artifacts: Option<&StageArtifacts>) -> Option<Vec<Segm
         .filter(|segs| !segs.is_empty())
 }
 
+/// 是否该把标点/润色阶段的产物落盘（纯函数，便于单测）。
+///
+/// 判据是「**结果真的写回了** `segments`」（`applied`），而不是「这一跑跑过这个阶段」：
+/// 超时、失败、取消时 `segments` 仍是识别原文，落盘等于把一个「还没标点」的产物
+/// 登记成成品——[`resume_polish_segments`] 优先复用 `06_polish.json`，下次续跑就会
+/// 直接跳过标点阶段，用户永远等不到补标点。
+fn should_persist_polish_artifact(
+    applied: bool,
+    resumed: bool,
+    enabled: bool,
+    has_segments: bool,
+    skip_post: bool,
+) -> bool {
+    applied && !resumed && enabled && has_segments && !skip_post
+}
+
 /// Resume helper: cached media duration, valid only for the SAME input file.
 ///
 /// A record describing another input is stale (task folder reused with a
@@ -2284,6 +2319,37 @@ mod tests {
         scale_segment_to_original_time(&mut seg, 1.25, 600.0);
         assert!((seg.start - 12.5).abs() < 1e-9);
         assert!((seg.end - 15.0).abs() < 1e-9);
+    }
+
+    /// 只有「结果真的写回了 segments」才允许落盘标点/润色产物。
+    ///
+    /// 回归护栏：曾经的判据是「这一跑跑过这个阶段」，标点超时/失败/取消时也成立，
+    /// 于是把**未标点**的识别原文写成 `06_polish.json`；而续跑优先复用它，
+    /// 标点阶段就被永久跳过（用户再点多少次续跑都不会补标点）。
+    #[test]
+    fn polish_artifact_is_persisted_only_when_the_result_was_applied() {
+        // 正常跑完且写回：落盘。
+        assert!(should_persist_polish_artifact(
+            true, false, true, true, false
+        ));
+        // 超时 / 失败 / 被取消：segments 仍是识别原文，绝不能登记成成品。
+        assert!(!should_persist_polish_artifact(
+            false, false, true, true, false
+        ));
+        // 续跑复用了已有产物：不要覆盖它。
+        assert!(!should_persist_polish_artifact(
+            true, true, true, true, false
+        ));
+        // 关润色 / 没字幕 / 跳过收尾：都不写。
+        assert!(!should_persist_polish_artifact(
+            true, false, false, true, false
+        ));
+        assert!(!should_persist_polish_artifact(
+            true, false, true, false, false
+        ));
+        assert!(!should_persist_polish_artifact(
+            true, false, true, true, true
+        ));
     }
 
     /// 加速音频的流式预览同样要还原词级时间戳：段被缩放、词不缩放 = 逐词高亮错位。
