@@ -5229,38 +5229,267 @@ impl MainWindow {
     }
 }
 
-/// 把任意长度的峰值序列重采样成 `bars` 根等宽柱体，每根取所在窗口的**最大值**。
+// 时间轴的水平平移量（可视窗口起点，秒）。
+//
+// 不挂在 `MainWindow` 上：窗口结构体定义在 `ui/mod.rs`，本模块不便向外扩字段
+// （同 `REPLACE_PANEL_TOGGLES`）。缩放复用已有字段 `state.timeline_zoom`，平移是纯
+// 视图态——不需要持久化，换了素材后 `clamp_window` 会把它夹回新素材范围内。
+thread_local! {
+    static TIMELINE_PAN_START: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+/// 时间轴缩放上下限：1.0 = 整段（与改造前一致），20.0 = 一秒的素材也能占到 1/20 宽。
+const TIMELINE_ZOOM_MIN: f64 = 1.0;
+const TIMELINE_ZOOM_MAX: f64 = 20.0;
+/// 顶栏 `-` / `+` 一次点击的倍率，以及滚轮一格的倍率。
+const TIMELINE_ZOOM_BTN_STEP: f64 = 1.5;
+const TIMELINE_ZOOM_SCROLL_STEP: f64 = 1.15;
+/// 滚轮一格的水平平移量（占窗口宽度的比例）。
+const TIMELINE_PAN_STEP: f64 = 0.1;
+/// 播放跟随可视带：播放中游标进入前后各 10% 就把窗口推着走，留出前视空间。
+const TIMELINE_FOLLOW_BAND: f64 = 0.1;
+
+/// 时间轴的可视时间窗口 `[start, end]`，是整个时间轴**唯一**的「时间 → 横向比例」变换。
 ///
-/// 取最大值而非平均值：包络上的「毛刺」正是人眼用来定位语音起止的特征，
-/// 平均会把它们抹平成一条没有信息量的平滑曲线。
-fn resample_peaks(peaks: &[f32], bars: usize) -> Vec<f32> {
-    if peaks.is_empty() || bars == 0 {
-        return Vec::new();
+/// 为什么收敛成一个类型：缩放与平移一旦分别内联进片段、播放头、标尺、波形各自的
+/// 表达式，就必然出现「有的按整段、有的按窗口」的错位——那正是这次要根治的问题。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TimelineWindow {
+    start: f64,
+    end: f64,
+}
+
+impl TimelineWindow {
+    /// 时间 → 窗口内比例。**不夹紧**：落在窗口外的时间要拿到 < 0 或 > 1 的值，片段
+    /// 据此被容器的 `overflow_hidden` 裁掉，而不是全挤在边缘。
+    fn time_to_ratio(self, t: f64) -> f64 {
+        let span = self.span();
+        if span <= 0.0 {
+            return 0.0;
+        }
+        (t - self.start) / span
     }
-    if peaks.len() <= bars {
-        // 桶数比柱数还少（极短视频）时按比例拉伸复用，避免出现空柱
-        return (0..bars).map(|i| peaks[i * peaks.len() / bars]).collect();
+
+    /// 窗口内比例 → 时间。比例夹到 `[0, 1]`：鼠标拖出轨道时只取端点时间。
+    fn ratio_to_time(self, ratio: f64) -> f64 {
+        self.start + ratio.clamp(0.0, 1.0) * self.span()
     }
-    (0..bars)
-        .map(|i| {
-            let lo = i * peaks.len() / bars;
-            let hi = (((i + 1) * peaks.len()) / bars)
-                .max(lo + 1)
-                .min(peaks.len());
-            peaks[lo..hi].iter().copied().fold(0.0f32, f32::max)
-        })
-        .collect()
+
+    fn span(self) -> f64 {
+        (self.end - self.start).max(0.0)
+    }
+}
+
+/// 倍率夹到 `[MIN, MAX]`；非有限值退回整段，避免 NaN 渗进布局。
+fn clamp_zoom(zoom: f64) -> f64 {
+    if !zoom.is_finite() {
+        return TIMELINE_ZOOM_MIN;
+    }
+    zoom.clamp(TIMELINE_ZOOM_MIN, TIMELINE_ZOOM_MAX)
+}
+
+/// 把窗口夹回 `[0, total]`：平移不越界、缩放后不越界，总时长为 0 时退化成空窗口。
+///
+/// `span >= total`（整段或更宽）一律回到 `[0, total]`——这正是「zoom = 1.0 与改造前
+/// 逐像素一致」的根：未放大时任何平移/跟随都会被这里抹掉。
+fn clamp_window(start: f64, end: f64, total: f64) -> (f64, f64) {
+    if !total.is_finite() || total <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let span = if start.is_finite() && end.is_finite() {
+        (end - start).max(0.0)
+    } else {
+        total
+    };
+    if span >= total {
+        return (0.0, total);
+    }
+    let start = if start.is_finite() {
+        start.clamp(0.0, total - span)
+    } else {
+        0.0
+    };
+    (start, start + span)
+}
+
+/// 由「倍率 + 窗口起点」导出夹紧后的窗口：状态 → 变换的唯一出口，渲染、鼠标定位、
+/// 播放跟随都走这里，不各算各的。
+fn timeline_window(zoom: f64, start: f64, total: f64) -> TimelineWindow {
+    let zoom = clamp_zoom(zoom);
+    if !total.is_finite() || total <= 0.0 {
+        return TimelineWindow {
+            start: 0.0,
+            end: 0.0,
+        };
+    }
+    let span = total / zoom;
+    let (start, end) = clamp_window(start, start + span, total);
+    TimelineWindow { start, end }
+}
+
+/// 以 `anchor_ratio`（鼠标在时间轴上的横向占比）为不动点缩放。
+///
+/// 锚点不动是缩放的语义要求：鼠标指着哪一帧，滚完之后还得指着那一帧，否则每滚一次
+/// 都要重新找位置。返回 `(夹紧后的倍率, 夹紧后的窗口起点)`。
+fn zoom_at(
+    anchor_ratio: f64,
+    visible_start: f64,
+    total: f64,
+    zoom: f64,
+    factor: f64,
+) -> (f64, f64) {
+    let zoom = clamp_zoom(zoom);
+    if !total.is_finite() || total <= 0.0 || !factor.is_finite() || factor <= 0.0 {
+        return (zoom, 0.0);
+    }
+    let anchor = if anchor_ratio.is_finite() {
+        anchor_ratio.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let anchor_time = visible_start + anchor * (total / zoom);
+    let new_zoom = clamp_zoom(zoom * factor);
+    let span = total / new_zoom;
+    let start = anchor_time - anchor * span;
+    let (start, _) = clamp_window(start, start + span, total);
+    (new_zoom, start)
+}
+
+/// 播放头跟随：窗口跟着游标走，保证「按了播放一定看得见游标」。
+///
+/// 播放中按前后各 [`TIMELINE_FOLLOW_BAND`] 的可视带跟随（游标不贴死边缘，留出前视
+/// 空间）；暂停时只在游标**完全移出**窗口才跟随——否则用户手动平移去看别处，会被
+/// 下一帧立刻拽回来。未放大时 [`clamp_window`] 会把结果按回 `[0, total]`，所以这个
+/// 函数在 zoom = 1.0 下不改变任何渲染。
+fn follow_playhead(
+    win: TimelineWindow,
+    cur_time: f64,
+    total: f64,
+    is_playing: bool,
+) -> TimelineWindow {
+    if !cur_time.is_finite() {
+        return win;
+    }
+    let span = win.span();
+    if span <= 0.0 {
+        return win;
+    }
+    let band = if is_playing {
+        TIMELINE_FOLLOW_BAND
+    } else {
+        0.0
+    };
+    let start = if cur_time < win.start + span * band {
+        cur_time - span * band
+    } else if cur_time > win.end - span * band {
+        cur_time - span * (1.0 - band)
+    } else {
+        return win;
+    };
+    let (start, end) = clamp_window(start, start + span, total);
+    TimelineWindow { start, end }
+}
+
+/// 鼠标横向位置 → 时间轴窗口内的比例（0 = 窗口起点，1 = 窗口终点）。
+///
+/// 夹在 `[0, 1]`：光标落在轨道标签或右侧留白上时按对应端点缩放，而不是让窗口因为
+/// 一个越界的锚点整体漂走。
+fn timeline_anchor_ratio(mouse_x: Pixels, win_w: Pixels) -> f64 {
+    let track_w = f32::from(win_w - px(Theme::TRACK_LABEL_W) - px(Theme::TRACK_RIGHT_PAD));
+    if track_w <= 10.0 {
+        return 0.5;
+    }
+    (f32::from(mouse_x - px(Theme::TRACK_LABEL_W)) / track_w).clamp(0.0, 1.0) as f64
+}
+
+/// 一个滚轮事件的「格数」：行模式本身就是格数；像素模式按 50px 一格折算——不同驱动
+/// 一次滚轮报 50~120px，不折算会让缩放/平移速度差一倍以上。
+fn scroll_notches(event: &ScrollWheelEvent) -> f64 {
+    let raw = match event.delta {
+        ScrollDelta::Lines(p) => p.y as f64,
+        ScrollDelta::Pixels(p) => f32::from(p.y) as f64 / 50.0,
+    };
+    raw.clamp(-4.0, 4.0)
+}
+
+impl MainWindow {
+    /// 时间轴按到的总时长：与改造前的 `total_duration.max(1.0)` 同源，
+    /// 空白工程下也要留出一条完整的时间轴。
+    fn timeline_total_dur(&self) -> f64 {
+        self.state.total_duration.max(1.0)
+    }
+
+    /// 当前可视窗口（不含播放跟随，见 [`MainWindow::timeline_window_followed`]）。
+    ///
+    /// 渲染与鼠标定位必须都从这里取值：两处各算各的，点击落点就会和播放头错位。
+    fn timeline_window(&self) -> TimelineWindow {
+        timeline_window(
+            self.state.timeline_zoom,
+            TIMELINE_PAN_START.with(|p| p.get()),
+            self.timeline_total_dur(),
+        )
+    }
+
+    /// 渲染用的窗口：在 [`MainWindow::timeline_window`] 之上做播放头跟随，并把跟随后的
+    /// 起点写回平移量。只影响下一帧，不需要 `cx.notify()`——本帧本来就在渲染。
+    fn timeline_window_followed(&self, cur_time: f64) -> TimelineWindow {
+        let win = self.timeline_window();
+        let followed = follow_playhead(
+            win,
+            cur_time,
+            self.timeline_total_dur(),
+            self.state.is_playing,
+        );
+        if followed.start != win.start {
+            TIMELINE_PAN_START.with(|p| p.set(followed.start));
+        }
+        followed
+    }
+
+    /// 以 `anchor_ratio` 为不动点缩放，并把夹紧后的窗口起点存回平移量。
+    fn zoom_timeline(&mut self, anchor_ratio: f64, factor: f64, cx: &mut Context<Self>) {
+        let total = self.timeline_total_dur();
+        let start = TIMELINE_PAN_START.with(|p| p.get());
+        let (zoom, start) = zoom_at(anchor_ratio, start, total, self.state.timeline_zoom, factor);
+        self.state.timeline_zoom = zoom;
+        TIMELINE_PAN_START.with(|p| p.set(start));
+        cx.notify();
+    }
+
+    /// 水平平移 `delta_spans`（以窗口宽度为单位，正值 = 往更晚的时间看）。
+    fn pan_timeline(&mut self, delta_spans: f64, cx: &mut Context<Self>) {
+        let total = self.timeline_total_dur();
+        let win = self.timeline_window();
+        let span = win.span();
+        let start = win.start + delta_spans * span;
+        let (start, _) = clamp_window(start, start + span, total);
+        TIMELINE_PAN_START.with(|p| p.set(start));
+        cx.notify();
+    }
+
+    /// 复位到整段视图。
+    fn reset_timeline_zoom(&mut self, cx: &mut Context<Self>) {
+        self.state.timeline_zoom = TIMELINE_ZOOM_MIN;
+        TIMELINE_PAN_START.with(|p| p.set(0.0));
+        cx.notify();
+    }
 }
 
 impl MainWindow {
     /// 渲染时间轴波形轨 (F-014)。
     ///
     /// 包络在后台由 FFmpeg 解码成 8kHz 单声道后按时间桶取峰值（见
-    /// `engines::waveform`），这里只做「重采样到固定柱数 + 上色」两件事。
-    /// 固定柱数而非直接铺满桶数，是为了让每根柱在任意窗口宽度下都对应一段
-    /// 稳定的时间切片，同时把元素数量压在两百个量级，播放时逐帧重绘不卡。
+    /// `engines::waveform`），这里只做「按可视窗口重采样到固定柱数 + 上色」两件事。
+    ///
+    /// 固定柱数而非直接铺满桶数，是为了让每根柱在任意窗口宽度下都对应一段稳定的
+    /// 时间切片，同时把元素数量压在两百个量级，播放时逐帧重绘不卡。
+    ///
+    /// 窗口内取峰值直接用 `WaveformData::peaks_in_window`（它就是为可视窗口写的，
+    /// 自带单测）：整段重采样与窗口重采样本是同一件事的两个实现，只留窗口这一条路，
+    /// 才不会在缩放途中退回「按整段铺满」的坐标。
     fn render_waveform_lane(
         &mut self,
+        visible: TimelineWindow,
         progress_ratio: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -5270,7 +5499,7 @@ impl MainWindow {
         const MAX_BAR_H: f32 = 22.0;
 
         let peaks: Vec<f32> = match self.state.waveform.as_ref() {
-            Some(w) if !w.peaks.is_empty() => resample_peaks(&w.peaks, BARS),
+            Some(w) if !w.peaks.is_empty() => w.peaks_in_window(visible.start, visible.end, BARS),
             _ => Vec::new(),
         };
         let extracting = self.state.waveform_busy_for.is_some();
@@ -5390,7 +5619,10 @@ impl MainWindow {
     ) -> impl IntoElement {
         let total_dur = self.state.total_duration.max(1.0);
         let cur_time = self.state.current_time;
-        let progress_ratio = (cur_time / total_dur).clamp(0.0, 1.0) as f32;
+        // 时间 → 像素只认这一个窗口：片段、播放头、波形、刻度、鼠标定位全走它
+        let win = self.timeline_window_followed(cur_time);
+        let progress_ratio = win.time_to_ratio(cur_time).clamp(0.0, 1.0) as f32;
+        let zoom = self.state.timeline_zoom;
         let sel_idx = self.state.selected_segment_index;
 
         div()
@@ -5404,6 +5636,24 @@ impl MainWindow {
             .flex()
             .flex_col()
             .overflow_hidden()
+            // 时间轴独占 Ctrl/Shift + 滚轮：缩放与平移不该顺带把外层页面滚了
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                let notches = scroll_notches(event);
+                if notches == 0.0 {
+                    return;
+                }
+                if event.modifiers.control {
+                    // 锚点取鼠标位置：滚轮指着的那一帧缩放前后必须是同一个像素
+                    let win_w = window.viewport_size().width;
+                    let anchor = timeline_anchor_ratio(event.position.x, win_w);
+                    this.zoom_timeline(anchor, TIMELINE_ZOOM_SCROLL_STEP.powf(notches), cx);
+                    cx.stop_propagation();
+                } else if event.modifiers.shift {
+                    // 滚轮向前 = 看更早的时间（同浏览器 Shift+滚轮横向滚动的口径）
+                    this.pan_timeline(-notches * TIMELINE_PAN_STEP, cx);
+                    cx.stop_propagation();
+                }
+            }))
             // 时间轴顶栏工具区 (紧凑 28px)
             .child(
                 div()
@@ -5452,45 +5702,90 @@ impl MainWindow {
                                     )),
                             ),
                     )
-                    // 右侧：快捷键速查（与 shortcuts::SHORTCUT_HINTS 同源，只挑高频几项，避免占满工具条）
+                    // 右侧：缩放控件 + 快捷键速查（后者与 shortcuts::SHORTCUT_HINTS 同源，
+                    // 只挑高频几项，避免占满工具条）
                     .child(
-                        div().flex().items_center().gap_3().children(
-                            crate::ui::shortcuts::SHORTCUT_HINTS
-                                .iter()
-                                .filter(|(key, _)| {
-                                    // 撤销是这次新加的高频操作，不进这个白名单的话
-                                    // 提示只写在常量里、用户永远看不到
-                                    matches!(
-                                        *key,
-                                        "Ctrl+Space" | "Alt+↑↓" | "Ctrl+F" | "Ctrl+E" | "Ctrl+Z"
-                                    )
-                                })
-                                .map(|(key, label)| {
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .rounded(px(Theme::RADIUS_SM))
-                                                .bg(Theme::bg_inset())
-                                                .border_1()
-                                                .border_color(Theme::border_mid())
-                                                .text_size(px(Theme::TEXT_CAPTION))
-                                                .font_family("Consolas")
-                                                .text_color(Theme::text_secondary())
-                                                .child(*key),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            // 缩放三键：按钮拿不到鼠标位置，锚点固定为窗口中心
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(Self::render_mini_btn(
+                                        "timeline-zoom-out",
+                                        "-",
+                                        zoom > TIMELINE_ZOOM_MIN,
+                                        cx,
+                                        |this, cx| {
+                                            this.zoom_timeline(
+                                                0.5,
+                                                1.0 / TIMELINE_ZOOM_BTN_STEP,
+                                                cx,
+                                            )
+                                        },
+                                    ))
+                                    .child(Self::render_mini_btn(
+                                        "timeline-zoom-reset",
+                                        "复位",
+                                        zoom > TIMELINE_ZOOM_MIN,
+                                        cx,
+                                        |this, cx| this.reset_timeline_zoom(cx),
+                                    ))
+                                    .child(Self::render_mini_btn(
+                                        "timeline-zoom-in",
+                                        "+",
+                                        zoom < TIMELINE_ZOOM_MAX,
+                                        cx,
+                                        |this, cx| {
+                                            this.zoom_timeline(0.5, TIMELINE_ZOOM_BTN_STEP, cx)
+                                        },
+                                    )),
+                            )
+                            .children(
+                                crate::ui::shortcuts::SHORTCUT_HINTS
+                                    .iter()
+                                    .filter(|(key, _)| {
+                                        // 撤销是这次新加的高频操作，不进这个白名单的话
+                                        // 提示只写在常量里、用户永远看不到
+                                        matches!(
+                                            *key,
+                                            "Ctrl+Space"
+                                                | "Alt+↑↓"
+                                                | "Ctrl+F"
+                                                | "Ctrl+E"
+                                                | "Ctrl+Z"
                                         )
-                                        .child(
-                                            div()
-                                                .text_size(px(Theme::TEXT_CAPTION))
-                                                .text_color(Theme::text_muted())
-                                                .child(*label),
-                                        )
-                                }),
-                        ),
+                                    })
+                                    .map(|(key, label)| {
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded(px(Theme::RADIUS_SM))
+                                                    .bg(Theme::bg_inset())
+                                                    .border_1()
+                                                    .border_color(Theme::border_mid())
+                                                    .text_size(px(Theme::TEXT_CAPTION))
+                                                    .font_family("Consolas")
+                                                    .text_color(Theme::text_secondary())
+                                                    .child(*key),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(Theme::TEXT_CAPTION))
+                                                    .text_color(Theme::text_muted())
+                                                    .child(*label),
+                                            )
+                                    }),
+                            ),
                     ),
             )
             // 1. 统一主字幕轨道 (紧凑苗条单轨布局，高 34px)
@@ -5557,9 +5852,11 @@ impl MainWindow {
                                             .map(|pos| {
                                                 let seg = &segments[pos];
                                                 let seg_idx = seg.index;
-                                                let start_r =
-                                                    (seg.start / total_dur).clamp(0.0, 1.0) as f32;
-                                                let width_r = (((seg.end - seg.start) / total_dur)
+                                                // 左偏移不夹紧：窗口外的片段要能拿到负值 /
+                                                // 大于 1 的值，靠容器裁掉，而不是全挤在两端
+                                                let start_r = win.time_to_ratio(seg.start) as f32;
+                                                // 宽度按窗口折算，放大后短句不会缩成一条线
+                                                let width_r = (((seg.end - seg.start) / win.span())
                                                     .clamp(0.015, 1.0)
                                                     as f32)
                                                     .max(0.02);
@@ -5683,7 +5980,7 @@ impl MainWindow {
                     ),
             )
             // 2. 音频波形轨 (F-014)：与字幕轨共用同一条时间刻度，方便对着语音峰值卡点
-            .child(self.render_waveform_lane(progress_ratio, cx))
+            .child(self.render_waveform_lane(win, progress_ratio, cx))
             // 3. 探底时间刻度标尺 (Time Ruler 移至底部展示，精简 20px)
             .child(
                 div()
@@ -5723,8 +6020,10 @@ impl MainWindow {
                             .left(px(Theme::TRACK_LABEL_W))
                             .right(px(Theme::TRACK_RIGHT_PAD))
                             .children((0usize..=10).map(|i| {
+                                // 刻度位置与刻度值都按窗口取：放大后刻度自动变密，
+                                // 每一格仍是窗口内的 1/10
                                 let ratio = i as f64 / 10.0;
-                                let t = total_dur * ratio;
+                                let t = win.ratio_to_time(ratio);
                                 div()
                                     .id(("ruler-tick-btn", i))
                                     .absolute()
@@ -5786,7 +6085,8 @@ impl MainWindow {
         }
         let relative_x = mouse_x - track_start_x;
         let ratio = (relative_x / track_w).clamp(0.0, 1.0) as f64;
-        let target_time = ratio * self.state.total_duration;
+        // 与渲染同一条变换：放大/平移后点击落点仍然对得上播放头
+        let target_time = self.timeline_window().ratio_to_time(ratio);
         self.state.seek_to(target_time);
 
         if is_drag {
@@ -6453,11 +6753,12 @@ impl MainWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        click_seek_target, fit_video_size, is_playing_at, karaoke_mark_style, karaoke_word_marks,
-        min_gap_hint, monitor_picture_source, monitor_screen_size, raw_line_byte_start,
-        render_image_from_frame_file, timeline_clip_positions, MonitorPictureSource, WordMark,
-        EDITOR_STACK_MONITOR_H, MONITOR_VIDEO_FIT_FRAC, TIMELINE_FULL_DRAW_LIMIT,
-        TIMELINE_WINDOW_MARGIN_SECS,
+        clamp_zoom, click_seek_target, fit_video_size, follow_playhead, is_playing_at,
+        karaoke_mark_style, karaoke_word_marks, min_gap_hint, monitor_picture_source,
+        monitor_screen_size, raw_line_byte_start, render_image_from_frame_file,
+        timeline_clip_positions, timeline_window, zoom_at, MonitorPictureSource, TimelineWindow,
+        WordMark, EDITOR_STACK_MONITOR_H, MONITOR_VIDEO_FIT_FRAC, TIMELINE_FULL_DRAW_LIMIT,
+        TIMELINE_WINDOW_MARGIN_SECS, TIMELINE_ZOOM_MAX, TIMELINE_ZOOM_MIN,
     };
     use crate::subtitle::segment::WordTiming;
     use crate::subtitle::{ExportMode, GapPlan, Segment};
@@ -7128,5 +7429,110 @@ mod tests {
             vec![19usize, 20],
             "选中句必须在绘制集合里，且仍按存储顺序"
         );
+    }
+
+    /// 默认 zoom = 1.0 时窗口必须是整段 `[0, total]`：这是「与改造前逐像素一致」的根
+    /// ——整段视图下窗口一旦整体偏移，所有按时间定位的元素都会跟着错位。
+    #[test]
+    fn window_at_default_zoom_covers_the_whole_timeline() {
+        let win = timeline_window(1.0, 0.0, 120.0);
+        assert_eq!(
+            win,
+            TimelineWindow {
+                start: 0.0,
+                end: 120.0
+            }
+        );
+        // 未放大时平移没有意义，一律被夹回 [0, total]
+        assert_eq!(timeline_window(1.0, 30.0, 120.0).start, 0.0);
+        assert_eq!(timeline_window(1.0, -5.0, 120.0).start, 0.0);
+        // 比例换算必须与改造前的 `t / total` **逐位**一致（不是近似）
+        assert_eq!(win.time_to_ratio(42.0), 42.0 / 120.0);
+        assert_eq!(win.ratio_to_time(0.25), 30.0);
+    }
+
+    /// 缩放的语义不变量：锚点（鼠标指着的那一帧）缩放前后必须落在同一个像素上。
+    #[test]
+    fn zoom_keeps_the_anchor_time_in_place() {
+        let total = 100.0;
+        let (zoom, start) = zoom_at(0.25, 0.0, total, 1.0, 4.0);
+        assert!((zoom - 4.0).abs() < 1e-9, "zoom = {zoom}");
+        assert!((start - 18.75).abs() < 1e-9, "start = {start}");
+        let win = timeline_window(zoom, start, total);
+        assert!((win.time_to_ratio(25.0) - 0.25).abs() < 1e-9);
+
+        // 已经平移过的窗口：锚点照样不动
+        let panned = timeline_window(2.0, 50.0, 200.0);
+        assert_eq!((panned.start, panned.end), (50.0, 150.0));
+        let anchor = 0.8;
+        let anchor_time = panned.ratio_to_time(anchor);
+        let (zoom, start) = zoom_at(anchor, panned.start, 200.0, 2.0, 2.0);
+        let zoomed = timeline_window(zoom, start, 200.0);
+        assert!((zoomed.time_to_ratio(anchor_time) - anchor).abs() < 1e-9);
+    }
+
+    /// 平移夹在 `[0, total]`：窗口不能被拖出素材范围，落界内时原样保留。
+    #[test]
+    fn pan_window_is_clamped_into_the_media_range() {
+        // 放大 4 倍 → 窗口宽 25 秒，起点上限 = 100 - 25
+        let right = timeline_window(4.0, 90.0, 100.0);
+        assert_eq!((right.start, right.end), (75.0, 100.0));
+        let left = timeline_window(4.0, -30.0, 100.0);
+        assert_eq!((left.start, left.end), (0.0, 25.0));
+        let middle = timeline_window(4.0, 40.0, 100.0);
+        assert_eq!((middle.start, middle.end), (40.0, 65.0));
+    }
+
+    /// 倍率夹在 `[1, 20]`：滚轮连打既不会把窗口压成 0 宽，也不会让窗口比整段还宽；
+    /// 缩回整段时窗口必须回到 `[0, total]`。
+    #[test]
+    fn zoom_factor_is_clamped_to_the_configured_range() {
+        let (zoom, _) = zoom_at(0.5, 0.0, 60.0, 15.0, 10.0);
+        assert_eq!(zoom, TIMELINE_ZOOM_MAX);
+        let (zoom, start) = zoom_at(0.5, 20.0, 60.0, 1.5, 0.01);
+        assert_eq!(zoom, TIMELINE_ZOOM_MIN);
+        assert_eq!(start, 0.0, "缩回整段后窗口起点必须回到 0");
+        // 非有限倍率一律退回整段，不让 NaN/Inf 渗进布局
+        assert_eq!(clamp_zoom(f64::NAN), TIMELINE_ZOOM_MIN);
+        assert_eq!(clamp_zoom(f64::INFINITY), TIMELINE_ZOOM_MIN);
+    }
+
+    /// 播放跟随：放大后游标移出可视带时窗口跟着走；整段视图（zoom = 1）下一条都不改，
+    /// 否则就会破坏「默认视图与改造前逐像素一致」。
+    #[test]
+    fn playhead_follow_only_moves_a_zoomed_window() {
+        let total = 100.0;
+        let whole = timeline_window(1.0, 0.0, total);
+        // 播放中游标在 42% / 99% / 越界到 150 秒，都不该动整段视图
+        assert_eq!(follow_playhead(whole, 42.0, total, true), whole);
+        assert_eq!(follow_playhead(whole, 99.0, total, true), whole);
+        assert_eq!(follow_playhead(whole, 150.0, total, true), whole);
+
+        // 放大 4 倍 → 窗口宽 25 秒
+        let win = timeline_window(4.0, 0.0, total);
+        // 播放中游标越过 90% 处：窗口被推着走，游标停在 90% 位置
+        let followed = follow_playhead(win, 24.0, total, true);
+        assert!((followed.start - (24.0 - 25.0 * 0.9)).abs() < 1e-9);
+        // 暂停时窗口不动（用户可能正手动平移去看别处，不该被拽回来）
+        assert_eq!(follow_playhead(win, 24.0, total, false), win);
+        // 暂停时游标真的出了窗口才跟随
+        let followed = follow_playhead(win, 40.0, total, false);
+        assert!((followed.start - 15.0).abs() < 1e-9);
+    }
+
+    /// 没有素材（总时长 0）、极短素材、非有限输入：缩放/平移/换算都不许 panic，
+    /// 窗口退化成空或按整段处理。
+    #[test]
+    fn degenerate_durations_and_inputs_do_not_panic() {
+        for total in [0.0, -1.0, 1e-12, 0.4] {
+            let win = timeline_window(8.0, 5.0, total);
+            assert!(win.end >= win.start, "total = {total} 时窗口不能反向");
+            assert!(win.time_to_ratio(1.0).is_finite(), "total = {total}");
+            assert!(win.ratio_to_time(0.5).is_finite(), "total = {total}");
+            let (zoom, start) = zoom_at(0.5, 3.0, total, 2.0, 3.0);
+            assert!(zoom.is_finite() && start.is_finite(), "total = {total}");
+        }
+        let (zoom, start) = zoom_at(f64::NAN, f64::NAN, 10.0, 2.0, f64::NAN);
+        assert!(zoom.is_finite() && start.is_finite());
     }
 }
