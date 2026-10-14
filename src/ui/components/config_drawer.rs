@@ -92,101 +92,18 @@ fn thread_presets(current: u32, cores: u32) -> Vec<u32> {
     values
 }
 
-/// 「识别引擎」档位的静态文案：`(档位, 一句话定位)`。
+/// 「识别引擎」卡片的档位顺序。
 ///
-/// 名字与体积不写死在表里：名字取 `WhisperModelTier::label()`、体积取下载清单
-/// （`utils::model_download`），两处都是唯一实现——同一档位在抽屉和性能页显示成
-/// 不同的名字或数字是很容易出现的分叉，这里从源头避免。
-const TIER_TAGLINES: [(WhisperModelTier, &str); 5] = [
-    (WhisperModelTier::SenseVoice, "中文首选 · 不吃显卡也飞快"),
-    (WhisperModelTier::Fast, "最快 · 低配机器也跑得动"),
-    (WhisperModelTier::Balanced, "均衡 · 出厂默认，多数视频够用"),
-    (
-        WhisperModelTier::TurboSpeed,
-        "较准 · 比默认更快更准，综合推荐",
-    ),
-    (WhisperModelTier::Precise, "最准 · 抗口音吞音，也最慢"),
+/// 只放顺序，不放任何说明文字或元数据：卡片上**只显示模型名**（外加「当前」「已下载/
+/// 需下载」两个状态徽标）。定位句、星级、体积这些附加信息都按用户要求去掉了——体积
+/// 在下单的地方（「模型与组件」）逐项都写着，选型不缺这一处。
+const TIER_ORDER: [WhisperModelTier; 5] = [
+    WhisperModelTier::SenseVoice,
+    WhisperModelTier::Fast,
+    WhisperModelTier::Balanced,
+    WhisperModelTier::TurboSpeed,
+    WhisperModelTier::Precise,
 ];
-
-/// 「识别引擎」档位的相对性能元数据：`(档位, 速度星级, 精度星级)`。
-///
-/// 星级是产品定位的相对值，不是跑分：只在同一列里横向比较，换台机器或换个模型
-/// 版本数字就全变，所以这里钉的是「谁比谁快、谁比谁准」的相对口径——SenseVoice
-/// 最快但精度中上，Q8 最准也最慢。取值 0..=5，5 表示该列最强。
-const TIER_METRICS: [(WhisperModelTier, u8, u8); 5] = [
-    (WhisperModelTier::SenseVoice, 5, 3),
-    (WhisperModelTier::Fast, 4, 1),
-    (WhisperModelTier::Balanced, 3, 2),
-    (WhisperModelTier::TurboSpeed, 2, 4),
-    (WhisperModelTier::Precise, 1, 5),
-];
-
-/// 星级上限：满格 5 颗。
-const STAR_MAX: u8 = 5;
-
-/// 档位的 `(速度星级, 精度星级)`。
-///
-/// 表与档位枚举脱节时给中位兜底而不是 panic：漏一档最多显示得不准，
-/// 渲染期 panic 却会让整个抽屉打不开。
-fn tier_metrics(tier: WhisperModelTier) -> (u8, u8) {
-    TIER_METRICS
-        .iter()
-        .find(|(t, _, _)| *t == tier)
-        .map(|(_, speed, accuracy)| (*speed, *accuracy))
-        .unwrap_or((3, 3))
-}
-
-/// 星级文案：`★★★☆☆`，实心 = 得分，恒 5 颗。
-///
-/// 超界输入夹到 `0..=STAR_MAX`，让渲染函数本身全定义，改表写错数也不会崩界面。
-fn star_text(stars: u8) -> String {
-    let filled = stars.min(STAR_MAX) as usize;
-    let mut text = String::with_capacity(STAR_MAX as usize * 3);
-    for _ in 0..filled {
-        text.push('★');
-    }
-    for _ in filled..STAR_MAX as usize {
-        text.push('☆');
-    }
-    text
-}
-
-/// 速度 / 精度两段星级文案：`★★★☆☆ 快 · ★★★★☆ 准`。
-fn tier_metrics_text(tier: WhisperModelTier) -> String {
-    let (speed, accuracy) = tier_metrics(tier);
-    format!("{} 快 · {} 准", star_text(speed), star_text(accuracy))
-}
-
-/// SenseVoice 档对应的一组下载条目：模型 + 词表 + VAD，三个文件缺一不可。
-const SENSEVOICE_ITEM_IDS: [&str; 3] = ["sensevoice-model", "sensevoice-tokens", "sensevoice-vad"];
-
-/// 一组下载条目的合计体积文案：`约 229 MB`。
-///
-/// 一个条目都查不到时返回「体积未知」，而不是隐藏整块或 panic：清单里改了 id、
-/// 删了条目都不该让卡片消失——用户至少要能看到这一档，只是体积未知。
-fn bundle_size_text(ids: &[&str]) -> String {
-    let bytes: u64 = ids
-        .iter()
-        .filter_map(|id| crate::utils::model_download::item_by_id(id))
-        .map(|item| item.size)
-        .sum();
-    if bytes == 0 {
-        "体积未知".to_string()
-    } else {
-        format!("约 {}", crate::utils::model_download::human_size(bytes))
-    }
-}
-
-/// 档位卡片上显示的体积。
-///
-/// SenseVoice 不是单个文件（模型 / 词表 / VAD 三条目），只报模型那一条会低估用户
-/// 实际要下载的量，所以按整组求和。
-fn tier_size_text(tier: WhisperModelTier) -> String {
-    match tier.download_item_id() {
-        Some(id) => bundle_size_text(&[id]),
-        None => bundle_size_text(&SENSEVOICE_ITEM_IDS),
-    }
-}
 
 /// 档位状态徽标文案：下载中 > 已下载 > 需下载。
 fn tier_status_text(present: bool, downloading: bool) -> &'static str {
@@ -638,8 +555,8 @@ impl MainWindow {
     /// （`MainWindow::missing_engine_reason`），一句明确提示比偷偷换档可操作得多。
     fn render_engine_card(&mut self, cx: &mut Context<Self>) -> Div {
         let mut cards = div().flex().flex_col().gap(px(Theme::SPACE_1_5));
-        for (index, (tier, tagline)) in TIER_TAGLINES.into_iter().enumerate() {
-            cards = cards.child(self.tier_card(index, tier, tagline, cx));
+        for (index, tier) in TIER_ORDER.into_iter().enumerate() {
+            cards = cards.child(self.tier_card(index, tier, cx));
         }
 
         primitives::card_sm()
@@ -648,7 +565,11 @@ impl MainWindow {
             .child(cards)
     }
 
-    /// 单个档位卡片：名字 + 状态徽标 + 速度/精度星级 + 体积，选中 / 未下载 / 下载中各有样式。
+    /// 单个档位卡片：**只有档位名 + 状态徽标**（+ 未就位时的行内下载按钮）。
+    ///
+    /// 卡片上不再有任何附加文字（定位句、速度/精度星级、体积都去过一版又按用户要求
+    /// 撤掉）：这一栏是「选哪一个」，名称与「当前 / 已下载 / 需下载」就够做决定了，
+    /// 体积在「模型与组件」里逐项都写着。
     ///
     /// 点击整卡 = 选中该档位（语义与老胶囊一致：写配置 + 把「模型与组件」页切到
     /// 对应分栏）；未下载时行内多一个动作按钮，点它不会顺带改档位。
@@ -656,7 +577,6 @@ impl MainWindow {
         &mut self,
         index: usize,
         tier: WhisperModelTier,
-        _tagline: &'static str,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let is_sel = self.state.whisper_model_tier == tier;
@@ -666,7 +586,6 @@ impl MainWindow {
         let present = tier.installed_path().is_some();
         let downloading = tier_downloading(tier, self.state.download_current.as_deref());
         let busy = self.state.is_downloading;
-        let size_text = tier_size_text(tier);
 
         // 名字允许被压缩并省略（`min_w_0` + `truncate`）：这一行同时要放「当前」徽标、
         // 状态徽标和下载按钮，固定宽度下若不让名字收缩，长档位名会把按钮挤出可见区域。
@@ -730,36 +649,6 @@ impl MainWindow {
             }
         }
 
-        // 卡片只保留「名字 + 状态徽标 + 速度/精度 + 体积」：定位句这类小字说明按用户
-        // 要求去掉，五张卡片因此能从五行文字压到三行，抽屉里一屏能看全。
-        // 速度/精度星级与体积挤在同一行：选型要权衡的就是这三项，横向一眼可比。
-        let body = div()
-            .flex()
-            .flex_col()
-            .gap(px(Theme::SPACE_1))
-            .child(head)
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(Theme::SPACE_1_5))
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_secondary())
-                            .child(tier_metrics_text(tier)),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_muted())
-                            .child(size_text),
-                    ),
-            );
-
         div()
             .id(("engine-tier-card", index))
             .w_full()
@@ -798,7 +687,7 @@ impl MainWindow {
                 };
                 cx.notify();
             }))
-            .child(body)
+            .child(head)
     }
 
     /// 「转写参数」卡片：识别语言 / 输出格式 / 标点润色 / 转写线程
@@ -1432,10 +1321,8 @@ mod tests {
     // 这里刻意不用 `use super::*`：父模块的 `use gpui::*` 会把 gpui 自带的
     // `test` 属性宏带进来，遮蔽内建的 `#[test]`，导致展开递归超限。
     use super::{
-        apply_hotwords_bare_key, bundle_size_text, hotwords_display_window, speaker_options,
-        star_text, tier_downloading, tier_metrics, tier_metrics_text, tier_size_text,
-        tier_status_text, HOTWORDS_VIEW_CHARS, OUTPUT_FORMAT_CHOICES, STAR_MAX, TIER_METRICS,
-        TIER_TAGLINES,
+        apply_hotwords_bare_key, hotwords_display_window, speaker_options, tier_downloading,
+        tier_status_text, HOTWORDS_VIEW_CHARS, OUTPUT_FORMAT_CHOICES, TIER_ORDER,
     };
     use crate::app::WhisperModelTier;
     use crate::engines::MAX_SPEAKERS;
@@ -1469,45 +1356,19 @@ mod tests {
     /// 五档卡片必须齐：抽屉里少一档，用户就再也选不到那个引擎（老逻辑只列已下载档位，
     /// 未下载的档位会整块消失，这正是「想选 Turbo 却找不到」的来源）。
     #[test]
-    fn tier_taglines_cover_every_tier_once() {
-        let mut seen: Vec<&str> = Vec::new();
-        for (tier, tagline) in TIER_TAGLINES.iter() {
-            assert!(!tagline.trim().is_empty(), "{tier:?} 缺定位句");
-            assert!(
-                !seen.contains(tagline),
-                "{tier:?} 的定位句与前面的档位重复：{tagline}"
-            );
-            seen.push(tagline);
-        }
+    fn tier_order_covers_every_tier_once() {
+        let mut covered: Vec<WhisperModelTier> = TIER_ORDER.to_vec();
+        let count = covered.len();
+        covered.sort_by_key(|tier| *tier as u8);
+        covered.dedup();
+        assert_eq!(covered.len(), count, "档位不能重复登记");
 
-        let covered: Vec<WhisperModelTier> = TIER_TAGLINES.iter().map(|(t, _)| *t).collect();
         for tier in WhisperModelTier::WHISPER_TIERS {
             assert!(covered.contains(&tier), "抽屉缺少 {tier:?} 的卡片");
         }
         assert!(covered.contains(&WhisperModelTier::SenseVoice));
         assert_eq!(covered.len(), WhisperModelTier::WHISPER_TIERS.len() + 1);
     }
-
-    /// 体积文案：正常条目要给得出数字，查不到的条目要老实说「体积未知」而不是空白。
-    #[test]
-    fn tier_size_text_reports_known_sizes_and_falls_back() {
-        assert_eq!(bundle_size_text(&[]), "体积未知");
-        assert_eq!(bundle_size_text(&["no-such-item"]), "体积未知");
-
-        let base = bundle_size_text(&["whisper-base"]);
-        assert!(base.starts_with("约 "), "正常条目应带「约」前缀：{base}");
-        assert!(base.contains("MB"), "Base 档应为 MB 级：{base}");
-
-        // SenseVoice = 模型 + 词表 + VAD，比单看模型条目更大：只报模型会低估下载量。
-        let bundle = tier_size_text(WhisperModelTier::SenseVoice);
-        assert_ne!(bundle, "体积未知");
-        assert_ne!(
-            bundle,
-            bundle_size_text(&["sensevoice-model"]),
-            "SenseVoice 体积必须是三条目合计"
-        );
-    }
-
     /// 徽标优先级：正在下载的档位不能说成「已下载」，否则用户以为已经能用了。
     #[test]
     fn tier_status_text_prefers_downloading_over_present() {
@@ -1649,61 +1510,5 @@ mod tests {
             crate::subtitle::writer::export_spec_for("txt").0,
             crate::subtitle::writer::export_spec_for("txt-ts").0,
         );
-    }
-
-    /// 元数据表必须与档位枚举一一对应：漏一档就只能落到 `tier_metrics` 的中位兜底，
-    /// 用户看到的星级与选型建议就对不上了；多一档说明枚举改过而表没跟着改。
-    #[test]
-    fn tier_metrics_cover_every_tier_once() {
-        let mut covered: Vec<WhisperModelTier> =
-            TIER_METRICS.iter().map(|(tier, _, _)| *tier).collect();
-        let count = covered.len();
-        covered.sort_by_key(|tier| *tier as u8);
-        covered.dedup();
-
-        assert_eq!(count, 5, "五档都要有元数据");
-        assert_eq!(covered.len(), count, "档位不能重复登记");
-
-        // 与定位句表覆盖同一组档位：两表脱节时卡片会一半有星级一半没有。
-        let taglined: Vec<WhisperModelTier> = TIER_TAGLINES.iter().map(|(tier, _)| *tier).collect();
-        for tier in taglined {
-            assert!(
-                TIER_METRICS.iter().any(|(t, _, _)| *t == tier),
-                "{tier:?} 有定位句却没有星级"
-            );
-        }
-    }
-
-    /// 星级必须在 `0..=STAR_MAX`：写超了会在卡片上画出 6 颗星，写 0 会让「快」那一列
-    /// 变成空白，两种都是肉眼可见的错。
-    #[test]
-    fn tier_metrics_stars_within_range() {
-        for (tier, speed, accuracy) in TIER_METRICS {
-            assert!(speed <= STAR_MAX, "{tier:?} 速度星级超界：{speed}");
-            assert!(accuracy <= STAR_MAX, "{tier:?} 精度星级超界：{accuracy}");
-        }
-    }
-
-    /// 星级文案恒为 `STAR_MAX` 颗：0 星 / 满星 / 超界都不 panic，且长度稳定，
-    /// 卡片上的两段星级才会对齐成一条竖线。
-    #[test]
-    fn star_text_is_fixed_width_and_clamped() {
-        let empty = star_text(0);
-        let full = star_text(STAR_MAX);
-        let over = star_text(STAR_MAX + 3);
-
-        assert_eq!(empty.chars().count(), STAR_MAX as usize);
-        assert_eq!(full, "★".repeat(STAR_MAX as usize));
-        assert_eq!(over, full, "超界按满格渲染，不能画出多余的星");
-        assert!(empty.starts_with('☆'));
-    }
-
-    /// 渲染文案的同时包含速度与精度两段：只写一段就没法横向比较了。
-    #[test]
-    fn tier_metrics_text_carries_both_axes() {
-        let text = tier_metrics_text(WhisperModelTier::SenseVoice);
-        assert!(text.contains("快"), "缺速度段：{text}");
-        assert!(text.contains("准"), "缺精度段：{text}");
-        assert_eq!(tier_metrics(WhisperModelTier::SenseVoice), (5, 3));
     }
 }
