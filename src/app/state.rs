@@ -2210,6 +2210,39 @@ impl AppState {
         true
     }
 
+    /// 把队列里的某一条搬到指定下标（`from` → `to`，都是**当前**队列的下标）。
+    ///
+    /// 只动顺序，不碰 [`Self::batch_running`] / [`Self::status`]：正在跑的那条换了位置
+    /// 也还是它自己在跑，重排不该打断或重启任何一条转写。
+    ///
+    /// 关键在活动指针：搬迁会让**所有**下标失效，所以这里不假定下标不变，而是先记下
+    /// `batch_active` 那条的**路径**，搬完再按路径查回它的新位置。少了这一步，
+    /// [`Self::finish_active_queue_item`] 会把完成/失败结算给它的邻居，而真正在跑的
+    /// 那条永远停在「转写中」。
+    ///
+    /// 返回是否真的动了：越界、`from == to`、空队列一律 `false` 且不改任何状态。
+    pub fn move_queue_item(&mut self, from: usize, to: usize) -> bool {
+        let len = self.batch_queue.len();
+        if from >= len || to >= len || from == to {
+            return false;
+        }
+        // 记路径而不是下标：搬完只有「同一条」这个身份还可靠。`batch_active` 越界
+        // （理论上的脏值）时拿到 `None`，此时保持原值不动——顺手把一个本就无效的指针
+        // 「修」成别的样子只会更糟。
+        let active_path = self
+            .batch_active
+            .and_then(|idx| self.batch_queue.get(idx))
+            .map(|item| item.path.clone());
+        let item = self.batch_queue.remove(from);
+        self.batch_queue.insert(to, item);
+        if let Some(path) = active_path {
+            self.batch_active = self.queue_index_of(&path);
+        }
+        // 顺序也要落盘：用户排好队才关窗，下次启动必须还是这个顺序。
+        self.persist_queue();
+        true
+    }
+
     /// 队列里还没跑完的条目数（等待中 + 失败待重试）。
     /// 失败项也算「待处理」——用户点「开始全部」时它们会被重新排队。
     pub fn queue_pending_count(&self) -> usize {
@@ -4698,6 +4731,102 @@ mod tests {
         state.batch_active = Some(0);
         assert!(!state.remove_queue_item(9));
         assert_eq!(state.batch_active, Some(0));
+    }
+
+    /// 重排只对「合法且真的会换位置」的入参生效：空队列 / 单元素队列 / 越界 /
+    /// `from == to` 都是安全空操作，合法移动则把条目搬到目标下标上。
+    ///
+    /// 空操作必须是**一字不动**：这类调用来自第一行的「上移」、最后一行的「下移」
+    /// （界面已置灰，但状态层要能兜住任何调用方），一旦顺手重排就会把用户排好的顺序改掉。
+    #[test]
+    fn move_queue_item_reorders_only_valid_distinct_indices() {
+        use super::{QueueItem, QueueState};
+        use std::path::PathBuf;
+
+        fn names(state: &AppState) -> Vec<String> {
+            state.batch_queue.iter().map(|i| i.name.clone()).collect()
+        }
+
+        let mut state = test_state(Vec::new());
+        assert!(!state.move_queue_item(0, 0), "空队列不能移动");
+        assert!(state.batch_queue.is_empty(), "失败的空操作不许建出条目");
+
+        // 单元素队列：没有任何合法目标（上移 / 下移都无处可去）
+        state.batch_queue = vec![QueueItem::new(PathBuf::from("a.mp4"))];
+        assert!(!state.move_queue_item(0, 1));
+        assert!(!state.move_queue_item(1, 0));
+        assert!(!state.move_queue_item(0, 0));
+        assert_eq!(names(&state), vec!["a.mp4"]);
+
+        state.batch_queue = vec![
+            QueueItem::new(PathBuf::from("a.mp4")),
+            QueueItem::new(PathBuf::from("b.mp4")),
+            QueueItem::new(PathBuf::from("c.mp4")),
+        ];
+        state.batch_queue[1].state = QueueState::Running;
+
+        // 下移一格：a 落到下标 1
+        assert!(state.move_queue_item(0, 1));
+        assert_eq!(names(&state), vec!["b.mp4", "a.mp4", "c.mp4"]);
+        // 搬到队首：c 从队尾插到 0
+        assert!(state.move_queue_item(2, 0));
+        assert_eq!(names(&state), vec!["c.mp4", "b.mp4", "a.mp4"]);
+
+        // 越界 / 原地：返回 false，顺序不动
+        assert!(!state.move_queue_item(0, 3));
+        assert!(!state.move_queue_item(3, 0));
+        assert!(!state.move_queue_item(1, 1));
+        assert_eq!(names(&state), vec!["c.mp4", "b.mp4", "a.mp4"]);
+    }
+
+    /// 重排不得让活动指针错位：`batch_active` 必须仍然指向**同一条**任务，
+    /// 不论它在移动中换了哪个下标。
+    ///
+    /// 这是重排最致命的坑：下标一变，指针若留在原数字上就指向了邻居——
+    /// `finish_active_queue_item` 会把完成 / 失败结算到别人头上，而真正在跑的那条
+    /// 永远停在「转写中」。所以移动别的条目、甚至移动正在跑的那条本身，指针都得跟着走。
+    #[test]
+    fn moving_queue_items_keeps_active_pointer_on_the_running_item() {
+        use super::{QueueItem, QueueState};
+        use std::path::PathBuf;
+
+        let mut state = test_state(Vec::new());
+        state.batch_queue = vec![
+            QueueItem::new(PathBuf::from("a.mp4")),
+            QueueItem::new(PathBuf::from("b.mp4")),
+            QueueItem::new(PathBuf::from("c.mp4")),
+            QueueItem::new(PathBuf::from("d.mp4")),
+        ];
+        // c.mp4 正在跑（下标 2）
+        state.batch_active = Some(2);
+        state.batch_queue[2].state = QueueState::Running;
+
+        // 把队首的 a 搬到队尾：c 前移到 1，指针必须跟着改到 1
+        assert!(state.move_queue_item(0, 3));
+        assert_eq!(state.batch_active, Some(1));
+        assert_eq!(state.batch_queue[1].name, "c.mp4");
+
+        // 再把队尾的 a 搬回队首：c 回到 2
+        assert!(state.move_queue_item(3, 0));
+        assert_eq!(state.batch_active, Some(2));
+        assert_eq!(state.batch_queue[2].name, "c.mp4");
+
+        // 失败的空操作更不能碰指针
+        assert!(!state.move_queue_item(2, 2));
+        assert!(!state.move_queue_item(9, 0));
+        assert_eq!(state.batch_active, Some(2));
+        assert_eq!(state.batch_queue[2].name, "c.mp4");
+
+        // 连正在跑的那条自己也能搬（界面置灰只是不给点，状态层照样保持归属正确）
+        assert!(state.move_queue_item(2, 0));
+        assert_eq!(state.batch_active, Some(0));
+        assert_eq!(state.batch_queue[0].name, "c.mp4");
+
+        // 结算必须落在真正在跑的那条上，而不是它换位前的邻居
+        state.finish_active_queue_item(Ok(9));
+        assert_eq!(state.batch_queue[0].state, QueueState::Done { segments: 9 });
+        assert!(state.batch_active.is_none());
+        assert_eq!(state.batch_queue[1].state, QueueState::Pending);
     }
 
     /// 反复点「起点 +0.5」不能把当前句推过下一句：交叉区间会被

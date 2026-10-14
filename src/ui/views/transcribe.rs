@@ -1632,6 +1632,44 @@ impl MainWindow {
                                     .text_color(label_color)
                                     .child(label),
                             )
+                            // ── 顺序调整：上移 / 下移各一格 ──
+                            // 队列此前只能删 / 清空，加进来就只能按加入顺序跑，一条急着要的
+                            // 片子排在队尾时只能整批重排。移不动的情形（第一条上移、最后一条
+                            // 下移、正在跑的那条）统一走 btn_state 的置灰外观，点了没反应也不意外。
+                            .child({
+                                let can_move = !(is_active && is_processing);
+                                let can_move_up = can_move && idx > 0;
+                                let target = idx.saturating_sub(1);
+                                primitives::btn_state(
+                                    "上移",
+                                    primitives::BtnSize::Xs,
+                                    primitives::BtnVariant::Ghost,
+                                    can_move_up,
+                                )
+                                .id(("batch-queue-up", idx))
+                                .when(can_move_up, |s| {
+                                    s.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.move_queue_item(idx, target, cx)
+                                    }))
+                                })
+                            })
+                            .child({
+                                let can_move = !(is_active && is_processing);
+                                let can_move_down = can_move && idx + 1 < total;
+                                let target = idx + 1;
+                                primitives::btn_state(
+                                    "下移",
+                                    primitives::BtnSize::Xs,
+                                    primitives::BtnVariant::Ghost,
+                                    can_move_down,
+                                )
+                                .id(("batch-queue-down", idx))
+                                .when(can_move_down, |s| {
+                                    s.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.move_queue_item(idx, target, cx)
+                                    }))
+                                })
+                            })
                             .child(
                                 if is_active && is_processing {
                                     // 正在转写的条目不给删：删了会让「当前项」失去归属，

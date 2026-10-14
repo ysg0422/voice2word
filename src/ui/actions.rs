@@ -1761,6 +1761,16 @@ impl MainWindow {
         }
     }
 
+    /// 把队列里的某一条搬到指定下标（`from` → `to`），只动顺序。
+    ///
+    /// 刻意不碰正在进行的转写：重排不是「换一条跑」，正在跑的那条只是换了位置，
+    /// 活动指针由 `AppState::move_queue_item` 按路径纠正，所以这里既不取消也不重启。
+    pub(crate) fn move_queue_item(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if self.state.move_queue_item(from, to) {
+            cx.notify();
+        }
+    }
+
     /// 清空队列并退出批量模式（已转写完成、已落库的工程不受影响）
     pub(crate) fn clear_batch_queue(&mut self, cx: &mut Context<Self>) {
         if matches!(self.state.status, ProcessStatus::Processing { .. }) {
