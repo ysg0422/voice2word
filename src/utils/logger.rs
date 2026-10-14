@@ -269,6 +269,76 @@ pub fn init_logger() -> anyhow::Result<PathBuf> {
     Ok(log_path)
 }
 
+/// 专属运行错误日志文件名
+pub const ERROR_LOG_NAME: &str = "error.log";
+
+/// 记录一次结构化运行错误日志到 logs/error.log
+pub fn record_error_log(context: &str, details: &str) {
+    let logs_dir = crate::utils::AppConfig::app_root_dir().join("logs");
+    let _ = fs::create_dir_all(&logs_dir);
+    let err_file = logs_dir.join(ERROR_LOG_NAME);
+
+    let entry = format!(
+        "\n================================================================================\n\
+        [时间] {}\n\
+        [错误分类] {}\n\
+        [进程 PID] {}\n\
+        [详细报错信息]\n{}\n\
+        ================================================================================\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+        context,
+        std::process::id(),
+        details.trim()
+    );
+
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&err_file) {
+        let _ = f.write_all(entry.as_bytes());
+        let _ = f.flush();
+    }
+}
+
+/// 打开日志所在文件夹
+pub fn open_logs_folder() {
+    let logs_dir = crate::utils::AppConfig::app_root_dir().join("logs");
+    let _ = fs::create_dir_all(&logs_dir);
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer").arg(&logs_dir).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&logs_dir).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&logs_dir).spawn();
+    }
+}
+
+/// 打开最新的运行/错误日志文件
+pub fn open_latest_log_file() {
+    let logs_dir = crate::utils::AppConfig::app_root_dir().join("logs");
+    let error_log = logs_dir.join(ERROR_LOG_NAME);
+    let target = if error_log.exists() {
+        error_log
+    } else {
+        logs_dir.join(LATEST_LOG_NAME)
+    };
+
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("notepad").arg(&target).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&target).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&target).spawn();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

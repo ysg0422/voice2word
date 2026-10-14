@@ -241,6 +241,7 @@ impl MainWindow {
             return div().into_any_element();
         };
 
+        let msg_for_copy = msg.clone();
         div()
             .id("global-error-banner")
             .w_full()
@@ -264,20 +265,85 @@ impl MainWindow {
             )
             .child(
                 div()
-                    .id("global-error-banner-dismiss")
-                    .flex_shrink_0()
-                    .px(px(Theme::SPACE_2))
-                    .py(px(Theme::SPACE_0_5))
-                    .rounded(px(Theme::RADIUS_SM))
-                    .cursor_pointer()
-                    .text_size(px(Theme::TEXT_SMALL))
-                    .text_color(Theme::accent_red())
-                    .hover(|s| s.bg(Theme::tint_red_border()))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.state.status = ProcessStatus::Idle;
-                        cx.notify();
-                    }))
-                    .child("知道了"),
+                    .flex()
+                    .items_center()
+                    .gap(px(Theme::SPACE_1_5))
+                    .child(
+                        div()
+                            .id("global-error-banner-view-log")
+                            .flex_shrink_0()
+                            .px(px(Theme::SPACE_2))
+                            .py(px(Theme::SPACE_0_5))
+                            .rounded(px(Theme::RADIUS_SM))
+                            .bg(Theme::bg_inset())
+                            .border_1()
+                            .border_color(Theme::tint_red_border())
+                            .cursor_pointer()
+                            .text_size(px(Theme::TEXT_SMALL))
+                            .text_color(Theme::accent_red())
+                            .hover(|s| s.bg(Theme::tint_red_border()).text_color(Theme::text_primary()))
+                            .on_click(cx.listener(|_this, _, _, _cx| {
+                                crate::utils::open_latest_log_file();
+                            }))
+                            .child("查看报错日志"),
+                    )
+                    .child(
+                        div()
+                            .id("global-error-banner-open-dir")
+                            .flex_shrink_0()
+                            .px(px(Theme::SPACE_2))
+                            .py(px(Theme::SPACE_0_5))
+                            .rounded(px(Theme::RADIUS_SM))
+                            .bg(Theme::bg_inset())
+                            .border_1()
+                            .border_color(Theme::tint_red_border())
+                            .cursor_pointer()
+                            .text_size(px(Theme::TEXT_SMALL))
+                            .text_color(Theme::accent_red())
+                            .hover(|s| s.bg(Theme::tint_red_border()).text_color(Theme::text_primary()))
+                            .on_click(cx.listener(|_this, _, _, _cx| {
+                                crate::utils::open_logs_folder();
+                            }))
+                            .child("打开日志目录"),
+                    )
+                    .child(
+                        div()
+                            .id("global-error-banner-copy")
+                            .flex_shrink_0()
+                            .px(px(Theme::SPACE_2))
+                            .py(px(Theme::SPACE_0_5))
+                            .rounded(px(Theme::RADIUS_SM))
+                            .bg(Theme::bg_inset())
+                            .border_1()
+                            .border_color(Theme::tint_red_border())
+                            .cursor_pointer()
+                            .text_size(px(Theme::TEXT_SMALL))
+                            .text_color(Theme::accent_red())
+                            .hover(|s| s.bg(Theme::tint_red_border()).text_color(Theme::text_primary()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(msg_for_copy.clone()));
+                                this.notice = Some("已成功复制报错详情至剪贴板".to_string());
+                                cx.notify();
+                            }))
+                            .child("复制详情"),
+                    )
+                    .child(
+                        div()
+                            .id("global-error-banner-dismiss")
+                            .flex_shrink_0()
+                            .px(px(Theme::SPACE_2))
+                            .py(px(Theme::SPACE_0_5))
+                            .rounded(px(Theme::RADIUS_SM))
+                            .cursor_pointer()
+                            .text_size(px(Theme::TEXT_SMALL))
+                            .text_color(Theme::accent_red())
+                            .hover(|s| s.bg(Theme::tint_red_border()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.status = ProcessStatus::Idle;
+                                cx.notify();
+                            }))
+                            .child("知道了"),
+                    ),
             )
             .into_any_element()
     }

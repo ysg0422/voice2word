@@ -737,11 +737,11 @@ impl LlamaServer {
         drop(listener);
 
         let mut cmd = Command::new(server_path);
-        // 让路模式：llama-server 是常驻进程，CPU 占用高，必须跟随全局设置
         super::media_pipeline::apply_default_child_flags(&mut cmd);
+        let safe_model = crate::utils::to_cli_safe_path(model_path);
         let mut child = cmd
             .arg("-m")
-            .arg(model_path)
+            .arg(&safe_model)
             .arg("-c")
             .arg(ctx_size.to_string())
             .arg("-t")
@@ -1115,7 +1115,7 @@ impl LLMEngine {
     }
 
     fn run_prompt(&self, prompt: &str, max_tokens: u32) -> Option<CompletionOutcome> {
-        let temp_prompt_file = std::env::temp_dir().join(format!(
+        let temp_prompt_file = crate::utils::safe_temp_dir().join(format!(
             "v2w_prompt_{}_{}.txt",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1131,18 +1131,21 @@ impl LLMEngine {
         file.write_all(prompt.as_bytes()).ok()?;
         drop(file);
 
+        let safe_model = crate::utils::to_cli_safe_path(&self.model_path);
+        let safe_prompt = crate::utils::to_cli_safe_path(&temp_prompt_file);
+
         let mut cli_cmd = Command::new(&self.cli_path);
         // 让路模式同样适用于命令行回退路径
         super::media_pipeline::apply_default_child_flags(&mut cli_cmd);
         let mut child = cli_cmd
             .arg("-m")
-            .arg(&self.model_path)
+            .arg(&safe_model)
             .arg("-c")
             .arg(self.ctx_size.to_string())
             .arg("-t")
             .arg(self.threads().to_string())
             .arg("-f")
-            .arg(&temp_prompt_file)
+            .arg(&safe_prompt)
             .arg("-n")
             .arg(max_tokens.to_string())
             .arg("--temp")

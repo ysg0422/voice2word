@@ -664,7 +664,7 @@ impl WhisperEngine {
         // 本轮结果是否被截断：必须在任何读取线程启动前清零，保证读到的永远是
         // **本次运行**的事实（上一轮的失败不能污染本轮）。
         self.output_truncated.store(false, Ordering::SeqCst);
-        let temp_dir = std::env::temp_dir();
+        let temp_dir = crate::utils::safe_temp_dir();
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -767,12 +767,21 @@ impl WhisperEngine {
             );
         }
 
+        let safe_model = crate::utils::to_cli_safe_path(&effective_model);
+        let safe_vad = self.vad_model_path.as_ref().map(|p| crate::utils::to_cli_safe_path(p));
+
         let mut cmd = Command::new(&effective_cli);
-        cmd.arg("-m").arg(&effective_model);
+        if let Some(parent) = effective_model.parent() {
+            if parent.exists() {
+                cmd.current_dir(parent);
+            }
+        }
+        cmd.arg("-m").arg(&safe_model);
 
         match &audio_input {
             AudioInput::Path(p) => {
-                cmd.arg("-f").arg(p);
+                let safe_p = crate::utils::to_cli_safe_path(p);
+                cmd.arg("-f").arg(safe_p);
                 cmd.stdin(std::process::Stdio::null());
             }
             AudioInput::Stream(_) => {
@@ -781,7 +790,7 @@ impl WhisperEngine {
             }
         }
 
-        if let Some(ref vad_path) = self.vad_model_path {
+        if let Some(ref vad_path) = safe_vad {
             if vad_path.exists() {
                 info!(
                     "Whisper 启用 Silero VAD 高密度语音无损压实与时间戳映射: {:?}",
@@ -1277,6 +1286,13 @@ impl WhisperEngine {
                     output_status.code()
                 );
             }
+            let err_summary = format!(
+                "whisper-cli 退出码: {:?}\n模型路径: {:?}\nstderr 输出:\n{}",
+                output_status.code(),
+                effective_model,
+                stderr_str
+            );
+            crate::utils::record_error_log("Whisper 转写失败", &err_summary);
             error!(
                 "whisper-cli 运行报错 (退出码 {:?}): {}",
                 output_status.code(),
