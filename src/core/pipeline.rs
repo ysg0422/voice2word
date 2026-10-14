@@ -711,6 +711,12 @@ impl TaskPipeline {
         if let Some(sv) = self.sensevoice.as_ref() {
             sv.cancel();
         }
+        // 标点阶段同样是外部 runner 子进程：不在这里一起取消的话，用户点终止后标点会
+        // 照跑到自己结束（界面表现就是「点了终止却还停在极速标点」）。取消的是引擎侧
+        // 标志与在册 PID，与上面两条同一套语义。
+        if let Some(punc) = self.punc.as_ref() {
+            punc.cancel();
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -753,6 +759,11 @@ impl TaskPipeline {
         self.whisper.reset();
         if let Some(sv) = self.sensevoice.as_ref() {
             sv.reset();
+        }
+        // 标点引擎的取消标志同批作废：不复位的话，上一轮的取消会把下一轮的标点阶段
+        // 直接掐掉（登记表里的 runner 早在上一次 cancel() 时就被杀 / 回收了）。
+        if let Some(punc) = self.punc.as_ref() {
+            punc.reset();
         }
     }
 
@@ -1627,6 +1638,10 @@ impl TaskPipeline {
                     progress: 0.95,
                     detail: "SenseVoice 原生自带高精度标点与 ITN，已瞬时就绪".into(),
                 });
+            } else if use_punc && self.is_cancelled() {
+                // 前查：用户在识别收尾期间就点了终止时，不再白起一个 Python 子进程
+                // 跑一遍标点。语义与其余检查点一致——取消 ⇒ 不产出成品。
+                info!("标点阶段开始前已取消，跳过 CT-Punc 极速标点");
             } else if use_punc {
                 polish_engine_name = Some("CT-Punc 极速标点".to_string());
                 let _ = tx.send(PipelineEvent::StageChanged(Stage::Punctuate.label().into()));
@@ -1656,19 +1671,45 @@ impl TaskPipeline {
                 .await
                 {
                     Ok(Ok(polished)) => {
-                        segments = polished;
-                        qwen_sec = punc_started.elapsed().as_secs_f64();
-                        info!(elapsed = ?punc_started.elapsed(), segments = segments.len(), "CT-Punc 极速标点完成");
-                        if !skip_post {
-                            if let Some(a) = artifacts.as_ref() {
-                                if let Err(e) = a.write_segments(Stage::Punctuate, &segments) {
-                                    warn!("标点产物落盘失败: {e:#}");
+                        // 后查：标点跑完的那一刻用户可能已经终止。此时绝不写回结果
+                        // （写回后会经下面的 `polish_ran` 落盘半成品），保持未标点原文。
+                        if self.is_cancelled() {
+                            info!("标点完成后检测到取消，丢弃本次标点结果");
+                        } else {
+                            segments = polished;
+                            qwen_sec = punc_started.elapsed().as_secs_f64();
+                            info!(elapsed = ?punc_started.elapsed(), segments = segments.len(), "CT-Punc 极速标点完成");
+                            if !skip_post {
+                                if let Some(a) = artifacts.as_ref() {
+                                    if let Err(e) = a.write_segments(Stage::Punctuate, &segments) {
+                                        warn!("标点产物落盘失败: {e:#}");
+                                    }
                                 }
                             }
                         }
                     }
                     Ok(Err(err)) => {
-                        warn!(error = %err, "极速标点失败，保留识别原文并继续收尾");
+                        // 取消与超时/失败要给不同文案：取消是用户预期内的静默收尾，
+                        // 超时必须明确告警（字幕保持未标点，而不是把半截输出当结果）。
+                        match err.downcast_ref::<crate::engines::punc::PuncStageError>() {
+                            Some(crate::engines::punc::PuncStageError::Cancelled) => {
+                                info!("极速标点已取消，字幕保持未标点");
+                            }
+                            Some(crate::engines::punc::PuncStageError::TimedOut) => {
+                                warn!(error = %err, "极速标点超时，已终止；字幕保持未标点");
+                                // 超时不像取消那样在后面的闸门早退，性能报告仍会打印：
+                                // 名字若留在「CT-Punc 极速标点」就是在报告一份没发生的标点。
+                                polish_engine_name = Some("标点超时（字幕未标点）".to_string());
+                                let _ = tx.send(PipelineEvent::Progress {
+                                    stage: "极速标点".into(),
+                                    progress: 0.95,
+                                    detail: "标点引擎超时，已终止；字幕保持未标点".into(),
+                                });
+                            }
+                            None => {
+                                warn!(error = %err, "极速标点失败，保留识别原文并继续收尾");
+                            }
+                        }
                     }
                     Err(err) => {
                         warn!(error = %err, "极速标点任务异常，保留识别原文");
@@ -2754,6 +2795,41 @@ mod tests {
             );
         }
     }
+
+    /// 标点引擎必须被管线一起取消 / 复位：不然用户点「终止」后标点会照跑到自己结束
+    /// （正是「标点阶段完全没接终止」这条缺陷），而上一轮的取消又会把下一轮的标点
+    /// 阶段直接掐掉。这条用例钉的就是这两条接线的存在。
+    #[test]
+    fn cancel_and_begin_task_reach_punc_engine() {
+        use crate::engines::{FFmpegEngine, LLMEngine, PunctuationEngine, WhisperEngine};
+        let punc = Arc::new(PunctuationEngine::with_python_and_provider(
+            "runner.py",
+            "model.onnx",
+            1,
+            "python",
+            "cpu",
+        ));
+        let pipeline = TaskPipeline::new(
+            Arc::new(FFmpegEngine::new("ffmpeg")),
+            Arc::new(WhisperEngine::new("whisper-cli", "ggml-small.bin", 4, 1)),
+            None,
+            Arc::new(LLMEngine::new("llama-cli", "model.gguf", 2048, 4)),
+            Some(punc.clone()),
+        );
+
+        assert!(!punc.is_cancelled(), "初始应为未取消");
+        pipeline.cancel();
+        assert!(pipeline.is_cancelled());
+        assert!(punc.is_cancelled(), "cancel() 必须把标点引擎也一起取消");
+
+        pipeline.begin_task();
+        assert!(!pipeline.is_cancelled());
+        assert!(
+            !punc.is_cancelled(),
+            "begin_task() 必须复位标点引擎的取消标志，否则新任务的标点会被上一轮掐掉"
+        );
+    }
+
     // ── 自动导出接线：样式回落（缺省不改变历史输出）+ mode 推断（不与 writer 漂移）──
 
     /// 单测用的临时目录（每个用例一个，跑完自清理）。
