@@ -1148,14 +1148,22 @@ impl WhisperEngine {
                                 last_emit = ratio;
                                 if let Some(cb) = cb_clone.as_ref() {
                                     match preview_segs {
-                                        // 一条长段拆成多条时逐条推送，`opt_seg` 只用于
-                                        // `should_emit` 的「有新句」判定与进度 label
                                         Some(segs) => {
                                             for seg in segs {
-                                                cb(ratio, &label, Some(seg));
+                                                let _ = std::panic::catch_unwind(
+                                                    std::panic::AssertUnwindSafe(|| {
+                                                        cb(ratio, &label, Some(seg));
+                                                    }),
+                                                );
                                             }
                                         }
-                                        None => cb(ratio, &label, None),
+                                        None => {
+                                            let _ = std::panic::catch_unwind(
+                                                std::panic::AssertUnwindSafe(|| {
+                                                    cb(ratio, &label, None);
+                                                }),
+                                            );
+                                        }
                                     }
                                 }
                             }

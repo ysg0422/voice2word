@@ -500,6 +500,7 @@ pub fn run_chunked_parallel(
 
     let progress_cb = progress_cb.map(Arc::new);
     let done = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let total_chunks = slice_paths.len();
 
     let pool = rayon_pool(workers)?;
@@ -508,9 +509,19 @@ pub fn run_chunked_parallel(
         slice_paths
             .par_iter()
             .map(|(chunk, path)| {
+                if failed.load(Ordering::Relaxed) {
+                    anyhow::bail!("已有分块转写失败，中止剩余任务");
+                }
                 let cb = progress_cb.clone();
                 let done = done.clone();
-                let (segs, chunk_vad_sec) = transcribe_one(path, chunk.duration, per_proc_threads)?;
+                let failed_flag = failed.clone();
+                let (segs, chunk_vad_sec) = match transcribe_one(path, chunk.duration, per_proc_threads) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        failed_flag.store(true, Ordering::Relaxed);
+                        return Err(e);
+                    }
+                };
                 let finished = done.fetch_add(1, Ordering::SeqCst) + 1;
                 let ratio = finished as f64 / total_chunks as f64;
                 if let Some(cb) = cb.as_ref() {

@@ -179,8 +179,8 @@ impl SpeechFilterOptions {
             // nr=12：只衰减 12 dB，宁可少降也不引入伪影
             // nf=-30：初始噪声底 -30 dBFS（典型室内底噪量级）
             // tn=1：自适应跟踪噪声底，避免把持续的低电平语音当成噪声削掉
-            // gs=8：增益平滑，抑制音乐化伪影
-            stages.push("afftdn=nr=12:nf=-30:tn=1:gs=8".to_string());
+            // 注：不追加 gs（gain smoothing），FFmpeg 4.x 不支持该参数会导致 Option 'gs' not found 崩溃
+            stages.push("afftdn=nr=12:nf=-30:tn=1".to_string());
         }
         if active.normalize {
             // f=250：250 ms 分析窗，匹配语音音节尺度
