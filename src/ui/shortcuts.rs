@@ -38,8 +38,6 @@ actions!(
         CancelOrClose,
         /// 按剪辑台当前选中的格式导出
         ExportSubtitle,
-        /// 切换深浅主题
-        ToggleTheme,
         /// 聚焦字幕清单搜索框
         FocusSubtitleSearch,
         /// 撤销上一次字幕编辑
@@ -1132,5 +1130,24 @@ mod tests {
                 .any(|(key, hint)| key == "Ctrl+E" && hint.contains("冲突")),
             "被驳回的覆盖要在速查表里标注"
         );
+    }
+
+    /// README 的「快捷键」一节必须与 [`SHORTCUT_SPECS`] 同源。
+    ///
+    /// F1 速查面板是从这张表渲染的，所以面板永远不会错；README 是手写的，改了键位
+    /// 表却忘了改 README，文档就会教用户按一个不再生效的键——历史上 README 就写过
+    /// 一条从未绑定过的 `Ctrl+T 切换主题`。这里直接读仓库根的 README，把每条
+    /// `hint_key` 是否出现钉住，键位增删时文档不同步会立刻失败。
+    #[test]
+    fn readme_shortcut_table_covers_every_spec() {
+        let readme = include_str!("../../README.md");
+        for spec in SHORTCUT_SPECS.iter() {
+            assert!(
+                readme.contains(spec.hint_key),
+                "README 缺少快捷键 {}（{}）",
+                spec.hint_key,
+                spec.hint
+            );
+        }
     }
 }

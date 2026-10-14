@@ -29,7 +29,10 @@ static LIGHT_MODE: AtomicBool = AtomicBool::new(false);
 pub struct Theme;
 
 impl Theme {
-    /// 切换主题（由设置页 / 侧边栏开关调用，并在启动时按配置初始化）
+    /// 设置主题模式。
+    ///
+    /// 界面上**没有**主题切换入口（见 `main.rs` 里启动时固定 `set_light(false)`），
+    /// 深色是唯一在用的主题；浅色分支只在颜色 token 与测试里保留，供将来做主题时复用。
     pub fn set_light(on: bool) {
         LIGHT_MODE.store(on, Ordering::Relaxed);
     }
