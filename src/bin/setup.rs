@@ -1,4 +1,6 @@
-//! Voice2Word Windows 原生向导式安装程序
+//! Voice2Word Windows 原生安装程序（单窗口）。
+//! 一屏装完：打开就看到安装位置，可点【选择其他位置】改路径，点【安装】后就地显示进度，
+//! 装完同一个窗口里直接启动，全程不弹向导式对话框（也没有控制台黑窗）。
 //! 单文件独立安装包，内置最新主程序，自动创建桌面与开始菜单快捷方式，支持无管理员权限安装与干净卸载。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -285,58 +287,57 @@ fn write_failure_hint(err: &std::io::Error) -> String {
     }
 }
 
-fn run_installer() {
-    let default_dir = get_install_dir();
-    // 步骤 1：选择安装位置（默认目录，或由用户自定义）。
-    let install_dir = match select_install_dir(&default_dir) {
-        Some(dir) => dir,
-        None => return,
-    };
+/// 安装主体产出的结果。
+///
+/// 窗口版与对话框版共用同一份安装流程、只由各自的 UI 决定怎么展示；装了什么、
+/// 哪些步骤没成功，全部从这里回传——两份实现各自演化必然分叉，所以只留一份。
+struct InstallOutcome {
+    warnings: Vec<String>,
+    target_exe: PathBuf,
+    desktop_ok: bool,
+    start_menu_ok: bool,
+}
+
+/// 创建安装目录。抽成独立函数是为了能在临时目录上单测失败分支，
+/// 而单测不必真去写 30MB 主程序、动注册表和桌面。
+fn prepare_install_dir(dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(dir)
+        .map_err(|e| format!("无法创建安装目录:\n{}\n\n错误: {}", dir.display(), e))
+}
+
+/// 安装主体：单窗口版与旧对话框版**共用**这一段。
+///
+/// `status` 把进度回传给 UI——窗口版写进状态行，对话框版直接丢掉。
+/// 只有**致命**失败才返回 `Err`（目录建不出来、主程序写不进去）；快捷方式、
+/// 注册表这类非致命步骤失败照旧进 `warnings`，由调用方在完成摘要里如实列出。
+fn install_to(dir: &Path, status: &mut dyn FnMut(&str)) -> Result<InstallOutcome, String> {
     // 记录非致命步骤的失败原因，最终在完成提示里如实反馈，避免假装成功。
     let mut warnings: Vec<String> = Vec::new();
 
     // 1. 创建目标目录
-    if let Err(e) = fs::create_dir_all(&install_dir) {
-        message_box(
-            "安装失败",
-            &format!(
-                "无法创建安装目录:\n{}\n\n错误: {}",
-                install_dir.display(),
-                e
-            ),
-            MB_OK | MB_ICONERROR,
-        );
-        return;
-    }
+    status("正在创建安装目录…");
+    prepare_install_dir(dir)?;
 
     // 2. 释放主执行程序
-    let target_exe = install_dir.join(APP_EXE_NAME);
+    status("正在释放主程序…");
+    let target_exe = dir.join(APP_EXE_NAME);
     if MAIN_EXE_BYTES.len() < 1024 * 1024 {
-        message_box(
-            "安装失败",
-            "安装程序数据不完整，请重新下载官方正式发布的安装包！",
-            MB_OK | MB_ICONERROR,
-        );
-        return;
+        return Err("安装程序数据不完整，请重新下载官方正式发布的安装包！".to_string());
     }
     if let Err(e) = fs::write(&target_exe, MAIN_EXE_BYTES) {
-        message_box(
-            "安装失败",
-            &format!(
-                "{}\n\n文件: {}\n错误: {}",
-                write_failure_hint(&e),
-                target_exe.display(),
-                e
-            ),
-            MB_OK | MB_ICONERROR,
-        );
-        return;
+        return Err(format!(
+            "{}\n\n文件: {}\n错误: {}",
+            write_failure_hint(&e),
+            target_exe.display(),
+            e
+        ));
     }
 
     // 3. 复制 tools 目录与 config.toml（如存在）
+    status("正在复制组件（tools）…");
     let current_dir = std::env::current_dir().unwrap_or_default();
     let src_config = current_dir.join("config.toml");
-    let dst_config = install_dir.join("config.toml");
+    let dst_config = dir.join("config.toml");
     if src_config.exists() && !dst_config.exists() {
         if let Err(e) = fs::copy(&src_config, &dst_config) {
             warnings.push(format!("配置文件 config.toml 复制失败：{e}"));
@@ -344,7 +345,7 @@ fn run_installer() {
     }
 
     let src_tools = current_dir.join("tools");
-    let dst_tools = install_dir.join("tools");
+    let dst_tools = dir.join("tools");
     if src_tools.exists() {
         if let Err(e) = fs::create_dir_all(&dst_tools) {
             warnings.push(format!("创建 tools 目录失败：{e}"));
@@ -368,19 +369,21 @@ fn run_installer() {
     }
 
     // 4. 生成卸载脚本
-    let uninstall_bat = install_dir.join("uninstall.bat");
-    let bat_content = build_uninstall_script(APP_NAME, APP_EXE_NAME, &install_dir);
+    status("正在生成卸载脚本…");
+    let uninstall_bat = dir.join("uninstall.bat");
+    let bat_content = build_uninstall_script(APP_NAME, APP_EXE_NAME, dir);
     if let Err(e) = fs::write(&uninstall_bat, bat_content) {
         warnings.push(format!("卸载脚本 uninstall.bat 写入失败：{e}"));
     }
 
     // 5. 创建桌面快捷方式
+    status("正在创建快捷方式…");
     let mut desktop_ok = false;
     if let Ok(user_profile) = std::env::var("USERPROFILE") {
         let desktop = PathBuf::from(user_profile).join("Desktop");
         if desktop.exists() {
             let desktop_shortcut = desktop.join(format!("{}.lnk", APP_NAME));
-            match create_shortcut(&target_exe, &desktop_shortcut, &install_dir) {
+            match create_shortcut(&target_exe, &desktop_shortcut, dir) {
                 Ok(()) => desktop_ok = true,
                 Err(e) => warnings.push(format!("桌面快捷方式创建失败：{e}")),
             }
@@ -401,7 +404,7 @@ fn run_installer() {
             .join("Programs");
         if start_menu.exists() {
             let start_shortcut = start_menu.join(format!("{}.lnk", APP_NAME));
-            match create_shortcut(&target_exe, &start_shortcut, &install_dir) {
+            match create_shortcut(&target_exe, &start_shortcut, dir) {
                 Ok(()) => start_menu_ok = true,
                 Err(e) => warnings.push(format!("开始菜单快捷方式创建失败：{e}")),
             }
@@ -413,6 +416,7 @@ fn run_installer() {
     }
 
     // 7. 注册 Windows 控制面板卸载项 (当前用户)
+    status("正在注册卸载项…");
     //
     // # 为什么不再拼一条 `cmd /c reg add ... && ...`
     //
@@ -427,7 +431,7 @@ fn run_installer() {
         ("DisplayName", format!("{APP_NAME} (音视频智能字幕生成器)")),
         ("DisplayVersion", APP_VERSION.to_string()),
         ("Publisher", "Voice2Word Team".to_string()),
-        ("InstallLocation", install_dir.display().to_string()),
+        ("InstallLocation", dir.display().to_string()),
         // 卸载串必须自带引号：控制面板会把它当命令行执行，路径含空格时不加引号会断。
         (
             "UninstallString",
@@ -453,53 +457,941 @@ fn run_installer() {
         }
     }
 
-    // 8. 询问是否立即启动
-    let mut finish_lines = vec![
+    Ok(InstallOutcome {
+        warnings,
+        target_exe,
+        desktop_ok,
+        start_menu_ok,
+    })
+}
+
+/// 安装完成摘要（沿用原来的完成提示文案）。
+///
+/// 窗口版把它放进「复制详情」，对话框版连同一句「是否立即启动」弹出来——文案只有一份。
+fn build_finish_summary(dir: &Path, outcome: &InstallOutcome) -> String {
+    let mut lines = vec![
         format!("{APP_NAME} v{APP_VERSION} 已成功安装到您的电脑！"),
         String::new(),
-        format!("• 安装位置: {}", install_dir.display()),
+        format!("• 安装位置: {}", dir.display()),
     ];
-    if desktop_ok {
-        finish_lines.push("• 桌面快捷方式已创建".to_string());
+    if outcome.desktop_ok {
+        lines.push("• 桌面快捷方式已创建".to_string());
     }
-    if start_menu_ok {
-        finish_lines.push("• 开始菜单项已创建".to_string());
+    if outcome.start_menu_ok {
+        lines.push("• 开始菜单项已创建".to_string());
     }
-    if !warnings.is_empty() {
-        finish_lines.push(String::new());
-        finish_lines.push("以下步骤未完全成功，请留意：".to_string());
-        for w in warnings.iter().take(5) {
-            finish_lines.push(format!("· {w}"));
+    if !outcome.warnings.is_empty() {
+        lines.push(String::new());
+        lines.push("以下步骤未完全成功，请留意：".to_string());
+        for w in outcome.warnings.iter().take(5) {
+            lines.push(format!("· {w}"));
         }
-        if warnings.len() > 5 {
-            finish_lines.push(format!("· 另有 {} 项提示已省略", warnings.len() - 5));
+        if outcome.warnings.len() > 5 {
+            lines.push(format!(
+                "· 另有 {} 项提示已省略",
+                outcome.warnings.len() - 5
+            ));
         }
     }
-    finish_lines.push(String::new());
-    finish_lines.push(format!("是否立即启动 {APP_NAME}？"));
-    let finish_msg = finish_lines.join("\n");
+    lines.join("\n")
+}
 
-    let run_now = message_box(
-        &format!("{app} 安装成功", app = APP_NAME),
-        &finish_msg,
-        MB_YESNO | MB_ICONINFORMATION,
-    );
+/// 启动刚装好的主程序；两个入口共用同一份失败文案。
+fn launch_installed(dir: &Path, target_exe: &Path) -> Result<(), String> {
+    Command::new(target_exe)
+        .current_dir(dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("启动 {APP_NAME} 失败：\n{e}\n\n您可以稍后从桌面快捷方式手动启动。"))
+}
 
-    if run_now == IDYES {
-        if let Err(e) = Command::new(&target_exe).current_dir(&install_dir).spawn() {
-            message_box(
-                "启动失败",
-                &format!("启动 {APP_NAME} 失败：\n{e}\n\n您可以稍后从桌面快捷方式手动启动。"),
-                MB_OK | MB_ICONERROR,
+/// 旧的对话框流程：单窗口起不来时（以及非 Windows 平台）走这条，保证「窗口建不出来也还能装」。
+fn run_installer_dialog() {
+    let default_dir = get_install_dir();
+    let install_dir = match select_install_dir(&default_dir) {
+        Some(dir) => dir,
+        None => return,
+    };
+    match install_to(&install_dir, &mut |_| {}) {
+        Err(message) => {
+            message_box("安装失败", &message, MB_OK | MB_ICONERROR);
+        }
+        Ok(outcome) => {
+            let message = format!(
+                "{}\n\n是否立即启动 {APP_NAME}？",
+                build_finish_summary(&install_dir, &outcome)
             );
+            let run_now = message_box(
+                &format!("{app} 安装成功", app = APP_NAME),
+                &message,
+                MB_YESNO | MB_ICONINFORMATION,
+            );
+            if run_now == IDYES {
+                if let Err(message) = launch_installed(&install_dir, &outcome.target_exe) {
+                    message_box("启动失败", &message, MB_OK | MB_ICONERROR);
+                }
+            }
+        }
+    }
+}
+/// 单窗口安装器（原生 Win32，不引任何新依赖）。
+///
+/// # 为什么自己拉窗口
+///
+/// 原来靠一串 `MessageBoxW` 串成「向导」：欢迎框（是/否/取消）→ 文件夹选择框 →
+/// 确认框 → 危险目录再确认 → 完成框再问是否启动，加上控制台黑窗，用户看到的是
+/// 「好几个界面」，而且**安装位置从来没在一开始显示出来**。
+///
+/// 这里用 `CreateWindowExW` + `BUTTON`／`STATIC` 子控件 + 标准消息循环把它们压成
+/// 一屏：一上来就显示安装位置，切换路径立刻刷新，装完在同一个窗口里把「安装」
+/// 变成「启动 Voice2Word」，全程不弹对话框——只有「目标目录不像本程序的旧安装」
+/// 这种边缘情况才确认一次（那是护栏，不是向导步骤）。
+#[cfg(windows)]
+mod window {
+    use super::{
+        build_finish_summary, get_install_dir, install_to, is_existing_foreign_dir,
+        launch_installed, message_box, pick_directory, resolve_install_dir, to_wide_chars,
+        APP_EXE_NAME, APP_NAME, APP_VERSION, IDYES, MB_ICONERROR, MB_ICONINFORMATION,
+        MB_ICONQUESTION, MB_OK, MB_YESNO,
+    };
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    // ---- Win32 基础类型：与文件顶部的 MessageBoxW 同一条路子，手写 extern ----
+    type Hwnd = *mut c_void;
+    type Hinstance = *mut c_void;
+    type Hgdiobj = *mut c_void;
+    type Hdc = *mut c_void;
+    type Lresult = isize;
+    type Wparam = usize;
+    type Lparam = isize;
+
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    /// MSG：只声明到真实尺寸（x64 上 48 字节，含尾部 lPrivate），
+    /// 少声明会让 GetMessageW 越界写栈。
+    #[repr(C)]
+    struct Msg {
+        hwnd: Hwnd,
+        message: u32,
+        w_param: Wparam,
+        l_param: Lparam,
+        time: u32,
+        pt_x: i32,
+        pt_y: i32,
+        private: u32,
+    }
+
+    #[repr(C)]
+    struct WndClassExW {
+        cb_size: u32,
+        style: u32,
+        wnd_proc: Option<unsafe extern "system" fn(Hwnd, u32, Wparam, Lparam) -> Lresult>,
+        cls_extra: i32,
+        wnd_extra: i32,
+        instance: Hinstance,
+        icon: *mut c_void,
+        cursor: *mut c_void,
+        background: *mut c_void,
+        menu_name: *const u16,
+        class_name: *const u16,
+        icon_sm: *mut c_void,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn RegisterClassExW(wc: *const WndClassExW) -> u16;
+        fn CreateWindowExW(
+            ex_style: u32,
+            class_name: *const u16,
+            window_name: *const u16,
+            style: u32,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            parent: Hwnd,
+            menu: *mut c_void,
+            instance: Hinstance,
+            param: *mut c_void,
+        ) -> Hwnd;
+        fn DestroyWindow(hwnd: Hwnd) -> i32;
+        fn DefWindowProcW(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) -> Lresult;
+        fn GetMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32) -> i32;
+        fn TranslateMessage(msg: *const Msg) -> i32;
+        fn DispatchMessageW(msg: *const Msg) -> Lresult;
+        fn PostQuitMessage(code: i32);
+        fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
+        fn UpdateWindow(hwnd: Hwnd) -> i32;
+        fn SetWindowTextW(hwnd: Hwnd, text: *const u16) -> i32;
+        fn EnableWindow(hwnd: Hwnd, enable: i32) -> i32;
+        fn SendMessageW(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) -> Lresult;
+        fn AdjustWindowRectEx(rect: *mut Rect, style: u32, menu: i32, ex_style: u32) -> i32;
+        fn GetSystemMetrics(index: i32) -> i32;
+        fn SetForegroundWindow(hwnd: Hwnd) -> i32;
+        fn SetFocus(hwnd: Hwnd) -> Hwnd;
+        fn LoadCursorW(instance: Hinstance, name: *const u16) -> *mut c_void;
+        fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
+        fn SetProcessDPIAware() -> i32;
+        fn GetDC(hwnd: Hwnd) -> Hdc;
+        fn ReleaseDC(hwnd: Hwnd, hdc: Hdc) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> Hinstance;
+    }
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        fn GetStockObject(kind: i32) -> Hgdiobj;
+        fn GetDeviceCaps(hdc: Hdc, index: i32) -> i32;
+        fn SetBkMode(hdc: Hdc, mode: i32) -> i32;
+        fn SetTextColor(hdc: Hdc, color: u32) -> u32;
+        fn SetBkColor(hdc: Hdc, color: u32) -> u32;
+    }
+
+    const WINDOW_CLASS: &str = "Voice2WordSetupWindow";
+
+    // 窗口样式：刻意**不含** WS_THICKFRAME / WS_MAXIMIZEBOX —— 固定大小，禁止拉伸。
+    const WS_OVERLAPPED: u32 = 0x0000_0000;
+    const WS_CAPTION: u32 = 0x00C0_0000;
+    const WS_SYSMENU: u32 = 0x0008_0000;
+    const WS_MINIMIZEBOX: u32 = 0x0002_0000;
+    const WS_CLIPCHILDREN: u32 = 0x0200_0000;
+    const WS_CHILD: u32 = 0x4000_0000;
+    const WS_VISIBLE: u32 = 0x1000_0000;
+    const WS_TABSTOP: u32 = 0x0001_0000;
+    const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
+    const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
+    const SS_LEFT: u32 = 0x0000_0000;
+    const SS_LEFTNOWORDWRAP: u32 = 0x0000_000C;
+    const SS_PATHELLIPSIS: u32 = 0x0000_8000;
+
+    const SW_HIDE: i32 = 0;
+    const SW_SHOW: i32 = 5;
+    const SW_SHOWNORMAL: i32 = 1;
+
+    const WM_CREATE: u32 = 0x0001;
+    const WM_DESTROY: u32 = 0x0002;
+    const WM_CLOSE: u32 = 0x0010;
+    const WM_COMMAND: u32 = 0x0111;
+    const WM_CTLCOLORSTATIC: u32 = 0x0138;
+    const WM_SETFONT: u32 = 0x0030;
+    const WM_KEYDOWN: u32 = 0x0100;
+
+    const VK_RETURN: usize = 0x0D;
+    const VK_ESCAPE: usize = 0x1B;
+
+    const GWL_EXSTYLE: i32 = -20;
+    const DEFAULT_GUI_FONT: i32 = 17;
+    const WHITE_BRUSH: i32 = 0;
+    /// 系统色 COLOR_BTNFACE(15) 的「+1 即画刷」形式，直接当窗口背景。
+    const FACE_BRUSH: isize = 16;
+    const LOGPIXELSY: i32 = 90;
+    const SM_CXSCREEN: i32 = 0;
+    const SM_CYSCREEN: i32 = 1;
+    const IDC_ARROW: usize = 32512;
+    const BK_TRANSPARENT: i32 = 1;
+
+    // 逻辑像素下的窗口客户区尺寸（按 DPI 缩放）。
+    const CLIENT_W: f32 = 520.0;
+    const CLIENT_H: f32 = 196.0;
+
+    const ID_PICK: u16 = 1001;
+    const ID_INSTALL: u16 = 1002;
+    const ID_CANCEL: u16 = 1003;
+    const ID_DETAILS: u16 = 1004;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Phase {
+        Idle,
+        Installing,
+        Done,
+        Failed,
+    }
+
+    /// 窗口的全部可变状态。放在 thread_local 里而不是 GWLP_USERDATA：
+    /// 单线程消息循环只需要一份，RefCell 的借用检查能挡掉「安装回调里再改状态」
+    /// 这类重入，不必自己摸裸指针。
+    struct AppState {
+        dir: PathBuf,
+        phase: Phase,
+        /// 完成摘要 / 失败原因；「复制详情」和失败弹框都用它。
+        details: String,
+        target_exe: Option<PathBuf>,
+        path_text: Hwnd,
+        status: Hwnd,
+        pick: Hwnd,
+        install: Hwnd,
+        cancel: Hwnd,
+        details_btn: Hwnd,
+    }
+
+    thread_local! {
+        static STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
+    }
+
+    fn with_state<R>(f: impl FnOnce(&mut AppState) -> R) -> Option<R> {
+        STATE.with(|cell| cell.borrow_mut().as_mut().map(f))
+    }
+
+    fn flag(on: bool) -> i32 {
+        if on {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn set_text(control: Hwnd, text: &str) {
+        let wide = to_wide_chars(text);
+        unsafe {
+            SetWindowTextW(control, wide.as_ptr());
+        }
+    }
+
+    /// 安装是同步跑在 UI 线程上的：状态行写完必须立刻重画，
+    /// 否则用户看到的是「卡死」而不是「进度」。
+    fn set_status(state: &AppState, text: &str) {
+        set_text(state.status, text);
+        unsafe {
+            UpdateWindow(state.status);
+        }
+    }
+
+    fn set_path_text(state: &AppState) {
+        set_text(state.path_text, &state.dir.display().to_string());
+    }
+
+    /// 按阶段统一切换按钮文案／可用状态。集中在一处，避免各分支只改一半。
+    fn refresh_buttons(state: &AppState) {
+        let (install_text, cancel_text, pick_enabled, main_enabled) = match state.phase {
+            Phase::Idle | Phase::Failed => ("安装", "取消", true, true),
+            Phase::Installing => ("安装", "取消", false, false),
+            Phase::Done => ("启动 Voice2Word", "关闭", false, true),
+        };
+        let has_details = !state.details.is_empty();
+        set_text(state.install, install_text);
+        set_text(state.cancel, cancel_text);
+        unsafe {
+            EnableWindow(state.pick, flag(pick_enabled));
+            EnableWindow(state.install, flag(main_enabled));
+            // 「取消／关闭」任何时候都能点：装到一半也不会把用户锁死在窗口里。
+            EnableWindow(state.cancel, 1);
+            EnableWindow(state.details_btn, flag(has_details));
+            ShowWindow(
+                state.details_btn,
+                if has_details { SW_SHOW } else { SW_HIDE },
+            );
+        }
+    }
+
+    fn handle_command(hwnd: Hwnd, id: u16) {
+        match id {
+            ID_CANCEL => unsafe {
+                DestroyWindow(hwnd);
+            },
+            ID_PICK => pick_dir(),
+            ID_INSTALL => match with_state(|s| s.phase) {
+                Some(Phase::Done) => launch_now(hwnd),
+                Some(Phase::Idle | Phase::Failed) => run_install(hwnd),
+                _ => {}
+            },
+            ID_DETAILS => copy_and_report(),
+            _ => {}
+        }
+    }
+
+    /// 「选择其他位置…」：以当前值为初始目录；用户取消（返回空）时保持原值不变。
+    fn pick_dir() {
+        if !matches!(with_state(|s| s.phase), Some(Phase::Idle | Phase::Failed)) {
+            return;
+        }
+        let current = match with_state(|s| s.dir.clone()) {
+            Some(dir) => dir,
+            None => return,
+        };
+        let Some(picked) = pick_directory(&current) else {
+            return;
+        };
+        let resolved = resolve_install_dir(&picked);
+        with_state(|s| {
+            s.dir = resolved;
+            set_path_text(s);
+        });
+    }
+
+    fn run_install(_hwnd: Hwnd) {
+        let dir = match with_state(|s| s.dir.clone()) {
+            Some(dir) => dir,
+            None => return,
+        };
+        // 先置忙并置灰按钮：下面的确认框自己会跑消息泵，不设防的话用户能在泵里
+        // 再点一次「安装」，叠出第二遍安装流程。
+        with_state(|s| {
+            s.phase = Phase::Installing;
+            refresh_buttons(s);
+        });
+        // 「目标目录已存在、非空、且不像本程序的旧安装」是护栏（卸载会 rmdir /s /q
+        // 整个目录），只在边缘情况确认一次，不算向导步骤。
+        if is_existing_foreign_dir(&dir) {
+            let proceed = message_box(
+                &format!("{app} v{ver} 安装程序", app = APP_NAME, ver = APP_VERSION),
+                &format!(
+                    "所选目录已存在，且里面没有 {app}（{exe}）：\n{dir}\n\n\
+                     它可能是您自己的目录。{app} 只写入自己的文件，但「卸载时会删除\n\
+                     整个目录」，其中原有文件也会一并消失，且不可恢复。\n\n\
+                     确定仍要安装到这个目录吗？",
+                    app = APP_NAME,
+                    exe = APP_EXE_NAME,
+                    dir = dir.display()
+                ),
+                MB_YESNO | MB_ICONQUESTION,
+            );
+            if proceed != IDYES {
+                with_state(|s| {
+                    s.phase = Phase::Idle;
+                    refresh_buttons(s);
+                });
+                return;
+            }
+        }
+
+        let status_hwnd = match with_state(|s| s.status) {
+            Some(hwnd) => hwnd,
+            None => return,
+        };
+        let mut on_status = |text: &str| {
+            let wide = to_wide_chars(text);
+            unsafe {
+                SetWindowTextW(status_hwnd, wide.as_ptr());
+                UpdateWindow(status_hwnd);
+            }
+        };
+
+        match install_to(&dir, &mut on_status) {
+            Ok(outcome) => {
+                let summary = build_finish_summary(&dir, &outcome);
+                let exe = outcome.target_exe.clone();
+                with_state(|s| {
+                    s.phase = Phase::Done;
+                    s.details = summary;
+                    s.target_exe = Some(exe);
+                    // 状态与按钮在同一个窗口里就地翻牌：不再弹「是否启动」。
+                    set_status(s, "安装完成");
+                    refresh_buttons(s);
+                });
+            }
+            Err(message) => {
+                with_state(|s| {
+                    s.phase = Phase::Failed;
+                    s.details = message.clone();
+                    set_status(s, "安装失败");
+                    refresh_buttons(s);
+                });
+                // 只在失败时弹一次错误框；正常流程从头到尾不弹，保持「一屏」。
+                message_box("安装失败", &message, MB_OK | MB_ICONERROR);
+            }
+        }
+    }
+
+    fn launch_now(hwnd: Hwnd) {
+        let (dir, exe) = match with_state(|s| (s.dir.clone(), s.target_exe.clone())) {
+            Some((dir, Some(exe))) => (dir, exe),
+            _ => return,
+        };
+        match launch_installed(&dir, &exe) {
+            // 起来了就关掉安装窗口：用户接下来看到的就是主程序本身。
+            Ok(()) => unsafe {
+                DestroyWindow(hwnd);
+            },
+            Err(message) => {
+                message_box("启动失败", &message, MB_OK | MB_ICONERROR);
+            }
+        }
+    }
+
+    /// 「复制详情」：走临时文件 + Set-Clipboard。
+    /// 多行文本直接内插进命令行会被引号/换行拆坏，和注册表那条经验一样，绕开解析层。
+    fn copy_details(state: &AppState) -> Result<(), String> {
+        let path =
+            std::env::temp_dir().join(format!("voice2word_setup_{}.txt", std::process::id()));
+        std::fs::write(&path, &state.details).map_err(|e| e.to_string())?;
+        let quoted = path.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "Set-Clipboard -Value ([IO.File]::ReadAllText('{quoted}', [Text.Encoding]::UTF8))"
+        );
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &script,
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&path);
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    }
+
+    fn copy_and_report() {
+        let details = match with_state(|s| s.details.clone()) {
+            Some(text) => text,
+            None => return,
+        };
+        if details.is_empty() {
+            return;
+        }
+        if let Some(Err(e)) = with_state(|s| copy_details(s)) {
+            message_box(
+                &format!("{APP_NAME} 安装详情"),
+                &format!("复制到剪贴板失败：{e}\n\n{details}"),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+    }
+    /// 子控件规格：逻辑坐标在调用处按 DPI 换算好，避免每个控件各自算一遍。
+    struct Ctrl<'a> {
+        class: &'a str,
+        text: &'a str,
+        style: u32,
+        ex_style: u32,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        id: u16,
+    }
+
+    fn create_child(parent: Hwnd, instance: Hinstance, font: Hgdiobj, spec: &Ctrl<'_>) -> Hwnd {
+        let class = to_wide_chars(spec.class);
+        let text = to_wide_chars(spec.text);
+        let control = unsafe {
+            CreateWindowExW(
+                spec.ex_style,
+                class.as_ptr(),
+                text.as_ptr(),
+                spec.style,
+                spec.x,
+                spec.y,
+                spec.w,
+                spec.h,
+                parent,
+                spec.id as usize as *mut c_void,
+                instance,
+                std::ptr::null_mut(),
+            )
+        };
+        if !control.is_null() {
+            // DEFAULT_GUI_FONT 而不是系统默认字体：后者在中文界面下又小又糊。
+            unsafe {
+                SendMessageW(control, WM_SETFONT, font as Wparam, 1);
+            }
+        }
+        control
+    }
+
+    /// 一次把整屏控件建出来；任何控件建失败都返回 false，让调用方退回对话框流程。
+    fn on_create(hwnd: Hwnd) -> bool {
+        let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        let scale = dpi_scale();
+        let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+        let button_style = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+        let label_style = WS_CHILD | WS_VISIBLE;
+        let at = |x: f32, y: f32, w: f32, h: f32| {
+            (px(x, scale), px(y, scale), px(w, scale), px(h, scale))
+        };
+
+        let title_text = format!("{APP_NAME} 安装");
+        let hint_text = "选择安装位置，然后点【安装】。".to_string();
+        let path_label = "安装位置：".to_string();
+        let (tx, ty, tw, th) = at(16.0, 14.0, 488.0, 20.0);
+        let title = create_child(
+            hwnd,
+            instance,
+            font,
+            &Ctrl {
+                class: "STATIC",
+                text: &title_text,
+                style: label_style | SS_LEFT,
+                ex_style: 0,
+                x: tx,
+                y: ty,
+                w: tw,
+                h: th,
+                id: 0,
+            },
+        );
+        let (hx, hy, hw, hh) = at(16.0, 36.0, 488.0, 18.0);
+        let hint = create_child(
+            hwnd,
+            instance,
+            font,
+            &Ctrl {
+                class: "STATIC",
+                text: &hint_text,
+                style: label_style | SS_LEFT,
+                ex_style: 0,
+                x: hx,
+                y: hy,
+                w: hw,
+                h: hh,
+                id: 0,
+            },
+        );
+        let (lx, ly, lw, lh) = at(16.0, 68.0, 64.0, 18.0);
+        let label = create_child(
+            hwnd,
+            instance,
+            font,
+            &Ctrl {
+                class: "STATIC",
+                text: &path_label,
+                style: label_style | SS_LEFT,
+                ex_style: 0,
+                x: lx,
+                y: ly,
+                w: lw,
+                h: lh,
+                id: 0,
+            },
+        );
+        // 安装位置：只读文本 + SS_PATHELLIPSIS —— 长路径压缩中间段，
+        // 用户一眼能看出装到哪个盘、哪个目录，而不是只看得到开头。
+        let (px_, py_, pw_, ph_) = at(84.0, 66.0, 420.0, 22.0);
+        let path_text = create_child(
+            hwnd,
+            instance,
+            font,
+            &Ctrl {
+                class: "STATIC",
+                text: "",
+                style: label_style | SS_LEFTNOWORDWRAP | SS_PATHELLIPSIS,
+                ex_style: WS_EX_CLIENTEDGE,
+                x: px_,
+                y: py_,
+                w: pw_,
+                h: ph_,
+                id: 0,
+            },
+        );
+        let (sx, sy, sw, sh) = at(16.0, 104.0, 356.0, 18.0);
+        let status = create_child(
+            hwnd,
+            instance,
+            font,
+            &Ctrl {
+                class: "STATIC",
+                text: "",
+                style: label_style | SS_LEFT,
+                ex_style: 0,
+                x: sx,
+                y: sy,
+                w: sw,
+                h: sh,
+                id: 0,
+            },
+        );
+        let (dx, dy, dw, dh) = at(384.0, 100.0, 120.0, 26.0);
+        let details_btn = create_child(
+            hwnd,
+            instance,
+            font,
+            &Ctrl {
+                class: "BUTTON",
+                text: "复制详情",
+                style: button_style,
+                ex_style: 0,
+                x: dx,
+                y: dy,
+                w: dw,
+                h: dh,
+                id: ID_DETAILS,
+            },
+        );
+        let (cx, cy, cw, ch) = at(16.0, 150.0, 168.0, 30.0);
+        let pick = create_child(
+            hwnd,
+            instance,
+            font,
+            &Ctrl {
+                class: "BUTTON",
+                text: "选择其他位置…",
+                style: button_style,
+                ex_style: 0,
+                x: cx,
+                y: cy,
+                w: cw,
+                h: ch,
+                id: ID_PICK,
+            },
+        );
+        let (ix, iy, iw, ih) = at(264.0, 150.0, 120.0, 30.0);
+        let install = create_child(
+            hwnd,
+            instance,
+            font,
+            &Ctrl {
+                class: "BUTTON",
+                text: "安装",
+                // 默认按钮：Enter 由消息循环转发成主按钮点击。
+                style: button_style | BS_DEFPUSHBUTTON,
+                ex_style: 0,
+                x: ix,
+                y: iy,
+                w: iw,
+                h: ih,
+                id: ID_INSTALL,
+            },
+        );
+        let (nx, ny, nw, nh) = at(392.0, 150.0, 112.0, 30.0);
+        let cancel = create_child(
+            hwnd,
+            instance,
+            font,
+            &Ctrl {
+                class: "BUTTON",
+                text: "取消",
+                style: button_style,
+                ex_style: 0,
+                x: nx,
+                y: ny,
+                w: nw,
+                h: nh,
+                id: ID_CANCEL,
+            },
+        );
+
+        if [
+            title,
+            hint,
+            label,
+            path_text,
+            status,
+            details_btn,
+            pick,
+            install,
+            cancel,
+        ]
+        .iter()
+        .any(|h| h.is_null())
+        {
+            return false;
+        }
+
+        let state = AppState {
+            dir: get_install_dir(),
+            phase: Phase::Idle,
+            details: String::new(),
+            target_exe: None,
+            path_text,
+            status,
+            pick,
+            install,
+            cancel,
+            details_btn,
+        };
+        set_path_text(&state);
+        set_status(&state, "准备就绪");
+        // 「复制详情」只在失败/完成后才有内容，平时不占视线。
+        unsafe {
+            ShowWindow(details_btn, SW_HIDE);
+        }
+        STATE.with(|cell| {
+            *cell.borrow_mut() = Some(state);
+        });
+        true
+    }
+
+    /// STATIC 的底色：普通文字直接落在窗口底色上（不然会出现白底方块）；
+    /// 只有带 WS_EX_CLIENTEDGE 的「安装位置」那一行按输入框画成白底。
+    fn on_ctl_color(wp: Wparam, lp: Lparam) -> Lresult {
+        let hdc = wp as Hdc;
+        let control = lp as Hwnd;
+        unsafe {
+            SetBkMode(hdc, BK_TRANSPARENT);
+            if GetWindowLongPtrW(control, GWL_EXSTYLE) & (WS_EX_CLIENTEDGE as isize) != 0 {
+                SetBkColor(hdc, 0x00FF_FFFF);
+                SetTextColor(hdc, 0x0000_0000);
+                return GetStockObject(WHITE_BRUSH) as Lresult;
+            }
+        }
+        FACE_BRUSH
+    }
+
+    fn dpi_scale() -> f32 {
+        unsafe {
+            let hdc = GetDC(std::ptr::null_mut());
+            if hdc.is_null() {
+                return 1.0;
+            }
+            let dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+            ReleaseDC(std::ptr::null_mut(), hdc);
+            if dpi > 0 {
+                dpi as f32 / 96.0
+            } else {
+                1.0
+            }
+        }
+    }
+
+    fn px(value: f32, scale: f32) -> i32 {
+        (value * scale).round() as i32
+    }
+
+    unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wp: Wparam, lp: Lparam) -> Lresult {
+        match msg {
+            // 控件建立失败就让 CreateWindowExW 整体失败 —— 不半残地显示一个空窗口。
+            WM_CREATE => {
+                if on_create(hwnd) {
+                    0
+                } else {
+                    -1
+                }
+            }
+            WM_COMMAND => {
+                let id = (wp & 0xFFFF) as u16;
+                if id != 0 {
+                    handle_command(hwnd, id);
+                }
+                0
+            }
+            WM_CTLCOLORSTATIC => on_ctl_color(wp, lp),
+            WM_CLOSE => {
+                DestroyWindow(hwnd);
+                0
+            }
+            WM_DESTROY => {
+                STATE.with(|cell| {
+                    cell.borrow_mut().take();
+                });
+                PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
+
+    /// 跑单窗口安装器。返回 false 表示窗口建不起来（例如 CreateWindowExW 返回空），
+    /// 调用方必须退回对话框流程 —— 「窗口起不来也还能装」。
+    pub(crate) fn run() -> bool {
+        unsafe {
+            // 高分屏下不加这句，窗口会被系统拉伸放大成一个糊块。
+            SetProcessDPIAware();
+            let instance = GetModuleHandleW(std::ptr::null());
+            let class_name = to_wide_chars(WINDOW_CLASS);
+            let cursor = LoadCursorW(std::ptr::null_mut(), IDC_ARROW as *const u16);
+            let wc = WndClassExW {
+                cb_size: std::mem::size_of::<WndClassExW>() as u32,
+                style: 0,
+                wnd_proc: Some(wnd_proc),
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance,
+                icon: std::ptr::null_mut(),
+                cursor,
+                background: FACE_BRUSH as *mut c_void,
+                menu_name: std::ptr::null(),
+                class_name: class_name.as_ptr(),
+                icon_sm: std::ptr::null_mut(),
+            };
+            if RegisterClassExW(&wc) == 0 {
+                return false;
+            }
+
+            let scale = dpi_scale();
+            // 固定大小：样式里没有 WS_THICKFRAME，再把客户区反算成窗口大小。
+            let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+            let mut rect = Rect {
+                left: 0,
+                top: 0,
+                right: px(CLIENT_W, scale),
+                bottom: px(CLIENT_H, scale),
+            };
+            AdjustWindowRectEx(&mut rect, style, 0, 0);
+            let width = rect.right - rect.left;
+            let height = rect.bottom - rect.top;
+            let x = ((GetSystemMetrics(SM_CXSCREEN) - width) / 2).max(0);
+            let y = ((GetSystemMetrics(SM_CYSCREEN) - height) / 2).max(0);
+            let caption = to_wide_chars(&format!(
+                "{app} v{ver} 安装",
+                app = APP_NAME,
+                ver = APP_VERSION
+            ));
+            let hwnd = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                caption.as_ptr(),
+                style,
+                x,
+                y,
+                width,
+                height,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null_mut(),
+            );
+            if hwnd.is_null() {
+                STATE.with(|cell| {
+                    cell.borrow_mut().take();
+                });
+                return false;
+            }
+
+            ShowWindow(hwnd, SW_SHOWNORMAL);
+            UpdateWindow(hwnd);
+            SetForegroundWindow(hwnd);
+            if let Some(focus) = with_state(|s| s.install) {
+                SetFocus(focus);
+            }
+
+            let mut msg: Msg = std::mem::zeroed();
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                if msg.message == WM_KEYDOWN {
+                    // 没有对话框管理器，Enter/Esc 得自己接：Enter 当主按钮，Esc 关窗。
+                    if msg.w_param == VK_RETURN {
+                        SendMessageW(hwnd, WM_COMMAND, ID_INSTALL as Wparam, 0);
+                        continue;
+                    }
+                    if msg.w_param == VK_ESCAPE {
+                        DestroyWindow(hwnd);
+                        continue;
+                    }
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            true
         }
     }
 }
 
 fn main() {
-    run_installer();
+    #[cfg(windows)]
+    {
+        // 单窗口安装器；窗口创建失败就退回原来的对话框流程，保证还能装。
+        if window::run() {
+            return;
+        }
+    }
+    run_installer_dialog();
 }
-
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -550,7 +1442,8 @@ mod tests {
 #[cfg(test)]
 mod robustness_tests {
     use super::{
-        build_uninstall_script, escape_batch_percent, is_existing_foreign_dir, write_failure_hint,
+        build_uninstall_script, escape_batch_percent, is_existing_foreign_dir, prepare_install_dir,
+        write_failure_hint,
     };
     use super::{APP_EXE_NAME, APP_NAME};
     use std::path::Path;
@@ -643,5 +1536,29 @@ mod robustness_tests {
         // 其它错误码不臆测原因，保持中性措辞
         let hint = write_failure_hint(&std::io::Error::from_raw_os_error(1));
         assert_eq!(hint, "写入程序文件失败");
+    }
+
+    #[test]
+    fn prepare_install_dir_creates_missing_target() {
+        // 装到全新位置是最常见的路径：目标目录不存在时必须自己建出来
+        let dir = std::env::temp_dir().join(format!("v2w_setup_new_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("a").join("b");
+        assert!(prepare_install_dir(&nested).is_ok());
+        assert!(nested.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_install_dir_returns_err_when_creation_fails() {
+        // 父级是文件 → 建目录必然失败。必须返回 Err 让 UI 把话说清楚，而不是 panic：
+        // 单窗口版就靠这个 Err 把状态行翻成「安装失败」。
+        let blocker = std::env::temp_dir().join(format!("v2w_setup_block_{}", std::process::id()));
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::write(&blocker, b"not a dir").unwrap();
+        let err = prepare_install_dir(&blocker.join("sub")).unwrap_err();
+        assert!(err.contains("无法创建安装目录"), "{err}");
+        let _ = std::fs::remove_file(&blocker);
     }
 }

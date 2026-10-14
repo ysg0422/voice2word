@@ -100,7 +100,7 @@ Voice2Word 是一款**完全本地运行**的音视频字幕工作台，覆盖�
 
 ### 方式一：下载安装包（推荐）
 
-前往 [Releases](https://github.com/ysg0422/voice2word/releases/latest) 下载最新的 `Voice2Word-vX.Y.Z-Setup.exe` 并运行。安装向导支持**自定义安装位置**，可选择任意磁盘与目录；同时会创建桌面快捷方式、开始菜单项与卸载入口。
+前往 [Releases](https://github.com/ysg0422/voice2word/releases/latest) 下载最新的 `Voice2Word-vX.Y.Z-Setup.exe` 并运行。安装程序**打开就是一个窗口**：上面直接显示安装位置，想换地方点「选择其他位置…」即可（任意磁盘与目录），点「安装」即完成；装完同一个窗口里的按钮变成「启动 Voice2Word」。不弹向导式对话框，也没有控制台黑窗。同时会创建桌面快捷方式、开始菜单项与卸载入口。
 
 ### 方式二：从源码构建
 
