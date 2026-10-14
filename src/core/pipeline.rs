@@ -1757,10 +1757,18 @@ impl TaskPipeline {
                 .await
                 {
                     Ok(Ok(polished)) => {
-                        segments = polished;
-                        polish_applied = true;
-                        qwen_sec = polishing_started.elapsed().as_secs_f64();
-                        info!(elapsed = ?polishing_started.elapsed(), segments = segments.len(), "Qwen 润色完成");
+                        // 后查：与标点分支同一条语义——用户在润色跑完的那一刻点了终止，
+                        // 就不把结果写回（写回后会经 `polish_applied` 落盘半成品）。
+                        // Qwen 是分批长循环，`install_cancel_flag` 只保证它在批边界停下，
+                        // 停在半路时得到的是「一半润色一半原文」，更不能当成品。
+                        if self.is_cancelled() {
+                            info!("润色完成后检测到取消，丢弃本次润色结果");
+                        } else {
+                            segments = polished;
+                            polish_applied = true;
+                            qwen_sec = polishing_started.elapsed().as_secs_f64();
+                            info!(elapsed = ?polishing_started.elapsed(), segments = segments.len(), "Qwen 润色完成");
+                        }
                     }
                     Ok(Err(err)) => {
                         warn!(error = %err, "润色失败，保留识别原文并继续收尾");
