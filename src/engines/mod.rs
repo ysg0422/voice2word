@@ -43,7 +43,10 @@ pub use punc::PunctuationEngine;
 pub use sensevoice::SenseVoiceEngine;
 pub use translate::{OnlineApiConfig, TranslateEngine, TranslateMode};
 pub use video_player::{PlayerFrame, VideoPlayerEngine, PLAYER_HEIGHT, PLAYER_WIDTH};
-pub use waveform::{WaveformData, WAVEFORM_SAMPLE_RATE};
+pub use waveform::{
+    find_magnetic_snap_point, WaveformColumn, WaveformData, DEFAULT_SILENCE_THRESHOLD,
+    DEFAULT_SNAP_RADIUS_SECS, WAVEFORM_SAMPLE_RATE,
+};
 pub use whisper::WhisperEngine;
 
 /// 子进程 spawn 失败时的可操作报错。

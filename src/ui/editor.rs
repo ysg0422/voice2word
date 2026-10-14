@@ -5512,6 +5512,79 @@ fn clamp_trim_time(raw: f64, lower: f64, upper: f64, fallback: f64) -> f64 {
     raw.clamp(lower, upper)
 }
 
+/// 时间轴磁性吸附（纯函数）：优先相邻字幕边缘对齐，其次波形静音谷底吸附。
+///
+/// 若未命中有效吸附点，返回原目标时间 `target_t`。
+pub(crate) fn snap_trim_time(
+    target_t: f64,
+    edges: &[f64],
+    waveform: Option<&crate::engines::WaveformData>,
+    search_radius: f64,
+) -> f64 {
+    let snapped = match waveform {
+        Some(wf) => wf.snap_time(target_t, search_radius, edges, None),
+        None => crate::engines::waveform::find_magnetic_snap_point(
+            target_t,
+            search_radius,
+            &[],
+            edges,
+            None,
+        ),
+    };
+    snapped.unwrap_or(target_t)
+}
+
+/// 片段平移磁性吸附（纯函数）：对 `start` 与 `end` 分别尝试吸附，选择吸附距离更短的一端并折算为吸附后的位移 `delta`。
+pub(crate) fn snap_move_delta(
+    raw_delta: f64,
+    origin_start: f64,
+    origin_end: f64,
+    start_edges: &[f64],
+    end_edges: &[f64],
+    waveform: Option<&crate::engines::WaveformData>,
+    search_radius: f64,
+) -> f64 {
+    let raw_start = origin_start + raw_delta;
+    let raw_end = origin_end + raw_delta;
+
+    let snap_start = match waveform {
+        Some(wf) => wf.snap_time(raw_start, search_radius, start_edges, None),
+        None => crate::engines::waveform::find_magnetic_snap_point(
+            raw_start,
+            search_radius,
+            &[],
+            start_edges,
+            None,
+        ),
+    };
+
+    let snap_end = match waveform {
+        Some(wf) => wf.snap_time(raw_end, search_radius, end_edges, None),
+        None => crate::engines::waveform::find_magnetic_snap_point(
+            raw_end,
+            search_radius,
+            &[],
+            end_edges,
+            None,
+        ),
+    };
+
+    match (snap_start, snap_end) {
+        (Some(s), Some(e)) => {
+            let dist_s = (s - raw_start).abs();
+            let dist_e = (e - raw_end).abs();
+            if dist_s <= dist_e {
+                s - origin_start
+            } else {
+                e - origin_end
+            }
+        }
+        (Some(s), None) => s - origin_start,
+        (None, Some(e)) => e - origin_end,
+        (None, None) => raw_delta,
+    }
+}
+
 /// 拖拽左端：返回夹紧后的新 `start`（纯函数，不带任何 UI 状态）。
 ///
 /// 约束：`start >= 0`；`start >= prev_end`（不许拖到前一句之前，相邻顺序不变）；
@@ -5773,38 +5846,92 @@ impl MainWindow {
         // 邻居，所以每帧现取与按下那一刻等价。
         let prev_end = pos.checked_sub(1).map(|p| self.state.segments[p].end);
         let next_start = self.state.segments.get(pos + 1).map(|s| s.start);
+
+        // 磁性吸附搜索半径：基准 120ms（100ms~150ms 黄金手感），并根据当前视口宽度动态自适应
+        let track_w = window_width - px(Theme::TRACK_LABEL_W) - px(Theme::TRACK_RIGHT_PAD);
+        let px_dur = if f32::from(track_w) > 10.0 {
+            (8.0 / f32::from(track_w) as f64) * (win.end - win.start)
+        } else {
+            0.0
+        };
+        let snap_radius = crate::engines::waveform::DEFAULT_SNAP_RADIUS_SECS.max(px_dur.min(0.25));
+        let waveform = self.state.waveform.as_deref();
+
         let (start, end) = match drag.mode {
-            TimelineTrimMode::Start => (
-                trim_start(
-                    drag.origin_start + delta,
+            TimelineTrimMode::Start => {
+                let mut edges = SmallVec::<[f64; 2]>::new();
+                if let Some(pe) = prev_end {
+                    edges.push(pe);
+                } else {
+                    edges.push(0.0);
+                }
+                let raw_target = drag.origin_start + delta;
+                let target = snap_trim_time(raw_target, &edges, waveform, snap_radius);
+                (
+                    trim_start(
+                        target,
+                        drag.origin_start,
+                        drag.origin_end,
+                        prev_end,
+                        total,
+                        TIMELINE_TRIM_MIN_SECS,
+                    ),
+                    drag.origin_end,
+                )
+            }
+            TimelineTrimMode::End => {
+                let mut edges = SmallVec::<[f64; 2]>::new();
+                if let Some(ns) = next_start {
+                    edges.push(ns);
+                } else if total.is_finite() && total > 0.0 {
+                    edges.push(total);
+                }
+                let raw_target = drag.origin_end + delta;
+                let target = snap_trim_time(raw_target, &edges, waveform, snap_radius);
+                (
+                    drag.origin_start,
+                    trim_end(
+                        target,
+                        drag.origin_start,
+                        drag.origin_end,
+                        next_start,
+                        total,
+                        TIMELINE_TRIM_MIN_SECS,
+                    ),
+                )
+            }
+            TimelineTrimMode::Move => {
+                let mut start_edges = SmallVec::<[f64; 2]>::new();
+                if let Some(pe) = prev_end {
+                    start_edges.push(pe);
+                } else {
+                    start_edges.push(0.0);
+                }
+                let mut end_edges = SmallVec::<[f64; 2]>::new();
+                if let Some(ns) = next_start {
+                    end_edges.push(ns);
+                } else if total.is_finite() && total > 0.0 {
+                    end_edges.push(total);
+                }
+                let effective_delta = snap_move_delta(
+                    delta,
+                    drag.origin_start,
+                    drag.origin_end,
+                    &start_edges,
+                    &end_edges,
+                    waveform,
+                    snap_radius,
+                );
+                shift_segment(
+                    effective_delta,
                     drag.origin_start,
                     drag.origin_end,
                     prev_end,
-                    total,
-                    TIMELINE_TRIM_MIN_SECS,
-                ),
-                drag.origin_end,
-            ),
-            TimelineTrimMode::End => (
-                drag.origin_start,
-                trim_end(
-                    drag.origin_end + delta,
-                    drag.origin_start,
-                    drag.origin_end,
                     next_start,
                     total,
                     TIMELINE_TRIM_MIN_SECS,
-                ),
-            ),
-            TimelineTrimMode::Move => shift_segment(
-                delta,
-                drag.origin_start,
-                drag.origin_end,
-                prev_end,
-                next_start,
-                total,
-                TIMELINE_TRIM_MIN_SECS,
-            ),
+                )
+            }
         };
         let seg = &mut self.state.segments[pos];
         if times_equal(seg.start, start) && times_equal(seg.end, end) {
@@ -7303,6 +7430,7 @@ mod tests {
         karaoke_mark_style, karaoke_word_marks, min_gap_hint, monitor_picture_source,
         monitor_screen_size, raw_line_byte_start, render_image_from_frame_file, shift_segment,
         timeline_clip_positions, timeline_time_at_x, timeline_window, trim_end, trim_start,
+        snap_move_delta, snap_trim_time,
         zoom_at, MonitorPictureSource, TimelineWindow, WordMark, EDITOR_STACK_MONITOR_H,
         MONITOR_VIDEO_FIT_FRAC, TIMELINE_FULL_DRAW_LIMIT, TIMELINE_TRIM_MIN_SECS,
         TIMELINE_WINDOW_MARGIN_SECS, TIMELINE_ZOOM_MAX, TIMELINE_ZOOM_MIN,
@@ -8257,5 +8385,62 @@ mod tests {
         // 轨道比阈值还窄：算不出来（不 panic，也不给半截换算）
         let narrow = Theme::TRACK_LABEL_W + Theme::TRACK_RIGHT_PAD;
         assert!(timeline_time_at_x(gpui::px(10.0), gpui::px(narrow), win).is_none());
+    }
+
+    /// 拖拽边缘时磁性吸附至相邻边缘并配合 `trim_start` / `trim_end` 夹紧
+    #[test]
+    fn snap_trim_time_and_clamp_pipeline() {
+        let edges = [3.0];
+        // 目标拖拽到 3.04s，在 0.12s 搜索半径内吸附到 3.0s
+        let snapped = snap_trim_time(3.04, &edges, None, 0.12);
+        assert_eq!(snapped, 3.0);
+        let valid_start = trim_start(snapped, 2.8, 4.0, Some(3.0), 10.0, TIMELINE_TRIM_MIN_SECS);
+        assert_eq!(valid_start, 3.0);
+
+        // 目标拖拽到 3.25s，超出 0.12s 搜索半径，不吸附
+        let unsnapped = snap_trim_time(3.25, &edges, None, 0.12);
+        assert_eq!(unsnapped, 3.25);
+    }
+
+    /// 拖拽边缘时磁性吸附至波形静音谷底
+    #[test]
+    fn snap_trim_time_snaps_to_waveform_valley() {
+        let wf = crate::engines::WaveformData {
+            peaks: vec![0.8, 0.6, 0.01, 0.5, 0.9],
+            duration: 5.0, // 桶中心：0.5, 1.5, 2.5, 3.5, 4.5
+            source: std::path::PathBuf::from("test.wav"),
+        };
+        // 拖拽到 2.45s，波形在 2.5s 处为 0.01 静音谷底
+        let snapped = snap_trim_time(2.45, &[], Some(&wf), 0.12);
+        assert_eq!(snapped, 2.5);
+
+        // 终点被吸附到 2.5s 后通过 trim_end 夹紧校验
+        let valid_end = trim_end(snapped, 1.0, 2.0, None, 10.0, TIMELINE_TRIM_MIN_SECS);
+        assert_eq!(valid_end, 2.5);
+    }
+
+    /// 平移整个字幕块时自动磁吸对齐相邻片段
+    #[test]
+    fn snap_move_delta_aligns_segment_boundaries() {
+        let prev_end = 4.0;
+        let origin_start = 4.5;
+        let origin_end = 6.5;
+
+        // 用户向左拖动 0.46s (新 start = 4.04s，离 prev_end 4.0 仅 0.04s)
+        let raw_delta = -0.46;
+        let delta = snap_move_delta(
+            raw_delta,
+            origin_start,
+            origin_end,
+            &[prev_end],
+            &[],
+            None,
+            0.12,
+        );
+        // 吸附后 delta 应当变成恰好对齐到 4.0 的位移 (-0.5s)
+        assert_eq!(delta, -0.5);
+        let (s, e) = shift_segment(delta, origin_start, origin_end, Some(prev_end), None, 10.0, TIMELINE_TRIM_MIN_SECS);
+        assert_eq!(s, 4.0);
+        assert_eq!(e, 6.0);
     }
 }

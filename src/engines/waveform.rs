@@ -116,6 +116,123 @@ impl WaveformData {
         let r = self.bucket_range(time_sec, time_sec + 0.001);
         self.peaks.get(r.start).copied().unwrap_or(0.0)
     }
+
+    /// 获取全部波形采样列 (时间戳与归一化峰值)
+    pub fn columns(&self) -> Vec<WaveformColumn> {
+        if self.peaks.is_empty() || self.duration <= 0.0 {
+            return Vec::new();
+        }
+        let total = self.peaks.len();
+        let bucket_dur = self.duration / total as f64;
+        self.peaks
+            .iter()
+            .enumerate()
+            .map(|(i, &peak)| {
+                let time = (i as f64 + 0.5) * bucket_dur;
+                WaveformColumn { time, peak }
+            })
+            .collect()
+    }
+
+    /// 在当前波形数据与边缘端点上执行高精度磁性吸附计算。
+    ///
+    /// 内部使用等宽时间桶的 O(1) 索引映射定位搜索区间，避免遍历整个音频包络，
+    /// 无堆内存分配，支持在 60fps/120fps 拖拽事件循环中高频调用。
+    pub fn snap_time(
+        &self,
+        target_t: f64,
+        search_radius: f64,
+        edges: &[f64],
+        silence_threshold: Option<f32>,
+    ) -> Option<f64> {
+        if !target_t.is_finite() || !search_radius.is_finite() || search_radius <= 0.0 {
+            return None;
+        }
+
+        // (a) 优先检查相邻字幕边缘端点（防重叠与无缝拼合）
+        let mut closest_edge = None;
+        let mut min_edge_dist = f64::INFINITY;
+        for &edge in edges {
+            if !edge.is_finite() || edge < 0.0 {
+                continue;
+            }
+            let dist = (edge - target_t).abs();
+            if dist <= search_radius && dist < min_edge_dist {
+                min_edge_dist = dist;
+                closest_edge = Some(edge);
+            }
+        }
+
+        if let Some(edge) = closest_edge {
+            return Some(edge);
+        }
+
+        // (b) 其次在波形采样点中检测局部极小值 / 静音谷底
+        if self.peaks.is_empty() || self.duration <= 0.0 {
+            return None;
+        }
+
+        let total = self.peaks.len();
+        let bucket_dur = self.duration / total as f64;
+        let threshold = silence_threshold.unwrap_or(DEFAULT_SILENCE_THRESHOLD);
+
+        let t_min = (target_t - search_radius).max(0.0);
+        let t_max = (target_t + search_radius).min(self.duration);
+        if t_min > t_max {
+            return None;
+        }
+
+        let min_idx = ((t_min / bucket_dur).floor() as usize).min(total.saturating_sub(1));
+        let max_idx = ((t_max / bucket_dur).ceil() as usize).min(total.saturating_sub(1));
+        if min_idx > max_idx {
+            return None;
+        }
+
+        let mut best_valley: Option<(f64, f32, f64)> = None;
+
+        for i in min_idx..=max_idx {
+            let peak = self.peaks[i];
+            if peak > threshold {
+                continue;
+            }
+
+            let is_valley = match total {
+                1 => true,
+                _ if i == 0 => peak <= self.peaks[1],
+                _ if i == total - 1 => peak <= self.peaks[total - 2],
+                _ => peak <= self.peaks[i - 1] && peak <= self.peaks[i + 1],
+            };
+
+            if !is_valley {
+                continue;
+            }
+
+            let col_time = (i as f64 + 0.5) * bucket_dur;
+            let dist = (col_time - target_t).abs();
+            if dist > search_radius {
+                continue;
+            }
+
+            match best_valley {
+                None => {
+                    best_valley = Some((col_time, peak, dist));
+                }
+                Some((_, b_peak, b_dist)) => {
+                    let peak_diff = peak - b_peak;
+                    let is_better = if peak_diff.abs() <= 0.005 {
+                        dist < b_dist || (dist == b_dist && peak < b_peak)
+                    } else {
+                        peak < b_peak
+                    };
+                    if is_better {
+                        best_valley = Some((col_time, peak, dist));
+                    }
+                }
+            }
+        }
+
+        best_valley.map(|(t, _, _)| t)
+    }
 }
 
 /// 从媒体文件提取波形包络。
@@ -350,6 +467,137 @@ pub fn render_bars_bgra(
         }
     }
     (width, height, buf)
+}
+
+/// 默认磁性吸附搜索半径 (秒，120ms，处于 100ms~150ms 剪辑吸附手感区间)
+pub const DEFAULT_SNAP_RADIUS_SECS: f64 = 0.12;
+
+/// 默认静音波谷检测阈值 (归一化振幅 0.0 ~ 1.0，低于此值视为静音或弱音间隙)
+pub const DEFAULT_SILENCE_THRESHOLD: f32 = 0.05;
+
+/// 单个波形采样列的时间戳与归一化峰值 (用于磁性吸附与波形几何分析)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaveformColumn {
+    /// 该列对应的中心时间戳 (秒)
+    pub time: f64,
+    /// 归一化振幅峰值 (0.0 ~ 1.0)
+    pub peak: f32,
+}
+
+impl WaveformColumn {
+    #[inline]
+    pub fn new(time: f64, peak: f32) -> Self {
+        Self {
+            time,
+            peak: peak.clamp(0.0, 1.0),
+        }
+    }
+}
+
+/// 高精度磁性吸附计算核心算法 (Waveform Magnetic Snapping)。
+///
+/// # 参数说明
+/// - `target_t`: 用户当前拖动/定位的目标时间戳 (秒)；
+/// - `search_radius`: 吸附搜索半径 (秒，通常为 100ms ~ 150ms)；
+/// - `columns`: 波形采样列数据（含时间戳与峰值振幅）；
+/// - `edges`: 相邻字幕片段的边缘端点切片 (如相邻字幕的 `start` 与 `end`)；
+/// - `silence_threshold`: 静音阈值，若未传入则默认使用 [`DEFAULT_SILENCE_THRESHOLD`] (0.05)。
+///
+/// # 算法策略
+/// 1. **边缘对齐吸附优先 (Rule a)**：优先检查输入中的相邻字幕边缘端点 (`edges`)。
+///    若存在距离 `target_t` 在 `search_radius` 内的边缘端点，返回距离最近的边缘点。
+///    这能有效防止字幕重叠，消除 1~2 帧的无意义缝隙，提供卡扣式的缝合手感；
+/// 2. **波形静音波谷检测 (Rule b)**：当没有边缘命中时，在波形列中检测局部极小值 (local valley)：
+///    - 该采样点的振幅峰值必须低于静音阈值 (`silence_threshold`)；
+///    - 该采样点是局部的波谷（其振幅不大于左右相邻采样）；
+///    - 该采样点的时间位于 `target_t ± search_radius` 范围内。
+///    在所有符合条件的候选波谷中，优先选择振幅更低（静音更彻底）且距 `target_t` 最近的波谷时刻；
+/// 3. 若均未命中，返回 `None`。
+pub fn find_magnetic_snap_point(
+    target_t: f64,
+    search_radius: f64,
+    columns: &[WaveformColumn],
+    edges: &[f64],
+    silence_threshold: Option<f32>,
+) -> Option<f64> {
+    if !target_t.is_finite() || !search_radius.is_finite() || search_radius <= 0.0 {
+        return None;
+    }
+
+    // (a) 优先检查相邻字幕边缘端点
+    let mut closest_edge = None;
+    let mut min_edge_dist = f64::INFINITY;
+    for &edge in edges {
+        if !edge.is_finite() || edge < 0.0 {
+            continue;
+        }
+        let dist = (edge - target_t).abs();
+        if dist <= search_radius && dist < min_edge_dist {
+            min_edge_dist = dist;
+            closest_edge = Some(edge);
+        }
+    }
+
+    if let Some(edge) = closest_edge {
+        return Some(edge);
+    }
+
+    // (b) 其次在波形采样点中检测局部极小值 / 静音谷底
+    if columns.is_empty() {
+        return None;
+    }
+
+    let threshold = silence_threshold.unwrap_or(DEFAULT_SILENCE_THRESHOLD);
+    let mut best_valley: Option<(f64, f32, f64)> = None;
+
+    let len = columns.len();
+    for i in 0..len {
+        let col = &columns[i];
+        if !col.time.is_finite() || !col.peak.is_finite() {
+            continue;
+        }
+        let dist = (col.time - target_t).abs();
+        if dist > search_radius {
+            continue;
+        }
+        if col.peak > threshold {
+            continue;
+        }
+
+        // 局部波谷检测：
+        // 边界处理：len == 1 算波谷；len > 1 时，边界点单侧比较，内部点双侧比较
+        let is_valley = match len {
+            1 => true,
+            _ if i == 0 => col.peak <= columns[1].peak,
+            _ if i == len - 1 => col.peak <= columns[len - 2].peak,
+            _ => col.peak <= columns[i - 1].peak && col.peak <= columns[i + 1].peak,
+        };
+
+        if !is_valley {
+            continue;
+        }
+
+        // 候选评估：振幅更低的静音谷底更具吸引力；振幅相近（<= 0.005）时选离拖动点更近的
+        match best_valley {
+            None => {
+                best_valley = Some((col.time, col.peak, dist));
+            }
+            Some((_b_time, b_peak, b_dist)) => {
+                let peak_diff = col.peak - b_peak;
+                let is_better = if peak_diff.abs() <= 0.005 {
+                    dist < b_dist || (dist == b_dist && col.peak < b_peak)
+                } else {
+                    col.peak < b_peak
+                };
+
+                if is_better {
+                    best_valley = Some((col.time, col.peak, dist));
+                }
+            }
+        }
+    }
+
+    best_valley.map(|(t, _, _)| t)
 }
 
 #[cfg(test)]
@@ -597,5 +845,118 @@ mod tests {
         let empty = PeakAccumulator::new(8_000).finish(&PathBuf::from("a.wav"), 8_000, 16);
         assert!(empty.peaks.is_empty());
         assert_eq!(empty.duration, 0.0);
+    }
+
+    #[test]
+    fn magnetic_snap_edge_takes_priority_over_waveform() {
+        let cols = vec![
+            WaveformColumn::new(1.00, 0.40),
+            WaveformColumn::new(1.02, 0.01), // 静音波谷 (低于 0.05)
+            WaveformColumn::new(1.04, 0.50),
+        ];
+        let edges = vec![1.05]; // 相邻字幕端点
+        let target = 1.01;
+        let radius = 0.12;
+
+        let snapped = find_magnetic_snap_point(target, radius, &cols, &edges, None);
+        // 虽然 1.02 离 1.01 更近且是波谷，但 Rule (a) 规定边缘端点优先吸附（防止接缝重叠）
+        assert_eq!(snapped, Some(1.05));
+    }
+
+    #[test]
+    fn magnetic_snap_edge_picks_closest_within_radius() {
+        let edges = vec![1.00, 1.25, 2.50];
+        let radius = 0.12;
+
+        // 离 1.00 仅 0.04s，在 0.12 范围内
+        assert_eq!(find_magnetic_snap_point(1.04, radius, &[], &edges, None), Some(1.00));
+        // 离 1.25 仅 0.03s
+        assert_eq!(find_magnetic_snap_point(1.22, radius, &[], &edges, None), Some(1.25));
+        // 离所有边缘都远超 radius
+        assert_eq!(find_magnetic_snap_point(1.50, radius, &[], &edges, None), None);
+    }
+
+    #[test]
+    fn magnetic_snap_waveform_silence_valley() {
+        let cols = vec![
+            WaveformColumn::new(0.10, 0.80),
+            WaveformColumn::new(0.20, 0.40),
+            WaveformColumn::new(0.30, 0.01), // 明显波谷且 < 0.05
+            WaveformColumn::new(0.40, 0.35),
+            WaveformColumn::new(0.50, 0.90),
+        ];
+        let radius = 0.12;
+
+        // 拖动到 0.28s，附近 0.30s 为静音谷底
+        let snapped = find_magnetic_snap_point(0.28, radius, &cols, &[], None);
+        assert_eq!(snapped, Some(0.30));
+
+        // 拖动到 0.12s，附近波形虽然有局部低点但振幅为 0.40/0.80，均高于阈值 0.05
+        assert_eq!(find_magnetic_snap_point(0.12, radius, &cols, &[], None), None);
+    }
+
+    #[test]
+    fn magnetic_snap_rejects_above_silence_threshold() {
+        let cols = vec![
+            WaveformColumn::new(0.10, 0.50),
+            WaveformColumn::new(0.20, 0.08), // 虽然是局部波谷，但 0.08 > 0.05
+            WaveformColumn::new(0.30, 0.60),
+        ];
+        let snapped = find_magnetic_snap_point(0.20, 0.12, &cols, &[], None);
+        assert_eq!(snapped, None, "高于静音阈值的波谷不应被误判为吸附点");
+
+        // 若传入自定义宽松阈值 0.10，则应当命中
+        let custom_snapped = find_magnetic_snap_point(0.20, 0.12, &cols, &[], Some(0.10));
+        assert_eq!(custom_snapped, Some(0.20));
+    }
+
+    #[test]
+    fn magnetic_snap_flat_silence_picks_closest_point() {
+        // 一段连续静音区
+        let cols = vec![
+            WaveformColumn::new(0.10, 0.60),
+            WaveformColumn::new(0.20, 0.00),
+            WaveformColumn::new(0.30, 0.00),
+            WaveformColumn::new(0.40, 0.00),
+            WaveformColumn::new(0.50, 0.70),
+        ];
+        // 用户拖到 0.22s，离 0.20s 最近
+        assert_eq!(find_magnetic_snap_point(0.22, 0.12, &cols, &[], None), Some(0.20));
+        // 用户拖到 0.39s，离 0.40s 最近
+        assert_eq!(find_magnetic_snap_point(0.39, 0.12, &cols, &[], None), Some(0.40));
+    }
+
+    #[test]
+    fn waveform_data_snap_time_matches_columns_algorithm() {
+        let data = WaveformData {
+            peaks: vec![0.8, 0.5, 0.02, 0.4, 0.9, 0.01, 0.7],
+            duration: 7.0, // 每桶恰好 1.0 秒，中心分别在 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5
+            source: PathBuf::from("dummy.wav"),
+        };
+        let edges = vec![0.0];
+
+        // 拖拽到 2.4s，目标附近的桶中心在 2.5s (peak = 0.02)
+        let res_struct = data.snap_time(2.4, 0.25, &edges, None);
+        let res_func = find_magnetic_snap_point(2.4, 0.25, &data.columns(), &edges, None);
+        assert_eq!(res_struct, Some(2.5));
+        assert_eq!(res_struct, res_func);
+
+        // 拖拽到 0.08s，边缘 0.0 优先触发
+        assert_eq!(data.snap_time(0.08, 0.12, &edges, None), Some(0.0));
+    }
+
+    #[test]
+    fn magnetic_snap_degenerate_inputs_return_none() {
+        assert_eq!(find_magnetic_snap_point(f64::NAN, 0.12, &[], &[], None), None);
+        assert_eq!(find_magnetic_snap_point(1.0, 0.0, &[], &[], None), None);
+        assert_eq!(find_magnetic_snap_point(1.0, -0.5, &[], &[], None), None);
+        assert_eq!(find_magnetic_snap_point(1.0, 0.12, &[], &[f64::NAN, -1.0], None), None);
+
+        let data = WaveformData {
+            peaks: Vec::new(),
+            duration: 0.0,
+            source: PathBuf::from("dummy.wav"),
+        };
+        assert_eq!(data.snap_time(1.0, 0.12, &[], None), None);
     }
 }
