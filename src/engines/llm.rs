@@ -891,6 +891,55 @@ struct CompletionOutcome {
     stopped_by_limit: bool,
 }
 
+/// 命令行回退路径的截断判据：从 llama.cpp 的计时统计里取「本次生成阶段生成的 token 数」。
+///
+/// 命令行路径拿不到 `/completion` 的 `stop_type`，但 llama.cpp 会把性能统计打到 stderr，
+/// 其中生成阶段那一行形如：
+/// `llama_perf_context_print:        eval time =   1234.56 ms /   512 runs   ( ... )`
+/// 结尾的 `N runs` 就是本次生成的 token 数；`N >= max_tokens` 说明是被 `-n` 顶停的。
+/// 解析不到（不同版本日志格式、被 --no-perf 关掉）返回 false——宁可漏报也不能把
+/// 完整输出误判成截断（误判会白白丢掉一条完整译文）。
+fn cli_stderr_reports_limit(stderr: &str, max_tokens: u32) -> bool {
+    if max_tokens == 0 {
+        return false;
+    }
+    let Ok(re_runs) = regex::Regex::new(r"/\s*(\d+)\s+runs") else {
+        return false;
+    };
+    stderr.lines().any(|line| {
+        // 只认生成阶段那一行：`prompt eval time` 行的 `N runs` 是**输入** token 数，
+        // 通常远大于 max_tokens，若不排除会把每次请求都误判成截断。
+        if !line.contains("eval time") || line.contains("prompt") {
+            return false;
+        }
+        re_runs
+            .captures(line)
+            .and_then(|caps| caps.get(1))
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+            .map(|runs| runs >= max_tokens as u64)
+            .unwrap_or(false)
+    })
+}
+
+/// 输出被长度上限截断时丢弃「最后一条已解析结果」，返回被丢弃的序号。
+/// `order` 是本批的序号顺序（按批内顺序），用于确定「最后一条」。
+fn drop_truncated_tail(
+    result: &mut std::collections::HashMap<usize, String>,
+    order: &[usize],
+    stopped_by_limit: bool,
+) -> Option<usize> {
+    if !stopped_by_limit {
+        return None;
+    }
+    let last_matched = order
+        .iter()
+        .rev()
+        .copied()
+        .find(|index| result.contains_key(index))?;
+    result.remove(&last_matched);
+    Some(last_matched)
+}
+
 impl Drop for LlamaServer {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
@@ -1061,11 +1110,11 @@ impl LLMEngine {
         );
 
         self.run_prompt(&full_prompt, 64)
-            .map(|output| Self::clean_response(&output, text))
+            .map(|outcome| Self::clean_response(&outcome.content, text))
             .unwrap_or_else(|| text.to_string())
     }
 
-    fn run_prompt(&self, prompt: &str, max_tokens: u32) -> Option<String> {
+    fn run_prompt(&self, prompt: &str, max_tokens: u32) -> Option<CompletionOutcome> {
         let temp_prompt_file = std::env::temp_dir().join(format!(
             "v2w_prompt_{}_{}.txt",
             std::process::id(),
@@ -1156,17 +1205,26 @@ impl LLMEngine {
         let stdout_bytes = stdout_reader
             .and_then(|h| h.join().ok())
             .unwrap_or_default();
+        // 进程已退出，join 安全。stderr 不再只在失败分支取：成功分支也要拿它解析
+        // 生成阶段的 token 数，才能判断输出是否被 `-n` 顶停（见
+        // [`cli_stderr_reports_limit`]）。
+        let stderr_bytes = stderr_reader
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
 
         // 进程已退出，提示词文件不再需要：立刻删除（守卫仍会在返回时兜底）
         prompt_guard.remove_now();
 
         match status {
-            Some(s) if s.success() => Some(String::from_utf8_lossy(&stdout_bytes).into_owned()),
+            Some(s) if s.success() => Some(CompletionOutcome {
+                content: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+                stopped_by_limit: cli_stderr_reports_limit(
+                    &String::from_utf8_lossy(&stderr_bytes),
+                    max_tokens,
+                ),
+            }),
             Some(s) => {
-                let err_bytes = stderr_reader
-                    .and_then(|h| h.join().ok())
-                    .unwrap_or_default();
-                let err = String::from_utf8_lossy(&err_bytes);
+                let err = String::from_utf8_lossy(&stderr_bytes);
                 let tail: String = err
                     .chars()
                     .rev()
@@ -1528,13 +1586,7 @@ impl LLMEngine {
     ) -> std::collections::HashMap<usize, String> {
         let outcome = server
             .and_then(|server| server.complete(prompt, max_tokens))
-            .or_else(|| {
-                self.run_prompt(prompt, max_tokens)
-                    .map(|content| CompletionOutcome {
-                        content,
-                        stopped_by_limit: false,
-                    })
-            });
+            .or_else(|| self.run_prompt(prompt, max_tokens));
         let Some(CompletionOutcome {
             content,
             stopped_by_limit,
@@ -1545,19 +1597,12 @@ impl LLMEngine {
         let expected: std::collections::HashSet<usize> =
             suspects.iter().map(|(index, _, _)| *index).collect();
         let mut result = Self::parse_batch_response(&content, &expected);
-        if stopped_by_limit {
-            let last_matched = suspects
-                .iter()
-                .rev()
-                .map(|(index, _, _)| *index)
-                .find(|index| result.contains_key(index));
-            if let Some(index) = last_matched {
-                result.remove(&index);
-                warn!(
-                    index,
-                    "反思重试输出被长度上限截断，丢弃末条（该句按回退处理）"
-                );
-            }
+        let order: Vec<usize> = suspects.iter().map(|(index, _, _)| *index).collect();
+        if let Some(index) = drop_truncated_tail(&mut result, &order, stopped_by_limit) {
+            warn!(
+                index,
+                "反思重试输出被长度上限截断，丢弃末条（该句按回退处理）"
+            );
         }
         result
     }
@@ -1984,17 +2029,12 @@ impl LLMEngine {
         let fixed_tokens =
             fixed_prompt_tokens(&format!("{src_hint}{glossary}")) + PROMPT_HINT_TOKENS;
         let max_tokens = output_token_budget(source_chars, self.ctx_size, fixed_tokens);
-        // 命令行回退路径（`run_prompt`）拿不到 `stop_type`，截断信号只能置 false：
-        // 只有常驻服务 `/completion` 的响应带 `stop_type`。
+        // 两条路径都能给出截断信号：常驻服务看响应里的 `stop_type: "limit"`，
+        // 命令行回退看 stderr 性能统计里生成阶段的 `N runs`（见
+        // [`cli_stderr_reports_limit`]）。
         let outcome = server
             .and_then(|server| server.complete(&prompt, max_tokens))
-            .or_else(|| {
-                self.run_prompt(&prompt, max_tokens)
-                    .map(|content| CompletionOutcome {
-                        content,
-                        stopped_by_limit: false,
-                    })
-            });
+            .or_else(|| self.run_prompt(&prompt, max_tokens));
         let Some(CompletionOutcome {
             content: output,
             stopped_by_limit,
@@ -2013,20 +2053,13 @@ impl LLMEngine {
         // 完整译文——上层「本批未译全」的分支不会触发，用户看到的就是一句残缺译文。
         // 与在线链路同一套策略：主动**丢掉最后一条已解析的译文**，用自带的「缺一条」
         // 触发折半重试（`retry_missing`）补回。
-        if stopped_by_limit {
-            let last_matched = source_segments
-                .iter()
-                .rev()
-                .map(|s| s.index)
-                .find(|i| result.contains_key(i));
-            if let Some(idx) = last_matched {
-                result.remove(&idx);
-                warn!(
-                    index = idx,
-                    batch = source_segments.len(),
-                    "Qwen 翻译输出被长度上限截断，丢弃末条并交由折半重试补齐"
-                );
-            }
+        let order: Vec<usize> = source_segments.iter().map(|s| s.index).collect();
+        if let Some(idx) = drop_truncated_tail(&mut result, &order, stopped_by_limit) {
+            warn!(
+                index = idx,
+                batch = source_segments.len(),
+                "Qwen 翻译输出被长度上限截断，丢弃末条并交由折半重试补齐"
+            );
         }
         if result.len() != source_segments.len() {
             warn!(
@@ -2066,13 +2099,7 @@ impl LLMEngine {
             output_token_budget(source_chars, self.ctx_size, POLISH_FIXED_PROMPT_TOKENS);
         let outcome = server
             .and_then(|server| server.complete(&prompt, max_tokens))
-            .or_else(|| {
-                self.run_prompt(&prompt, max_tokens)
-                    .map(|content| CompletionOutcome {
-                        content,
-                        stopped_by_limit: false,
-                    })
-            });
+            .or_else(|| self.run_prompt(&prompt, max_tokens));
         // P1：必须解构出 `stopped_by_limit`。此前这里是
         // `let output = output.content;`，把截断信号直接丢了——模型撞上
         // `n_predict` 上限时返回的是**被切一半的半截文本**，而末行
@@ -2105,20 +2132,13 @@ impl LLMEngine {
             .map(|seg| seg.index)
             .collect::<std::collections::HashSet<_>>();
         let mut result = Self::parse_batch_response(output, &expected);
-        if stopped_by_limit {
-            let last_matched = source_segments
-                .iter()
-                .rev()
-                .map(|seg| seg.index)
-                .find(|idx| result.contains_key(idx));
-            if let Some(idx) = last_matched {
-                result.remove(&idx);
-                warn!(
-                    index = idx,
-                    batch = source_segments.len(),
-                    "Qwen 润色输出被长度上限截断，丢弃末条结果并保留原文"
-                );
-            }
+        let order: Vec<usize> = source_segments.iter().map(|seg| seg.index).collect();
+        if let Some(idx) = drop_truncated_tail(&mut result, &order, stopped_by_limit) {
+            warn!(
+                index = idx,
+                batch = source_segments.len(),
+                "Qwen 润色输出被长度上限截断，丢弃末条结果并保留原文"
+            );
         }
         if result.len() != source_segments.len() {
             warn!(
@@ -2421,9 +2441,10 @@ impl LLMEngine {
 mod tests {
     use super::{
         batch_char_budget, chinese_variant_target, clamp_ctx_size, clamp_threads,
-        classify_retry_outcome, cli_wait_budget, count_untranslated_copies,
-        fit_glossary_to_context, fixed_overhead_exceeds_window, fixed_prompt_tokens,
-        glossary_entry_count, is_untranslated_copy, llama_stop_type_is_limit, output_token_budget,
+        classify_retry_outcome, cli_stderr_reports_limit, cli_wait_budget,
+        count_untranslated_copies, drop_truncated_tail, fit_glossary_to_context,
+        fixed_overhead_exceeds_window, fixed_prompt_tokens, glossary_entry_count,
+        is_untranslated_copy, llama_stop_type_is_limit, output_token_budget,
         plan_translate_batches, similarity, trim_glossary_to_tokens, validate_rewrite,
         validate_translation, CopyRate, LLMEngine, RetryVerdict, RewriteVerdict, MAX_LLM_THREADS,
         MAX_SEGMENTS_PER_BATCH, MIN_BATCH_CHARS, MIN_LLM_THREADS, OUTPUT_TOKENS_PER_CHAR,
@@ -2999,6 +3020,42 @@ mod tests {
         assert!(!llama_stop_type_is_limit(&serde_json::json!({})));
     }
 
+    // ─────────── P2：命令行回退路径的截断信号（stderr 性能统计） ───────────
+
+    /// 生成阶段 `N runs` 达到 `-n` 上限：命令行回退路径也必须报「被截断」。
+    #[test]
+    fn cli_stderr_reports_limit_when_runs_reach_max_tokens() {
+        let stderr = "llama_perf_context_print:        eval time =   100.00 ms /   512 runs   ( 0.20 ms per token, 5000.00 tokens per second)";
+        assert!(cli_stderr_reports_limit(stderr, 512));
+    }
+
+    /// `N runs` 未达上限：模型是自然收尾的，不能当成截断（误判会丢掉完整译文）。
+    #[test]
+    fn cli_stderr_reports_limit_ignores_runs_below_max_tokens() {
+        let stderr = "llama_perf_context_print:        eval time =   100.00 ms /   100 runs   ( 1.00 ms per token, 1000.00 tokens per second)";
+        assert!(!cli_stderr_reports_limit(stderr, 512));
+    }
+
+    /// `prompt eval time` 行的 `N runs` 是**输入** token 数（远大于 max_tokens），
+    /// 混进来会把每次请求都误判成截断。
+    #[test]
+    fn cli_stderr_reports_limit_ignores_prompt_eval_line() {
+        let stderr = "llama_perf_context_print: prompt eval time =  10.00 ms /  9000 runs   ( 0.00 ms per token, 900000.00 tokens per second)";
+        assert!(!cli_stderr_reports_limit(stderr, 512));
+    }
+
+    /// 没有统计（版本差异 / `--no-perf`）时宁可漏报：不能把完整输出误判成截断。
+    #[test]
+    fn cli_stderr_reports_limit_false_on_unknown_log() {
+        assert!(!cli_stderr_reports_limit("some random log", 512));
+        assert!(!cli_stderr_reports_limit("", 512));
+        // max_tokens == 0：没有上限可比，直接不判截断
+        assert!(!cli_stderr_reports_limit(
+            "llama_perf_context_print:        eval time =   100.00 ms /   512 runs   ( 0.20 ms per token)",
+            0
+        ));
+    }
+
     /// 截断时丢弃**最后一条已解析译文**，让上层的折半重试把它补回来。
     #[test]
     fn truncated_batch_drops_last_parsed_line() {
@@ -3014,6 +3071,32 @@ mod tests {
         assert_eq!(last, Some(3));
         parsed.remove(&3);
         assert_eq!(parsed.len(), 2, "末条应被丢弃以触发折半重试");
+    }
+
+    /// `drop_truncated_tail`：无截断信号时一条都不丢；有截断信号时按 `order` 倒序
+    /// 丢弃**最后一条已解析**（半截末条被丢、完整末条不被丢靠的就是这个开关）。
+    #[test]
+    fn drop_truncated_tail_keeps_or_drops_last_parsed_line() {
+        let mut complete: HashMap<usize, String> =
+            HashMap::from([(1, "第一句。".to_string()), (3, "第三句。".to_string())]);
+        let order = [1usize, 2, 3];
+        // 无截断信号：完整的末条必须原样保留
+        assert_eq!(drop_truncated_tail(&mut complete, &order, false), None);
+        assert!(complete.contains_key(&3), "无截断信号不得丢弃完整末条");
+        assert_eq!(complete.len(), 2);
+        // 有截断信号：序号 2 没有结果，倒序第一个命中的 3 才是「最后一条已解析」
+        assert_eq!(drop_truncated_tail(&mut complete, &order, true), Some(3));
+        assert_eq!(complete.len(), 1);
+        assert!(complete.contains_key(&1));
+
+        // 只有一条时同理
+        let mut single: HashMap<usize, String> = HashMap::from([(1, "半截".to_string())]);
+        assert_eq!(drop_truncated_tail(&mut single, &[1usize], true), Some(1));
+        assert!(single.is_empty());
+
+        // 结果为空：没有可丢的，返回 None
+        let mut empty: HashMap<usize, String> = HashMap::new();
+        assert_eq!(drop_truncated_tail(&mut empty, &order, true), None);
     }
     // ─────────── P1：润色链路的截断丢弃与结果保留 ───────────
 

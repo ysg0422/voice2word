@@ -55,7 +55,7 @@ impl TranslateMode {
 }
 
 /// 在线 OpenAI 兼容接口的连接参数（与 `config.toml` 的 `[translate]` 一一对应）
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OnlineApiConfig {
     /// 已拼好的 `/chat/completions` 完整地址
     pub endpoint: String,
@@ -66,6 +66,47 @@ pub struct OnlineApiConfig {
     /// 术语表提示（由 `TranslateConfig::glossary_prompt` 生成，空串表示无）。
     /// 离线与在线两条链路共用同一份注入文本。
     pub glossary_hint: String,
+}
+
+/// `api_key` 的日志包装：`{:?}` 只暴露前 4 位，其余打码。
+///
+/// 为什么不能直接 `#[derive(Debug)]`：`api_key` 是**明文密钥字段**，任何一处后来
+/// 加上的 `debug!(?cfg)` / `info!("{cfg:?}")` 都会把密钥整条写进日志文件，
+/// 而用户往往会把日志贴进工单或聊天窗口。密钥一旦离开本机就只能吊销重发。
+/// 因此把「打码」塞进 `Debug` 实现本身，而不是指望每个调用点自觉脱敏。
+///
+/// 前 4 位保留是为了排障时能看出「填的是哪把 key」（`sk-…` 还是别家的），
+/// 但对短密钥（≤8 字符）连前 4 位也不给：短串的前 4 位几乎泄露一半。
+struct RedactedKey<'a>(&'a str);
+
+impl std::fmt::Debug for RedactedKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = self.0;
+        if key.trim().is_empty() {
+            return f.write_str("<empty>");
+        }
+        if key.chars().count() > 8 {
+            let head: String = key.chars().take(4).collect();
+            return write!(f, "{head}…<redacted>");
+        }
+        f.write_str("<redacted>")
+    }
+}
+
+/// 手写 `Debug`：`api_key` 走 [`RedactedKey`] 打码，其余字段照常输出。
+///
+/// 不能 `derive`：derive 会把 `pub api_key` 原文打进任何 `{:?}`。
+impl std::fmt::Debug for OnlineApiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnlineApiConfig")
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &RedactedKey(&self.api_key))
+            .field("model", &self.model)
+            .field("batch_size", &self.batch_size)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("glossary_hint", &self.glossary_hint)
+            .finish()
+    }
 }
 
 /// 部分结果回传槽：在线链路在**整片中终止**前把已写回的译文放进这里。
@@ -508,7 +549,9 @@ fn translate_via_online_api_with_stats(
                     "在线翻译本批失败（已重试 {} 次），跳过该批继续后续句子",
                     MAX_BATCH_RETRIES
                 );
-                completed += chunk.len();
+                // 本批**一句都没写回**：完成数不得增加。此前这里把整批计成已完成，
+                // 于是进度条冲到 100% 之后，用户重试或收尾补译时又会回落——
+                // 看起来像「翻译完了又重新开始」。进度只反映真实产出的句子。
                 if let Some(ref cb) = progress_cb {
                     let progress = completed as f64 / pending_total.max(1) as f64;
                     cb(
@@ -637,6 +680,7 @@ fn translate_via_online_api_with_stats(
                 target_lang,
                 &cancel,
                 &profile,
+                &mut last_batch_error,
             );
             if recovered < missing.len() {
                 soft_failed_batches += 1;
@@ -651,7 +695,15 @@ fn translate_via_online_api_with_stats(
             .iter()
             .filter(|&&pos| !segments[pos].translation_matches(target_lang))
             .count();
-        completed += chunk.len();
+        // 进度只统计**真的写回译文的句子数**。此前无条件 `+= chunk.len()`：本批若
+        // 有句子没译出（输出被截断、被输出校验拒收、折半补译也没补回），它们同样
+        // 被算作「已完成」，进度条冲到 100% 再回落，或让用户以为已经全部译完。
+        // 只数「现在确实带目标语言译文」的句子——`translatable` 已排除开工前就有
+        // 译文的句子，所以这个差值就是本批真正写回的条数。
+        completed += chunk
+            .iter()
+            .filter(|&&pos| segments[pos].translation_matches(target_lang))
+            .count();
         if let Some(ref cb) = progress_cb {
             let progress = completed as f64 / pending_total.max(1) as f64;
             cb(
@@ -730,6 +782,9 @@ fn translate_via_online_api_with_stats(
 /// 与离线链路同一套思路：输出被截断时整批丢弃会让用户看到「翻译少了几句」，
 /// 拆成更小的批（折半）通常一轮就能补齐。最多折半到单句；对某句反复补不上
 /// （模型就是吐不出该序号）则放弃，交由上层计入软失败并提示用户可再点一次补译。
+///
+/// `last_error` 是收尾错误文案用的「最后一批失败原因」槽：折半补译里的请求失败
+/// 同样要写进去，否则整片一句都没译出时用户只看到「原因未知」。
 fn retry_missing_online(
     cfg: &OnlineApiConfig,
     segments: &mut [Segment],
@@ -737,6 +792,7 @@ fn retry_missing_online(
     target_lang: &str,
     cancel: &AtomicBool,
     profile: &ModelProfile,
+    last_error: &mut Option<String>,
 ) -> usize {
     if missing.is_empty() {
         return 0;
@@ -784,8 +840,16 @@ fn retry_missing_online(
                     }
                 }
                 // 请求整体失败：不再继续折半（多半是网络/限流，继续只会更糟），
-                // 把剩余的留给上层计入软失败。
-                Err(_) => {
+                // 把剩余的留给上层计入软失败。失败原因**必须**与主路径同款记录：
+                // 整片一句都没译出时，收尾错误文案里的「最后一批失败原因」正是
+                // 取自这里，若静默吞掉，用户看到的就是「原因未知」。
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        remaining = sub.len(),
+                        "在线翻译折半补译请求失败，本批保持未译"
+                    );
+                    *last_error = Some(err.to_string());
                     still.extend_from_slice(sub);
                 }
             }
@@ -1586,6 +1650,31 @@ fn parse_response_json(body: &str) -> Result<serde_json::Value> {
     })
 }
 
+/// 错误响应体透出给用户的最大字符数（错误文案要可读，不能把整张错误页贴进界面）。
+const ERROR_BODY_SNIPPET_CHARS: usize = 300;
+
+/// 把错误响应体的读取结果转成**展示片段**：`(片段, 截断提示)`。
+///
+/// - 读取成功 → 取前 [`ERROR_BODY_SNIPPET_CHARS`] 个字符，超长时附上截断提示；
+/// - 读取失败 → 片段是**失败原因本身**（连接被中断 / 超过 4MB 上限 / 非 UTF-8），
+///   绝不退化成空串。空串会让 401/404 的错误文案变成「服务端什么都没说」，
+///   而真正的原因（响应体没读出来）反而消失。
+fn error_body_snippet(body: Result<String>) -> (String, &'static str) {
+    match body {
+        Ok(body) => {
+            let snippet: String = body.chars().take(ERROR_BODY_SNIPPET_CHARS).collect();
+            // 只在真的被截断时才提示，免得短错误体上也挂一句无意义的「已截断」。
+            let note = if snippet.chars().count() < body.chars().count() {
+                "（响应体过长已截断）"
+            } else {
+                ""
+            };
+            (snippet, note)
+        }
+        Err(e) => (format!("读取错误响应体失败: {e}"), ""),
+    }
+}
+
 /// 统一 POST 到 `/chat/completions` 并解析 JSON 响应体
 ///
 /// 除翻译链路外，无头模式的「工具调用」入口也复用它：超时、鉴权、错误文案
@@ -1616,15 +1705,21 @@ pub(crate) fn post_chat_completions(
         Err(ureq::Error::Status(code, resp)) => {
             // 4xx/5xx 的响应体通常带服务端的错误说明，原样透出便于排查。
             // 同样带字节上限：错误页也可能是超大响应。
-            let body = read_response_body(resp).unwrap_or_default();
-            let snippet: String = body.chars().take(300).collect();
+            //
+            // 401/404 这种「最需要看服务端原文」的场景，恰恰也是「读不出体」最容易
+            // 发生的场景（网关直接掐断连接）。此前 `unwrap_or_default()` 把读取失败
+            // 抹成空串，用户只看到「HTTP 401: 」，服务端的线索全丢。这里把失败原因
+            // 本身当片段透出。
+            let (snippet, truncated) = error_body_snippet(read_response_body(resp));
             let hint = match code {
                 401 | 403 => "（API Key 无效或无权限）",
                 404 => "（接口地址或模型名不存在）",
                 429 => "（触发限流，请降低批量条数或稍后重试）",
                 _ => "",
             };
-            Err(anyhow!("在线接口返回 HTTP {code}{hint}: {snippet}"))
+            Err(anyhow!(
+                "在线接口返回 HTTP {code}{hint}: {snippet}{truncated}"
+            ))
         }
         Err(e) => Err(anyhow!("无法连接在线翻译接口 {}: {e}", cfg.endpoint)),
     }
@@ -3504,6 +3599,7 @@ mod tests {
         let (addr, _seen) = spawn_mock_server_status(vec![(200, reply)]);
         let cfg = online_cfg_for(&addr);
         let mut segs = vec![Segment::new(1, 0.0, 1.0, source)];
+        let mut last_error = None;
         let recovered = retry_missing_online(
             &cfg,
             &mut segs,
@@ -3511,6 +3607,7 @@ mod tests {
             "English",
             &AtomicBool::new(false),
             &ModelProfile::default(),
+            &mut last_error,
         );
         assert_eq!(recovered, 0, "近似复制不得计入已译");
         assert!(segs[0].translation.is_none(), "近似复制不得写回字幕");
@@ -3550,6 +3647,163 @@ mod tests {
             "第一批已译好的句子必须保留在部分结果里"
         );
         assert!(partial[1].translation.is_none());
+    }
+
+    /// `OnlineApiConfig` 的 `Debug` 必须给密钥打码：任何人后来加一行 `debug!(?cfg)`
+    /// 都不该把明文密钥写进日志（日志常被贴进工单或聊天窗口）。
+    #[test]
+    fn online_api_config_debug_redacts_api_key() {
+        let cfg = OnlineApiConfig {
+            api_key: "sk-supersecretvalue123456".to_string(),
+            ..sample_cfg()
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("sk-supersecretvalue123456"),
+            "完整密钥不得出现在 Debug 输出里: {rendered}"
+        );
+        assert!(
+            !rendered.contains("supersecretvalue"),
+            "密钥尾部不得泄露: {rendered}"
+        );
+        assert!(
+            rendered.contains("api_key"),
+            "仍要能看出哪个字段是密钥: {rendered}"
+        );
+        assert!(
+            rendered.contains("sk-s"),
+            "前 4 位应保留，便于确认填的是哪把 key: {rendered}"
+        );
+        // 其余字段照常可读（排障需要）
+        assert!(rendered.contains("https://example.com/v1/chat/completions"));
+        assert!(rendered.contains("test-model"));
+
+        // 空 / 纯空白：显示 <empty>
+        for blank in ["", "   "] {
+            let empty = OnlineApiConfig {
+                api_key: blank.to_string(),
+                ..sample_cfg()
+            };
+            let text = format!("{empty:?}");
+            assert!(text.contains("<empty>"), "空密钥应显示 <empty>: {text}");
+        }
+
+        // 短密钥连前 4 位也不暴露（前 4 位几乎等于泄露一半）
+        let short = OnlineApiConfig {
+            api_key: "abc123".to_string(),
+            ..sample_cfg()
+        };
+        let text = format!("{short:?}");
+        assert!(!text.contains("abc123"), "短密钥不得泄露: {text}");
+        assert!(text.contains("<redacted>"), "{text}");
+    }
+
+    /// 错误响应体读取失败时必须保留**失败原因**，不能抹成空串：401/404 最需要看
+    /// 服务端原文，而这时恰恰最容易读不出体。超长体则截断并明确提示。
+    #[test]
+    fn error_body_snippet_keeps_read_failure_reason() {
+        let (text, note) = error_body_snippet(Err(anyhow!(
+            "在线接口读取响应体失败（连接被中断或超时）: unexpected eof"
+        )));
+        assert!(text.contains("读取错误响应体失败"), "{text}");
+        assert!(
+            text.contains("unexpected eof"),
+            "必须带上底层失败原因: {text}"
+        );
+        assert!(note.is_empty(), "读取失败时不需要截断提示: {note}");
+
+        // 正常错误体：原文透出，短体不加截断提示
+        let (short, note) = error_body_snippet(Ok("{\"error\":\"invalid api key\"}".to_string()));
+        assert!(short.contains("invalid api key"), "{short}");
+        assert!(note.is_empty(), "{note}");
+
+        // 超长错误体：截断到上限并明确提示
+        let long = "x".repeat(ERROR_BODY_SNIPPET_CHARS + 50);
+        let (cut, note) = error_body_snippet(Ok(long));
+        assert_eq!(cut.chars().count(), ERROR_BODY_SNIPPET_CHARS);
+        assert!(note.contains("已截断"), "{note}");
+    }
+
+    /// 端到端：服务端回了一个超过 4MB 上限的错误体时 `read_response_body` 会失败，
+    /// 但失败原因必须留在给用户的错误文案里（此前 `unwrap_or_default()` 把它抹平，
+    /// 用户只看到「HTTP 401: 」）。
+    #[test]
+    fn oversized_error_body_keeps_read_failure_in_message() {
+        let huge = "x".repeat(MAX_RESPONSE_BYTES + 16);
+        let (addr, _seen) = spawn_mock_server_status(vec![(401, huge)]);
+        let cfg = online_cfg_for(&addr);
+        let err = post_chat_completions(&cfg, &serde_json::json!({ "model": "m" }))
+            .expect_err("401 必须报错");
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP 401"), "{msg}");
+        assert!(
+            msg.contains("读取错误响应体失败"),
+            "必须保留读取失败原因而不是空串: {msg}"
+        );
+        assert!(msg.contains("超过上限"), "{msg}");
+    }
+
+    /// 折半补译的请求失败必须写进「最后一批失败原因」：整片一句都没译出时，收尾错误
+    /// 文案正是从这里取原因，静默吞掉会让用户只看到「原因未知」。
+    #[test]
+    fn halving_retry_failure_records_reason_for_final_error() {
+        // 400（非长度类）是不可重试错误 → `retry_missing_online` 立刻拿到 Err。
+        let (addr, _seen) =
+            spawn_mock_server_status(vec![(400, "{\"error\":\"bad request\"}".to_string())]);
+        let cfg = online_cfg_for(&addr);
+        let mut segs = vec![Segment::new(7, 0.0, 1.0, "hello world")];
+        let mut last_error: Option<String> = None;
+        let recovered = retry_missing_online(
+            &cfg,
+            &mut segs,
+            &[0],
+            "English",
+            &AtomicBool::new(false),
+            &ModelProfile::default(),
+            &mut last_error,
+        );
+        assert_eq!(recovered, 0, "请求失败时补回条数为 0");
+        assert!(segs[0].translation.is_none());
+        let reason = last_error.expect("折半补译失败必须记下失败原因");
+        assert!(reason.contains("400"), "应保留服务端的失败原因: {reason}");
+    }
+
+    /// 整批软失败（重试用尽）时这一批**不得**计入已完成条数：否则进度条先冲到 100%，
+    /// 收尾/重试时再回落，看起来像「翻译完了又重新开始」。
+    #[test]
+    fn soft_failed_batch_is_not_counted_as_completed() {
+        // 500 属可重试错误：喂满 3 次重试后整批软失败。
+        let (addr, _seen) = spawn_mock_server_status(vec![
+            (500, "boom".to_string()),
+            (500, "boom".to_string()),
+            (500, "boom".to_string()),
+        ]);
+        let mut cfg = online_cfg_for(&addr);
+        cfg.batch_size = 2;
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "你好"),
+            Segment::new(2, 1.0, 2.0, "世界"),
+        ];
+        let seen_progress = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+        let recorder = seen_progress.clone();
+        let cb: crate::engines::TextProgressCb = Box::new(move |p, _msg| {
+            recorder.lock().unwrap().push(p);
+        });
+        // 整批都没译出 → 收尾按「未能译出任何一句」报错；这里只关心进度回调。
+        let _ = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            Some(cb),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let seen = seen_progress.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "至少应有一次进度回调");
+        assert!(
+            seen.iter().all(|&p| p < 1.0),
+            "软失败批次不得计入完成，进度不该到 100%: {seen:?}"
+        );
     }
 }
 
