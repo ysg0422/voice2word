@@ -1201,6 +1201,10 @@ impl WhisperEngine {
                 // 缺 offsets 的片段会被当作 0.0 → 0.0：时间轴优化随后按「无效时长」把
                 // 它们剔掉，用户只看到字幕凭空少几句。这里计数，循环后统一告警。
                 let mut missing_offsets = 0usize;
+                // VAD 生效时段/词不同轴（见 Self::align_words_to_segment），记下被归一化的段数与首例，
+                // 循环后统一告警一次：免得以后又有人以为词级高亮「本来就不准」。
+                let mut realigned_segments = 0usize;
+                let mut first_realign: Option<(usize, f64, f64, f64, f64)> = None;
                 if let Some(trans) = data.transcription {
                     for (i, item) in trans.into_iter().enumerate() {
                         let text = normalize_zh_text(&item.text.unwrap_or_default());
@@ -1217,7 +1221,7 @@ impl WhisperEngine {
                         let end =
                             item.offsets.as_ref().and_then(|o| o.to).unwrap_or(0) as f64 / 1000.0;
 
-                        segments.push(Segment {
+                        let mut seg = Segment {
                             index: i + 1,
                             start,
                             end,
@@ -1229,12 +1233,32 @@ impl WhisperEngine {
                             confidence: Self::tokens_avg_logprob(&item.tokens),
                             speaker: None,
                             words: Self::word_timings_from_tokens(&item.tokens),
-                        });
+                        };
+                        // 段级 offsets 在原始轴、token 级 offsets 在 VAD 处理后轴：不同轴时
+                        // 先把词窗映射回本段区间，否则下游 clamp_words_to_segment 会整段删词。
+                        if let Some((w_min, w_max)) = Self::align_words_to_segment(&mut seg) {
+                            realigned_segments += 1;
+                            first_realign.get_or_insert((seg.index, start, end, w_min, w_max));
+                        }
+                        segments.push(seg);
                     }
                     if missing_offsets > 0 {
                         warn!(
                             missing_offsets,
                             "whisper JSON 有片段缺少时间偏移：这些片段按 0.0 秒入表，可能被时间轴优化按无效时长剔除"
+                        );
+                    }
+                    if realigned_segments > 0 {
+                        let (index, segment_from, segment_to, words_from, words_to) =
+                            first_realign.unwrap_or((0, 0.0, 0.0, 0.0, 0.0));
+                        warn!(
+                            realigned_segments,
+                            first_index = index,
+                            segment_from,
+                            segment_to,
+                            words_from,
+                            words_to,
+                            "whisper JSON 的段级与词级时间不同轴（--vad 只把段 t0/t1 映射回原始轴，token 级 offsets 留在处理后轴）：已把词窗线性映射进本段区间，上面是首例的段窗与词窗（秒）"
                         );
                     }
                 }
@@ -1318,6 +1342,89 @@ impl WhisperEngine {
                 })
             })
             .collect()
+    }
+
+    /// 词窗与段窗的时间容差（秒）：半个 whisper 时间戳栅格（100 ms）。
+    /// 只在「词窗已被段窗包含」的判定上用，用来吸收毫秒级取整抖动。
+    const WORD_AXIS_TOL_SEC: f64 = 0.05;
+
+    /// 段/词时间轴归一化：词窗探出段窗时把它线性映射回段区间，改动了就返回映射前的词窗 (wmin, wmax)。
+    ///
+    /// # 为什么需要
+    ///
+    /// 开 `--vad` 时 whisper.cpp 先压掉静音、把语音切片拼成「处理后轴」，然后**只**把段级 t0/t1
+    /// 映射回原始轴（`whisper_full_get_segment_t0/t1_from_state` → `map_processed_to_original_time`，
+    /// 见 `_whisper_build/whisper.cpp-1.8.4/src/whisper.cpp`），而 token 级 `offsets` 是原样写进 JSON 的
+    /// （`examples/cli/cli.cpp` 的 JSON 导出直接取 `token.t0/t1`，不做映射）。
+    /// 于是同一条 `Segment` 的两套时间来自两条轴：段在原始轴、词在处理后轴，
+    /// 差值是逐个 VAD 切片累积的静音量，**不是常数偏移**（所以不存在「平移一个常数」的修法）。
+    ///
+    /// 实测（whisper-cli 1.8.4 + ggml-base + Silero v6.2.0，`-vt 0.50 -vsd 250`）：
+    /// 45 秒素材词比段早 0.1~3.5 s（3 分钟素材早到 30.9 s）；不开 VAD 的对照里两轴完全一致。
+    ///
+    /// 后果不是「差一点」而是**整句丢词**：下游 `crate::subtitle::optimize_segments` 的
+    /// `clamp_words_to_segment` 判据是「整词落在段区间之外（`w.end <= seg.start || w.start >= seg.end`）
+    /// 即丢弃」，落在处理后轴的词与原始轴的段窗无交集就被静默删除——实测 45 秒素材 8 段里 1 段
+    /// 16 个词全删、合计丢 37% 的词，逐词高亮 / ASS `\k` 卡拉OK 在 VAD 生效时整体失效。
+    ///
+    /// # 判据与做法（为什么这么窄）
+    ///
+    /// 词窗被段窗包含（含 [`Self::WORD_AXIS_TOL_SEC`] 容差）时**一个字节都不改**：未开 VAD 的档位实测
+    /// 100% 包含（45 秒 5/5 段、3 分钟 29/29 段），此时两轴合一，任何「归一化」只会把本来正确的
+    /// 时间戳拉变形。只有词窗探出段窗——VAD 生效的典型特征——才把 `[wmin, wmax]` 线性映射到
+    /// `[seg.start, seg.end]`（保序、保比例）。
+    ///
+    /// 判据用「包含」而不是「完全无交集」：VAD 的位移随切片累积，长句会出现「词窗与段窗相交但
+    /// 整体偏早」的中间态（实测 45 秒素材 8 段里 7 段、3 分钟素材 49 段里 7 段如此），
+    /// 只按无交集判据会漏掉它们，而 `clamp_words_to_segment` 照样会删掉探出去的那些词。
+    ///
+    /// 为什么用线性映射而不是整体平移：whisper.cpp 自己的原始轴映射就是「两个映射点之间线性插值」
+    /// （`map_processed_to_original_time`），段内线性是同一种近似。以 whisper-cli stderr 打印的
+    /// `vad_segment_info` 映射点反算真值对拍本函数（45 秒素材、420 个词端点）：线性映射平均误差
+    /// 176 ms / p90 437 ms / 最大 744 ms；整体平移平均 251 ms / 最大 1670 ms（词尾会被段尾 clamp 住）；
+    /// 不动则平均 1982 ms 且被删词。
+    ///
+    /// # 适用范围与残留
+    ///
+    /// 只修「轴不一致」这一件事：段内被 VAD 剪掉的静音无法从 JSON 恢复，线性映射是单调保序近似，
+    /// 残留误差在几百 ms 量级——够逐词高亮/卡拉OK 用，不等价于 whisper.cpp 内部的精确映射。
+    /// 未开 VAD（词窗被段窗包含）时行为与改动前逐字节相同。
+    fn align_words_to_segment(seg: &mut Segment) -> Option<(f64, f64)> {
+        if seg.words.is_empty() {
+            return None;
+        }
+        let (seg_start, seg_end) = (seg.start, seg.end);
+        // 段本身无效（时长为 0 或负）时无从映射，交给下游按无效段剔除。
+        if seg_end <= seg_start {
+            return None;
+        }
+        let w_min = seg
+            .words
+            .iter()
+            .map(|w| w.start)
+            .fold(f64::INFINITY, f64::min);
+        let w_max = seg
+            .words
+            .iter()
+            .map(|w| w.end)
+            .fold(f64::NEG_INFINITY, f64::max);
+        // 词窗已在段窗内：两轴一致，不动（这是不开 VAD 时 100% 的形态）。
+        if w_min >= seg_start - Self::WORD_AXIS_TOL_SEC
+            && w_max <= seg_end + Self::WORD_AXIS_TOL_SEC
+        {
+            return None;
+        }
+        let (w_span, seg_span) = (w_max - w_min, seg_end - seg_start);
+        // 词窗退化成一点时没有「比例」可保，不猜；这类词随后会被段区间裁掉。
+        if w_span <= 0.0 {
+            return None;
+        }
+        let scale = seg_span / w_span;
+        for w in seg.words.iter_mut() {
+            w.start = seg_start + (w.start - w_min) * scale;
+            w.end = seg_start + (w.end - w_min) * scale;
+        }
+        Some((w_min, w_max))
     }
 
     /// 从单行 whisper-cli 日志中提取 VAD 耗时（毫秒），非 VAD 行返回 None。
@@ -1875,6 +1982,132 @@ mod tests {
         ]);
         assert_eq!(words.len(), 1);
         assert_eq!(words[0].word, "你");
+    }
+
+    /// 造一条只关心时间轴的片段：正常路径下 `words` 与 `start/end` 应当同轴。
+    fn seg_with_words(start: f64, end: f64, words: &[(f64, f64)]) -> Segment {
+        Segment {
+            index: 1,
+            start,
+            end,
+            text: "测试".to_string(),
+            translation: None,
+            translation_lang: None,
+            polished: String::new(),
+            language: None,
+            confidence: None,
+            speaker: None,
+            words: words
+                .iter()
+                .enumerate()
+                .map(|(i, (s, e))| WordTiming {
+                    word: format!("w{i}"),
+                    start: *s,
+                    end: *e,
+                })
+                .collect(),
+        }
+    }
+
+    /// 词窗被段窗包含（不开 VAD 的实测形态：45 秒素材 5/5 段、3 分钟素材 29/29 段）时
+    /// 归一化必须一个字节都不改——否则本来正确的词级时间戳会被拉变形。
+    #[test]
+    fn align_words_to_segment_is_noop_when_words_inside_window() {
+        let mut seg = seg_with_words(
+            13.32,
+            22.56,
+            &[(13.47, 13.90), (13.90, 14.20), (22.10, 22.56)],
+        );
+        let before = seg.clone();
+        assert_eq!(WhisperEngine::align_words_to_segment(&mut seg), None);
+        assert_eq!(seg, before, "词窗在段窗内时不得改动任何时间戳");
+    }
+
+    /// VAD 生效的实测形态：整段词窗落在段窗之外（token 留在处理后轴、段已映射回原始轴）。
+    /// 数字取自 45 秒素材第 6 段：段 [33.42, 36.42]、词窗 [30.43, 33.40]（`w.end <= seg.start`
+    /// 意味着下游 clamp_words_to_segment 会把 16 个词全删）。归一化后所有词必须落进段区间，
+    /// 且保序保比例。
+    #[test]
+    fn align_words_to_segment_maps_disjoint_words_into_window() {
+        let mut seg = seg_with_words(
+            33.42,
+            36.42,
+            &[(30.43, 30.80), (30.80, 31.20), (33.10, 33.40)],
+        );
+        let got = WhisperEngine::align_words_to_segment(&mut seg)
+            .expect("词窗探出段窗就该报告映射前的词窗");
+        assert!((got.0 - 30.43).abs() < 1e-9, "返回的应该是 wmin");
+        assert!((got.1 - 33.40).abs() < 1e-9, "返回的应该是 wmax");
+        assert_eq!(seg.words.len(), 3, "归一化不得增删词");
+        assert!((seg.words[0].start - 33.42).abs() < 1e-9, "首词对齐段首");
+        assert!((seg.words[2].end - 36.42).abs() < 1e-9, "末词对齐段尾");
+        for w in &seg.words {
+            assert!(
+                w.start >= seg.start - 1e-9 && w.end <= seg.end + 1e-9,
+                "归一化后有词落在段区间外: {w:?}"
+            );
+            assert!(w.end >= w.start, "词区间不得倒挂: {w:?}");
+        }
+        for pair in seg.words.windows(2) {
+            assert!(pair[0].end <= pair[1].start + 1e-9, "保序失败: {pair:?}");
+        }
+        // 保比例：第 3 个词在词窗里位于 (33.10-30.43)/2.97 = 0.898989…，映射后应落在段内同比例处。
+        let expect_start = 33.42 + 3.0 * (33.10 - 30.43) / 2.97;
+        assert!(
+            (seg.words[2].start - expect_start).abs() < 1e-9,
+            "线性映射应保持相对位置"
+        );
+    }
+
+    /// 与段窗**部分**重叠的中间态同样要归一化：VAD 的位移随切片累积、不是常数偏移，
+    /// 长句上实测会出现「词窗与段窗相交但仍整体偏早」（45 秒素材 8 段里 7 段、3 分钟素材 49 段里 7 段）。
+    /// 只按「完全无交集」判据会漏掉它们，而下游 clamp_words_to_segment 照样会删掉探出去的词。
+    #[test]
+    fn align_words_to_segment_normalizes_partially_overlapping_window() {
+        // 45 秒素材第 3 段的真实数字：段 [17.04, 22.59]、词窗 [15.15, 20.48]
+        let mut seg = seg_with_words(
+            17.04,
+            22.59,
+            &[(15.15, 15.60), (15.60, 20.00), (20.00, 20.48)],
+        );
+        let got = WhisperEngine::align_words_to_segment(&mut seg).expect("部分重叠也要归一化");
+        assert!((got.0 - 15.15).abs() < 1e-9 && (got.1 - 20.48).abs() < 1e-9);
+        assert_eq!(seg.words.len(), 3);
+        assert!((seg.words[0].start - 17.04).abs() < 1e-9);
+        assert!((seg.words[2].end - 22.59).abs() < 1e-9);
+        for w in &seg.words {
+            assert!(
+                w.start >= seg.start - 1e-9 && w.end <= seg.end + 1e-9,
+                "{w:?}"
+            );
+        }
+        // 词窗整体偏晚（探出段尾）是同一类轴错位，同样收敛回段内。
+        let mut late = seg_with_words(10.0, 20.0, &[(19.0, 24.0), (24.0, 26.0)]);
+        assert!(WhisperEngine::align_words_to_segment(&mut late).is_some());
+        assert!((late.words[0].start - 10.0).abs() < 1e-9);
+        assert!((late.words[1].end - 20.0).abs() < 1e-9);
+    }
+
+    /// 退化输入不猜：空词表、零长词窗、无效段区间一律原样返回 None。
+    #[test]
+    fn align_words_to_segment_skips_degenerate_inputs() {
+        // 空词表：没有词就没有轴可言
+        let mut empty = seg_with_words(10.0, 20.0, &[]);
+        let before = empty.clone();
+        assert_eq!(WhisperEngine::align_words_to_segment(&mut empty), None);
+        assert_eq!(empty, before);
+
+        // 词窗退化成一点（w_span == 0）：没有比例可保，直接不猜
+        let mut point = seg_with_words(10.0, 20.0, &[(5.0, 5.0)]);
+        let before = point.clone();
+        assert_eq!(WhisperEngine::align_words_to_segment(&mut point), None);
+        assert_eq!(point, before);
+
+        // 段区间无效（时长为 0）：留给下游按无效片段剔除
+        let mut degenerate = seg_with_words(10.0, 10.0, &[(1.0, 2.0)]);
+        let before = degenerate.clone();
+        assert_eq!(WhisperEngine::align_words_to_segment(&mut degenerate), None);
+        assert_eq!(degenerate, before);
     }
 
     /// 质检置信度开关：默认开启（出厂配置下 `-ojf` 必须被加上，否则质检低置信恒空），

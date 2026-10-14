@@ -238,8 +238,7 @@ pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment>
     let mut last_chunk: Option<usize> = None;
     for (chunk_idx, offset, segs) in parts {
         for mut seg in segs {
-            seg.start += offset;
-            seg.end += offset;
+            shift_segment(&mut seg, offset);
             if let Some(prev) = out.last_mut() {
                 let cross_chunk = last_chunk != Some(chunk_idx);
                 let gap = seg.start - prev.end;
@@ -409,6 +408,29 @@ pub fn merge_overlap(prev_tail: &Segment, next_head: &Segment, threshold: f64) -
     MergeDecision::Merged(merged)
 }
 
+/// 把片段从「块内相对时间」平移到全局时间轴：段边界与**词级时间戳**用同一个偏移量一起挪。
+///
+/// 为什么词必须跟着段一起挪：下游 [`crate::subtitle::optimize_segments`] 收口时会调
+/// `clamp_words_to_segment`，把「整词落在段区间之外」的词**静默丢弃**。切块路径此前
+/// 只挪 `seg.start/end`，第二块起词级时间仍是块内相对值——整词都落在段区间之外，于是
+/// 收口时被删光：逐词高亮 / ASS 卡拉OK（`\kf`）只对第一块生效，且不报错、无从察觉。
+/// 段与词出自同一次识别的同一套相对时间，只有共用同一个偏移量才能在全局时间轴上对齐。
+///
+/// 平移后顺带把词收敛回本段区间（沿用下游 `clamp(start, end)` 的同一口径）。**只钳不删**：
+/// 源数据本身带偏差时（词时间戳略微越界），照搬下游的 `retain` 会在这里提前静默丢词；
+/// 钳制既能保证「段 → 词」自洽（收口前的预览 / 导出也读得到合法区间），又把「整词仍在
+/// 区间外」这种极端输入原样交回下游按既有口径处理。本函数只负责同向平移与不越界，
+/// 绝不自行删除任何词。
+fn shift_segment(seg: &mut Segment, offset_secs: f64) {
+    seg.start += offset_secs;
+    seg.end += offset_secs;
+    let (start, end) = (seg.start, seg.end);
+    for w in &mut seg.words {
+        w.start = (w.start + offset_secs).clamp(start, end);
+        w.end = (w.end + offset_secs).clamp(start, end);
+    }
+}
+
 /// 单块转写回调：传入（切片 WAV 路径, 该块时长秒, 建议线程数），
 /// 返回块内相对时间戳的片段与（可选的）该块 VAD 耗时。
 pub type ChunkTranscriber<'a> =
@@ -485,8 +507,7 @@ pub fn run_chunked_parallel(
                 let ratio = finished as f64 / total_chunks as f64;
                 if let Some(cb) = cb.as_ref() {
                     for mut seg in segs.iter().cloned() {
-                        seg.start += chunk.start;
-                        seg.end += chunk.start;
+                        shift_segment(&mut seg, chunk.start);
                         cb(
                             ratio,
                             &format!(
@@ -1288,6 +1309,116 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&wav);
+    }
+
+    // ---------- 词级时间戳必须随段一起平移（P0 回归） ----------
+
+    /// 词级时间戳构造器：本模块既有用例多不关心 words，新用例自带一个。
+    fn word(start: f64, end: f64, text: &str) -> crate::subtitle::segment::WordTiming {
+        crate::subtitle::segment::WordTiming {
+            word: text.to_string(),
+            start,
+            end,
+        }
+    }
+
+    /// 缺陷回归（P0，静默丢数据）：切块路径给段加了块偏移，**词级时间戳必须同量平移**。
+    ///
+    /// 下游 `optimize_segments` 的 `clamp_words_to_segment` 会把「整词落在段区间之外」的
+    /// 词直接删掉。旧实现只挪 `seg.start/end`，第二块起所有词都停在块内相对时间（整词
+    /// 都在段外），收口时被清空——逐词高亮 / ASS 卡拉OK（`\kf`）只对第一块生效，且不
+    /// 报错、无从察觉。
+    #[test]
+    fn shift_segment_moves_words_with_the_segment() {
+        let mut seg = Segment::new(1, 2.0, 5.0, "切比雪夫不等式");
+        seg.words = vec![
+            word(2.0, 2.8, " 切比"),
+            word(2.8, 4.0, "雪夫"),
+            word(4.0, 5.0, "不等式"),
+        ];
+        let before = seg.clone();
+        let offset = 300.0;
+
+        shift_segment(&mut seg, offset);
+
+        assert_eq!(seg.start, before.start + offset, "段起点必须平移 offset");
+        assert_eq!(seg.end, before.end + offset, "段终点必须平移 offset");
+        assert_eq!(seg.words.len(), before.words.len(), "平移不得增删词");
+        for (w, b) in seg.words.iter().zip(before.words.iter()) {
+            assert_eq!(w.word, b.word, "平移不得改词文本与词序");
+            assert_eq!(w.start, b.start + offset, "词的 start 必须同量平移");
+            assert_eq!(w.end, b.end + offset, "词的 end 必须同量平移");
+            assert!(
+                w.start >= seg.start && w.end <= seg.end,
+                "平移后词必须落在段区间内: {w:?} / 段 {:?}",
+                (seg.start, seg.end)
+            );
+        }
+    }
+
+    /// 缺陷回归护栏：两块拼接（第二块 offset > 0）后，**每一块**的词都必须仍落在各自
+    /// 段区间内；再过一遍下游 `optimize_segments`，也不得被 `clamp_words_to_segment`
+    /// 清空。
+    ///
+    /// 修复前第二块的词停在块内相对时间（0.x~2.x），整词落在 [305, 308] 之外 → 收口
+    /// 时被删光，这条断言正是那道护栏。
+    #[test]
+    fn stitched_chunk_words_survive_optimize_segments() {
+        let mut head = Segment::new(1, 1.0, 4.0, "第一块的第一句话");
+        head.words = vec![word(1.0, 2.2, " 第一块的"), word(2.2, 4.0, "第一句话")];
+        let mut tail = Segment::new(1, 5.0, 8.0, "第二块的另一句话");
+        tail.words = vec![word(5.0, 6.5, " 第二块的"), word(6.5, 8.0, "另一句话")];
+
+        let mut out = stitch_chunks(vec![(0, 0.0, vec![head]), (1, 300.0, vec![tail])]);
+        assert_eq!(out.len(), 2, "两句文本不同且不重叠，必须都保留: {out:?}");
+        assert!(
+            (out[1].start - 305.0).abs() < 1e-9,
+            "第二块的段必须带上块偏移: {out:?}"
+        );
+
+        crate::subtitle::optimize_segments(&mut out);
+
+        assert_eq!(out.len(), 2, "收口后两句仍应在: {out:?}");
+        for seg in &out {
+            assert!(
+                !seg.words.is_empty(),
+                "收口不得清空任何一块的词级时间戳: {seg:?}"
+            );
+            for w in &seg.words {
+                assert!(
+                    w.start >= seg.start && w.end <= seg.end,
+                    "词必须落在段区间内: {w:?} / 段 {:?}",
+                    (seg.start, seg.end)
+                );
+            }
+        }
+    }
+
+    /// 空 `words` 与「源数据本身就带偏差」的越界词：平移阶段不得 panic、不得静默删词。
+    #[test]
+    fn shift_segment_tolerates_empty_and_out_of_range_words() {
+        // 空词表：只挪段边界，无事发生
+        let mut empty = Segment::new(1, 1.0, 2.0, "无词级时间戳");
+        shift_segment(&mut empty, 100.0);
+        assert!(empty.words.is_empty(), "空词表平移后仍应为空");
+        assert_eq!(empty.start, 101.0);
+
+        // 越界词（早于段起点 / 晚于段终点）：只钳不删——整词仍在区间外的极端输入
+        // 交回下游 `clamp_words_to_segment` 按既有口径处理，这里一个词都不删。
+        let mut skewed = Segment::new(1, 10.0, 14.0, "源数据越界");
+        skewed.words = vec![
+            word(0.1, 0.9, " 早于段起点"),
+            word(20.0, 21.0, " 晚于段终点"),
+        ];
+        shift_segment(&mut skewed, 0.0);
+
+        assert_eq!(skewed.words.len(), 2, "平移阶段不得静默删词");
+        for w in &skewed.words {
+            assert!(
+                w.start >= skewed.start && w.end <= skewed.end,
+                "钳制后词必须落在段区间内: {w:?}"
+            );
+        }
     }
 }
 
