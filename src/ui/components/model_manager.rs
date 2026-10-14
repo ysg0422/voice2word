@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gpui::prelude::*;
-use gpui::{div, px, AnyElement, FontWeight, Global, IntoElement, ParentElement, Styled};
+use gpui::{div, px, relative, AnyElement, FontWeight, Global, IntoElement, ParentElement, Styled};
 
 use crate::ui::primitives;
 use crate::ui::theme::Theme;
@@ -608,66 +608,131 @@ impl MainWindow {
             card = card.child(p);
         }
 
-        // 版本更新横幅（如果有）
-        if let Some((true, text, _url)) = self.state.update_check_result.clone() {
+        // 版本更新横幅（发现新版本或已是最新版）
+        if let Some((newer, text, _url)) = self.state.update_check_result.clone() {
             let is_downloading = self.state.update_download_busy;
             let downloaded = self.state.update_downloaded_path.is_some();
             let has_target = self.state.update_download_target.is_some();
-            card = card.child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(Theme::SPACE_2))
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_SMALL))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(Theme::accent_mint())
-                            .child(if let Some(status) = &self.state.update_download_status {
-                                status.clone()
-                            } else {
-                                text
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(Theme::SPACE_2))
-                            .children(if downloaded {
-                                Some(
-                                    primitives::chip_clickable("打开新版本", true, false)
-                                        .id("update-open-file-btn")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.open_downloaded_update(cx);
-                                        })),
+            let progress = self.state.update_download_progress;
+
+            if newer {
+                card = card.child(
+                    div()
+                        .w_full()
+                        .p(px(Theme::SPACE_2_5))
+                        .rounded_md()
+                        .bg(Theme::bg_inset())
+                        .border_1()
+                        .border_color(Theme::accent_mint())
+                        .flex()
+                        .flex_col()
+                        .gap(px(Theme::SPACE_2))
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(Theme::SPACE_2))
+                                .child(
+                                    div()
+                                        .text_size(px(Theme::TEXT_SMALL))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(Theme::accent_mint())
+                                        .child(if let Some(status) = &self.state.update_download_status {
+                                            status.clone()
+                                        } else {
+                                            text
+                                        }),
                                 )
-                            } else if is_downloading {
-                                Some(
-                                    primitives::chip_clickable("正在下载…", false, false)
-                                        .id("update-downloading-btn"),
-                                )
-                            } else if has_target {
-                                Some(
-                                    primitives::chip_clickable("直接下载更新", true, false)
-                                        .id("update-direct-download-btn")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.download_app_update(cx);
-                                        })),
-                                )
-                            } else {
-                                Some(
-                                    primitives::chip_clickable("前往下载", false, false)
-                                        .id("update-open-page-btn")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.open_release_page(cx);
-                                        })),
-                                )
-                            }),
-                    ),
-            );
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(Theme::SPACE_2))
+                                        .child(
+                                            primitives::chip_clickable("查看更新详情", true, false)
+                                                .id("update-view-modal-btn")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.update_modal_open = true;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .children(if downloaded {
+                                            Some(
+                                                primitives::chip_clickable("立即安装升级", true, false)
+                                                    .id("update-install-btn")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.install_downloaded_update(cx);
+                                                    })),
+                                            )
+                                        } else if is_downloading {
+                                            Some(
+                                                primitives::chip_clickable("正在下载…", false, false)
+                                                    .id("update-downloading-btn"),
+                                            )
+                                        } else if has_target {
+                                            Some(
+                                                primitives::chip_clickable("直接下载更新", true, false)
+                                                    .id("update-direct-download-btn")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.download_app_update(cx);
+                                                    })),
+                                            )
+                                        } else {
+                                            None
+                                        }),
+                                ),
+                        )
+                        .children(if is_downloading {
+                            Some(
+                                div()
+                                    .w_full()
+                                    .h(px(4.0))
+                                    .rounded_full()
+                                    .bg(Theme::bg_raised())
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .rounded_full()
+                                            .bg(Theme::accent_mint())
+                                            .w(relative(progress.clamp(0.01, 1.0))),
+                                    ),
+                            )
+                        } else {
+                            None
+                        }),
+                );
+            } else {
+                card = card.child(
+                    div()
+                        .w_full()
+                        .px(px(Theme::SPACE_2_5))
+                        .py(px(Theme::SPACE_1_5))
+                        .rounded_md()
+                        .bg(Theme::bg_inset())
+                        .border_1()
+                        .border_color(Theme::border_light())
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_SMALL))
+                                .text_color(Theme::text_secondary())
+                                .child(format!(
+                                    "✓ 当前已是最新版本 (v{})，无需更新",
+                                    crate::utils::update_check::current_version()
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(Theme::text_muted())
+                                .child("已与 GitHub 官方源同步"),
+                        ),
+                );
+            }
         }
 
         card = card.child(list);

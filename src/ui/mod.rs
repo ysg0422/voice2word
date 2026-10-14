@@ -560,6 +560,8 @@ pub struct MainWindow {
     pub(crate) benchmark_dialog: Option<BenchmarkDialogInfo>,
     /// 待确认的破坏性操作（清空队列 / 删除记录）。`Some` 时渲染通用确认弹窗。
     pub(crate) confirm_dialog: Option<ConfirmDialogInfo>,
+    /// 版本更新详情弹窗是否展开
+    pub(crate) update_modal_open: bool,
     /// 一次性中性提示（成功类反馈，如「已删除该记录」）。
     ///
     /// 与 `state.status` 的 `Failed` 分开：那个语义是「出错了」，走红色横幅；
@@ -1491,6 +1493,7 @@ impl MainWindow {
             completion_dialog: None,
             benchmark_dialog: None,
             confirm_dialog: None,
+            update_modal_open: false,
             notice: None,
             translate_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3174,6 +3177,13 @@ impl Render for MainWindow {
         // 首次打开软件硬件配置向导（用户未完成初始选择时居中弹窗，提供「我有GPU」与「我没有GPU」选择）
         let root = if !self.state.config.gpu.hardware_init_completed {
             root.child(self.render_hardware_setup_modal(cx))
+        } else {
+            root
+        };
+
+        // 软件更新详情弹窗
+        let root = if self.update_modal_open {
+            root.child(self.render_update_modal(cx))
         } else {
             root
         };

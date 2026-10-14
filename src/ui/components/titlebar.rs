@@ -124,6 +124,7 @@ impl MainWindow {
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .h_full()
                     .child(self.render_titlebar_update_widget(cx))
@@ -315,22 +316,59 @@ impl MainWindow {
         let downloaded = self.state.update_downloaded_path.is_some();
         let has_new_version = matches!(self.state.update_check_result, Some((true, _, _)));
         let is_latest = matches!(self.state.update_check_result, Some((false, _, _)));
+        let progress = self.state.update_download_progress;
+        let cur_ver = crate::utils::update_check::current_version();
+
+        let new_ver = self
+            .state
+            .update_release_info
+            .as_ref()
+            .map(|r| r.version.as_str())
+            .unwrap_or("");
 
         div()
             .flex()
+            .flex_shrink_0()
             .items_center()
             .gap(px(Theme::SPACE_1))
             .pr(px(Theme::SPACE_2))
             .child(if downloaded {
-                primitives::chip_clickable("新版本就绪（打开）", true, false)
-                    .id("titlebar-update-open-btn")
+                div()
+                    .id("titlebar-update-ready-btn")
+                    .px(px(Theme::SPACE_2))
+                    .py(px(Theme::SPACE_0_5))
+                    .rounded_md()
+                    .bg(Theme::accent_mint())
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(Theme::text_on_accent())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(Theme::accent_mint_deep()))
+                    .child("★ 新版就绪 (点击安装)")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_downloaded_update(cx);
+                        this.update_modal_open = true;
+                        cx.notify();
                     }))
                     .into_any_element()
             } else if is_downloading {
-                primitives::chip_clickable("下载更新中…", false, false)
+                div()
                     .id("titlebar-update-downloading-btn")
+                    .px(px(Theme::SPACE_2))
+                    .py(px(Theme::SPACE_0_5))
+                    .rounded_md()
+                    .bg(Theme::bg_inset())
+                    .border_1()
+                    .border_color(Theme::accent_blue())
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(Theme::accent_blue())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(Theme::bg_hover()))
+                    .child(format!("↓ 下载中 {:.0}%", progress * 100.0))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.update_modal_open = true;
+                        cx.notify();
+                    }))
                     .into_any_element()
             } else if has_new_version {
                 div()
@@ -344,9 +382,14 @@ impl MainWindow {
                     .text_color(Theme::text_on_accent())
                     .cursor_pointer()
                     .hover(|s| s.bg(Theme::accent_mint_deep()))
-                    .child("发现新版本（点击更新）")
+                    .child(if new_ver.is_empty() {
+                        "↑ 发现新版本".to_string()
+                    } else {
+                        format!("↑ 发现新版 v{new_ver}")
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.download_app_update(cx);
+                        this.update_modal_open = true;
+                        cx.notify();
                     }))
                     .into_any_element()
             } else if is_latest {
@@ -357,15 +400,12 @@ impl MainWindow {
                     .rounded_md()
                     .bg(Theme::bg_inset())
                     .border_1()
-                    .border_color(Theme::accent_mint())
+                    .border_color(Theme::border_mid())
                     .text_size(px(Theme::TEXT_SMALL))
-                    .text_color(Theme::accent_mint())
+                    .text_color(Theme::text_secondary())
                     .cursor_pointer()
-                    .hover(|s| s.bg(Theme::bg_hover()))
-                    .child(format!(
-                        "当前已是最新版（v{}）✓",
-                        crate::utils::update_check::current_version()
-                    ))
+                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                    .child(format!("✓ 最新版 (v{cur_ver})"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.check_for_update(cx);
                     }))
@@ -373,16 +413,18 @@ impl MainWindow {
             } else {
                 primitives::chip_clickable(
                     if is_checking {
-                        "检查中…"
+                        "↻ 检查中…"
                     } else {
-                        "检查更新"
+                        "↻ 检查更新"
                     },
                     false,
-                    false,
+                    is_checking,
                 )
                 .id("titlebar-check-update-btn")
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.check_for_update(cx);
+                    if !this.state.update_check_busy {
+                        this.check_for_update(cx);
+                    }
                 }))
                 .into_any_element()
             })

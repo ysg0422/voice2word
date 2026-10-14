@@ -943,13 +943,14 @@ impl MainWindow {
     ///
     /// 只**报告**、不下载也不替换 exe：静默替换正在运行的可执行文件是能把安装搞死
     /// 的操作，那属于单独的、更高风险的一步（见 `utils::update_check` 的模块文档）。
+    /// 检查是否有新版本（用户显式点击才发请求，不轮询）。
     pub(crate) fn check_for_update(&mut self, cx: &mut Context<Self>) {
         if self.state.update_check_busy {
             return;
         }
         self.state.update_check_busy = true;
         self.state.download_status_msg = "正在检查更新…".to_string();
-        self.state.update_download_status = Some("正在检查更新…".to_string());
+        self.state.update_download_status = Some("正在连接 GitHub 检查最新版本…".to_string());
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -965,18 +966,22 @@ impl MainWindow {
                         let newer = is_newer(&latest.version, current);
                         let text = describe(current, &latest.version, newer);
                         this.state.download_status_msg = text.clone();
+                        this.state.update_release_info = Some(latest.clone());
                         this.state.update_check_result =
                             Some((newer, text.clone(), latest.page_url));
                         this.state.update_download_target =
                             Some((latest.download_url, latest.asset_name, latest.asset_size));
                         this.state.update_download_status = Some(text);
+
+                        // 发现新版本时，自动弹出更新详情弹窗，便于用户查看改动并一键下载
+                        if newer {
+                            this.update_modal_open = true;
+                        }
                     }
                     Err(e) => {
                         let err_msg = format!("检查更新失败：{e}");
                         this.state.download_status_msg = err_msg.clone();
                         this.state.update_download_status = Some(err_msg);
-                        this.state.update_check_result = None;
-                        this.state.update_download_target = None;
                     }
                 }
                 cx.notify();
@@ -985,7 +990,7 @@ impl MainWindow {
         .detach();
     }
 
-    /// 应用内直接下载最新版本（支持国内加速镜像，不跳转网页）
+    /// 应用内直接下载最新版本（支持国内加速镜像，打通实时进度流）
     pub(crate) fn download_app_update(&mut self, cx: &mut Context<Self>) {
         if self.state.update_download_busy {
             return;
@@ -998,12 +1003,39 @@ impl MainWindow {
         }
 
         self.state.update_download_busy = true;
-        self.state.update_download_progress = 0.0;
+        self.state.update_download_progress = 0.01;
         self.state.update_download_status = Some("正在连接更新镜像…".to_string());
         self.update_download_cancel
             .store(false, std::sync::atomic::Ordering::Relaxed);
         let cancel = self.update_download_cancel.clone();
         cx.notify();
+
+        // 建立跨线程实时下载进度通信通道
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(f32, u64, u64)>();
+
+        // 监听进度通道并热刷新 UI
+        cx.spawn(async move |this, cx| {
+            while let Some((frac, written, total)) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.state.update_download_progress = frac;
+                    let mb_done = written as f64 / 1024.0 / 1024.0;
+                    if total > 0 {
+                        let mb_total = total as f64 / 1024.0 / 1024.0;
+                        this.state.update_download_status = Some(format!(
+                            "正在下载更新：{:.1} MB / {:.1} MB ({:.0}%)",
+                            mb_done,
+                            mb_total,
+                            frac * 100.0
+                        ));
+                    } else {
+                        this.state.update_download_status =
+                            Some(format!("正在下载更新：{:.1} MB", mb_done));
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
 
         cx.spawn(async move |this, cx| {
             let res = cx
@@ -1013,7 +1045,9 @@ impl MainWindow {
                         &url,
                         &name,
                         &cancel,
-                        |_frac, _written, _total| {},
+                        move |frac, written, total| {
+                            let _ = tx.send((frac, written, total));
+                        },
                     )
                 })
                 .await;
@@ -1035,6 +1069,47 @@ impl MainWindow {
             });
         })
         .detach();
+    }
+
+    /// 取消更新包下载
+    pub(crate) fn cancel_update_download(&mut self, cx: &mut Context<Self>) {
+        if self.state.update_download_busy {
+            self.update_download_cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.state.update_download_busy = false;
+            self.state.update_download_status = Some("已取消下载".to_string());
+            cx.notify();
+        }
+    }
+
+    /// 安装已下载的新版本并退出当前应用
+    pub(crate) fn install_downloaded_update(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.state.update_downloaded_path.clone() else {
+            return;
+        };
+        if !path.exists() {
+            self.state.update_download_status = Some("更新文件不存在，请重新下载".to_string());
+            cx.notify();
+            return;
+        }
+
+        // 保存未保存的字幕数据
+        let _ = self.flush_segments_before_close(cx);
+
+        #[cfg(target_os = "windows")]
+        {
+            let res = std::process::Command::new(&path).spawn();
+            if let Err(e) = res {
+                self.state.update_download_status = Some(format!("启动更新程序失败：{e}"));
+                cx.notify();
+                return;
+            }
+            cx.quit();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = open::that(&path);
+        }
     }
 
     /// 打开已下载的新版文件所在文件夹

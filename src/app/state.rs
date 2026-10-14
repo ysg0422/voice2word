@@ -898,6 +898,8 @@ pub struct AppState {
     /// 缓存在会话里（不落盘）：版本不会在几分钟内变化，而用户可能反复点「检查更新」；
     /// 每次点都发一次 GitHub API 请求既慢又容易撞上未认证的速率限制。
     pub update_check_result: Option<(bool, String, String)>,
+    /// 最新版本的完整 Release 元数据（版本、更新日志、大小、直链等）
+    pub update_release_info: Option<crate::utils::update_check::LatestRelease>,
     /// 是否正在检查更新（防连点）
     pub update_check_busy: bool,
     /// 更新包直接下载目标：(download_url, asset_name, size)
@@ -1152,6 +1154,7 @@ impl AppState {
             show_perf_help: false,
             show_audio_advanced: false,
             update_check_result: None,
+            update_release_info: None,
             update_check_busy: false,
             update_download_target: None,
             update_download_busy: false,
