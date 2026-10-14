@@ -270,6 +270,7 @@ docs/         优化记录与设计规范
 - 面向机器调用的命令与 JSON 契约见 [无头模式与机器调用](docs/headless.md)。
 - 单次调用：`voice2word run --json --input talk.mp4`（stdout 恒为一行 JSON）；可用工具清单：`voice2word tools --json`。
 - 环境体检：`voice2word doctor [--json]` 逐项检查配置、FFmpeg / ffprobe、识别与翻译所需组件与模型、GPU 与硬解、日志目录与数据库，并给出可操作的修复建议；有问题时退出码为 1。
+- 脚本与 CI 请用同目录下的 `voice2word-cli.exe`：命令完全一样，但它是控制台子系统程序，shell 会等待它，重定向（`> out.json`）、管道与退出码都可靠（`voice2word.exe` 是 GUI 子系统，PowerShell 不等它，重定向容易拿到空文件）。
 - 集成资产位于 [integrations/](integrations/)：
   - [integrations/voice2word-skill/](integrations/voice2word-skill/)：Skill（`SKILL.md` + `scripts/transcribe.ps1`）。
   - [integrations/mcp-server/](integrations/mcp-server/)：MCP stdio 服务器（`voice2word_mcp.py` + 协议测试）。

@@ -16,6 +16,11 @@ path = "src/main.rs"
 name = "voice2word-setup"
 path = "src/bin/setup.rs"
 
+# 无头/脚本入口：控制台子系统，让 shell 同步等待（重定向、管道、退出码都正常）。
+[[bin]]
+name = "voice2word-cli"
+path = "src/bin/cli.rs"
+
 [dependencies]
 gpui = "0.2.2"
 tokio = { version = "1.43", features = ["full"] }

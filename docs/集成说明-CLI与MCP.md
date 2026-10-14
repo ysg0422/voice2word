@@ -6,7 +6,8 @@
 
 ### 1.1 定位可执行文件
 
-Windows 下按以下顺序定位 `voice2word.exe`：
+Windows 下有两个可执行文件，**行为与命令完全一致，区别只在 Windows 子系统**：`voice2word.exe`（GUI 子系统，带图形界面）与 `voice2word-cli.exe`（控制台子系统，无图形界面）。**脚本与 CI 请用 `voice2word-cli.exe`**：PowerShell 不会等待 GUI 子系统的进程，`voice2word.exe ... > out.json` 会在子进程写出之前拆掉重定向（文件为空，并伴随 `failed printing to stdout: 管道正在被关闭`）；控制台子系统的进程由 shell 同步等待，重定向、管道与 `` 都正常。
+按以下顺序定位 `voice2word.exe`（要无头入口就把文件名换成 `voice2word-cli`）：
 
 1. 显式指定（MCP / 脚本参数、环境变量 `VOICE2WORD_EXE`）；
 2. 仓库内 `target\release\voice2word.exe`；

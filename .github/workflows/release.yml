@@ -76,6 +76,7 @@ jobs:
           $version = $tag -replace '^v', ''
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           Copy-Item target/release/voice2word.exe dist/voice2word.exe -Force
+          Copy-Item target/release/voice2word-cli.exe dist/voice2word-cli.exe -Force
           Copy-Item target/release/voice2word-setup.exe "dist/Voice2Word-v$version-Setup.exe" -Force
           Get-ChildItem dist
 
@@ -92,6 +93,7 @@ jobs:
           files: |
             dist/Voice2Word-*-Setup.exe
             dist/voice2word.exe
+            dist/voice2word-cli.exe
           body: |
             ## Voice2Word ${{ github.ref_name }} (Windows x64)
 

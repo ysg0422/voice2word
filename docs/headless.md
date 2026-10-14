@@ -10,7 +10,7 @@
 
 ## 1. 定位可执行文件
 
-按以下顺序找 `voice2word.exe`：
+按以下顺序找 `voice2word.exe`（**脚本请优先用控制台子系统的 `voice2word-cli.exe`**：它是同一个 CLI，但由 shell 同步等待，`> out.json` 这类重定向与 `` 才可靠；`voice2word.exe` 是 GUI 子系统，PowerShell 不等它，重定向可能拿到空文件）：
 
 1. 安装包安装后的程序目录；
 2. 源码构建产物：`target\release\voice2word.exe`（其次 `target\debug\voice2word.exe`）；
