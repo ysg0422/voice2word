@@ -367,6 +367,65 @@ pub fn missing_terminal_punctuation(segments: &[Segment]) -> Vec<usize> {
     plan_punctuation_fix(segments).indices
 }
 
+/// 相邻片段「时间交叠」的容差（秒）。
+///
+/// 为什么非要这个常量：本项目所有导入/导出格式都是毫秒量级取整（SRT/VTT 的
+/// `.mmm`、FCPXML 的有理帧号、内部 `f64` 秒），两句**本想首尾相接**的台词经过
+/// 换算后可能差出一个远小于 1ms 的浮点尾巴。这种交叠在播放上根本不可见，报出来
+/// 只会稀释清单的信噪比。1ms 恰是这些格式的最细刻度：小于它的差异不可能是用户
+/// 能感知、值得动手改的真实交叠。
+const OVERLAP_TOLERANCE_SECS: f64 = 0.001;
+
+/// 时间交叠的句子下标：`seg[i].end` 明显晚于 `seg[i+1].start` 时返回**前一句**
+/// 的下标（要收紧的是前一句的 `end`，不是后一句的 `start`——后一句的入场时间通常
+/// 已经对上了画面/说话起点）。
+///
+/// 只比对**相邻**两句：字幕里真正要处理的交叠几乎都发生在时间轴接缝，隔句的「重叠」
+/// 多半是正常的插叙，报了反成噪声。回退语义与同模块其它判据一致：只报告、绝不改时间。
+///
+/// 容差见 [`OVERLAP_TOLERANCE_SECS`]：恰好相接（`end == next.start`）与浮点噪声级的
+/// 交叠都不报。
+pub fn overlapping_segments(segments: &[Segment]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for pair in segments.windows(2) {
+        let (prev, next) = (&pair[0], &pair[1]);
+        if prev.end > next.start + OVERLAP_TOLERANCE_SECS {
+            out.push(prev.index);
+        }
+    }
+    out
+}
+
+/// 相邻两句**原文**规范化后相同的**后一句**下标。
+///
+/// 规范化只做两件保守的事：去掉全部空白、把 ASCII 字母折叠成小写。为什么不再多剥一层
+/// （例如像「修复常见错误」那样连标点一起丢掉）：那套激进规范化是「折叠删除」的前置
+/// 判断；这里只产出「值得看一眼」，误报会直接消耗清单的可信度，所以仅在「两串文本除
+/// 空白与大小写外逐字相同」时才报。
+///
+/// 空白句（空串 / 纯空白）不参与：它们归核心四类的「空/超短句」，在这里再点一次名只是
+/// 噪声。与同模块其它判据一致：只报告、绝不改文本（删哪句、留哪句由用户定）。
+pub fn duplicate_neighbors(segments: &[Segment]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for pair in segments.windows(2) {
+        let a = normalize_for_adjacent_compare(pair[0].display_text());
+        let b = normalize_for_adjacent_compare(pair[1].display_text());
+        if !a.is_empty() && a == b {
+            out.push(pair[1].index);
+        }
+    }
+    out
+}
+
+/// 相邻重复句的文本规范化：去全部空白 + ASCII 大小写折叠（取值理由见
+/// [`duplicate_neighbors`]）。
+fn normalize_for_adjacent_compare(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,5 +850,125 @@ mod punctuation_tests {
         let plan = plan_punctuation_fix(&segs);
         assert_eq!(plan.indices, vec![1]);
         assert_eq!(plan.skipped, 2);
+    }
+}
+
+#[cfg(test)]
+mod overlap_duplicate_tests {
+    // 刻意不用 `use super::*`：只依赖公开接口，实现细节改名不会连累测试。
+    use super::{duplicate_neighbors, overlapping_segments};
+    use crate::subtitle::segment::Segment;
+
+    fn seg(index: usize, start: f64, end: f64, text: &str) -> Segment {
+        Segment::new(index, start, end, text)
+    }
+
+    /// 空输入 / 单句：没有相邻对，两个判据都必须是空列表。
+    #[test]
+    fn empty_and_single_input_report_nothing() {
+        assert!(overlapping_segments(&[]).is_empty());
+        assert!(duplicate_neighbors(&[]).is_empty());
+
+        let one = [seg(1, 0.0, 1.0, "只有一句")];
+        assert!(overlapping_segments(&one).is_empty());
+        assert!(duplicate_neighbors(&one).is_empty());
+    }
+
+    /// 正常片段（不交叠、不重复）一个都不报。
+    #[test]
+    fn clean_neighbors_report_nothing() {
+        let segs = [
+            seg(1, 0.0, 1.0, "第一句"),
+            seg(2, 1.2, 2.0, "第二句"),
+            seg(3, 2.0, 3.0, "第三句"),
+        ];
+        assert!(overlapping_segments(&segs).is_empty());
+        assert!(duplicate_neighbors(&segs).is_empty());
+    }
+
+    /// 恰好相接（`end == next.start`）是最常见的正常形态，绝不能报交叠。
+    #[test]
+    fn touching_boundaries_are_not_overlaps() {
+        let segs = [
+            seg(1, 0.0, 1.0, "上一句"),
+            seg(2, 1.0, 2.0, "下一句"),
+            seg(3, 2.0, 3.0, "再一句"),
+        ];
+        assert!(overlapping_segments(&segs).is_empty());
+    }
+
+    /// 浮点噪声级（小于容差）的交叠不报；真交叠报，且返回的是**前一句**下标。
+    #[test]
+    fn tiny_overlap_ignored_real_overlap_flags_previous() {
+        let noise = [seg(10, 0.0, 1.0, "甲"), seg(11, 1.0 - 1e-9, 2.0, "乙")];
+        assert!(
+            overlapping_segments(&noise).is_empty(),
+            "浮点噪声不该被报成交叠"
+        );
+
+        // 略超容差就要报：容差只挡噪声，不是把真交叠一并吞掉。
+        let edge = [seg(1, 0.0, 1.0015, "甲"), seg(2, 1.0, 2.0, "乙")];
+        assert_eq!(overlapping_segments(&edge), vec![1]);
+
+        let real = [
+            seg(3, 0.0, 1.5, "前一句"),
+            seg(4, 1.0, 2.0, "后一句"),
+            seg(5, 2.5, 3.0, "不相干"),
+        ];
+        assert_eq!(
+            overlapping_segments(&real),
+            vec![3],
+            "要点出的正是前一句（要收紧的是它的 end）"
+        );
+    }
+
+    /// 仅空白 / ASCII 大小写差异算重复，返回**后一句**下标；内容不同则不报。
+    #[test]
+    fn duplicate_neighbors_ignores_whitespace_and_ascii_case() {
+        let segs = [
+            seg(1, 0.0, 1.0, "Hello   World"),
+            seg(2, 1.0, 2.0, "  hello world  "),
+            seg(3, 2.0, 3.0, "不一样的一句"),
+        ];
+        assert_eq!(duplicate_neighbors(&segs), vec![2], "返回后一句下标");
+
+        let distinct = [
+            seg(1, 0.0, 1.0, "hello world"),
+            seg(2, 1.0, 2.0, "hello  earth"),
+        ];
+        assert!(duplicate_neighbors(&distinct).is_empty(), "内容不同不报");
+    }
+
+    /// 空句 / 纯空白句不参与相邻重复（它们归核心四类的「空/超短句」）。
+    #[test]
+    fn blank_lines_never_count_as_duplicates() {
+        let blank = [seg(1, 0.0, 1.0, ""), seg(2, 1.0, 2.0, "   ")];
+        assert!(duplicate_neighbors(&blank).is_empty(), "空白句不参与");
+
+        let mixed = [seg(1, 0.0, 1.0, "有意义的一句"), seg(2, 1.0, 2.0, "   ")];
+        assert!(
+            duplicate_neighbors(&mixed).is_empty(),
+            "有内容句后跟空白句不算重复"
+        );
+    }
+
+    /// 返回的下标升序且取的是 `Segment::index`（而不是列表位置）：index 非连续、
+    /// 非从 0 开始时也要一一对上。
+    #[test]
+    fn indices_are_ascending_and_use_segment_index() {
+        let overlaps = [
+            seg(10, 0.0, 1.5, "甲"),
+            seg(20, 1.0, 2.0, "乙"),
+            seg(30, 2.0, 3.5, "丙"),
+            seg(40, 3.0, 4.0, "丁"),
+        ];
+        assert_eq!(overlapping_segments(&overlaps), vec![10, 30]);
+
+        let dups = [
+            seg(5, 0.0, 1.0, "repeat"),
+            seg(9, 1.0, 2.0, "REPEAT"),
+            seg(9_000, 2.0, 3.0, "RePeAt"),
+        ];
+        assert_eq!(duplicate_neighbors(&dups), vec![9, 9_000]);
     }
 }

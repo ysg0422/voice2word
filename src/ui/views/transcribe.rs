@@ -761,15 +761,18 @@ impl MainWindow {
     /// 「下一处」的落点：当前选中句之后的第一处待复核；已是最后一处则回卷到第一处。
     /// 一处待复核都没有时返回 `None`（`jump_to_quality_issue` 会安全忽略）。
     ///
-    /// 跨四类 + 两项扩展翻查：扩展项（语速超限 / 句尾标点）与四类判据无关，可能
-    /// **独自**存在（四类全通过、只有语速超限），只翻四类的话「下一处」点了不动。
+    /// 跨四类 + 四项扩展翻查：扩展项（语速超限 / 句尾标点 / 时间重叠 / 重复句）与四类
+    /// 判据无关，可能**独自**存在（四类全通过、只有语速超限），只翻四类的话「下一处」
+    /// 点了不动。
     /// 合并后的列表由 `next_issue_in` 消费，而它约定升序，所以这里排一次
-    /// （两个扩展桶各自升序、彼此无序）。
+    /// （四个扩展桶各自升序、彼此无序）。
     fn quality_next_issue_any(&mut self, extras: &QualityExtras) -> Option<usize> {
         let report = self.quality_report_snapshot()?;
         let mut all = report.all_issues();
         all.extend(extras.cps.iter().copied());
         all.extend(extras.punctuation.iter().copied());
+        all.extend(extras.overlap.iter().copied());
+        all.extend(extras.duplicates.iter().copied());
         all.sort_unstable();
         all.dedup();
         crate::subtitle::segment::next_issue_in(self.state.selected_segment_index, &all)
@@ -794,14 +797,14 @@ impl MainWindow {
         cx.notify();
     }
 
-    /// 两项质检扩展（语速超限 / 句尾标点）的句下标快照。
+    /// 扩展项（语速超限 / 句尾标点 / 时间重叠 / 重复句）的句下标快照。
     ///
     /// 缓存挂在 GPUI 全局的 [`TranscribeDerivedCache`] 上（`MainWindow` 的结构体定义在
     /// `ui/mod.rs`，不在本轮改动范围内），失效键见 [`QualityExtrasKey`]：
     /// `segments_revision` + 语速上限的位模式。
     ///
-    /// 为什么必须缓存：两项判据都是 O(句数) 全量扫描，而这张卡片在转写完成后每帧
-    /// 都会被重建一次，逐帧直算等于每帧两次整表遍历。
+    /// 为什么必须缓存：四项判据都是 O(句数) 全量扫描，而这张卡片在转写完成后每帧
+    /// 都会被重建一次，逐帧直算等于每帧四次整表遍历。
     fn quality_extras_snapshot(&self, cx: &mut Context<Self>) -> Arc<QualityExtras> {
         let key = QualityExtrasKey {
             revision: self.state.segments_revision,
@@ -812,6 +815,8 @@ impl MainWindow {
             quality_extras_cached(&mut cache.quality_extras, key, || QualityExtras {
                 cps: state.cps_violation_indices(DEFAULT_MAX_CPS),
                 punctuation: state.punctuation_plan().indices,
+                overlap: crate::subtitle::qc::overlapping_segments(&state.segments),
+                duplicates: crate::subtitle::qc::duplicate_neighbors(&state.segments),
             })
         })
     }
@@ -824,22 +829,31 @@ impl MainWindow {
         let report = self.quality_report_snapshot()?;
         let total = report.total_issues();
         let scored = report.confidence_scored;
-        // 两项扩展（语速超限 / 句尾标点）走本文件内的跨帧缓存，判据与失效键见
-        // `QualityExtras` / `QualityExtrasKey`：都是 O(句数) 全量扫描，不能每帧直算。
+        // 扩展项（语速超限 / 句尾标点 / 时间重叠 / 重复句）走本文件内的跨帧缓存，判据与
+        // 失效键见 `QualityExtras` / `QualityExtrasKey`：都是 O(句数) 全量扫描，不能每帧直算。
         let extras = self.quality_extras_snapshot(cx);
         // 「待质检 N 项」把扩展项一起算进来：它们同样要点进剪辑台复核，分开算会出现
         // 「胶囊写着有 3 句要改、右上角药丸却说质检通过」。
-        let pending_total = total + extras.cps.len() + extras.punctuation.len();
+        let pending_total = total
+            + extras.cps.len()
+            + extras.punctuation.len()
+            + extras.overlap.len()
+            + extras.duplicates.len();
         // 「开始复核」的第一跳落点。必须在这里算好：下面给每个胶囊挂 `cx.listener`
         // 时要可变借用 `this`，闭包里再读 `report` 就与借用打架
         // （与 `render_batch_queue_panel` 先抽纯值是同一个处理）。
         // 扩展项可能**独自**存在问题（四类判据全通过、但语速超限），只取
         // `report.first_issue()` 会让这个按钮点了不动，所以两边取更靠前的那一处。
-        let extra_first = [extras.cps.first(), extras.punctuation.first()]
-            .into_iter()
-            .flatten()
-            .copied()
-            .min();
+        let extra_first = [
+            extras.cps.first(),
+            extras.punctuation.first(),
+            extras.overlap.first(),
+            extras.duplicates.first(),
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+        .min();
         let first_issue = match (report.first_issue(), extra_first) {
             (Some(reported), Some(extra)) => Some(reported.min(extra)),
             (reported, extra) => reported.or(extra),
@@ -912,9 +926,10 @@ impl MainWindow {
         // 用户要看得出「这一项确实检查过、结果是 0」，而不是被悄悄藏掉。
         // 唯一的例外是低置信判据**全无置信度数据**时：那时「0 句」是把「没测」说成了
         // 「通过」，文案改由 `quality_chip_label` 给「未评估」（判据见 `QualityReport`）。
-        // 扩展项胶囊（语速超限 / 句尾标点）：与上面四类共用 `tag_tinted` 的样式与
-        // Theme 配色阶梯，区别只在 0 句时**不生成元素**（`extra_quality_chip_text`
-        // 返回 `None`，见其文档）。两项点下去都只是跳到第一处让用户自己判断，
+        // 扩展项胶囊（语速超限 / 句尾标点 / 时间重叠 / 重复句）：与上面四类共用
+        // `tag_tinted` 的样式与 Theme 配色阶梯，区别只在 0 句时**不生成元素**
+        // （`extra_quality_chip_text` 返回 `None`，见其文档）。四项点下去都只是跳到
+        // 第一处让用户自己判断（时间重叠与重复句也一样：只定位、绝不改文本），
         // 所以这里不接任何改文本的动作，文案里也没有「修复」二字。
         let mut extra_chips: Vec<AnyElement> = Vec::new();
         for kind in ExtraQuality::ALL {
@@ -924,10 +939,21 @@ impl MainWindow {
                     extras.punctuation.len(),
                     extras.punctuation.first().copied(),
                 ),
+                ExtraQuality::OverlappingTimes => {
+                    (extras.overlap.len(), extras.overlap.first().copied())
+                }
+                ExtraQuality::DuplicateNeighbors => {
+                    (extras.duplicates.len(), extras.duplicates.first().copied())
+                }
             };
             let Some(label) = extra_quality_chip_text(kind, count) else {
                 continue;
             };
+            // 配色取 Theme 阶梯、调用点不出现裸色值。色板只有六个色族（red / warn /
+            // blue / neutral / primary / mint），四类判据 + 两项旧扩展已占满前五族，
+            // 所以新增两类只能这样最小化重色：时间重叠用唯一空着的薄荷族；重复句沿用
+            // 红族底但换成更深的 `accent_red_strong`，与「低置信」的 `accent_red`
+            // 拉开一档。
             let (soft, border, text) = match kind {
                 ExtraQuality::CpsOverLimit => (
                     Theme::tint_warn_soft(),
@@ -938,6 +964,16 @@ impl MainWindow {
                     Theme::tint_primary_soft(),
                     Theme::tint_primary_border(),
                     Theme::accent_primary(),
+                ),
+                ExtraQuality::OverlappingTimes => (
+                    Theme::tint_mint_soft(),
+                    Theme::tint_mint_border(),
+                    Theme::accent_mint(),
+                ),
+                ExtraQuality::DuplicateNeighbors => (
+                    Theme::tint_red_soft(),
+                    Theme::tint_red_border(),
+                    Theme::accent_red_strong(),
                 ),
             };
             extra_chips.push(
@@ -1088,7 +1124,7 @@ impl MainWindow {
                             )
                             .id("quality-review-next")
                             .cursor_pointer()
-                            // 「下一处」也把两项扩展算进翻查队列（见
+                            // 「下一处」也把四项扩展算进翻查队列（见
                             // `quality_next_issue_any`）：只翻四类的话，
                             // 「四类全通过、只有语速超限」时这个按钮点了不动。
                             .on_click(cx.listener(
@@ -2013,13 +2049,14 @@ fn category_has_issues(report: &QualityReport, category: QualityCategory) -> boo
     }
 }
 
-// ==================== 质检扩展项（语速超限 / 句尾标点） ====================
+// ============ 质检扩展项（语速超限 / 句尾标点 / 时间重叠 / 重复句） ============
 
-/// 质检扩展项：不属于 [`QualityCategory`] 四类、但同样值得复核的两项。
+/// 质检扩展项：不属于 [`QualityCategory`] 四类、但同样值得复核的四项。
 ///
 /// 为什么不是新的 `QualityCategory` 变体：那四类的判据与桶都在
-/// `subtitle::segment`（另一个文件的改动范围），这里的两个判据来自
-/// `subtitle::timing::cps_violations` 与 `subtitle::qc::plan_punctuation_fix`，
+/// `subtitle::segment`（另一个文件的改动范围），这里的判据来自
+/// `subtitle::timing::cps_violations` 与 `subtitle::qc` 的三个纯函数
+/// （`plan_punctuation_fix` / `overlapping_segments` / `duplicate_neighbors`），
 /// 只在界面层合成。展示语义与四类一致：给句数 + 点击跳到第一处。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExtraQuality {
@@ -2027,13 +2064,19 @@ enum ExtraQuality {
     CpsOverLimit,
     /// 句尾缺收尾标点（**只报告、绝不改文本**）。
     MissingTerminalPunctuation,
+    /// 相邻句时间交叠（前一句的 `end` 压过后一句的 `start`；只动时间、不改文本）。
+    OverlappingTimes,
+    /// 相邻两句原文（去空白、忽略 ASCII 大小写）相同（只定位、不改文本）。
+    DuplicateNeighbors,
 }
 
 impl ExtraQuality {
     /// 全部扩展项，顺序即胶囊展示顺序。
-    const ALL: [ExtraQuality; 2] = [
+    const ALL: [ExtraQuality; 4] = [
         ExtraQuality::CpsOverLimit,
         ExtraQuality::MissingTerminalPunctuation,
+        ExtraQuality::OverlappingTimes,
+        ExtraQuality::DuplicateNeighbors,
     ];
 }
 
@@ -2051,23 +2094,29 @@ fn extra_quality_chip_text(kind: ExtraQuality, count: usize) -> Option<String> {
     Some(match kind {
         ExtraQuality::CpsOverLimit => format!("语速超限 {count} 句"),
         ExtraQuality::MissingTerminalPunctuation => format!("句尾标点 {count} 句"),
+        ExtraQuality::OverlappingTimes => format!("时间重叠 {count} 句"),
+        ExtraQuality::DuplicateNeighbors => format!("重复句 {count} 句"),
     })
 }
 
-/// 两项扩展的句下标快照（按类分桶，桶内升序）。
+/// 扩展项的句下标快照（按类分桶，桶内升序）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct QualityExtras {
     /// 语速超限的句下标。
     cps: Vec<usize>,
     /// 句尾缺标点的句下标。
     punctuation: Vec<usize>,
+    /// 相邻句时间交叠的句下标（取前一句）。
+    overlap: Vec<usize>,
+    /// 相邻重复句的句下标（取后一句）。
+    duplicates: Vec<usize>,
 }
 
 /// [`QualityExtras`] 快照的失效键：`(segments_revision, 语速上限的位模式)`。
 ///
 /// # 为什么是这两个键
 ///
-/// - `segments_revision`：两项判据都只读字幕文本与时间（`display_text()` / `duration()`），
+/// - `segments_revision`：四类判据都只读字幕文本与时间（`display_text()` / 起止时间），
 ///   而**任何**改字幕的入口都必须递增它（编辑 / 拆分合并 / 应用修复 / 换工程 / 载入缓存，
 ///   见 `AppState::bump_segments_revision`），所以它是内容变化的唯一失效依据。
 /// - `max_cps_bits`：语速上限不随 revision 变化（改配置不碰字幕），漏进键就是
@@ -2075,7 +2124,8 @@ struct QualityExtras {
 ///   会踩 `-0.0 == 0.0` 与 `NaN != NaN` 两种反直觉语义（与 `DerivedSnapshotKey`
 ///   的 `low_confidence_bits` 同法）。
 ///
-/// 句尾标点没有额外配置输入（判据只看文本），所以不进键。
+/// 句尾标点 / 时间重叠 / 相邻重复都没有额外配置输入（判据只看文本与原片的起止时间），
+/// 所以只靠 `segments_revision` 失效，不进键。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QualityExtrasKey {
     /// 字幕内容的修订号。
@@ -2088,7 +2138,7 @@ struct QualityExtrasKey {
 ///
 /// 抽成自由函数（不吃 `AppState` / GUI 上下文）是为了能在单测里钉死两条性质：
 /// 「同键命中不重算、复用同一个 `Arc`」与「revision 或语速上限变了必重算」。
-/// 存 `Arc` 而不是裸结构体：命中路径只加一次引用计数，不 clone 两个 `Vec`。
+/// 存 `Arc` 而不是裸结构体：命中路径只加一次引用计数，不 clone 四个 `Vec`。
 fn quality_extras_cached(
     cache: &mut Option<(QualityExtrasKey, Arc<QualityExtras>)>,
     key: QualityExtrasKey,
@@ -2136,7 +2186,7 @@ struct TranscribeDerivedCache {
     progress_detail: Option<SharedString>,
     /// 批量队列每行的文件名 / 阶段名
     queue_text: QueueTextCache,
-    /// 质检扩展项（语速超限 / 句尾标点）的句下标快照，键见 [`QualityExtrasKey`]
+    /// 质检扩展项（语速超限 / 句尾标点 / 时间重叠 / 重复句）的句下标快照，键见 [`QualityExtrasKey`]
     quality_extras: Option<(QualityExtrasKey, Arc<QualityExtras>)>,
 }
 
@@ -2486,12 +2536,25 @@ mod tests {
     #[test]
     fn extra_quality_chip_hidden_at_zero_and_counted_when_positive() {
         assert_eq!(
+            ExtraQuality::ALL.len(),
+            4,
+            "扩展项新增两类（时间重叠 / 重复句）后总数应为 4"
+        );
+        assert_eq!(
             extra_quality_chip_text(ExtraQuality::CpsOverLimit, 0),
             None,
             "0 句不挂胶囊：恒为 0 的胶囊只会稀释真问题的信号"
         );
         assert_eq!(
             extra_quality_chip_text(ExtraQuality::MissingTerminalPunctuation, 0),
+            None
+        );
+        assert_eq!(
+            extra_quality_chip_text(ExtraQuality::OverlappingTimes, 0),
+            None
+        );
+        assert_eq!(
+            extra_quality_chip_text(ExtraQuality::DuplicateNeighbors, 0),
             None
         );
         assert_eq!(
@@ -2502,16 +2565,26 @@ mod tests {
             extra_quality_chip_text(ExtraQuality::MissingTerminalPunctuation, 12).as_deref(),
             Some("句尾标点 12 句")
         );
+        assert_eq!(
+            extra_quality_chip_text(ExtraQuality::OverlappingTimes, 5).as_deref(),
+            Some("时间重叠 5 句")
+        );
+        assert_eq!(
+            extra_quality_chip_text(ExtraQuality::DuplicateNeighbors, 2).as_deref(),
+            Some("重复句 2 句")
+        );
     }
 
-    /// 两项的点击行为都只是「跳过去看一眼」，文案不许出现「修复」这类承诺改文本的
-    /// 字眼（补标点必须猜语气，工具不替用户改正文），且统一以「N 句」收尾。
+    /// 各项的点击行为都只是「跳过去看一眼」，文案不许出现「修复」这类承诺改文本的
+    /// 字眼（补标点必须猜语气，工具不替用户改正文），统一以「N 句」收尾且互不重复。
     #[test]
     fn extra_quality_chip_copy_never_promises_a_fix() {
+        let mut seen = std::collections::BTreeSet::new();
         for kind in ExtraQuality::ALL {
             let text = extra_quality_chip_text(kind, 2).expect("非零必须有文案");
             assert!(!text.contains("修复"), "文案不得承诺修复：{text}");
             assert!(text.ends_with("句"), "统一以「N 句」收尾：{text}");
+            assert!(seen.insert(text.clone()), "各类文案不得重名：{text}");
         }
     }
 
@@ -2529,6 +2602,8 @@ mod tests {
             QualityExtras {
                 cps: vec![2, 5],
                 punctuation: vec![9],
+                overlap: vec![7],
+                duplicates: vec![8],
             }
         });
         let second = quality_extras_cached(&mut cache, key, || {
@@ -2539,6 +2614,8 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second), "同键必须复用同一个 Arc");
         assert_eq!(second.cps, vec![2, 5]);
         assert_eq!(second.punctuation, vec![9]);
+        assert_eq!(second.overlap, vec![7]);
+        assert_eq!(second.duplicates, vec![8]);
     }
 
     /// 失效键之一：`segments_revision` 变了（任何改字幕的入口都会推进它）必须重算。
@@ -2565,10 +2642,40 @@ mod tests {
             QualityExtras {
                 cps: vec![4],
                 punctuation: vec![],
+                ..QualityExtras::default()
             }
         });
         assert_eq!(builds.get(), 2, "revision 变了必须重算");
         assert_eq!(third.cps, vec![4], "换键必须拿到新结果");
+    }
+
+    /// 新增的两类（时间重叠 / 重复句）也必须吃同一份 revision 失效：revision 一变就
+    /// 重算、并拿到新值，不能因为它们是后加的就漏在缓存键之外（那样改一次时间轴、
+    /// 胶囊计数却纹丝不动）。
+    #[test]
+    fn quality_extras_cache_recomputes_new_kinds_after_revision_bump() {
+        let key = |revision: u64| QualityExtrasKey {
+            revision,
+            max_cps_bits: 9.0f64.to_bits(),
+        };
+        let mut cache: Option<(QualityExtrasKey, Arc<QualityExtras>)> = None;
+        let builds = std::cell::Cell::new(0u32);
+        let first = quality_extras_cached(&mut cache, key(1), || {
+            builds.set(builds.get() + 1);
+            QualityExtras::default()
+        });
+        assert!(first.overlap.is_empty() && first.duplicates.is_empty());
+        let second = quality_extras_cached(&mut cache, key(2), || {
+            builds.set(builds.get() + 1);
+            QualityExtras {
+                overlap: vec![3],
+                duplicates: vec![6],
+                ..QualityExtras::default()
+            }
+        });
+        assert_eq!(builds.get(), 2, "revision 变了必须重算");
+        assert_eq!(second.overlap, vec![3], "时间重叠随 revision 重算");
+        assert_eq!(second.duplicates, vec![6], "重复句随 revision 重算");
     }
 
     /// 失效键之二：语速上限变了必须重算（它不进 `segments_revision`——改配置不碰字幕）。
@@ -2595,6 +2702,7 @@ mod tests {
             QualityExtras {
                 cps: vec![1, 3],
                 punctuation: vec![],
+                ..QualityExtras::default()
             }
         });
         assert_eq!(builds.get(), 2, "上限变了必须重算（revision 没变）");
