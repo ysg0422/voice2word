@@ -107,13 +107,8 @@ fn main() -> Result<()> {
     // 冷采样与后面的建库/引擎初始化并行起来——两笔耗时都不再占主线程。
     let gpu_flags_enabled = config.gpu.hwaccel_decode || config.gpu.whisper_offload;
     let hardware_probe = std::thread::spawn(move || {
-        // 先采一次 CPU/内存：返回值只是副产品（给下次调用命中缓存），真正要的是
-        // 让 sysinfo 那笔首采在采集线程里发生，主线程稍后取用时直接命中缓存。
-        let _ = voice2word::core::HardwareInfo::detect_with_media_profile(
-            &engines::HardwareProfile::cpu_only(),
-        );
         if !gpu_flags_enabled {
-            // 两个开关都关：适配器结果没人用，不枚举，直接交回纯 CPU 档案。
+            // 两个开关都关：无需枚举适配器，瞬间返回纯 CPU 档案 (0ms)
             return engines::HardwareProfile::cpu_only();
         }
         // 采集线程里 panic 不该把启动带死（旧写法只会让进程直接崩），

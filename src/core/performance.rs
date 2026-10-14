@@ -207,26 +207,31 @@ impl HardwareInfo {
     /// 启动关键路径之外（`AppState::with_hardware` 前的汇合点），或确保已有一个
     /// 线程先采过一次——结果缓存在进程级静态状态里，之后的调用只要 ~1 ms。
     pub fn detect_with_media_profile(profile: &crate::engines::HardwareProfile) -> Self {
-        let mut system = System::new_with_specifics(
-            RefreshKind::new()
-                .with_cpu(CpuRefreshKind::everything())
-                .with_memory(MemoryRefreshKind::everything()),
-        );
-        system.refresh_cpu_all();
-        system.refresh_memory();
+        static CACHE: std::sync::OnceLock<(String, usize, usize, u64, u64, u64)> = std::sync::OnceLock::new();
+        let (cpu_brand, physical_cores, logical_threads, cpu_frequency_mhz, total_memory_bytes, available_memory_bytes) =
+            CACHE.get_or_init(|| {
+                let mut system = System::new_with_specifics(
+                    RefreshKind::new()
+                        .with_cpu(CpuRefreshKind::everything())
+                        .with_memory(MemoryRefreshKind::everything()),
+                );
+                system.refresh_cpu_all();
+                system.refresh_memory();
 
-        let cpus = system.cpus();
-        let cpu_brand = cpus
-            .first()
-            .map(|c| c.brand().trim().to_string())
-            .unwrap_or_else(|| "未知 CPU".to_string());
-        let cpu_frequency_mhz = cpus.first().map(|c| c.frequency()).unwrap_or(0);
-        let logical_threads = cpus.len().max(1);
-        let physical_cores = system
-            .physical_core_count()
-            .unwrap_or(logical_threads.max(1));
-        let total_memory_bytes = system.total_memory();
-        let available_memory_bytes = system.available_memory();
+                let cpus = system.cpus();
+                let cpu_brand = cpus
+                    .first()
+                    .map(|c| c.brand().trim().to_string())
+                    .unwrap_or_else(|| "未知 CPU".to_string());
+                let cpu_frequency_mhz = cpus.first().map(|c| c.frequency()).unwrap_or(0);
+                let logical_threads = cpus.len().max(1);
+                let physical_cores = system
+                    .physical_core_count()
+                    .unwrap_or(logical_threads.max(1));
+                let total_memory_bytes = system.total_memory();
+                let available_memory_bytes = system.available_memory();
+                (cpu_brand, physical_cores, logical_threads, cpu_frequency_mhz, total_memory_bytes, available_memory_bytes)
+            }).clone();
 
         let gpus = if profile.use_gpu_pipeline() {
             vec![GpuInfo {

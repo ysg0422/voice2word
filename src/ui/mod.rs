@@ -741,6 +741,8 @@ pub struct MainWindow {
     pub(crate) inline_edit_focus: FocusHandle,
     /// 自定义调色板展开状态
     pub(crate) custom_color_picker_open: bool,
+    /// 全局字幕样式卡片是否收起折叠（默认展开，点击可折叠以给单句精修腾出空间）
+    pub(crate) subtitle_style_collapsed: bool,
     /// 缓存的色相圆环图像
     #[allow(dead_code)]
     pub(crate) cached_color_wheel: Option<Arc<RenderImage>>,
@@ -1582,6 +1584,7 @@ impl MainWindow {
             shortcuts_help_open: false,
             model_manager_tab: default_model_tab,
             custom_color_picker_open: false,
+            subtitle_style_collapsed: false,
             cached_color_wheel: None,
             color_picker_brightness: 1.0,
         };

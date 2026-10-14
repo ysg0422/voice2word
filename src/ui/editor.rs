@@ -1325,43 +1325,128 @@ impl MainWindow {
                         if panel == EditorSubtitlePanel::Style {
                             let cur_style = self.state.config.subtitle_style.clone();
 
-                            primitives::card_sm()
-                                .flex_none()
-                                .gap(px(Theme::SPACE_2))
-                                // 卡片标题与恢复默认
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .text_size(px(Theme::TEXT_BODY))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(Theme::text_muted())
-                                                .child("全局字幕样式与排版"),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("btn-reset-subtitle-style")
-                                                .px_2()
-                                                .py_0p5()
-                                                .rounded_md()
-                                                .bg(Theme::bg_inset())
-                                                .border_1()
-                                                .border_color(Theme::border())
-                                                .cursor_pointer()
-                                                .text_size(px(Theme::TEXT_SMALL))
-                                                .text_color(Theme::text_secondary())
-                                                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.config.subtitle_style = crate::utils::SubtitleStyleConfig::default();
-                                                    this.state.save_subtitle_style();
-                                                    cx.notify();
-                                                }))
-                                                .child("恢复默认"),
-                                        ),
-                                )
+                            if self.subtitle_style_collapsed {
+                                div()
+                                    .id("bar-subtitle-style-collapsed")
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_lg()
+                                    .bg(Theme::bg_sidebar())
+                                    .border_1()
+                                    .border_color(Theme::border())
+                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.subtitle_style_collapsed = false;
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.0))
+                                                    .text_color(Theme::accent_mint())
+                                                    .child("▶")
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(Theme::TEXT_BODY))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(Theme::text_primary())
+                                                    .child("全局字幕样式与排版"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(Theme::TEXT_CAPTION))
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_md()
+                                                    .bg(Theme::bg_inset())
+                                                    .text_color(Theme::text_muted())
+                                                    .child(format!("{}px · {} · {}", cur_style.font_size, if cur_style.is_bold { "加粗" } else { "常规" }, match cur_style.alignment.as_str() { "left" => "靠左", "right" => "靠右", _ => "居中" })),
+                                            )
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(Theme::TEXT_SMALL))
+                                            .text_color(Theme::accent_mint())
+                                            .child("展开 ⚙"),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                primitives::card_sm()
+                                    .flex_none()
+                                    .gap(px(Theme::SPACE_2))
+                                    // 卡片标题与恢复默认（带收起按钮）
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .id("btn-collapse-subtitle-style")
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_1p5()
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.subtitle_style_collapsed = true;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(10.0))
+                                                            .text_color(Theme::text_muted())
+                                                            .child("▼")
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(Theme::TEXT_BODY))
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(Theme::text_primary())
+                                                            .child("全局字幕样式与排版"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(Theme::TEXT_CAPTION))
+                                                            .px_1p5()
+                                                            .py_0p5()
+                                                            .rounded_sm()
+                                                            .bg(Theme::bg_inset())
+                                                            .text_color(Theme::text_muted())
+                                                            .hover(|s| s.text_color(Theme::accent_mint()))
+                                                            .child("收起"),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("btn-reset-subtitle-style")
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_md()
+                                                    .bg(Theme::bg_inset())
+                                                    .border_1()
+                                                    .border_color(Theme::border())
+                                                    .cursor_pointer()
+                                                    .text_size(px(Theme::TEXT_SMALL))
+                                                    .text_color(Theme::text_secondary())
+                                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.state.config.subtitle_style = crate::utils::SubtitleStyleConfig::default();
+                                                        this.state.save_subtitle_style();
+                                                        cx.notify();
+                                                    }))
+                                                    .child("恢复默认"),
+                                            ),
+                                    )
                                 // 1) 文字颜色池（纯色圆点 + 最后一个调色板色轮）
                                 .child({
                                     let is_custom_color = !crate::utils::SUBTITLE_COLOR_PALETTE
@@ -1465,36 +1550,31 @@ impl MainWindow {
                                             div().into_any_element()
                                         })
                                 })
-                                // 2) 字重与水平对齐
-                                //
-                                // 「字重对齐」这一行以前把字重（加粗/常规）与对齐（靠左/居中/靠右）
-                                // 各包成一个分组：字重那半固定 96px、对齐那半按剩余宽度三等分，
-                                // 于是同一行里五颗胶囊宽窄不一。现在五颗都是同一条 flex 行里的
-                                // 等分项，与下面「文字描边 / 背景底框」用的是同一套排版。
-                                //
-                                // 等分项必须同时写 `flex_1()` 与 `min_w(px(0.0))`：只写 `flex_1`
-                                // 时，flex 项的默认 `min-width:auto` 会按**内容最小宽度**顶住，
-                                // 于是「加粗」比「常规」窄、整排又参差不齐。
+                                // 2) 字重与水平对齐（彻底分离成两列独立控件，消除混淆感）
                                 .child(
                                     div()
                                         .flex()
                                         .items_center()
-                                        .gap_1p5()
-                                        .child(
-                                            div()
-                                                .w(px(58.0))
-                                                .flex_shrink_0()
-                                                .text_size(px(Theme::TEXT_SMALL))
-                                                .text_color(Theme::text_secondary())
-                                                .child("字重对齐"),
-                                        )
+                                        .gap_2()
+                                        // 左列：字重
                                         .child(
                                             div()
                                                 .flex_1()
                                                 .flex()
                                                 .items_center()
-                                                .gap_1()
-                                                // 粗细开关
+                                                .gap_1p5()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                        .text_color(Theme::text_secondary())
+                                                        .child("字重"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1()
                                                         .child({
                                                             let is_bold = cur_style.is_bold;
                                                             div()
@@ -1544,7 +1624,27 @@ impl MainWindow {
                                                                     cx.notify();
                                                                 }))
                                                         })
-                                                // 对齐方式 (靠左/居中/靠右)
+                                                )
+                                        )
+                                        // 右列：水平对齐
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                        .text_color(Theme::text_secondary())
+                                                        .child("对齐"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1()
                                                         .children([("靠左", "left"), ("居中", "center"), ("靠右", "right")].into_iter().enumerate().map(|(idx, (label, align))| {
                                                             let is_sel = cur_style.alignment == align;
                                                             div()
@@ -1569,6 +1669,7 @@ impl MainWindow {
                                                                     cx.notify();
                                                                 }))
                                                         }))
+                                                )
                                         )
                                 )
                                 // 3) 文字描边
@@ -1661,134 +1762,143 @@ impl MainWindow {
                                                 }))
                                         )
                                 )
-                                // 3) 排版参数（字号 / 字间距 / 行间距 / 单行字数 / 底边距）
+                                // 5) 排版参数（双列紧凑网格：字号/字距、行距/边距、单行限制，高度砍半更紧凑）
                                 .child(
                                     div()
                                         .flex()
                                         .flex_col()
                                         .gap_1p5()
-                                        // 字体大小
+                                        // 第 1 行：字号 + 字距
                                         .child(
                                             div()
-                                                .flex_1()
                                                 .flex()
                                                 .items_center()
-                                                .gap_1p5()
-                                                .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("字体大小"))
-                                                .child(self.render_style_stepper_input(
-                                                    StyleField::FontSize,
-                                                    "-2",
-                                                    "+2",
-                                                    |this, cx| {
-                                                        let cur = this.state.config.subtitle_style.font_size;
-                                                        this.state.config.subtitle_style.font_size = cur.saturating_sub(2).max(10);
-                                                        this.state.save_subtitle_style();
-                                                        cx.notify();
-                                                    },
-                                                    |this, cx| {
-                                                        let cur = this.state.config.subtitle_style.font_size;
-                                                        this.state.config.subtitle_style.font_size = (cur + 2).min(120);
-                                                        this.state.save_subtitle_style();
-                                                        cx.notify();
-                                                    },
-                                                    format!("{}px", cur_style.font_size),
-                                                    cx,
-                                                ))
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1p5()
+                                                        .child(div().w(px(32.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("字号"))
+                                                        .child(self.render_style_stepper_input(
+                                                            StyleField::FontSize,
+                                                            "-2",
+                                                            "+2",
+                                                            |this, cx| {
+                                                                let cur = this.state.config.subtitle_style.font_size;
+                                                                this.state.config.subtitle_style.font_size = cur.saturating_sub(2).max(10);
+                                                                this.state.save_subtitle_style();
+                                                                cx.notify();
+                                                            },
+                                                            |this, cx| {
+                                                                let cur = this.state.config.subtitle_style.font_size;
+                                                                this.state.config.subtitle_style.font_size = (cur + 2).min(120);
+                                                                this.state.save_subtitle_style();
+                                                                cx.notify();
+                                                            },
+                                                            format!("{}px", cur_style.font_size),
+                                                            cx,
+                                                        ))
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1p5()
+                                                        .child(div().w(px(32.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("字距"))
+                                                        .child(self.render_style_stepper_input(
+                                                            StyleField::LetterSpacing,
+                                                            "-1",
+                                                            "+1",
+                                                            |this, cx| {
+                                                                let cur = this.state.config.subtitle_style.letter_spacing;
+                                                                this.state.config.subtitle_style.letter_spacing = cur.saturating_sub(1);
+                                                                this.state.save_subtitle_style();
+                                                                cx.notify();
+                                                            },
+                                                            |this, cx| {
+                                                                let cur = this.state.config.subtitle_style.letter_spacing;
+                                                                this.state.config.subtitle_style.letter_spacing = (cur + 1).min(50);
+                                                                this.state.save_subtitle_style();
+                                                                cx.notify();
+                                                            },
+                                                            format!("{}px", cur_style.letter_spacing),
+                                                            cx,
+                                                        ))
+                                                )
                                         )
-                                        // 字间距
+                                        // 第 2 行：行距 + 边距
                                         .child(
                                             div()
-                                                .flex_1()
                                                 .flex()
                                                 .items_center()
-                                                .gap_1p5()
-                                                .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("字间距"))
-                                                .child(self.render_style_stepper_input(
-                                                    StyleField::LetterSpacing,
-                                                    "-1",
-                                                    "+1",
-                                                    |this, cx| {
-                                                        let cur = this.state.config.subtitle_style.letter_spacing;
-                                                        this.state.config.subtitle_style.letter_spacing = cur.saturating_sub(1);
-                                                        this.state.save_subtitle_style();
-                                                        cx.notify();
-                                                    },
-                                                    |this, cx| {
-                                                        let cur = this.state.config.subtitle_style.letter_spacing;
-                                                        this.state.config.subtitle_style.letter_spacing = (cur + 1).min(50);
-                                                        this.state.save_subtitle_style();
-                                                        cx.notify();
-                                                    },
-                                                    format!("{}px", cur_style.letter_spacing),
-                                                    cx,
-                                                ))
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1p5()
+                                                        .child(div().w(px(32.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("行距"))
+                                                        .child(self.render_style_stepper_input(
+                                                            StyleField::LineSpacing,
+                                                            "-0.1",
+                                                            "+0.1",
+                                                            |this, cx| {
+                                                                let cur = this.state.config.subtitle_style.line_spacing;
+                                                                let next = ((cur - 0.1) * 10.0).round() / 10.0;
+                                                                this.state.config.subtitle_style.line_spacing = next.max(0.5);
+                                                                this.state.save_subtitle_style();
+                                                                cx.notify();
+                                                            },
+                                                            |this, cx| {
+                                                                let cur = this.state.config.subtitle_style.line_spacing;
+                                                                let next = ((cur + 0.1) * 10.0).round() / 10.0;
+                                                                this.state.config.subtitle_style.line_spacing = next.min(5.0);
+                                                                this.state.save_subtitle_style();
+                                                                cx.notify();
+                                                            },
+                                                            format!("{:.1}x", cur_style.line_spacing),
+                                                            cx,
+                                                        ))
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1p5()
+                                                        .child(div().w(px(32.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("边距"))
+                                                        .child(self.render_style_stepper_input(
+                                                            StyleField::BottomMargin,
+                                                            "-5",
+                                                            "+5",
+                                                            |this, cx| {
+                                                                let cur = this.state.config.subtitle_style.bottom_margin;
+                                                                this.state.config.subtitle_style.bottom_margin = cur.saturating_sub(5);
+                                                                this.state.save_subtitle_style();
+                                                                cx.notify();
+                                                            },
+                                                            |this, cx| {
+                                                                let cur = this.state.config.subtitle_style.bottom_margin;
+                                                                this.state.config.subtitle_style.bottom_margin = (cur + 5).min(500);
+                                                                this.state.save_subtitle_style();
+                                                                cx.notify();
+                                                            },
+                                                            format!("{}px", cur_style.bottom_margin),
+                                                            cx,
+                                                        ))
+                                                )
                                         )
-                                        // 底边距
+                                        // 第 3 行：单行限制
                                         .child(
                                             div()
-                                                .flex_1()
                                                 .flex()
                                                 .items_center()
                                                 .gap_1p5()
-                                                .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("底边距"))
-                                                .child(self.render_style_stepper_input(
-                                                    StyleField::BottomMargin,
-                                                    "-5",
-                                                    "+5",
-                                                    |this, cx| {
-                                                        let cur = this.state.config.subtitle_style.bottom_margin;
-                                                        this.state.config.subtitle_style.bottom_margin = cur.saturating_sub(5);
-                                                        this.state.save_subtitle_style();
-                                                        cx.notify();
-                                                    },
-                                                    |this, cx| {
-                                                        let cur = this.state.config.subtitle_style.bottom_margin;
-                                                        this.state.config.subtitle_style.bottom_margin = (cur + 5).min(500);
-                                                        this.state.save_subtitle_style();
-                                                        cx.notify();
-                                                    },
-                                                    format!("{}px", cur_style.bottom_margin),
-                                                    cx,
-                                                ))
-                                        )
-                                        // 行间距
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("行间距"))
-                                                .child(self.render_style_stepper_input(
-                                                    StyleField::LineSpacing,
-                                                    "-0.1",
-                                                    "+0.1",
-                                                    |this, cx| {
-                                                        let cur = this.state.config.subtitle_style.line_spacing;
-                                                        let next = ((cur - 0.1) * 10.0).round() / 10.0;
-                                                        this.state.config.subtitle_style.line_spacing = next.max(0.5);
-                                                        this.state.save_subtitle_style();
-                                                        cx.notify();
-                                                    },
-                                                    |this, cx| {
-                                                        let cur = this.state.config.subtitle_style.line_spacing;
-                                                        let next = ((cur + 0.1) * 10.0).round() / 10.0;
-                                                        this.state.config.subtitle_style.line_spacing = next.min(5.0);
-                                                        this.state.save_subtitle_style();
-                                                        cx.notify();
-                                                    },
-                                                    format!("{:.1}x", cur_style.line_spacing),
-                                                    cx,
-                                                ))
-                                        )
-                                        // 单行字数
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("单行字数"))
+                                                .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("单行限制"))
                                                 .child(self.render_style_stepper_input(
                                                     StyleField::MaxChars,
                                                     "-1",
@@ -1805,12 +1915,13 @@ impl MainWindow {
                                                         this.state.save_subtitle_style();
                                                         cx.notify();
                                                     },
-                                                    format!("{}字", cur_style.max_chars_per_line),
+                                                    format!("{}字/行", cur_style.max_chars_per_line),
                                                     cx,
                                                 ))
                                         )
                                 )
                                 .into_any_element()
+                            }
                         } else {
                             div().into_any_element()
                         }
@@ -1904,133 +2015,155 @@ impl MainWindow {
                                                 ),
                                         ),
                                 )
-                                // 第一行半：次级操作工具条 (弹窗编辑、改译文、拆分、合并下句)
+                                // 第一行半：次级操作工具条（语义化三组分立：剪辑、文本、导出）
                                 .child(
                                     div()
                                         .flex()
                                         .flex_wrap()
                                         .items_center()
-                                        .gap_1p5()
+                                        .justify_between()
+                                        .gap_2()
+                                        // 组 1：剪辑动作（拆分 / 合并下句）
                                         .child(
                                             div()
-                                                .id("btn-open-prompt-edit")
-                                                .px_2p5()
-                                                .py_1()
-                                                .rounded_md()
-                                                .bg(Theme::bg_inset())
-                                                .border_1()
-                                                .border_color(Theme::border_mid())
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.prompt_edit_text(cx);
-                                                }))
-                                                .child(
-                                                    div()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .text_color(Theme::text_secondary())
-                                                        .child("弹窗编辑"),
-                                                ),
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(Self::render_mini_btn(
+                                                    "btn-split-seg",
+                                                    "✂ 拆分",
+                                                    can_split,
+                                                    cx,
+                                                    |this, cx| {
+                                                        let len = this.state.editing_text.chars().count();
+                                                        let at = if this.text_cursor_pos > 0
+                                                            && this.text_cursor_pos < len
+                                                        {
+                                                            Some(this.text_cursor_pos)
+                                                        } else {
+                                                            None
+                                                        };
+                                                        this.state.split_selected_segment(at);
+                                                        this.trigger_extract_frame(cx);
+                                                    },
+                                                ))
+                                                .child(Self::render_mini_btn(
+                                                    "btn-merge-seg",
+                                                    "🔗 合并下句",
+                                                    can_merge,
+                                                    cx,
+                                                    |this, cx| {
+                                                        this.state.merge_selected_with_next();
+                                                        this.trigger_extract_frame(cx);
+                                                    },
+                                                ))
                                         )
+                                        // 组 2：文本辅助（弹窗大图编辑 / 改译文 / 清译文）
                                         .child(
                                             div()
-                                                .id("btn-open-translation-edit")
-                                                .px_2p5()
-                                                .py_1()
-                                                .rounded_md()
-                                                .bg(Theme::bg_inset())
-                                                .border_1()
-                                                .border_color(Theme::border_mid())
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(Theme::bg_hover()))
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    if let Some(idx) = this.state.selected_segment_index {
-                                                        let trans = this.state.segments.iter().find(|s| s.index == idx)
-                                                            .and_then(|s| s.translation.clone())
-                                                            .unwrap_or_default();
-                                                        this.start_inline_edit(idx, true, &trans, window, cx);
-                                                    }
-                                                }))
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
                                                 .child(
                                                     div()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .text_color(Theme::text_secondary())
-                                                        .child("改译文"),
-                                                ),
-                                        )
-                                        .child(
-                                            if seg.has_translation() {
-                                                div()
-                                                    .id("btn-clear-translation")
-                                                    .px_2p5()
-                                                    .py_1()
-                                                    .rounded_md()
-                                                    .bg(Theme::bg_inset())
-                                                    .border_1()
-                                                    .border_color(Theme::border_mid())
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(Theme::bg_hover()))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.state.set_selected_translation("");
-                                                        cx.notify();
-                                                    }))
-                                                    .child(
+                                                        .id("btn-open-prompt-edit")
+                                                        .px_2p5()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .bg(Theme::bg_inset())
+                                                        .border_1()
+                                                        .border_color(Theme::border_mid())
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.prompt_edit_text(cx);
+                                                        }))
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(Theme::TEXT_SMALL))
+                                                                .text_color(Theme::text_secondary())
+                                                                .child("弹窗编辑"),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("btn-open-translation-edit")
+                                                        .px_2p5()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .bg(Theme::bg_inset())
+                                                        .border_1()
+                                                        .border_color(Theme::border_mid())
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                                        .on_click(cx.listener(|this, _, window, cx| {
+                                                            if let Some(idx) = this.state.selected_segment_index {
+                                                                let trans = this.state.segments.iter().find(|s| s.index == idx)
+                                                                    .and_then(|s| s.translation.clone())
+                                                                    .unwrap_or_default();
+                                                                this.start_inline_edit(idx, true, &trans, window, cx);
+                                                            }
+                                                        }))
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(Theme::TEXT_SMALL))
+                                                                .text_color(Theme::text_secondary())
+                                                                .child("改译文"),
+                                                        ),
+                                                )
+                                                .child(
+                                                    if seg.has_translation() {
                                                         div()
-                                                            .text_size(px(Theme::TEXT_SMALL))
-                                                            .text_color(Theme::text_secondary())
-                                                            .child("清除译文"),
-                                                    )
-                                                    .into_any_element()
-                                            } else {
-                                                div().into_any_element()
-                                            },
+                                                            .id("btn-clear-translation")
+                                                            .px_2()
+                                                            .py_1()
+                                                            .rounded_md()
+                                                            .bg(Theme::bg_inset())
+                                                            .border_1()
+                                                            .border_color(Theme::border_mid())
+                                                            .cursor_pointer()
+                                                            .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::accent_red()))
+                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                this.state.set_selected_translation("");
+                                                                cx.notify();
+                                                            }))
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(Theme::TEXT_SMALL))
+                                                                    .text_color(Theme::text_muted())
+                                                                    .child("清除译文"),
+                                                            )
+                                                            .into_any_element()
+                                                    } else {
+                                                        div().into_any_element()
+                                                    },
+                                                )
                                         )
-                                        .child(Self::render_mini_btn(
-                                            "btn-split-seg",
-                                            "拆分",
-                                            can_split,
-                                            cx,
-                                            |this, cx| {
-                                                let len = this.state.editing_text.chars().count();
-                                                let at = if this.text_cursor_pos > 0
-                                                    && this.text_cursor_pos < len
-                                                {
-                                                    Some(this.text_cursor_pos)
-                                                } else {
-                                                    None
-                                                };
-                                                this.state.split_selected_segment(at);
-                                                this.trigger_extract_frame(cx);
-                                            },
-                                        ))
-                                        .child(Self::render_mini_btn(
-                                            "btn-merge-seg",
-                                            "合并下句",
-                                            can_merge,
-                                            cx,
-                                            |this, cx| {
-                                                this.state.merge_selected_with_next();
-                                                this.trigger_extract_frame(cx);
-                                            },
-                                        ))
-                                        .child(Self::render_mini_btn(
-                                            "btn-export-clip",
-                                            "导出片段",
-                                            clip_idle,
-                                            cx,
-                                            |this, cx| {
-                                                this.export_selected_clip(cx);
-                                            },
-                                        ))
-                                        .child(Self::render_mini_btn(
-                                            "btn-export-clip-audio",
-                                            "导出音频",
-                                            clip_idle,
-                                            cx,
-                                            |this, cx| {
-                                                this.export_selected_clip_audio(cx);
-                                            },
-                                        )),
+                                        // 组 3：音视频导出
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(Self::render_mini_btn(
+                                                    "btn-export-clip",
+                                                    "导出片段",
+                                                    clip_idle,
+                                                    cx,
+                                                    |this, cx| {
+                                                        this.export_selected_clip(cx);
+                                                    },
+                                                ))
+                                                .child(Self::render_mini_btn(
+                                                    "btn-export-clip-audio",
+                                                    "导出音频",
+                                                    clip_idle,
+                                                    cx,
+                                                    |this, cx| {
+                                                        this.export_selected_clip_audio(cx);
+                                                    },
+                                                ))
+                                        ),
                                 )
                                 // 第二行：原文输入框（带清晰标题）
                                 .child(
@@ -2296,88 +2429,105 @@ impl MainWindow {
                                         .flex()
                                         .flex_col()
                                         .gap(px(Theme::SPACE_2))
-                                        // 第一行：时间微调（起止各 ±0.1s / ±0.5s）
+                                        // 第一行：时间微调（对称连体胶囊：起点 + 终点，告别杂乱按键）
                                         .child(
                                             div()
                                                 .flex()
-                                                .flex_wrap()
                                                 .items_center()
                                                 .gap_2()
+                                                // 起点微调连体胶囊
                                                 .child(
                                                     div()
+                                                        .flex_1()
                                                         .flex()
                                                         .items_center()
-                                                        .gap_1()
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(Theme::TEXT_SMALL))
-                                                                .text_color(Theme::text_muted())
-                                                                .child("起点："),
-                                                        )
+                                                        .justify_between()
+                                                        .bg(Theme::bg_inset())
+                                                        .border_1()
+                                                        .border_color(Theme::border())
+                                                        .rounded_md()
+                                                        .p_0p5()
                                                         .child(Self::render_mini_btn(
                                                             "fine-tune-start-minus-500",
-                                                            "-0.5",
+                                                            "-0.5s",
                                                             true,
                                                             cx,
                                                             |this, _| this.state.adjust_selected_times(-0.5, 0.0),
                                                         ))
                                                         .child(Self::render_mini_btn(
                                                             "fine-tune-start-minus-100",
-                                                            "-0.1",
+                                                            "-0.1s",
                                                             true,
                                                             cx,
                                                             |this, _| this.state.adjust_selected_times(-0.1, 0.0),
                                                         ))
+                                                        .child(
+                                                            div()
+                                                                .px_1()
+                                                                .text_size(px(Theme::TEXT_SMALL))
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .text_color(Theme::text_secondary())
+                                                                .child("起点"),
+                                                        )
                                                         .child(Self::render_mini_btn(
                                                             "fine-tune-start-plus-100",
-                                                            "+0.1",
+                                                            "+0.1s",
                                                             true,
                                                             cx,
                                                             |this, _| this.state.adjust_selected_times(0.1, 0.0),
                                                         ))
                                                         .child(Self::render_mini_btn(
                                                             "fine-tune-start-plus-500",
-                                                            "+0.5",
+                                                            "+0.5s",
                                                             true,
                                                             cx,
                                                             |this, _| this.state.adjust_selected_times(0.5, 0.0),
                                                         )),
                                                 )
+                                                // 终点微调连体胶囊
                                                 .child(
                                                     div()
+                                                        .flex_1()
                                                         .flex()
                                                         .items_center()
-                                                        .gap_1()
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(Theme::TEXT_SMALL))
-                                                                .text_color(Theme::text_muted())
-                                                                .child("终点："),
-                                                        )
+                                                        .justify_between()
+                                                        .bg(Theme::bg_inset())
+                                                        .border_1()
+                                                        .border_color(Theme::border())
+                                                        .rounded_md()
+                                                        .p_0p5()
                                                         .child(Self::render_mini_btn(
                                                             "fine-tune-end-minus-500",
-                                                            "-0.5",
+                                                            "-0.5s",
                                                             true,
                                                             cx,
                                                             |this, _| this.state.adjust_selected_times(0.0, -0.5),
                                                         ))
                                                         .child(Self::render_mini_btn(
                                                             "fine-tune-end-minus-100",
-                                                            "-0.1",
+                                                            "-0.1s",
                                                             true,
                                                             cx,
                                                             |this, _| this.state.adjust_selected_times(0.0, -0.1),
                                                         ))
+                                                        .child(
+                                                            div()
+                                                                .px_1()
+                                                                .text_size(px(Theme::TEXT_SMALL))
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .text_color(Theme::text_secondary())
+                                                                .child("终点"),
+                                                        )
                                                         .child(Self::render_mini_btn(
                                                             "fine-tune-end-plus-100",
-                                                            "+0.1",
+                                                            "+0.1s",
                                                             true,
                                                             cx,
                                                             |this, _| this.state.adjust_selected_times(0.0, 0.1),
                                                         ))
                                                         .child(Self::render_mini_btn(
                                                             "fine-tune-end-plus-500",
-                                                            "+0.5",
+                                                            "+0.5s",
                                                             true,
                                                             cx,
                                                             |this, _| this.state.adjust_selected_times(0.0, 0.5),
@@ -2389,18 +2539,24 @@ impl MainWindow {
                                             div()
                                                 .flex()
                                                 .items_center()
-                                                .gap_2()
+                                                .justify_between()
+                                                .bg(Theme::bg_inset())
+                                                .border_1()
+                                                .border_color(Theme::border_subtle())
+                                                .rounded_md()
+                                                .px_2p5()
+                                                .py_1()
                                                 .child(
                                                     div()
                                                         .text_size(px(Theme::TEXT_SMALL))
                                                         .text_color(Theme::text_secondary())
-                                                        .child("标点："),
+                                                        .child("快捷标点注入："),
                                                 )
                                                 .child(
                                                     div()
                                                         .flex()
                                                         .items_center()
-                                                        .gap_1p5()
+                                                        .gap_2()
                                                         .child(self.render_punct_btn("，", cx))
                                                         .child(self.render_punct_btn("。", cx))
                                                         .child(self.render_punct_btn("？", cx))
@@ -7348,7 +7504,8 @@ impl MainWindow {
                 div()
                     .id(SharedString::from(val_id))
                     .track_focus(&focus_handle)
-                    .w(px(76.0))
+                    .flex_1()
+                    .min_w(px(36.0))
                     .px_1p5()
                     .py_0p5()
                     .bg(Theme::bg_app())
@@ -7388,7 +7545,8 @@ impl MainWindow {
             } else {
                 div()
                     .id(SharedString::from(val_id))
-                    .w(px(76.0))
+                    .flex_1()
+                    .min_w(px(36.0))
                     .px_1p5()
                     .py_0p5()
                     .rounded_sm()

@@ -243,8 +243,77 @@ impl WaveformData {
 /// 全程流式：只解一遍音频，边解边折成槽峰值，因此内存与素材时长无关。没有音轨、
 /// 音轨损坏、FFmpeg 卡死超时都会以 `Err` 上报（波形轨降级为「没有波形」即可，
 /// 不牵动字幕主流程）。
+/// 为指定媒体文件和桶数构建波形磁盘缓存路径
+fn waveform_cache_path(media: &Path, buckets: usize) -> Option<std::path::PathBuf> {
+    let meta = std::fs::metadata(media).ok()?;
+    let size = meta.len();
+    let mtime = meta.modified().ok()?
+        .duration_since(std::time::UNIX_EPOCH).ok()?
+        .as_secs();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&media.to_string_lossy(), &mut hasher);
+    std::hash::Hash::hash(&size, &mut hasher);
+    std::hash::Hash::hash(&mtime, &mut hasher);
+    std::hash::Hash::hash(&buckets, &mut hasher);
+    let hash_val = std::hash::Hasher::finish(&hasher);
+
+    let cache_dir = crate::utils::AppConfig::resolve_path("cache/waveforms");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    Some(cache_dir.join(format!("{:016x}.bin", hash_val)))
+}
+
+/// 尝试从磁盘加载预先提取好的波形包络数据
+fn try_read_waveform_cache(media: &Path, buckets: usize) -> Option<WaveformData> {
+    let cache_file = waveform_cache_path(media, buckets)?;
+    let bytes = std::fs::read(&cache_file).ok()?;
+    if bytes.len() < 20 || &bytes[0..8] != b"V2WWF001" {
+        return None;
+    }
+    let duration = f64::from_le_bytes(bytes[8..16].try_into().ok()?);
+    let peak_count = u32::from_le_bytes(bytes[16..20].try_into().ok()?) as usize;
+    if bytes.len() != 20 + peak_count * 4 {
+        return None;
+    }
+    let mut peaks = Vec::with_capacity(peak_count);
+    for i in 0..peak_count {
+        let offset = 20 + i * 4;
+        peaks.push(f32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?));
+    }
+    tracing::info!(
+        path = %cache_file.display(),
+        peaks = peaks.len(),
+        "命中磁盘波形包络缓存，0ms 秒开"
+    );
+    Some(WaveformData {
+        peaks,
+        duration,
+        source: media.to_path_buf(),
+    })
+}
+
+/// 将提取好的波形包络持久化到磁盘缓存文件 (约 8KB)
+fn try_write_waveform_cache(data: &WaveformData, buckets: usize) {
+    if let Some(cache_file) = waveform_cache_path(&data.source, buckets) {
+        let mut bytes = Vec::with_capacity(20 + data.peaks.len() * 4);
+        bytes.extend_from_slice(b"V2WWF001");
+        bytes.extend_from_slice(&data.duration.to_le_bytes());
+        bytes.extend_from_slice(&(data.peaks.len() as u32).to_le_bytes());
+        for &p in &data.peaks {
+            bytes.extend_from_slice(&p.to_le_bytes());
+        }
+        let _ = std::fs::write(cache_file, bytes);
+    }
+}
+
 pub fn extract(ffmpeg: &FFmpegEngine, media: &Path, buckets: usize) -> Result<WaveformData> {
     let buckets = buckets.clamp(1, MAX_WAVEFORM_BUCKETS);
+
+    // 优先命中磁盘二进制缓存，消灭二次打开大视频时的 FFmpeg 软解高负荷脉冲
+    if let Some(cached) = try_read_waveform_cache(media, buckets) {
+        return Ok(cached);
+    }
+
     let mut acc = PeakAccumulator::new(WAVEFORM_SAMPLE_RATE);
     // 每解出 60 秒音频打一条 debug 进度：提取看起来「没动静」时，
     // 日志里能区分是「还在解」还是「第一秒就卡住了」。
@@ -267,6 +336,8 @@ pub fn extract(ffmpeg: &FFmpegEngine, media: &Path, buckets: usize) -> Result<Wa
         duration_sec = data.duration,
         "波形包络提取完成"
     );
+    // 写入磁盘缓存供下次秒开
+    try_write_waveform_cache(&data, buckets);
     Ok(data)
 }
 
