@@ -2786,6 +2786,7 @@ impl MainWindow {
                                                                             .font_weight(FontWeight::SEMIBOLD)
                                                                             .text_color(speaker_color(s))
                                                                             .on_click(cx.listener(move |this, _, _, cx| {
+                                                                                cx.stop_propagation();
                                                                                 this.cycle_segment_speaker(seg_idx, cx);
                                                                             }))
                                                                             .child(label)

@@ -189,6 +189,7 @@ impl std::fmt::Display for SenseVoiceStageError {
 impl std::error::Error for SenseVoiceStageError {}
 #[derive(Debug, Deserialize)]
 struct SenseVoiceStreamLine {
+    #[serde(default)]
     event: String,
     #[serde(default)]
     index: usize,
@@ -1077,6 +1078,12 @@ fn decode_stdout_line(raw: &[u8]) -> String {
     String::from_utf8_lossy(raw).trim().to_string()
 }
 
+/// 清理 SenseVoice 输出的前置与后置特殊标记，如 `<|zh|><|NEUTRAL|><|Speech|><|withitn|>`
+pub fn clean_sensevoice_tags_rs(text: &str) -> String {
+    let re = regex::Regex::new(r"<\|.*?\|>").unwrap();
+    re.replace_all(text, "").trim().to_string()
+}
+
 /// 把 runner stderr 的原始字节解成文本（多编码兜底，永不失败）。
 ///
 /// sherpa-onnx 的 C++ 日志直接 `write(2)` 到 fd 2，编码随系统区域设置（中文 Windows 上常见
@@ -1174,6 +1181,26 @@ fn apply_stream_event(
         "provider" => summary
             .provider_reports
             .push((parsed.requested.clone(), parsed.actual.clone())),
+        // 兼容原生 sherpa-onnx 独立程序输出（无 event 字段，但直接带有 text）
+        "" if !parsed.text.is_empty() => {
+            let clean = clean_sensevoice_tags_rs(&parsed.text);
+            if !clean.is_empty() {
+                summary.segments.push(Segment {
+                    index: summary.segments.len() + 1,
+                    start: parsed.start,
+                    end: parsed.end,
+                    text: clean.clone(),
+                    translation: None,
+                    translation_lang: None,
+                    polished: clean,
+                    language: None,
+                    confidence: None,
+                    speaker: None,
+                    speaker_name: None,
+                    words: Vec::new(),
+                });
+            }
+        }
         // 未知事件一律忽略：协议只增不改，旧引擎遇到新事件必须安全跳过。
         _ => {}
     }
@@ -1209,6 +1236,22 @@ fn consume_stdout<R: std::io::BufRead>(
                         apply_stream_event(&mut summary, parsed, progress_cb);
                     }
                     Err(err) => {
+                        // 兜底尝试原生 sherpa-onnx 独立执行体输出（如 {"text": "..."}）
+                        if let Ok(native_val) = serde_json::from_str::<serde_json::Value>(&line) {
+                            if let Some(txt) = native_val.get("text").and_then(|t| t.as_str()) {
+                                let clean = clean_sensevoice_tags_rs(txt);
+                                if !clean.is_empty() {
+                                    summary.parsed_lines += 1;
+                                    summary.segments.push(Segment::new(
+                                        summary.segments.len() + 1,
+                                        0.0,
+                                        0.0,
+                                        clean,
+                                    ));
+                                    continue;
+                                }
+                            }
+                        }
                         // runner 协议是逐行 JSON：解不开的行以前被完全静默地丢掉，版本不匹配
                         // 时用户只会看到「一句都没有」。只报首条（带截断预览）避免刷屏，
                         // 收尾按 `stdout_verdict` 定性。
@@ -2211,5 +2254,20 @@ mod tests {
             !engine.output_truncated(),
             "reset（每轮任务开始调用）必须清掉上一轮的截断标记"
         );
+    }
+
+    #[test]
+    fn clean_sensevoice_tags_removes_all_special_tokens() {
+        let raw = "<|zh|><|NEUTRAL|><|Speech|><|withitn|>今天天气很好<|withitn|>";
+        assert_eq!(clean_sensevoice_tags_rs(raw), "今天天气很好");
+    }
+
+    #[test]
+    fn consume_stdout_parses_native_sherpa_output() {
+        let native_line = "{\"text\":\"<|zh|><|NEUTRAL|>原生测试识别内容\"}\n".as_bytes();
+        let mut cursor = std::io::Cursor::new(native_line.to_vec());
+        let summary = consume_stdout(&mut cursor, None);
+        assert_eq!(summary.segments.len(), 1);
+        assert_eq!(summary.segments[0].text, "原生测试识别内容");
     }
 }

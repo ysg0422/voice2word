@@ -1158,12 +1158,12 @@ pub fn build_replace_audio_args(
     ];
 
     if bgm_volume <= 0.001 {
-        // 纯替换音轨，无需重新编码视频
+        // 纯替换音轨，无需重新编码视频（带 ? 容忍纯音频或无视频流输入）
         args.extend([
             "-map".into(),
-            "0:v:0".into(),
+            "0:v:0?".into(),
             "-map".into(),
-            "1:a:0".into(),
+            "1:a:0?".into(),
             "-c:v".into(),
             "copy".into(),
             "-c:a".into(),
@@ -1180,7 +1180,7 @@ pub fn build_replace_audio_args(
         );
         args.extend([
             "-map".into(),
-            "0:v:0".into(),
+            "0:v:0?".into(),
             "-filter_complex".into(),
             filter.into(),
             "-map".into(),
