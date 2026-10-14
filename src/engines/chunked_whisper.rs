@@ -264,6 +264,14 @@ pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment>
                     }
                     if seg.start < prev.end {
                         seg.start = prev.end;
+                        for w in &mut seg.words {
+                            if w.start < seg.start {
+                                w.start = seg.start;
+                            }
+                            if w.end <= w.start {
+                                w.end = (w.start + 0.05).min(seg.end);
+                            }
+                        }
                     }
                     if seg.end - seg.start < 0.12 {
                         continue;

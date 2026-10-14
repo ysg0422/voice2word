@@ -2022,12 +2022,15 @@ impl MainWindow {
         let configured_cli =
             crate::utils::AppConfig::resolve_path(&self.state.config.paths.whisper_cli);
         let has_cli = configured_cli.is_file()
-            || crate::utils::AppConfig::resolve_path("tools/whisper-cuda/whisper-cli.exe")
-                .is_file()
+            || crate::utils::AppConfig::resolve_path("tools/whisper-cli.exe").is_file()
             || crate::utils::AppConfig::resolve_path(
                 "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe",
             )
-            .is_file();
+            .is_file()
+            || crate::utils::AppConfig::resolve_path("tools/whisper-vulkan/whisper-cli.exe")
+                .is_file()
+            || crate::utils::AppConfig::resolve_path("tools/whisper-cuda/whisper-cli.exe")
+                .is_file();
 
         if !has_cli {
             let sv_ready = self.state.model_is_present("sensevoice-model");

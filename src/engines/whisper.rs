@@ -744,10 +744,12 @@ impl WhisperEngine {
             self.cli_path.clone()
         } else if is_default_layout {
             let candidates = [
-                crate::utils::AppConfig::resolve_path("tools/whisper-cuda/whisper-cli.exe"),
+                crate::utils::AppConfig::resolve_path("tools/whisper-cli.exe"),
                 crate::utils::AppConfig::resolve_path(
                     "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe",
                 ),
+                crate::utils::AppConfig::resolve_path("tools/whisper-vulkan/whisper-cli.exe"),
+                crate::utils::AppConfig::resolve_path("tools/whisper-cuda/whisper-cli.exe"),
             ];
             candidates
                 .into_iter()
