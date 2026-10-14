@@ -3595,10 +3595,15 @@ impl MainWindow {
         cancel_flag.store(false, std::sync::atomic::Ordering::SeqCst);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(f64, String)>();
+        // 部分结果回传槽：在线链路整片中终止前会把已译好的部分放进这里。任务期间
+        // `segments` 已被移进引擎，失败分支若不预留这个槽，本次已算好、已计费的
+        // 译文就会随一次网络抖动全部作废。
+        let partial_sink = crate::engines::translate::PartialSink::default();
+        let partial_sink_for_task = partial_sink.clone();
 
         cx.spawn(async move |this, cx| {
             let handle = cx.background_executor().spawn(async move {
-                let translate_engine = match mode {
+                let mut translate_engine = match mode {
                     crate::engines::TranslateMode::OnlineApi => {
                         crate::engines::TranslateEngine::online(online_cfg)
                     }
@@ -3613,6 +3618,7 @@ impl MainWindow {
                         crate::engines::TranslateEngine::offline(llm_engine)
                     }
                 };
+                translate_engine.set_partial_sink(partial_sink_for_task);
                 let tx_clone = tx.clone();
                 translate_engine.translate_subtitles(
                     segments,
@@ -3714,6 +3720,25 @@ impl MainWindow {
                         // 会返回带真实原因的 Err（见 engines 的 fail-fast），这里把它
                         // 失败统一走 `note_translate_failure`：它在没有转写在跑时才占用
                         // 全局 `ProcessStatus::Failed` 横幅，避免翻译失败把转写进度态冲掉。
+                        //
+                        // 但「整片中终止」不等于「本次一无所获」：在线链路按 token 计费，
+                        // 中止前往往已经译好若干批。先把那份**部分结果**合并回字幕表
+                        // （有就合并、没有就保持原样），再照旧报错——一次网络抖动不该让
+                        // 本次已计费的部分译文全部作废。
+                        let partial = {
+                            let mut slot = partial_sink
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            slot.take()
+                        };
+                        if let Some(segs) = partial {
+                            if segs.iter().any(|s| s.has_translation()) {
+                                info!("翻译中止，合并本次已译出的部分译文");
+                                this.state.merge_translations(segs);
+                                this.state.segments_dirty = true;
+                                this.state.flush_segments_if_dirty();
+                            }
+                        }
                         tracing::warn!("字幕多语言翻译过程报错：{}", e);
                         let msg = format!("翻译失败：{e}");
                         // 统一收口（见 AppState::note_translate_failure）：转写进行中

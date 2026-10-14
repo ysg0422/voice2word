@@ -14,8 +14,8 @@ use anyhow::{anyhow, Result};
 use tracing::{debug, info, warn};
 
 use crate::engines::llm::{
-    chinese_variant_target, convert_chinese_variant, is_untranslated_copy, validate_translation,
-    CopyRate, RewriteStats, RewriteVerdict, REFLECT_PROMPT,
+    chinese_variant_target, convert_chinese_variant, validate_translation, CopyRate, RewriteStats,
+    RewriteVerdict, REFLECT_PROMPT,
 };
 use crate::engines::LLMEngine;
 use crate::subtitle::Segment;
@@ -66,6 +66,23 @@ pub struct OnlineApiConfig {
     /// 术语表提示（由 `TranslateConfig::glossary_prompt` 生成，空串表示无）。
     /// 离线与在线两条链路共用同一份注入文本。
     pub glossary_hint: String,
+}
+
+/// 部分结果回传槽：在线链路在**整片中终止**前把已写回的译文放进这里。
+///
+/// 在线翻译按 token 计费，一次任务可能已经跑完好几十批。整片中止（配置错误、
+/// 质量异常）时若不回传这部分结果，一次故障就会让本次已算好、已计费的部分全部作废。
+/// 界面在失败分支读它并合并回字幕表（见 `ui::actions`）。
+pub type PartialSink = Arc<Mutex<Option<Vec<Segment>>>>;
+
+/// 把当前进度下的译文存进部分结果槽（供失败分支合并）。
+///
+/// 只做**克隆**：调用点上往往还借着 `segments`（例如持有 `batch: Vec<&Segment>`），
+/// 移动所有权会与借用冲突；错误路径本就罕见，拷贝几百条 `Segment` 的代价可忽略。
+fn stash_partial(sink: Option<&PartialSink>, segments: &[Segment]) {
+    if let Some(sink) = sink {
+        *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(segments.to_vec());
+    }
 }
 
 /// 在线模型能力画像：是否为「推理模型」（先输出思考、再输出译文）。
@@ -122,6 +139,8 @@ pub struct TranslateEngine {
     /// `translate_via_online_api_with_stats` 直接给出；用 `Mutex` 是因为引擎挂在
     /// `Arc` 后面共享、写回时拿不到 `&mut self`。
     rewrite_stats: Mutex<RewriteStats>,
+    /// 在线链路整片中终止时的部分结果回传槽；未设置时为 `None`（离线链路不使用）。
+    partial_sink: Option<PartialSink>,
 }
 
 impl TranslateEngine {
@@ -136,6 +155,7 @@ impl TranslateEngine {
             llm_engine: Some(llm_engine),
             online: None,
             rewrite_stats: Mutex::new(RewriteStats::default()),
+            partial_sink: None,
         }
     }
 
@@ -145,6 +165,7 @@ impl TranslateEngine {
             llm_engine: None,
             online: Some(config),
             rewrite_stats: Mutex::new(RewriteStats::default()),
+            partial_sink: None,
         }
     }
 
@@ -160,6 +181,12 @@ impl TranslateEngine {
     /// 写回本次翻译的校验自愈统计。
     fn store_rewrite_stats(&self, stats: RewriteStats) {
         *self.rewrite_stats.lock().unwrap_or_else(|e| e.into_inner()) = stats;
+    }
+
+    /// 设置部分结果回传槽：在线链路整片中终止前会把已译好的部分存进这里，
+    /// 让界面失败时仍能合并已计费的结果（见 [`PartialSink`] 与 `ui::actions`）。
+    pub fn set_partial_sink(&mut self, sink: PartialSink) {
+        self.partial_sink = Some(sink);
     }
 
     /// 批量翻译字幕片段为目标语言（默认 "简体中文"）
@@ -235,6 +262,7 @@ impl TranslateEngine {
                     target_lang,
                     progress_cb,
                     cancel,
+                    self.partial_sink.as_ref(),
                 )?;
                 self.store_rewrite_stats(stats);
                 Ok(translated)
@@ -302,7 +330,7 @@ fn translate_via_online_api(
     progress_cb: Option<crate::engines::TextProgressCb>,
     cancel: Arc<AtomicBool>,
 ) -> Result<Vec<Segment>> {
-    translate_via_online_api_with_stats(cfg, segments, target_lang, progress_cb, cancel)
+    translate_via_online_api_with_stats(cfg, segments, target_lang, progress_cb, cancel, None)
         .map(|(segments, _stats)| segments)
 }
 
@@ -314,6 +342,7 @@ fn translate_via_online_api_with_stats(
     target_lang: &str,
     progress_cb: Option<crate::engines::TextProgressCb>,
     cancel: Arc<AtomicBool>,
+    partial: Option<&PartialSink>,
 ) -> Result<(Vec<Segment>, RewriteStats)> {
     if cfg.api_key.trim().is_empty() {
         return Err(anyhow!(
@@ -382,7 +411,25 @@ fn translate_via_online_api_with_stats(
     // P0-C：单批源文本预算必须扣掉**每批重复注入**的固定开销——system 提示词模板
     // （含源语言线索与术语表）。术语表理论上限约 9.7k 字符，不扣就会顶爆小上下文
     // 服务端（400）或让输出被截断。
-    let char_budget = online_char_budget(online_fixed_chars(&cfg.glossary_hint, ""));
+    //
+    // 固定开销**本身就超窗**时（术语表一大就必然如此），预算会顶到下限，组出来的批
+    // 是「超长提示词 + 极小 max_tokens」——服务端必然回 400，而 400 又会被判 Fatal
+    // 让整片第一批就中止。这里先裁术语表再发，而不是硬着头皮发一个注定被拒的请求。
+    // 本地克隆一份配置：裁过的术语表要真的用于本轮的提示词注入。
+    let mut cfg = cfg.clone();
+    let budget = online_char_budget(online_fixed_chars(&cfg.glossary_hint, ""));
+    if budget.oversubscribed {
+        let (fitted, trimmed) = fit_glossary_to_window(&cfg.glossary_hint, "");
+        if trimmed {
+            warn!(
+                original_chars = cfg.glossary_hint.chars().count(),
+                fitted_chars = fitted.chars().count(),
+                "术语表过长，已按顺序裁剪到预算内（固定开销本身超窗，不裁则每次请求都会被服务端拒为 400）"
+            );
+            cfg.glossary_hint = fitted;
+        }
+    }
+    let char_budget = online_char_budget(online_fixed_chars(&cfg.glossary_hint, "")).char_budget;
 
     // P0-2：推理模型的思考 token 与译文共享 `max_tokens`，必须缩批 + 加大预算。
     // `profile` 在整片翻译内共享：首批响应里出现非空 `reasoning_content` 即判定
@@ -404,7 +451,7 @@ fn translate_via_online_api_with_stats(
         // 都会让「整片翻译」前功尽弃。重试有上限，超限后跳过本批继续后面的句子，
         // 把已经译好的部分保住（与取消时的语义一致：返回偏序结果而非丢弃）。
         let translations = match request_batch_with_retry(
-            cfg,
+            &cfg,
             &batch,
             target_lang,
             &cancel,
@@ -426,10 +473,33 @@ fn translate_via_online_api_with_stats(
                 // 其余一律按「本批软失败」处理并继续后面的句子：重试用尽（429/网络）
                 // 与确定性的单批失败（推理模型的思考吃光输出预算）都只坏这一批，
                 // 没有理由把前面已经译好的句子一起丢掉。
-                if classify_batch_error(&err) == BatchErrorAction::Fatal {
-                    return Err(err).map_err(|e| {
-                        anyhow!("在线翻译中止：{e}。请检查「性能设置 → 在线翻译 API」的地址、密钥与模型名。")
-                    });
+                match classify_batch_error(&err) {
+                    BatchErrorAction::Fatal => {
+                        // 中止前先把已译好的部分存进回传槽：界面失败分支会合并它，
+                        // 不让本次已算好、已计费的译文随中止一起作废。
+                        stash_partial(partial, &segments);
+                        return Err(err).map_err(|e| {
+                            anyhow!("在线翻译中止：{e}。请检查「性能设置 → 在线翻译 API」的地址、密钥与模型名。")
+                        });
+                    }
+                    // 因长度被拒（400/413 且错误体提示上下文/长度）：折半后重发。
+                    // 术语表 + 长行的组合顶爆上下文时，把一批拆小是最直接的出路——
+                    // 整片中止或整片跳过都会白丢这一批本可译出的句子。
+                    BatchErrorAction::HalveBatch if chunk.len() > 1 => {
+                        let half = chunk.len().div_ceil(2);
+                        warn!(
+                            batch = chunk.len(),
+                            "在线翻译本批因长度被拒（400/413），折半后重发"
+                        );
+                        let parts: Vec<Vec<usize>> =
+                            chunk.chunks(half).map(|c| c.to_vec()).collect();
+                        // 保序插回队首：先插后半批，前半批最终排在队首。
+                        for part in parts.into_iter().rev() {
+                            queue.push_front(part);
+                        }
+                        continue;
+                    }
+                    _ => {}
                 }
                 last_batch_error = Some(err.to_string());
                 soft_failed_batches += 1;
@@ -499,6 +569,12 @@ fn translate_via_online_api_with_stats(
         // 反思重试（**最多一次**）：只把可疑句重问一遍，要求最小必要改动；拿回结果后
         // 再过一遍校验，仍不合格就保持未译（与既有「未翻译」口径一致）。
         if !suspect_candidates.is_empty() {
+            // 取消复核：主请求已经返回，但用户可能在这期间点了取消。反思请求同样是
+            // **付费**请求，取消后不得再发（对照：折半路径与退避等待都有查取消）。
+            if cancel.load(Ordering::Relaxed) {
+                info!("在线翻译被取消，跳过对可疑句的反思重试");
+                break;
+            }
             let triples: Vec<(usize, String, String)> = suspect_candidates
                 .iter()
                 .map(|&pos| {
@@ -513,7 +589,7 @@ fn translate_via_online_api_with_stats(
                 })
                 .collect();
             heal.reflect_calls += 1;
-            match request_reflect_translation(cfg, &triples, target_lang, &profile) {
+            match request_reflect_translation(&cfg, &triples, target_lang, &profile, &cancel) {
                 Ok(healed) => {
                     for &pos in &suspect_candidates {
                         let source = segments[pos].translate_source();
@@ -554,8 +630,14 @@ fn translate_via_online_api_with_stats(
                 // 可疑句已走过「反思重试一次」的额度，不再进入折半重试（否则等于无限重试）。
                 .filter(|pos| !suspect_candidates.contains(pos))
                 .collect();
-            let recovered =
-                retry_missing_online(cfg, &mut segments, &missing, target_lang, &cancel, &profile);
+            let recovered = retry_missing_online(
+                &cfg,
+                &mut segments,
+                &missing,
+                target_lang,
+                &cancel,
+                &profile,
+            );
             if recovered < missing.len() {
                 soft_failed_batches += 1;
                 warn!(
@@ -600,6 +682,7 @@ fn translate_via_online_api_with_stats(
                 "在线翻译复制率过高（{:.0}%）：译文与原文相同，疑似模型未真正翻译",
                 copy.rate() * 100.0
             );
+            stash_partial(partial, &segments);
             return Err(anyhow!(
                 "在线翻译质量异常：{}/{} 句译文与原文完全相同（复制率 {:.0}%），已按「未译出」处理。请检查模型是否适合该目标语言（可换更大的模型）。",
                 copy.rejected,
@@ -612,6 +695,7 @@ fn translate_via_online_api_with_stats(
                 .as_deref()
                 .map(|e| format!("最后一批的失败原因：{e}。"))
                 .unwrap_or_default();
+            stash_partial(partial, &segments);
             return Err(anyhow!(
                 "在线翻译未能译出任何一句（共 {pending_total} 句待译）。{reason}请用「性能设置 → 在线翻译 API → 测试连接」检查地址、密钥与模型名。"
             ));
@@ -676,13 +760,23 @@ fn retry_missing_online(
                 Ok(map) => {
                     for &pos in sub {
                         if let Some(text) = map.get(&segments[pos].index) {
-                            // 折半后仍原样复制 → 就是没译出：保持未译，计入软失败。
-                            if is_untranslated_copy(&segments[pos].translate_source(), text) {
-                                still.push(pos);
-                            } else {
+                            // 与主路径**用同一条校验**（`validate_translation`）。主路径有
+                            // 三档拒收（一字不差 / 相似度 ≥0.97 的近似复制 / 长度失控），
+                            // 折半路径此前只判「完全等于原文」，于是「改一个功能字 / 加个
+                            // 标点 / 扩写」的近似复制会**静默写进用户字幕**，还绕过了复制率
+                            // 兜底。这里复用同一判据：非 Ok 一律保持未译。
+                            if validate_translation(&segments[pos].translate_source(), text)
+                                == RewriteVerdict::Ok
+                            {
                                 segments[pos].translation = Some(text.clone());
                                 segments[pos].translation_lang = Some(target_lang.to_string());
                                 recovered += 1;
+                            } else {
+                                debug!(
+                                    index = segments[pos].index,
+                                    "折半补译结果未通过输出校验，保持未译"
+                                );
+                                still.push(pos);
                             }
                         } else {
                             still.push(pos);
@@ -773,26 +867,37 @@ fn request_batch_with_retry(
 /// 只坏在这一批，没有理由把前面已经译好的几百句一起丢掉。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchErrorAction {
-    /// 暂时性（限流 / 5xx / 网络抖动 / 空响应）：原样重发就有机会成功。
+    /// 暂时性（限流 / 5xx / 网络抖动 / 空响应 / 响应体读不出）：原样重发就有机会成功。
     Retry,
     /// 只坏这一批、且重发必然同样（推理模型的输出预算被思考吃光）：
     /// 跳过本批继续后面的句子，保住已完成的部分。
     SkipBatch,
-    /// 配置/参数类（401/403/404、非法 JSON、取消）：后面的批会以同样的原因失败，
+    /// 请求因**过长**被服务端拒绝（400/413 且错误体提示上下文/长度）：折半后重发。
+    /// 术语表一大、单批就必然超窗；整片中止或静默跳过都会白丢已译好的部分。
+    HalveBatch,
+    /// 配置/参数类（401/403/404、与长度无关的 400、取消）：后面的批会以同样的原因失败，
     /// 立刻带着真实原因中止，免得把配置错误伪装成「翻译完成 0 句」。
     Fatal,
 }
 
-/// 单批失败该怎么处置：重试、跳过本批，还是中止整片。
+/// 单批失败该怎么处置：重试、折半、跳过本批，还是中止整片。
 fn classify_batch_error(err: &anyhow::Error) -> BatchErrorAction {
     let msg = err.to_string();
-    // 优先按真实状态码判断。不能直接 `contains("HTTP 5")`：因为错误文案里还拼了服务端的
+    // 「拿到了响应但读不出 body / JSON」「body 为空」「连接被中断」这几类是我们自己发的
+    // 文案，**没有明确的 4xx 业务语义**，全是暂时性的传输问题。必须**先**判：解析失败
+    // 文案里带响应体片段，片段里若恰好出现「HTTP 400」之类字样，会被下面的状态码分支
+    // 误判成 Fatal，把一次响应异常升级成整片中止。
+    if is_response_body_failure(&msg) {
+        return BatchErrorAction::Retry;
+    }
+    // 再按真实状态码判断。不能直接 `contains("HTTP 5")`：因为错误文案里还拼了服务端的
     // 响应体（snippet），一个 4xx 的响应体若恰好提到了「HTTP 5xx」，就会被误判为可重试而白等退避。
     if let Some(code) = http_status_code(&msg) {
-        return if code == 429 || (500..=599).contains(&code) {
-            BatchErrorAction::Retry
-        } else {
-            BatchErrorAction::Fatal
+        return match code {
+            429 | 500..=599 => BatchErrorAction::Retry,
+            // 400/413 且错误体在抱怨长度：折半重发，绝不整片中止。
+            400 | 413 if is_length_rejection(&msg) => BatchErrorAction::HalveBatch,
+            _ => BatchErrorAction::Fatal,
         };
     }
     // 无状态码：ureq 的网络类错误，文案里带「无法连接」或底层 io 超时
@@ -808,6 +913,38 @@ fn classify_batch_error(err: &anyhow::Error) -> BatchErrorAction {
         return BatchErrorAction::SkipBatch;
     }
     BatchErrorAction::Fatal
+}
+
+/// 错误是否是「响应体读不出 / 为空 / 连接被中断」这类没有 4xx 业务语义的传输问题。
+fn is_response_body_failure(msg: &str) -> bool {
+    const MARKERS: [&str; 5] = [
+        "读取响应体失败",
+        "响应体超过上限",
+        "返回了空响应体",
+        "响应不是合法 UTF-8",
+        "不是合法 JSON",
+    ];
+    MARKERS.iter().any(|m| msg.contains(m))
+}
+
+/// 4xx 的响应体是否在抱怨「请求 / 上下文过长」。
+///
+/// 只认常见服务端措辞（英文小写比对 + 中文关键片），不做任何仅凭数字的猜测。
+fn is_length_rejection(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    const MARKERS: [&str; 10] = [
+        "too long",
+        "context length",
+        "context_length",
+        "maximum context",
+        "too many tokens",
+        "reduce the length",
+        "prompt is too",
+        "超过了最大",
+        "上下文长度",
+        "过长",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// 错误是否值得**原样重试**（[`BatchErrorAction::Retry`]）。
@@ -937,10 +1074,91 @@ fn online_fixed_chars(glossary: &str, src_hint: &str) -> usize {
     ONLINE_SYSTEM_PROMPT_CHARS + glossary.chars().count() + src_hint.chars().count()
 }
 
+/// 单批**最低**可用源文本预算。
+///
+/// 不能再低：低于这个数连一条正常字幕（几十字）都装不下，组出来的批必然是
+/// 「几乎全是提示词 + 极小正文」，服务端只会回 400。固定开销大到连它都塞不下时
+/// 应当**先裁术语表**（见 [`fit_glossary_to_window`]），而不是把预算压到 0。
+const MIN_ONLINE_CHAR_BUDGET: usize = 1_024;
+
+/// 在线链路单批的预算判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OnlineBudget {
+    /// 单批可用源文本字符预算（含 `[序号] ` 前缀），始终 ≥ [`MIN_ONLINE_CHAR_BUDGET`]。
+    char_budget: usize,
+    /// 固定开销（提示词模板 + 术语表 + 语言线索）是否已经**吃满** [`ONLINE_CHAR_CAP`]。
+    /// 为真时无论怎么切批都必然超窗，调用方必须先裁术语表再发请求。
+    oversubscribed: bool,
+}
+
 /// 在线链路单批的**可用源文本字符预算**：从 [`ONLINE_CHAR_CAP`] 里扣掉
-/// [`online_fixed_chars`] 算出的固定开销。
-fn online_char_budget(fixed_chars: usize) -> usize {
-    ONLINE_CHAR_CAP.saturating_sub(fixed_chars).max(1_024)
+/// [`online_fixed_chars`] 算出的固定开销，并报告固定开销是否已经超窗。
+fn online_char_budget(fixed_chars: usize) -> OnlineBudget {
+    OnlineBudget {
+        char_budget: ONLINE_CHAR_CAP
+            .saturating_sub(fixed_chars)
+            .max(MIN_ONLINE_CHAR_BUDGET),
+        oversubscribed: fixed_chars >= ONLINE_CHAR_CAP,
+    }
+}
+
+/// 把术语表裁到**能放进预算**：保留前面的条目（用户优先写的），必要时截断最后一条。
+///
+/// 返回（裁剪后的术语表，是否发生裁剪）。已经放得下时原样返回。
+///
+/// 术语表是**每批重复注入**的固定开销，而 `config.rs` 允许上千条 × 60 字符，远超
+/// [`ONLINE_CHAR_CAP`]。此时唯一的出路是**先裁它**——否则组出来的批必然是「超长提示词 +
+/// 小 max_tokens」，服务端回 400。裁剪按「用户书写顺序」保留（前面的条目对用户更
+/// 重要），最后一条按字符截断。
+fn fit_glossary_to_window(glossary: &str, src_hint: &str) -> (String, bool) {
+    // 设术语表占 g 字符：固定开销 = 模板 + g + 语言线索。要求裁完仍给正文留
+    // MIN_ONLINE_CHAR_BUDGET，故 g ≤ CAP − MIN − 模板 − 线索。
+    let room = ONLINE_CHAR_CAP.saturating_sub(
+        ONLINE_SYSTEM_PROMPT_CHARS + src_hint.chars().count() + MIN_ONLINE_CHAR_BUDGET,
+    );
+    if glossary.chars().count() <= room {
+        return (glossary.to_string(), false);
+    }
+    // `glossary_prompt()` 形如 `前缀：条目；条目。`；按 `；` 切条目，保住前缀。
+    let (head, body) = match glossary.split_once('：') {
+        Some((h, b)) => (format!("{h}："), b),
+        None => (String::new(), glossary),
+    };
+    let body = body.strip_suffix('。').unwrap_or(body);
+    let mut kept = String::new();
+    let mut used = head.chars().count();
+    if used <= room {
+        kept.push_str(&head);
+    } else {
+        // 连前缀都放不下（极端配置）：截断前缀，至少别产出空提示。
+        kept.extend(head.chars().take(room));
+        used = room;
+    }
+    for (i, entry) in body.split('；').enumerate() {
+        let sep = usize::from(i > 0);
+        let entry_chars = entry.chars().count();
+        if used + sep + entry_chars <= room {
+            if sep == 1 {
+                kept.push('；');
+            }
+            kept.push_str(entry);
+            used += sep + entry_chars;
+        } else {
+            // 放不下整条：按字符截断这一条，别把整条丢掉。
+            let take = room.saturating_sub(used + sep);
+            if take > 0 {
+                if sep == 1 {
+                    kept.push('；');
+                }
+                kept.extend(entry.chars().take(take));
+            }
+            break;
+        }
+    }
+    if room > 0 {
+        kept.push('。');
+    }
+    (kept, true)
 }
 
 /// 一条字幕译文大致需要的输出 token（本地 Qwen2.5 实测中→英约 0.84 token/字符，
@@ -1192,7 +1410,13 @@ fn request_reflect_translation(
     suspects: &[(usize, String, String)],
     target_lang: &str,
     profile: &ModelProfile,
+    cancel: &AtomicBool,
 ) -> Result<HashMap<usize, String>> {
+    // 取消复核（与主请求同款）：主请求返回后用户可能已点取消，反思请求也是付费请求，
+    // 取消后**不得**再发。放在拼 payload 之前，确保一个字节都不发出去。
+    if cancel.load(Ordering::Relaxed) {
+        return Err(anyhow!("在线翻译已取消，跳过反思重试"));
+    }
     let mut user = String::new();
     for (index, original, previous) in suspects {
         user.push_str(&format!(
@@ -1311,6 +1535,57 @@ fn finish_reason_is_length(value: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// 成功响应体的读取**字节上限**。
+///
+/// 错误分支此前就有上限（只取前 300 字符），成功分支却用 `into_json()` 把整个响应读进
+/// 内存。没有 `Content-Length` 的响应（分块传输 / 网关流 / 失控的上游）能一直吐字节，
+/// 足够把进程内存撑爆。正常 `chat/completions` 响应远小于此值。
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// 读响应体，带字节上限。
+///
+/// `ureq::Response::into_json()` 会把**所有**读取失败折成同一句「Failed to read JSON」，
+/// 于是「连接被中途掐断 / 分块传输断了」与「服务端真的回了非法 JSON」在错误串里无法区分。
+/// 这里自己读字节：
+/// - 读取本身失败 → 「读取响应体失败（连接被中断或超时）」，判**可重试**；
+/// - 超过 [`MAX_RESPONSE_BYTES`] → 明确超限，同样按可重试的暂时性故障处理。
+fn read_response_body(resp: ureq::Response) -> Result<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(MAX_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| anyhow!("在线接口读取响应体失败（连接被中断或超时）: {e}"))?;
+    if buf.len() > MAX_RESPONSE_BYTES {
+        return Err(anyhow!(
+            "在线接口响应体超过上限（>{MAX_RESPONSE_BYTES} 字节），已放弃该响应"
+        ));
+    }
+    String::from_utf8(buf)
+        .map_err(|e| anyhow!("在线接口读取响应体失败（响应不是合法 UTF-8 文本）: {e}"))
+}
+
+/// 解析响应体 JSON。空体 / 非 JSON 都在错误里带上响应体片段，便于排查。
+///
+/// 这类失败**没有明确的 4xx 业务语义**：拿到的是 WAF 页、半截 body（连接被掐断）或
+/// 空 body，都是暂时性的传输问题。分类为可重试（见 [`classify_batch_error`]），
+/// 绝不能因为一次响应异常就把整片已译好的任务作废。
+fn parse_response_json(body: &str) -> Result<serde_json::Value> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "在线接口返回了空响应体（HTTP 200 但 body 为空，可能是网关/WAF 拦截或连接被截断）"
+        ));
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed).map_err(|e| {
+        let snippet: String = trimmed.chars().take(160).collect();
+        anyhow!(
+            "在线接口响应不是合法 JSON: {e}；响应体前 {} 字符：{snippet}",
+            snippet.chars().count()
+        )
+    })
+}
+
 /// 统一 POST 到 `/chat/completions` 并解析 JSON 响应体
 ///
 /// 除翻译链路外，无头模式的「工具调用」入口也复用它：超时、鉴权、错误文案
@@ -1335,12 +1610,13 @@ pub(crate) fn post_chat_completions(
         .send_json(payload.clone());
 
     match response {
-        Ok(resp) => resp
-            .into_json::<serde_json::Value>()
-            .map_err(|e| anyhow!("在线接口响应不是合法 JSON: {e}")),
+        // 拿到了响应：再读体、再解析。任何「读不出 JSON」都单独成类（可重试），
+        // 而不与 401/403/404 这类明确的业务错误混在一起。
+        Ok(resp) => read_response_body(resp).and_then(|body| parse_response_json(&body)),
         Err(ureq::Error::Status(code, resp)) => {
-            // 4xx/5xx 的响应体通常带服务端的错误说明，原样透出便于排查
-            let body = resp.into_string().unwrap_or_default();
+            // 4xx/5xx 的响应体通常带服务端的错误说明，原样透出便于排查。
+            // 同样带字节上限：错误页也可能是超大响应。
+            let body = read_response_body(resp).unwrap_or_default();
             let snippet: String = body.chars().take(300).collect();
             let hint = match code {
                 401 | 403 => "（API Key 无效或无权限）",
@@ -1618,7 +1894,9 @@ mod tests {
         assert!(!is_retryable(&anyhow!(
             "在线接口返回 HTTP 404（接口地址或模型名不存在）"
         )));
-        assert!(!is_retryable(&anyhow!(
+        // 「拿到了响应但读不出 JSON」没有 4xx 业务语义（响应体可能是 WAF 页 / 半截
+        // body）→ 可重试。回归：此前它落进 Fatal，一次响应异常就作废了整片已译内容。
+        assert!(is_retryable(&anyhow!(
             "在线接口响应不是合法 JSON: expected value"
         )));
         // 4xx 的响应体里提到「HTTP 5xx」时不得被误判为可重试（只看真实状态码）
@@ -1667,7 +1945,6 @@ mod tests {
             "在线接口返回 HTTP 401（API Key 无效或无权限）: unauthorized",
             "在线接口返回 HTTP 403（API Key 无效或无权限）",
             "在线接口返回 HTTP 404（接口地址或模型名不存在）",
-            "在线接口响应不是合法 JSON: expected value",
             "在线接口返回 HTTP 400: upstream said HTTP 500, bad request",
         ] {
             assert_eq!(classify_batch_error(&anyhow!("{msg}")), Fatal, "{msg}");
@@ -1844,6 +2121,7 @@ mod tests {
             "English",
             None,
             Arc::new(AtomicBool::new(false)),
+            None,
         )
         .expect("mock 服务器应返回成功");
 
@@ -2485,14 +2763,19 @@ mod tests {
     #[test]
     fn online_char_budget_shrinks_with_glossary() {
         let base = online_char_budget(0);
-        assert_eq!(base, ONLINE_CHAR_CAP);
+        assert_eq!(base.char_budget, ONLINE_CHAR_CAP);
+        assert!(!base.oversubscribed, "无固定开销时不该超窗");
         let with_glossary = online_char_budget(2_000);
         assert!(
-            with_glossary < base,
-            "术语表开销必须压缩在线预算: {with_glossary} vs {base}"
+            with_glossary.char_budget < base.char_budget,
+            "术语表开销必须压缩在线预算: {} vs {}",
+            with_glossary.char_budget,
+            base.char_budget
         );
-        // 术语表长到超过上限时也不能归零（留最小可用批）
-        assert!(online_char_budget(50_000) >= 1_024);
+        // 术语表长到超过上限时也不能归零（留最小可用批），并且必须报告「超窗」
+        let huge = online_char_budget(50_000);
+        assert!(huge.char_budget >= MIN_ONLINE_CHAR_BUDGET);
+        assert!(huge.oversubscribed, "固定开销吃满窗口必须报告超窗");
     }
 
     /// 术语表很长时，在线批次应收缩到「固定开销 + 本批 + 输出」仍能放进上下文。
@@ -2503,11 +2786,12 @@ mod tests {
             .collect();
         let pending: Vec<usize> = (0..60).collect();
 
-        let no_glossary = plan_online_batches(&pending, &segs, 40, online_char_budget(0));
+        let no_glossary =
+            plan_online_batches(&pending, &segs, 40, online_char_budget(0).char_budget);
         let huge = "术语表（以下词条必须按给定译法翻译，不得改写）：".to_string()
             + &"甲=乙；".repeat(1_000);
         let fixed = online_fixed_chars(&huge, "");
-        let budget = online_char_budget(fixed);
+        let budget = online_char_budget(fixed).char_budget;
         let with_glossary = plan_online_batches(&pending, &segs, 40, budget);
 
         assert!(
@@ -2967,6 +3251,305 @@ mod tests {
             mt >= REASONING_THINKING_TOKENS,
             "重试必须给足推理预算: {mt}"
         );
+    }
+
+    /// 回归：拿到 200 却读不出 JSON（WAF 页 / 半截 body）、空响应体、连接被中断，
+    /// 这几类都**没有** 4xx 业务语义 → 必须判可重试，绝不能升级成整片中止。
+    #[test]
+    fn response_body_failures_classify_as_retryable() {
+        use BatchErrorAction::{Fatal, HalveBatch, Retry};
+        for msg in [
+            "在线接口返回了空响应体（HTTP 200 但 body 为空，可能是网关/WAF 拦截或连接被截断）",
+            "在线接口响应不是合法 JSON: expected value at line 1；响应体前 5 字符：<html",
+            "在线接口读取响应体失败（连接被中断或超时）: unexpected end of file",
+            "在线接口响应体超过上限（>4194304 字节），已放弃该响应",
+        ] {
+            assert_eq!(classify_batch_error(&anyhow!("{msg}")), Retry, "{msg}");
+        }
+        // 解析失败文案里带响应体片段：片段里恰好出现「HTTP 400」时也不能被状态码
+        // 分支误判成 Fatal，把一次响应异常升级成整片中止。
+        assert_eq!(
+            classify_batch_error(&anyhow!(
+                "在线接口响应不是合法 JSON: expected value；响应体前 40 字符：<html>HTTP 400 Bad Request</html>"
+            )),
+            Retry
+        );
+        // 鉴权 / 地址 / 模型名错误仍然 Fatal，不能一股脑全改可重试。
+        for msg in [
+            "在线接口返回 HTTP 401（API Key 无效或无权限）: unauthorized",
+            "在线接口返回 HTTP 403（API Key 无效或无权限）",
+            "在线接口返回 HTTP 404（接口地址或模型名不存在）",
+            "在线接口返回 HTTP 400: bad request",
+        ] {
+            assert_eq!(classify_batch_error(&anyhow!("{msg}")), Fatal, "{msg}");
+        }
+        // 400/413 + 长度措辞 → 折半重发，而不是整片中止。
+        assert_eq!(
+            classify_batch_error(&anyhow!(
+                "在线接口返回 HTTP 400: This model's maximum context length is 8192 tokens, reduce the length of the messages"
+            )),
+            HalveBatch
+        );
+        assert_eq!(
+            classify_batch_error(&anyhow!("在线接口返回 HTTP 413: 请求体过长")),
+            HalveBatch
+        );
+    }
+
+    /// 端到端：第二批拿到 200 + 非 JSON 响应体时**不得**整片中止；重试 3 次后只跳过
+    /// 这一批，第一批已译好的句子必须保留（修前：一次坏响应 → Fatal → 整片作废）。
+    #[test]
+    fn online_non_json_body_does_not_abort_the_whole_run() {
+        let ok = serde_json::json!({ "choices": [{ "message": { "content": "[1] Hello." } }] })
+            .to_string();
+        let garbage = "<html><body>502 Bad Gateway</body></html>".to_string();
+        let (addr, seen) = spawn_mock_server_status(vec![
+            (200, ok),
+            (200, garbage.clone()),
+            (200, garbage.clone()),
+            (200, garbage),
+        ]);
+        let mut cfg = online_cfg_for(&addr);
+        cfg.batch_size = 1;
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "你好"),
+            Segment::new(2, 1.0, 2.0, "世界"),
+        ];
+        let out = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("响应体读不出是暂时性故障，不得整片中终止");
+        assert_eq!(out[0].translation.as_deref(), Some("Hello."));
+        assert!(out[1].translation.is_none(), "坏响应的那批应保持未译");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            4,
+            "第二批应按 MAX_BATCH_RETRIES 重试 3 次"
+        );
+    }
+
+    /// 端到端：HTTP 200 + 空响应体同样是暂时性传输故障 → 可重试、不整片中终止。
+    #[test]
+    fn online_empty_body_does_not_abort_the_whole_run() {
+        let ok = serde_json::json!({ "choices": [{ "message": { "content": "[1] Hello." } }] })
+            .to_string();
+        let (addr, _seen) = spawn_mock_server_status(vec![
+            (200, ok),
+            (200, String::new()),
+            (200, String::new()),
+            (200, String::new()),
+        ]);
+        let mut cfg = online_cfg_for(&addr);
+        cfg.batch_size = 1;
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "你好"),
+            Segment::new(2, 1.0, 2.0, "世界"),
+        ];
+        let out = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("空响应体不得整片中终止");
+        assert_eq!(out[0].translation.as_deref(), Some("Hello."));
+    }
+
+    /// 固定开销（术语表）本身就超窗时，预算函数必须报告；裁剪后必须能组出合法批。
+    #[test]
+    fn oversubscribed_glossary_is_trimmed_to_fit_window() {
+        let huge = "术语表（以下词条必须按给定译法翻译，不得改写）：".to_string()
+            + &"甲甲甲甲=乙乙乙乙；".repeat(1_000);
+        let budget = online_char_budget(online_fixed_chars(&huge, ""));
+        assert!(budget.oversubscribed, "固定开销吃满窗口时必须报告超窗");
+        assert!(budget.char_budget >= MIN_ONLINE_CHAR_BUDGET);
+
+        let (fitted, trimmed) = fit_glossary_to_window(&huge, "");
+        assert!(trimmed, "超窗时必须裁剪术语表");
+        assert!(fitted.chars().count() < huge.chars().count());
+        assert!(
+            fitted.starts_with("术语表（以下词条必须按给定译法翻译，不得改写）："),
+            "前缀必须保留: {fitted}"
+        );
+        let fitted_budget = online_char_budget(online_fixed_chars(&fitted, ""));
+        assert!(!fitted_budget.oversubscribed, "裁剪后不得再超窗");
+        assert!(fitted_budget.char_budget >= MIN_ONLINE_CHAR_BUDGET);
+
+        let segs: Vec<Segment> = (1..=20)
+            .map(|i| Segment::new(i, 0.0, 1.0, "字".repeat(120)))
+            .collect();
+        let pending: Vec<usize> = (0..20).collect();
+        let batches = plan_online_batches(&pending, &segs, 40, fitted_budget.char_budget);
+        assert!(!batches.is_empty());
+        for b in &batches {
+            let chars: usize = b
+                .iter()
+                .map(|&p| segs[p].translate_source().chars().count() + 6)
+                .sum();
+            assert!(
+                chars <= fitted_budget.char_budget,
+                "单批字符数应受预算约束: {chars} > {}",
+                fitted_budget.char_budget
+            );
+        }
+
+        // 放得下的术语表原样返回。
+        let small = "术语表（以下词条必须按给定译法翻译，不得改写）：甲=乙。";
+        let (kept, trimmed) = fit_glossary_to_window(small, "");
+        assert!(!trimmed);
+        assert_eq!(kept, small);
+    }
+
+    /// 端到端：超窗的术语表必须先被裁剪再注入请求，否则请求必然被服务端 400 拒绝。
+    #[test]
+    fn oversized_glossary_is_trimmed_before_request() {
+        let reply = serde_json::json!({ "choices": [{ "message": { "content": "[1] Hello." } }] })
+            .to_string();
+        let (addr, seen) = spawn_mock_server_status(vec![(200, reply)]);
+        let mut cfg = online_cfg_for(&addr);
+        cfg.glossary_hint = "术语表（以下词条必须按给定译法翻译，不得改写）：".to_string()
+            + &"甲甲乙乙=丙丙丁丁；".repeat(4_000);
+        let segs = vec![Segment::new(1, 0.0, 1.0, "你好")];
+        let out = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("术语表超窗时应先裁剪再发请求");
+        assert_eq!(out[0].translation.as_deref(), Some("Hello."));
+        let body = seen.lock().unwrap().join("\n");
+        assert!(
+            body.len() < 20_000,
+            "术语表必须被裁剪后再注入: 请求体 {} 字节",
+            body.len()
+        );
+    }
+
+    /// 端到端：一批 2 句被服务端以「context length 超限」拒（400）时不得整片中止，
+    /// 应折半重发，拆成单句后逐条成功。
+    #[test]
+    fn length_rejection_halves_batch_instead_of_aborting() {
+        let too_long = serde_json::json!({
+            "error": { "message": "This model's maximum context length is 8192 tokens" }
+        })
+        .to_string();
+        let ok1 = serde_json::json!({ "choices": [{ "message": { "content": "[1] Hello." } }] })
+            .to_string();
+        let ok2 = serde_json::json!({ "choices": [{ "message": { "content": "[2] World." } }] })
+            .to_string();
+        let (addr, seen) = spawn_mock_server_status(vec![(400, too_long), (200, ok1), (200, ok2)]);
+        let cfg = online_cfg_for(&addr);
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "你好"),
+            Segment::new(2, 1.0, 2.0, "世界"),
+        ];
+        let out = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("长度类 400 不得整片中终止");
+        assert_eq!(out[0].translation.as_deref(), Some("Hello."));
+        assert_eq!(out[1].translation.as_deref(), Some("World."));
+        assert_eq!(seen.lock().unwrap().len(), 3, "首次整批 + 折半两次");
+    }
+
+    /// 取消后反思请求**不得再发**（反思也是付费请求）；修前主请求返回与反思之间没有复查
+    /// 取消标志，取消后仍会白发一次。
+    #[test]
+    fn reflect_request_is_skipped_when_already_cancelled() {
+        let reply = serde_json::json!({ "choices": [{ "message": { "content": "[1] Hello." } }] })
+            .to_string();
+        let (addr, seen) = spawn_mock_server_status(vec![(200, reply)]);
+        let cfg = online_cfg_for(&addr);
+        let suspects = vec![(1usize, "你好世界".to_string(), "你好世界。".to_string())];
+        let cancel = AtomicBool::new(true);
+        let err = request_reflect_translation(
+            &cfg,
+            &suspects,
+            "English",
+            &ModelProfile::default(),
+            &cancel,
+        )
+        .expect_err("已取消时不得发反思请求");
+        assert!(err.to_string().contains("取消"), "{err}");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            0,
+            "取消后一个反思请求都不该发出"
+        );
+    }
+
+    /// 折半补译回来的仍是「近似复制 / 扩写」时，必须与主路径同口径拒收：保持未译，
+    /// 绝不静默写进用户字幕。修前折半路径只判「完全等于原文」，扩写会被静默采纳。
+    #[test]
+    fn halved_writeback_rejects_near_copy() {
+        // 原文 11 字，译文 = 原文重复 9 次 → 长度比 9 > 8，判「改动过大」。
+        let source = "今天天气真好我们出发吧";
+        let runaway = source.repeat(9);
+        let reply = serde_json::json!({
+            "choices": [{ "message": { "content": format!("[1] {runaway}") } }]
+        })
+        .to_string();
+        let (addr, _seen) = spawn_mock_server_status(vec![(200, reply)]);
+        let cfg = online_cfg_for(&addr);
+        let mut segs = vec![Segment::new(1, 0.0, 1.0, source)];
+        let recovered = retry_missing_online(
+            &cfg,
+            &mut segs,
+            &[0],
+            "English",
+            &AtomicBool::new(false),
+            &ModelProfile::default(),
+        );
+        assert_eq!(recovered, 0, "近似复制不得计入已译");
+        assert!(segs[0].translation.is_none(), "近似复制不得写回字幕");
+    }
+
+    /// 在线链路整片中终止（配置类 Fatal）时，已译好的部分必须留在部分结果槽里供界面
+    /// 合并，而不是一次故障全部作废。
+    #[test]
+    fn fatal_abort_keeps_partial_translations_in_sink() {
+        let ok = serde_json::json!({ "choices": [{ "message": { "content": "[1] Hello." } }] })
+            .to_string();
+        // 第一批成功、第二批收到 401（配置类 Fatal）→ 整片立即中止。
+        let (addr, _seen) =
+            spawn_mock_server_status(vec![(200, ok), (401, "unauthorized".to_string())]);
+        let mut cfg = online_cfg_for(&addr);
+        cfg.batch_size = 1;
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "你好"),
+            Segment::new(2, 1.0, 2.0, "世界"),
+        ];
+        let mut engine = TranslateEngine::online(cfg);
+        let sink = PartialSink::default();
+        engine.set_partial_sink(sink.clone());
+        let err = engine
+            .translate_subtitles(segs, "English", None, Arc::new(AtomicBool::new(false)))
+            .expect_err("401 必须整片中终止");
+        assert!(err.to_string().contains("在线翻译中止"), "{err}");
+
+        let partial = sink
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("Fatal 必须留下部分结果");
+        assert_eq!(
+            partial[0].translation.as_deref(),
+            Some("Hello."),
+            "第一批已译好的句子必须保留在部分结果里"
+        );
+        assert!(partial[1].translation.is_none());
     }
 }
 
