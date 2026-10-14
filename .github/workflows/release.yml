@@ -66,6 +66,11 @@ jobs:
       - name: cargo build --release (voice2word-setup)
         run: cargo build --release --bin voice2word-setup
 
+      # 便携版里的无头入口：脚本/CI 用它（控制台子系统，shell 会同步等待，
+      # 重定向与退出码可靠）。单独构建，避免与上面两步的 `--bin` 语义混淆。
+      - name: cargo build --release (voice2word-cli)
+        run: cargo build --release --bin voice2word-cli
+
       # ---------------------------------------------------------------
       # 组装发布物（安装包向导版 + 绿色便携版）
       # ---------------------------------------------------------------
@@ -102,6 +107,7 @@ jobs:
             | :--- | :--- | :--- |
             | **`Voice2Word-${{ github.ref_name }}-Setup.exe`** | **安装包向导版（推荐）** | 自动向导安装，自动生成桌面快捷方式、开始菜单图标与卸载项，无控制台黑框 |
             | `voice2word.exe` | 绿色便携版 | 单文件即开即用（无控制台黑框），免安装 |
+            | `voice2word-cli.exe` | 无头 / 脚本入口 | 与便携版同一套命令，但为控制台子系统：shell 会等待它，`> out.json` 重定向、管道与 `$LASTEXITCODE` 都可靠。用法见仓库 `docs/headless.md` |
 
             ### 首次使用
             1. 下载安装包或便携版直接运行即可。
