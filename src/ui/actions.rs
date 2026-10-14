@@ -2022,6 +2022,12 @@ impl MainWindow {
         if matches!(self.state.status, ProcessStatus::Processing { .. }) {
             return;
         }
+        // 开工前先把当前工程的未落库编辑写回：新一轮转写会在管线回报时整体替换
+        // `segments`，落库又是 1.2s 去抖的——用户「改完字幕就点了另一个文件的开始」
+        // 会丢掉最后一段编辑。写失败时拦下这次开工（横幅说明原因），与关窗守卫同一取舍。
+        if !self.flush_segments_before_close(cx) {
+            return;
+        }
         // 开工前先确认**选中的档位**确实有模型。
         //
         // 档位下拉现在会明示「已就位 / 未下载」并就地给下载按钮，用户完全可以先选中

@@ -1093,6 +1093,13 @@ impl MainWindow {
                         )
                         .id(("lib-edit-btn", task_id as usize))
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            // 切工程前先把当前这条的未落库编辑写回：落库是 1.2s 去抖的，
+                            // 用户改完字幕立刻回库里点「校对」，最后一段编辑会连同脏位一起
+                            // 被下一条工程顶掉。写失败时拦下这次切换（横幅会说明原因），
+                            // 与关窗守卫同一取舍。
+                            if !this.flush_segments_before_close(cx) {
+                                return;
+                            }
                             // 点击时才按 id 取出完整任务数据（渲染期不再克隆）
                             let Some(record) = this
                                 .state

@@ -1629,16 +1629,19 @@ impl MainWindow {
         )
     }
 
-    /// 关窗前的脏数据守卫（系统关窗路径 Alt+F4 / 任务栏右键 / 系统关闭按钮，
-    /// 与自绘标题栏的关闭按钮共用同一实现）。
+    /// 「离开当前工程」前的脏数据守卫：关窗（系统关窗路径 Alt+F4 / 任务栏右键 /
+    /// 系统关闭按钮，与自绘标题栏的关闭按钮共用）与**切工程**（历史库里点「校对」、
+    /// 开工新一次转写）都走这一条。
     ///
     /// `segments_dirty` 的落库是去抖的（切句 / 跳转 / 播放 / 导出时才 flush），
     /// 用户改完字幕直接关窗会丢掉最后一段未落库的编辑，所以这里先同步 flush 一次。
     /// 只在「本次确实尝试保存了脏数据、且保存失败」时拦下关窗：若 `db_write_error`
     /// 是更早一次失败留下的旧值，不能拿它挡住一次与保存无关的正常关闭。
     ///
-    /// 返回 `true` 表示允许关窗。`components/titlebar.rs` 的关闭按钮直接调用本函数，
-    /// 两条关窗路径收敛到这里，不再各写一份判定。
+    /// 返回 `true` 表示可以继续（关窗 / 切工程）。`components/titlebar.rs` 的关闭按钮、
+    /// `views/library.rs` 的「校对」、`actions::start_processing_for` 都调用本函数，
+    /// 各条离开路径收敛到这里，不再各写一份判定——少写一处，那条路上未落库的编辑
+    /// 就会被静默丢掉。
     pub(crate) fn flush_segments_before_close(&mut self, cx: &mut Context<Self>) -> bool {
         let had_dirty = self.state.segments_dirty;
         self.state.flush_segments_if_dirty();
