@@ -202,6 +202,30 @@ impl Default for TranslateConfig {
     }
 }
 
+/// 术语表分隔符的**优先级分层**（每层内部取最靠左的一个）。
+///
+/// 分层的理由：分隔符出现在「原文/译文」里的概率并不相同。`=` 是文档格式的一部分，
+/// 基本不会当普通字符用；而 `:` / `：` 遍地都是（`时间: 12:30`、`注意：xxx`）。
+/// 把两者平铺取最靠左，`12:30=十二点半` 就会被时间里的冒号切开，整条术语报废；
+/// 所以按「越像真分隔符 → 越靠前」排三层，而不是一次 `min_by_key` 了事。
+const GLOSSARY_SEPARATOR_TIERS: [&[&str]; 3] = [
+    // 1) 显式：文档格式就是 `原文=译文`
+    &["=", "＝"],
+    // 2) 结构化：粘贴一行时的常见写法，正常译法里极少出现
+    &[",", ";", "->", "→"],
+    // 3) 冒号兜底：出现频率最高，必须最后考虑
+    &[":", "："],
+];
+
+/// 找术语表一行的切分点：返回 `(字节下标, 分隔符的字节长度)`。
+fn glossary_split_point(line: &str) -> Option<(usize, usize)> {
+    GLOSSARY_SEPARATOR_TIERS.iter().find_map(|tier| {
+        tier.iter()
+            .filter_map(|sep| line.find(sep).map(|i| (i, sep.len())))
+            .min_by_key(|(i, _)| *i)
+    })
+}
+
 impl TranslateConfig {
     /// 是否配置为在线 API 模式
     pub fn is_online(&self) -> bool {
@@ -210,10 +234,17 @@ impl TranslateConfig {
 
     /// 把术语表文本解析成 `(原文, 译文)` 列表。
     ///
-    /// 每行一条，分隔符接受 `=` / `->` / `→` / `:` / `：`（取**第一次**出现的位置切分，
-    /// 因此译文里再含冒号也不会被切坏）。空行、以 `#` 开头的注释行、以及任一侧为空的
-    /// 行都会被跳过——用户排错时少一条不该整表失效。单条过长的（>60 字符）也跳过，
-    /// 避免把整段误贴进来污染提示词预算。
+    /// 每行一条。分隔符按**优先级分层**找，层内取最靠左的一个，命中哪一层就只用哪一层：
+    ///
+    /// 1. 显式 `=` / `＝`：文档里写的就是这个，命中即用；
+    /// 2. 结构化写法 `,` / `;` / `->` / `→`：从聊天记录里粘一行时的常见形态；
+    /// 3. 冒号 `:` / `：`：只在前两层都没命中时兜底。
+    ///
+    /// 冒号必须垫底：它本来就常出现在正常译法/键里（`时间: 12:30`），一旦和 `=` 平级，
+    /// `12:30=十二点半` 会被时间里的冒号切开，键只剩 `12`、译法变成 `30=十二点半`。
+    ///
+    /// 空行、以 `#` 开头的注释行、以及任一侧为空的行都会被跳过——用户排错时少一条
+    /// 不该整表失效。单条过长的（>60 字符）也跳过，避免把整段误贴进来污染提示词预算。
     pub fn glossary_entries(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for raw in self.glossary.lines() {
@@ -221,11 +252,7 @@ impl TranslateConfig {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let split_at = ["->", "→", "=", ":", "："]
-                .iter()
-                .filter_map(|sep| line.find(sep).map(|i| (i, sep.len())))
-                .min_by_key(|(i, _)| *i);
-            let Some((idx, sep_len)) = split_at else {
+            let Some((idx, sep_len)) = glossary_split_point(line) else {
                 continue;
             };
             let left = line[..idx].trim();
@@ -2363,6 +2390,77 @@ mod tests {
             ("注意力机制".to_string(), "注意力机制".to_string())
         );
         assert_eq!(entries[3], ("时间".to_string(), "12:30 开始".to_string()));
+    }
+
+    /// 构造期望值用的小工具：`(String, String)` 字面量太吵。
+    fn pair(a: &str, b: &str) -> (String, String) {
+        (a.to_string(), b.to_string())
+    }
+
+    /// 分隔符优先级回归：`=` 是文档格式，必须压过键 / 译法里的冒号。
+    ///
+    /// 旧实现把 `:` 与 `=` 平铺取最靠左的一个，`12:30=十二点半` 会被时间里的冒号切开，
+    /// 键变成 `12`、译法变成 `30=十二点半`——整条术语报废。
+    #[test]
+    fn glossary_keeps_colons_inside_keys_and_values() {
+        let cfg = TranslateConfig {
+            glossary: [
+                "12:30=十二点半",             // 键里带半角冒号（时间戳）
+                "12：30＝十二点半",           // 全角冒号 + 全角等号
+                "会议纪要=上午 9:30 开始",    // 译法里带半角冒号
+                "attention=注意力：核心机制", // 译法里带全角冒号
+            ]
+            .join("\n"),
+            ..TranslateConfig::default()
+        };
+        assert_eq!(
+            cfg.glossary_entries(),
+            vec![
+                pair("12:30", "十二点半"),
+                pair("12：30", "十二点半"),
+                pair("会议纪要", "上午 9:30 开始"),
+                pair("attention", "注意力：核心机制"),
+            ]
+        );
+    }
+
+    /// 分隔符分层：`=` 优先；没有 `=` 时认逗号 / 分号 / 箭头；只有冒号时才按冒号兜底。
+    #[test]
+    fn glossary_separator_tiers_and_legacy_formats() {
+        let entries = |text: &str| {
+            TranslateConfig {
+                glossary: text.to_string(),
+                ..TranslateConfig::default()
+            }
+            .glossary_entries()
+        };
+
+        // 显式 `=` / 全角 `＝`
+        assert_eq!(entries("a=b"), vec![pair("a", "b")]);
+        assert_eq!(entries("a＝b"), vec![pair("a", "b")]);
+        // 多行 + 注释 + 空行
+        assert_eq!(
+            entries("# 说明\n\na=b\n\nc=d\n"),
+            vec![pair("a", "b"), pair("c", "d")]
+        );
+        // 逗号 / 分号 / 箭头：没有 `=` 时的结构化写法
+        assert_eq!(entries("原文,译文"), vec![pair("原文", "译文")]);
+        assert_eq!(entries("原文;译文"), vec![pair("原文", "译文")]);
+        assert_eq!(
+            entries("GPT -> 生成式预训练模型"),
+            vec![pair("GPT", "生成式预训练模型")]
+        );
+        // 冒号兜底：整行只有冒号时仍按既有行为生效
+        assert_eq!(entries("时间:12:30 开始"), vec![pair("时间", "12:30 开始")]);
+        assert_eq!(
+            entries("注意力机制：注意力机制"),
+            vec![pair("注意力机制", "注意力机制")]
+        );
+        // 显式 `=` 压过同一行里更靠左的逗号 / 冒号
+        assert_eq!(entries("a,b=c"), vec![pair("a,b", "c")]);
+        assert_eq!(entries("12:30=a,b"), vec![pair("12:30", "a,b")]);
+        // 残留脏行仍然安静跳过（没有分隔符 / 任一侧为空）
+        assert_eq!(entries("坏行没有分隔符"), Vec::<(String, String)>::new());
     }
 
     /// 空术语表不产生任何提示词注入（默认行为不受影响）。

@@ -47,7 +47,16 @@ const MAX_HIGHPASS_HZ: f64 = 2_000.0;
 const MIN_TARGET_RATE: u32 = 8_000;
 const MAX_TARGET_RATE: u32 = 192_000;
 
-/// `atempo` 的速率上限（实测 ffmpeg 对 `tempo` 的合法区间是 `[0.5, 100]`）。
+/// `atempo` 的速率**下界**：1.0，而不是 ffmpeg 允许的 0.5。
+///
+/// 本工程只把变速当作「加速以减少送进模型的音频量」的手段：`core/pipeline.rs` 已经把
+/// `audio_speed` 夹在 `[1.0, 1.5]`，变慢只会把音频拉长、让 batch=1 的解码调用次数变多，
+/// 正是本模块要消掉的那部分开销；停顿压实的时间轴回映射也是按 `× speed`（speed ≥ 1）
+/// 还原原始时间轴的。所以这里对外承诺的区间是 `[1.0, 100.0]`，不再对外声称 `[0.5, 100]`。
+const MIN_SPEED: f64 = 1.0;
+
+/// `atempo` 的速率上限（实测 ffmpeg 对 `tempo` 的合法区间是 `[0.5, 100]`；
+/// 本模块只使用其中的 `[1.0, 100]`，下界理由见 [`MIN_SPEED`]）。
 const MAX_SPEED: f64 = 100.0;
 
 // ───────────────────────── 语音增强滤镜链 ─────────────────────────
@@ -82,9 +91,65 @@ impl Default for SpeechFilterOptions {
     }
 }
 
+/// 净化之后**实际会生效**的语音增强级。
+///
+/// 存在的唯一理由：让 `is_noop()` 与 `chain()` 同源。两处各写一遍判断条件，同一份配置
+/// 就会出现「`is_noop()` 说没什么可做、`chain()` 却拼出了 `aresample`」这种自相矛盾的
+/// 组合（只改 `target_rate` 时必然发生）；`NaN` 更糟——`NaN <= 0.0` 是 `false`，于是
+/// `chain()` 那边按「关闭」处理、`is_noop()` 这边却认为「高通开着」，结论正好相反。
+/// 所以「哪些级会生效」只判断一次，两边都只读这个结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveStages {
+    /// 取整并限幅后的高通截止频率（Hz）。0 = 关闭。
+    highpass_hz: u32,
+    denoise: bool,
+    normalize: bool,
+    /// 限幅后的目标采样率（Hz）。0 = 不重采样。
+    target_rate: u32,
+}
+
+impl ActiveStages {
+    /// 一个级都不生效。
+    fn is_empty(&self) -> bool {
+        self.highpass_hz == 0 && !self.denoise && !self.normalize && self.target_rate == 0
+    }
+}
+
 impl SpeechFilterOptions {
+    /// 把用户可手写的裸值净化成「实际会生效的级」。
+    ///
+    /// config 里这两项都是裸数值（JSON 的 `1e400` 会解析成 `inf`）：`NaN` / `inf` /
+    /// 负值 / 取整后不足 1 Hz 的高通一律按**关闭该级**处理——`inf` 拼进 `-af` 会被
+    /// ffmpeg 判 out of range 让整条链失败，落在 `(Nyquist, 999999]` 的值不报错、
+    /// 却把语音静默削没（见 [`MAX_HIGHPASS_HZ`]）；非法采样率（1 Hz / `u32::MAX`）ffmpeg
+    /// 同样不报错、只把音频重采样成静音，所以也要限幅。取整成整数 Hz 再拼串是因为
+    /// `{:.0}` 的银行家舍入会把 (0, 0.5) 里的值格式化成 `highpass=f=0`（实测 ffmpeg 把
+    /// f=0 当无滤波），配置上却显示「高通已开」。
+    ///
+    /// `is_noop()` 与 [`Self::chain_with_speed`] 都只依据这个结果，不再各自比较原始字段。
+    fn active_stages(&self) -> ActiveStages {
+        ActiveStages {
+            highpass_hz: if self.highpass_hz.is_finite() && self.highpass_hz > 0.0 {
+                self.highpass_hz.min(MAX_HIGHPASS_HZ).round() as u32
+            } else {
+                0
+            },
+            denoise: self.denoise,
+            normalize: self.normalize,
+            target_rate: if self.target_rate == 0 {
+                0
+            } else {
+                self.target_rate.clamp(MIN_TARGET_RATE, MAX_TARGET_RATE)
+            },
+        }
+    }
+
+    /// 是否完全不做任何处理。
+    ///
+    /// 恒等式：`is_noop() == chain().is_none()`——两者都由 [`Self::active_stages`] 决定，
+    /// 调用方据此判断「要不要走预处理通道」时不会再和实际拼出来的滤镜链打架。
     pub fn is_noop(&self) -> bool {
-        self.highpass_hz <= 0.0 && !self.denoise && !self.normalize
+        self.active_stages().is_empty()
     }
 
     /// 构建 FFmpeg `-af` 滤镜链（不含变速）。返回 `None` 表示无需处理。
@@ -101,59 +166,50 @@ impl SpeechFilterOptions {
     /// 变速放在降噪/归一之后：降噪器与归一器都基于「自然语速下的语音统计量」
     /// 估计参数，先变速会让它们看到非自然的包络。
     pub fn chain_with_speed(&self, speed: f64) -> Option<String> {
+        // 「哪些级会生效」（含非有限值 / 非法采样率的净化与限幅）只算一次，且与
+        // `is_noop()` 共用，见 [`Self::active_stages`]。
+        let active = self.active_stages();
         let mut stages: Vec<String> = Vec::new();
 
-        // 用户可在 config 里手写 `preprocess_highpass_hz`（含 JSON `1e400` 解析出的
-        // `inf`）。`inf` / `NaN` / 负值 / 极大值直接拼进 `-af` 的后果见
-        // [`MAX_HIGHPASS_HZ`]：轻则 ffmpeg 参数越界整条链失败，重则静默把语音削成
-        // 静音。所以非有限的、非正的一律按「关闭」处理，其余限幅。
-        //
-        // 取整成整数 Hz 再拼串：`{:.0}` 的银行家舍入会把 (0, 0.5) 里的值格式化成
-        // `highpass=f=0`（实测 ffmpeg 把 f=0 当无滤波处理），配置上却显示「高通已开」，
-        // 语义不一致。取整后不足 1 Hz 的档位直接丢弃。
-        let highpass_hz = if self.highpass_hz.is_finite() && self.highpass_hz > 0.0 {
-            self.highpass_hz.min(MAX_HIGHPASS_HZ).round() as u32
-        } else {
-            0
-        };
-        if highpass_hz > 0 {
+        if active.highpass_hz > 0 {
             // poles=2 是 12 dB/oct，足够削掉直流与轰鸣又不动 80 Hz 以上的语音基频
-            stages.push(format!("highpass=f={highpass_hz}:poles=2"));
+            stages.push(format!("highpass=f={}:poles=2", active.highpass_hz));
         }
-        if self.denoise {
+        if active.denoise {
             // nr=12：只衰减 12 dB，宁可少降也不引入伪影
             // nf=-30：初始噪声底 -30 dBFS（典型室内底噪量级）
             // tn=1：自适应跟踪噪声底，避免把持续的低电平语音当成噪声削掉
             // gs=8：增益平滑，抑制音乐化伪影
             stages.push("afftdn=nr=12:nf=-30:tn=1:gs=8".to_string());
         }
-        if self.normalize {
+        if active.normalize {
             // f=250：250 ms 分析窗，匹配语音音节尺度
             // p=0.90：目标峰值，留 1 dB 余量避免削顶
             // m=4.0：最大放大 4 倍（12 dB）。这个上限很关键——不设限的话
             //        归一器会把句间底噪放大到「像语音」，反而制造幻觉
             stages.push("dynaudnorm=f=250:g=15:p=0.90:m=4.0".to_string());
         }
-        // atempo 的合法区间是 [0.5, 100]：`inf` / `NaN` 会被判 out of range 让整条
-        // 滤镜图失败（实测 exit≠0）。上游虽然已经 limit 过一次，这里作为公开 API
-        // 仍然自己兜底：非有限值 = 不变速，其余限幅。
+        // ffmpeg 对 atempo 的合法区间是 [0.5, 100]：`inf` / `NaN` 会被判 out of range
+        // 让整条滤镜图失败（实测 exit≠0）。上游虽然已经 limit 过一次，这里作为公开 API
+        // 仍然自己兜底：非有限值 = 不变速，其余限幅到本模块的契约区间
+        // [`MIN_SPEED`, `MAX_SPEED`] = [1.0, 100.0]（下界不是 0.5，理由见 MIN_SPEED）。
         let speed = if speed.is_finite() {
-            speed.clamp(1.0, MAX_SPEED)
+            speed.clamp(MIN_SPEED, MAX_SPEED)
         } else {
-            1.0
+            MIN_SPEED
         };
-        if speed > 1.0 {
+        if speed > MIN_SPEED {
             // 1.0~1.5 区间内 atempo 不需要级联（>2.0 才需要）
             stages.push(format!("atempo={speed:.3}"));
         }
-        if self.target_rate != 0 {
-            // 非法采样率（1 Hz / u32::MAX）ffmpeg 并不报错，只会把音频重采样成静音；
-            // 限幅到可选区间后再拼串。0 = 不重采样（保留源采样率）。
-            let target_rate = self.target_rate.clamp(MIN_TARGET_RATE, MAX_TARGET_RATE);
+        if active.target_rate != 0 {
+            // 0 = 不重采样（保留源采样率）；非 0 已经在 `active_stages()` 里限幅到
+            // `[MIN_TARGET_RATE, MAX_TARGET_RATE]`。
             // soxr 在 16 kHz 目标下的阻带抑制明显优于默认 swr，
             // mel 谱更干净；precision=28 是 32 位浮点下的实用上限
             stages.push(format!(
-                "aresample={target_rate}:resampler=soxr:precision=28:cutoff=0.97"
+                "aresample={}:resampler=soxr:precision=28:cutoff=0.97",
+                active.target_rate
             ));
         }
 
@@ -883,7 +939,7 @@ mod tests {
 mod sanitize_tests {
     use super::{
         frame_db, plan_compaction, wav_header_mono16, CompactionConfig, SpeechFilterOptions,
-        MAX_HIGHPASS_HZ, MAX_SPEED, MAX_TARGET_RATE, MIN_TARGET_RATE,
+        MAX_HIGHPASS_HZ, MAX_SPEED, MAX_TARGET_RATE, MIN_SPEED, MIN_TARGET_RATE,
     };
 
     /// 一个除了被测字段外全部关闭的选项集，避免其它级干扰断言。
@@ -1269,5 +1325,90 @@ mod sanitize_tests {
         assert!(out.len() <= short.len());
         assert!(out.len() <= plan.kept_samples);
         assert!(plan.materialize(&[]).is_empty());
+    }
+
+    /// ② `is_noop()` 与 `chain()` 必须同源：同一份配置两者只能给出同一个结论。
+    /// 覆盖默认配置、只改 `target_rate`、只改 `highpass`（含 `NaN` / 负值 / 取整到 0）。
+    #[test]
+    fn is_noop_agrees_with_chain_on_every_stage_combination() {
+        for highpass_hz in [0.0, -1.0, f64::NAN, f64::INFINITY, 0.4, 70.0] {
+            for denoise in [false, true] {
+                for normalize in [false, true] {
+                    for target_rate in [0u32, 16_000, u32::MAX] {
+                        let opts = SpeechFilterOptions {
+                            highpass_hz,
+                            denoise,
+                            normalize,
+                            target_rate,
+                        };
+                        assert_eq!(
+                            opts.is_noop(),
+                            opts.chain().is_none(),
+                            "is_noop 与 chain 结论必须一致: {opts:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// ②④ 语义细化：重采样本身就是一级真实处理（只改 `target_rate` 不算 noop）；
+    /// `NaN` / `inf` / 负值 / 取整到 0 的 highpass 一律视为「关闭该级」。
+    #[test]
+    fn is_noop_treats_target_rate_as_stage_and_bad_highpass_as_off() {
+        // 只改 target_rate：真会产出 aresample，所以不能算 noop（旧实现漏了这件事）
+        let resample_only = SpeechFilterOptions {
+            target_rate: 16_000,
+            ..bare()
+        };
+        assert!(!resample_only.is_noop());
+        assert!(resample_only
+            .chain()
+            .expect("重采样级必然存在")
+            .contains("aresample=16000"));
+
+        // 只改 highpass 且该值是「关闭」语义：两个方法都必须说没有活干
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.4] {
+            let hp_only = SpeechFilterOptions {
+                highpass_hz: bad,
+                ..bare()
+            };
+            assert!(hp_only.is_noop(), "highpass={bad} 应视为关闭: {hp_only:?}");
+            assert!(hp_only.chain().is_none(), "highpass={bad} 不得产出滤镜串");
+        }
+
+        // 默认配置：两个方法都必须说「有活干」
+        let defaults = SpeechFilterOptions::default();
+        assert!(!defaults.is_noop());
+        assert!(defaults.chain().is_some());
+    }
+
+    /// ③ 速度契约：注释里的区间必须与 clamp 一致——下界是 `MIN_SPEED = 1.0`（不允许变慢）。
+    /// 上游 `core/pipeline.rs` 已把 `audio_speed` 夹到 `[1.0, 1.5]`，变慢只会把音频拉长、
+    /// 让单 token 解码的调用次数变多，与「减少喂给模型的音频量」相悖。
+    #[test]
+    fn filter_chain_speed_floor_is_one_and_matches_docs() {
+        assert_eq!(MIN_SPEED, 1.0, "对外契约下界");
+        let opts = SpeechFilterOptions::default();
+
+        for slow in [0.0, 0.5, 0.999, 1.0, -3.0] {
+            let chain = opts.chain_with_speed(slow).expect("增强级仍在，链不为空");
+            assert!(
+                !chain.contains("atempo"),
+                "speed={slow} 不得插入 atempo: {chain}"
+            );
+        }
+        assert!(
+            opts.chain_with_speed(MIN_SPEED + 0.001)
+                .unwrap()
+                .contains("atempo=1.001"),
+            "刚过下界就必须变速"
+        );
+        assert!(
+            opts.chain_with_speed(1e9)
+                .unwrap()
+                .contains(&format!("atempo={MAX_SPEED:.3}")),
+            "上限仍是 MAX_SPEED"
+        );
     }
 }
