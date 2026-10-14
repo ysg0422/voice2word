@@ -1107,6 +1107,7 @@ impl WhisperEngine {
                                     language: None,
                                     confidence: None,
                                     speaker: None,
+                                    speaker_name: None,
                                     words: Vec::new(),
                                 })
                             } else {
@@ -1380,6 +1381,7 @@ impl WhisperEngine {
                             language: detected_lang.clone(),
                             confidence: Self::tokens_avg_logprob(&item.tokens),
                             speaker: None,
+                            speaker_name: None,
                             words: Self::word_timings_from_tokens(&item.tokens),
                         };
                         // 段级 offsets 在原始轴、token 级 offsets 在 VAD 处理后轴：不同轴时
@@ -1645,6 +1647,7 @@ impl WhisperEngine {
                             language: None,
                             confidence: None,
                             speaker: None,
+                            speaker_name: None,
                             words: Vec::new(),
                         });
                         idx += 1;
@@ -2214,6 +2217,7 @@ mod tests {
             language: None,
             confidence: None,
             speaker: None,
+            speaker_name: None,
             words: words
                 .iter()
                 .enumerate()

@@ -54,6 +54,9 @@ pub struct Segment {
     /// `None` 表示尚未做过说话人分离，或该段没有有效人声。
     #[serde(default)]
     pub speaker: Option<u32>,
+    /// 说话人自定义名称（如 "张三"、"主讲人"）。设置后 UI 与导出优先展示该名称。
+    #[serde(default)]
+    pub speaker_name: Option<String>,
     /// 词级时间戳（秒）。空表示该段没有词级信息（旧记录 / 非 Whisper 引擎）。
     ///
     /// 容忍 `null`（老库与外部工具写出过 `"words": null`），见 [`null_is_default`]。
@@ -99,6 +102,7 @@ impl Segment {
             language: None,
             confidence: None,
             speaker: None,
+            speaker_name: None,
             words: Vec::new(),
         }
     }
@@ -158,8 +162,14 @@ impl Segment {
         !self.words.is_empty()
     }
 
-    /// 说话人标签（1 起编号，供界面与导出使用）
+    /// 说话人标签（优先使用自定义名称，否则回退至「说话人 N」）
     pub fn speaker_label(&self) -> Option<String> {
+        if let Some(ref name) = self.speaker_name {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
         // 用饱和加法：序号是外部数据，理论上可到 u32::MAX，`s + 1` 在 debug 构建
         // 会直接 panic（release 回绕成 0），而这里只想渲染一个标签。
         self.speaker
@@ -912,6 +922,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         language: seg.language.clone(),
         confidence: seg.confidence,
         speaker: seg.speaker,
+        speaker_name: seg.speaker_name.clone(),
         words: left_words,
     };
     let mut right = Segment {
@@ -925,6 +936,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         language: seg.language,
         confidence: seg.confidence,
         speaker: seg.speaker,
+        speaker_name: seg.speaker_name,
         words: right_words,
     };
     // 收敛到各自子段区间（含边界），与 optimize_segments 的收口口径一致。
@@ -1590,6 +1602,20 @@ mod tests {
             Some("说话人 4294967295"),
             "饱和加法不该回绕"
         );
+    }
+
+    #[test]
+    fn speaker_label_prefers_custom_speaker_name() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "文本");
+        seg.speaker = Some(0);
+        assert_eq!(seg.speaker_label().as_deref(), Some("说话人 1"));
+
+        seg.speaker_name = Some("张三".to_string());
+        assert_eq!(seg.speaker_label().as_deref(), Some("张三"));
+
+        // 空白或纯空格应回退至默认编号
+        seg.speaker_name = Some("   ".to_string());
+        assert_eq!(seg.speaker_label().as_deref(), Some("说话人 1"));
     }
     // ─────────── 翻译相关的取值与判定 ───────────
 

@@ -2653,6 +2653,7 @@ impl MainWindow {
                                                 let has_trans = seg.has_translation();
                                                 let trans_text = seg.translation.clone().unwrap_or_default();
                                                 let speaker = seg.speaker;
+                                                let speaker_label = seg.speaker_label();
                                                 let glossary_flagged = glossary_bad.contains(&seg_idx);
                                                 let low_conf_flagged = low_conf.contains(&seg_idx);
 
@@ -2769,7 +2770,12 @@ impl MainWindow {
                                                                     .items_center()
                                                                     .gap_1()
                                                                     .children(speaker.map(|s| {
+                                                                        let label = speaker_label
+                                                                            .clone()
+                                                                            .unwrap_or_else(|| format!("说话人 {}", s + 1));
                                                                         div()
+                                                                            .id(("badge-speaker", seg_idx))
+                                                                            .cursor_pointer()
                                                                             .px_1p5()
                                                                             .py_0p5()
                                                                             .rounded_sm()
@@ -2779,7 +2785,10 @@ impl MainWindow {
                                                                             .text_size(px(Theme::TEXT_CAPTION))
                                                                             .font_weight(FontWeight::SEMIBOLD)
                                                                             .text_color(speaker_color(s))
-                                                                            .child(format!("说话人 {}", s + 1))
+                                                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                                                this.cycle_segment_speaker(seg_idx, cx);
+                                                                            }))
+                                                                            .child(label)
                                                                     }))
                                                                     .children(glossary_flagged.then(|| {
                                                                         div()
@@ -7429,11 +7438,10 @@ mod tests {
         clamp_zoom, click_seek_target, fit_video_size, follow_playhead, is_playing_at,
         karaoke_mark_style, karaoke_word_marks, min_gap_hint, monitor_picture_source,
         monitor_screen_size, raw_line_byte_start, render_image_from_frame_file, shift_segment,
-        timeline_clip_positions, timeline_time_at_x, timeline_window, trim_end, trim_start,
-        snap_move_delta, snap_trim_time,
-        zoom_at, MonitorPictureSource, TimelineWindow, WordMark, EDITOR_STACK_MONITOR_H,
-        MONITOR_VIDEO_FIT_FRAC, TIMELINE_FULL_DRAW_LIMIT, TIMELINE_TRIM_MIN_SECS,
-        TIMELINE_WINDOW_MARGIN_SECS, TIMELINE_ZOOM_MAX, TIMELINE_ZOOM_MIN,
+        snap_move_delta, snap_trim_time, timeline_clip_positions, timeline_time_at_x,
+        timeline_window, trim_end, trim_start, zoom_at, MonitorPictureSource, TimelineWindow,
+        WordMark, EDITOR_STACK_MONITOR_H, MONITOR_VIDEO_FIT_FRAC, TIMELINE_FULL_DRAW_LIMIT,
+        TIMELINE_TRIM_MIN_SECS, TIMELINE_WINDOW_MARGIN_SECS, TIMELINE_ZOOM_MAX, TIMELINE_ZOOM_MIN,
     };
     use crate::subtitle::segment::WordTiming;
     use crate::subtitle::{ExportMode, GapPlan, Segment};
@@ -8439,7 +8447,15 @@ mod tests {
         );
         // 吸附后 delta 应当变成恰好对齐到 4.0 的位移 (-0.5s)
         assert_eq!(delta, -0.5);
-        let (s, e) = shift_segment(delta, origin_start, origin_end, Some(prev_end), None, 10.0, TIMELINE_TRIM_MIN_SECS);
+        let (s, e) = shift_segment(
+            delta,
+            origin_start,
+            origin_end,
+            Some(prev_end),
+            None,
+            10.0,
+            TIMELINE_TRIM_MIN_SECS,
+        );
         assert_eq!(s, 4.0);
         assert_eq!(e, 6.0);
     }

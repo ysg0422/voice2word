@@ -385,6 +385,7 @@ pub const OVERLAP_MATCH_THRESHOLD: f64 = 0.7;
 const MERGE_GAP_TOLERANCE: f64 = 0.4;
 
 /// 相邻块边界处一对候选字幕的合并决策。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum MergeDecision {
     /// 两条是同一句话的两次识别：合并成一条——起点取更早者、终点取较晚者（避免合并后
@@ -515,13 +516,14 @@ pub fn run_chunked_parallel(
                 let cb = progress_cb.clone();
                 let done = done.clone();
                 let failed_flag = failed.clone();
-                let (segs, chunk_vad_sec) = match transcribe_one(path, chunk.duration, per_proc_threads) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        failed_flag.store(true, Ordering::Relaxed);
-                        return Err(e);
-                    }
-                };
+                let (segs, chunk_vad_sec) =
+                    match transcribe_one(path, chunk.duration, per_proc_threads) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            failed_flag.store(true, Ordering::Relaxed);
+                            return Err(e);
+                        }
+                    };
                 let finished = done.fetch_add(1, Ordering::SeqCst) + 1;
                 let ratio = finished as f64 / total_chunks as f64;
                 if let Some(cb) = cb.as_ref() {

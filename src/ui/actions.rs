@@ -3866,6 +3866,49 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// 循环切换指定片段的说话人 (0 -> 1 -> 2 -> 3 -> 0)
+    pub fn cycle_segment_speaker(&mut self, seg_idx: usize, cx: &mut Context<Self>) {
+        let Some(pos) = self.state.segments.iter().position(|s| s.index == seg_idx) else {
+            return;
+        };
+        self.state.snapshot_for_undo();
+        let next_spk = match self.state.segments[pos].speaker {
+            Some(s) => (s + 1) % 4,
+            None => 0,
+        };
+        self.state.segments[pos].speaker = Some(next_spk);
+        self.state.bump_segments_revision();
+        self.state.segments_dirty = true;
+        self.state.flush_segments_if_dirty();
+        cx.notify();
+    }
+
+    /// 批量重命名说话人角色（如将 "说话人 1" 映射为 "嘉宾张老师"）
+    pub fn rename_speaker(&mut self, speaker_id: u32, new_name: &str, cx: &mut Context<Self>) {
+        let trimmed = new_name.trim();
+        let target_name = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+        self.state.snapshot_for_undo();
+        let mut count = 0;
+        for seg in &mut self.state.segments {
+            if seg.speaker == Some(speaker_id) {
+                seg.speaker_name = target_name.clone();
+                count += 1;
+            }
+        }
+        self.state.bump_segments_revision();
+        self.state.segments_dirty = true;
+        self.state.flush_segments_if_dirty();
+        self.notice = Some(format!(
+            "已为说话人 {} 批量更新角色名称（涉及 {count} 个片段）",
+            speaker_id + 1
+        ));
+        cx.notify();
+    }
+
     /// 当前选中的规则集（没选 / 下标越界都按「没选」处理）。
     fn selected_replace_rule_set(&self) -> Option<ReplaceRuleSet> {
         let idx = self.replace_rule_selected?;
@@ -5470,5 +5513,28 @@ mod tests {
             none.contains("2 句") && none.contains("延不开"),
             "全部 unresolved 不能被当成「都在合理范围内」：{none}"
         );
+    }
+
+    #[test]
+    fn speaker_rename_and_cycle_logic() {
+        let mut segments = vec![
+            Segment::new(1, 0.0, 1.0, "片段一"),
+            Segment::new(2, 1.0, 2.0, "片段二"),
+        ];
+        segments[0].speaker = Some(0);
+        segments[1].speaker = Some(1);
+
+        // 批量重命名角色
+        for seg in &mut segments {
+            if seg.speaker == Some(0) {
+                seg.speaker_name = Some("演讲人".to_string());
+            }
+        }
+        assert_eq!(segments[0].speaker_label().as_deref(), Some("演讲人"));
+        assert_eq!(segments[1].speaker_label().as_deref(), Some("说话人 2"));
+
+        // 循环切换说话人 (0 -> 1)
+        segments[0].speaker = Some((segments[0].speaker.unwrap() + 1) % 4);
+        assert_eq!(segments[0].speaker, Some(1));
     }
 }

@@ -1105,6 +1105,98 @@ impl FFmpegEngine {
         }
         Ok(output.to_path_buf())
     }
+
+    /// 视频音轨替换 / 配音混音（支持 BGM 闪避 Ducking）
+    /// - `bgm_volume == 0.0`: 纯替换，原视频音轨被剔除，纯拷贝视频流 `-c:v copy`，极速出片；
+    /// - `bgm_volume > 0.0`: 混音模式，将原背景音按比例降低，并与配音音轨合成。
+    pub fn replace_video_audio(
+        &self,
+        video_input: &Path,
+        dubbing_audio: &Path,
+        output_video: &Path,
+        bgm_volume: f32,
+    ) -> Result<PathBuf> {
+        if let Some(parent) = output_video.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("创建输出目录失败: {:?}", parent))?;
+            }
+        }
+
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
+        let args = build_replace_audio_args(video_input, dubbing_audio, output_video, bgm_volume);
+        cmd.args(args);
+
+        let status = run_with_deadline(&mut cmd, SUBPROCESS_LONG_TIMEOUT)
+            .with_context(|| format!("执行 FFmpeg 音频替换/配音混音失败: {:?}", self.ffmpeg_path))?
+            .status;
+
+        if !status.success() {
+            anyhow::bail!("FFmpeg 配音合成返回非零退出码");
+        }
+        Ok(output_video.to_path_buf())
+    }
+}
+
+/// 组装音视频替换或配音混音的命令行参数（纯函数，便于脱离子进程测试）
+pub fn build_replace_audio_args(
+    video_input: &Path,
+    dubbing_audio: &Path,
+    output_video: &Path,
+    bgm_volume: f32,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-y".into(),
+        "-i".into(),
+        video_input.as_os_str().to_os_string(),
+        "-i".into(),
+        dubbing_audio.as_os_str().to_os_string(),
+    ];
+
+    if bgm_volume <= 0.001 {
+        // 纯替换音轨，无需重新编码视频
+        args.extend([
+            "-map".into(),
+            "0:v:0".into(),
+            "-map".into(),
+            "1:a:0".into(),
+            "-c:v".into(),
+            "copy".into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "192k".into(),
+            "-shortest".into(),
+        ]);
+    } else {
+        // 背景音乐混音 / 闪避
+        let filter = format!(
+            "[0:a]volume={:.2}[bgm];[1:a]volume=1.0[voice];[bgm][voice]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+            bgm_volume
+        );
+        args.extend([
+            "-map".into(),
+            "0:v:0".into(),
+            "-filter_complex".into(),
+            filter.into(),
+            "-map".into(),
+            "[aout]".into(),
+            "-c:v".into(),
+            "copy".into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "192k".into(),
+            "-shortest".into(),
+        ]);
+    }
+
+    args.push(output_video.as_os_str().to_os_string());
+    args
 }
 
 #[cfg(test)]
@@ -1396,8 +1488,11 @@ mod tests {
 /// 拉进命名空间。规划是纯函数，全部用例无需真起 FFmpeg。
 #[cfg(test)]
 mod clip_tests {
-    use crate::engines::ffmpeg::{plan_segment_clip, ClipKind, DEFAULT_CLIP_PAD};
+    use crate::engines::ffmpeg::{
+        build_replace_audio_args, plan_segment_clip, ClipKind, DEFAULT_CLIP_PAD,
+    };
     use crate::subtitle::{Segment, MIN_EDIT_DUR};
+    use std::path::Path;
 
     fn seg(start: f64, end: f64) -> Segment {
         Segment::new(1, start, end, "测试句")
@@ -1527,5 +1622,29 @@ mod clip_tests {
         let err = plan_segment_clip(&seg(f64::NAN, 1.0), 60.0, DEFAULT_CLIP_PAD, ClipKind::Video)
             .expect_err("NaN 起点必须报错");
         assert!(err.to_string().contains("非法"), "{err}");
+    }
+
+    #[test]
+    fn build_replace_audio_args_handles_zero_and_ducking_volume() {
+        let v = Path::new("video.mp4");
+        let a = Path::new("audio.wav");
+        let out = Path::new("out.mp4");
+
+        // 纯替换模式
+        let zero_args: Vec<String> = build_replace_audio_args(v, a, out, 0.0)
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(zero_args.contains(&"-shortest".to_string()));
+        assert!(zero_args.contains(&"copy".to_string()));
+        assert!(!zero_args.iter().any(|s| s.contains("amix")));
+
+        // 伴奏闪避混音模式 (30% 音量)
+        let duck_args: Vec<String> = build_replace_audio_args(v, a, out, 0.3)
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(duck_args.iter().any(|s| s.contains("volume=0.30")));
+        assert!(duck_args.iter().any(|s| s.contains("amix=inputs=2")));
     }
 }

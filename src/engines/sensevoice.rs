@@ -525,12 +525,23 @@ impl SenseVoiceEngine {
         (guard, self.is_cancelled())
     }
 
-    /// 检查 SenseVoice 所需脚本与全部模型权重是否就位
+    /// 探测是否存在原生无需 Python 的 sherpa-onnx 独立执行体
+    pub fn find_native_cli() -> Option<PathBuf> {
+        let candidates = [
+            crate::utils::AppConfig::resolve_path("tools/sherpa-onnx-offline.exe"),
+            crate::utils::AppConfig::resolve_path("tools/sherpa-onnx.exe"),
+            crate::utils::AppConfig::resolve_path("tools/sherpa-onnx/sherpa-onnx-offline.exe"),
+            crate::utils::AppConfig::resolve_path("tools/sherpa-onnx/sherpa-onnx.exe"),
+        ];
+        candidates.into_iter().find(|p| p.is_file())
+    }
+
+    /// 检查 SenseVoice 所需权重与执行体是否就位（支持纯原生 exe 或 Python runner）
     pub fn is_available(&self) -> bool {
-        self.runner_path.exists()
-            && self.model_path.exists()
+        self.model_path.exists()
             && self.tokens_path.exists()
-            && self.vad_model_path.exists()
+            && (Self::find_native_cli().is_some()
+                || (self.runner_path.exists() && self.vad_model_path.exists()))
     }
 
     /// 转写本地 WAV 音频文件
@@ -543,40 +554,54 @@ impl SenseVoiceEngine {
         progress_cb: Option<crate::engines::SegmentProgressCb>,
     ) -> Result<(Vec<Segment>, f64)> {
         let audio_path = audio_path.as_ref();
+        let th = clamp_threads(threads.unwrap_or(self.threads));
         info!(
             "SenseVoice 启动极速非自回归转写: {:?}, 语言: {:?}, 线程: {}",
-            audio_path,
-            language,
-            clamp_threads(threads.unwrap_or(self.threads))
+            audio_path, language, th
         );
 
-        let mut cmd = Command::new(&self.python_path);
-        // 让路模式必须在这里生效：SenseVoice 走 Python 子进程，长音频下
-        // 多进程并行会吃满 CPU。只设 CREATE_NO_WINDOW 等于忽略用户的让路开关。
-        super::media_pipeline::apply_default_child_flags(&mut cmd);
-
-        let th = clamp_threads(threads.unwrap_or(self.threads));
-        cmd.arg(&self.runner_path)
-            .arg("--model")
-            .arg(&self.model_path)
-            .arg("--tokens")
-            .arg(&self.tokens_path)
-            .arg("--vad-model")
-            .arg(&self.vad_model_path)
-            .arg("--input")
-            .arg(audio_path)
-            .arg("--threads")
-            .arg(th.to_string())
-            .arg("--language")
-            .arg(language.unwrap_or("auto"))
-            .arg("--provider")
-            .arg(&self.provider);
-
-        if let Some(dur) = total_duration {
-            if dur > 0.0 {
-                cmd.arg("--total-duration").arg(dur.to_string());
+        let mut cmd = if let Some(native_cli) = Self::find_native_cli() {
+            info!("SenseVoice 检测到官方原生 sherpa-onnx 独立程序: {:?}，直接以纯 C++ 模式运行（0 Python 依赖）", native_cli);
+            let mut c = Command::new(&native_cli);
+            super::media_pipeline::apply_default_child_flags(&mut c);
+            c.arg(format!("--sense-voice-model={}", self.model_path.display()))
+                .arg(format!("--tokens={}", self.tokens_path.display()))
+                .arg(format!("--num-threads={}", th));
+            if self.vad_model_path.exists() {
+                c.arg(format!(
+                    "--silero-vad-model-config-model={}",
+                    self.vad_model_path.display()
+                ))
+                .arg("--silero-vad-model-config-threshold=0.5");
             }
-        }
+            c.arg(audio_path);
+            c
+        } else {
+            let mut c = Command::new(&self.python_path);
+            super::media_pipeline::apply_default_child_flags(&mut c);
+            c.arg(&self.runner_path)
+                .arg("--model")
+                .arg(&self.model_path)
+                .arg("--tokens")
+                .arg(&self.tokens_path)
+                .arg("--vad-model")
+                .arg(&self.vad_model_path)
+                .arg("--input")
+                .arg(audio_path)
+                .arg("--threads")
+                .arg(th.to_string())
+                .arg("--language")
+                .arg(language.unwrap_or("auto"))
+                .arg("--provider")
+                .arg(&self.provider);
+
+            if let Some(dur) = total_duration {
+                if dur > 0.0 {
+                    c.arg("--total-duration").arg(dur.to_string());
+                }
+            }
+            c
+        };
 
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1094,6 +1119,7 @@ fn apply_stream_event(
                 language: None,
                 confidence: None,
                 speaker: None,
+                speaker_name: None,
                 words: Vec::new(),
             };
             summary.segments.push(seg.clone());
@@ -1139,6 +1165,7 @@ fn apply_stream_event(
                         language: None,
                         confidence: None,
                         speaker: None,
+                        speaker_name: None,
                         words: Vec::new(),
                     });
                 }

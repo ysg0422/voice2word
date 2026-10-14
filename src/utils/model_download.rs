@@ -476,6 +476,23 @@ pub const ITEMS: &[DownloadItem] = &[
         companion: Some("cublas64_12.dll"),
         sha256: None,
     },
+    DownloadItem {
+        id: "sherpa-onnx-cli",
+        label: "sherpa-onnx 独立执行体（SenseVoice 纯原生免 Python 版）",
+        note: "官方 C++ 原生 Windows 构建，极速非自回归识别，彻底无需安装 Python / pip 环境",
+        dest: "tools/sherpa-onnx-offline.exe",
+        urls: &[
+            "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.10.35/sherpa-onnx-v1.10.35-win-x64.zip",
+            "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.10.35/sherpa-onnx-v1.10.35-win-x64.zip",
+        ],
+        size: 18_420_000,
+        min_size: 100_000,
+        required: false,
+        group: ItemGroup::Binary,
+        is_archive: true,
+        companion: Some("onnxruntime.dll"),
+        sha256: None,
+    },
 ];
 
 /// 系统 PATH 上能不能找到这个命令（不含扩展名，例如 `ffmpeg`）。

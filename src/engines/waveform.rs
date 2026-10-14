@@ -511,6 +511,7 @@ impl WaveformColumn {
 ///    - 该采样点的振幅峰值必须低于静音阈值 (`silence_threshold`)；
 ///    - 该采样点是局部的波谷（其振幅不大于左右相邻采样）；
 ///    - 该采样点的时间位于 `target_t ± search_radius` 范围内。
+///
 ///    在所有符合条件的候选波谷中，优先选择振幅更低（静音更彻底）且距 `target_t` 最近的波谷时刻；
 /// 3. 若均未命中，返回 `None`。
 pub fn find_magnetic_snap_point(
@@ -869,11 +870,20 @@ mod tests {
         let radius = 0.12;
 
         // 离 1.00 仅 0.04s，在 0.12 范围内
-        assert_eq!(find_magnetic_snap_point(1.04, radius, &[], &edges, None), Some(1.00));
+        assert_eq!(
+            find_magnetic_snap_point(1.04, radius, &[], &edges, None),
+            Some(1.00)
+        );
         // 离 1.25 仅 0.03s
-        assert_eq!(find_magnetic_snap_point(1.22, radius, &[], &edges, None), Some(1.25));
+        assert_eq!(
+            find_magnetic_snap_point(1.22, radius, &[], &edges, None),
+            Some(1.25)
+        );
         // 离所有边缘都远超 radius
-        assert_eq!(find_magnetic_snap_point(1.50, radius, &[], &edges, None), None);
+        assert_eq!(
+            find_magnetic_snap_point(1.50, radius, &[], &edges, None),
+            None
+        );
     }
 
     #[test]
@@ -892,7 +902,10 @@ mod tests {
         assert_eq!(snapped, Some(0.30));
 
         // 拖动到 0.12s，附近波形虽然有局部低点但振幅为 0.40/0.80，均高于阈值 0.05
-        assert_eq!(find_magnetic_snap_point(0.12, radius, &cols, &[], None), None);
+        assert_eq!(
+            find_magnetic_snap_point(0.12, radius, &cols, &[], None),
+            None
+        );
     }
 
     #[test]
@@ -921,9 +934,15 @@ mod tests {
             WaveformColumn::new(0.50, 0.70),
         ];
         // 用户拖到 0.22s，离 0.20s 最近
-        assert_eq!(find_magnetic_snap_point(0.22, 0.12, &cols, &[], None), Some(0.20));
+        assert_eq!(
+            find_magnetic_snap_point(0.22, 0.12, &cols, &[], None),
+            Some(0.20)
+        );
         // 用户拖到 0.39s，离 0.40s 最近
-        assert_eq!(find_magnetic_snap_point(0.39, 0.12, &cols, &[], None), Some(0.40));
+        assert_eq!(
+            find_magnetic_snap_point(0.39, 0.12, &cols, &[], None),
+            Some(0.40)
+        );
     }
 
     #[test]
@@ -947,10 +966,16 @@ mod tests {
 
     #[test]
     fn magnetic_snap_degenerate_inputs_return_none() {
-        assert_eq!(find_magnetic_snap_point(f64::NAN, 0.12, &[], &[], None), None);
+        assert_eq!(
+            find_magnetic_snap_point(f64::NAN, 0.12, &[], &[], None),
+            None
+        );
         assert_eq!(find_magnetic_snap_point(1.0, 0.0, &[], &[], None), None);
         assert_eq!(find_magnetic_snap_point(1.0, -0.5, &[], &[], None), None);
-        assert_eq!(find_magnetic_snap_point(1.0, 0.12, &[], &[f64::NAN, -1.0], None), None);
+        assert_eq!(
+            find_magnetic_snap_point(1.0, 0.12, &[], &[f64::NAN, -1.0], None),
+            None
+        );
 
         let data = WaveformData {
             peaks: Vec::new(),
