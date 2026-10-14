@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use crate::subtitle::segment::WordTiming;
@@ -58,6 +59,25 @@ pub const MAX_THREADS: u32 = 512;
 /// 而推荐档位实测用到的最大值只有 3（见 `core/performance.rs` 的决策矩阵）。
 pub const MIN_PROCESSORS: u32 = 1;
 pub const MAX_PROCESSORS: u32 = 8;
+
+/// 停滞看门狗预算：whisper-cli 连续这么久**没有任何一行** stdout/stderr 输出，就判定它卡死。
+///
+/// # 为什么判据是「停滞」而不是「总时长上限」
+/// 长音频跑十几分钟是正常的（1 小时素材在弱 CPU 上确实要跑很久），拿总耗时当上限必然
+/// 误杀。但正常推理的输出是**连续**的：whisper.cpp 每完成一个 30 秒窗口就打印分段，
+/// 开启 VAD 时每个切片一行，`--print-progress` 还会按段推进打印进度；因此「整整 5 分钟
+/// 一行都没有」只可能是卡死（Vulkan/驱动死等、输出管道 I/O 卡住、子进程被挂起后
+/// 没恢复），不可能是正常推理。
+///
+/// # 为什么是 300 秒
+/// 现实里最慢的场景（弱 CPU + large 模型）单个 30 秒窗口的推理也远小于 5 分钟，
+/// 而模型加载阶段在起始 1 秒内就会打印 init 日志；取值再大只是让卡死发现得更晚，
+/// 代价是无人值守的批量队列被一个死进程多拖几分钟。
+const WHISPER_STALL_BUDGET: Duration = Duration::from_secs(300);
+
+/// 停滞看门狗的轮询间隔：判定精度与调度开销的折中。
+/// 500ms 让「判死 → 强杀」最多晚半秒，同时每秒只唤醒 2 次，对转写线程可忽略。
+const WHISPER_WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 共享配置文件名，与 `AppConfig::load_from_file("config.toml")` 的约定一致。
 const CONFIG_FILE_NAME: &str = "config.toml";
@@ -145,6 +165,32 @@ pub(crate) fn take_live_pids(registry: &Arc<Mutex<Vec<ChildEntry>>>) -> Vec<u32>
         .unwrap_or_else(|e| e.into_inner())
         .drain(..)
         .map(|(pid, _)| pid)
+        .collect()
+}
+
+/// 取登记表中**仍然有效**的子进程 PID 的**快照**（不清空登记表）。
+///
+/// # 为什么 `cancel()` 用快照而不是 [`take_live_pids`] 的 drain
+/// drain 语义让「取消」变成一次性动作：用户连点两次「终止转写」，第二次取到的名单
+/// 是空的——如果第一次的 `taskkill` 因为竞态/权限没把子进程杀掉，用户就再也没有
+/// 第二次机会，界面表现就是「点了终止，转写照跑」。改成快照后，每一次取消都能对着
+/// 「当前仍在登记表中的」子进程重发强杀。
+///
+/// # 为什么这不削弱「不得杀到陈旧 PID」的加固
+/// 登记行仍然只在 `child.wait()` 返回处由 [`ChildPidGuard::disarm`] 摘除——「先摘
+/// 登记行、后关进程句柄」那套原样保留，因此快照里不会出现「已归还系统、可能被复用
+/// 给无关进程」的号码。Windows 上还有句柄这一层：PID 只在进程对象的最后一个句柄
+/// 关闭后才可能被复用，而句柄由 `Child` 持有到 `wait()` 之后才关闭。
+///
+/// # 为什么不直接改 [`take_live_pids`]
+/// `punc` / `sensevoice` 两个引擎仍按 drain 语义调用它，本轮只允许改本文件，
+/// 保留原函数不动、另加一个快照函数是唯一不破坏它们的做法。
+pub(crate) fn live_child_pids(registry: &Arc<Mutex<Vec<ChildEntry>>>) -> Vec<u32> {
+    registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(pid, _)| *pid)
         .collect()
 }
 
@@ -404,12 +450,16 @@ impl WhisperEngine {
 
     /// 用户请求终止：置位取消标志并强杀全部正在运行的 whisper-cli 子进程（含切块并行实例）
     ///
-    /// 只杀 [`take_live_pids`] 交回的「尚未回收」PID：已被 `wait()` 回收的进程，
-    /// 会在 `wait()` 返回处就被 [`ChildPidGuard::disarm`] 从登记表摘掉，因此这里
+    /// 名单来源是 [`live_child_pids`] 的**快照**（不清表）：这样「终止」可以连点，
+    /// 每一次都对当前仍在运行的子进程重发强杀，而不是第二次拿到空名单、眼看着第一次
+    /// 没杀掉的进程继续跑。
+    ///
+    /// 只杀名单里的「尚未回收」PID：已被 `wait()` 回收的进程会在 `wait()` 返回处就被
+    /// [`ChildPidGuard::disarm`] 从登记表摘掉（先摘登记行、后关进程句柄），因此这里
     /// 不可能对着一个已归还系统、可能被复用给无关进程的号码发信号。
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
-        for pid in take_live_pids(&self.active_children) {
+        for pid in live_child_pids(&self.active_children) {
             kill_process_tree(pid);
         }
     }
@@ -448,15 +498,15 @@ impl WhisperEngine {
     /// 登记子进程 PID，并回报「登记这一刻取消是否已经到达」。
     ///
     /// 收口的是 `cancel()` 与「刚 `spawn()`、尚未登记」之间的竞态：`cancel()` 先
-    /// 置位取消标志，再 `take_live_pids()` 取名单逐个强杀。若它恰好插在 `spawn()`
+    /// 置位取消标志，再 `live_child_pids()` 取快照逐个强杀。若它恰好插在 `spawn()`
     /// 成功与本次 `register()` 之间，登记表里还没有这一行，取到的名单是空的，
     /// 这一发信号就丢了——子进程会一直占着 GPU 跑到自己结束，用户看来就是
     /// 「点了终止转写却完全没生效」。
     ///
     /// 为什么在登记之后复查标志就能闭合：`cancel()` 的置位与本次复查都是 SeqCst，
-    /// 二者有全序；而 `take_live_pids()` 的 drain 与本次 register 又在同一把 Mutex
-    /// 下互斥。若 drain 没看到本行，只能是 drain 早于 register，那么置位也早于
-    /// register，复查必然读到 `true`。于是「drain 发信号」与「本处补杀」两条路径
+    /// 二者有全序；而 `live_child_pids()` 取快照与本次 register 又在同一把 Mutex
+    /// 下互斥。若快照没看到本行，只能是快照早于 register，那么置位也早于
+    /// register，复查必然读到 `true`。于是「快照发信号」与「本处补杀」两条路径
     /// 必有一条命中，不存在都漏。
     ///
     /// 返回值交给调用方去补 `kill_process_tree`，而不是在本函数里直接杀，是为了让
@@ -867,7 +917,7 @@ impl WhisperEngine {
         // 正常跑完时还要在 `wait()` 返回处主动 `disarm()`，见其文档。
         let (mut child_guard, cancelled_before_register) = self.register_child(child.id());
         // 竞态收口：cancel() 可能恰好插在 spawn() 成功与上面的登记之间——那会儿本行
-        // 还没进表，cancel() 的 take_live_pids() 拿到空名单，强杀信号就丢了，子进程
+        // 还没进表，cancel() 的 live_child_pids() 拿到空名单，强杀信号就丢了，子进程
         // 会一直占着 GPU 跑到自己结束。register_child 已用 SeqCst 全序保证「drain 没
         // 看到本行」必然意味着「本处复查命中」，所以这里补一发即可闭合窗口。
         // 此刻 child 仍持有进程句柄、尚未 wait()，PID 不可能被系统复用给无关进程。
@@ -922,10 +972,17 @@ impl WhisperEngine {
         let cb_shared = std::sync::Arc::new(progress_cb);
         let cb_clone = cb_shared.clone();
 
+        // 【停滞看门狗】共享的「最后一行输出时刻」：stdout/stderr 读线程每收到一行就刷新它，
+        // 主线程把它与停滞预算比较，从而判定子进程是否卡死（见 `WHISPER_STALL_BUDGET`）。
+        // 初值 = 现在：从 spawn 起算，模型加载阶段几秒内就会打印 init 日志，
+        // 因此正常启动不会一上来就被判死。
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+
         // stderr 流式解析：whisper-cli 在长视频 + VAD 下会输出海量日志（每个 VAD 切片一行），
         // 原先 read_to_end 全量读入再整体解码，会占用几十 MB 并产生一次大字符串分配。
         // 这里改为逐行处理：只累计 VAD 耗时、保留末尾若干行用于报错信息，其余直接丢弃。
         const STDERR_TAIL_LINES: usize = 40;
+        let stderr_activity = last_activity.clone();
         let stderr_handle = std::thread::spawn(move || -> (f64, String) {
             let Some(err) = stderr else {
                 return (0.0, String::new());
@@ -937,6 +994,8 @@ impl WhisperEngine {
             // 读失败（≠ 正常 EOF）时 `read_pipe_lines` 返回 true：诊断日志已不可信，
             // 在尾部补一条标记，避免用户把截断的报错当成完整原因。
             let truncated = read_pipe_lines(&mut reader, "whisper-cli stderr", |line| {
+                // 每一行都算「子进程还活着」：stderr 是 GPU/Vulkan 模式下的主要进度来源。
+                *stderr_activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
                 if let Some(ms) = WhisperEngine::parse_vad_ms_line(line) {
                     vad_ms += ms;
                 }
@@ -958,6 +1017,7 @@ impl WhisperEngine {
         // stdout 读取线程置位、调用方读取：读失败时它把「输出被截断」这一事实
         // 从线程内部带回到 `transcribe_input*` 的调用方。
         let output_truncated_flag = self.output_truncated.clone();
+        let stdout_activity = last_activity.clone();
         let stdout_handle = std::thread::spawn(move || {
             let mut captured_lines = Vec::new();
             let mut last_emit = 0.0f64;
@@ -976,6 +1036,8 @@ impl WhisperEngine {
                 // 读到一半报错」与「子进程正常收尾」在结果上完全同形，用户只看到字幕
                 // 莫名少了一截。`read_pipe_lines` 返回 true = 因读失败中止。
                 let truncated = read_pipe_lines(&mut reader, "whisper-cli stdout", |line| {
+                    // 每一行都算「子进程还活着」：stdout 上的分段输出就是推理在推进的证据。
+                    *stdout_activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
                     let trimmed = line.trim();
                     if trimmed.contains("-->") {
                         if let Some((time_bracket, text_part)) = trimmed.split_once(']') {
@@ -1093,7 +1155,36 @@ impl WhisperEngine {
             captured_lines.join("\n")
         });
 
-        let wait_result = child.wait();
+        // 【停滞看门狗】不裸用 `child.wait()`：whisper-cli 在 Vulkan/驱动死等或输出管道
+        // I/O 卡住时会永久挂起，无人值守（批量队列 / CLI 无头）时整条转写线程就此陪葬。
+        // 改成有界轮询：进程仍活着、但距最后一次输出已达到 `WHISPER_STALL_BUDGET`，
+        // 就判为卡死——强杀进程树并收尸，随后按「可读错误」返回，而不是无限等下去。
+        // 判据只能是「停滞」，绝不能是「总耗时」：长音频跑十几分钟是正常的。
+        let mut stalled = false;
+        let wait_result: std::io::Result<std::process::ExitStatus> = loop {
+            match child.try_wait() {
+                // 进程已退出：正常结束 / 被 cancel() 杀掉 都走这条，交给下游按退出码与
+                // 取消标志分流。
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    let last = *last_activity.lock().unwrap_or_else(|e| e.into_inner());
+                    if stall_budget_exceeded(last, Instant::now(), WHISPER_STALL_BUDGET, false) {
+                        stalled = true;
+                        warn!(
+                            pid = child.id(),
+                            budget_secs = WHISPER_STALL_BUDGET.as_secs(),
+                            "whisper-cli 连续无输出达到停滞预算，判定卡死，强制终止进程树"
+                        );
+                        kill_process_tree(child.id());
+                        // 强杀之后收尸：`wait()` 此刻必然很快返回，回收进程句柄。
+                        // 若连收尸都失败，错误照常由下面的 with_context 带出。
+                        break child.wait();
+                    }
+                    std::thread::sleep(WHISPER_WATCHDOG_POLL_INTERVAL);
+                }
+                Err(err) => break Err(err),
+            }
+        };
         // 进程已被 wait() 回收：立刻摘掉登记行。必须排在 gpu_throttle.stop() 之前——
         // 后者要 join 限速线程、可能阻塞，不能把这段等待夹在「PID 已归还系统」与
         // 「摘除登记行」之间，否则 cancel() 仍有机会对着陈旧 PID 发信号。
@@ -1131,6 +1222,19 @@ impl WhisperEngine {
             return Ok((Vec::new(), 0.0));
         }
 
+        // 【停滞看门狗】判为卡死而强杀的路径：错误必须与上面「用户取消」（已提前返回）
+        // 和下面按退出码归因的失败分开，否则用户会照着一个已卡死的推理进程去排查
+        // 「缺少运行库 / 参数错误」。文案里说明「已终止、可重试」并给出降级方向。
+        if stalled {
+            anyhow::bail!(
+                "Whisper 识别进程无响应，已强制终止：连续 {} 秒没有任何输出/分段。\
+                 正常推理会持续打印进度与分段，静默这么久只可能是子进程卡死——\
+                 常见于 Vulkan/驱动死等或输出管道 I/O 卡住。本次转写未完成，请重试；\
+                 若反复出现，可在「性能设置」里改用 CPU 推理或换更小的模型。",
+                WHISPER_STALL_BUDGET.as_secs()
+            );
+        }
+
         if !output_status.success() {
             // stderr 读取线程 panic 时 stderr_str 必为空：若继续走下面的「无输出＝缺运行库」
             // 分支，会把用户引向完全错误的方向——真正的事实是诊断通道本身坏了。
@@ -1163,9 +1267,10 @@ impl WhisperEngine {
         }
 
         let mut segments = Vec::new();
-        // JSON 是否解析成功（与「解出 0 句」区分）：stdout 兜底线程 panic 时，只有
-        // JSON 也没解析成功才意味着「已无任何文本来源」。
-        let mut json_parsed_ok = false;
+        // JSON 侧的最终状态：区分「正常解析（哪怕结果是空的）」「文件没产出」「文件在但
+        // 解析失败」。stdout 兜底线程 panic 时，只有非 [`JsonOutcome::Parsed`] 才意味着
+        // 「已无任何文本来源」；空结果的报错归因也完全依赖它（见 [`empty_result_error`]）。
+        let mut json_outcome = JsonOutcome::Missing;
 
         if json_file.exists() {
             // 读失败（被清理、权限、磁盘错误）以前被 `unwrap_or_default()` 吞成空
@@ -1178,6 +1283,7 @@ impl WhisperEngine {
                         error = %err,
                         "--output-json 结果文件读取失败：回退 stdout 兜底解析"
                     );
+                    json_outcome = JsonOutcome::ParseFailed;
                     Vec::new()
                 }
             };
@@ -1194,13 +1300,17 @@ impl WhisperEngine {
                     raw_len = json_str.len(),
                     "whisper --output-json 解析失败：回退 stdout 兜底解析"
                 );
+                json_outcome = JsonOutcome::ParseFailed;
             }
             if let Ok(data) = parsed {
-                json_parsed_ok = true;
+                json_outcome = JsonOutcome::Parsed;
                 let detected_lang = data.result.and_then(|r| r.language);
                 // 缺 offsets 的片段会被当作 0.0 → 0.0：时间轴优化随后按「无效时长」把
                 // 它们剔掉，用户只看到字幕凭空少几句。这里计数，循环后统一告警。
                 let mut missing_offsets = 0usize;
+                // 时间戳非法（负数 / 倒序）而被夹紧的片段数：同样循环后统一告警，
+                // 别让「句子的时间被改过」这件事无声发生。
+                let mut invalid_offsets = 0usize;
                 // VAD 生效时段/词不同轴（见 Self::align_words_to_segment），记下被归一化的段数与首例，
                 // 循环后统一告警一次：免得以后又有人以为词级高亮「本来就不准」。
                 let mut realigned_segments = 0usize;
@@ -1216,10 +1326,16 @@ impl WhisperEngine {
                         {
                             missing_offsets += 1;
                         }
-                        let start =
-                            item.offsets.as_ref().and_then(|o| o.from).unwrap_or(0) as f64 / 1000.0;
-                        let end =
-                            item.offsets.as_ref().and_then(|o| o.to).unwrap_or(0) as f64 / 1000.0;
+                        // 负值 / 倒序在解析时就夹到合法区间（start≥0、end≥start），
+                        // 否则它们会变成无效时长，随后被时间轴优化**静默**删掉整句。
+                        // 被修正过的片段单独计数，循环后统一告警。
+                        let (start, end, offsets_clamped) = clamp_json_offsets(
+                            item.offsets.as_ref().and_then(|o| o.from),
+                            item.offsets.as_ref().and_then(|o| o.to),
+                        );
+                        if offsets_clamped {
+                            invalid_offsets += 1;
+                        }
 
                         let mut seg = Segment {
                             index: i + 1,
@@ -1248,6 +1364,12 @@ impl WhisperEngine {
                             "whisper JSON 有片段缺少时间偏移：这些片段按 0.0 秒入表，可能被时间轴优化按无效时长剔除"
                         );
                     }
+                    if invalid_offsets > 0 {
+                        warn!(
+                            invalid_offsets,
+                            "whisper JSON 有片段的时间偏移非法（负数或倒序）：已在解析时夹到合法区间（start≥0、end≥start），句子文本全部保留、只修正了时间"
+                        );
+                    }
                     if realigned_segments > 0 {
                         let (index, segment_from, segment_to, words_from, words_to) =
                             first_realign.unwrap_or((0, 0.0, 0.0, 0.0, 0.0));
@@ -1273,7 +1395,7 @@ impl WhisperEngine {
         // stdout 读取线程 panic，且 JSON 也没解析成功：此时空结果不代表「素材里没有语音」，
         // 而是唯一的文本来源在收尾时坏掉了。必须带上下文返回错误，否则用户拿到的是一枚
         // 没有任何解释的空字幕，日志里也无从追查。
-        if segments.is_empty() && stdout_thread_panicked && !json_parsed_ok {
+        if segments.is_empty() && stdout_thread_panicked && json_outcome != JsonOutcome::Parsed {
             anyhow::bail!(
                 "Whisper 转写结果不可用：stdout 读取线程异常退出（panic），且 --output-json 结果缺失或无法解析，已无任何文本来源。请重试；若可复现请保留 logs/ 中的日志反馈。"
             );
@@ -1282,7 +1404,7 @@ impl WhisperEngine {
         // 成功退出（退出码 0）却拿不到任何文本来源：必须报错，不能静默返回 Ok(空)。
         // 触发路径与文案见 [`empty_result_error`]。
         if segments.is_empty() {
-            if let Some(msg) = empty_result_error(lang, json_parsed_ok) {
+            if let Some(msg) = empty_result_error(lang, json_outcome) {
                 anyhow::bail!(msg);
             }
         }
@@ -1586,27 +1708,72 @@ fn normalize_language(raw: &str) -> &str {
     }
 }
 
+/// JSON 侧的最终产出状态：决定「成功退出却零字幕」到底是素材事实，还是某个环节坏了。
+///
+/// 为什么必须三分而不是原来的 `bool`：原来的 `false` 把「JSON 没产出」与「JSON 有但
+/// 解析失败」混为一谈，于是磁盘满 / 进程被强杀写出半截 JSON 这类故障也会被报成
+/// 「语言码不被接受」，把用户引去改语言设置——排查方向彻底错。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JsonOutcome {
+    /// 文件正常产出并解析成功（`transcription` 为空是素材里确实没有语音，属正常）。
+    Parsed,
+    /// `--output-json` 文件根本没产出：实测最常见的原因是 `-l` 收到了未知语言码
+    /// （识别程序打印一行 error 后**以退出码 0** 结束，不写 JSON）。
+    Missing,
+    /// 文件存在但读取 / 解析失败：磁盘满、写一半被强杀、JSON 被中途清理。与语言码无关。
+    ParseFailed,
+}
+
 /// 子进程以退出码 0 收尾、却拿不到任何文本来源时给出的报错文案；`None` = 空结果**正常**。
 ///
 /// 正常收尾必然写出 `--output-json`（素材里没有语音时也会写出空的 `transcription`），
-/// 所以 `json_parsed_ok = true` 已经证明「结果是空的」是素材事实、不是失败；只有
-/// `false`（文件没产出或解析失败）才是「没有任何文本来源」。
-///
-/// 实测触发路径：`-l <未知语言码>`。识别程序只往 stderr 打一行 `error: unknown language`
-/// （紧跟着 60 多行用法说明，正好把那一行挤出本文件只保留的 stderr 尾部），然后
-/// `exit(0)`——退出码为 0、stdout 0 字节、没有 JSON 文件，于是旧代码返回 `Ok((空, 0.0))`，
-/// 调用方（UI / HTTP API）看到的是「转写完成，共 0 个片段」，真正的原因只躺在日志里。
-/// 文案里带上 `-l` 的取值，正是因为它比 stderr 尾部更有用。
-fn empty_result_error(lang: &str, json_parsed_ok: bool) -> Option<String> {
-    if json_parsed_ok {
-        return None;
+/// 所以 [`JsonOutcome::Parsed`] 已经证明「结果是空的」是素材事实、不是失败；另外两种
+/// 状态才是「没有任何文本来源」，且**归因不同、文案必须不同**：
+///   - [`JsonOutcome::Missing`]：实测触发路径是 `-l <未知语言码>`——识别程序只往 stderr
+///     打一行 `error: unknown language`（紧跟着 60 多行用法说明，正好把那一行挤出本文件
+///     只保留的 stderr 尾部），然后 `exit(0)`：退出码 0、stdout 0 字节、没有 JSON 文件。
+///     文案里带上 `-l` 的取值，正是因为它比 stderr 尾部更有用。
+///   - [`JsonOutcome::ParseFailed`]：文件在但读取/解析失败，与语言码无关，文案要指向
+///     磁盘空间与日志，绝不能引导用户去改「识别语言」。
+fn empty_result_error(lang: &str, json: JsonOutcome) -> Option<String> {
+    match json {
+        JsonOutcome::Parsed => None,
+        JsonOutcome::Missing => Some(format!(
+            "Whisper 未产出任何识别结果：既没有 --output-json 文件，stdout 也没有任何片段。\
+             最常见的原因是语言码 `-l {lang}` 不被识别程序接受（它只认 2 字母语言码、语言全名或 auto；\
+             遇到未知值只会打印一行 error 后以退出码 0 结束，因此不会走别的报错分支）。\
+             请把「识别语言」改成 auto 或有效代码后重试。"
+        )),
+        JsonOutcome::ParseFailed => Some(
+            "Whisper 未产出任何识别结果：--output-json 结果文件存在，但无法读取或解析\
+             （可能是磁盘空间不足、文件被中途清理，或进程被强杀时只写出了半截 JSON）。\
+             这不是语言设置的问题——请先检查磁盘剩余空间与 logs/ 中的日志，然后重试。"
+                .to_string(),
+        ),
     }
-    Some(format!(
-        "Whisper 未产出任何识别结果：既没有 --output-json 文件，stdout 也没有任何片段。\
-         最常见的原因是语言码 `-l {lang}` 不被识别程序接受（它只认 2 字母语言码、语言全名或 auto；\
-         遇到未知值只会打印一行 error 后以退出码 0 结束，因此不会走别的报错分支）。\
-         请把「识别语言」改成 auto 或有效代码后重试。"
-    ))
+}
+
+/// 把 JSON 里的毫秒级 offsets 夹成合法的时间区间（秒）：`start >= 0`、`end >= start`。
+///
+/// 返回 `(start_sec, end_sec, changed)`；`changed = true` 表示该片段的时间戳**被修正过**
+/// （负值或倒序）。缺字段按 0.0 处理，但**不计入** `changed`——「缺字段」由调用方单独
+/// 计数，两个计数报告的是两类不同的坏数据，重复计数会让告警条数虚高。
+///
+/// # 为什么必须在解析时就夹
+/// json 里的 offsets 直接来自识别程序，负值 / `to < from` 被原样收下后会变成负时长或
+/// 零时长，随后 `optimize_segments` 按「无效时长」把它们**静默**删掉——用户只看到字幕
+/// 凭空少几句，日志里什么都没有。解析时夹到合法区间并单独计数、收尾统一告警一次，
+/// 坏数据就变成看得见的提示，而不是无声丢句子。
+/// 注意：夹取只改时间，**任何情况下都不丢弃该句文本**。
+fn clamp_json_offsets(from_ms: Option<i64>, to_ms: Option<i64>) -> (f64, f64, bool) {
+    let raw_start = from_ms.unwrap_or(0) as f64 / 1000.0;
+    let raw_end = to_ms.unwrap_or(0) as f64 / 1000.0;
+    let start = raw_start.max(0.0);
+    let end = raw_end.max(0.0).max(start);
+    let negative = from_ms.is_some_and(|v| v < 0) || to_ms.is_some_and(|v| v < 0);
+    // 只有两端都给出时才谈得上「倒序」；缺一端属于 missing，另有计数。
+    let inverted = matches!((from_ms, to_ms), (Some(_), Some(_))) && raw_end < start;
+    (start, end, negative || inverted)
 }
 
 /// 收尾子线程：把 `JoinHandle::join()` 的 panic 显式记录成日志，而不是用
@@ -1891,6 +2058,24 @@ fn read_pipe_lines<R: std::io::BufRead>(
             }
         }
     }
+}
+
+/// 停滞判定（纯函数，便于单测）：进程仍存活、且「距最后一次输出的时长」达到预算 → 判死。
+///
+/// - `process_exited = true` 时恒为 `false`：进程都已经退出了，没有「卡死」可言
+///   （这正是「卡死」与「正常结束 / 被杀」的分界，也是看门狗不能误杀的关键）。
+/// - 用 `saturating_duration_since` 而不是减法：`Instant` 在个别平台上会出现极小回拨，
+///   减法会 panic；回拨时视为「刚刚有活动」，宁可不判死也不误杀。
+fn stall_budget_exceeded(
+    last_activity: Instant,
+    now: Instant,
+    budget: Duration,
+    process_exited: bool,
+) -> bool {
+    if process_exited {
+        return false;
+    }
+    now.saturating_duration_since(last_activity) >= budget
 }
 
 /// Whisper 的 zh 词表偏繁体；落地前统一转简体。
@@ -2752,6 +2937,119 @@ mod tests {
         );
     }
 
+    // ---- 停滞看门狗：判据必须只认「停滞」，不许误杀长音频 ----
+
+    /// 【停滞判定】未超预算不算、恰好到预算算、超预算算、进程已退出不算；
+    /// 另外 `Instant` 回拨不得 panic、不得误判。
+    #[test]
+    fn stall_watchdog_only_trips_after_budget_with_live_process() {
+        let budget = Duration::from_secs(300);
+        let now = Instant::now();
+        let last = now - Duration::from_secs(10);
+
+        // 未超预算：正在正常推理（时间一直在被刷新）绝不能判死
+        assert!(!stall_budget_exceeded(last, now, budget, false));
+        // 恰好到预算：判死（边界取「>=」，与预算定义一致）
+        assert!(stall_budget_exceeded(last, last + budget, budget, false));
+        // 超预算：判死
+        assert!(stall_budget_exceeded(
+            last,
+            last + budget + Duration::from_secs(1),
+            budget,
+            false
+        ));
+        // 进程已退出：静默多久都不算卡死——这是「卡死」与「正常结束/被杀」的分界
+        assert!(!stall_budget_exceeded(
+            last,
+            last + budget + Duration::from_secs(3600),
+            budget,
+            true
+        ));
+        // 时间回拨（now 早于 last）：不得 panic，也不得误判为卡死
+        assert!(!stall_budget_exceeded(
+            now,
+            now - Duration::from_secs(5),
+            budget,
+            false
+        ));
+    }
+
+    // ---- 时间戳夹紧：负值 / 倒序 / 缺字段的落点 ----
+
+    /// 【时间戳夹紧】正常值原样保留；负数归 0、倒序把 end 抬到 start；缺字段按 0.0
+    /// 处理但不算「被修正」（missing 另有计数）。并穷举不变量：start≥0 且 end≥start。
+    #[test]
+    fn json_offsets_are_clamped_and_bad_values_counted() {
+        // 正常值：原样，不算被修正
+        assert_eq!(clamp_json_offsets(Some(0), Some(500)), (0.0, 0.5, false));
+        assert_eq!(
+            clamp_json_offsets(Some(1500), Some(3500)),
+            (1.5, 3.5, false)
+        );
+        // 两端都是负数：夹到 0.0，标记被修正
+        assert_eq!(clamp_json_offsets(Some(-500), Some(-100)), (0.0, 0.0, true));
+        // 倒序：end 抬到 start（时长 0）；文本仍保留，只是计数告警
+        assert_eq!(clamp_json_offsets(Some(5000), Some(1000)), (5.0, 5.0, true));
+        // 只有 start 为负：start 归 0，end 保持
+        assert_eq!(clamp_json_offsets(Some(-500), Some(2000)), (0.0, 2.0, true));
+        // 缺字段按 0.0 处理，但不算「被修正」
+        assert_eq!(clamp_json_offsets(None, None), (0.0, 0.0, false));
+        assert_eq!(clamp_json_offsets(Some(1000), None), (1.0, 1.0, false));
+
+        // 不变量穷举：任何取值夹取后都必须 start>=0 且 end>=start
+        for (f, t) in [
+            (0i64, 0i64),
+            (-1, -1),
+            (7, 7),
+            (0, -1),
+            (-1, 0),
+            (i64::MIN, i64::MAX),
+            (i64::MAX, i64::MIN),
+            (i64::MIN, i64::MIN),
+        ] {
+            let (s, e, _) = clamp_json_offsets(Some(f), Some(t));
+            assert!(
+                s.is_finite() && e.is_finite(),
+                "{f}/{t}: 夹取结果必须是有限值，实际 {s}/{e}"
+            );
+            assert!(
+                s >= 0.0 && e >= s,
+                "{f}/{t}: 夹取后必须 start>=0 且 end>=start，实际 {s}/{e}"
+            );
+        }
+    }
+
+    // ---- 取消可重复：名单取快照，连点两次仍能拿到同一 PID ----
+
+    /// 【取消可重复】`live_child_pids` 只取快照、不清表：第二次「终止」仍能拿到同一 PID；
+    /// 进程被 `wait()` 回收并 `disarm()` 之后，名单里立刻不再有它（不杀陈旧 PID 的前提不变）。
+    #[test]
+    fn cancel_snapshot_is_repeatable_until_child_is_reaped() {
+        let registry = empty_registry();
+        let _guard = ChildPidGuard::register(registry.clone(), 7788);
+
+        // 连点两次「终止」：两次都必须拿到同一 PID，否则第二次强杀信号会丢。
+        assert_eq!(live_child_pids(&registry), vec![7788]);
+        assert_eq!(
+            live_child_pids(&registry),
+            vec![7788],
+            "取名单不得清空登记行，否则第二次取消就没有第二次机会"
+        );
+        // 与 drain 版对照：take_live_pids 一次就把行取走，正是「取消一次性」的根源。
+        assert_eq!(take_live_pids(&registry), vec![7788]);
+        assert!(live_child_pids(&registry).is_empty());
+
+        // 换一张表复现正常路径：登记 → 回收（disarm）→ 名单为空。
+        let reaped_registry = empty_registry();
+        let mut reaped = ChildPidGuard::register(reaped_registry.clone(), 7789);
+        assert_eq!(live_child_pids(&reaped_registry), vec![7789]);
+        reaped.disarm();
+        assert!(
+            live_child_pids(&reaped_registry).is_empty(),
+            "已回收的 PID 不得留在快照里，否则连点终止会误杀复用该 PID 的无关进程"
+        );
+    }
+
     // ---- 缺陷 2 回归：收尾子线程 panic 必须显式收口 ----
     //
     // 旧写法 `handle.join().unwrap_or_default()` 把 panic 静默换成空串 / (0.0, "")，
@@ -3123,7 +3421,7 @@ mod hotwords_tests {
 mod argv_and_result_guard_tests {
     use super::{
         effective_processors, effective_threads, empty_result_error, normalize_language,
-        WhisperEngine, MAX_PROCESSORS, MAX_THREADS, MIN_PROCESSORS, MIN_THREADS,
+        JsonOutcome, WhisperEngine, MAX_PROCESSORS, MAX_THREADS, MIN_PROCESSORS, MIN_THREADS,
     };
 
     /// `-t 0` 会让识别程序在 ggml 的线程池断言上 abort（实测：退出码 0xC0000409、
@@ -3211,19 +3509,42 @@ mod argv_and_result_guard_tests {
         );
     }
 
-    /// 「成功退出却没有任何文本来源」必须报错，而不是 `Ok((空, 0.0))`：
-    /// 只有 JSON 正常产出（哪怕是空转写）才算「素材里确实没有语音」这一正常情况。
+    /// 【错误归因】「成功退出却没有任何文本来源」必须报错，而不是 `Ok((空, 0.0))`；
+    /// 且三种 JSON 状态必须走三条不同文案：
+    ///   - 解析成功（哪怕空转写）= 素材事实，不报错；
+    ///   - 文件没产出 = 指向语言码（实测触发路径）；
+    ///   - 文件在但解析失败（磁盘满 / 半截 JSON）= 指向磁盘与日志，**绝不**引导改语言设置。
     #[test]
-    fn empty_result_without_text_source_is_reported_as_failure() {
+    fn empty_result_error_attributes_by_json_outcome() {
         assert!(
-            empty_result_error("zh", true).is_none(),
+            empty_result_error("zh", JsonOutcome::Parsed).is_none(),
             "json 已产出就证明空结果是素材事实，不得报错"
         );
-        let msg = empty_result_error("zh-CN", false).expect("没有任何文本来源必须报错");
-        assert!(msg.contains("zh-CN"), "报错要带上实际传入的 -l 值: {msg}");
+
+        let missing =
+            empty_result_error("zh-CN", JsonOutcome::Missing).expect("没有任何文本来源必须报错");
         assert!(
-            msg.contains("auto"),
-            "报错要给出可操作的下一步（改用 auto 或有效代码）: {msg}"
+            missing.contains("zh-CN"),
+            "报错要带上实际传入的 -l 值: {missing}"
+        );
+        assert!(
+            missing.contains("auto"),
+            "报错要给出可操作的下一步（改用 auto 或有效代码）: {missing}"
+        );
+
+        let parse_failed =
+            empty_result_error("zh", JsonOutcome::ParseFailed).expect("解析失败必须报错");
+        assert!(
+            !parse_failed.contains("语言码") && !parse_failed.contains("-l "),
+            "解析失败与语言码无关，不得把用户引向改语言设置: {parse_failed}"
+        );
+        assert!(
+            parse_failed.contains("解析"),
+            "要说明问题出在结果文件的读取/解析: {parse_failed}"
+        );
+        assert_ne!(
+            missing, parse_failed,
+            "两种归因必须是不同文案，否则用户分不清该改语言还是查磁盘"
         );
     }
 
