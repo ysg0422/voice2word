@@ -91,7 +91,21 @@ fn select_install_dir(default_dir: &Path) -> Option<PathBuf> {
 
     let parent = match choice {
         IDYES => default_parent,
-        IDNO => pick_directory(&default_parent)?,
+        IDNO => match pick_directory(&default_parent, std::ptr::null_mut()) {
+            PickOutcome::Picked(picked) => picked,
+            // 取消：退出向导（和以前一样）。
+            PickOutcome::Canceled => return None,
+            // 弹不出选择框：只提示一次，然后保持「当前路径」= 默认位置继续走流程，
+            // 绝不退回「起 PowerShell 同步等」那条会卡死界面的路。
+            PickOutcome::Failed => {
+                message_box(
+                    &title,
+                    "无法打开系统文件夹选择框，将使用默认安装位置。",
+                    MB_OK | MB_ICONERROR,
+                );
+                default_parent
+            }
+        },
         _ => return None,
     };
     let install_dir = resolve_install_dir(&parent);
@@ -166,30 +180,222 @@ fn is_existing_foreign_dir(dir: &Path) -> bool {
     }
 }
 
-fn pick_directory(initial: &Path) -> Option<PathBuf> {
-    // 通过 PowerShell 的 FolderBrowserDialog 让用户可视化选择安装目录。
-    let initial = initial.to_string_lossy().replace('\'', "''");
-    let script = format!(
-        "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{}}; Add-Type -AssemblyName System.Windows.Forms | Out-Null; $dlg = New-Object System.Windows.Forms.FolderBrowserDialog; $dlg.Description = '选择 {APP_NAME} 的安装位置（将在其中创建 {APP_NAME} 文件夹）'; $dlg.SelectedPath = '{initial}'; $dlg.ShowNewFolderButton = $true; if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Console]::Out.Write($dlg.SelectedPath) }}",
-    );
+/// 选目录的结果。
+///
+/// 分三态是为了不把「用户按了取消」也报成失败：取消是正常操作（保持当前路径、
+/// 不打扰用户），只有真弹不出框才需要提示一次。
+enum PickOutcome {
+    Picked(PathBuf),
+    Canceled,
+    Failed,
+}
 
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-STA",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            &script,
-        ])
-        .output()
-        .ok()?;
+/// 选择框的初始目录必须是**已存在**的目录。
+///
+/// shell 的树里没有不存在的路径，`BFFM_SETSELECTIONW` 会被静默丢掉、对话框退回默认
+/// 位置；而默认安装目录（`...\Programs\Voice2Word`）在装之前正好就是不存在的那种。
+/// 所以向上找到最接近的已存在祖先；一个都不存在就返回原值，交给对话框选默认位置。
+#[cfg(windows)]
+fn nearest_existing_dir(path: &Path) -> PathBuf {
+    let mut current = path;
+    loop {
+        if current.is_dir() {
+            return current.to_path_buf();
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => return path.to_path_buf(),
+        }
+    }
+}
 
-    let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if chosen.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(chosen))
+/// 初始目录 → 选择框要用的 NUL 结尾宽字符串。
+///
+/// 抽出来是因为这块内存必须活到 `SHBrowseForFolderW` 返回（回调按指针读它），
+/// 而「Path 怎么变成宽字符」用不着真弹窗就能验证。
+#[cfg(windows)]
+fn initial_selection_wide(path: &Path) -> Vec<u16> {
+    if path.as_os_str().is_empty() {
+        // 没有初始目录就不传：让选中项留在默认位置，而不是塞一个空串进去解析。
+        return Vec::new();
+    }
+    to_wide_chars(&path.to_string_lossy())
+}
+
+/// 选择框回填的宽字符缓冲 → 路径。
+///
+/// `SHGetPathFromIDListW` 只保证写一个 NUL 结尾的串，缓冲尾部是清零时留下的 0，
+/// 不能算路径内容；按第一个 NUL 截断，截断后为空说明没拿到路径。
+#[cfg(windows)]
+fn wide_to_path(buffer: &[u16]) -> Option<PathBuf> {
+    let len = buffer
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(buffer.len());
+    if len == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer[..len])))
+}
+
+/// 原生「浏览文件夹」选择框：直接调 shell32 的 `SHBrowseForFolderW`。
+///
+/// # 为什么不用原来的 PowerShell 版
+///
+/// 那条路要 `Command::new("powershell").output()`：先起进程、再加载 .NET 程序集，
+/// 然后**在窗口线程上同步等它退出**。等的这几秒里窗口一条消息都不处理，Windows 就
+/// 把标题画成「（未响应）」；而且那个 Shell 对话框也没法指定 owner，于是选择框反而
+/// 被卡住的主窗口压住。
+///
+/// `SHBrowseForFolderW` 是 shell32 自己的模态对话框：它在本线程跑自己的消息泵，
+/// 主窗口的消息照常被处理，也不会多出第二个进程 —— 全程不阻塞。
+/// `BROWSEINFOW.hwndOwner` 传安装窗口的 HWND，它就模态于该窗口、永远在上面。
+#[cfg(windows)]
+mod folder_picker {
+    use super::{
+        initial_selection_wide, nearest_existing_dir, to_wide_chars, wide_to_path, PickOutcome,
+        APP_NAME,
+    };
+    use std::ffi::c_void;
+    use std::path::Path;
+
+    type Hwnd = *mut c_void;
+    /// `LPITEMIDLIST`／`PIDLIST_ABSOLUTE`：一串 SHITEMID 的指针。
+    type Pidl = *mut c_void;
+
+    /// 与头文件逐字段对齐；x64 上 `ulFlags` 后面有 4 字节填充，`repr(C)` 会自己补。
+    #[repr(C)]
+    struct BrowseInfoW {
+        hwnd_owner: Hwnd,
+        pidl_root: *mut c_void,
+        psz_display_name: *mut u16,
+        lpsz_title: *const u16,
+        ul_flags: u32,
+        lpfn: Option<unsafe extern "system" fn(Hwnd, u32, isize, isize) -> i32>,
+        l_param: isize,
+        i_image: i32,
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHBrowseForFolderW(info: *mut BrowseInfoW) -> Pidl;
+        fn SHGetPathFromIDListW(pidl: Pidl, path: *mut u16) -> i32;
+    }
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
+        fn CoUninitialize();
+        fn CoTaskMemFree(ptr: *mut c_void);
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SendMessageW(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) -> isize;
+    }
+
+    const MAX_PATH: usize = 260;
+
+    const BIF_RETURNONLYFSDIRS: u32 = 0x0000_0001;
+    const BIF_EDITBOX: u32 = 0x0000_0010;
+    const BIF_NEWDIALOGSTYLE: u32 = 0x0000_0040;
+
+    const BFFM_INITIALIZED: u32 = 1;
+    /// `WM_USER + 103`，Unicode 版「把某个目录设为当前选中项」。
+    const BFFM_SETSELECTIONW: u32 = 0x0400 + 103;
+
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+
+    /// 对话框初始化完成后，把初始目录贴进去。
+    ///
+    /// `wParam` 非 0 表示 `lParam` 是**字符串指针**（传 0 才是 PIDL），所以这里写 1；
+    /// `data` 就是调用方放在 `BROWSEINFOW.lParam` 里的那个指针 —— 是**指针**不是索引。
+    unsafe extern "system" fn on_initialized(hwnd: Hwnd, msg: u32, _wp: isize, data: isize) -> i32 {
+        if msg == BFFM_INITIALIZED && data != 0 {
+            SendMessageW(hwnd, BFFM_SETSELECTIONW, 1, data);
+        }
+        0
+    }
+
+    /// 弹一次模态选择框。`owner` 为空（对话框流程没有窗口）时照样能弹。
+    /// 初始位置取 `initial` 最接近的已存在目录（见 `nearest_existing_dir`）。
+    pub(super) fn pick(initial: &Path, owner: Hwnd) -> PickOutcome {
+        // 这块内存必须活到 SHBrowseForFolderW 返回：回调是按指针去读它的。
+        let initial_wide = initial_selection_wide(&nearest_existing_dir(initial));
+        let title = to_wide_chars(&format!(
+            "选择 {APP_NAME} 的安装位置（将在其中创建 {APP_NAME} 文件夹）"
+        ));
+        let mut info = BrowseInfoW {
+            hwnd_owner: owner,
+            pidl_root: std::ptr::null_mut(),
+            psz_display_name: std::ptr::null_mut(),
+            lpsz_title: title.as_ptr(),
+            // 只列目录 + 新版对话框（能改大小、能新建文件夹）+ 地址栏（可直接粘路径）。
+            ul_flags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX,
+            lpfn: Some(on_initialized),
+            // 没有初始目录就传 0：回调据此跳过设置选中项，不去解析空串。
+            l_param: if initial_wide.is_empty() {
+                0
+            } else {
+                initial_wide.as_ptr() as isize
+            },
+            i_image: 0,
+        };
+
+        // 新版选择框内部要用 shell 的 COM 对象，本线程先按 STA 初始化一次。
+        let hr = unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
+        let co_initialized = hr >= 0;
+        // RPC_E_CHANGED_MODE：本线程已被别的套间模型初始化过。这不是错误，对话框照样
+        // 能弹；只是这次不能去反初始化（成对规则：谁初始化谁反初始化）。
+        if !co_initialized && hr != RPC_E_CHANGED_MODE {
+            return PickOutcome::Failed;
+        }
+
+        let pidl = unsafe { SHBrowseForFolderW(&mut info) };
+        let outcome = if pidl.is_null() {
+            // 用户按了取消（或直接关掉框）：保持当前路径不变。
+            PickOutcome::Canceled
+        } else {
+            let mut buffer = [0u16; MAX_PATH];
+            let got_path = unsafe { SHGetPathFromIDListW(pidl, buffer.as_mut_ptr()) } != 0;
+            // PIDL 是 shell 分配在 COM 任务内存上的，必须还回去。
+            unsafe { CoTaskMemFree(pidl) };
+            match if got_path {
+                wide_to_path(&buffer)
+            } else {
+                None
+            } {
+                Some(path) => PickOutcome::Picked(path),
+                None => PickOutcome::Failed,
+            }
+        };
+
+        if co_initialized {
+            unsafe { CoUninitialize() };
+        }
+        outcome
+    }
+}
+
+/// 让用户挑一个目录。
+///
+/// `owner` 是安装窗口句柄：非空时选择框**模态于该窗口**（永远在上面，不会被压住）；
+/// 对话框流程没有窗口，传空也能用。
+///
+/// 实现在调用线程上跑 shell32 的模态选择框 —— **不起任何子进程，也没有
+/// `.output()`/`wait()` 这类同步等待**；对话框期间消息由 shell 的模态消息泵处理，
+/// 所以窗口线程一直在处理消息，Windows 不会把它标成「未响应」。
+fn pick_directory(initial: &Path, owner: *mut std::ffi::c_void) -> PickOutcome {
+    #[cfg(windows)]
+    {
+        folder_picker::pick(initial, owner)
+    }
+    #[cfg(not(windows))]
+    {
+        // 非 Windows 平台没有 shell32 选择框：保留签名，但没有可视化选择器可用。
+        let _ = (initial, owner);
+        PickOutcome::Failed
     }
 }
 
@@ -551,7 +757,7 @@ mod window {
     use super::{
         build_finish_summary, get_install_dir, install_to, is_existing_foreign_dir,
         launch_installed, message_box, pick_directory, resolve_install_dir, to_wide_chars,
-        APP_EXE_NAME, APP_NAME, APP_VERSION, IDYES, MB_ICONERROR, MB_ICONINFORMATION,
+        PickOutcome, APP_EXE_NAME, APP_NAME, APP_VERSION, IDYES, MB_ICONERROR, MB_ICONINFORMATION,
         MB_ICONQUESTION, MB_OK, MB_YESNO,
     };
     use std::cell::RefCell;
@@ -800,7 +1006,7 @@ mod window {
             ID_CANCEL => unsafe {
                 DestroyWindow(hwnd);
             },
-            ID_PICK => pick_dir(),
+            ID_PICK => pick_dir(hwnd),
             ID_INSTALL => match with_state(|s| s.phase) {
                 Some(Phase::Done) => launch_now(hwnd),
                 Some(Phase::Idle | Phase::Failed) => run_install(hwnd),
@@ -811,8 +1017,12 @@ mod window {
         }
     }
 
-    /// 「选择其他位置…」：以当前值为初始目录；用户取消（返回空）时保持原值不变。
-    fn pick_dir() {
+    /// 「选择其他位置…」：以当前值为初始目录，弹原生模态选择框。
+    ///
+    /// 选择框带 owner（本窗口），模态于本窗口、永远在上面；它跑的是 shell 自己的
+    /// 消息泵，所以从点下到选完，窗口线程一直在处理消息，不会「未响应」。
+    /// 用户取消 → 保持当前路径不变；真弹不出框才提示一次。
+    fn pick_dir(hwnd: Hwnd) {
         if !matches!(with_state(|s| s.phase), Some(Phase::Idle | Phase::Failed)) {
             return;
         }
@@ -820,14 +1030,25 @@ mod window {
             Some(dir) => dir,
             None => return,
         };
-        let Some(picked) = pick_directory(&current) else {
-            return;
-        };
-        let resolved = resolve_install_dir(&picked);
-        with_state(|s| {
-            s.dir = resolved;
-            set_path_text(s);
-        });
+        match pick_directory(&current, hwnd) {
+            PickOutcome::Picked(picked) => {
+                let resolved = resolve_install_dir(&picked);
+                with_state(|s| {
+                    s.dir = resolved;
+                    set_path_text(s);
+                });
+            }
+            // 取消是正常操作：什么都不做，路径维持原样。
+            PickOutcome::Canceled => {}
+            // 降级：只提示一次，不改路径，也不退回会卡死窗口的 PowerShell 选目录。
+            PickOutcome::Failed => {
+                message_box(
+                    &format!("{APP_NAME} 安装"),
+                    "无法打开系统文件夹选择框，安装位置保持原样。",
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+        }
     }
 
     fn run_install(_hwnd: Hwnd) {
@@ -1432,6 +1653,51 @@ mod tests {
     fn default_install_dir_is_dedicated_app_folder() {
         let dir = get_install_dir();
         assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some(APP_NAME));
+    }
+
+    /// 初始路径转宽字符：必须 NUL 结尾（`SHBrowseForFolderW` 按指针一直读到 NUL），
+    /// 且没有初始目录时返回空 —— 调用方据此不设置选中项，免得去解析空串。
+    #[test]
+    fn initial_selection_wide_is_nul_terminated_and_empty_when_missing() {
+        let wide = initial_selection_wide(Path::new(r"D:\Apps"));
+        let expected: Vec<u16> = r"D:\Apps"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        assert_eq!(wide, expected);
+        assert_eq!(*wide.last().unwrap(), 0);
+        assert!(initial_selection_wide(Path::new("")).is_empty());
+    }
+
+    /// 初始目录要落在**已存在**的目录上：默认安装目录 `...\Programs\Voice2Word` 在装
+    /// 之前不存在，shell 会把这种初始选中静默丢掉（对话框退回默认位置）。
+    #[test]
+    fn nearest_existing_dir_walks_up_to_an_existing_ancestor() {
+        let base = std::env::temp_dir();
+        // 已存在的目录：原样返回。
+        assert_eq!(nearest_existing_dir(&base), base);
+        // 不存在的多级子目录：回到最近的存在祖先（临时目录本身）。
+        let missing = base
+            .join("v2w_setup_anchor_missing")
+            .join("Voice2Word")
+            .join("sub");
+        assert_eq!(nearest_existing_dir(&missing), base);
+    }
+
+    /// PIDL 回填的缓冲转路径：按第一个 NUL 截断，尾部残留的 0 不算路径内容；
+    /// 截断后为空（没拿到路径）必须返回 None，而不是一个空 PathBuf。
+    #[test]
+    fn wide_to_path_stops_at_nul_and_rejects_empty() {
+        let mut buffer = [0u16; 32];
+        for (slot, unit) in buffer.iter_mut().zip(r"C:\Apps\Voice2Word".encode_utf16()) {
+            *slot = unit;
+        }
+        assert_eq!(
+            wide_to_path(&buffer),
+            Some(PathBuf::from(r"C:\Apps\Voice2Word"))
+        );
+        assert_eq!(wide_to_path(&[0u16; 32]), None);
+        assert_eq!(wide_to_path(&[]), None);
     }
 }
 
