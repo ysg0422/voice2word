@@ -183,22 +183,64 @@ fn check_project_root(root: &Path) -> CheckItem {
     }
 }
 
-/// FFmpeg：唯一**没有回退**的组件，所以用 `is_file()` 而不是 `exists()` 判定。
+/// FFmpeg：配置路径 → PATH 回退，与引擎启动时的解析口径**同一套**
+/// （[`model_download::resolve_configured_executable`]）。
 ///
-/// 为什么强调 `is_file`：同名的**目录**会让 `exists()` 通过，而真正调用 ffmpeg
-/// 时只会得到一个含糊的「不是有效的 Win32 应用程序」。体检必须在用户之前发现它。
+/// 为什么必须回退：`FFmpegEngine::new` 在配置路径不存在、而 PATH 上有同名命令时，
+/// 会把裸命令名交给系统 PATH。体检若只看配置路径，就会出现「体检报 FAIL、实际转写
+/// 一切正常」的自相矛盾——用户会照着 fix 去装一份本来不需要的 FFmpeg。
+/// `tools --json` 早就用 [`model_download::resolved_executable_is_usable`] 判可用性，
+/// 两处口径必须一致，这里改用同一个。
+///
+/// 「同名的**目录**不算可用」这条保留：`exists()` 会放过目录，真正调用 ffmpeg 时
+/// 只会得到一个含糊的「不是有效的 Win32 应用程序」。体检必须在用户之前发现它。
 fn check_ffmpeg(cfg: &AppConfig, root: &Path) -> CheckItem {
-    let path = resolve_under(root, &cfg.paths.ffmpeg);
-    let (status, detail) = if path.is_file() {
-        (CheckStatus::Ok, describe_file(&path))
-    } else {
-        (CheckStatus::Fail, format!("{} 不存在", path.display()))
-    };
+    let configured = resolve_under(root, &cfg.paths.ffmpeg);
+    let resolved = model_download::resolve_configured_executable(&configured);
+    let usable = model_download::resolved_executable_is_usable(&resolved);
+    let (status, detail) = ffmpeg_outcome(&configured, &resolved, resolved.is_file(), usable);
     CheckItem {
         id: "ffmpeg",
         label: "FFmpeg".to_string(),
         status,
         detail,
+    }
+}
+
+/// FFmpeg 检查项的判定。抽成纯函数是为了把四条分支（文件在 / PATH 回退 / 同名目录 /
+/// 彻底缺失）都钉进单测，而不是依赖跑测试那台机器上装没装 ffmpeg。
+fn ffmpeg_outcome(
+    configured: &Path,
+    resolved: &Path,
+    resolved_is_file: bool,
+    usable: bool,
+) -> (CheckStatus, String) {
+    if resolved_is_file {
+        (CheckStatus::Ok, describe_file(resolved))
+    } else if usable {
+        // 与 `doctor` 的 ffprobe 项同款措辞：显式说明「配置那个路径不存在，改用的是
+        // PATH 上的哪一个」，免得用户以为配置里那条不存在的路径居然生效了。
+        (
+            CheckStatus::Ok,
+            format!(
+                "{} 不存在，改用 PATH 上的 {}",
+                configured.display(),
+                resolved.display()
+            ),
+        )
+    } else if resolved.exists() {
+        (
+            CheckStatus::Fail,
+            format!(
+                "{} 不是文件（是目录或特殊文件），无法作为 FFmpeg 运行",
+                resolved.display()
+            ),
+        )
+    } else {
+        (
+            CheckStatus::Fail,
+            format!("{} 不存在，PATH 上也没有 ffmpeg", configured.display()),
+        )
     }
 }
 
@@ -535,7 +577,7 @@ fn hint_for(id: &str, status: CheckStatus) -> Option<&'static str> {
     }
     Some(match id {
         "project_root" => "确认启动目录：项目根的判据是根下存在 models/；也可用 VOICE2WORD_HOME 指定。",
-        "ffmpeg" => "下载 FFmpeg 放到 tools/ffmpeg.exe，或把 config.local.toml 的 paths.ffmpeg 指到实际位置。",
+        "ffmpeg" => "把 FFmpeg 放到 tools/ffmpeg.exe、加入系统 PATH，或在 config.local.toml 里把 paths.ffmpeg 指到实际位置。",
         "whisper_cli" => "把缺失的 DLL 放到 exe 同目录，或换用官方 MSVC 构建（自带 VC++ 运行库依赖）。",
         "whisper_model" => "重新下载该模型：截断文件要到加载时才报错，体积对比是唯一的早期信号。",
         "llama_cpp" => "把缺失的 DLL 放到 exe 同目录；官方包解压不完整时重新解压一次。",
@@ -608,7 +650,10 @@ mod tests {
     fn cfg_in(dir: &Path) -> AppConfig {
         let mut cfg = AppConfig::default();
         let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
-        cfg.paths.ffmpeg = p("ffmpeg.exe");
+        // 名字里带前缀是刻意的：文件名若正好叫 `ffmpeg.exe`，在**装了 FFmpeg 的机器**上
+        // 会被 PATH 回退判成「可用」，于是「全缺失」这条用例的结果随机器而变。
+        // 用一个不可能出现在 PATH 上的名字，测试结果只取决于临时目录。
+        cfg.paths.ffmpeg = p("v2w-test-ffmpeg.exe");
         cfg.paths.whisper_cli = p("whisper-cli.exe");
         cfg.paths.whisper_model = p("ggml-small-q5_0.bin");
         cfg.paths.llama_cli = p("llama-completion.exe");
@@ -668,6 +713,46 @@ mod tests {
             ffmpeg.detail
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FFmpeg 判定的四条分支：文件在 / PATH 回退 / 同名目录 / 彻底缺失。
+    ///
+    /// 抽成纯函数测的理由：真机判定依赖那台机器装没装 FFmpeg，而这四条分支的语义
+    /// （尤其「PATH 上找到时必须照实说明、同名目录必须判失败」）与机器无关。
+    #[test]
+    fn ffmpeg_outcome_covers_every_branch() {
+        let missing = Path::new(r"A:\nowhere\ffmpeg.exe");
+        let on_path = Path::new("ffmpeg");
+
+        // 1. 配置路径真的在 → Ok，详情是解析到的那个文件。
+        let file_case = temp_dir("ffmpeg_branch_file");
+        let real = file_case.join("v2w-test-ffmpeg.exe");
+        std::fs::write(&real, b"fake-ffmpeg").expect("写假 ffmpeg");
+        let (status, detail) = ffmpeg_outcome(&real, &real, true, true);
+        assert_eq!(status, CheckStatus::Ok);
+        assert!(detail.contains("v2w-test-ffmpeg.exe"), "{detail}");
+
+        // 2. 配置路径不在、PATH 上找到了同名命令 → Ok，但必须点明用的是 PATH 上那个。
+        let (status, detail) = ffmpeg_outcome(missing, on_path, false, true);
+        assert_eq!(status, CheckStatus::Ok, "PATH 回退可用时不能报错");
+        assert!(detail.contains("改用 PATH 上的"), "{detail}");
+        assert!(detail.contains("ffmpeg.exe 不存在"), "{detail}");
+
+        // 3. 同名**目录**：`exists()` 会放过它，必须判 Fail 并点明「不是文件」。
+        let dir_case = temp_dir("ffmpeg_branch_dir");
+        let as_dir = dir_case.join("ffmpeg.exe");
+        std::fs::create_dir_all(&as_dir).expect("建同名目录");
+        let (status, detail) = ffmpeg_outcome(&as_dir, &as_dir, false, false);
+        assert_eq!(status, CheckStatus::Fail, "同名目录不算可用");
+        assert!(detail.contains("不是文件"), "{detail}");
+
+        // 4. 彻底缺失：说清「PATH 上也没有」，而不是只说一句「不存在」。
+        let (status, detail) = ffmpeg_outcome(missing, missing, false, false);
+        assert_eq!(status, CheckStatus::Fail);
+        assert!(detail.contains("PATH 上也没有"), "{detail}");
+
+        let _ = std::fs::remove_dir_all(&file_case);
+        let _ = std::fs::remove_dir_all(&dir_case);
     }
 
     /// 体积远小于登记下限的 whisper 模型 → `Warn`（截断下载的典型形态）。

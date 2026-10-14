@@ -1414,7 +1414,7 @@ fn doctor_check_from_diagnostics(item: &CheckItem) -> DoctorCheck {
 fn doctor_fix(id: &str) -> Option<&'static str> {
     Some(match id {
         "project_root" => "确认启动目录：项目根的判据是根下存在 models/；也可用 VOICE2WORD_HOME 指定。",
-        "ffmpeg" => "把 FFmpeg 放到 tools/ffmpeg.exe，或在 config.local.toml 里把 paths.ffmpeg 指到实际位置。",
+        "ffmpeg" => "把 FFmpeg 放到 tools/ffmpeg.exe、加入系统 PATH，或在 config.local.toml 里把 paths.ffmpeg 指到实际位置。",
         "whisper_cli" => "把缺失的 DLL 放到 exe 同目录，或换用自带运行库的构建。",
         "whisper_model" => "重新下载该模型：文件被截断要到加载时才报错，体积对比是唯一的早期信号。",
         "llama_cpp" => "把缺失的 DLL 放到 exe 同目录；解压不完整时重新解压一次。",

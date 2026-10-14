@@ -949,33 +949,9 @@ impl MainWindow {
             let Some(label) = extra_quality_chip_text(kind, count) else {
                 continue;
             };
-            // 配色取 Theme 阶梯、调用点不出现裸色值。色板只有六个色族（red / warn /
-            // blue / neutral / primary / mint），四类判据 + 两项旧扩展已占满前五族，
-            // 所以新增两类只能这样最小化重色：时间重叠用唯一空着的薄荷族；重复句沿用
-            // 红族底但换成更深的 `accent_red_strong`，与「低置信」的 `accent_red`
-            // 拉开一档。
-            let (soft, border, text) = match kind {
-                ExtraQuality::CpsOverLimit => (
-                    Theme::tint_warn_soft(),
-                    Theme::tint_warn_border(),
-                    Theme::accent_orange(),
-                ),
-                ExtraQuality::MissingTerminalPunctuation => (
-                    Theme::tint_primary_soft(),
-                    Theme::tint_primary_border(),
-                    Theme::accent_primary(),
-                ),
-                ExtraQuality::OverlappingTimes => (
-                    Theme::tint_mint_soft(),
-                    Theme::tint_mint_border(),
-                    Theme::accent_mint(),
-                ),
-                ExtraQuality::DuplicateNeighbors => (
-                    Theme::tint_red_soft(),
-                    Theme::tint_red_border(),
-                    Theme::accent_red_strong(),
-                ),
-            };
+            // 配色取 Theme 阶梯、调用点不出现裸色值；四项扩展共用中性底、靠前景色区分
+            // （理由见 `extra_quality_chip_palette` 的文档）。
+            let (soft, border, text) = extra_quality_chip_palette(kind);
             extra_chips.push(
                 primitives::tag_tinted(label, soft, border, text)
                     .id(("quality-chip-extra", kind as usize))
@@ -2099,6 +2075,26 @@ fn extra_quality_chip_text(kind: ExtraQuality, count: usize) -> Option<String> {
     })
 }
 
+/// 扩展项胶囊的配色：`(浅底, 描边, 前景)`。
+///
+/// # 为什么四项共用中性底
+///
+/// 色板只有六个色族（red / warn / blue / neutral / primary / mint），而胶囊一共
+/// **八枚**（四类判据 + 四项扩展），底色必然重复。既然躲不掉，就把它变成规则：
+/// 四类判据各用自己那一族的底（一眼看出是哪一类），扩展项统一「中性底 + 各自强调色
+/// 的文字」——既让「核心判据 / 补充检查」在视觉上分层，又靠前景色把八枚两两分开。
+/// 反例是曾经的写法：两项扩展直接复用 `tint_red_soft` / `tint_warn_soft`，同一行里
+/// 会出现两枚几乎一样的胶囊，色觉弱的用户分不清点的是哪一项。
+fn extra_quality_chip_palette(kind: ExtraQuality) -> (Rgba, Rgba, Rgba) {
+    let text = match kind {
+        ExtraQuality::CpsOverLimit => Theme::accent_orange(),
+        ExtraQuality::MissingTerminalPunctuation => Theme::accent_primary(),
+        ExtraQuality::OverlappingTimes => Theme::accent_mint(),
+        ExtraQuality::DuplicateNeighbors => Theme::accent_red_strong(),
+    };
+    (Theme::tint_neutral(), Theme::tint_neutral_border(), text)
+}
+
 /// 扩展项的句下标快照（按类分桶，桶内升序）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct QualityExtras {
@@ -2272,11 +2268,11 @@ fn queue_text_cached(
 #[cfg(test)]
 mod tests {
     use super::{
-        category_has_issues, cleanup_preview_cached, cleanup_sample, extra_quality_chip_text,
-        is_last_stream_row, quality_chip_label, quality_extras_cached, queue_progress_view,
-        queue_text_cached, shared_string_cached, transcribe_status_pill, truncate_for_ui,
-        CleanupPreview, CleanupPreviewKey, ExtraQuality, QualityExtras, QualityExtrasKey,
-        QueueProgressView, QueueTextCache, StatusPill, StepChain, StepPhase,
+        category_has_issues, cleanup_preview_cached, cleanup_sample, extra_quality_chip_palette,
+        extra_quality_chip_text, is_last_stream_row, quality_chip_label, quality_extras_cached,
+        queue_progress_view, queue_text_cached, shared_string_cached, transcribe_status_pill,
+        truncate_for_ui, CleanupPreview, CleanupPreviewKey, ExtraQuality, QualityExtras,
+        QualityExtrasKey, QueueProgressView, QueueTextCache, StatusPill, StepChain, StepPhase,
     };
     use crate::app::state::{QueueItem, QueueState};
     use crate::subtitle::cleanup::{CleanupPlan, CleanupRule, CleanupRules};
@@ -2812,5 +2808,34 @@ mod tests {
         let (names, stages) = queue_text_cached(&mut cache, &items);
         assert_eq!(names.len(), 1);
         assert_eq!(stages.len(), 1);
+    }
+
+    /// 八枚质检胶囊的「(底色, 前景色)」必须两两不同。
+    ///
+    /// 底色只有六个色族、八枚胶囊必然有两枚同底——这时**前景色就是唯一的区分手段**。
+    /// 一旦有人给某项顺手抄了邻居的配色（历史上「重复句」就抄了「低置信」的红底红字），
+    /// 同一行里会出现两枚看起来一模一样的胶囊，色觉弱的用户分不清哪个是哪个。这条用例
+    /// 把「八枚两两可区分」钉住：四类判据各用自己那一族，四项扩展共用中性底 + 各自强调色。
+    #[test]
+    fn quality_chip_palettes_are_pairwise_distinguishable() {
+        use crate::ui::theme::Theme;
+
+        let mut seen: Vec<(gpui::Rgba, gpui::Rgba)> = vec![
+            (Theme::tint_red_soft(), Theme::accent_red()),
+            (Theme::tint_warn_soft(), Theme::accent_orange()),
+            (Theme::tint_blue_soft(), Theme::accent_blue()),
+            (Theme::tint_neutral(), Theme::text_muted()),
+        ];
+        assert_eq!(seen.len(), 4, "四类判据各一枚");
+
+        for kind in ExtraQuality::ALL {
+            let (soft, _border, text) = extra_quality_chip_palette(kind);
+            assert!(
+                !seen.contains(&(soft, text)),
+                "{kind:?} 的（底色, 前景色）与已有胶囊重复"
+            );
+            seen.push((soft, text));
+        }
+        assert_eq!(seen.len(), 8, "四类判据 + 四项扩展共八枚");
     }
 }

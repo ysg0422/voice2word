@@ -236,7 +236,7 @@ api_key    = ""                    # 留空则读取环境变量 VOICE2WORD_API_
 api_model  = "deepseek-chat"
 
 [ui]
-theme             = "dark"         # dark / light
+theme             = "dark"         # 目前只有深色（浅色切换入口已移除，改这里不生效）
 export_mode       = "bilingual"    # raw / translation / bilingual
 export_format     = "jianying"     # 剪辑台导出格式
 export_name_template = "{name}.{ext}"   # 支持 {name} / {ext} / {date}
