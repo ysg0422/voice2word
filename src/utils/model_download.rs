@@ -2446,6 +2446,14 @@ mod tests {
     }
 
     /// 路径下什么都没有时删除是幂等的空操作：`Ok(None)`，不报错。
+    ///
+    /// # 为什么不能直接断言 `is_none`
+    ///
+    /// 这条用例原本假设「ffmpeg 的默认 dest（`tools/ffmpeg.exe`）在本仓库不存在」——
+    /// 但那是**机器状态**，不是代码性质：用户在「模型与组件」里下过 ffmpeg，这个文件
+    /// 就真的在那里（本机就下过）。一旦它存在，删除会命中**真实文件**，测试绝不能碰。
+    /// 因此分两种情形：默认路径也不存在时照旧断言空操作；存在时只断言「配置里那个不
+    /// 存在的路径没被当成可用」——绝不去调删除。
     #[test]
     fn delete_item_file_missing_returns_none() {
         let dir = std::env::temp_dir().join(format!("v2w_del_missing_{}", std::process::id()));
@@ -2453,16 +2461,24 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let mut cfg = AppConfig::default();
-        // 指向一个不存在的文件；ffmpeg 的默认 dest（tools/ffmpeg.exe）在本仓库也不存在，
-        // 因此 `resolve_existing_path` 必然返回 None。
+        // 配置指向一个不存在的文件（临时目录里没建它）。
         cfg.paths.ffmpeg = dir.join("not-there.exe").to_string_lossy().to_string();
+        let configured = PathBuf::from(&cfg.paths.ffmpeg);
 
         let item = item_by_id("ffmpeg").unwrap();
-        assert!(
-            resolve_existing_path(item, Some(&cfg)).is_none(),
-            "前置条件：配置与默认路径都不存在"
-        );
-        assert_eq!(delete_item_file("ffmpeg", &cfg).unwrap(), None);
+        match resolve_existing_path(item, Some(&cfg)) {
+            // 默认路径也不存在：真正的「什么都没有」，删除是空操作。
+            None => assert_eq!(
+                delete_item_file("ffmpeg", &cfg).unwrap(),
+                None,
+                "无文件时删除应为空操作"
+            ),
+            // 默认路径存在（用户下载过）：**绝不删除**，只确认没把配置里那个不存在的路径当成可用。
+            Some(found) => assert_ne!(
+                found, configured,
+                "配置里不存在的路径不该被当成可用的解析结果"
+            ),
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2887,12 +2903,19 @@ mod tests {
             "自编译判定的借用/按值入口结论必须一致"
         );
 
-        // 反例：配置指向不存在的文件时两条路径都要判缺失——借用不得退化成
+        // 反例：配置指向不存在的文件时两条路径必须**同结论**——借用不得退化成
         // 「读默认路径」或「忽略配置」。
+        //
+        // 只钉一致性、不钉真假：结论的绝对值取决于本机有没有把 ffmpeg 下到默认路径
+        // （`tools/ffmpeg.exe`）。用户在「模型与组件」里下过它就是「存在」——那是正确
+        // 行为，不是缺陷；把「必须判缺失」写死会让这条用例随机器状态飘。
         cfg.paths.ffmpeg = dir.join("not-there.exe").to_string_lossy().to_string();
+        assert!(
+            !Path::new(&cfg.paths.ffmpeg).exists(),
+            "前置条件：配置指向的路径确实不存在"
+        );
         let missing = is_present_with(item, &(Some(cfg.clone())));
         let ctx = PresenceContextRef::new(&cfg);
-        assert!(!missing, "前置条件：配置与默认路径都不存在");
         assert_eq!(ctx.is_present(item), missing, "缺失结论也必须一致");
 
         let _ = fs::remove_dir_all(&dir);
