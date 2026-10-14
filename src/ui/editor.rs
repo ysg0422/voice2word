@@ -5238,6 +5238,15 @@ thread_local! {
     static TIMELINE_PAN_START: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
+// 「用户手动调过视图」标记：记的是手动平移/缩放**那一刻的播放头时间**（秒）。
+//
+// 暂停时窗口不跟随播放头（用户手动平移的意图优先），但只有在用户没动过视图时才做
+// 「播放头离屏就拉回」的兜底；播放头一动（seek / 播放推进）该标记自动失效，跟随随之
+// 恢复——所以从清单点一句跳到窗口外的句子仍会把窗口带过去。
+thread_local! {
+    static TIMELINE_PAN_ANCHOR: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
 /// 时间轴缩放上下限：1.0 = 整段（与改造前一致），20.0 = 一秒的素材也能占到 1/20 宽。
 const TIMELINE_ZOOM_MIN: f64 = 1.0;
 const TIMELINE_ZOOM_MAX: f64 = 20.0;
@@ -5357,15 +5366,28 @@ fn zoom_at(
 
 /// 播放头跟随：窗口跟着游标走，保证「按了播放一定看得见游标」。
 ///
-/// 播放中按前后各 [`TIMELINE_FOLLOW_BAND`] 的可视带跟随（游标不贴死边缘，留出前视
-/// 空间）；暂停时只在游标**完全移出**窗口才跟随——否则用户手动平移去看别处，会被
-/// 下一帧立刻拽回来。未放大时 [`clamp_window`] 会把结果按回 `[0, total]`，所以这个
-/// 函数在 zoom = 1.0 下不改变任何渲染。
+/// **播放中**按前后各 [`TIMELINE_FOLLOW_BAND`] 的可视带跟随（游标不贴死边缘，留出前视
+/// 空间），并把游标推到窗口内 90% / 10% 的位置。
+///
+/// **暂停时不跟随**——这是修正过的语义。旧实现把「暂停」写成 `band = 0` 的同一条分支，
+/// 看着只是取消了前后留白，其实还留着「窗口必须包住播放头」这条硬约束：只要手动平移把
+/// 播放头挤出窗口，下一帧就被拉回来（`current_time` 初值 0.0 贴在左缘，于是向右平移等于
+/// 白滚，滚轮/平移完全没反应）。现在暂停时只在用户**没动过视图**时才保留一个兜底
+/// （播放头整个出窗口就拉回），动过视图就一律保持用户给的窗口，播放头允许离屏，
+/// 直到一次 seek / 播放把它带回来。
+///
+/// `manual_anchor` 就是「动过视图」的标记：内容是手动调整视图那一刻的播放头时间
+/// （见 [`mark_manual_view_change`]）。播放头一动它自然对不上、标记失效，跟随随之恢复；
+/// 不需要任何额外的清除钩子，也就不会有「忘了清、跟随再也不回来」的状态残留。
+///
+/// 未放大时 [`clamp_window`] 会把结果按回 `[0, total]`，所以这个函数在 zoom = 1.0 下
+/// 不改变任何渲染。
 fn follow_playhead(
     win: TimelineWindow,
     cur_time: f64,
     total: f64,
     is_playing: bool,
+    manual_anchor: Option<f64>,
 ) -> TimelineWindow {
     if !cur_time.is_finite() {
         return win;
@@ -5374,11 +5396,24 @@ fn follow_playhead(
     if span <= 0.0 {
         return win;
     }
-    let band = if is_playing {
-        TIMELINE_FOLLOW_BAND
-    } else {
-        0.0
-    };
+    if !is_playing {
+        // 用户手动挪过视图且此后没有导航：窗口保持在用户给的位置（播放头允许离屏）
+        if manual_anchor.is_some_and(|t| times_equal(t, cur_time)) {
+            return win;
+        }
+        // 否则只做兜底：播放头还在窗口里就什么都不做，真出去了才把它拉回窗口内
+        if cur_time >= win.start && cur_time <= win.end {
+            return win;
+        }
+        let start = if cur_time < win.start {
+            cur_time
+        } else {
+            cur_time - span
+        };
+        let (start, end) = clamp_window(start, start + span, total);
+        return TimelineWindow { start, end };
+    }
+    let band = TIMELINE_FOLLOW_BAND;
     let start = if cur_time < win.start + span * band {
         cur_time - span * band
     } else if cur_time > win.end - span * band {
@@ -5412,6 +5447,430 @@ fn scroll_notches(event: &ScrollWheelEvent) -> f64 {
     raw.clamp(-4.0, 4.0)
 }
 
+/// 片段两端拖拽热区的宽度（px）。
+///
+/// 6px 是「抓得住、又不吃掉可点区域」的折中：再窄鼠标点不中，再宽则最短的片段
+/// （[`Theme::SEG_CLIP_MIN_W`] = 40px）只剩中间一小块能点选/跳播。
+const TIMELINE_TRIM_HANDLE_W: f32 = 6.0;
+
+/// 鼠标位移小于该值（px）不算拖拽：手抖一两像素不该把时间挪走几十毫秒。
+const TIMELINE_TRIM_SLOP_PX: f32 = 3.0;
+
+/// 拖拽改时间时的最短片段时长（秒）。
+///
+/// 取 0.1s（与管道里的 `MIN_SEGMENT_DUR` 同值）：一帧约 0.04s，比 0.1s 更短的时间码在
+/// 字面上就没有可读意义（SRT/VTT 里 0.1s 已是可用粒度），用户根本看不到这么短的字幕；
+/// 而载入工程时 `optimize_segments` 还会把这类片段当幻读鬼影直接删掉。
+const TIMELINE_TRIM_MIN_SECS: f64 = crate::subtitle::MIN_SEGMENT_DUR;
+
+/// 拖拽编辑的部位：左端改 `start`、右端改 `end`、中段整段平移。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimelineTrimMode {
+    Start,
+    End,
+    Move,
+}
+
+/// 一轮拖拽的会话（按下 → 移动 → 松手）。
+///
+/// 与 [`TIMELINE_PAN_START`] 同一套 thread_local 范式：窗口结构体定义在 `ui/mod.rs`，
+/// 本模块不便向外扩字段（同 `REPLACE_PANEL_TOGGLES`）。
+#[derive(Clone, Copy)]
+struct TimelineTrimDrag {
+    /// 被拖拽片段的 `Segment::index`。不用下标：拖拽途中任何一次拆分/合并都会让下标
+    /// 指向别的句子，`index` 才是清单与列表共用的稳定标识。
+    index: usize,
+    mode: TimelineTrimMode,
+    /// 按下前的原始时间：判定「有没有真的改动」、以及推撤销快照时写回原值都要它。
+    origin_start: f64,
+    origin_end: f64,
+    /// 按下时的鼠标横坐标：拖动量取「按下点 → 当前点」的时间差，热区抓偏一点也不会跳。
+    press_x: Pixels,
+}
+
+thread_local! {
+    static TIMELINE_TRIM_DRAG: std::cell::Cell<Option<TimelineTrimDrag>> =
+        const { std::cell::Cell::new(None) };
+    /// 「刚拖过时间」标记：松手时 GPUI 仍会补一次 click（按下/松开都在片段内），那一次
+    /// 不该再顺手跳播。按下任何热区/片段时清零（见 `begin_timeline_trim`）。
+    static TIMELINE_TRIM_CLICK_GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 记一笔「用户手动调过视图」：存下手动那一刻的播放头时间。
+/// 播放头一动（seek / 播放推进）标记自动失效，跟随随之恢复（见 [`follow_playhead`]）。
+fn mark_manual_view_change(playhead: f64) {
+    TIMELINE_PAN_ANCHOR.with(|a| a.set(Some(playhead)));
+}
+
+/// 最小时长的兜底：非有限或非正值一律退回常量，免得 NaN 渗进夹紧区间。
+fn sane_min_dur(min_dur: f64) -> f64 {
+    if min_dur.is_finite() && min_dur > 0.0 {
+        min_dur
+    } else {
+        TIMELINE_TRIM_MIN_SECS
+    }
+}
+
+/// 夹紧到 `[lower, upper]`；区间非法或输入非有限时退回 `fallback`。
+///
+/// 退回原值而不是硬夹到某个端点：数据本身已经坏掉（前一句压着后一句）时，宁可一动
+/// 不动，也别顺手把时间码改成另一个坏值。
+fn clamp_trim_time(raw: f64, lower: f64, upper: f64, fallback: f64) -> f64 {
+    if !raw.is_finite() || !lower.is_finite() || !upper.is_finite() || lower > upper {
+        return fallback;
+    }
+    raw.clamp(lower, upper)
+}
+
+/// 拖拽左端：返回夹紧后的新 `start`（纯函数，不带任何 UI 状态）。
+///
+/// 约束：`start >= 0`；`start >= prev_end`（不许拖到前一句之前，相邻顺序不变）；
+/// `start <= end - min_dur`；`start <= total - min_dur`。
+fn trim_start(
+    raw: f64,
+    cur_start: f64,
+    cur_end: f64,
+    prev_end: Option<f64>,
+    total: f64,
+    min_dur: f64,
+) -> f64 {
+    let min_dur = sane_min_dur(min_dur);
+    // 上界 = 「本句终点 - 最小时长」：终点不动，起点就不能顶穿它。总时长只是一层额外的
+    // 天花板（正常数据必然 end <= total），防的是上游给了越界的 end。
+    let upper = if total.is_finite() && total > 0.0 {
+        cur_end.min(total) - min_dur
+    } else {
+        cur_end - min_dur
+    };
+    let lower = prev_end
+        .filter(|v| v.is_finite())
+        .map_or(0.0, |v| v.max(0.0));
+    clamp_trim_time(raw, lower, upper, cur_start)
+}
+
+/// 拖拽右端：返回夹紧后的新 `end`。
+///
+/// 约束：`end >= start + min_dur`；`end <= next_start`（不许压过后一句的起点）；
+/// `end <= total`。
+fn trim_end(
+    raw: f64,
+    cur_start: f64,
+    cur_end: f64,
+    next_start: Option<f64>,
+    total: f64,
+    min_dur: f64,
+) -> f64 {
+    let min_dur = sane_min_dur(min_dur);
+    let upper = match (
+        total.is_finite() && total > 0.0,
+        next_start.filter(|v| v.is_finite()),
+    ) {
+        (true, Some(next)) => total.min(next),
+        (true, None) => total,
+        (false, Some(next)) => next,
+        // 既没有总时长也没有下一句：没有可用的上界，别猜
+        (false, None) => return cur_end,
+    };
+    clamp_trim_time(raw, cur_start + min_dur, upper, cur_end)
+}
+
+/// 整段平移：时长不变，返回夹紧后的 `(start, end)`。
+///
+/// 越界体现在「能挪多远」：先算出允许的位移区间（左端不得越过前一句终点、也不得为负；
+/// 右端不得越过下一句起点与总时长），再把请求位移夹进去——够不着就少挪，绝不变时长。
+fn shift_segment(
+    delta: f64,
+    cur_start: f64,
+    cur_end: f64,
+    prev_end: Option<f64>,
+    next_start: Option<f64>,
+    total: f64,
+    min_dur: f64,
+) -> (f64, f64) {
+    let dur = cur_end - cur_start;
+    // 退化片段（时长非正、比最小可见时长还短）不参与平移：挪了也还是坏数据
+    if !delta.is_finite() || !dur.is_finite() || dur < sane_min_dur(min_dur) {
+        return (cur_start, cur_end);
+    }
+    let lower = prev_end
+        .filter(|v| v.is_finite())
+        .map_or(0.0, |v| v.max(0.0));
+    let upper = match (
+        total.is_finite() && total > 0.0,
+        next_start.filter(|v| v.is_finite()),
+    ) {
+        (true, Some(next)) => total.min(next),
+        (true, None) => total,
+        (false, Some(next)) => next,
+        (false, None) => return (cur_start, cur_end),
+    };
+    let min_delta = lower - cur_start;
+    let max_delta = upper - cur_end;
+    if min_delta > max_delta {
+        // 前后邻居已经把它夹死（没有任何合法位置）：原地不动
+        return (cur_start, cur_end);
+    }
+    let d = delta.clamp(min_delta, max_delta);
+    (cur_start + d, cur_end + d)
+}
+
+/// 两个时间是否算「没变」。1e-9 秒远低于时间码精度（0.1s），只用来吃掉浮点毛刺：
+/// 「拖出去又拖回原处」必须判定成没变，否则会白留一个撤销点。
+fn times_equal(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-9
+}
+
+/// 鼠标横坐标 → 可视窗口内的时间（轨道太窄时算不出来，返回 `None`）。
+///
+/// 偏移量与 `MainWindow::seek_by_mouse_x` 同源（`TRACK_LABEL_W` / `TRACK_RIGHT_PAD`），
+/// 并且只走 [`TimelineWindow`] 这一条变换——拖拽热区和播放头必须落在同一套坐标里，
+/// 各算一套就必然错位。
+fn timeline_time_at_x(mouse_x: Pixels, window_width: Pixels, win: TimelineWindow) -> Option<f64> {
+    let track_w = window_width - px(Theme::TRACK_LABEL_W) - px(Theme::TRACK_RIGHT_PAD);
+    if f32::from(track_w) <= 10.0 {
+        return None;
+    }
+    let offset = f32::from(mouse_x - px(Theme::TRACK_LABEL_W));
+    let ratio = (offset / f32::from(track_w)) as f64;
+    Some(win.ratio_to_time(ratio))
+}
+
+/// 片段左右两端的拖拽热区（窄条，平时透明；选中时各画一条细亮条做提示）。
+///
+/// 为什么做成独立子元素、而不是「片段中部按下 + 自己判断左右 6px」：GPUI 的鼠标事件按
+/// hitbox 冒泡，独立热区才能各自带 `col-resize` 光标，并用 `stop_propagation` 独占这次
+/// 按下——中段平移与轨道定位都不许再接手。
+fn trim_handles(index: usize, selected: bool, cx: &Context<MainWindow>) -> [AnyElement; 2] {
+    let handle = |mode: TimelineTrimMode, on_left: bool| -> AnyElement {
+        div()
+            .id(if on_left {
+                ("timeline-trim-start", index)
+            } else {
+                ("timeline-trim-end", index)
+            })
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .w(px(TIMELINE_TRIM_HANDLE_W))
+            .when(on_left, |d| d.left_0())
+            .when(!on_left, |d| d.right_0())
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .when(selected, |d| {
+                d.child(
+                    div()
+                        .w(px(2.0))
+                        .h(px(Theme::CTRL_H_XS))
+                        .rounded_full()
+                        .bg(Theme::text_on_saturated()),
+                )
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.begin_timeline_trim(
+                        index,
+                        mode,
+                        event.position.x,
+                        window.viewport_size().width,
+                    );
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                    if event.pressed_button == Some(MouseButton::Left)
+                        && this.update_timeline_trim(event.position.x, window.viewport_size().width)
+                    {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
+                    // 没拖动过的那次松手仍算「点选 + 跳播」；真拖了就只落这一次编辑
+                    if !TIMELINE_TRIM_CLICK_GUARD.with(|g| g.get()) {
+                        this.select_timeline_segment(index, cx);
+                    }
+                    this.commit_timeline_trim(cx);
+                    // 热区自己收尾，别让片段再把这次松手当 click（拖完又跳一次）
+                    cx.stop_propagation();
+                }),
+            )
+            .into_any_element()
+    };
+    [
+        handle(TimelineTrimMode::Start, true),
+        handle(TimelineTrimMode::End, false),
+    ]
+}
+
+impl MainWindow {
+    /// 开始一轮拖拽编辑：记下按下点与原始时间，**不**动数据、不记撤销。
+    fn begin_timeline_trim(
+        &self,
+        index: usize,
+        mode: TimelineTrimMode,
+        press_x: Pixels,
+        window_width: Pixels,
+    ) {
+        // 新一轮按下先清零「刚拖过」标记（上一个会话可能没走到 click 就结束了）
+        TIMELINE_TRIM_CLICK_GUARD.with(|g| g.set(false));
+        let Some((origin_start, origin_end)) = self
+            .state
+            .segments
+            .iter()
+            .find(|s| s.index == index)
+            .map(|s| (s.start, s.end))
+        else {
+            TIMELINE_TRIM_DRAG.with(|d| d.set(None));
+            return;
+        };
+        if timeline_time_at_x(press_x, window_width, self.timeline_window()).is_none() {
+            // 轨道太窄，换算不出按下点：宁可不拖，也别产生半截编辑
+            TIMELINE_TRIM_DRAG.with(|d| d.set(None));
+            return;
+        }
+        TIMELINE_TRIM_DRAG.with(|d| {
+            d.set(Some(TimelineTrimDrag {
+                index,
+                mode,
+                origin_start,
+                origin_end,
+                press_x,
+            }))
+        });
+    }
+
+    /// 拖拽中：把鼠标位置换算成新时间写进 `segments`（实时预览）。
+    ///
+    /// 这里**不**记撤销、**不**置脏、**不**递增修订号：一次拖动会来几十个鼠标事件，每个
+    /// 都落一次库既没用又卡；正式落账统一在 [`MainWindow::commit_timeline_trim`]。
+    /// 返回是否真的改了时间（调用方据此重绘）。
+    ///
+    /// 拖拽途中改的是 `segments` 本体而修订号不动，派生快照里的时间轴排序索引暂时是旧
+    /// 的；被拖的片段本来就在可视范围内（否则点不到），不会中途从轨道上消失，松手递增
+    /// 修订号后索引立刻归位。
+    fn update_timeline_trim(&mut self, mouse_x: Pixels, window_width: Pixels) -> bool {
+        let Some(drag) = TIMELINE_TRIM_DRAG.with(|d| d.get()) else {
+            return false;
+        };
+        // 手抖一两像素不算拖拽：否则每次点选都会顺手把时间挪走几十毫秒
+        if (f32::from(mouse_x) - f32::from(drag.press_x)).abs() < TIMELINE_TRIM_SLOP_PX {
+            return false;
+        }
+        let win = self.timeline_window();
+        let (Some(press_time), Some(now_time)) = (
+            timeline_time_at_x(drag.press_x, window_width, win),
+            timeline_time_at_x(mouse_x, window_width, win),
+        ) else {
+            return false;
+        };
+        let delta = now_time - press_time;
+        let total = self.timeline_total_dur();
+        let Some(pos) = self
+            .state
+            .segments
+            .iter()
+            .position(|s| s.index == drag.index)
+        else {
+            return false;
+        };
+        // 邻居按存储顺序取 `pos ± 1`（与 `adjust_selected_times` 同口径）；拖拽期间不动
+        // 邻居，所以每帧现取与按下那一刻等价。
+        let prev_end = pos.checked_sub(1).map(|p| self.state.segments[p].end);
+        let next_start = self.state.segments.get(pos + 1).map(|s| s.start);
+        let (start, end) = match drag.mode {
+            TimelineTrimMode::Start => (
+                trim_start(
+                    drag.origin_start + delta,
+                    drag.origin_start,
+                    drag.origin_end,
+                    prev_end,
+                    total,
+                    TIMELINE_TRIM_MIN_SECS,
+                ),
+                drag.origin_end,
+            ),
+            TimelineTrimMode::End => (
+                drag.origin_start,
+                trim_end(
+                    drag.origin_end + delta,
+                    drag.origin_start,
+                    drag.origin_end,
+                    next_start,
+                    total,
+                    TIMELINE_TRIM_MIN_SECS,
+                ),
+            ),
+            TimelineTrimMode::Move => shift_segment(
+                delta,
+                drag.origin_start,
+                drag.origin_end,
+                prev_end,
+                next_start,
+                total,
+                TIMELINE_TRIM_MIN_SECS,
+            ),
+        };
+        let seg = &mut self.state.segments[pos];
+        if times_equal(seg.start, start) && times_equal(seg.end, end) {
+            // 拖回原处：时间没变，别点亮「刚拖过」标记（松手时也不该留撤销点）
+            return false;
+        }
+        seg.start = start;
+        seg.end = end;
+        TIMELINE_TRIM_CLICK_GUARD.with(|g| g.set(true));
+        true
+    }
+
+    /// 松手落账：一轮拖拽只产生**一次**编辑。
+    ///
+    /// 三者缺一不可：压一次撤销快照（拖错了要有路可退）、置 `segments_dirty`（不置脏时
+    /// 关窗守卫读到的仍是 false，这次改动会被当成「无改动」丢掉）、
+    /// `bump_segments_revision`（只失效清单缓存、不自己落库，见 `AppState` 上的同款注释）。
+    fn commit_timeline_trim(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = TIMELINE_TRIM_DRAG.with(|d| d.take()) else {
+            return;
+        };
+        let Some(pos) = self
+            .state
+            .segments
+            .iter()
+            .position(|s| s.index == drag.index)
+        else {
+            return;
+        };
+        let (start, end) = (self.state.segments[pos].start, self.state.segments[pos].end);
+        // 时间一点没动（压根没拖 / 拖回原处）：不留撤销点、不置脏——白压一层撤销点会让
+        // Ctrl+Z 退无可退，白置脏则会把一份没变的文档写回库。
+        if times_equal(start, drag.origin_start) && times_equal(end, drag.origin_end) {
+            return;
+        }
+        // 撤销快照必须记「按下前的原样」：拖拽期间改的就是 `segments` 本体，直接推当前值
+        // 等于把改后的状态当成撤销目标，Ctrl+Z 会退无可退。先把原值写回、推栈、再落回新值。
+        self.state.segments[pos].start = drag.origin_start;
+        self.state.segments[pos].end = drag.origin_end;
+        self.state.snapshot_for_undo();
+        self.state.segments[pos].start = start;
+        self.state.segments[pos].end = end;
+        self.state.segments_dirty = true;
+        self.state.bump_segments_revision();
+        self.state.flush_segments_if_dirty();
+        cx.notify();
+    }
+
+    /// 点选片段并跳播（片段中部点击、热区上「没拖动」的松手共用同一套动作）。
+    fn select_timeline_segment(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.state.select_segment(index);
+        self.trigger_extract_frame(cx);
+        cx.notify();
+    }
+}
+
 impl MainWindow {
     /// 时间轴按到的总时长：与改造前的 `total_duration.max(1.0)` 同源，
     /// 空白工程下也要留出一条完整的时间轴。
@@ -5439,6 +5898,8 @@ impl MainWindow {
             cur_time,
             self.timeline_total_dur(),
             self.state.is_playing,
+            // 暂停时「手动调过视图」的标记：内容是手动那一刻的播放头时间（见 follow_playhead）
+            TIMELINE_PAN_ANCHOR.with(|a| a.get()),
         );
         if followed.start != win.start {
             TIMELINE_PAN_START.with(|p| p.set(followed.start));
@@ -5447,16 +5908,24 @@ impl MainWindow {
     }
 
     /// 以 `anchor_ratio` 为不动点缩放，并把夹紧后的窗口起点存回平移量。
+    /// 以 `anchor_ratio` 为不动点缩放，并把夹紧后的窗口起点存回平移量。
+    ///
+    /// 缩放也算「用户手动调过视图」：暂停时窗口不该被播放头拽回，否则锚点选在别处时，
+    /// 下一帧渲染就被 [`follow_playhead`] 拉走，放大到哪都白给。
     fn zoom_timeline(&mut self, anchor_ratio: f64, factor: f64, cx: &mut Context<Self>) {
         let total = self.timeline_total_dur();
         let start = TIMELINE_PAN_START.with(|p| p.get());
         let (zoom, start) = zoom_at(anchor_ratio, start, total, self.state.timeline_zoom, factor);
         self.state.timeline_zoom = zoom;
         TIMELINE_PAN_START.with(|p| p.set(start));
+        mark_manual_view_change(self.state.current_time);
         cx.notify();
     }
 
     /// 水平平移 `delta_spans`（以窗口宽度为单位，正值 = 往更晚的时间看）。
+    ///
+    /// 平移是「用户手动调过视图」的典型动作：记下这一刻的播放头时间，暂停时
+    /// [`follow_playhead`] 就不再把它拽回来——这里正是「暂停时向右滚完全没反应」的根。
     fn pan_timeline(&mut self, delta_spans: f64, cx: &mut Context<Self>) {
         let total = self.timeline_total_dur();
         let win = self.timeline_window();
@@ -5464,6 +5933,7 @@ impl MainWindow {
         let start = win.start + delta_spans * span;
         let (start, _) = clamp_window(start, start + span, total);
         TIMELINE_PAN_START.with(|p| p.set(start));
+        mark_manual_view_change(self.state.current_time);
         cx.notify();
     }
 
@@ -5625,6 +6095,22 @@ impl MainWindow {
         let zoom = self.state.timeline_zoom;
         let sel_idx = self.state.selected_segment_index;
 
+        // 拖拽中的时间提示：显示正在编辑的那一端（右端热区 = 终点，其余 = 起点）。
+        // 只给时间码，不加说明文字——拖动时眼睛在片段上，多一个字都是噪声。
+        let trim_hint: Option<String> = TIMELINE_TRIM_DRAG.with(|d| d.get()).and_then(|drag| {
+            self.state
+                .segments
+                .iter()
+                .find(|s| s.index == drag.index)
+                .map(|s| {
+                    let t = match drag.mode {
+                        TimelineTrimMode::End => s.end,
+                        TimelineTrimMode::Start | TimelineTrimMode::Move => s.start,
+                    };
+                    seconds_to_timestamp_short(t)
+                })
+        });
+
         div()
             .id("editor-multitrack-timeline")
             .h(px(Theme::TIMELINE_H))
@@ -5654,6 +6140,20 @@ impl MainWindow {
                     cx.stop_propagation();
                 }
             }))
+            // 拖拽改时间的收尾兜底：松手时指针可能已经不在片段/热区上（拖到别的轨、
+            // 甚至拖出时间轴）。漏掉收尾会把「已改但没置脏」留在内存里，改动静默丢失。
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    this.commit_timeline_trim(cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    this.commit_timeline_trim(cx);
+                }),
+            )
             // 时间轴顶栏工具区 (紧凑 28px)
             .child(
                 div()
@@ -5700,7 +6200,22 @@ impl MainWindow {
                                         self.state.segments.len(),
                                         format_duration_short(total_dur)
                                     )),
-                            ),
+                            )
+                            // 拖拽中把时间码顶到工具条上：位置固定、文案只有时间码
+                            .children(trim_hint.clone().map(|hint| {
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .bg(Theme::bg_inset())
+                                    .border_1()
+                                    .border_color(Theme::accent_primary())
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .font_family("Consolas")
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(Theme::accent_primary())
+                                    .child(hint)
+                            })),
                     )
                     // 右侧：缩放控件 + 快捷键速查（后者与 shortcuts::SHORTCUT_HINTS 同源，
                     // 只挑高频几项，避免占满工具条）
@@ -5895,11 +6410,45 @@ impl MainWindow {
                                                     .items_center()
                                                     .overflow_hidden()
                                                     .hover(|s| s.opacity(0.85))
+                                                    // 中段按下 = 整段平移（按下只记会话，真移动了才算拖拽）
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, event: &MouseDownEvent, window, _cx| {
+                                                            this.begin_timeline_trim(
+                                                                seg_idx,
+                                                                TimelineTrimMode::Move,
+                                                                event.position.x,
+                                                                window.viewport_size().width,
+                                                            );
+                                                        }),
+                                                    )
+                                                    .on_mouse_move(cx.listener(
+                                                        move |this, event: &MouseMoveEvent, window, cx| {
+                                                            if event.pressed_button == Some(MouseButton::Left)
+                                                                && this.update_timeline_trim(
+                                                                    event.position.x,
+                                                                    window.viewport_size().width,
+                                                                )
+                                                            {
+                                                                cx.notify();
+                                                            }
+                                                        },
+                                                    ))
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                                                            this.commit_timeline_trim(cx);
+                                                        }),
+                                                    )
                                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.state.select_segment(seg_idx);
-                                                        this.trigger_extract_frame(cx);
-                                                        cx.notify();
+                                                        // 刚拖过时间的那次松手，GPUI 仍会补一次 click：
+                                                        // 这一下不该再跳播，否则改完时间画面又跳回去
+                                                        if TIMELINE_TRIM_CLICK_GUARD.with(|g| g.get()) {
+                                                            return;
+                                                        }
+                                                        this.select_timeline_segment(seg_idx, cx);
                                                     }))
+                                                    .children(trim_handles(seg_idx, is_selected, cx))
                                                     .child(
                                                         div()
                                                             .text_size(px(Theme::TEXT_SMALL))
@@ -5942,6 +6491,12 @@ impl MainWindow {
                                 |this, event: &MouseMoveEvent, window, cx| {
                                     if event.pressed_button == Some(MouseButton::Left) {
                                         let win_w = window.viewport_size().width;
+                                        // 拖拽改时间时由这一层把拖动跟到底：片段被邻居/边界夹住
+                                        // 之后指针会跑到片段外，片段自己的 move 事件收不到
+                                        if this.update_timeline_trim(event.position.x, win_w) {
+                                            cx.notify();
+                                        }
+                                        // 拖拽期间这条定位会被 seek_by_mouse_x 自己拦下
                                         this.seek_by_mouse_x(event.position.x, win_w, true, cx);
                                     }
                                 },
@@ -6070,23 +6625,24 @@ impl MainWindow {
         if self.state.total_duration <= 0.0 {
             return;
         }
+        // 拖拽改时间期间不再按鼠标位置挪播放头：轨道响应层比片段/热区后画（冒泡里必然
+        // 先吃到事件，`stop_propagation` 拦不住它），不在这里拦的话，修右端时指针一路往右、
+        // 播放头跟着跑，画面被拽得到处都是。
+        if TIMELINE_TRIM_DRAG.with(|d| d.get()).is_some() {
+            return;
+        }
         self.halt_preview_playback();
         // 两个偏移量必须与布局里的实际值同源，否则点击位置与播放头会整体错位。
         //
         // 注意：导航已从左侧 180px 竖栏改为顶部标签条，时间轴现在从窗口左缘
         // （x=0）起铺满整宽，不再有 `NAV_W` 的左偏移——多减它会让点击位置整体左移 180px。
-        let left_pad = px(Theme::TRACK_LABEL_W);
-        let right_pad = px(Theme::TRACK_RIGHT_PAD);
-
-        let track_start_x = left_pad;
-        let track_w = window_width - left_pad - right_pad;
-        if track_w <= px(10.0) {
+        //
+        // 「鼠标横坐标 → 时间」与拖拽热区共用 [`timeline_time_at_x`]：两处各算各的，
+        // 落点就会和播放头差几帧。
+        let Some(target_time) = timeline_time_at_x(mouse_x, window_width, self.timeline_window())
+        else {
             return;
-        }
-        let relative_x = mouse_x - track_start_x;
-        let ratio = (relative_x / track_w).clamp(0.0, 1.0) as f64;
-        // 与渲染同一条变换：放大/平移后点击落点仍然对得上播放头
-        let target_time = self.timeline_window().ratio_to_time(ratio);
+        };
         self.state.seek_to(target_time);
 
         if is_drag {
@@ -6755,9 +7311,10 @@ mod tests {
     use super::{
         clamp_zoom, click_seek_target, fit_video_size, follow_playhead, is_playing_at,
         karaoke_mark_style, karaoke_word_marks, min_gap_hint, monitor_picture_source,
-        monitor_screen_size, raw_line_byte_start, render_image_from_frame_file,
-        timeline_clip_positions, timeline_window, zoom_at, MonitorPictureSource, TimelineWindow,
-        WordMark, EDITOR_STACK_MONITOR_H, MONITOR_VIDEO_FIT_FRAC, TIMELINE_FULL_DRAW_LIMIT,
+        monitor_screen_size, raw_line_byte_start, render_image_from_frame_file, shift_segment,
+        timeline_clip_positions, timeline_time_at_x, timeline_window, trim_end, trim_start,
+        zoom_at, MonitorPictureSource, TimelineWindow, WordMark, EDITOR_STACK_MONITOR_H,
+        MONITOR_VIDEO_FIT_FRAC, TIMELINE_FULL_DRAW_LIMIT, TIMELINE_TRIM_MIN_SECS,
         TIMELINE_WINDOW_MARGIN_SECS, TIMELINE_ZOOM_MAX, TIMELINE_ZOOM_MIN,
     };
     use crate::subtitle::segment::WordTiming;
@@ -7504,20 +8061,47 @@ mod tests {
         let total = 100.0;
         let whole = timeline_window(1.0, 0.0, total);
         // 播放中游标在 42% / 99% / 越界到 150 秒，都不该动整段视图
-        assert_eq!(follow_playhead(whole, 42.0, total, true), whole);
-        assert_eq!(follow_playhead(whole, 99.0, total, true), whole);
-        assert_eq!(follow_playhead(whole, 150.0, total, true), whole);
+        assert_eq!(follow_playhead(whole, 42.0, total, true, None), whole);
+        assert_eq!(follow_playhead(whole, 99.0, total, true, None), whole);
+        assert_eq!(follow_playhead(whole, 150.0, total, true, None), whole);
 
         // 放大 4 倍 → 窗口宽 25 秒
         let win = timeline_window(4.0, 0.0, total);
         // 播放中游标越过 90% 处：窗口被推着走，游标停在 90% 位置
-        let followed = follow_playhead(win, 24.0, total, true);
+        let followed = follow_playhead(win, 24.0, total, true, None);
         assert!((followed.start - (24.0 - 25.0 * 0.9)).abs() < 1e-9);
-        // 暂停时窗口不动（用户可能正手动平移去看别处，不该被拽回来）
-        assert_eq!(follow_playhead(win, 24.0, total, false), win);
-        // 暂停时游标真的出了窗口才跟随
-        let followed = follow_playhead(win, 40.0, total, false);
+        // 暂停、且没手动动过视图：游标还在窗口里就不动
+        assert_eq!(follow_playhead(win, 24.0, total, false, None), win);
+        // 暂停、且没手动动过视图：游标真的出了窗口才跟随（兜底）
+        let followed = follow_playhead(win, 40.0, total, false, None);
         assert!((followed.start - 15.0).abs() < 1e-9);
+    }
+
+    /// 回归（P1）：暂停时手动平移过视图，窗口必须保持用户给的起点——播放头允许离屏，
+    /// 不能被下一帧的跟随悄悄夹回来。旧实现把「暂停」写成 `band = 0` 的同一条分支，
+    /// 看似只取消了前后留白，其实还留着「窗口必须包住播放头」这条硬约束，于是
+    /// `current_time` 还贴在 0 时向右平移等于白滚（滚轮/平移完全没反应）。
+    /// 播放头一动（seek / 播放）标记自动失效，跟随立即恢复。
+    #[test]
+    fn paused_manual_pan_is_not_yanked_back_by_the_playhead() {
+        let total = 100.0;
+        // 4 倍缩放后窗口宽 25 秒；用户把它平移到 [10, 35]
+        let panned = timeline_window(4.0, 10.0, total);
+        assert!((panned.start - 10.0).abs() < 1e-9, "平移本身要生效");
+        // 播放头还在 0（窗口外）：窗口一点都不许动
+        assert_eq!(
+            follow_playhead(panned, 0.0, total, false, Some(0.0)),
+            panned
+        );
+        // 用户 seek 到窗口外的句子：标记失效，窗口跟过去把播放头带回视野
+        let followed = follow_playhead(panned, 60.0, total, false, Some(0.0));
+        assert!(
+            followed.start <= 60.0 && followed.end >= 60.0,
+            "seek 之后播放头必须可见：{followed:?}"
+        );
+        // 播放中永远跟随（游标贴到右侧留白带就推着窗口走）
+        let playing = follow_playhead(panned, 34.0, total, true, Some(34.0));
+        assert!(playing.start > 10.0, "播放时必须跟随：{playing:?}");
     }
 
     /// 没有素材（总时长 0）、极短素材、非有限输入：缩放/平移/换算都不许 panic，
@@ -7534,5 +8118,154 @@ mod tests {
         }
         let (zoom, start) = zoom_at(f64::NAN, f64::NAN, 10.0, 2.0, f64::NAN);
         assert!(zoom.is_finite() && start.is_finite());
+    }
+
+    /// 拖拽左端：0 下界、前一句边界、最小时长三条夹紧，外加非有限输入不 panic。
+    #[test]
+    fn trim_start_clamps_zero_previous_end_and_min_duration() {
+        let f = |raw: f64| trim_start(raw, 10.0, 12.0, Some(8.0), 60.0, TIMELINE_TRIM_MIN_SECS);
+        assert!((f(8.5) - 8.5).abs() < 1e-9, "区间内原样通过");
+        assert!((f(-3.0) - 8.0).abs() < 1e-9, "不许拖到前一句之前");
+        assert!((f(11.99) - 11.9).abs() < 1e-9, "最小时长 0.1s 是硬下界");
+        assert!((f(f64::NAN) - 10.0).abs() < 1e-9, "NaN 退回原值");
+        assert!((f(f64::INFINITY) - 10.0).abs() < 1e-9, "∞ 退回原值");
+        assert!((f(f64::NEG_INFINITY) - 10.0).abs() < 1e-9, "-∞ 退回原值");
+        // 第一句没有前邻居：只能拖到 0
+        let first = trim_start(-5.0, 1.0, 3.0, None, 60.0, TIMELINE_TRIM_MIN_SECS);
+        assert!(first.abs() < 1e-9, "first = {first}");
+    }
+
+    /// 拖拽右端：最小时长下界 + 后一句起点 / 总时长两条上界。
+    #[test]
+    fn trim_end_clamps_min_duration_next_start_and_total() {
+        let f = |raw: f64| trim_end(raw, 10.0, 12.0, Some(15.0), 60.0, TIMELINE_TRIM_MIN_SECS);
+        assert!((f(14.0) - 14.0).abs() < 1e-9, "区间内原样通过");
+        assert!((f(9.0) - 10.1).abs() < 1e-9, "不许压到最小时长以下");
+        assert!((f(30.0) - 15.0).abs() < 1e-9, "不许压过后一句起点");
+        assert!((f(f64::NAN) - 12.0).abs() < 1e-9, "NaN 退回原值");
+        // 最后一句：上界只剩总时长
+        let last = trim_end(90.0, 50.0, 55.0, None, 60.0, TIMELINE_TRIM_MIN_SECS);
+        assert!((last - 60.0).abs() < 1e-9, "last = {last}");
+    }
+
+    /// 整段平移：时长不变、被边界截住、非有限输入原地不动。
+    #[test]
+    fn shift_segment_keeps_duration_and_stops_at_neighbours() {
+        let p = |d: f64| {
+            shift_segment(
+                d,
+                10.0,
+                12.0,
+                Some(8.0),
+                Some(15.0),
+                60.0,
+                TIMELINE_TRIM_MIN_SECS,
+            )
+        };
+        let (s, e) = p(1.0);
+        assert!((s - 11.0).abs() < 1e-9 && (e - 13.0).abs() < 1e-9);
+        assert!((e - s - 2.0).abs() < 1e-9, "时长必须不变");
+        let (s, e) = p(-100.0);
+        assert!(
+            (s - 8.0).abs() < 1e-9 && (e - 10.0).abs() < 1e-9,
+            "左越界被前一句截住"
+        );
+        let (s, e) = p(100.0);
+        assert!(
+            (s - 13.0).abs() < 1e-9 && (e - 15.0).abs() < 1e-9,
+            "右越界被后一句截住"
+        );
+        // 最后一句：被总时长截住，时长仍是 5 秒
+        let (s, e) = shift_segment(100.0, 50.0, 55.0, None, None, 60.0, TIMELINE_TRIM_MIN_SECS);
+        assert!((s - 55.0).abs() < 1e-9 && (e - 60.0).abs() < 1e-9);
+        // 非有限位移：原地不动，绝不产出 NaN 时间码
+        let (s, e) = p(f64::NAN);
+        assert!((s - 10.0).abs() < 1e-9 && (e - 12.0).abs() < 1e-9);
+    }
+
+    /// 顺序不变：左右端与整段平移到任意极值，都不会把这一句挪到前一句之前或压过后一句
+    /// 起点，也不会越过 `[0, total]`；退化/非有限输入同样不产出 NaN。
+    #[test]
+    fn drag_edits_never_reorder_or_leave_the_timeline() {
+        let (prev_end, next_start, total) = (8.0, 15.0, 60.0);
+        for raw in [-1000.0, -1.0, 0.0, 8.0, 11.0, 14.9, 1e9] {
+            let s = trim_start(
+                raw,
+                10.0,
+                12.0,
+                Some(prev_end),
+                total,
+                TIMELINE_TRIM_MIN_SECS,
+            );
+            assert!(s >= prev_end - 1e-9, "raw = {raw} 时拖到前一句之前：{s}");
+            assert!(
+                s <= 12.0 - TIMELINE_TRIM_MIN_SECS + 1e-9,
+                "raw = {raw} 时短于最小时长：{s}"
+            );
+            let e = trim_end(
+                raw,
+                10.0,
+                12.0,
+                Some(next_start),
+                total,
+                TIMELINE_TRIM_MIN_SECS,
+            );
+            assert!(
+                e >= 10.0 + TIMELINE_TRIM_MIN_SECS - 1e-9,
+                "raw = {raw} 时短于最小时长：{e}"
+            );
+            assert!(e <= next_start + 1e-9, "raw = {raw} 时压过后一句：{e}");
+        }
+        for d in [-1e9, -1000.0, -5.0, 0.0, 0.3, 1000.0, 1e9, f64::NAN] {
+            let (s, e) = shift_segment(
+                d,
+                10.0,
+                12.0,
+                Some(prev_end),
+                Some(next_start),
+                total,
+                TIMELINE_TRIM_MIN_SECS,
+            );
+            assert!(s >= prev_end - 1e-9 && s >= 0.0, "d = {d} 时左越界：{s}");
+            assert!(
+                e <= next_start + 1e-9 && e <= total + 1e-9,
+                "d = {d} 时右越界：{e}"
+            );
+            assert!(s.is_finite() && e.is_finite(), "d = {d} 产出非有限时间码");
+        }
+    }
+
+    /// 退化输入（总时长 0 / 负 / 非有限，最小时长非法）不许产出 NaN 或反向区间。
+    #[test]
+    fn trim_edits_survive_degenerate_inputs() {
+        for total in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let s = trim_start(5.0, 4.0, 6.0, None, total, TIMELINE_TRIM_MIN_SECS);
+            assert!(
+                s.is_finite() && s <= 6.0 - TIMELINE_TRIM_MIN_SECS + 1e-9,
+                "total = {total} 的起点：{s}"
+            );
+            let e = trim_end(5.0, 4.0, 6.0, None, total, TIMELINE_TRIM_MIN_SECS);
+            assert!(
+                e.is_finite() && e >= 4.0 + TIMELINE_TRIM_MIN_SECS - 1e-9,
+                "total = {total} 的终点：{e}"
+            );
+        }
+        // 最小时长传了 NaN / 负值：退回常量照常工作，不 panic
+        assert!((trim_start(5.0, 4.0, 6.0, None, 60.0, f64::NAN) - 5.0).abs() < 1e-9);
+        assert!((trim_end(5.0, 4.0, 6.0, None, 60.0, -1.0) - 5.0).abs() < 1e-9);
+    }
+
+    /// 鼠标定位必须走 [`TimelineWindow`]（放大/平移后的可视窗口），不能拿整段总时长当分母。
+    #[test]
+    fn trim_mouse_position_maps_through_the_visible_window() {
+        let win = timeline_window(4.0, 30.0, 120.0); // 窗口 = [30, 60]
+        assert!((win.start - 30.0).abs() < 1e-9);
+        let track = Theme::TRACK_LABEL_W + Theme::TRACK_RIGHT_PAD + 800.0;
+        let mid = timeline_time_at_x(gpui::px(Theme::TRACK_LABEL_W + 400.0), gpui::px(track), win)
+            .expect("轨道宽度足够时必须算得出时间");
+        assert!((mid - 45.0).abs() < 1e-6, "mid = {mid}");
+        // 轨道比阈值还窄：算不出来（不 panic，也不给半截换算）
+        let narrow = Theme::TRACK_LABEL_W + Theme::TRACK_RIGHT_PAD;
+        assert!(timeline_time_at_x(gpui::px(10.0), gpui::px(narrow), win).is_none());
     }
 }
