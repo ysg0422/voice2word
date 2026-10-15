@@ -837,6 +837,7 @@ impl WhisperEngine {
             .arg("-mc")
             .arg(self.max_context.to_string())
             .arg("-sns") // 抑制非语音标记(音乐/掌声/杂音)，杜绝自回归发散与幻读
+            .arg("-pp") // 启用实时高频内部推理进度汇报 (whisper_print_progress_callback: progress = X%)
             .arg("-of")
             .arg(&prefix);
         // token 概率在「救场开启」或「质检需要逐句置信度」时收集：-ojf 全量 JSON 带
@@ -1022,6 +1023,8 @@ impl WhisperEngine {
         // 这里改为逐行处理：只累计 VAD 耗时、保留末尾若干行用于报错信息，其余直接丢弃。
         const STDERR_TAIL_LINES: usize = 40;
         let stderr_activity = last_activity.clone();
+        let cb_stderr = cb_shared.clone();
+        let dur_stderr = total_duration.unwrap_or(0.0);
         let stderr_handle = std::thread::spawn(move || -> (f64, String) {
             let Some(err) = stderr else {
                 return (0.0, String::new());
@@ -1030,6 +1033,7 @@ impl WhisperEngine {
             let mut tail: std::collections::VecDeque<String> =
                 std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES);
             let mut reader = std::io::BufReader::new(err);
+            let mut last_pp_pct = 0u32;
             // 读失败（≠ 正常 EOF）时 `read_pipe_lines` 返回 true：诊断日志已不可信，
             // 在尾部补一条标记，避免用户把截断的报错当成完整原因。
             let truncated = read_pipe_lines(&mut reader, "whisper-cli stderr", |line| {
@@ -1037,6 +1041,28 @@ impl WhisperEngine {
                 *stderr_activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
                 if let Some(ms) = WhisperEngine::parse_vad_ms_line(line) {
                     vad_ms += ms;
+                }
+                // 解析 -pp 输出的实时推理内部细粒度进度（whisper_print_progress_callback: progress = X%）
+                if let Some(pct) = WhisperEngine::parse_whisper_progress_pct(line) {
+                    if pct > last_pp_pct || pct == 100 {
+                        last_pp_pct = pct;
+                        let ratio = (pct as f64 / 100.0).clamp(0.01, 1.0);
+                        if let Some(ref cb) = cb_stderr.as_ref() {
+                            let label = if dur_stderr > 0.0 {
+                                let cur_sec = ratio * dur_stderr;
+                                let mm = (cur_sec / 60.0) as u32;
+                                let ss = (cur_sec % 60.0) as u32;
+                                let tot_mm = (dur_stderr / 60.0) as u32;
+                                let tot_ss = (dur_stderr % 60.0) as u32;
+                                format!("已处理至 {mm:02}:{ss:02} / {tot_mm:02}:{tot_ss:02} ({pct}%)")
+                            } else {
+                                format!("正在进行声学神经网络推理 ({pct}%)")
+                            };
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                cb(ratio, &label, None);
+                            }));
+                        }
+                    }
                 }
                 if tail.len() == STDERR_TAIL_LINES {
                     tail.pop_front();
@@ -1624,6 +1650,18 @@ impl WhisperEngine {
             .take_while(|c| c.is_ascii_digit() || *c == '.')
             .collect();
         num.parse::<f64>().ok()
+    }
+
+    /// 解析 whisper-cli -pp 输出的实时推理细粒度进度百分比：
+    /// `whisper_print_progress_callback: progress =  12%` 或 `progress = 100%`
+    pub fn parse_whisper_progress_pct(line: &str) -> Option<u32> {
+        let rest = line.split_once("progress =")?.1;
+        let num: String = rest
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        num.parse::<u32>().ok()
     }
 
     /// 当前生效的 GPU 占用上限（供单测与外部观测；引擎内部 spawn 时读同一份）。
@@ -2435,6 +2473,26 @@ mod tests {
         let stderr = "whisper_print_timings: vad time = 100.00 ms processing 1 samples\n\
                       whisper_print_timings: vad time = 250.00 ms processing 2 samples\n";
         assert!((WhisperEngine::parse_vad_time(stderr) - 0.35).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_whisper_progress_pct_tests() {
+        assert_eq!(
+            WhisperEngine::parse_whisper_progress_pct("whisper_print_progress_callback: progress =   0%"),
+            Some(0)
+        );
+        assert_eq!(
+            WhisperEngine::parse_whisper_progress_pct("whisper_print_progress_callback: progress =  15%"),
+            Some(15)
+        );
+        assert_eq!(
+            WhisperEngine::parse_whisper_progress_pct("whisper_print_progress_callback: progress = 100%"),
+            Some(100)
+        );
+        assert_eq!(
+            WhisperEngine::parse_whisper_progress_pct("some other log line without target"),
+            None
+        );
     }
 
     #[test]

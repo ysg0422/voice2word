@@ -239,6 +239,7 @@ pub fn progress_bar(ratio: f32) -> Div {
             div()
                 .h_full()
                 .w(relative(r))
+                .min_w(px(if r > 0.001 { 4.0 } else { 0.0 }))
                 .rounded_full()
                 .bg(Theme::accent_mint()),
         )

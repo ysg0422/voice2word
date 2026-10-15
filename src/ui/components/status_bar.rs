@@ -557,12 +557,13 @@ impl MainWindow {
                                             .child(stage_text.to_string()),
                                     )
                                     .child(if total_dur > 0.0 {
+                                        let display_sec = cur_sec.max(display_ratio * total_dur);
                                         div()
                                             .text_size(px(Theme::TEXT_SMALL))
                                             .text_color(Theme::text_secondary())
                                             .child(format!(
                                                 "{} / {}",
-                                                crate::ui::format_mm_ss(cur_sec),
+                                                crate::ui::format_mm_ss(display_sec),
                                                 crate::ui::format_mm_ss(total_dur)
                                             ))
                                     } else {

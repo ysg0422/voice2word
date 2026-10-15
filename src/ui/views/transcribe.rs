@@ -290,12 +290,21 @@ impl MainWindow {
                                                 .font_weight(FontWeight::BOLD)
                                                 .text_color(Theme::text_secondary())
                                                 .child(if total_dur > 0.0 {
-                                                    format!(
-                                                        "进度：{} / {}（{:.1}%）",
-                                                        format_mm_ss(cur_sec),
-                                                        format_mm_ss(total_dur),
-                                                        display_ratio * 100.0
-                                                    )
+                                                    let display_sec = cur_sec.max(display_ratio * total_dur);
+                                                    if display_sec > 0.0 {
+                                                        format!(
+                                                            "进度：{} / {}（{:.1}%）",
+                                                            format_mm_ss(display_sec),
+                                                            format_mm_ss(total_dur),
+                                                            display_ratio * 100.0
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "准备中：{}（{:.1}%）",
+                                                            format_mm_ss(total_dur),
+                                                            display_ratio * 100.0
+                                                        )
+                                                    }
                                                 } else {
                                                     "正在实时推流…".to_string()
                                                 }),

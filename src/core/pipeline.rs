@@ -884,7 +884,7 @@ impl TaskPipeline {
         ));
         let _ = tx.send(PipelineEvent::Progress {
             stage: "提取音频".into(),
-            progress: 0.1,
+            progress: 0.05,
             detail: "正在探测媒体时长并准备音频通道...".into(),
         });
 
@@ -909,6 +909,16 @@ impl TaskPipeline {
         };
 
         let duration_for_chunks = total_dur.unwrap_or(0.0);
+        if duration_for_chunks > 0.0 {
+            let _ = tx.send(PipelineEvent::Progress {
+                stage: "提取音频".into(),
+                progress: 0.08,
+                detail: format!(
+                    "媒体时长探测完成（{}），正在初始化音频通道...",
+                    crate::ui::format_mm_ss(duration_for_chunks)
+                ),
+            });
+        }
 
         // best-effort 落盘阶段 1 产物（仅在未命中缓存时写；写失败只告警，不中断）。
         if cached_duration.is_none() {
@@ -1171,7 +1181,7 @@ impl TaskPipeline {
                 );
                 let _ = tx.send(PipelineEvent::Progress {
                     stage: "提取音频".into(),
-                    progress: 1.0,
+                    progress: 0.14,
                     detail: "已建立纯内存音频推流管道 (0 磁盘 I/O，毫秒级就绪)".into(),
                 });
             } else {
@@ -1189,7 +1199,7 @@ impl TaskPipeline {
                 info!(elapsed = ?extraction_started.elapsed(), "FFmpeg 临时 WAV 提取完成 (CPU 切块模式)");
                 let _ = tx.send(PipelineEvent::Progress {
                     stage: "提取音频".into(),
-                    progress: 1.0,
+                    progress: 0.14,
                     detail: "音频提取成功".into(),
                 });
                 temp_wav_path = Some(TempPathGuard::file(wav_path));
