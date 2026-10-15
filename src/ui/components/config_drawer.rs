@@ -45,6 +45,7 @@ const _: () = assert!(
 /// `txt` 与 `txt-ts` **同扩展名 `.txt`**：前者是纯文本（无时间轴），后者每行带
 /// `[00:01:23.456]` 时间码。两枚胶囊相邻摆放，名字里分别写「纯文本 / 带时间码」，
 /// 免得用户在导出目录里看到两个都叫 .txt 的文件却分不清。
+#[allow(dead_code)]
 const OUTPUT_FORMAT_CHOICES: [(&str, &str); 10] = [
     ("srt", "SRT"),
     ("vtt", "VTT"),
@@ -700,26 +701,6 @@ impl MainWindow {
             "yue" => "yue",
             _ => "auto",
         };
-        // 兜底回落到 "srt" 之前，必须把新增的专业格式也列出来——否则 output_format
-        // 明明是 json/ttml/ttal，界面上却高亮 SRT，用户以为设置没生效。
-        let fmt_sel = match self.state.output_format.as_str() {
-            "vtt" => "vtt",
-            "ass" => "ass",
-            "txt" => "txt",
-            "txt-ts" => "txt-ts",
-            "json" => "json",
-            "ttml" => "ttml",
-            "ttal" => "ttal",
-            "sbv" => "sbv",
-            "lrc" => "lrc",
-            _ => "srt",
-        };
-        // 逐词卡拉OK开关（落盘键：`[subtitle_style] karaoke_word_highlight`）。
-        let karaoke_sel = if self.state.config.subtitle_style.karaoke_word_highlight {
-            "on"
-        } else {
-            "off"
-        };
         let polish_sel = if !self.state.enable_polish {
             "off"
         } else if self.state.polish_mode == PolishMode::PuncFast {
@@ -775,35 +756,6 @@ impl MainWindow {
                     // 重启后 `AppState::with_hardware` 从配置读回的仍是旧语言。
                     this.state.config.pipeline.language = sel.to_string();
                     this.state.persist_config();
-                    cx.notify();
-                },
-                cx,
-            ))
-            .child(self.param_group(
-                "字幕输出格式",
-                OUTPUT_FORMAT_CHOICES.to_vec(),
-                fmt_sel,
-                |this, sel, cx| {
-                    this.state.output_format = sel.to_string();
-                    // 同上：不落盘的话，重启后配置里的旧格式会把这次选择覆盖掉
-                    this.state.config.pipeline.output_format = sel.to_string();
-                    this.state.persist_config();
-                    cx.notify();
-                },
-                cx,
-            ))
-            // 逐词卡拉OK高亮：只影响 ASS 原文行的逐词点亮（`{\kfN}`），放在「字幕输出格式」
-            // 之后——格式选 ASS 才有它，两个控件是同一件事的两面。默认开启；没有词级数据
-            // 的老工程一个标签都不会插，导出结果与关闭时逐字节一致。
-            .child(self.param_group(
-                "逐词卡拉OK高亮",
-                vec![("on", "开启"), ("off", "关闭")],
-                karaoke_sel,
-                |this, sel, cx| {
-                    this.state.config.subtitle_style.karaoke_word_highlight = sel == "on";
-                    // 与样式面板同源：样式类改动一律走 save_subtitle_style（落盘 + 同步给管线），
-                    // 否则重启后配置里的旧值会把这次选择覆盖掉。
-                    this.state.save_subtitle_style();
                     cx.notify();
                 },
                 cx,

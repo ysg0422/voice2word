@@ -495,10 +495,9 @@ impl MainWindow {
                         }
                     };
 
-                    // 转写质检摘要 (P1-9)：只在「工作区当前载入的字幕就是这张卡片对应的媒体」时展示。
-                    // 用户刚挑了一个还没转写的新文件时 `transcribe_file` 已换成新路径，而
-                    // `segments` 里还是上一支片子的结果——拿它算质检等于把上一支的问题挂到新文件头上。
-                    let quality_card = if self.state.selected_file.as_ref() == self.state.transcribe_file.as_ref() {
+                    // 转写质检摘要 (P1-9)：仅在用户手动展开且「工作区当前载入的字幕就是这张卡片对应的媒体」时展示。
+                    // 默认折叠以保持就绪卡片极简清爽、避免信息过载。
+                    let quality_card = if self.ready_qc_open && self.state.selected_file.as_ref() == self.state.transcribe_file.as_ref() {
                         self.render_quality_summary(cx)
                     } else {
                         None
@@ -593,10 +592,8 @@ impl MainWindow {
                                                 .child(format!("命中本地转写缓存（含 {} 句字幕）", cached.segments.len())),
                                         )
                                 }))
-                                // 转写质检摘要（已在卡片上方算好；无字幕时为 None）
-                                .children(quality_card)
                                 // 核心操作按钮组：主行动 Lg/Primary，其余 Lg/Secondary，
-                                // 按钮骨架（高度 / 内边距 / 文字色）交给 btn 原语统一
+                                // 放置在缓存提示下方正中，保持视觉聚焦与极简动线
                                 .child(
                                     div()
                                         .flex()
@@ -643,7 +640,35 @@ impl MainWindow {
                                                     .into_any_element(),
                                             ]
                                         }),
-                                ),
+                                )
+                                // 可选质检折叠入口：仅在有对应字幕时展示，默认折叠不扰民
+                                .children(if self.state.selected_file.as_ref() == self.state.transcribe_file.as_ref() && !self.state.segments.is_empty() {
+                                    let is_open = self.ready_qc_open;
+                                    Some(
+                                        div()
+                                            .mt(px(Theme::SPACE_1))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                primitives::btn(
+                                                    if is_open { "收起转写质检与修复 ▲" } else { "查看转写质检与修复 (可选) ▾" },
+                                                    primitives::BtnSize::Sm,
+                                                    primitives::BtnVariant::Ghost,
+                                                )
+                                                .id("ready-qc-toggle-btn")
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.ready_qc_open = !this.ready_qc_open;
+                                                    cx.notify();
+                                                }))
+                                            )
+                                    )
+                                } else {
+                                    None
+                                })
+                                // 转写质检与修复面板（仅展开时显示）
+                                .children(quality_card),
                         )
                         .into_any_element()
                 } else if !self.state.batch_queue.is_empty() {

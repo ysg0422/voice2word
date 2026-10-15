@@ -589,6 +589,8 @@ pub struct MainWindow {
     /// 术语表编辑的最近状态提示（打开文件 / 应用结果）。`None` 表示没操作过。
     pub(crate) glossary_status: Option<String>,
     pub(crate) is_export_dropdown_open: bool,
+    /// 转写就绪卡片中是否展开转写质检与常见错误修复面板（默认折叠，保持就绪卡片极简清爽）
+    pub(crate) ready_qc_open: bool,
     /// 样式面板「文字描边」下拉是否展开
     pub(crate) outline_dropdown_open: bool,
     /// 样式面板「背景底框」下拉是否展开
@@ -1505,6 +1507,7 @@ impl MainWindow {
             editor_export_mode: export_mode_initial,
             glossary_status: None,
             is_export_dropdown_open: false,
+            ready_qc_open: false,
             outline_dropdown_open: false,
             bg_style_dropdown_open: false,
             preview_box_w: preview_box_w_initial,
