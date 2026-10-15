@@ -98,12 +98,16 @@ fn thread_presets(current: u32, cores: u32) -> Vec<u32> {
 /// 只放顺序，不放任何说明文字或元数据：卡片上**只显示模型名**（外加「当前」「已下载/
 /// 需下载」两个状态徽标）。定位句、星级、体积这些附加信息都按用户要求去掉了——体积
 /// 在下单的地方（「模型与组件」）逐项都写着，选型不缺这一处。
-const TIER_ORDER: [WhisperModelTier; 5] = [
+#[allow(dead_code)]
+const TIER_ORDER: [WhisperModelTier; 8] = [
     WhisperModelTier::SenseVoice,
-    WhisperModelTier::Fast,
-    WhisperModelTier::Balanced,
     WhisperModelTier::TurboSpeed,
     WhisperModelTier::Precise,
+    WhisperModelTier::LargeV3,
+    WhisperModelTier::Medium,
+    WhisperModelTier::Balanced,
+    WhisperModelTier::Fast,
+    WhisperModelTier::Tiny,
 ];
 
 /// 档位状态徽标文案：下载中 > 已下载 > 需下载。
@@ -579,21 +583,70 @@ impl MainWindow {
         )
     }
 
-    /// 「识别引擎」卡片：五档全部列出，没下载过的档位也可见（灰态 + 「需下载」徽标）。
-    ///
-    /// 老逻辑只列已下载档位，还会在**渲染过程中**把用户选中的档位悄悄改成「第一个
-    /// 已就位」的那档——用户只是点开抽屉看一眼，配置就被写脏了。现在改成如实显示
-    /// 「需下载」并在行内给下载入口：真正拦住开始转写的是开工守卫
-    /// （`MainWindow::missing_engine_reason`），一句明确提示比偷偷换档可操作得多。
+    /// 「识别引擎」卡片：动态根据本地实际已下载的模型呈现选项（用户下载啥了就显示啥）。
     fn render_engine_card(&mut self, cx: &mut Context<Self>) -> Div {
+        let installed = WhisperModelTier::available_installed_tiers();
         let mut cards = div().flex().flex_col().gap(px(Theme::SPACE_1_5));
-        for (index, tier) in TIER_ORDER.into_iter().enumerate() {
-            cards = cards.child(self.tier_card(index, tier, cx));
+
+        if !installed.is_empty() {
+            // 用户下载了什么模型，这里就只显示什么模型！
+            for (index, tier) in installed.iter().copied().enumerate() {
+                cards = cards.child(self.tier_card(index, tier, cx));
+            }
+        } else {
+            // 本地尚无已下载模型时，给出清爽的引导
+            cards = cards.child(
+                div()
+                    .p(px(Theme::SPACE_3))
+                    .bg(Theme::bg_inset())
+                    .rounded_md()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(Theme::SPACE_2))
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_BODY))
+                            .text_color(Theme::text_secondary())
+                            .child("尚未检测到已下载模型"),
+                    )
+                    .child(
+                        primitives::btn(
+                            "前往「模型与组件」下载",
+                            primitives::BtnSize::Sm,
+                            primitives::BtnVariant::Primary,
+                        )
+                        .id("goto-model-manager-btn")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state.active_tab = WorkspaceTab::Performance;
+                            cx.notify();
+                        })),
+                    ),
+            );
         }
 
         primitives::card_sm()
             .gap(px(Theme::SPACE_2))
-            .child(primitives::section_title("识别引擎"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(primitives::section_title("识别引擎（已就位）"))
+                    .child(
+                        div()
+                            .id("goto-model-manager-link")
+                            .cursor_pointer()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::accent_blue())
+                            .hover(|s| s.text_color(Theme::accent_primary()))
+                            .child("+ 管理/下载更多")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.active_tab = WorkspaceTab::Performance;
+                                cx.notify();
+                            })),
+                    ),
+            )
             .child(cards)
     }
 

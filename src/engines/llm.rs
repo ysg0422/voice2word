@@ -1647,14 +1647,17 @@ impl LLMEngine {
         //
         // 这里也做一次判定（不只是引擎构造处的 `TranslateEngine`），因为
         // `LLMEngine::translate` 是公开入口：短路判定必须落在最终执行的地方。
-        if let Some(variant) = chinese_variant_target(target_lang) {
-            return convert_chinese_variant(
-                segments,
-                target_lang,
-                variant,
-                progress_cb,
-                &self.cancel_flag(),
-            );
+        // 必须源语言也是中文时才短路；外语目标为中文时必须调用 LLM 翻译。
+        if crate::subtitle::is_source_chinese(&segments) {
+            if let Some(variant) = chinese_variant_target(target_lang) {
+                return convert_chinese_variant(
+                    segments,
+                    target_lang,
+                    variant,
+                    progress_cb,
+                    &self.cancel_flag(),
+                );
+            }
         }
         // 同 polish：模型/程序缺失时 fail-fast，避免「翻译完成 0 句」的假成功。
         self.ensure_ready()?;

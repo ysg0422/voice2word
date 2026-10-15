@@ -59,8 +59,8 @@ pub(crate) fn is_item_needed_for_tab(
             }
         }
         ModelManagerTab::Common => {
-            // 公用组件：FFmpeg 媒体流提取、本地翻译大模型及 llama.cpp
-            matches!(item_id, "ffmpeg" | "llama-cpp" | "qwen-llm")
+            // 公用组件：FFmpeg 媒体流提取、FFplay 伴音播放、本地翻译大模型及 llama.cpp
+            matches!(item_id, "ffmpeg" | "ffplay" | "llama-cpp" | "qwen-llm")
         }
     }
 }
@@ -71,8 +71,8 @@ pub fn is_item_needed_by_current_config(item_id: &str, state: &crate::app::AppSt
     let is_sv = state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
 
     match item_id {
-        // 音视频抽音解码：任何模式都需要
-        "ffmpeg" => true,
+        // 音视频抽音解码与伴音播放：任何模式都需要
+        "ffmpeg" | "ffplay" => true,
 
         // GPU 专用的 CUDA 推理程序：435MB 可选深度加速包，不绑架一键补齐
         "whisper-cublas" => false,
@@ -88,7 +88,13 @@ pub fn is_item_needed_by_current_config(item_id: &str, state: &crate::app::AppSt
         "sensevoice-model" | "sensevoice-tokens" | "sensevoice-vad" => is_sv,
 
         // Whisper 模型档位与 Silero VAD：选择 Whisper 模式时需要
-        "whisper-small" | "whisper-base" | "whisper-turbo-q5" | "whisper-turbo-q8"
+        "whisper-tiny"
+        | "whisper-base"
+        | "whisper-small"
+        | "whisper-medium"
+        | "whisper-turbo-q5"
+        | "whisper-turbo-q8"
+        | "whisper-large-v3"
         | "silero-vad" => {
             if is_sv {
                 false
@@ -97,7 +103,7 @@ pub fn is_item_needed_by_current_config(item_id: &str, state: &crate::app::AppSt
             } else if let Some(current_id) = state.whisper_model_tier.download_item_id() {
                 item_id == current_id
             } else {
-                item_id == "whisper-small"
+                item_id == "whisper-turbo-q5"
             }
         }
 
@@ -474,12 +480,15 @@ impl MainWindow {
             }],
             ModelManagerTab::Whisper => vec![
                 ModelCategory {
-                    title: "Whisper 识别模型库",
+                    title: "Whisper 识别模型库（全系可选）",
                     item_ids: &[
                         "whisper-turbo-q5",
                         "whisper-turbo-q8",
+                        "whisper-large-v3",
+                        "whisper-medium",
                         "whisper-small",
                         "whisper-base",
+                        "whisper-tiny",
                         "silero-vad",
                         "punc-model",
                     ],
@@ -491,8 +500,8 @@ impl MainWindow {
             ],
             ModelManagerTab::Common => vec![
                 ModelCategory {
-                    title: "音视频解码（FFmpeg）",
-                    item_ids: &["ffmpeg"],
+                    title: "音视频解码与伴音播放（FFmpeg / FFplay）",
+                    item_ids: &["ffmpeg", "ffplay"],
                 },
                 ModelCategory {
                     title: "本地大模型翻译与润色引擎",

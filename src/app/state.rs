@@ -170,11 +170,14 @@ pub enum WorkspaceTab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WhisperModelTier {
     SenseVoice, // 阿里 SenseVoice 极速 — model.int8.onnx (非自回归单次出字，极致提速 5~8 倍)
-    Fast,       // 极速 Base — ggml-base.bin (39M 参数)
+    Tiny,       // 尝鲜 Tiny — ggml-tiny.bin (75MB 超轻量)
+    Fast,       // 极速 Base — ggml-base.bin (148MB)
     #[default]
-    Balanced, // 均衡 Small — ggml-small.bin (244M 参数)
-    TurboSpeed, // 极速 Turbo — ggml-large-v3-turbo-q5_0.bin (Q5 破带宽版，提速 25%~30%)
-    Precise,    // 高精 Turbo — ggml-large-v3-turbo-q8_0.bin (Q8 旗舰版，抗口音吞音)
+    Balanced,   // 均衡 Small — ggml-small.bin / ggml-small-q5_0.bin (181MB)
+    Medium,     // 进阶 Medium — ggml-medium.bin (1.5GB)
+    TurboSpeed, // 极速 Turbo — ggml-large-v3-turbo-q5_0.bin (547MB)
+    Precise,    // 高精 Turbo — ggml-large-v3-turbo-q8_0.bin (833MB)
+    LargeV3,    // 全尺寸旗舰 — ggml-large-v3.bin (3.1GB 完整版)
 }
 
 /// 润色模式：CT-Punc 极速标点恢复 vs Qwen 大模型深度润色
@@ -207,51 +210,64 @@ impl WhisperModelTier {
         let name = path.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
         match name.as_str() {
             "model.int8.onnx" => Some(Self::SenseVoice),
+            "ggml-tiny.bin" => Some(Self::Tiny),
             "ggml-base.bin" => Some(Self::Fast),
             "ggml-small.bin" | "ggml-small-q5_0.bin" => Some(Self::Balanced),
+            "ggml-medium.bin" => Some(Self::Medium),
             "ggml-large-v3-turbo-q5_0.bin" => Some(Self::TurboSpeed),
             "ggml-large-v3-turbo-q8_0.bin" => Some(Self::Precise),
+            "ggml-large-v3.bin" => Some(Self::LargeV3),
             _ => None,
         }
     }
 
-    /// Whisper 四档（不含 SenseVoice）：档位下拉菜单的遍历来源。
-    ///
-    /// 顺序即界面顺序：从最省资源到最准，用户从上往下读就是「越来越准、越来越慢」。
-    pub const WHISPER_TIERS: [Self; 4] =
-        [Self::Fast, Self::Balanced, Self::TurboSpeed, Self::Precise];
+    /// Whisper 纯 Whisper 档位（不含 SenseVoice）：按速度与精度排列。
+    pub const WHISPER_TIERS: [Self; 7] = [
+        Self::Tiny,
+        Self::Fast,
+        Self::Balanced,
+        Self::Medium,
+        Self::TurboSpeed,
+        Self::Precise,
+        Self::LargeV3,
+    ];
+
+    /// 全部受支持的引擎档位（含 SenseVoice），用于动态过滤已就位模型。
+    pub const ALL_TIERS: [Self; 8] = [
+        Self::SenseVoice,
+        Self::TurboSpeed,
+        Self::Precise,
+        Self::LargeV3,
+        Self::Medium,
+        Self::Balanced,
+        Self::Fast,
+        Self::Tiny,
+    ];
+
+    /// 返回本地当前所有已经下载就绪的引擎档位列表
+    pub fn available_installed_tiers() -> Vec<Self> {
+        Self::ALL_TIERS
+            .into_iter()
+            .filter(|tier| tier.installed_path().is_some())
+            .collect()
+    }
 
     /// 该档位对应的**可下载组件 id**（`utils::model_download::ITEMS` 里的 id）。
-    ///
-    /// 档位下拉里的「下载 / 删除」要落到具体的 `DownloadItem` 上，而 id 是那份清单的
-    /// 唯一键。SenseVoice 不在此列：它由 `sensevoice-*` 三条目（模型 / 词表 / VAD）
-    /// 共同构成，不是「一个档位 = 一个文件」，因此返回 `None`——调用方据此不渲染
-    /// 单文件的下载/删除按钮，避免只删掉模型却留下悬空的词表引用。
     pub fn download_item_id(self) -> Option<&'static str> {
         match self {
             Self::SenseVoice => None,
+            Self::Tiny => Some("whisper-tiny"),
             Self::Fast => Some("whisper-base"),
             Self::Balanced => Some("whisper-small"),
+            Self::Medium => Some("whisper-medium"),
             Self::TurboSpeed => Some("whisper-turbo-q5"),
             Self::Precise => Some("whisper-turbo-q8"),
+            Self::LargeV3 => Some("whisper-large-v3"),
         }
     }
 
     /// 该档位**现在可用**的模型文件绝对路径；文件不在则 `None`。
-    ///
-    /// 语义刻意与 [`Self::model_relative_path`] 对齐（直接复用它）：界面上的
-    /// 「已就位 / 未下载」必须与「点开始转写后管线真正会加载的那个文件」同结论，
-    /// 否则会出现最气人的那种不一致——界面说未下载、其实跑得起来，或界面说已就位、
-    /// 一点却报「模型加载失败」。因此档位内的量化回退（Small 的 q5_0→ggml-small、
-    /// Turbo 的 q5→q8）在这里同样生效。
-    ///
-    /// **不**看 `paths.whisper_model`：那个字段表达的是「管线默认加载谁」，与
-    /// 「这一档下没下过」无关——若跟着它走，用户把配置指到 Turbo Q8 后，四个档位
-    /// 会一起显示「已就位」。
     pub fn installed_path(self) -> Option<std::path::PathBuf> {
-        // 直接复用 `model_relative_path()`（含档位内量化回退），保证界面的
-        // 「已就位」与管线真正会加载的文件同结论；**不**看 `paths.whisper_model`
-        // ——那个字段表达「管线默认加载谁」，与「这一档下没下过」无关。
         let p = AppConfig::resolve_path(&self.model_relative_path());
         p.is_file().then_some(p)
     }
@@ -260,10 +276,13 @@ impl WhisperModelTier {
     pub fn label(self) -> &'static str {
         match self {
             Self::SenseVoice => "SenseVoice 极速",
+            Self::Tiny => "Whisper Tiny",
             Self::Fast => "Whisper Base",
             Self::Balanced => "Whisper Small-Q5",
+            Self::Medium => "Whisper Medium",
             Self::TurboSpeed => "Whisper Turbo Q5",
             Self::Precise => "Whisper Turbo Q8",
+            Self::LargeV3 => "Whisper Large-V3",
         }
     }
 
@@ -271,17 +290,21 @@ impl WhisperModelTier {
     pub fn model_filename(self) -> &'static str {
         match self {
             Self::SenseVoice => "model.int8.onnx",
+            Self::Tiny => "ggml-tiny.bin",
             Self::Fast => "ggml-base.bin",
             Self::Balanced => "ggml-small-q5_0.bin",
+            Self::Medium => "ggml-medium.bin",
             Self::TurboSpeed => "ggml-large-v3-turbo-q5_0.bin",
             Self::Precise => "ggml-large-v3-turbo-q8_0.bin",
+            Self::LargeV3 => "ggml-large-v3.bin",
         }
     }
 
-    /// 返回相对路径（如果 TurboSpeed 本地未下载完成，自动平滑回退至 Q8）
+    /// 返回相对路径（如果 TurboSpeed 本地未下载完成，自动平滑回退至 Q8 或 Large-V3）
     pub fn model_relative_path(self) -> String {
         match self {
             Self::SenseVoice => "models/sensevoice/model.int8.onnx".to_string(),
+            Self::Tiny => "models/whisper/ggml-tiny.bin".to_string(),
             Self::Fast => "models/whisper/ggml-base.bin".to_string(),
             Self::Balanced => {
                 let preferred = "models/whisper/ggml-small-q5_0.bin".to_string();
@@ -291,29 +314,38 @@ impl WhisperModelTier {
                     "models/whisper/ggml-small.bin".to_string()
                 }
             }
+            Self::Medium => "models/whisper/ggml-medium.bin".to_string(),
             Self::TurboSpeed => {
                 let preferred = "models/whisper/ggml-large-v3-turbo-q5_0.bin".to_string();
                 if !crate::utils::AppConfig::resolve_path(&preferred).exists() {
-                    "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string()
+                    if crate::utils::AppConfig::resolve_path("models/whisper/ggml-large-v3-turbo-q8_0.bin").exists() {
+                        "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string()
+                    } else if crate::utils::AppConfig::resolve_path("models/whisper/ggml-large-v3.bin").exists() {
+                        "models/whisper/ggml-large-v3.bin".to_string()
+                    } else {
+                        preferred
+                    }
                 } else {
                     preferred
                 }
             }
             Self::Precise => "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string(),
+            Self::LargeV3 => "models/whisper/ggml-large-v3.bin".to_string(),
         }
     }
+
 
     /// CPU 下相对视频时长的转写耗时系数（校准自 32 分钟样片）。
     fn cpu_realtime_factor(self) -> f64 {
         match self {
-            // SenseVoice 实测：32 分钟样片约 134 秒（8 线程）。
-            // 旧值 0.4/32 来自早期预估，实际偏低 5.5 倍，会把「预计耗时」
-            // 显示成 24 秒而用户要等 2 分多钟，属于误导，故按实测重标。
             Self::SenseVoice => 2.4 / 32.0,
+            Self::Tiny => 0.8 / 32.0,
             Self::Fast => 1.5 / 32.0,
-            Self::Balanced => 3.8 / 32.0, // Small-Q5 CPU 16 线程约 2.8 分钟/32 分钟样片
-            Self::TurboSpeed => 5.6 / 32.0, // Q5 降低内存带宽传输，提速约 30%
+            Self::Balanced => 3.8 / 32.0,
+            Self::Medium => 6.5 / 32.0,
+            Self::TurboSpeed => 5.6 / 32.0,
             Self::Precise => 8.0 / 32.0,
+            Self::LargeV3 => 11.0 / 32.0,
         }
     }
 
@@ -361,13 +393,14 @@ impl WhisperModelTier {
     /// `HardwareProfile::is_discrete` 分流，届时补独显档位数据即可。
     fn gpu_speedup_ratio(self) -> f64 {
         match self {
-            // SenseVoice 是 ONNX 引擎、不走此分支；给个中性值避免误导。
             Self::SenseVoice => 1.0,
+            Self::Tiny => 0.70,
             Self::Fast => 0.585,
             Self::Balanced => 0.412,
+            Self::Medium => 0.30,
             Self::TurboSpeed => 0.199,
-            // 高精 Turbo Q8 未单独实测，与 Q5 同为大模型，沿用同一比值。
             Self::Precise => 0.199,
+            Self::LargeV3 => 0.180,
         }
     }
 

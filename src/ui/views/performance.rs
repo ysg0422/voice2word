@@ -99,10 +99,13 @@ pub(crate) fn tier_menu_desc(tier: crate::app::WhisperModelTier) -> &'static str
     use crate::app::WhisperModelTier as T;
     match tier {
         T::SenseVoice => "极速识别，SenseVoice 档下不参与选择",
+        T::Tiny => "轻量 · 75M 参数 · 超快秒级响应",
         T::Fast => "最快 · 39M 参数 · 低配机器首选",
         T::Balanced => "均衡 · 244M 参数 · CPU 友好，出厂默认",
+        T::Medium => "进阶 · 769M 参数 · 介于 Small 与 Large 之间",
         T::TurboSpeed => "较准 · 提速 25%~30% · 综合推荐",
-        T::Precise => "最准 · 抗口音吞音 · 旗舰精度，最慢",
+        T::Precise => "高精 · 抗口音吞音 · Q8 旗舰精度",
+        T::LargeV3 => "旗舰 · 1550M 参数 · 3.1GB 全尺寸原版，最强抗噪",
     }
 }
 

@@ -97,6 +97,17 @@ jobs:
           Copy-Item target/release/voice2word.exe dist/voice2word.exe -Force
           Copy-Item target/release/voice2word-cli.exe dist/voice2word-cli.exe -Force
 
+          # 确保 tools 目录存在并预先抓取 ffmpeg.exe 与 ffplay.exe 打包入安装包
+          New-Item -ItemType Directory -Path tools -Force | Out-Null
+          if (-not (Test-Path tools/ffmpeg.exe)) {
+            Write-Host "Downloading ffmpeg.exe for installer..." -ForegroundColor Cyan
+            Invoke-WebRequest -Uri "https://hf-mirror.com/lj1995/VoiceConversionWebUI/resolve/main/ffmpeg.exe" -OutFile tools/ffmpeg.exe -TimeoutSec 60
+          }
+          if (-not (Test-Path tools/ffplay.exe)) {
+            Write-Host "Downloading ffplay.exe for installer..." -ForegroundColor Cyan
+            Invoke-WebRequest -Uri "https://hf-mirror.com/lj1995/VoiceConversionWebUI/resolve/main/ffplay.exe" -OutFile tools/ffplay.exe -TimeoutSec 60
+          }
+
           Write-Host "Compiling Inno Setup Script..." -ForegroundColor Cyan
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion="$version" installer/voice2word.iss
 

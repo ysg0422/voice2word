@@ -461,17 +461,7 @@ impl MainWindow {
                     let has_dur = self.state.transcribe_duration > 0.0;
                     let cached_opt = self.state.get_cached_transcription();
 
-                    let tier_name = if is_sensevoice {
-                        "SenseVoice 极速"
-                    } else {
-                        match self.state.whisper_model_tier {
-                            crate::app::WhisperModelTier::Fast => "Whisper Base",
-                            crate::app::WhisperModelTier::Balanced => "Whisper Small-Q5",
-                            crate::app::WhisperModelTier::TurboSpeed => "Whisper Turbo Q5",
-                            crate::app::WhisperModelTier::Precise => "Whisper Turbo Q8",
-                            _ => "Whisper",
-                        }
-                    };
+                    let tier_name = self.state.whisper_model_tier.label();
 
                     // 转写质检摘要 (P1-9)：仅在用户手动展开且「工作区当前载入的字幕就是这张卡片对应的媒体」时展示。
                     // 默认折叠以保持就绪卡片极简清爽、避免信息过载。

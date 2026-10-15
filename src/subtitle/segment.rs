@@ -139,7 +139,19 @@ impl Segment {
             self.translation.as_deref(),
             self.translation_lang.as_deref(),
         ) {
-            (Some(text), Some(lang)) => !text.trim().is_empty() && lang == target_lang,
+            (Some(text), Some(lang)) => {
+                if text.trim().is_empty() || lang != target_lang {
+                    return false;
+                }
+                // 防脏数据兜底：如果目标语言是中文（简体/繁体），但译文中包含日文假名或韩文，
+                // 绝不可能是有效的中文译文（必定是此前短路 Bug 污染或复制了外语原文），必须判为未匹配。
+                if (target_lang.contains('中') || target_lang.starts_with("zh"))
+                    && contains_kana_or_hangul(text)
+                {
+                    return false;
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -633,6 +645,78 @@ pub fn export_text_for(seg: &Segment, mode: ExportMode, with_speaker: bool) -> S
     } else {
         seg.export_text(mode)
     }
+}
+
+/// 是否包含日文假名（平假名 / 片假名 / 片假名音标扩展）
+pub fn contains_japanese_kana(s: &str) -> bool {
+    s.chars().any(|c| matches!(c as u32, 0x3040..=0x309F | 0x30A0..=0x30FF | 0x31F0..=0x31FF))
+}
+
+/// 是否包含韩文（谚文字母 / 谚文音节）
+pub fn contains_korean_hangul(s: &str) -> bool {
+    s.chars().any(|c| matches!(c as u32, 0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F))
+}
+
+/// 是否包含假名或韩文（常用于检测目标语言为中文时是否被原样复制或错转）
+pub fn contains_kana_or_hangul(s: &str) -> bool {
+    contains_japanese_kana(s) || contains_korean_hangul(s)
+}
+
+/// 判断当前字幕片段的源文本是否为中文。
+///
+/// 只有当源语言是中文时，目标语言为中文变体（简体/繁体）才允许使用 zhconv 进行字面确定性转换。
+/// 若源文本为日语（含假名）、韩语（含谚文）、英语（拉丁文）等外语，必须交由 LLM / 在线 API 进行真正的跨语言翻译！
+pub fn is_source_chinese(segments: &[Segment]) -> bool {
+    if segments.is_empty() {
+        return false;
+    }
+    // 1. 如果有标注语言，检查标注语言
+    let dominant = dominant_language(segments);
+    if let Some(ref lang) = dominant {
+        let l = lang.trim().to_ascii_lowercase();
+        if l == "ja" || l == "en" || l == "ko" || l == "ru" || l == "fr" || l == "de" || l == "es" || l == "it" {
+            return false;
+        }
+        if l.starts_with("zh") || l.starts_with("cmn") || l.starts_with("yue") {
+            // 即便标了 zh，也要检查是否有日文假名或韩文（防止转写模型把外语误标为中文）
+            for seg in segments {
+                if contains_kana_or_hangul(&seg.translate_source()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    // 2. 检查实际文本字符特征
+    let mut total_chars = 0usize;
+    let mut cjk_chars = 0usize;
+    let mut latin_chars = 0usize;
+
+    for seg in segments {
+        let text = seg.translate_source();
+        if contains_kana_or_hangul(&text) {
+            return false;
+        }
+        for c in text.chars() {
+            if c.is_whitespace() || c.is_ascii_punctuation() {
+                continue;
+            }
+            total_chars += 1;
+            if matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FA1F) {
+                cjk_chars += 1;
+            } else if c.is_ascii_alphabetic() {
+                latin_chars += 1;
+            }
+        }
+    }
+
+    if total_chars == 0 || cjk_chars == 0 {
+        return false;
+    }
+
+    // 汉字数量必须多于西文字母，且汉字占比需达到阈值（>= 30%）
+    cjk_chars >= 4 && cjk_chars > latin_chars && (cjk_chars as f64 / total_chars as f64) >= 0.3
 }
 
 /// 智能优化字幕时间轴与消除鬼影/闪烁：
@@ -1669,6 +1753,48 @@ mod tests {
         // 空白译文不算完成
         seg.translation = Some("   ".to_string());
         assert!(!seg.translation_matches("English"));
+
+        // 防脏数据：目标语言为简体中文/繁体中文，但译文里含有日文假名或韩文（如历史短路污染），不应判为已完成
+        seg.translation = Some("こんにちは".to_string());
+        seg.translation_lang = Some("简体中文".to_string());
+        assert!(
+            !seg.translation_matches("简体中文"),
+            "含日文假名的译文即便标了简体中文，也必须判为未完成"
+        );
+        seg.translation = Some("안녕하세요".to_string());
+        assert!(
+            !seg.translation_matches("繁体中文"),
+            "含韩文字母的译文即便标了繁体中文，也必须判为未完成"
+        );
+    }
+
+    #[test]
+    fn is_source_chinese_accuracy() {
+        // 纯中文
+        let zh_segs = vec![Segment::new(1, 0.0, 1.0, "今天的天气真好，我们一起去公园散步吧。")];
+        assert!(is_source_chinese(&zh_segs));
+
+        // 日文（含假名）
+        let ja_segs = vec![Segment::new(1, 0.0, 1.0, "こんにちは、今日はいい天気ですね。")];
+        assert!(!is_source_chinese(&ja_segs));
+
+        // 英文（纯拉丁）
+        let en_segs = vec![Segment::new(1, 0.0, 1.0, "Hello world, this is a test.")];
+        assert!(!is_source_chinese(&en_segs));
+
+        // 韩文
+        let ko_segs = vec![Segment::new(1, 0.0, 1.0, "안녕하세요 여러분.")];
+        assert!(!is_source_chinese(&ko_segs));
+
+        // 显式标了 ja
+        let mut ja_labeled = Segment::new(1, 0.0, 1.0, "東京大学");
+        ja_labeled.language = Some("ja".to_string());
+        assert!(!is_source_chinese(&[ja_labeled]));
+
+        // 显式标了 zh 且文本是汉字
+        let mut zh_labeled = Segment::new(1, 0.0, 1.0, "北京大学");
+        zh_labeled.language = Some("zh".to_string());
+        assert!(is_source_chinese(&[zh_labeled]));
     }
     /// 术语表合规检查：原文含术语但译文未含对应译法 → 标记；已遵守或未带译文 → 不标记。
     #[test]

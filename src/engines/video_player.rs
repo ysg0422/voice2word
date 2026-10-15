@@ -470,6 +470,7 @@ impl VideoPlayerEngine {
             }
         };
 
+        let safe_video = crate::utils::to_cli_safe_path(&video_path);
         if let Some(ref ffplay_bin) = effective_ffplay {
             let mut feeder_cmd = Command::new(&self.ffmpeg_path);
             apply_no_window(&mut feeder_cmd);
@@ -483,7 +484,7 @@ impl VideoPlayerEngine {
                     &start_sec_str,
                     "-i",
                 ])
-                .arg(&video_path)
+                .arg(&safe_video)
                 .args([
                     "-vn",
                     "-sn",
@@ -769,12 +770,13 @@ impl VideoPlayerEngine {
         if hwaccel {
             video_cmd.args(["-hwaccel", "auto"]);
         }
+        let safe_video = crate::utils::to_cli_safe_path(video_path);
         // 先粗略 seek 再打开，暂停续播启动更快。
         video_cmd
             .arg("-ss")
             .arg(start_sec_str)
             .arg("-i")
-            .arg(video_path)
+            .arg(&safe_video)
             .args([
                 "-an",
                 "-sn",

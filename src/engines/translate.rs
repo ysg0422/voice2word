@@ -251,20 +251,17 @@ impl TranslateEngine {
             "开始执行字幕翻译 (目标语言: {}, 引擎: {:?})",
             target_lang, self.mode
         );
-        // P0-A：目标语言是**中文变体**时短路，不走 LLM。
+        // P0-A：目标语言是**中文变体**且源语言也是中文时短路走 zhconv 本地确定性转换，不走 LLM。
         //
-        // 本项目源字幕本来就是中文，而目标清单里含「简体中文 / 繁体中文」。若交给
-        // 小模型，提示词会变成自相矛盾的「源语言为中文；……翻译为地道的繁体中文。」，
-        // 它最省力的输出就是**原样复制**——实测 8/8 句与原文一模一样，界面却显示
-        // 「翻译已完成（8 句）」。中文变体之间是确定性字符映射，用 zhconv 直接转换
-        // 即可（简→繁 / 繁→简），既准确又不花推理时间。
-        //
-        // 例外：目标「简体中文」而源本来就是简体（绝大多数情况）时，转换结果 == 原文。
-        // 这是**正确行为**（中文→简体中文本就该是原文），不是失败，因此这里照常写入
-        // `translation`，不参与「译文==原文」的复制检测。
-        if let Some(variant) = chinese_variant_target(target_lang) {
-            self.store_rewrite_stats(RewriteStats::default());
-            return convert_chinese_variant(segments, target_lang, variant, progress_cb, &cancel);
+        // 关键前提：源字幕必须本身已经是中文！
+        // 若源字幕是日语（含假名）、韩语（含谚文）、英语（拉丁文）等外语，目标语言为中文时
+        // 属于真正的跨语言翻译，绝不能短路到 zhconv（zhconv 对假名与外语毫无反应，
+        // 会把外语原文原封不动吐回，导致 0 毫秒假完成且完全没有翻译）。
+        if crate::subtitle::is_source_chinese(&segments) {
+            if let Some(variant) = chinese_variant_target(target_lang) {
+                self.store_rewrite_stats(RewriteStats::default());
+                return convert_chinese_variant(segments, target_lang, variant, progress_cb, &cancel);
+            }
         }
         match self.mode {
             TranslateMode::OfflineQwen => {
@@ -272,18 +269,18 @@ impl TranslateEngine {
                     .llm_engine
                     .as_ref()
                     .ok_or_else(|| anyhow!("离线翻译引擎未初始化"))?;
-                // P0-A（离线侧）：中文变体目标同样短路——`LLMEngine::translate` 是
-                // 公开入口，可能被直接调用，判定下沉到那里同样成立（见
-                // `LLMEngine::translate` 的短路分支）。
-                if let Some(variant) = chinese_variant_target(target_lang) {
-                    self.store_rewrite_stats(RewriteStats::default());
-                    return convert_chinese_variant(
-                        segments,
-                        target_lang,
-                        variant,
-                        progress_cb,
-                        &cancel,
-                    );
+                // P0-A（离线侧）：源为中文且目标是中文变体时同样短路
+                if crate::subtitle::is_source_chinese(&segments) {
+                    if let Some(variant) = chinese_variant_target(target_lang) {
+                        self.store_rewrite_stats(RewriteStats::default());
+                        return convert_chinese_variant(
+                            segments,
+                            target_lang,
+                            variant,
+                            progress_cb,
+                            &cancel,
+                        );
+                    }
                 }
                 // 取消标志下沉到引擎：润色/翻译都是分批长循环，取消必须能在批次之间生效
                 engine.install_cancel_flag(cancel);
@@ -2780,6 +2777,29 @@ mod tests {
             .translate_subtitles(segs, "繁体中文", None, Arc::new(AtomicBool::new(true)))
             .expect("取消应返回偏序结果");
         assert!(out[0].translation.is_none(), "取消时不该写入译文");
+    }
+
+    /// 日语等外语源文本翻译为「简体中文」时，严禁短路走 zhconv，必须真正请求在线 API。
+    #[test]
+    fn japanese_source_to_chinese_target_does_not_short_circuit_and_calls_api() {
+        let resp = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] 你好，今天天气真好。" } }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![resp]);
+        let cfg = online_cfg_for(&addr);
+
+        let mut seg = Segment::new(1, 0.0, 1.0, "こんにちは、今日はいい天気ですね。");
+        seg.language = Some("ja".to_string());
+        let segs = vec![seg];
+
+        let out = TranslateEngine::online(cfg)
+            .translate_subtitles(segs, "简体中文", None, Arc::new(AtomicBool::new(false)))
+            .expect("日译中应成功走在线 API");
+
+        assert_eq!(seen.lock().unwrap().len(), 1, "日译中必须发送一次在线请求");
+        assert_eq!(out[0].translation.as_deref(), Some("你好，今天天气真好。"));
+        assert_eq!(out[0].translation_lang.as_deref(), Some("简体中文"));
     }
 
     // ─────────── P0-B：译文 == 原文 复制检测（在线链路） ───────────

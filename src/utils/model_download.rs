@@ -267,19 +267,17 @@ pub const ITEMS: &[DownloadItem] = &[
         sha256: Some("9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"),
     },
     DownloadItem {
-        id: "whisper-small",
-        label: "Whisper Small（均衡档）",
-        note: "默认档位；中文精度与速度平衡",
-        dest: "models/whisper/ggml-small-q5_0.bin",
+        id: "whisper-tiny",
+        label: "Whisper Tiny（轻量尝鲜）",
+        note: "75MB 超轻模型，低内存占用与秒级测试",
+        dest: "models/whisper/ggml-tiny.bin",
         urls: &[
-            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-small-q5_1.bin",
-            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-small.bin",
-            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin",
-            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-tiny.bin",
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
         ],
-        size: 181_300_000, // 上游 q5_1；本机若已有 q5_0(175MB) 也应算就位
-        min_size: 160_000_000,
-        required: true,
+        size: 77_700_000,
+        min_size: 70_000_000,
+        required: false,
         group: ItemGroup::Asr,
         is_archive: false,
         companion: None,
@@ -303,13 +301,49 @@ pub const ITEMS: &[DownloadItem] = &[
         sha256: None,
     },
     DownloadItem {
+        id: "whisper-small",
+        label: "Whisper Small（均衡档）",
+        note: "默认档位；中文精度与速度平衡",
+        dest: "models/whisper/ggml-small-q5_0.bin",
+        urls: &[
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-small-q5_1.bin",
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-small.bin",
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin",
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+        ],
+        size: 181_300_000, // 上游 q5_1；本机若已有 q5_0(175MB) 也应算就位
+        min_size: 160_000_000,
+        required: true,
+        group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
+    DownloadItem {
+        id: "whisper-medium",
+        label: "Whisper Medium（进阶档）",
+        note: "1.5GB 进阶模型，介于 Small 与 Large 之间",
+        dest: "models/whisper/ggml-medium.bin",
+        urls: &[
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-medium.bin",
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
+        ],
+        size: 1_530_000_000,
+        min_size: 1_400_000_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
+    DownloadItem {
         id: "whisper-turbo-q5",
         label: "Whisper Turbo Q5（推荐）",
-        note: "大模型量化版，速度与精度兼得",
+        note: "大模型量化版，速度与精度兼得（547MB）",
         dest: "models/whisper/ggml-large-v3-turbo-q5_0.bin",
         urls: &[
-            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3-q5_0.bin",
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3-turbo-q5_0.bin",
         ],
         size: 574_041_195,
         min_size: 500_000_000,
@@ -321,15 +355,32 @@ pub const ITEMS: &[DownloadItem] = &[
     },
     DownloadItem {
         id: "whisper-turbo-q8",
-        label: "Whisper Turbo Q8（最准）",
-        note: "旗舰精度，抗口音与吞音",
+        label: "Whisper Turbo Q8（高精）",
+        note: "旗舰精度量化版，抗口音吞音（833MB）",
         dest: "models/whisper/ggml-large-v3-turbo-q8_0.bin",
         urls: &[
-            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3.bin",
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin",
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3-turbo-q8_0.bin",
         ],
         size: 874_188_075,
         min_size: 800_000_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
+    DownloadItem {
+        id: "whisper-large-v3",
+        label: "Whisper Large-V3（全尺寸旗舰）",
+        note: "3.1GB 原始旗舰全尺寸模型，最强识别与抗噪",
+        dest: "models/whisper/ggml-large-v3.bin",
+        urls: &[
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3.bin",
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
+        ],
+        size: 3_094_000_000,
+        min_size: 3_000_000_000,
         required: false,
         group: ItemGroup::Asr,
         is_archive: false,
@@ -400,6 +451,23 @@ pub const ITEMS: &[DownloadItem] = &[
         // 本机用的正是后者。卡体积会把「已经能用」的 ffmpeg 误判为缺失。
         // 只要求它是个像样的可执行文件即可（几百 KB 起）。
         min_size: 200_000,
+        required: true,
+        group: ItemGroup::Binary,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
+    DownloadItem {
+        id: "ffplay",
+        label: "FFplay（伴音播放器）",
+        note: "内嵌视频播放器的音频同步渲染组件",
+        dest: "tools/ffplay.exe",
+        urls: &[
+            "https://hf-mirror.com/lj1995/VoiceConversionWebUI/resolve/main/ffplay.exe",
+            "https://hf-mirror.com/Politrees/RVC_resources/resolve/main/tools/ffmpeg/ffplay.exe",
+        ],
+        size: 17_850_368,
+        min_size: 1_000_000,
         required: true,
         group: ItemGroup::Binary,
         is_archive: false,
@@ -947,9 +1015,13 @@ fn configured_path_for(item: &DownloadItem, cfg: Option<&AppConfig>) -> Option<P
     let cfg = cfg?;
     let raw: Option<&str> = match item.id {
         "ffmpeg" => Some(cfg.paths.ffmpeg.as_str()),
-        "whisper-small" | "whisper-base" | "whisper-turbo-q5" | "whisper-turbo-q8" => {
-            Some(cfg.paths.whisper_model.as_str())
-        }
+        "whisper-tiny"
+        | "whisper-base"
+        | "whisper-small"
+        | "whisper-medium"
+        | "whisper-turbo-q5"
+        | "whisper-turbo-q8"
+        | "whisper-large-v3" => Some(cfg.paths.whisper_model.as_str()),
         "silero-vad" => cfg.paths.vad_model.as_deref(),
         "punc-model" => cfg.paths.punc_model.as_deref(),
         "sensevoice-model" => cfg.paths.sensevoice_model.as_deref(),
@@ -979,7 +1051,13 @@ fn configured_path_for(item: &DownloadItem, cfg: Option<&AppConfig>) -> Option<P
     // 档位也判成已就位（例如配的是 small，却因为磁盘上有 turbo 就认为 small 在）。
     if matches!(
         item.id,
-        "whisper-small" | "whisper-base" | "whisper-turbo-q5" | "whisper-turbo-q8"
+        "whisper-tiny"
+            | "whisper-base"
+            | "whisper-small"
+            | "whisper-medium"
+            | "whisper-turbo-q5"
+            | "whisper-turbo-q8"
+            | "whisper-large-v3"
     ) {
         let configured_name = raw
             .map(|p| {
@@ -997,10 +1075,13 @@ fn configured_path_for(item: &DownloadItem, cfg: Option<&AppConfig>) -> Option<P
             .to_ascii_lowercase();
         // small-q5_0 与 small-q5_1 视为同一档（本地量化版本号差异）
         let same_tier = configured_name == item_name
+            || (configured_name.starts_with("ggml-tiny") && item_name.starts_with("ggml-tiny"))
             || (configured_name.starts_with("ggml-small") && item_name.starts_with("ggml-small"))
             || (configured_name.starts_with("ggml-base") && item_name.starts_with("ggml-base"))
+            || (configured_name.starts_with("ggml-medium") && item_name.starts_with("ggml-medium"))
             || (configured_name.contains("turbo-q5") && item_name.contains("turbo-q5"))
-            || (configured_name.contains("turbo-q8") && item_name.contains("turbo-q8"));
+            || (configured_name.contains("turbo-q8") && item_name.contains("turbo-q8"))
+            || (configured_name == "ggml-large-v3.bin" && item_name == "ggml-large-v3.bin");
         if !same_tier {
             return None;
         }

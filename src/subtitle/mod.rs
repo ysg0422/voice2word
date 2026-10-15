@@ -23,7 +23,8 @@ pub use qc::{
     PunctuationPlan,
 };
 pub use segment::{
-    dominant_language, glossary_violations, indices_cover_segments, language_name, matched_indices,
+    contains_japanese_kana, contains_kana_or_hangul, contains_korean_hangul, dominant_language,
+    glossary_violations, indices_cover_segments, is_source_chinese, language_name, matched_indices,
     next_issue_in, optimize_segments, plan_time_edit, split_long_segments, ExportMode,
     QualityCategory, Segment, TimeEdit, MIN_EDIT_DUR, MIN_SEGMENT_DUR,
 };

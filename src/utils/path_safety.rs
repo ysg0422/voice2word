@@ -40,11 +40,32 @@ pub fn to_cli_safe_path(path: &Path) -> PathBuf {
             }
         }
 
-        // 2. 如果短路径依然包含非 ASCII，尝试在安全临时目录创建硬链接 (仅适用于普通文件)
+        // 2. 尝试在同驱动器根目录创建纯 ASCII 硬链接别名 (同驱动器 0 拷贝，仅适用于文件)
         if normalized.is_file() {
             if let Some(alias) = create_safe_file_alias(&normalized) {
                 debug!(original = ?normalized, alias = ?alias, "路径已创建纯 ASCII 安全文件硬链接别名");
                 return alias;
+            }
+        }
+
+        // 3. 尝试使用虚拟驱动器映射（DefineDosDeviceW，将包含中文的父目录映射为纯 ASCII 盘符如 Z:\）
+        if let Some(parent) = normalized.parent() {
+            if let Some(file_name) = normalized.file_name() {
+                if let Some(mapped_root) = map_directory_to_dos_device(parent) {
+                    let safe_mapped = mapped_root.join(file_name);
+                    if safe_mapped.exists() {
+                        debug!(original = ?normalized, mapped = ?safe_mapped, "路径已通过虚拟驱动器映射转换为纯 ASCII 路径");
+                        return safe_mapped;
+                    }
+                }
+            }
+        }
+
+        // 4. 终极兜底：复制到 safe_temp_dir()（对于模型等大文件，首次耗时 1 秒复制也比子进程崩溃强一万倍）
+        if normalized.is_file() {
+            if let Some(copied) = copy_to_safe_temp(&normalized) {
+                debug!(original = ?normalized, copied = ?copied, "路径已安全缓存复制到纯 ASCII 临时目录");
+                return copied;
             }
         }
     }
@@ -152,7 +173,12 @@ fn create_safe_file_alias(src: &Path) -> Option<PathBuf> {
         if std::fs::create_dir_all(&alias_dir).is_ok() {
             let alias = alias_dir.join(format!("m_{:x}.{}", hash, ext));
             if alias.exists() {
-                return Some(alias);
+                if let (Ok(m1), Ok(m2)) = (src.metadata(), alias.metadata()) {
+                    if m1.len() == m2.len() {
+                        return Some(alias);
+                    }
+                }
+                let _ = std::fs::remove_file(&alias);
             }
             if std::fs::hard_link(src, &alias).is_ok() {
                 return Some(alias);
@@ -160,17 +186,73 @@ fn create_safe_file_alias(src: &Path) -> Option<PathBuf> {
         }
     }
 
-    // 回退策略：对于小于等于 128MB 的文件（如音频 wav 输入文件），直接安全复制到纯英文 safe_temp_dir
-    if let Ok(meta) = src.metadata() {
-        if meta.len() <= 128 * 1024 * 1024 {
-            let temp_dest = safe_temp_dir().join(format!("v2w_safe_{:x}.{}", hash, ext));
-            if temp_dest.exists() {
-                return Some(temp_dest);
+    None
+}
+
+#[cfg(windows)]
+fn map_directory_to_dos_device(dir: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::sync::{Mutex, OnceLock};
+
+    static MAPPED_DRIVES: OnceLock<Mutex<std::collections::HashMap<PathBuf, char>>> =
+        OnceLock::new();
+    let drives_map = MAPPED_DRIVES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+
+    let dir_buf = dir.to_path_buf();
+    let mut mapped = drives_map.lock().unwrap();
+    if let Some(&drive_letter) = mapped.get(&dir_buf) {
+        return Some(PathBuf::from(format!("{}:\\", drive_letter)));
+    }
+
+    extern "system" {
+        fn DefineDosDeviceW(dwFlags: u32, lpDeviceName: *const u16, lpTargetPath: *const u16) -> i32;
+        fn GetLogicalDrives() -> u32;
+    }
+
+    let drives_mask = unsafe { GetLogicalDrives() };
+    // 从 Z 倒序向 D 寻找空闲盘符（跳过 A, B, C）
+    for i in (3..26).rev() {
+        if (drives_mask & (1 << i)) == 0 {
+            let letter = (b'A' + i as u8) as char;
+            if mapped.values().any(|&c| c == letter) {
+                continue;
             }
-            if std::fs::copy(src, &temp_dest).is_ok() {
+            let dev_name: Vec<u16> = format!("{}:", letter).encode_utf16().chain(Some(0)).collect();
+            let target_path: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+            let res = unsafe { DefineDosDeviceW(0, dev_name.as_ptr(), target_path.as_ptr()) };
+            if res != 0 {
+                mapped.insert(dir_buf, letter);
+                return Some(PathBuf::from(format!("{}:\\", letter)));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn copy_to_safe_temp(src: &Path) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    src.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin");
+
+    let temp_dest = safe_temp_dir().join(format!("v2w_safe_{:x}.{}", hash, ext));
+    if temp_dest.exists() {
+        if let (Ok(m1), Ok(m2)) = (src.metadata(), temp_dest.metadata()) {
+            if m1.len() == m2.len() {
                 return Some(temp_dest);
             }
         }
+        let _ = std::fs::remove_file(&temp_dest);
+    }
+
+    if std::fs::copy(src, &temp_dest).is_ok() {
+        return Some(temp_dest);
     }
 
     None

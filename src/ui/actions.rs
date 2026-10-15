@@ -3927,6 +3927,11 @@ impl MainWindow {
                         // `merge_translations` 只把译文按 index 并回去，原文/时间
                         // 等用户改动原样保留。
                         this.state.merge_translations(translated_segs);
+                        // 译出新译文后，若当前处于「仅原文」模式，自动切为「双语对照」，
+                        // 让用户一眼在监视器画面与导出栏看到刚刚译出的目标语言。
+                        if done > 0 && this.editor_export_mode == crate::subtitle::ExportMode::RawOnly {
+                            this.editor_export_mode = crate::subtitle::ExportMode::Bilingual;
+                        }
                         // 译文必须落库，否则重启后历史库里的双语对照会凭空消失
                         this.state.segments_dirty = true;
                         this.state.flush_segments_if_dirty();
