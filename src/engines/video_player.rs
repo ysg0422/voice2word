@@ -100,6 +100,38 @@ impl std::fmt::Display for PlaybackFailure {
     }
 }
 
+/// 自动探测并解析可用的 ffplay.exe 伴音播放器路径：
+/// 1. 与配置中的 ffmpeg 处于同级目录（例如 tools/ffplay.exe 或自定义 bin 目录）；
+/// 2. 程序相对根目录的 tools/ffplay.exe；
+/// 3. 系统全局 PATH 环境变量包含的任何目录。
+pub fn resolve_ffplay_path(ffmpeg: &Path) -> PathBuf {
+    let sibling = ffmpeg.with_file_name("ffplay.exe");
+    if sibling.is_file() {
+        return sibling;
+    }
+    let sibling_raw = ffmpeg.with_file_name("ffplay");
+    if sibling_raw.is_file() {
+        return sibling_raw;
+    }
+    let tools_ffplay = crate::utils::AppConfig::resolve_path("tools/ffplay.exe");
+    if tools_ffplay.is_file() {
+        return tools_ffplay;
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let p1 = dir.join("ffplay.exe");
+            if p1.is_file() {
+                return p1;
+            }
+            let p2 = dir.join("ffplay");
+            if p2.is_file() {
+                return p2;
+            }
+        }
+    }
+    sibling
+}
+
 pub struct VideoPlayerEngine {
     ffmpeg_path: PathBuf,
     ffplay_path: PathBuf,
@@ -155,7 +187,7 @@ impl VideoPlayerEngine {
         _prefer_gpu: bool,
     ) -> Self {
         let ffmpeg = ffmpeg_path.as_ref().to_path_buf();
-        let ffplay = ffmpeg.with_file_name("ffplay.exe");
+        let ffplay = resolve_ffplay_path(&ffmpeg);
         Self {
             ffmpeg_path: ffmpeg,
             ffplay_path: ffplay,
@@ -427,7 +459,18 @@ impl VideoPlayerEngine {
         self.is_playing.store(true, Ordering::SeqCst);
 
         // 启动音频管线：通过 FFmpeg 容器级关键帧快速寻轨 (100ms 响应，杜绝原生 ffplay 耗费 9.7 秒解码卡死的严重音画脱节)
-        if self.ffplay_path.exists() {
+        let effective_ffplay = if self.ffplay_path.is_file() {
+            Some(self.ffplay_path.clone())
+        } else {
+            let probe = resolve_ffplay_path(&self.ffmpeg_path);
+            if probe.is_file() {
+                Some(probe)
+            } else {
+                None
+            }
+        };
+
+        if let Some(ref ffplay_bin) = effective_ffplay {
             let mut feeder_cmd = Command::new(&self.ffmpeg_path);
             apply_no_window(&mut feeder_cmd);
             feeder_cmd
@@ -467,7 +510,7 @@ impl VideoPlayerEngine {
             if let Ok(mut feeder_child) = feeder_spawn {
                 crate::utils::child_registry::adopt(&feeder_child);
                 if let Some(feeder_stdout) = feeder_child.stdout.take() {
-                    let mut player_cmd = Command::new(&self.ffplay_path);
+                    let mut player_cmd = Command::new(ffplay_bin);
                     apply_no_window(&mut player_cmd);
                     player_cmd
                         .args([

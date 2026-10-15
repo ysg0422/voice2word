@@ -28,17 +28,23 @@ pub(crate) fn is_item_needed_for_tab(
     let _is_gpu = state.config.gpu.is_gpu_tier();
     match tab {
         ModelManagerTab::SenseVoice => {
-            // SenseVoice 专区：核心识别模型、分词表、VAD 专属项
-            matches!(
-                item_id,
-                "sensevoice-model" | "sensevoice-tokens" | "sensevoice-vad"
-            )
+            // SenseVoice 专区：核心识别模型、分词表、VAD 专属项，以及音视频解码抽音必需的 FFmpeg 底座
+            if item_id == "ffmpeg" {
+                !state.model_is_present("ffmpeg")
+            } else {
+                matches!(
+                    item_id,
+                    "sensevoice-model" | "sensevoice-tokens" | "sensevoice-vad"
+                )
+            }
         }
         ModelManagerTab::Whisper => {
-            // Whisper 专区：Whisper 模型档位、VAD、标点、推理程序
+            // Whisper 专区：Whisper 模型档位、VAD、标点、推理程序，以及音视频解码抽音必需的 FFmpeg 底座
             let has_cli =
                 state.model_is_present("whisper-cli") || state.model_is_present("whisper-cublas");
-            if item_id == "whisper-cli" {
+            if item_id == "ffmpeg" {
+                !state.model_is_present("ffmpeg")
+            } else if item_id == "whisper-cli" {
                 // 若本地尚未就位任何可用 CLI，4.1MB 的基础 whisper-cli 为绝对必需
                 !has_cli
             } else if item_id == "whisper-cublas" {

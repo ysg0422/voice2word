@@ -50,9 +50,10 @@ Name: "{app}\tools"
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\voice2word-cli.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\config.toml"; DestDir: "{app}"; Flags: onlyifdoesntexist skipifsourcedoesntexist
-; 仅打包必需的 Python 胶水小脚本，杜绝将本地巨型 DLL / ffmpeg.exe 误打入安装包
 Source: "..\tools\punc_runner.py"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\tools\sensevoice_runner.py"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\ffmpeg.exe"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\ffplay.exe"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
