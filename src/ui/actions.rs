@@ -655,26 +655,64 @@ impl MainWindow {
         .detach();
     }
 
-    /// 打开系统原生文件对话框选择音视频（异步非阻塞，杜绝 Win32 模态循环导致的 GPUI RefCell 重入借用冲突）
+    /// 打开系统原生文件对话框选择音视频（支持单选与多选，异步非阻塞）
     pub(crate) fn choose_file(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
+            let handles = rfd::AsyncFileDialog::new()
                 .add_filter(
                     "音视频文件",
                     &[
                         "mp4", "mkv", "mov", "avi", "flv", "webm", "mp3", "wav", "flac", "m4a",
                     ],
                 )
-                .pick_file()
+                .pick_files()
                 .await;
-            if let Some(file_handle) = handle {
-                let file = file_handle.path().to_path_buf();
-                let _ = this.update(cx, |this, cx| {
-                    this.adopt_media_file(file, cx);
-                });
+            let Some(handles) = handles else { return };
+            if handles.is_empty() {
+                return;
             }
+            let files: Vec<PathBuf> = handles.iter().map(|h| h.path().to_path_buf()).collect();
+            let _ = this.update(cx, |this, cx| {
+                this.handle_selected_media_files(files, cx);
+            });
         })
         .detach();
+    }
+
+    /// 处理用户通过文件对话框选择的音视频文件（支持单选与多选，平滑衔接单文件与批量队列）
+    pub(crate) fn handle_selected_media_files(
+        &mut self,
+        files: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        // 若多选、或当前批量队列已有项目：一律作为批量队列处理
+        if files.len() > 1 || !self.state.batch_queue.is_empty() {
+            // 如果单文件就绪卡片上先前已选中过一个文件，顺带并入批量队列，绝不丢弃
+            if let Some(prev) = self.state.transcribe_file.take() {
+                self.state.enqueue_files(vec![prev]);
+            }
+            let count = files.len();
+            self.ingest_paths(files, cx);
+            self.state.transcribe_file = None;
+            self.state.active_tab = WorkspaceTab::Generate;
+            self.notice = Some(format!("已添加 {count} 个视频到批量转写队列"));
+            cx.notify();
+        } else {
+            // 恰好 1 个文件且当前无队列：作为单文件就绪
+            self.adopt_media_file(files[0].clone(), cx);
+        }
+    }
+
+    /// 将单文件就绪卡片转为批量队列并打开选择器添加更多视频
+    pub(crate) fn convert_ready_to_batch(&mut self, cx: &mut Context<Self>) {
+        if let Some(file) = self.state.transcribe_file.take() {
+            self.state.enqueue_files(vec![file]);
+            self.probe_queue_durations(cx);
+        }
+        self.choose_batch_files(cx);
     }
 
     /// 删除某个可下载组件的本地文件（「模型与组件」卡的「删除」按钮走这里）。
@@ -1538,21 +1576,51 @@ impl MainWindow {
     ) {
         let media = &outcome.files;
         if media.len() == 1 {
-            // 单个文件仍走「选中 + 探测时长」的原路径，保持单文件手感不变。
-            // 但从目录里扫出来的这一个文件**不该**变成「当前文件」——用户拖的是
-            // 一个文件夹，期待的是队列，不是把里面第一个文件当成当前工程。
+            // 1. 若拖入的是文件夹，期待的是批量队列，始终入队
             if outcome.dirs_scanned > 0 || paths.iter().any(|p| p.is_dir()) {
                 let added = self.state.enqueue_files(media.clone());
+                self.state.transcribe_file = None;
                 self.state.active_tab = WorkspaceTab::Generate;
                 self.probe_queue_durations(cx);
                 self.notice = Some(format!("已从文件夹加入 {added} 个文件到批量队列"));
                 cx.notify();
-            } else {
-                self.adopt_media_file(media[0].clone(), cx)
+                return;
             }
+            // 2. 若当前批量队列已有条目：拖入单文件直接追加进队列，绝不覆盖冲毁队列
+            if !self.state.batch_queue.is_empty() {
+                let _added = self.state.enqueue_files(media.clone());
+                self.state.transcribe_file = None;
+                self.state.active_tab = WorkspaceTab::Generate;
+                self.probe_queue_durations(cx);
+                let name = media[0]
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("视频");
+                self.notice = Some(format!("已将「{name}」追加到批量转写队列（共 {} 个）", self.state.batch_queue.len()));
+                cx.notify();
+                return;
+            }
+            // 3. 若当前已有选中的单文件：拖入第 2 个文件自动转为批量队列并合并两者
+            if let Some(prev) = self.state.transcribe_file.take() {
+                let added = self.state.enqueue_files(vec![prev, media[0].clone()]);
+                self.state.transcribe_file = None;
+                self.state.active_tab = WorkspaceTab::Generate;
+                self.probe_queue_durations(cx);
+                self.notice = Some(format!("已自动转为批量队列（共 {added} 个视频）"));
+                cx.notify();
+                return;
+            }
+            // 4. 空闲状态且仅拖入 1 个文件：单文件就绪
+            self.adopt_media_file(media[0].clone(), cx);
             return;
         }
+
+        // 多文件拖入：若先前有未转写的单文件，顺带合并入队
+        if let Some(prev) = self.state.transcribe_file.take() {
+            self.state.enqueue_files(vec![prev]);
+        }
         let added = self.state.enqueue_files(media.clone());
+        self.state.transcribe_file = None;
         if added == 0 {
             self.state.status =
                 ProcessStatus::Failed("这些文件已经在批量队列里，未重复添加".to_string());
@@ -1560,11 +1628,8 @@ impl MainWindow {
             return;
         }
         info!("批量队列新增 {} 个文件", added);
-        // 队列面板在转写页，切过去用户才看得见刚入队的东西
         self.state.active_tab = WorkspaceTab::Generate;
         self.probe_queue_durations(cx);
-        // 拖了目录、里面有一堆非媒体文件是常态：必须交代「收了多少、跳过了
-        // 什么」，否则用户会以为漏扫了。
         self.notice = Some(Self::ingest_summary(added, &outcome));
         cx.notify();
     }

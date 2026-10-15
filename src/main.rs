@@ -32,6 +32,19 @@ fn main() -> Result<()> {
     if let Some(code) = voice2word::cli::run(std::env::args()) {
         std::process::exit(code);
     }
+
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "user32")]
+        extern "system" {
+            fn ChangeWindowMessageFilter(message: u32, dwflag: u32) -> i32;
+        }
+        // 允许 Explorer 拖拽文件进入（即使以管理员身份运行也不受 Windows UIPI 限制）
+        const MSGFLT_ADD: u32 = 1;
+        ChangeWindowMessageFilter(0x0233, MSGFLT_ADD); // WM_DROPFILES
+        ChangeWindowMessageFilter(0x004A, MSGFLT_ADD); // WM_COPYDATA
+        ChangeWindowMessageFilter(0x0049, MSGFLT_ADD); // WM_COPYGLOBALDATA
+    }
     // 冷启动量化（P1-A9）：从进程入口开始打点，每完成一个阶段就记一次耗时。
     // 只在启动路径上，之后不再有任何开销。
     let mut startup = StartupTimer::new();

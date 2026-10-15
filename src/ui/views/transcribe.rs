@@ -475,6 +475,9 @@ impl MainWindow {
                                 ),
                         )
                         .into_any_element()
+                } else if !self.state.batch_queue.is_empty() {
+                    // 批量队列非空且不在转写时：队列直接作为主工作区核心，撑满中央视窗！彻底解决队列被单文件冲毁的问题
+                    self.render_batch_queue_panel(cx, true)
                 } else if let Some(ref file) = self.state.transcribe_file {
                     // 已就绪待处理卡片 (用户刚选中了新视频，准备转写)
                     let fname = file.file_name().and_then(|s| s.to_str()).unwrap_or("视频").to_string();
@@ -611,6 +614,12 @@ impl MainWindow {
                                                         })
                                                     })
                                                     .into_any_element(),
+                                                primitives::btn("+ 批量添加", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
+                                                    .id("ready-convert-batch-btn")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.convert_ready_to_batch(cx);
+                                                    }))
+                                                    .into_any_element(),
                                                 primitives::btn("重新完整转写", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
                                                     .id("ready-start-process-btn")
                                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -630,6 +639,12 @@ impl MainWindow {
                                                     .id("ready-start-process-btn")
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.start_processing(cx);
+                                                    }))
+                                                    .into_any_element(),
+                                                primitives::btn("+ 批量添加", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
+                                                    .id("ready-convert-batch-btn")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.convert_ready_to_batch(cx);
                                                     }))
                                                     .into_any_element(),
                                                 primitives::btn("更换视频", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
@@ -671,9 +686,6 @@ impl MainWindow {
                                 .children(quality_card),
                         )
                         .into_any_element()
-                } else if !self.state.batch_queue.is_empty() {
-                    // 批量队列非空且不在转写时：队列直接作为主工作区核心，撑满中央视窗！彻底取消傻大空态框
-                    self.render_batch_queue_panel(cx, true)
                 } else {
                     // 空闲就绪引导工作区 (精简精致轻量 Dropzone)
                     div()
