@@ -2184,6 +2184,7 @@ impl MainWindow {
         // 清零，转写照跑完。放在这里之后，任务线程里不再有任何清标志的写方，派发口
         // 又由函数开头的 `status != Processing` 守卫兜底，上一轮的取消不会误伤新任务。
         self.state.pipeline.begin_task();
+        self.state.transcribe_started_at = Some(std::time::Instant::now());
         self.state.status = ProcessStatus::Processing {
             stage: "准备中...".to_string(),
             progress: 0.0,
@@ -2334,6 +2335,7 @@ impl MainWindow {
                             }
                             PipelineEvent::Finished(segments, metrics) => {
                                 this.state.clear_streaming();
+                                this.state.transcribe_started_at = None;
                                 if this.state.cancel_requested {
                                     // 用户主动终止：静默收尾，不弹完成框、不写历史库
                                     this.state.cancel_requested = false;

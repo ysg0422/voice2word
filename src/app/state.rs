@@ -753,6 +753,8 @@ pub struct AppState {
     /// 界面上「已流式生成 N 句」看起来像卡死了。这里单独计一个
     /// 单调计数器，与缓冲区裁剪解耦。
     pub streaming_segment_count: usize,
+    /// 转写任务启动的绝对时刻，用于实时推算真实剩余耗时（ETA）
+    pub transcribe_started_at: Option<std::time::Instant>,
 
     // 处理选项
     pub language: String,
@@ -1095,6 +1097,7 @@ impl AppState {
             streaming_segments: Vec::new(),
             streaming_current_sec: 0.0,
             streaming_segment_count: 0,
+            transcribe_started_at: None,
             language: lang,
             output_format: fmt,
             enable_polish: polish,
@@ -2377,13 +2380,39 @@ impl AppState {
         if dur <= 0.0 {
             return "--".to_string();
         }
-        let secs = self.whisper_model_tier.estimate_seconds(
+        let total_est = self.whisper_model_tier.estimate_seconds(
             dur,
             self.whisper_threads,
             self.hardware.use_gpu_pipeline(),
             self.enable_polish.then_some(self.polish_mode),
         );
-        WhisperModelTier::format_eta(secs)
+
+        // 若处于转写进行中，根据启动时间与真实推流速率动态计算「剩余时间」
+        if let ProcessStatus::Processing { .. } = self.status {
+            if let Some(started) = self.transcribe_started_at {
+                let elapsed = started.elapsed().as_secs_f64();
+                let audio_ratio = if dur > 0.0 && self.streaming_current_sec > 0.0 {
+                    (self.streaming_current_sec / dur).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+
+                // 若已转写出有效字幕（>= 2%）且已跑满 3 秒，按真实吞吐倍率预测剩余耗时
+                if audio_ratio >= 0.02 && elapsed >= 3.0 {
+                    let rate = audio_ratio / elapsed;
+                    if rate > 0.0001 {
+                        let rem_secs = ((1.0 - audio_ratio) / rate).clamp(1.0, 86400.0);
+                        return format!("剩余 {}", WhisperModelTier::format_eta(rem_secs));
+                    }
+                }
+
+                // 刚启动或首句尚未吐出时，用初始预估减去已耗时，实现平滑真实倒计时
+                let rem_secs = (total_est - elapsed).max(3.0);
+                return format!("剩余 {}", WhisperModelTier::format_eta(rem_secs));
+            }
+        }
+
+        WhisperModelTier::format_eta(total_est)
     }
 
     pub fn should_use_proxy(&self) -> bool {

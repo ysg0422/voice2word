@@ -497,7 +497,7 @@ impl MainWindow {
 
         // 只取阶段名与进度即可：`detail` 从未被消费（下游只用 stage/progress），
         // 而它是 `String`——每帧 `clone()` 一个可能非空的详情串纯属浪费。改为只借用。
-        let (stage_text, progress_val) = match &self.state.status {
+        let (stage_text, _progress_val) = match &self.state.status {
             ProcessStatus::Idle => ("就绪", 0.0),
             ProcessStatus::Processing {
                 stage, progress, ..
@@ -537,7 +537,7 @@ impl MainWindow {
                         let display_ratio = if total_dur > 0.0 && cur_sec > 0.0 {
                             (cur_sec / total_dur).clamp(0.0, 1.0)
                         } else {
-                            progress_val.clamp(0.0, 1.0)
+                            0.0
                         };
 
                         div()
@@ -557,13 +557,12 @@ impl MainWindow {
                                             .child(stage_text.to_string()),
                                     )
                                     .child(if total_dur > 0.0 {
-                                        let display_sec = cur_sec.max(display_ratio * total_dur);
                                         div()
                                             .text_size(px(Theme::TEXT_SMALL))
                                             .text_color(Theme::text_secondary())
                                             .child(format!(
                                                 "{} / {}",
-                                                crate::ui::format_mm_ss(display_sec),
+                                                crate::ui::format_mm_ss(cur_sec),
                                                 crate::ui::format_mm_ss(total_dur)
                                             ))
                                     } else {
