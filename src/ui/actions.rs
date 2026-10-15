@@ -696,7 +696,12 @@ impl MainWindow {
             }
             let count = files.len();
             self.ingest_paths(files, cx);
-            self.state.transcribe_file = None;
+            if let Some(first) = self.state.batch_queue.first() {
+                self.state.transcribe_file = Some(first.path.clone());
+                self.state.selected_file = Some(first.path.clone());
+                self.state.transcribe_duration = first.duration;
+            }
+            self.queue_sidebar_open = true;
             self.state.active_tab = WorkspaceTab::Generate;
             self.notice = Some(format!("已添加 {count} 个视频到批量转写队列"));
             cx.notify();
@@ -709,9 +714,11 @@ impl MainWindow {
     /// 将单文件就绪卡片转为批量队列并打开选择器添加更多视频
     pub(crate) fn convert_ready_to_batch(&mut self, cx: &mut Context<Self>) {
         if let Some(file) = self.state.transcribe_file.take() {
-            self.state.enqueue_files(vec![file]);
+            self.state.enqueue_files(vec![file.clone()]);
+            self.state.transcribe_file = Some(file);
             self.probe_queue_durations(cx);
         }
+        self.queue_sidebar_open = true;
         self.choose_batch_files(cx);
     }
 
@@ -1901,6 +1908,22 @@ impl MainWindow {
         }
     }
 
+    /// 选中队列中的某一项并在中央工作台显示
+    pub(crate) fn select_queue_item(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.state.batch_queue.len() {
+            return;
+        }
+        self.state.batch_active = Some(idx);
+        let path = self.state.batch_queue[idx].path.clone();
+        let dur = self.state.batch_queue[idx].duration;
+        self.state.transcribe_file = Some(path.clone());
+        self.state.selected_file = Some(path);
+        if dur > 0.0 {
+            self.state.transcribe_duration = dur;
+        }
+        cx.notify();
+    }
+
     /// 把队列里的某一条搬到指定下标（`from` → `to`），只动顺序。
     ///
     /// 刻意不碰正在进行的转写：重排不是「换一条跑」，正在跑的那条只是换了位置，
@@ -1917,6 +1940,7 @@ impl MainWindow {
             self.request_cancel_processing(cx);
         }
         self.state.clear_batch_queue();
+        self.state.transcribe_file = None;
         cx.notify();
     }
 

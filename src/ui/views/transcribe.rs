@@ -19,7 +19,10 @@ use crate::utils::time::format_duration_short;
 use std::sync::Arc;
 
 impl MainWindow {
-    /// 渲染智能生成模式主体布局 (中间是工作区，右侧是配置和选项)
+    /// 渲染智能生成模式主体布局：经典专业「左 - 中 - 右」三栏架构
+    /// - 左侧：竖向批量转写队列侧栏 (展开 300px / 折叠 38px 细轨)
+    /// - 中间：主工作台与监控视窗 (步骤条 + 实时流式字幕视窗 + 性能遥测 4 宫格 / 单文件就绪卡片 / 拖放引导区)
+    /// - 右侧：转写配置抽屉 (350px，模型选择、语言、标点、说话人等全套参数)
     pub(crate) fn render_generate_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -29,6 +32,12 @@ impl MainWindow {
             .w_full()
             .h_full()
             .overflow_hidden()
+            // 左侧：竖向批量转写队列侧栏 (展开 300px / 折叠 38px)
+            .child(if self.queue_sidebar_open {
+                self.render_batch_queue_sidebar(cx).into_any_element()
+            } else {
+                self.render_batch_queue_rail(cx).into_any_element()
+            })
             // 中间：主工作台与底部控制
             .child(
                 div()
@@ -43,6 +52,43 @@ impl MainWindow {
             )
             // 右侧：配置和选项面板
             .child(self.render_sidebar(cx))
+    }
+
+    /// 渲染批量任务队列折叠收起态的侧边细轨（38px 宽，点击展开）
+    pub(crate) fn render_batch_queue_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let total = self.state.batch_queue.len();
+        div()
+            .id("batch-queue-collapsed-rail")
+            .w(px(38.0))
+            .h_full()
+            .bg(Theme::bg_sidebar())
+            .border_r_1()
+            .border_color(Theme::border())
+            .flex()
+            .flex_col()
+            .items_center()
+            .py(px(Theme::SPACE_3))
+            .gap(px(Theme::SPACE_2))
+            .child(
+                primitives::btn("▶", primitives::BtnSize::Xs, primitives::BtnVariant::Ghost)
+                    .id("expand-queue-btn")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.queue_sidebar_open = true;
+                        cx.notify();
+                    }))
+            )
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_muted())
+                    .child("队列")
+            )
+            .children(if total > 0 {
+                Some(primitives::badge(format!("{total}")))
+            } else {
+                None
+            })
     }
 
     /// 渲染中央处理工作区：轻量化实时看板，彻底告别庞大表格卡顿
@@ -151,12 +197,6 @@ impl MainWindow {
                         }
                     ),
             )
-            // ── 批量转写队列 (F-012)：仅在转写运行中时固定在步骤流下方作为紧凑看板 ──
-            .children(if !self.state.batch_queue.is_empty() && is_processing {
-                Some(self.render_batch_queue_panel(cx, false))
-            } else {
-                None
-            })
             // 核心工作台展示区
             .child(
                 if is_processing {
@@ -475,10 +515,12 @@ impl MainWindow {
                                 ),
                         )
                         .into_any_element()
-                } else if !self.state.batch_queue.is_empty() {
-                    // 批量队列非空且不在转写时：队列直接作为主工作区核心，撑满中央视窗！彻底解决队列被单文件冲毁的问题
-                    self.render_batch_queue_panel(cx, true)
-                } else if let Some(ref file) = self.state.transcribe_file {
+                } else if let Some(ref file) = self.state.transcribe_file.clone().or_else(|| {
+                    self.state.batch_active
+                        .and_then(|idx| self.state.batch_queue.get(idx))
+                        .or_else(|| self.state.batch_queue.first())
+                        .map(|item| item.path.clone())
+                }) {
                     // 已就绪待处理卡片 (用户刚选中了新视频，准备转写)
                     let fname = file.file_name().and_then(|s| s.to_str()).unwrap_or("视频").to_string();
                     let dur_str = format_duration_short(self.state.transcribe_duration);
@@ -624,6 +666,38 @@ impl MainWindow {
                                                     .id("ready-start-process-btn")
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.start_processing(cx);
+                                                    }))
+                                                    .into_any_element(),
+                                                primitives::btn("更换视频", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
+                                                    .id("ready-repick-file-btn")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.choose_file(cx);
+                                                    }))
+                                                    .into_any_element(),
+                                            ]
+                                        } else if !self.state.batch_queue.is_empty() {
+                                            let pending = self.state.queue_pending_count();
+                                            vec![
+                                                primitives::btn(
+                                                    format!("开始全部转写 ({} 项)", pending),
+                                                    primitives::BtnSize::Lg,
+                                                    primitives::BtnVariant::Primary,
+                                                )
+                                                .id("ready-start-batch-btn")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.start_batch_queue(cx);
+                                                }))
+                                                .into_any_element(),
+                                                primitives::btn("仅转写此视频", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
+                                                    .id("ready-start-single-btn")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.start_processing(cx);
+                                                    }))
+                                                    .into_any_element(),
+                                                primitives::btn("+ 批量添加", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
+                                                    .id("ready-convert-batch-btn")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.convert_ready_to_batch(cx);
                                                     }))
                                                     .into_any_element(),
                                                 primitives::btn("更换视频", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
@@ -1388,11 +1462,11 @@ impl MainWindow {
             .into_any_element()
     }
 
-    /// 批量转写队列面板 (F-012)：文件清单 + 「开始全部 / 终止 / 清空」操作组。
+    /// 竖向批量转写队列侧栏 (F-012 左侧栏)：任务清单 + 操作组 + 底部开始全部。
     ///
-    /// 队列非空时常驻在工作区顶部，让用户随时看清哪些跑完了、哪些还在等，
-    /// 而不是只能盯着一条进度条猜整批的进度。
-    pub(crate) fn render_batch_queue_panel(&mut self, cx: &mut Context<Self>, is_main: bool) -> AnyElement {
+    /// 经典左中右布局的左翼：竖直排布任务卡片，展示文件名、时长、状态与阶段进度条，
+    /// 支持上下拖拽排序与单项删除，彻底告别顶部横向压扁的难看排版。
+    pub(crate) fn render_batch_queue_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
         let batch_running = self.state.batch_running;
         let total = self.state.batch_queue.len();
@@ -1438,160 +1512,117 @@ impl MainWindow {
             })
             .collect();
 
-        // 面板外壳：主工作区模式下 flex_1 撑满并用标准卡片；顶部紧凑模式用 card_sm
-        let card = if is_main {
-            primitives::card()
-                .id("batch-queue-main-panel")
-                .flex_1()
-                .w_full()
-                .h_full()
-                .min_h(px(0.0))
-                .overflow_hidden()
-                .border_color(if batch_running {
-                    Theme::tint_mint_border()
-                } else {
-                    Theme::border()
-                })
-                .gap(px(Theme::SPACE_3))
-        } else {
-            primitives::card_sm()
-                .id("batch-queue-panel")
-                .w_full()
-                .flex_shrink_0()
-                .border_color(if batch_running {
-                    Theme::tint_mint_border()
-                } else {
-                    Theme::border()
-                })
-                .gap(px(Theme::SPACE_2))
-        };
-
-        card
-            // ── 标头：统计徽章 + 操作组 ──
+        div()
+            .id("batch-queue-sidebar")
+            .w(px(Theme::QUEUE_SIDEBAR_W))
+            .h_full()
+            .bg(Theme::bg_sidebar())
+            .border_r_1()
+            .border_color(Theme::border())
+            .flex()
+            .flex_col()
+            .p(px(Theme::SPACE_3))
+            .gap(px(Theme::SPACE_2))
+            // ── 标头：标题 + 完成徽标 + 收起按钮 ──
             .child(
                 div()
+                    .w_full()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap(px(Theme::SPACE_3))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(Theme::SPACE_2))
                             .child(primitives::section_title("批量转写队列"))
-                            // 计数 / 失败 / 累计时长三类元信息统一走 badge 阶梯
-                            .child(primitives::badge(format!("{done}/{total} 完成 · {pending} 待处理")))
-                            .children(if failed > 0 {
-                                Some(primitives::badge_danger(format!("{failed} 失败")))
-                            } else {
-                                None
-                            })
-                            .child(
-                                div()
-                                    .text_size(px(Theme::TEXT_SMALL))
-                                    .text_color(Theme::text_muted())
-                                    .child(format!(
-                                        "累计时长 {}",
-                                        format_duration_short(total_dur)
-                                    )),
-                            ),
+                            .child(primitives::badge(format!("{done}/{total}"))),
                     )
+                    .child(
+                        primitives::btn("◀", primitives::BtnSize::Xs, primitives::BtnVariant::Ghost)
+                            .id("collapse-queue-sidebar-btn")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.queue_sidebar_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            // ── 工具条：添加文件、添加文件夹、清空 ──
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(Theme::SPACE_1_5))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(Theme::SPACE_2))
+                            .gap(px(Theme::SPACE_1_5))
                             .child(
-                                primitives::btn("批量导入", primitives::BtnSize::Sm, primitives::BtnVariant::Secondary)
-                                    .id("queue-add-files-btn")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.choose_batch_files(cx)),
-                                    ),
+                                primitives::btn("+ 文件", primitives::BtnSize::Xs, primitives::BtnVariant::Secondary)
+                                    .id("sidebar-queue-add-files-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| this.choose_batch_files(cx))),
                             )
                             .child(
-                                primitives::btn("导入文件夹", primitives::BtnSize::Sm, primitives::BtnVariant::Secondary)
-                                    .id("queue-add-folder-btn")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.choose_batch_folder(cx)),
-                                    ),
-                            )
-                            // 只有批量模式在跑时才显示「终止批量」：单文件转写也会置
-                            // `is_processing`，若按它判断，单文件转写时这里会误显示「终止批量」
-                            // （真正该用的「终止转写」在进度抽屉里）。用 `batch_running` 才准。
-                            .child(if batch_running {
-                                primitives::btn("终止批量", primitives::BtnSize::Sm, primitives::BtnVariant::Danger)
-                                    .id("queue-cancel-btn")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.cancel_batch_queue(cx)),
-                                    )
-                                    .into_any_element()
-                            } else {
-                                // 「开始全部」有可点 / 不可点两态，禁用态需要自绘底色与文字色，
-                                // 因此沿用 btn 的骨架再按 can_start 覆盖配色。
-                                primitives::btn("开始全部", primitives::BtnSize::Sm, primitives::BtnVariant::Primary)
-                                    .id("queue-start-all-btn")
-                                    .bg(if can_start {
-                                        Theme::accent_mint()
-                                    } else {
-                                        Theme::bg_hover_strong()
-                                    })
-                                    .text_color(if can_start {
-                                        Theme::text_on_accent()
-                                    } else {
-                                        Theme::text_muted()
-                                    })
-                                    .when(can_start, |s| s.cursor_pointer().hover(|s| s.opacity(0.9)))
-                                    // 禁用态（队列为空或已在转写）不能再挂 on_click：
-                                    // 否则点下去会走 start_batch_queue → 置 Failed 弹出全屏错误横幅，
-                                    // 与「按钮外观已禁用」自相矛盾。
-                                    .when(can_start, |s| {
-                                        s.on_click(
-                                            cx.listener(|this, _, _, cx| this.start_batch_queue(cx)),
-                                        )
-                                    })
-                                    .into_any_element()
-                            })
-                            .child(
-                                primitives::btn("清空", primitives::BtnSize::Sm, primitives::BtnVariant::Ghost)
-                                    .id("queue-clear-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        // 清空会连同正在跑的转写一起终止（`clear_batch_queue`
-                                        // 内部先 cancel），而按钮是最弱的 Ghost 样式、又紧挨
-                                        // 着「开始全部」，误触代价却是丢掉整批任务。
-                                        // 队列为空时没什么可清，直接跳过弹窗。
-                                        if this.state.batch_queue.is_empty() {
-                                            return;
-                                        }
-                                        let running = matches!(
-                                            this.state.status,
-                                            ProcessStatus::Processing { .. }
-                                        );
-                                        this.confirm_dialog = Some(ConfirmDialogInfo {
-                                            title: "清空批量队列？".to_string(),
-                                            message: if running {
-                                                "队列里所有文件都会被移除，**正在进行的转写也会被终止**。已转写完成并落库的工程不受影响。"
-                                                    .to_string()
-                                            } else {
-                                                "队列里所有文件都会被移除。已转写完成并落库的工程不受影响。"
-                                                    .to_string()
-                                            },
-                                            confirm_label: "清空".to_string(),
-                                            danger: running,
-                                            action: ConfirmAction::ClearBatchQueue,
-                                        });
-                                        cx.notify();
-                                    })),
+                                primitives::btn("+ 目录", primitives::BtnSize::Xs, primitives::BtnVariant::Secondary)
+                                    .id("sidebar-queue-add-folder-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| this.choose_batch_folder(cx))),
                             ),
+                    )
+                    .child(
+                        primitives::btn("清空", primitives::BtnSize::Xs, primitives::BtnVariant::Ghost)
+                            .id("sidebar-queue-clear-btn")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.state.batch_queue.is_empty() {
+                                    return;
+                                }
+                                let running = matches!(this.state.status, ProcessStatus::Processing { .. });
+                                this.confirm_dialog = Some(ConfirmDialogInfo {
+                                    title: "清空批量队列？".to_string(),
+                                    message: if running {
+                                        "队列里所有文件都会被移除，**正在进行的转写也会被终止**。已转写完成并落库的工程不受影响。".to_string()
+                                    } else {
+                                        "队列里所有文件都会被移除。已转写完成并落库的工程不受影响。".to_string()
+                                    },
+                                    confirm_label: "清空".to_string(),
+                                    danger: running,
+                                    action: ConfirmAction::ClearBatchQueue,
+                                });
+                                cx.notify();
+                            })),
                     ),
             )
+            // ── 概览摘要（当有条目时）──
+            .children(if total > 0 {
+                Some(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(Theme::text_muted())
+                        .child(format!("{pending} 待处理 · 累计约 {}", format_duration_short(total_dur)))
+                        .children(if failed > 0 {
+                            Some(primitives::badge_danger(format!("{failed} 失败")))
+                        } else {
+                            None
+                        }),
+                )
+            } else {
+                None
+            })
+            .child(primitives::divider())
             // ── 文件清单：主模式下自适应撑满，紧凑模式下限制高度滚动 ──
             .child(
                 div()
-                    .id("batch-queue-list")
+                    .id("batch-queue-sidebar-scroll")
                     .w_full()
-                    .when(is_main, |s| s.flex_1().min_h(px(0.0)))
-                    .when(!is_main, |s| s.max_h(px(Theme::QUEUE_LIST_MAX_H)))
+                    .flex_1()
+                    .min_h(px(0.0))
                     .overflow_y_scroll()
                     .track_scroll(&self.batch_queue_scroll)
                     // 内嵌队列自己吃掉滚轮：还有余量时不让事件继续冒泡到外层页面壳，
@@ -1610,7 +1641,31 @@ impl MainWindow {
                     }))
                     .flex()
                     .flex_col()
-                    .gap(px(Theme::SPACE_1))
+                    .gap(px(Theme::SPACE_2))
+                    .when(rows.is_empty(), |s| {
+                        s.child(
+                            div()
+                                .w_full()
+                                .py(px(Theme::SPACE_8))
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(Theme::SPACE_2))
+                                .text_color(Theme::text_muted())
+                                .child(
+                                    div()
+                                        .text_size(px(Theme::TEXT_BODY))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("队列暂无任务"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(Theme::TEXT_SMALL))
+                                        .child("点击上方「+」或拖拽文件添加"),
+                                ),
+                        )
+                    })
                     .children(rows.into_iter().map(|row| {
                         let QueueRow {
                             idx,
@@ -1633,18 +1688,14 @@ impl MainWindow {
                             _ => Theme::text_muted(),
                         };
                         let is_active = active == Some(idx);
-                        // 有进度就多挂一行（进度条 + 百分比 + 阶段名），没有就保持
-                        // 原来的单行卡片：排序、间距、圆角、描边一律走同一套值，
-                        // 只是外层从「一行」变成「一列」，不改既有布局体系。
                         let progress_line = progress
                             .map(|p| render_queue_progress(p, stage.as_ref().map(|s| s.as_str())));
-                        let has_progress = progress_line.is_some();
+
                         div()
-                            .id(("batch-queue-row", idx))
+                            .id(("batch-queue-card", idx))
                             .w_full()
                             .flex_shrink_0()
-                            .px(px(Theme::SPACE_2))
-                            .py(px(Theme::SPACE_1_5))
+                            .p(px(Theme::SPACE_2_5))
                             .rounded(px(Theme::RADIUS_LG))
                             .bg(if is_active {
                                 Theme::tint_mint_soft()
@@ -1657,163 +1708,195 @@ impl MainWindow {
                             } else {
                                 Theme::border_subtle()
                             })
-                            // 进度条**整行宽**，所以它必须待在文件名行之外：
-                            // 塞进那一行里会被右侧的时长 / 状态 / 移除按钮挤成
-                            // 短短一截，而卡片底下又要空出大片留白。
-                            .when_some(progress_line, |s, line| {
-                                s.flex()
-                                    .flex_col()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_queue_item(idx, cx);
+                            }))
+                            .flex()
+                            .flex_col()
+                            .gap(px(Theme::SPACE_1_5))
+                            // ── Row 1: 指示灯 + 序号 + 文件名 + (转写中标识/移除按钮) ──
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
                                     .gap(px(Theme::SPACE_1))
                                     .child(
                                         div()
-                                            .w_full()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(Theme::SPACE_1_5))
+                                            .child(primitives::stat_dot_sm(dot))
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_size(px(Theme::TEXT_SMALL))
+                                                    .text_color(Theme::text_muted())
+                                                    .child(format!("#{}", idx + 1)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .truncate()
+                                                    .text_size(px(Theme::TEXT_BODY))
+                                                    .font_weight(if is_active {
+                                                        FontWeight::BOLD
+                                                    } else {
+                                                        FontWeight::MEDIUM
+                                                    })
+                                                    .text_color(Theme::text_primary())
+                                                    .child(name),
+                                            ),
+                                    )
+                                    .child(if is_active && is_processing {
+                                        div()
+                                            .flex_shrink_0()
+                                            .px(px(Theme::SPACE_1))
+                                            .text_size(px(Theme::TEXT_SMALL))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(Theme::accent_orange())
+                                            .child("转写中")
+                                            .into_any_element()
+                                    } else {
+                                        div()
+                                            .id(("batch-queue-remove", idx))
+                                            .flex_shrink_0()
+                                            .px(px(Theme::SPACE_1))
+                                            .rounded(px(Theme::RADIUS_SM))
+                                            .cursor_pointer()
+                                            .text_size(px(Theme::TEXT_BODY))
+                                            .text_color(Theme::text_muted())
+                                            .hover(|s| {
+                                                s.bg(Theme::bg_hover_strong())
+                                                    .text_color(Theme::accent_red())
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.remove_queue_item(idx, cx);
+                                            }))
+                                            .child("✕")
+                                            .into_any_element()
+                                    }),
+                            )
+                            // ── Row 2: 时长 + 状态标签 + (上移/下移排序) ──
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(Theme::SPACE_1))
+                                    .child(
+                                        div()
                                             .flex()
                                             .items_center()
                                             .gap(px(Theme::SPACE_2))
-                                            .child(primitives::stat_dot_sm(dot)),
+                                            .text_size(px(Theme::TEXT_SMALL))
+                                            .child(
+                                                div()
+                                                    .text_color(Theme::text_muted())
+                                                    .child(if dur > 0.0 {
+                                                        format_duration_short(dur)
+                                                    } else {
+                                                        "--:--".to_string()
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .max_w(px(Theme::QUEUE_LABEL_MAX_W))
+                                                    .truncate()
+                                                    .text_color(label_color)
+                                                    .child(label),
+                                            ),
                                     )
-                                    .child(line)
-                            })
-                            .when(!has_progress, |s| {
-                                s.flex()
-                                    .items_center()
-                                    .gap(px(Theme::SPACE_2))
-                                    .child(primitives::stat_dot_sm(dot))
-                            })
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .text_size(px(Theme::TEXT_BODY))
-                                    .font_weight(if is_active {
-                                        FontWeight::BOLD
-                                    } else {
-                                        FontWeight::MEDIUM
-                                    })
-                                    .text_color(Theme::text_primary())
-                                    .child(name),
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(Theme::SPACE_1))
+                                            .child({
+                                                let can_move = !(is_active && is_processing);
+                                                let can_move_up = can_move && idx > 0;
+                                                let target = idx.saturating_sub(1);
+                                                primitives::btn_state(
+                                                    "↑",
+                                                    primitives::BtnSize::Xs,
+                                                    primitives::BtnVariant::Ghost,
+                                                    can_move_up,
+                                                )
+                                                .id(("batch-queue-up", idx))
+                                                .when(can_move_up, |s| {
+                                                    s.on_click(cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.move_queue_item(idx, target, cx);
+                                                    }))
+                                                })
+                                            })
+                                            .child({
+                                                let can_move = !(is_active && is_processing);
+                                                let can_move_down = can_move && idx + 1 < total;
+                                                let target = idx + 1;
+                                                primitives::btn_state(
+                                                    "↓",
+                                                    primitives::BtnSize::Xs,
+                                                    primitives::BtnVariant::Ghost,
+                                                    can_move_down,
+                                                )
+                                                .id(("batch-queue-down", idx))
+                                                .when(can_move_down, |s| {
+                                                    s.on_click(cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.move_queue_item(idx, target, cx);
+                                                    }))
+                                                })
+                                            }),
+                                    ),
                             )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(Theme::TEXT_SMALL))
-                                    .text_color(Theme::text_muted())
-                                    .child(if dur > 0.0 {
-                                        format_duration_short(dur)
-                                    } else {
-                                        "--:--".to_string()
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .max_w(px(Theme::QUEUE_LABEL_MAX_W))
-                                    .truncate()
-                                    .text_size(px(Theme::TEXT_SMALL))
-                                    .text_color(label_color)
-                                    .child(label),
-                            )
-                            // ── 顺序调整：上移 / 下移各一格 ──
-                            // 队列此前只能删 / 清空，加进来就只能按加入顺序跑，一条急着要的
-                            // 片子排在队尾时只能整批重排。移不动的情形（第一条上移、最后一条
-                            // 下移、正在跑的那条）统一走 btn_state 的置灰外观，点了没反应也不意外。
-                            .child({
-                                let can_move = !(is_active && is_processing);
-                                let can_move_up = can_move && idx > 0;
-                                let target = idx.saturating_sub(1);
-                                primitives::btn_state(
-                                    "上移",
-                                    primitives::BtnSize::Xs,
-                                    primitives::BtnVariant::Ghost,
-                                    can_move_up,
-                                )
-                                .id(("batch-queue-up", idx))
-                                .when(can_move_up, |s| {
-                                    s.on_click(cx.listener(move |this, _, _, cx| {
-                                        this.move_queue_item(idx, target, cx)
-                                    }))
-                                })
-                            })
-                            .child({
-                                let can_move = !(is_active && is_processing);
-                                let can_move_down = can_move && idx + 1 < total;
-                                let target = idx + 1;
-                                primitives::btn_state(
-                                    "下移",
-                                    primitives::BtnSize::Xs,
-                                    primitives::BtnVariant::Ghost,
-                                    can_move_down,
-                                )
-                                .id(("batch-queue-down", idx))
-                                .when(can_move_down, |s| {
-                                    s.on_click(cx.listener(move |this, _, _, cx| {
-                                        this.move_queue_item(idx, target, cx)
-                                    }))
-                                })
-                            })
-                            .child(
-                                if is_active && is_processing {
-                                    // 正在转写的条目不给删：删了会让「当前项」失去归属，
-                                    // 用户想停应该用「终止批量」。
-                                    div()
-                                        .flex_shrink_0()
-                                        .px(px(Theme::SPACE_1_5))
-                                        .text_size(px(Theme::TEXT_SMALL))
-                                        .text_color(Theme::accent_orange())
-                                        .child("转写中")
-                                        .into_any_element()
-                                } else {
-                                    div()
-                                        .id(("batch-queue-remove", idx))
-                                        .flex_shrink_0()
-                                        .px(px(Theme::SPACE_1_5))
-                                        .rounded(px(Theme::RADIUS_MD))
-                                        .cursor_pointer()
-                                        .text_size(px(Theme::TEXT_SMALL))
-                                        .text_color(Theme::text_muted())
-                                        .hover(|s| {
-                                            s.bg(Theme::bg_hover_strong())
-                                                .text_color(Theme::accent_red())
-                                        })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.remove_queue_item(idx, cx)
-                                        }))
-                                        .child("移除")
-                                        .into_any_element()
-                                },
-                            )
+                            // ── Row 3: 进度条（转写中时显示）──
+                            .children(progress_line)
                     }))
-                    .when(is_main, |s| {
-                        s.child(
-                            div()
-                                .id("batch-queue-add-more-btn")
-                                .w_full()
-                                .mt(px(Theme::SPACE_1))
-                                .py(px(Theme::SPACE_2))
-                                .border_1()
-                                .border_dashed()
-                                .border_color(Theme::border())
-                                .rounded(px(Theme::RADIUS_LG))
-                                .hover(|h| h.border_color(Theme::accent_mint()).bg(Theme::tint_mint_soft()))
-                                .cursor_pointer()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .gap(px(Theme::SPACE_2))
-                                .child(
-                                    div()
-                                        .text_size(px(Theme::TEXT_BODY))
-                                        .text_color(Theme::text_muted())
-                                        .child("+ 继续添加音视频文件（支持多选）"),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.choose_batch_files(cx);
-                                })),
+            )
+            // ── 底部固定主行动按钮 ──
+            .child(
+                div()
+                    .w_full()
+                    .pt(px(Theme::SPACE_2))
+                    .border_t_1()
+                    .border_color(Theme::border())
+                    .child(if batch_running {
+                        primitives::btn(
+                            "⏹ 终止批量转写",
+                            primitives::BtnSize::Md,
+                            primitives::BtnVariant::Danger,
                         )
+                        .id("sidebar-queue-cancel-btn")
+                        .w_full()
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_batch_queue(cx)))
+                        .into_any_element()
+                    } else {
+                        primitives::btn_state(
+                            if total > 0 {
+                                format!("▶ 开始全部转写 ({pending})")
+                            } else {
+                                "▶ 开始全部转写".to_string()
+                            },
+                            primitives::BtnSize::Md,
+                            primitives::BtnVariant::Primary,
+                            can_start,
+                        )
+                        .id("sidebar-queue-start-btn")
+                        .w_full()
+                        .when(can_start, |s| {
+                            s.on_click(cx.listener(|this, _, _, cx| this.start_batch_queue(cx)))
+                        })
+                        .into_any_element()
                     }),
             )
-            .into_any_element()
     }
 }
 
@@ -1886,32 +1969,32 @@ fn render_queue_progress(p: QueueProgressView, stage: Option<&str>) -> Div {
     div()
         .w_full()
         .flex()
-        .items_center()
-        .gap(px(Theme::SPACE_2))
+        .flex_col()
+        .gap(px(Theme::SPACE_0_5))
+        .pt(px(Theme::SPACE_0_5))
         .child(
             div()
-                .flex_1()
-                .min_w(px(0.0))
-                .child(primitives::progress_bar(p.ratio)),
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .max_w(px(160.0))
+                        .truncate()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(Theme::text_muted())
+                        .child(stage.unwrap_or("转写中").to_string()),
+                )
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(Theme::accent_orange())
+                        .child(format!("{}%", p.percent)),
+                ),
         )
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_size(px(Theme::TEXT_SMALL))
-                .text_color(Theme::text_muted())
-                .child(format!("{}%", p.percent)),
-        )
-        .when_some(stage.map(str::to_string), |s, stage| {
-            s.child(
-                div()
-                    .flex_shrink_0()
-                    .max_w(px(Theme::QUEUE_LABEL_MAX_W))
-                    .truncate()
-                    .text_size(px(Theme::TEXT_SMALL))
-                    .text_color(Theme::text_muted())
-                    .child(stage),
-            )
-        })
+        .child(primitives::progress_bar(p.ratio))
 }
 
 /// 流式看板里「当前行是不是最后一行」的判据（`i` 从 0 起，纯函数便于单测）。
