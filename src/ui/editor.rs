@@ -9,7 +9,8 @@ use super::primitives;
 use super::theme::Theme;
 use super::{
     apply_line_edit, timeline_visible_positions, EditorExportFormat, EditorSubtitlePanel,
-    MainWindow, ReplaceRuleScope, StyleField, TimelineIndex,
+    MainWindow, ReplaceRuleScope, StyleField, SubtitleMonitorDrag, SubtitleMonitorDragMode,
+    TimelineIndex,
 };
 use crate::app::state::{ProcessStatus, WorkspaceTab};
 use crate::subtitle::segment::WordTiming;
@@ -753,10 +754,20 @@ impl MainWindow {
         // 才回落 `AppState::get_active_segment()` 重新定位（见
         // `cached_active_segment_index`）。这里仍然克隆整条 `Segment`：下面
         // `render_monitor_picture` 要用可变借用 `self`，这个引用活不到那里。
-        let active_seg = self
-            .cached_active_segment_index()
-            .and_then(|idx| self.state.segments.get(idx).cloned());
         let is_playing = self.state.is_playing;
+        let active_seg = if is_playing {
+            self.cached_active_segment_index()
+                .and_then(|idx| self.state.segments.get(idx).cloned())
+        } else {
+            self.cached_active_segment_index()
+                .and_then(|idx| self.state.segments.get(idx).cloned())
+                .or_else(|| {
+                    self.state.selected_segment_index.and_then(|idx| {
+                        self.state.segments.get(idx).cloned()
+                    })
+                })
+                .or_else(|| self.state.segments.first().cloned())
+        };
 
         div()
             .id("editor-video-monitor")
@@ -801,145 +812,504 @@ impl MainWindow {
                             } else {
                                 div()
                             }),
-                    )
-                    .child(
-                        // 标头小胶囊走 primitives::btn_sm_outline
-                        primitives::btn_sm_outline("独立窗口")
-                            .id("monitor-ffplay-btn")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.play_video(cx);
-                            })),
                     ),
             )
             // 监视器视口屏幕：视频画面按真实宽高比等比适配居中（分辨率探测前回退 16:9）
-            .child(
+            .child({
+                let video_aspect = self.state.video_aspect();
+                let (screen_w, screen_h) = screen;
+                let (fit_w, fit_h) = fit_video_size(
+                    video_aspect,
+                    screen_w * MONITOR_VIDEO_FIT_FRAC,
+                    screen_h * MONITOR_VIDEO_FIT_FRAC,
+                );
+
                 div()
                     .id("monitor-viewport-screen")
-                    .flex_1()
-                    .w_full()
-                    .min_h(px(Theme::VIEWPORT_MIN_H))
-                    .relative()
-                    .bg(Theme::bg_media_deep())
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .overflow_hidden()
-                    // 画面容器 (stage)：与视频画面等比，是字幕覆盖层的定位基准，
-                    // 保证字幕始终压在画面上而不是视口黑边里
-                    .child({
-                        let video_aspect = self.state.video_aspect();
-                        // 画面尺寸由「视口内屏尺寸 + 视频宽高比」显式算出并双向内接，
-                        // 而不是靠 taffy 的 aspect-ratio 推导：后者在竖屏/方屏下宽度不会
-                        // 随高度收缩，画面会溢出视口。显式尺寸下「监视器里看到多大，
-                        // 字幕覆盖层的定位基准就是多大」，两者永远一致。
-                        let (screen_w, screen_h) = screen;
-                        let (fit_w, fit_h) = fit_video_size(
-                            video_aspect,
-                            screen_w * MONITOR_VIDEO_FIT_FRAC,
-                            screen_h * MONITOR_VIDEO_FIT_FRAC,
-                        );
-                        let mut stage = div().relative();
-                        if fit_w > 0.0 && fit_h > 0.0 {
-                            stage = stage.w(px(fit_w)).h(px(fit_h));
-                        } else {
-                            // 尺寸不可得（视口尚未测量 / 比例非法）时退回旧的自适应行为
-                            stage = stage.w_full().max_h_full();
-                            stage.style().aspect_ratio = Some(video_aspect);
-                        }
-                        stage
+                        .flex_1()
+                        .w_full()
+                        .min_h(px(Theme::VIEWPORT_MIN_H))
+                        .relative()
+                        .bg(Theme::bg_media_deep())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .overflow_hidden()
+                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                            if event.pressed_button != Some(MouseButton::Left) {
+                                return;
+                            }
+                            this.handle_monitor_subtitle_drag(
+                                (f32::from(event.position.x), f32::from(event.position.y)),
+                                fit_w,
+                                fit_h,
+                                cx,
+                            );
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.end_monitor_subtitle_drag(cx);
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.end_monitor_subtitle_drag(cx);
+                            }),
+                        )
+                        // 画面容器 (stage)：与视频画面等比，是字幕覆盖层的定位基准，
+                        // 保证字幕始终压在画面上而不是视口黑边里
+                        .child({
+                            let mut stage = div().relative();
+                            if fit_w > 0.0 && fit_h > 0.0 {
+                                stage = stage.w(px(fit_w)).h(px(fit_h));
+                            } else {
+                                // 尺寸不可得（视口尚未测量 / 比例非法）时退回旧的自适应行为
+                                stage = stage.w_full().max_h_full();
+                                stage.style().aspect_ratio = Some(video_aspect);
+                            }
+
                             // 视频画面展示 (实时内嵌播放 vs 静态时间轴帧)
-                            .child(self.render_monitor_picture(window, cx))
-                            // 字幕覆盖层：完全由 config.subtitle_style 驱动，
-                            // 主界面改样式即时反映在这里（预览按 PREVIEW_SCALE 缩放显示）
-                            .child({
-                                let style = self.state.config.subtitle_style.clone();
-                                let font_px = style.preview_font_px();
-                                let (fg, bg, border) = subtitle_computed_colors(&style);
-                                // 宽度与编辑卡里的预览框同源：拖把手时两者在同一帧一起变，
-                                // 不存在「预览改了、画面上没跟上」的延迟
-                                let box_w = self.subtitle_box_w();
+                            stage = stage.child(self.render_monitor_picture(window, cx));
+
+                            // 对称参考线：水平对称线（X=50% 轴贯穿）
+                            if self.monitor_snap_x {
+                                stage = stage.child(
+                                    div()
+                                        .id("monitor-guide-line-x")
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .left(relative(0.5))
+                                        .w(px(1.5))
+                                        .bg(Theme::accent_mint())
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top(px(8.0))
+                                                .left(px(4.0))
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .bg(Theme::accent_mint())
+                                                .text_size(px(10.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(rgb(0x000000))
+                                                .child("50% 水平居中"),
+                                        ),
+                                );
+                            }
+
+                            // 对称参考线：垂直对称线（Y=50% 轴贯穿）
+                            if self.monitor_snap_y {
+                                stage = stage.child(
+                                    div()
+                                        .id("monitor-guide-line-y")
+                                        .absolute()
+                                        .left_0()
+                                        .right_0()
+                                        .top(relative(0.5))
+                                        .h(px(1.5))
+                                        .bg(Theme::accent_mint())
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left(px(8.0))
+                                                .top(px(4.0))
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .bg(Theme::accent_mint())
+                                                .text_size(px(10.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(rgb(0x000000))
+                                                .child("50% 垂直居中"),
+                                        ),
+                                );
+                            }
+
+                            // PPT 风格自由移动与缩放的字幕文字框
+                            let sample_seg = if active_seg.is_none() && !is_playing {
+                                Some(Segment {
+                                    index: 0,
+                                    start: 0.0,
+                                    end: 2.0,
+                                    text: "Voice2Word 字幕文本框".to_string(),
+                                    translation: None,
+                                    translation_lang: None,
+                                    speaker: None,
+                                    speaker_name: None,
+                                    words: Vec::new(),
+                                    polished: String::new(),
+                                    language: None,
+                                    confidence: None,
+                                })
+                            } else {
+                                None
+                            };
+                            let effective_seg = active_seg.as_ref().or(sample_seg.as_ref());
+
+                            if let Some(seg) = effective_seg {
                                 let export_mode = self.editor_export_mode;
-                                div()
+                                let style = self.state.config.subtitle_style.clone();
+                                let video_scale = if fit_h > 0.0 { fit_h / 1080.0 } else { 0.5 };
+                                let font_px = (style.font_size as f32 * video_scale).clamp(12.0, 96.0);
+                                let (fg, bg, border) = subtitle_computed_colors(&style);
+
+                                let display_text = seg.export_text(export_mode);
+                                let max_line_chars = display_text
+                                    .lines()
+                                    .map(|l| l.chars().count())
+                                    .max()
+                                    .unwrap_or_else(|| display_text.chars().count())
+                                    .max(1);
+                                // 严丝合缝贴合字幕文字的文本框尺寸（字数 × 单字宽度 + 边距），像 PPT 一样包裹文字
+                                let content_w = ((max_line_chars as f32 * font_px) + 28.0).clamp(60.0, (fit_w - 16.0).max(60.0));
+                                let box_w = content_w;
+
+                                let cur_x_pct = style.pos_x_percent.clamp(5.0, 95.0);
+                                let cur_y_pct = style.current_pos_y_percent().clamp(5.0, 95.0);
+                                let center_x = fit_w * (cur_x_pct / 100.0);
+                                let center_y = fit_h * (cur_y_pct / 100.0);
+
+                                let box_left = (center_x - box_w / 2.0).clamp(4.0, (fit_w - box_w - 4.0).max(4.0));
+                                let approx_h = (font_px * style.line_spacing * 1.4 + 16.0).clamp(24.0, 300.0);
+                                let box_top = (center_y - approx_h / 2.0).clamp(4.0, (fit_h - approx_h - 4.0).max(4.0));
+
+                                let is_selected = self.monitor_subtitle_selected;
+                                let is_dragging = self.monitor_subtitle_drag.is_some();
+                                // 未播放时默认常驻展示 PPT 选框与缩放手柄，让用户一眼可见并随时拖拽调节
+                                let show_ppt_frame = !is_playing || is_selected || is_dragging;
+
+                                let is_moving = matches!(
+                                    self.monitor_subtitle_drag,
+                                    Some(SubtitleMonitorDrag { mode: SubtitleMonitorDragMode::Move, .. })
+                                );
+
+                                let mut box_container = div()
+                                    .id("monitor-subtitle-movable-box")
                                     .absolute()
-                                    .bottom(relative(style.preview_bottom_ratio()))
-                                    .left_0()
-                                    .right_0()
-                                    .flex()
-                                    .justify_center()
-                                    .px_6()
-                                    .child(if let Some(seg) = active_seg {
-                                        div()
-                                            // 固定宽度（不是 max_w）：拖动把手时画面上的
-                                            // 字幕框要跟着同宽变化，而不是只有超长句才受影响。
-                                            // 短句在框内居中，长句按此宽度折行——与编辑卡的
-                                            // 预览框是同一个宽度值，两者同步增减。
-                                            .w(px(box_w))
-                                            .min_w_0()
-                                            .px_3()
-                                            .py_1()
-                                            .rounded_md()
-                                            .bg(bg)
-                                            .border_1()
-                                            .border_color(border)
-                                            .text_size(px(font_px))
-                                            .font_weight(if style.is_bold {
-                                                FontWeight::BOLD
-                                            } else {
-                                                FontWeight::NORMAL
-                                            })
-                                            .text_color(fg)
-                                            .text_align(match style.alignment.as_str() {
-                                                "left" => TextAlign::Left,
-                                                "right" => TextAlign::Right,
-                                                _ => TextAlign::Center,
-                                            })
-                                            .line_height(px(font_px * style.line_spacing))
-                                            // 预览与导出同源：按当前导出内容模式渲染，
-                                            // 译好之后在监视器里就能直接看到译文/双语。
-                                            // 有词级时间戳时，原文行做「卡拉 OK」逐词高亮：已读词加薄荷浅底、
-                                            // 当前词换强调色加粗（样式见 `karaoke_mark_style`）；双语模式下译文行
-                                            // 没有词级时间，只高亮原文行。
-                                            .child({
-                                                let display_text = seg.export_text(export_mode);
-                                                let raw_text = seg.display_text();
-                                                let highlights = raw_line_byte_start(
-                                                    &display_text,
-                                                    raw_text,
-                                                    export_mode,
-                                                )
-                                                .map(
-                                                    |base| -> Vec<(Range<usize>, HighlightStyle)> {
-                                                        karaoke_word_marks(
-                                                            raw_text, &seg.words, cur_time,
-                                                            seg.start, seg.end,
-                                                        )
-                                                        .into_iter()
-                                                        .map(|(range, mark)| {
-                                                            (
-                                                                base + range.start
-                                                                    ..base + range.end,
-                                                                karaoke_mark_style(mark),
-                                                            )
-                                                        })
-                                                        .collect()
-                                                    },
-                                                )
-                                                .unwrap_or_default();
-                                                if highlights.is_empty() {
-                                                    // 无词级信息 / 文本与词表被改到对不齐：退回纯文本，外观与改动前一致。
-                                                    display_text.into_any_element()
-                                                } else {
-                                                    StyledText::new(display_text)
-                                                        .with_highlights(highlights)
-                                                        .into_any_element()
-                                                }
-                                            })
-                                    } else {
-                                        div()
+                                    .left(px(box_left))
+                                    .top(px(box_top))
+                                    .w(px(box_w))
+                                    .when(show_ppt_frame, |d| {
+                                        d.bg(rgba(0x38bdf80d))
+                                            .hover(|s| s.bg(rgba(0x38bdf81a)))
                                     })
-                            })
-                    }),
-            )
+                                    .cursor(if is_moving {
+                                        CursorStyle::ClosedHand
+                                    } else {
+                                        CursorStyle::OpenHand
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener({
+                                            let box_w = box_w;
+                                            move |this, event: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                this.begin_monitor_subtitle_drag(
+                                                    SubtitleMonitorDragMode::Move,
+                                                    (f32::from(event.position.x), f32::from(event.position.y)),
+                                                    box_w,
+                                                    cx,
+                                                );
+                                            }
+                                        }),
+                                    );
+
+                                let text_element = div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(bg)
+                                    .border_1()
+                                    .border_color(border)
+                                    .hover(|s| s.border_1().border_color(rgb(0x38bdf8)))
+                                    .text_size(px(font_px))
+                                    .font_weight(if style.is_bold {
+                                        FontWeight::BOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .text_color(fg)
+                                    .text_align(match style.alignment.as_str() {
+                                        "left" => TextAlign::Left,
+                                        "right" => TextAlign::Right,
+                                        _ => TextAlign::Center,
+                                    })
+                                    .line_height(px(font_px * style.line_spacing))
+                                .child({
+                                    let display_text = seg.export_text(export_mode);
+                                    let raw_text = seg.display_text();
+                                    let highlights = raw_line_byte_start(
+                                        &display_text,
+                                        raw_text,
+                                        export_mode,
+                                    )
+                                    .map(
+                                        |base| -> Vec<(Range<usize>, HighlightStyle)> {
+                                            karaoke_word_marks(
+                                                raw_text, &seg.words, cur_time,
+                                                seg.start, seg.end,
+                                            )
+                                            .into_iter()
+                                            .map(|(range, mark)| {
+                                                (
+                                                    base + range.start
+                                                        ..base + range.end,
+                                                    karaoke_mark_style(mark),
+                                                )
+                                            })
+                                            .collect()
+                                        },
+                                    )
+                                    .unwrap_or_default();
+                                    if highlights.is_empty() {
+                                        display_text.into_any_element()
+                                    } else {
+                                        StyledText::new(display_text)
+                                            .with_highlights(highlights)
+                                            .into_any_element()
+                                    }
+                                });
+
+                            box_container = box_container.child(text_element);
+
+                            if show_ppt_frame {
+                                // PPT 风格蓝色矩形选框
+                                box_container = box_container.child(
+                                    div()
+                                        .id("ppt-frame-outline")
+                                        .absolute()
+                                        .inset_0()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x38bdf8)),
+                                );
+
+                                // 左上手柄 (NW)
+                                box_container = box_container.child(
+                                    div()
+                                        .id("ppt-handle-tl")
+                                        .absolute()
+                                        .top(px(-6.0))
+                                        .left(px(-6.0))
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .rounded_sm()
+                                        .bg(rgb(0xffffff))
+                                        .border_1()
+                                        .border_color(rgb(0x0284c7))
+                                        .cursor(CursorStyle::ResizeUpLeftDownRight)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener({
+                                                let box_w = box_w;
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.begin_monitor_subtitle_drag(
+                                                        SubtitleMonitorDragMode::ResizeCorner { is_top: true, is_left: true },
+                                                        (f32::from(event.position.x), f32::from(event.position.y)),
+                                                        box_w,
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        ),
+                                );
+
+                                // 右上手柄 (NE)
+                                box_container = box_container.child(
+                                    div()
+                                        .id("ppt-handle-tr")
+                                        .absolute()
+                                        .top(px(-6.0))
+                                        .right(px(-6.0))
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .rounded_sm()
+                                        .bg(rgb(0xffffff))
+                                        .border_1()
+                                        .border_color(rgb(0x0284c7))
+                                        .cursor(CursorStyle::ResizeUpRightDownLeft)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener({
+                                                let box_w = box_w;
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.begin_monitor_subtitle_drag(
+                                                        SubtitleMonitorDragMode::ResizeCorner { is_top: true, is_left: false },
+                                                        (f32::from(event.position.x), f32::from(event.position.y)),
+                                                        box_w,
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        ),
+                                );
+
+                                // 左下手柄 (SW)
+                                box_container = box_container.child(
+                                    div()
+                                        .id("ppt-handle-bl")
+                                        .absolute()
+                                        .bottom(px(-6.0))
+                                        .left(px(-6.0))
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .rounded_sm()
+                                        .bg(rgb(0xffffff))
+                                        .border_1()
+                                        .border_color(rgb(0x0284c7))
+                                        .cursor(CursorStyle::ResizeUpRightDownLeft)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener({
+                                                let box_w = box_w;
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.begin_monitor_subtitle_drag(
+                                                        SubtitleMonitorDragMode::ResizeCorner { is_top: false, is_left: true },
+                                                        (f32::from(event.position.x), f32::from(event.position.y)),
+                                                        box_w,
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        ),
+                                );
+
+                                // 右下手柄 (SE)
+                                box_container = box_container.child(
+                                    div()
+                                        .id("ppt-handle-br")
+                                        .absolute()
+                                        .bottom(px(-6.0))
+                                        .right(px(-6.0))
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .rounded_sm()
+                                        .bg(rgb(0xffffff))
+                                        .border_1()
+                                        .border_color(rgb(0x0284c7))
+                                        .cursor(CursorStyle::ResizeUpLeftDownRight)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener({
+                                                let box_w = box_w;
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.begin_monitor_subtitle_drag(
+                                                        SubtitleMonitorDragMode::ResizeCorner { is_top: false, is_left: false },
+                                                        (f32::from(event.position.x), f32::from(event.position.y)),
+                                                        box_w,
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        ),
+                                );
+
+                                // 左边缘手柄 (W)
+                                box_container = box_container.child(
+                                    div()
+                                        .id("ppt-handle-ml")
+                                        .absolute()
+                                        .top(relative(0.5))
+                                        .left(px(-5.0))
+                                        .mt(px(-8.0))
+                                        .w(px(10.0))
+                                        .h(px(16.0))
+                                        .rounded_sm()
+                                        .bg(rgb(0xffffff))
+                                        .border_1()
+                                        .border_color(rgb(0x0284c7))
+                                        .cursor_col_resize()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener({
+                                                let box_w = box_w;
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.begin_monitor_subtitle_drag(
+                                                        SubtitleMonitorDragMode::ResizeHorizontal { is_left: true },
+                                                        (f32::from(event.position.x), f32::from(event.position.y)),
+                                                        box_w,
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        ),
+                                );
+
+                                // 右边缘手柄 (E)
+                                box_container = box_container.child(
+                                    div()
+                                        .id("ppt-handle-mr")
+                                        .absolute()
+                                        .top(relative(0.5))
+                                        .right(px(-5.0))
+                                        .mt(px(-8.0))
+                                        .w(px(10.0))
+                                        .h(px(16.0))
+                                        .rounded_sm()
+                                        .bg(rgb(0xffffff))
+                                        .border_1()
+                                        .border_color(rgb(0x0284c7))
+                                        .cursor_col_resize()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener({
+                                                let box_w = box_w;
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.begin_monitor_subtitle_drag(
+                                                        SubtitleMonitorDragMode::ResizeHorizontal { is_left: false },
+                                                        (f32::from(event.position.x), f32::from(event.position.y)),
+                                                        box_w,
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        ),
+                                );
+
+                                // 顶部提示胶囊：展示字号、宽度与当前位置
+                                box_container = box_container.child(
+                                    div()
+                                        .id("ppt-info-badge")
+                                        .absolute()
+                                        .bottom_full()
+                                        .mb_1()
+                                        .left_0()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(primitives::tag_tinted(
+                                            format!(
+                                                "字号: {}px | 宽: {}px | X: {:.0}% Y: {:.0}%",
+                                                style.font_size,
+                                                box_w.round() as u32,
+                                                cur_x_pct,
+                                                cur_y_pct,
+                                            ),
+                                            Theme::tint_blue_soft(),
+                                            Theme::tint_blue_border(),
+                                            Theme::accent_blue(),
+                                        )),
+                                );
+                            }
+
+                            stage = stage.child(box_container);
+                        }
+
+                        stage
+                    })
+            })
             // 监视器底部播放控制器与时间码显示
             .child(
                 div()
@@ -1447,11 +1817,8 @@ impl MainWindow {
                                                     .child("恢复默认"),
                                             ),
                                     )
-                                // 1) 文字颜色池（纯色圆点 + 最后一个调色板色轮）
+                                // 1) 文字样式与排版工具条
                                 .child({
-                                    let is_custom_color = !crate::utils::SUBTITLE_COLOR_PALETTE
-                                        .iter()
-                                        .any(|(_, hex)| cur_style.primary_color.eq_ignore_ascii_case(hex));
                                     let is_picker_open = self.custom_color_picker_open;
 
                                     div()
@@ -1462,205 +1829,112 @@ impl MainWindow {
                                             div()
                                                 .flex()
                                                 .items_center()
-                                                .gap_1p5()
-                                                .child(
-                                                    div()
-                                                        .w(px(58.0))
-                                                        .flex_shrink_0()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .text_color(Theme::text_secondary())
-                                                        .child("文字颜色"),
-                                                )
+                                                .flex_wrap()
+                                                .gap_2()
+                                                .py_0p5()
+                                                // 字号微调 A- 24px A+
                                                 .child(
                                                     div()
                                                         .flex()
                                                         .items_center()
-                                                        .flex_wrap()
-                                                        .gap_2()
-                                                        // 7 个预设纯色小圆点
-                                                        .children(crate::utils::SUBTITLE_COLOR_PALETTE.into_iter().enumerate().map(|(idx, (_name, hex))| {
-                                                            let is_sel = cur_style.primary_color.eq_ignore_ascii_case(hex);
-                                                            let (r, g, b) = crate::utils::SubtitleStyleConfig::hex_to_rgb(hex);
-                                                            let swatch_color = rgb((r as u32) << 16 | (g as u32) << 8 | (b as u32));
+                                                        .bg(Theme::bg_inset())
+                                                        .border_1()
+                                                        .border_color(Theme::border_subtle())
+                                                        .rounded_md()
+                                                        .child(
                                                             div()
-                                                                .id(("color-opt", idx))
-                                                                .w(px(22.0))
-                                                                .h(px(22.0))
-                                                                .rounded_full()
-                                                                .cursor_pointer()
-                                                                .bg(swatch_color)
-                                                                .border_2()
-                                                                .border_color(if is_sel {
-                                                                    Theme::accent_mint()
-                                                                } else {
-                                                                    rgba(0x80808044)
-                                                                })
-                                                                .hover(|s| if !is_sel { s.border_color(Theme::text_secondary()) } else { s })
-                                                                .on_click(cx.listener({
-                                                                    let hex_str = hex.to_string();
-                                                                    move |this, _, _, cx| {
-                                                                        this.state.config.subtitle_style.primary_color = hex_str.clone();
-                                                                        this.state.save_subtitle_style();
-                                                                        cx.notify();
-                                                                    }
-                                                                }))
-                                                        }))
-                                                        // 最后一个：调色板色轮圆点（可滑动自定义调色）
-                                                        .child({
-                                                            let is_wheel_active = is_custom_color || is_picker_open;
-                                                            let (r, g, b) = crate::utils::SubtitleStyleConfig::hex_to_rgb(&cur_style.primary_color);
-                                                            let cur_swatch = rgb((r as u32) << 16 | (g as u32) << 8 | (b as u32));
-                                                            div()
-                                                                .id("color-wheel-toggle-btn")
-                                                                .w(px(22.0))
-                                                                .h(px(22.0))
-                                                                .rounded_full()
-                                                                .cursor_pointer()
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .bg(if is_custom_color { cur_swatch } else { Theme::bg_inset() })
-                                                                .border_2()
-                                                                .border_color(if is_wheel_active {
-                                                                    Theme::accent_mint()
-                                                                } else {
-                                                                    rgba(0x80808044)
-                                                                })
-                                                                .hover(|s| s.border_color(Theme::accent_mint()))
-                                                                .child(
-                                                                    if is_custom_color {
-                                                                        div()
-                                                                    } else {
-                                                                        div()
-                                                                            .text_size(px(10.0))
-                                                                            .child("🎨")
-                                                                    }
-                                                                )
-                                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                                    this.custom_color_picker_open = !this.custom_color_picker_open;
-                                                                    cx.notify();
-                                                                }))
-                                                        })
-                                                )
-                                        )
-                                        // 若调色板展开：显示环形色轮与自由滑动调色卡片
-                                        .child(if is_picker_open {
-                                            self.render_color_wheel_picker(&cur_style.primary_color, cx)
-                                        } else {
-                                            div().into_any_element()
-                                        })
-                                })
-                                // 2) 字重与水平对齐（彻底分离成两列独立控件，消除混淆感）
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        // 左列：字重
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .child(
-                                                    div()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .text_color(Theme::text_secondary())
-                                                        .child("字重"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap_1()
-                                                        .child({
-                                                            let is_bold = cur_style.is_bold;
-                                                            div()
-                                                                .id("btn-bold-on")
-                                                                .flex_1()
-                                                                .min_w(px(0.0))
+                                                                .id("ribbon-font-dec")
+                                                                .px_2()
                                                                 .py_0p5()
-                                                                .rounded_md()
                                                                 .cursor_pointer()
                                                                 .text_size(px(Theme::TEXT_SMALL))
                                                                 .font_weight(FontWeight::BOLD)
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .bg(if is_bold { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                                .border_1()
-                                                                .border_color(if is_bold { Theme::accent_mint() } else { Theme::border_subtle() })
-                                                                .text_color(if is_bold { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                                .child("加粗")
+                                                                .text_color(Theme::text_secondary())
+                                                                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::accent_mint()))
+                                                                .child("A-")
                                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                                    this.state.config.subtitle_style.is_bold = true;
+                                                                    let cur = this.state.config.subtitle_style.font_size;
+                                                                    this.state.config.subtitle_style.font_size = cur.saturating_sub(2).max(10);
                                                                     this.state.save_subtitle_style();
                                                                     cx.notify();
                                                                 }))
-                                                        })
-                                                        .child({
-                                                            let is_bold = cur_style.is_bold;
+                                                        )
+                                                        .child(
                                                             div()
-                                                                .id("btn-bold-off")
-                                                                .flex_1()
-                                                                .min_w(px(0.0))
+                                                                .px_2()
                                                                 .py_0p5()
-                                                                .rounded_md()
+                                                                .text_size(px(Theme::TEXT_SMALL))
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .text_color(Theme::accent_mint())
+                                                                .child(format!("{}px", cur_style.font_size))
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id("ribbon-font-inc")
+                                                                .px_2()
+                                                                .py_0p5()
                                                                 .cursor_pointer()
                                                                 .text_size(px(Theme::TEXT_SMALL))
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .bg(if !is_bold { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                                .border_1()
-                                                                .border_color(if !is_bold { Theme::accent_mint() } else { Theme::border_subtle() })
-                                                                .text_color(if !is_bold { Theme::text_on_accent() } else { Theme::text_secondary() })
-                                                                .child("常规")
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .text_color(Theme::text_secondary())
+                                                                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::accent_mint()))
+                                                                .child("A+")
                                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                                    this.state.config.subtitle_style.is_bold = false;
+                                                                    let cur = this.state.config.subtitle_style.font_size;
+                                                                    this.state.config.subtitle_style.font_size = (cur + 2).min(120);
                                                                     this.state.save_subtitle_style();
                                                                     cx.notify();
                                                                 }))
-                                                        })
+                                                        )
                                                 )
-                                        )
-                                        // 右列：水平对齐
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .child(
+                                                // 加粗 B
+                                                .child({
+                                                    let is_bold = cur_style.is_bold;
                                                     div()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .text_color(Theme::text_secondary())
-                                                        .child("对齐"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_1()
+                                                        .id("ribbon-btn-bold")
+                                                        .w(px(26.0))
+                                                        .h(px(26.0))
+                                                        .rounded_md()
+                                                        .cursor_pointer()
                                                         .flex()
                                                         .items_center()
-                                                        .gap_1()
-                                                        .children([("靠左", "left"), ("居中", "center"), ("靠右", "right")].into_iter().enumerate().map(|(idx, (label, align))| {
+                                                        .justify_center()
+                                                        .text_size(px(13.0))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .bg(if is_bold { Theme::accent_mint() } else { Theme::bg_inset() })
+                                                        .border_1()
+                                                        .border_color(if is_bold { Theme::accent_mint() } else { Theme::border_subtle() })
+                                                        .text_color(if is_bold { Theme::text_on_accent() } else { Theme::text_primary() })
+                                                        .hover(|s| if !is_bold { s.border_color(Theme::accent_mint()) } else { s })
+                                                        .child("B")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.state.config.subtitle_style.is_bold = !this.state.config.subtitle_style.is_bold;
+                                                            this.state.save_subtitle_style();
+                                                            cx.notify();
+                                                        }))
+                                                })
+                                                // 对齐
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .bg(Theme::bg_inset())
+                                                        .border_1()
+                                                        .border_color(Theme::border_subtle())
+                                                        .rounded_md()
+                                                        .p_0p5()
+                                                        .gap_0p5()
+                                                        .children([("左", "left"), ("中", "center"), ("右", "right")].into_iter().enumerate().map(|(idx, (label, align))| {
                                                             let is_sel = cur_style.alignment == align;
                                                             div()
-                                                                .id(("align-btn", idx))
-                                                                .flex_1()
-                                                                .min_w(px(0.0))
+                                                                .id(("ribbon-align", idx))
+                                                                .px_2()
                                                                 .py_0p5()
-                                                                .rounded_md()
+                                                                .rounded_sm()
                                                                 .cursor_pointer()
                                                                 .text_size(px(Theme::TEXT_SMALL))
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .bg(if is_sel { Theme::accent_mint() } else { Theme::bg_inset() })
-                                                                .border_1()
-                                                                .border_color(if is_sel { Theme::accent_mint() } else { Theme::border_subtle() })
+                                                                .font_weight(if is_sel { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                                                .bg(if is_sel { Theme::accent_mint() } else { rgba(0x00000000) })
                                                                 .text_color(if is_sel { Theme::text_on_accent() } else { Theme::text_secondary() })
                                                                 .child(label)
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1670,8 +1944,67 @@ impl MainWindow {
                                                                 }))
                                                         }))
                                                 )
+                                                // 颜色圆点
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1p5()
+                                                        .children(crate::utils::SUBTITLE_COLOR_PALETTE.into_iter().take(6).enumerate().map(|(idx, (_name, hex))| {
+                                                            let is_sel = cur_style.primary_color.eq_ignore_ascii_case(hex);
+                                                            let (r, g, b) = crate::utils::SubtitleStyleConfig::hex_to_rgb(hex);
+                                                            let swatch_color = rgb((r as u32) << 16 | (g as u32) << 8 | (b as u32));
+                                                            div()
+                                                                .id(("ribbon-color", idx))
+                                                                .w(px(18.0))
+                                                                .h(px(18.0))
+                                                                .rounded_full()
+                                                                .cursor_pointer()
+                                                                .bg(swatch_color)
+                                                                .border_2()
+                                                                .border_color(if is_sel { Theme::accent_mint() } else { rgba(0x80808044) })
+                                                                .on_click(cx.listener({
+                                                                    let hex_str = hex.to_string();
+                                                                    move |this, _, _, cx| {
+                                                                        this.state.config.subtitle_style.primary_color = hex_str.clone();
+                                                                        this.state.save_subtitle_style();
+                                                                        cx.notify();
+                                                                    }
+                                                                }))
+                                                        }))
+                                                        .child({
+                                                            let is_custom_color = !crate::utils::SUBTITLE_COLOR_PALETTE
+                                                                .iter()
+                                                                .any(|(_, hex)| cur_style.primary_color.eq_ignore_ascii_case(hex));
+                                                            let is_picker_open = self.custom_color_picker_open;
+                                                            div()
+                                                                .id("ribbon-color-wheel-btn")
+                                                                .w(px(20.0))
+                                                                .h(px(20.0))
+                                                                .rounded_full()
+                                                                .cursor_pointer()
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .bg(Theme::bg_inset())
+                                                                .border_1()
+                                                                .border_color(if is_picker_open || is_custom_color { Theme::accent_mint() } else { Theme::border_subtle() })
+                                                                .child(div().text_size(px(10.0)).child("🎨"))
+                                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                                    this.custom_color_picker_open = !this.custom_color_picker_open;
+                                                                    cx.notify();
+                                                                }))
+                                                        })
+                                                ),
                                         )
-                                )
+                                        // 若调色板展开：显示环形色轮与自由滑动调色卡片
+                                        .child(if is_picker_open {
+                                            self.render_color_wheel_picker(&cur_style.primary_color, cx)
+                                        } else {
+                                            div().into_any_element()
+                                        })
+                                })
+
                                 // 3) 文字描边与背景底框（双列紧凑下拉选择框）
                                 .child({
                                     let outline_open = self.outline_dropdown_open;
@@ -1691,19 +2024,19 @@ impl MainWindow {
 
                                     div()
                                         .flex()
-                                        .flex_col()
-                                        .gap_1()
+                                        .items_center()
+                                        .gap_2()
+                                        // 左列：描边悬浮下拉框
                                         .child(
                                             div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
-                                                // 左列：文字描边下拉触发器
+                                                .relative()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                // 触发器按钮
                                                 .child(
                                                     div()
                                                         .id("outline-dropdown-trigger")
-                                                        .flex_1()
-                                                        .min_w(px(0.0))
+                                                        .w_full()
                                                         .h(px(26.0))
                                                         .px_2()
                                                         .rounded_md()
@@ -1718,29 +2051,97 @@ impl MainWindow {
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             this.outline_dropdown_open = !this.outline_dropdown_open;
                                                             this.bg_style_dropdown_open = false;
+                                                            cx.stop_propagation();
                                                             cx.notify();
                                                         }))
                                                         .child(
                                                             div()
-                                                                 .flex()
-                                                                 .items_center()
-                                                                 .gap_1()
-                                                                 .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("描边"))
-                                                                 .child(div().text_size(px(Theme::TEXT_SMALL)).font_weight(FontWeight::MEDIUM).text_color(Theme::text_primary()).child(cur_outline_label)),
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap_1()
+                                                                .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("描边"))
+                                                                .child(div().text_size(px(Theme::TEXT_SMALL)).font_weight(FontWeight::MEDIUM).text_color(Theme::text_primary()).child(cur_outline_label)),
                                                         )
                                                         .child(
                                                             div()
                                                                 .text_size(px(Theme::TEXT_CAPTION))
                                                                 .text_color(Theme::text_secondary())
                                                                 .child(if outline_open { "▲" } else { "▼" }),
-                                                        ),
+                                                        )
                                                 )
-                                                // 右列：背景底框下拉触发器
+                                                // 悬浮菜单：absolute 浮于上方，不挤压文档流
+                                                .children(if outline_open {
+                                                    Some(
+                                                        gpui::deferred(
+                                                            div()
+                                                                .id("outline-dropdown-floating-menu")
+                                                            .absolute()
+                                                            .top(px(29.0))
+                                                            .left_0()
+                                                            .w_full()
+                                                            .min_w(px(100.0))
+                                                            .rounded_md()
+                                                            .bg(Theme::bg_card())
+                                                            .border_1()
+                                                            .border_color(Theme::border_strong())
+                                                            .shadow_lg()
+                                                            .p_1()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap_0p5()
+                                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                                cx.stop_propagation();
+                                                            })
+                                                            .children(crate::utils::SUBTITLE_OUTLINE_OPTIONS.into_iter().enumerate().map(|(idx, (label, width))| {
+                                                                let is_sel = (cur_style.outline_width - width).abs() < 0.1;
+                                                                div()
+                                                                    .id(("outline-opt", idx))
+                                                                    .px_2()
+                                                                    .py_1()
+                                                                    .rounded_sm()
+                                                                    .cursor_pointer()
+                                                                    .bg(if is_sel { Theme::tint_mint_badge() } else { Theme::transparent() })
+                                                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_between()
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(Theme::TEXT_SMALL))
+                                                                            .font_weight(if is_sel { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                                                            .text_color(if is_sel { Theme::accent_mint() } else { Theme::text_primary() })
+                                                                            .child(label),
+                                                                    )
+                                                                    .children(if is_sel {
+                                                                        Some(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::accent_mint()).child("✓"))
+                                                                    } else {
+                                                                        None
+                                                                    })
+                                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                                        this.state.config.subtitle_style.outline_width = width;
+                                                                        this.state.save_subtitle_style();
+                                                                        this.outline_dropdown_open = false;
+                                                                        cx.stop_propagation();
+                                                                        cx.notify();
+                                                                    }))
+                                                            }))
+                                                        )
+                                                    )
+                                                } else {
+                                                    None
+                                                })
+                                        )
+                                        // 右列：底框悬浮下拉框
+                                        .child(
+                                            div()
+                                                .relative()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                // 触发器按钮
                                                 .child(
                                                     div()
                                                         .id("bg-style-dropdown-trigger")
-                                                        .flex_1()
-                                                        .min_w(px(0.0))
+                                                        .w_full()
                                                         .h(px(26.0))
                                                         .px_2()
                                                         .rounded_md()
@@ -1755,6 +2156,7 @@ impl MainWindow {
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             this.bg_style_dropdown_open = !this.bg_style_dropdown_open;
                                                             this.outline_dropdown_open = false;
+                                                            cx.stop_propagation();
                                                             cx.notify();
                                                         }))
                                                         .child(
@@ -1770,107 +2172,70 @@ impl MainWindow {
                                                                 .text_size(px(Theme::TEXT_CAPTION))
                                                                 .text_color(Theme::text_secondary())
                                                                 .child(if bg_open { "▲" } else { "▼" }),
-                                                        ),
-                                                ),
+                                                        )
+                                                )
+                                                // 悬浮菜单：absolute 浮于上方，不挤压文档流
+                                                .children(if bg_open {
+                                                    Some(
+                                                        gpui::deferred(
+                                                            div()
+                                                                .id("bg-style-dropdown-floating-menu")
+                                                            .absolute()
+                                                            .top(px(29.0))
+                                                            .left_0()
+                                                            .w_full()
+                                                            .min_w(px(100.0))
+                                                            .rounded_md()
+                                                            .bg(Theme::bg_card())
+                                                            .border_1()
+                                                            .border_color(Theme::border_strong())
+                                                            .shadow_lg()
+                                                            .p_1()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap_0p5()
+                                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                                cx.stop_propagation();
+                                                            })
+                                                            .children([("投影", "shadow"), ("黑框", "box"), ("胶囊", "pill"), ("纯净", "none")].into_iter().enumerate().map(|(idx, (label, mode))| {
+                                                                let is_sel = cur_style.bg_style == mode;
+                                                                div()
+                                                                    .id(("bg-mode-opt", idx))
+                                                                    .px_2()
+                                                                    .py_1()
+                                                                    .rounded_sm()
+                                                                    .cursor_pointer()
+                                                                    .bg(if is_sel { Theme::tint_mint_badge() } else { Theme::transparent() })
+                                                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_between()
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(Theme::TEXT_SMALL))
+                                                                            .font_weight(if is_sel { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                                                            .text_color(if is_sel { Theme::accent_mint() } else { Theme::text_primary() })
+                                                                            .child(label),
+                                                                    )
+                                                                    .children(if is_sel {
+                                                                        Some(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::accent_mint()).child("✓"))
+                                                                    } else {
+                                                                        None
+                                                                    })
+                                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                                        this.state.config.subtitle_style.bg_style = mode.to_string();
+                                                                        this.state.save_subtitle_style();
+                                                                        this.bg_style_dropdown_open = false;
+                                                                        cx.stop_propagation();
+                                                                        cx.notify();
+                                                                    }))
+                                                            }))
+                                                        )
+                                                    )
+                                                } else {
+                                                    None
+                                                })
                                         )
-                                        // 描边下拉展开菜单
-                                        .children(if outline_open {
-                                            Some(
-                                                div()
-                                                    .id("outline-dropdown-menu")
-                                                    .rounded_md()
-                                                    .bg(Theme::bg_card())
-                                                    .border_1()
-                                                    .border_color(Theme::border())
-                                                    .p_1()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap_0p5()
-                                                    .children(crate::utils::SUBTITLE_OUTLINE_OPTIONS.into_iter().enumerate().map(|(idx, (label, width))| {
-                                                        let is_sel = (cur_style.outline_width - width).abs() < 0.1;
-                                                        div()
-                                                            .id(("outline-opt", idx))
-                                                            .px_2()
-                                                            .py_1()
-                                                            .rounded_md()
-                                                            .cursor_pointer()
-                                                            .bg(if is_sel { Theme::tint_mint_badge() } else { Theme::transparent() })
-                                                            .hover(|s| s.bg(Theme::bg_hover()))
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_between()
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(Theme::TEXT_SMALL))
-                                                                    .font_weight(if is_sel { FontWeight::BOLD } else { FontWeight::NORMAL })
-                                                                    .text_color(if is_sel { Theme::accent_mint() } else { Theme::text_primary() })
-                                                                    .child(label),
-                                                            )
-                                                            .children(if is_sel {
-                                                                Some(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::accent_mint()).child("✓"))
-                                                            } else {
-                                                                None
-                                                            })
-                                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                                this.state.config.subtitle_style.outline_width = width;
-                                                                this.state.save_subtitle_style();
-                                                                this.outline_dropdown_open = false;
-                                                                cx.notify();
-                                                            }))
-                                                    }))
-                                            )
-                                        } else {
-                                            None
-                                        })
-                                        // 底框下拉展开菜单
-                                        .children(if bg_open {
-                                            Some(
-                                                div()
-                                                    .id("bg-style-dropdown-menu")
-                                                    .rounded_md()
-                                                    .bg(Theme::bg_card())
-                                                    .border_1()
-                                                    .border_color(Theme::border())
-                                                    .p_1()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap_0p5()
-                                                    .children([("投影", "shadow"), ("黑框", "box"), ("胶囊", "pill"), ("纯净", "none")].into_iter().enumerate().map(|(idx, (label, mode))| {
-                                                        let is_sel = cur_style.bg_style == mode;
-                                                        div()
-                                                            .id(("bg-mode-opt", idx))
-                                                            .px_2()
-                                                            .py_1()
-                                                            .rounded_md()
-                                                            .cursor_pointer()
-                                                            .bg(if is_sel { Theme::tint_mint_badge() } else { Theme::transparent() })
-                                                            .hover(|s| s.bg(Theme::bg_hover()))
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_between()
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(Theme::TEXT_SMALL))
-                                                                    .font_weight(if is_sel { FontWeight::BOLD } else { FontWeight::NORMAL })
-                                                                    .text_color(if is_sel { Theme::accent_mint() } else { Theme::text_primary() })
-                                                                    .child(label),
-                                                            )
-                                                            .children(if is_sel {
-                                                                Some(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::accent_mint()).child("✓"))
-                                                            } else {
-                                                                None
-                                                            })
-                                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                                this.state.config.subtitle_style.bg_style = mode.to_string();
-                                                                this.state.save_subtitle_style();
-                                                                this.bg_style_dropdown_open = false;
-                                                                cx.notify();
-                                                            }))
-                                                    }))
-                                            )
-                                        } else {
-                                            None
-                                        })
                                 })
                                 // 5) 排版参数（双列紧凑网格：字号/字距、行距/边距、单行限制，高度砍半更紧凑）
                                 .child(
@@ -1878,42 +2243,17 @@ impl MainWindow {
                                         .flex()
                                         .flex_col()
                                         .gap_1p5()
-                                        // 第 1 行：字号 + 字距
+                                        // 排版微调行：字距、行距、边距、单行限制（无重复字号）
                                         .child(
                                             div()
                                                 .flex()
                                                 .items_center()
+                                                .flex_wrap()
                                                 .gap_2()
                                                 .child(
                                                     div()
                                                         .flex_1()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap_1p5()
-                                                        .child(div().w(px(32.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("字号"))
-                                                        .child(self.render_style_stepper_input(
-                                                            StyleField::FontSize,
-                                                            "-2",
-                                                            "+2",
-                                                            |this, cx| {
-                                                                let cur = this.state.config.subtitle_style.font_size;
-                                                                this.state.config.subtitle_style.font_size = cur.saturating_sub(2).max(10);
-                                                                this.state.save_subtitle_style();
-                                                                cx.notify();
-                                                            },
-                                                            |this, cx| {
-                                                                let cur = this.state.config.subtitle_style.font_size;
-                                                                this.state.config.subtitle_style.font_size = (cur + 2).min(120);
-                                                                this.state.save_subtitle_style();
-                                                                cx.notify();
-                                                            },
-                                                            format!("{}px", cur_style.font_size),
-                                                            cx,
-                                                        ))
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_1()
+                                                        .min_w(px(140.0))
                                                         .flex()
                                                         .items_center()
                                                         .gap_1p5()
@@ -1938,16 +2278,10 @@ impl MainWindow {
                                                             cx,
                                                         ))
                                                 )
-                                        )
-                                        // 第 2 行：行距 + 边距
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
                                                 .child(
                                                     div()
                                                         .flex_1()
+                                                        .min_w(px(140.0))
                                                         .flex()
                                                         .items_center()
                                                         .gap_1p5()
@@ -1974,9 +2308,17 @@ impl MainWindow {
                                                             cx,
                                                         ))
                                                 )
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .flex_wrap()
+                                                .gap_2()
                                                 .child(
                                                     div()
                                                         .flex_1()
+                                                        .min_w(px(140.0))
                                                         .flex()
                                                         .items_center()
                                                         .gap_1p5()
@@ -2001,33 +2343,34 @@ impl MainWindow {
                                                             cx,
                                                         ))
                                                 )
-                                        )
-                                        // 第 3 行：单行限制
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .child(div().w(px(58.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("单行限制"))
-                                                .child(self.render_style_stepper_input(
-                                                    StyleField::MaxChars,
-                                                    "-1",
-                                                    "+1",
-                                                    |this, cx| {
-                                                        let cur = this.state.config.subtitle_style.max_chars_per_line;
-                                                        this.state.config.subtitle_style.max_chars_per_line = cur.saturating_sub(1).max(4);
-                                                        this.state.save_subtitle_style();
-                                                        cx.notify();
-                                                    },
-                                                    |this, cx| {
-                                                        let cur = this.state.config.subtitle_style.max_chars_per_line;
-                                                        this.state.config.subtitle_style.max_chars_per_line = (cur + 1).min(100);
-                                                        this.state.save_subtitle_style();
-                                                        cx.notify();
-                                                    },
-                                                    format!("{}字/行", cur_style.max_chars_per_line),
-                                                    cx,
-                                                ))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w(px(140.0))
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1p5()
+                                                        .child(div().w(px(32.0)).flex_shrink_0().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_secondary()).child("单行"))
+                                                        .child(self.render_style_stepper_input(
+                                                            StyleField::MaxChars,
+                                                            "-1",
+                                                            "+1",
+                                                            |this, cx| {
+                                                                let cur = this.state.config.subtitle_style.max_chars_per_line;
+                                                                this.state.config.subtitle_style.max_chars_per_line = cur.saturating_sub(1).max(4);
+                                                                this.state.save_subtitle_style();
+                                                                cx.notify();
+                                                            },
+                                                            |this, cx| {
+                                                                let cur = this.state.config.subtitle_style.max_chars_per_line;
+                                                                this.state.config.subtitle_style.max_chars_per_line = (cur + 1).min(100);
+                                                                this.state.save_subtitle_style();
+                                                                cx.notify();
+                                                            },
+                                                            format!("{}字/行", cur_style.max_chars_per_line),
+                                                            cx,
+                                                        ))
+                                                )
                                         )
                                 )
                                 .into_any_element()
@@ -3337,7 +3680,8 @@ impl MainWindow {
     ) -> impl IntoElement {
         // 样式取自全局配置（面板里改哪个参数都立即写回这里）
         let style = self.state.config.subtitle_style.clone();
-        let font_px = style.preview_font_px();
+        // 右侧卡片预览字号固定为标准小巧尺寸，绝不随字号暴增撑大右侧面板
+        let font_px = 14.0;
         let (fg, bg, border) = subtitle_computed_colors(&style);
         let bg = preview_backdrop(bg);
         // 空行会被 GPUI 折成 0 高，给个占位符保证预览条始终有形
@@ -3502,6 +3846,106 @@ impl MainWindow {
         }
     }
 
+    /// 开始监视器字幕拖拽（自由移动或手柄缩放）
+    pub(crate) fn begin_monitor_subtitle_drag(
+        &mut self,
+        mode: SubtitleMonitorDragMode,
+        mouse_pos: (f32, f32),
+        box_w: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let cur_x = self.state.config.subtitle_style.pos_x_percent;
+        let cur_y = self.state.config.subtitle_style.current_pos_y_percent();
+        let cur_font_size = self.state.config.subtitle_style.font_size;
+        self.monitor_subtitle_selected = true;
+        self.monitor_subtitle_drag = Some(SubtitleMonitorDrag {
+            mode,
+            start_mouse: mouse_pos,
+            start_pos_x: cur_x,
+            start_pos_y: cur_y,
+            start_box_w: box_w,
+            start_font_size: cur_font_size,
+        });
+        cx.notify();
+    }
+
+    /// 拖拽处理：支持自由移动（带 50% 轴对称磁吸）与手柄缩放（框尺寸与字号联动）
+    pub(crate) fn handle_monitor_subtitle_drag(
+        &mut self,
+        mouse_pos: (f32, f32),
+        fit_w: f32,
+        fit_h: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.monitor_subtitle_drag else {
+            return;
+        };
+        let dx = mouse_pos.0 - drag.start_mouse.0;
+        let dy = mouse_pos.1 - drag.start_mouse.1;
+
+        match drag.mode {
+            SubtitleMonitorDragMode::Move => {
+                let dx_pct = (dx / fit_w.max(1.0)) * 100.0;
+                let dy_pct = (dy / fit_h.max(1.0)) * 100.0;
+                let mut target_x = drag.start_pos_x + dx_pct;
+                let mut target_y = drag.start_pos_y + dy_pct;
+
+                // 水平居中（X=50%）对称线磁吸吸附
+                const SNAP_TOLERANCE_PCT: f32 = 2.0;
+                if (target_x - 50.0).abs() <= SNAP_TOLERANCE_PCT {
+                    target_x = 50.0;
+                    self.monitor_snap_x = true;
+                } else {
+                    self.monitor_snap_x = false;
+                }
+
+                // 垂直居中（Y=50%）对称线磁吸吸附
+                if (target_y - 50.0).abs() <= SNAP_TOLERANCE_PCT {
+                    target_y = 50.0;
+                    self.monitor_snap_y = true;
+                } else {
+                    self.monitor_snap_y = false;
+                }
+
+                target_x = target_x.clamp(5.0, 95.0);
+                target_y = target_y.clamp(5.0, 95.0);
+
+                self.state.config.subtitle_style.pos_x_percent = target_x;
+                self.state.config.subtitle_style.pos_y_percent = Some(target_y);
+                let b_margin = (((100.0 - target_y) / 100.0) * 1080.0).round().clamp(10.0, 950.0) as u32;
+                self.state.config.subtitle_style.bottom_margin = b_margin;
+                cx.notify();
+            }
+            SubtitleMonitorDragMode::ResizeCorner { is_top, is_left } => {
+                let sign_x = if is_left { -1.0 } else { 1.0 };
+                let sign_y = if is_top { -1.0 } else { 1.0 };
+                let delta = (dx * sign_x + dy * sign_y) * 0.5;
+                let scale = ((drag.start_box_w + delta) / drag.start_box_w.max(40.0)).clamp(0.35, 3.5);
+                let new_font_size = ((drag.start_font_size as f32) * scale).round().clamp(16.0, 120.0) as u32;
+                self.state.config.subtitle_style.font_size = new_font_size;
+                cx.notify();
+            }
+            SubtitleMonitorDragMode::ResizeHorizontal { is_left } => {
+                let sign_x = if is_left { -1.0 } else { 1.0 };
+                let delta = dx * sign_x;
+                let scale = ((drag.start_box_w + delta) / drag.start_box_w.max(40.0)).clamp(0.35, 3.5);
+                let new_font_size = ((drag.start_font_size as f32) * scale).round().clamp(16.0, 120.0) as u32;
+                self.state.config.subtitle_style.font_size = new_font_size;
+                cx.notify();
+            }
+        }
+    }
+
+    /// 结束监视器字幕拖拽并持久化样式
+    pub(crate) fn end_monitor_subtitle_drag(&mut self, cx: &mut Context<Self>) {
+        if self.monitor_subtitle_drag.take().is_some() {
+            self.monitor_snap_x = false;
+            self.monitor_snap_y = false;
+            self.state.save_subtitle_style();
+            cx.notify();
+        }
+    }
+
     /// 整轨时间轴调整卡：平移 / 缩放 / 铺满目标时长，以及句间最小间隔档位。
     ///
     /// # 为什么需要它
@@ -3595,7 +4039,7 @@ impl MainWindow {
 
         // 目标时长的默认建议：整轨已有时长与视频总时长差得远时，界面直接提示
         // （TXT 导入后必然命中）。
-        let fit_hint = suggest_fit(segments, self.state.total_duration);
+        let _fit_hint = suggest_fit(segments, self.state.total_duration);
 
         let op_row = div()
             .flex()
@@ -3639,7 +4083,7 @@ impl MainWindow {
                     0,
                     60,
                     format!("{:+.1} s", shift_ms as f64 / 1000.0),
-                    "正数往后、负数往前；起点会被钳在 0 且保持时长不变".to_string(),
+                    String::new(),
                     cx,
                     move |this, v, cx| {
                         // 滑条档位 0..60 秒 → -5.0..+55.0 秒，覆盖常见的修剪幅度。
@@ -3656,7 +4100,7 @@ impl MainWindow {
                     50,
                     150,
                     format!("{:.0}%", scale_pct),
-                    "成片比字幕版本更长就把比例调大（时间轴等比拉伸）".to_string(),
+                    String::new(),
                     cx,
                     move |this, v, cx| {
                         this.retime_scale_pct = v;
@@ -3672,19 +4116,7 @@ impl MainWindow {
                     10,
                     3600,
                     crate::utils::time::format_duration_short(target_secs as f64),
-                    fit_hint
-                        .map(|_| {
-                            format!(
-                                "当前整轨 {}，与视频时长不符——建议铺满到 {}",
-                                crate::utils::time::format_duration_short(
-                                    self.state.segments.last().map(|s| s.end).unwrap_or(0.0)
-                                ),
-                                crate::utils::time::format_duration_short(
-                                    self.state.total_duration
-                                )
-                            )
-                        })
-                        .unwrap_or_else(|| "按各句时长比例重新铺满整轨".to_string()),
+                    String::new(),
                     cx,
                     move |this, v, cx| {
                         this.retime_target_secs = v;
@@ -4425,6 +4857,7 @@ impl MainWindow {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
                         window.focus(&focus);
                         this.focused_replace_field = Some(field);
                         this.replace_cursor = match field {
@@ -4891,6 +5324,7 @@ impl MainWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
                     window.focus(&focus);
                     this.export_template_cursor =
                         this.state.config.ui.export_name_template.chars().count();
@@ -4968,6 +5402,7 @@ impl MainWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
                     window.focus(&focus);
                     this.subtitle_search_focused = true;
                     this.subtitle_search_cursor = this.subtitle_search.chars().count();

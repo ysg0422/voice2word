@@ -471,6 +471,7 @@ impl MainWindow {
     }
 
     /// 渲染底部状态与操作栏 (iOS Minimal Toolbar 规范)
+    #[allow(dead_code)]
     pub(crate) fn render_bottom_timeline(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
         let has_file = self.state.transcribe_file.is_some();

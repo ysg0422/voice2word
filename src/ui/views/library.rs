@@ -95,12 +95,8 @@ impl MainWindow {
                             ),
                     ),
             )
-            // 检索栏：关键字 + 未翻译筛选 + 排序 + 命中摘要。只有空库时才隐藏。
+            // 检索栏：关键字 + 未翻译筛选 + 排序 + 批量操作 + 命中摘要。只有空库时才隐藏。
             .children((total_count > 0).then(|| self.render_library_toolbar(cx)))
-            // 批量操作栏：勾选后才展开，不选时不占面积
-            .children(
-                (!self.library_selected.is_empty()).then(|| self.render_library_batch_bar(cx)),
-            )
             // 视频卡片列表区域
             .child(if total_count == 0 {
                 self.render_library_empty(cx)
@@ -160,6 +156,7 @@ impl MainWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
                     window.focus(&focus);
                     this.library_search_focused = true;
                     this.library_search_cursor = this.library_filter.query.chars().count();
@@ -236,27 +233,133 @@ impl MainWindow {
                 }))
         };
 
-        // 排序：下拉式一行胶囊（只有 4 项，不值得为它做一个浮层）。
-        let sort_row = div()
-            .flex()
-            .items_center()
-            .gap(px(Theme::SPACE_1))
+        // 排序：悬浮下拉框
+        let sort_open = self.library_sort_dropdown_open;
+        let cur_sort_label = sort.label();
+        let sort_dropdown = div()
+            .relative()
             .child(
                 div()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(Theme::text_muted())
-                    .flex_shrink_0()
-                    .child("排序"),
-            )
-            .children(LibrarySort::ALL.into_iter().map(|s| {
-                primitives::chip_clickable(s.label(), s == sort, false)
-                    .id(SharedString::from(format!("library-sort-{}", s as u8)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.library_sort = s;
-                        this.library_query_cache = None;
+                    .id("library-sort-trigger")
+                    .h(px(26.0))
+                    .px_2()
+                    .rounded_md()
+                    .bg(Theme::bg_inset())
+                    .border_1()
+                    .border_color(if sort_open {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::border_subtle()
+                    })
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(Theme::accent_mint()))
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.library_sort_dropdown_open = !this.library_sort_dropdown_open;
+                        cx.stop_propagation();
                         cx.notify();
                     }))
-            }));
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_SMALL))
+                            .text_color(Theme::text_muted())
+                            .child("排序"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_SMALL))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(Theme::text_primary())
+                            .child(cur_sort_label),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_secondary())
+                            .child(if sort_open { "▲" } else { "▼" }),
+                    ),
+            )
+            .children(if sort_open {
+                Some(
+                    gpui::deferred(
+                        div()
+                            .id("library-sort-floating-menu")
+                            .absolute()
+                            .top(px(29.0))
+                            .left_0()
+                            .min_w(px(130.0))
+                            .rounded_md()
+                            .bg(Theme::bg_card())
+                            .border_1()
+                            .border_color(Theme::border_strong())
+                            .shadow_lg()
+                            .p_1()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .children(LibrarySort::ALL.into_iter().enumerate().map(|(idx, s)| {
+                                let is_sel = s == sort;
+                                div()
+                                    .id(("library-sort-opt", idx))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .bg(if is_sel {
+                                        Theme::tint_mint_badge()
+                                    } else {
+                                        Theme::transparent()
+                                    })
+                                    .hover(|st| st.bg(Theme::bg_hover()))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(Theme::TEXT_SMALL))
+                                            .font_weight(if is_sel {
+                                                FontWeight::BOLD
+                                            } else {
+                                                FontWeight::NORMAL
+                                            })
+                                            .text_color(if is_sel {
+                                                Theme::accent_mint()
+                                            } else {
+                                                Theme::text_primary()
+                                            })
+                                            .child(s.label()),
+                                    )
+                                    .children(if is_sel {
+                                        Some(
+                                            div()
+                                                .text_size(px(Theme::TEXT_SMALL))
+                                                .text_color(Theme::accent_mint())
+                                                .child("✓"),
+                                        )
+                                    } else {
+                                        None
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.library_sort = s;
+                                        this.library_query_cache = None;
+                                        this.library_sort_dropdown_open = false;
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }))
+                            })),
+                    ),
+                )
+            } else {
+                None
+            });
 
         div()
             .id("library-toolbar")
@@ -295,16 +398,53 @@ impl MainWindow {
                         this.clear_library_filter(cx);
                     }))
             }))
-            .child(sort_row)
-            .child(
-                primitives::chip_clickable("全选", false, false)
-                    .id("lib-toolbar-select-all")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.library_selected =
-                            this.state.recent_tasks.iter().map(|t| t.id).collect();
-                        cx.notify();
-                    })),
-            )
+            .child(sort_dropdown)
+            .child({
+                let selected = self.library_selected.len();
+                let is_all_selected = total > 0 && selected == total;
+                if is_all_selected {
+                    primitives::chip_clickable("取消全选", true, false)
+                        .id("lib-toolbar-clear-all")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.library_selected.clear();
+                            cx.notify();
+                        }))
+                } else {
+                    primitives::chip_clickable("全选", false, false)
+                        .id("lib-toolbar-select-all")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.library_selected =
+                                this.state.recent_tasks.iter().map(|t| t.id).collect();
+                            cx.notify();
+                        }))
+                }
+            })
+            .children({
+                let selected = self.library_selected.len();
+                let busy = self.library_export_busy;
+                let can_export = selected > 0 && !busy;
+                (selected > 0).then(|| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(Theme::SPACE_1_5))
+                        .child(primitives::badge_accent(format!("已选 {selected} 项")))
+                        .child(
+                            primitives::btn_state(
+                                if busy { "导出中…" } else { "导出选中" },
+                                primitives::BtnSize::Sm,
+                                primitives::BtnVariant::Primary,
+                                can_export,
+                            )
+                            .id("lib-export-selected-btn")
+                            .when(can_export, |d| {
+                                d.on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_selected_library_tasks(cx);
+                                }))
+                            }),
+                        )
+                })
+            })
             .child(
                 primitives::chip_clickable("查重", false, false)
                     .id("lib-toolbar-find-dupes")
@@ -323,65 +463,6 @@ impl MainWindow {
                         Theme::text_muted()
                     })
                     .child(describe(total, shown, &filter)),
-            )
-            .into_any_element()
-    }
-
-    /// 视频库批量操作栏：勾选后展开
-    fn render_library_batch_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self.library_selected.len();
-        let total = self.state.recent_tasks.len();
-        let busy = self.library_export_busy;
-        let can_export = selected > 0 && !busy;
-        div()
-            .id("library-batch-bar")
-            .w_full()
-            .px(px(Theme::SPACE_4))
-            .py(px(Theme::SPACE_2))
-            .mb(px(Theme::SPACE_3))
-            .rounded_lg()
-            .bg(Theme::bg_raised())
-            .border_1()
-            .border_color(Theme::tint_mint_border())
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(
-                div().flex().items_center().gap(px(Theme::SPACE_2)).child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(Theme::accent_mint())
-                        .child(format!("已选 {selected} / {total} 项")),
-                ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(Theme::SPACE_2))
-                    .child(
-                        primitives::chip_clickable("取消全选", false, false)
-                            .id("lib-clear-sel-btn")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.library_selected.clear();
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        primitives::btn_state(
-                            if busy { "导出中…" } else { "导出选中" },
-                            primitives::BtnSize::Sm,
-                            primitives::BtnVariant::Primary,
-                            can_export,
-                        )
-                        .id("lib-export-selected-btn")
-                        .when(can_export, |d| {
-                            d.on_click(cx.listener(|this, _, _, cx| {
-                                this.export_selected_library_tasks(cx);
-                            }))
-                        }),
-                    ),
             )
             .into_any_element()
     }

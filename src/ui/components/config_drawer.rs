@@ -368,30 +368,61 @@ impl MainWindow {
                     )
                     .child(
                         div()
-                            .h(px(Theme::CHIP_H))
-                            .px(px(Theme::CHIP_PAD_X))
-                            .rounded(px(Theme::RADIUS_SM))
                             .flex()
                             .items_center()
-                            .bg(if has_file {
-                                Theme::bg_card_hover()
-                            } else {
-                                Theme::accent_mint()
-                            })
-                            .border_1()
-                            .border_color(if has_file {
-                                Theme::border_strong()
-                            } else {
-                                Theme::tint_mint_border()
-                            })
-                            .text_size(px(Theme::TEXT_SMALL))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(if has_file {
-                                Theme::text_secondary()
-                            } else {
-                                Theme::text_on_accent()
-                            })
-                            .child(if has_file { "更换" } else { "浏览" }),
+                            .gap(px(Theme::SPACE_1))
+                            .child(
+                                div()
+                                    .h(px(Theme::CHIP_H))
+                                    .px(px(Theme::CHIP_PAD_X))
+                                    .rounded(px(Theme::RADIUS_SM))
+                                    .flex()
+                                    .items_center()
+                                    .bg(if has_file {
+                                        Theme::bg_card_hover()
+                                    } else {
+                                        Theme::accent_mint()
+                                    })
+                                    .border_1()
+                                    .border_color(if has_file {
+                                        Theme::border_strong()
+                                    } else {
+                                        Theme::tint_mint_border()
+                                    })
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(if has_file {
+                                        Theme::text_secondary()
+                                    } else {
+                                        Theme::text_on_accent()
+                                    })
+                                    .child(if has_file { "更换" } else { "浏览" }),
+                            )
+                            .children(has_file.then(|| {
+                                div()
+                                    .id("media-clear-btn")
+                                    .h(px(Theme::CHIP_H))
+                                    .px(px(Theme::SPACE_1_5))
+                                    .rounded(px(Theme::RADIUS_SM))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(Theme::bg_card_hover())
+                                    .border_1()
+                                    .border_color(Theme::border_strong())
+                                    .hover(|s| s.bg(Theme::bg_hover_strong()).text_color(Theme::accent_red()))
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_muted())
+                                    .child("✕")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.state.transcribe_file = None;
+                                        this.state.selected_file = None;
+                                        this.state.transcribe_duration = 0.0;
+                                        cx.notify();
+                                    }))
+                            })),
                     ),
             )
             // ── 3. 识别引擎档位栅格 ──
@@ -934,6 +965,7 @@ impl MainWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
                     window.focus(&click_focus);
                     HOTWORDS_INPUT.with(|s| {
                         let mut s = s.borrow_mut();

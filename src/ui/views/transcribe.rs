@@ -25,6 +25,7 @@ impl MainWindow {
     /// - 右侧：转写配置抽屉 (350px，模型选择、语言、标点、说话人等全套参数)
     pub(crate) fn render_generate_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("generate-layout-root")
             .flex()
             .flex_row()
             .flex_1()
@@ -32,13 +33,27 @@ impl MainWindow {
             .w_full()
             .h_full()
             .overflow_hidden()
+            .on_drop::<ExternalPaths>(cx.listener(
+                |this, paths: &ExternalPaths, _window, cx| {
+                    let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
+                    tracing::info!("转写页面根容器监听到 ExternalPaths 拖放导入: {:?}", dropped);
+                    this.handle_dropped_files(&dropped, cx);
+                },
+            ))
+            .on_drop::<Arc<ExternalPaths>>(cx.listener(
+                |this, paths: &Arc<ExternalPaths>, _window, cx| {
+                    let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
+                    tracing::info!("转写页面根容器监听到 Arc<ExternalPaths> 拖放导入: {:?}", dropped);
+                    this.handle_dropped_files(&dropped, cx);
+                },
+            ))
             // 左侧：竖向批量转写队列侧栏 (展开 300px / 折叠 38px)
             .child(if self.queue_sidebar_open {
                 self.render_batch_queue_sidebar(cx).into_any_element()
             } else {
                 self.render_batch_queue_rail(cx).into_any_element()
             })
-            // 中间：主工作台与底部控制
+            // 中间：主工作台
             .child(
                 div()
                     .flex()
@@ -47,8 +62,7 @@ impl MainWindow {
                     .min_w(px(Theme::MIN_CENTER_COL_W))
                     .h_full()
                     .overflow_hidden()
-                    .child(self.render_main_workspace(cx))
-                    .child(self.render_bottom_timeline(cx)),
+                    .child(self.render_main_workspace(cx)),
             )
             // 右侧：配置和选项面板
             .child(self.render_sidebar(cx))
@@ -96,107 +110,26 @@ impl MainWindow {
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
         let is_sensevoice =
             self.state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
-        let file_loaded = self.state.transcribe_file.is_some();
-        // 「字幕确实属于这支媒体」的判据与质检卡片完全一致（`selected_file ==
-        // transcribe_file`）：只数 `segments` 非空的话，刚换了一支还没转写的新片，
-        // 上一支留下的字幕会把第 2 步说成「已完成」。
-        let subtitles_ready = !self.state.segments.is_empty()
-            && self.state.selected_file.as_ref() == self.state.transcribe_file.as_ref();
-        // 步骤条四步与右侧状态药丸的判定都走纯函数：它们各有四五条分支，写在渲染链里
-        // 只能用肉眼比对，而它们说的正是「现在在第几步、正在干什么」——对不上就是误导。
-        let steps = StepChain::of(file_loaded, is_processing, subtitles_ready);
-        let status_pill =
-            transcribe_status_pill(is_processing, self.state.batch_running, file_loaded);
 
         // 页面外壳统一走 primitives::page_shell：底色 / 内边距 / 分区间距与其余三个
         // 工作台页同源，切页时中央列不再横向跳动；`.flex_1()` 保留它在左右分栏里
         // 撑满剩余宽度的职责。
         primitives::page_shell("transcribe-main-workspace")
             .flex_1()
-            // ── 顶部步骤流式导航栏：转写是一条「导入音视频 → 语音转写 → 剪辑校对 → 导出工程」的直线，
-// 步骤常驻在顶部，用户随时知道自己在第几步、下一步该干什么 ──
-            .child(
-                div()
-                    .w_full()
-                    .px(px(Theme::CARD_PAD))
-                    .py(px(Theme::SPACE_2))
-                    .rounded(px(Theme::CARD_RADIUS))
-                    .bg(Theme::bg_card())
-                    .border_1()
-                    .border_color(Theme::border())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(Theme::SPACE_4))
-                            .child(step_item(
-                                "1",
-                                "导入音视频",
-                                steps.import,
-                                Theme::accent_mint(),
-                                Theme::text_on_accent(),
-                            ))
-                            .child(primitives::step_connector())
-                            .child(step_item(
-                                "2",
-                                "语音转写",
-                                steps.transcribe,
-                                Theme::accent_mint(),
-                                Theme::text_on_accent(),
-                            ))
-                            .child(primitives::step_connector())
-                            .child(step_item(
-                                "3",
-                                "剪辑校对",
-                                steps.edit,
-                                Theme::accent_blue(),
-                                Theme::text_on_saturated(),
-                            ))
-                            .child(primitives::step_connector())
-                            .child(step_item(
-                                "4",
-                                "导出工程",
-                                steps.export,
-                                Theme::accent_blue(),
-                                Theme::text_on_saturated(),
-                            ))
-                    )
-                    .child(
-                        // 右侧状态药丸：四态由 `transcribe_status_pill` 先判定（批量与单文件转写
-                        // 必须说两种话），外观一律走 badge / stat_dot_sm 原语。
-                        if let Some(label) = status_pill.transcribing_label() {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(Theme::SPACE_1))
-                                .child(primitives::stat_dot_sm(Theme::accent_mint()))
-                                .child(primitives::badge_accent(label))
-                        } else if status_pill == StatusPill::FileReady {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(Theme::SPACE_1))
-                                .child(primitives::stat_dot_sm(Theme::accent_blue()))
-                                .child(primitives::badge(
-                                    self.state
-                                        .transcribe_file
-                                        .as_ref()
-                                        .and_then(|f| f.file_name())
-                                        .and_then(|s| s.to_str())
-            .unwrap_or("音视频文件")
-                                        .to_string(),
-                                ))
-                        } else {
-                            div()
-                                .text_size(px(Theme::TEXT_SMALL))
-                                .text_color(Theme::text_muted())
-                                .child("就绪")
-                        }
-                    ),
-            )
+            .on_drop::<ExternalPaths>(cx.listener(
+                |this, paths: &ExternalPaths, _window, cx| {
+                    let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
+                    tracing::info!("主工作区容器监听到 ExternalPaths 拖放导入: {:?}", dropped);
+                    this.handle_dropped_files(&dropped, cx);
+                },
+            ))
+            .on_drop::<Arc<ExternalPaths>>(cx.listener(
+                |this, paths: &Arc<ExternalPaths>, _window, cx| {
+                    let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
+                    tracing::info!("主工作区容器监听到 Arc<ExternalPaths> 拖放导入: {:?}", dropped);
+                    this.handle_dropped_files(&dropped, cx);
+                },
+            ))
             // 核心工作台展示区
             .child(
                 if is_processing {
@@ -606,7 +539,28 @@ impl MainWindow {
                                                     )
                                                 } else {
                                                     None
-                                                }),
+                                                })
+                                                .child(
+                                                    div()
+                                                        .id("ready-card-close-btn")
+                                                        .w(px(20.0))
+                                                        .h(px(20.0))
+                                                        .rounded_sm()
+                                                        .cursor_pointer()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_size(px(Theme::TEXT_CAPTION))
+                                                        .text_color(Theme::text_muted())
+                                                        .hover(|s| s.bg(Theme::bg_hover_strong()).text_color(Theme::accent_red()))
+                                                        .child("✕")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.state.transcribe_file = None;
+                                                            this.state.selected_file = None;
+                                                            this.state.transcribe_duration = 0.0;
+                                                            cx.notify();
+                                                        }))
+                                                ),
                                         ),
                                 )
                                 // 文件主标题
@@ -647,7 +601,7 @@ impl MainWindow {
                                         .mt(px(Theme::SPACE_2))
                                         .children(if let Some(cached) = cached_opt {
                                             vec![
-                                                primitives::btn("载入缓存", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
+                                                primitives::btn("载入缓存", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
                                                     .id("cache-hit-load-btn")
                                                     .on_click({
                                                         let cached_clone = cached.clone();
@@ -656,75 +610,37 @@ impl MainWindow {
                                                         })
                                                     })
                                                     .into_any_element(),
-                                                primitives::btn("+ 批量添加", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
-                                                    .id("ready-convert-batch-btn")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.convert_ready_to_batch(cx);
-                                                    }))
-                                                    .into_any_element(),
-                                                primitives::btn("重新完整转写", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
+                                                primitives::btn("开始转写当前视频", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
                                                     .id("ready-start-process-btn")
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.start_processing(cx);
                                                     }))
                                                     .into_any_element(),
-                                                primitives::btn("更换视频", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
-                                                    .id("ready-repick-file-btn")
+                                                primitives::btn("取消", primitives::BtnSize::Lg, primitives::BtnVariant::Ghost)
+                                                    .id("ready-cancel-file-btn")
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.choose_file(cx);
-                                                    }))
-                                                    .into_any_element(),
-                                            ]
-                                        } else if !self.state.batch_queue.is_empty() {
-                                            let pending = self.state.queue_pending_count();
-                                            vec![
-                                                primitives::btn(
-                                                    format!("开始全部转写 ({} 项)", pending),
-                                                    primitives::BtnSize::Lg,
-                                                    primitives::BtnVariant::Primary,
-                                                )
-                                                .id("ready-start-batch-btn")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.start_batch_queue(cx);
-                                                }))
-                                                .into_any_element(),
-                                                primitives::btn("仅转写此视频", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
-                                                    .id("ready-start-single-btn")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.start_processing(cx);
-                                                    }))
-                                                    .into_any_element(),
-                                                primitives::btn("+ 批量添加", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
-                                                    .id("ready-convert-batch-btn")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.convert_ready_to_batch(cx);
-                                                    }))
-                                                    .into_any_element(),
-                                                primitives::btn("更换视频", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
-                                                    .id("ready-repick-file-btn")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.choose_file(cx);
+                                                        this.state.transcribe_file = None;
+                                                        this.state.selected_file = None;
+                                                        this.state.transcribe_duration = 0.0;
+                                                        cx.notify();
                                                     }))
                                                     .into_any_element(),
                                             ]
                                         } else {
                                             vec![
-                                                primitives::btn("开始转写", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
+                                                primitives::btn("开始转写当前视频", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
                                                     .id("ready-start-process-btn")
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.start_processing(cx);
                                                     }))
                                                     .into_any_element(),
-                                                primitives::btn("+ 批量添加", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
-                                                    .id("ready-convert-batch-btn")
+                                                primitives::btn("取消", primitives::BtnSize::Lg, primitives::BtnVariant::Ghost)
+                                                    .id("ready-cancel-file-btn")
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.convert_ready_to_batch(cx);
-                                                    }))
-                                                    .into_any_element(),
-                                                primitives::btn("更换视频", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
-                                                    .id("ready-repick-file-btn")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.choose_file(cx);
+                                                        this.state.transcribe_file = None;
+                                                        this.state.selected_file = None;
+                                                        this.state.transcribe_duration = 0.0;
+                                                        cx.notify();
                                                     }))
                                                     .into_any_element(),
                                             ]
@@ -761,7 +677,7 @@ impl MainWindow {
                         )
                         .into_any_element()
                 } else {
-                    // 空闲就绪引导工作区 (精简精致轻量 Dropzone)
+                    // 空闲就绪引导工作区 (精简直观 Dropzone)
                     div()
                         .id("lightweight-idle-dashboard")
                         .flex_1()
@@ -771,8 +687,22 @@ impl MainWindow {
                         .items_center()
                         .justify_center()
                         .p(px(Theme::PAGE_PAD))
+                        .on_drop::<ExternalPaths>(cx.listener(
+                            |this, paths: &ExternalPaths, _window, cx| {
+                                let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
+                                tracing::info!("空闲看板监听到 ExternalPaths 拖放导入: {:?}", dropped);
+                                this.handle_dropped_files(&dropped, cx);
+                            },
+                        ))
+                        .on_drop::<Arc<ExternalPaths>>(cx.listener(
+                            |this, paths: &Arc<ExternalPaths>, _window, cx| {
+                                let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
+                                tracing::info!("空闲看板监听到 Arc<ExternalPaths> 拖放导入: {:?}", dropped);
+                                this.handle_dropped_files(&dropped, cx);
+                            },
+                        ))
                         .child(
-                            primitives::card_with_pad(Theme::SPACE_5)
+                            primitives::card_with_pad(Theme::SPACE_6)
                                 .w_full()
                                 .max_w(px(520.0))
                                 .border_dashed()
@@ -780,8 +710,8 @@ impl MainWindow {
                                 .gap(px(Theme::SPACE_3))
                                 .child(
                                     div()
-                                        .w(px(40.0))
-                                        .h(px(40.0))
+                                        .w(px(48.0))
+                                        .h(px(48.0))
                                         .rounded(px(Theme::RADIUS_LG))
                                         .bg(Theme::tint_mint_soft())
                                         .border_1()
@@ -789,7 +719,7 @@ impl MainWindow {
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .text_size(px(Theme::TEXT_HEADING))
+                                        .text_size(px(24.0))
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(Theme::accent_mint())
                                         .child("+"),
@@ -800,20 +730,13 @@ impl MainWindow {
                                         .flex_col()
                                         .items_center()
                                         .gap(px(Theme::SPACE_1))
-                                        .child(primitives::section_title("拖拽音视频至此，或浏览本地文件"))
-                                        .child(
-                                            div()
-                                                .text_size(px(Theme::TEXT_SMALL))
-                                                .text_color(Theme::text_muted())
-                                                .child("支持 MP4, MKV, MP3, WAV, FLAC, M4A 等主流音视频格式"),
-                                        ),
+                                        .child(primitives::section_title("拖拽音视频至此，或浏览本地文件")),
                                 )
                                 .child(
                                     div()
                                         .flex()
-                                        .flex_col()
                                         .items_center()
-                                        .gap(px(Theme::SPACE_2_5))
+                                        .gap(px(Theme::SPACE_3))
                                         .mt(px(Theme::SPACE_1))
                                         .child(
                                             primitives::btn_clickable("浏览本地文件", primitives::BtnSize::Md, primitives::BtnVariant::Primary)
@@ -824,40 +747,12 @@ impl MainWindow {
                                                 })),
                                         )
                                         .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(Theme::SPACE_2))
-                                                .child(
-                                                    primitives::chip_clickable("批量导入", false, false)
-                                                        .id("idle-batch-import-btn")
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.choose_batch_files(cx);
-                                                        })),
-                                                )
-                                                .child(
-                                                    primitives::chip_clickable("导入文件夹", false, false)
-                                                        .id("idle-batch-folder-btn")
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.choose_batch_folder(cx);
-                                                        })),
-                                                )
-                                                .child(
-                                                    primitives::chip_clickable("从视频库选择", false, false)
-                                                        .id("idle-goto-library-btn")
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.active_tab = WorkspaceTab::Library;
-                                                            this.state.refresh_recent_tasks();
-                                                            cx.notify();
-                                                        })),
-                                                )
-                                                .child(
-                                                    primitives::chip_clickable("导入已有字幕", false, false)
-                                                        .id("idle-import-subtitle-btn")
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.import_subtitle_file(cx);
-                                                        })),
-                                                ),
+                                            primitives::btn_clickable("导入文件夹", primitives::BtnSize::Md, primitives::BtnVariant::Secondary)
+                                                .id("idle-batch-folder-btn")
+                                                .px(px(Theme::SPACE_5))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.choose_batch_folder(cx);
+                                                })),
                                         ),
                                 ),
                         )
@@ -1572,11 +1467,26 @@ impl MainWindow {
                                     .on_click(cx.listener(|this, _, _, cx| this.choose_batch_folder(cx))),
                             ),
                     )
-                    .child(
-                        primitives::btn("清空", primitives::BtnSize::Xs, primitives::BtnVariant::Ghost)
-                            .id("sidebar-queue-clear-btn")
-                            .on_click(cx.listener(|this, _, _, cx| {
+                    .child({
+                        let has_queue = !self.state.batch_queue.is_empty();
+                        let has_file = self.state.transcribe_file.is_some();
+                        let can_clear = has_queue || has_file;
+                        primitives::btn_state(
+                            "清空",
+                            primitives::BtnSize::Xs,
+                            primitives::BtnVariant::Ghost,
+                            can_clear,
+                        )
+                        .id("sidebar-queue-clear-btn")
+                        .when(can_clear, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| {
                                 if this.state.batch_queue.is_empty() {
+                                    if this.state.transcribe_file.is_some() {
+                                        this.state.transcribe_file = None;
+                                        this.state.selected_file = None;
+                                        this.state.transcribe_duration = 0.0;
+                                        cx.notify();
+                                    }
                                     return;
                                 }
                                 let running = matches!(this.state.status, ProcessStatus::Processing { .. });
@@ -1592,8 +1502,9 @@ impl MainWindow {
                                     action: ConfirmAction::ClearBatchQueue,
                                 });
                                 cx.notify();
-                            })),
-                    ),
+                            }))
+                        })
+                    }),
             )
             // ── 概览摘要（当有条目时）──
             .children(if total > 0 {
@@ -2052,6 +1963,7 @@ const STREAM_TAIL_ROWS: usize = 3;
 // ==================== 步骤条 / 状态药丸（纯判定） ====================
 
 /// 步骤条上一步所处的阶段。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepPhase {
     /// 已经完成
@@ -2063,6 +1975,7 @@ enum StepPhase {
 }
 
 /// 转写工作台顶部四步步骤条的状态。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StepChain {
     import: StepPhase,
@@ -2091,6 +2004,7 @@ impl StepChain {
     ///
     /// 第 4 步（导出工程）没有任何状态源可用（`ProcessStatus` 里没有「已导出」），
     /// 因此恒为 `Upcoming`：宁可它一直暗着，也不假装知道用户导出没导出。
+    #[allow(dead_code)]
     fn of(file_loaded: bool, processing: bool, subtitles_ready: bool) -> StepChain {
         let import = if file_loaded {
             StepPhase::Done
@@ -2133,6 +2047,7 @@ impl StepChain {
 /// - `Done` / `Current`：该步强调色的实心圆点。薄荷是浅底，配恒深的 `text_on_accent`；
 ///   蓝（`accent_blue`）是深底，必须配恒白的 `text_on_saturated`；
 /// - `Current` 额外把文案也染成强调色并加粗，`Done` 的文案走 `text_primary`。
+#[allow(dead_code)]
 fn step_item(
     number: &'static str,
     label: &'static str,
@@ -2178,6 +2093,7 @@ fn step_item(
 }
 
 /// 步骤条右侧状态药丸的形态（纯判定，便于单测）。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatusPill {
     /// 空闲待命：没有媒体、也没有任务在跑
@@ -2195,6 +2111,7 @@ impl StatusPill {
     ///
     /// 文案与底部状态栏的主按钮同词（「转写中… / 批量转写中…」）：同一件事不该在
     /// 顶部说一套、底部说另一套。
+    #[allow(dead_code)]
     fn transcribing_label(self) -> Option<&'static str> {
         match self {
             StatusPill::Transcribing => Some("转写中…"),
@@ -2209,6 +2126,7 @@ impl StatusPill {
 /// `batch_running` 必须单独判：单文件转写与批量转写都会置 `is_processing`，只说
 /// 「转写中」会让用户以为整批没跑起来（队列面板也是靠这个字段区分「终止批量」与
 /// 「开始全部」的）。
+#[allow(dead_code)]
 fn transcribe_status_pill(
     is_processing: bool,
     batch_running: bool,

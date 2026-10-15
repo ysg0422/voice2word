@@ -545,6 +545,28 @@ fn filter_commands(query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// 监视器舞台字幕拖拽操作模式
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum SubtitleMonitorDragMode {
+    /// 自由移动文本框位置
+    Move,
+    /// 左右边缘手柄拉宽/拉窄
+    ResizeHorizontal { is_left: bool },
+    /// 四角手柄等比拉大/缩小框和字号
+    ResizeCorner { is_top: bool, is_left: bool },
+}
+
+/// 监视器舞台字幕拖拽会话
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SubtitleMonitorDrag {
+    pub mode: SubtitleMonitorDragMode,
+    pub start_mouse: (f32, f32),
+    pub start_pos_x: f32,
+    pub start_pos_y: f32,
+    pub start_box_w: f32,
+    pub start_font_size: u32,
+}
+
 pub struct MainWindow {
     pub(crate) state: AppState,
     pub(crate) metrics_rx: watch::Receiver<crate::app::ResourceMetrics>,
@@ -595,6 +617,8 @@ pub struct MainWindow {
     pub(crate) outline_dropdown_open: bool,
     /// 样式面板「背景底框」下拉是否展开
     pub(crate) bg_style_dropdown_open: bool,
+    /// 媒体库「排序」下拉是否展开
+    pub(crate) library_sort_dropdown_open: bool,
     /// 字幕预览框的**手动**宽度（px）。`Some` 时以它为准并压过「单行最大字数」
     /// 推出的宽度；拖动预览条两侧把手会写入这里并落盘，`None` 则回到按字数自动推算。
     pub(crate) preview_box_w: Option<f32>,
@@ -604,6 +628,14 @@ pub struct MainWindow {
     /// 位移为正，左手柄往左拉位移为负。宽度变化要按手柄所在侧取符号，否则左手柄
     /// 往外拉会算成负增量，框反而变窄。
     pub(crate) preview_drag: Option<(f32, f32, bool)>,
+    /// 监视器舞台字幕拖拽会话
+    pub(crate) monitor_subtitle_drag: Option<SubtitleMonitorDrag>,
+    /// 是否显示水平居中（X=50%）对称辅助线
+    pub(crate) monitor_snap_x: bool,
+    /// 是否显示垂直居中（Y=50%）对称辅助线
+    pub(crate) monitor_snap_y: bool,
+    /// 监视器字幕框是否处于选中激活态
+    pub(crate) monitor_subtitle_selected: bool,
     /// 剪辑工作台右侧检查器宽度（自由拖拽调节，上限为窗口宽度的 50%）
     pub(crate) editor_split_w: Option<f32>,
     /// 检查器宽度拖拽会话：(起始宽度, 按下时的鼠标 x)
@@ -664,6 +696,7 @@ pub struct MainWindow {
     /// 字幕清单搜索关键字（空串表示不过滤）
     pub(crate) subtitle_search: String,
     pub(crate) subtitle_search_focus: FocusHandle,
+    pub(crate) root_focus: FocusHandle,
     /// 「查找替换」面板是否展开。
     ///
     /// 与搜索框分开：搜索只是过滤显示（不改数据），替换会**真的改字幕**，两者
@@ -751,8 +784,12 @@ pub struct MainWindow {
     pub(crate) inline_edit_focus: FocusHandle,
     /// 自定义调色板展开状态
     pub(crate) custom_color_picker_open: bool,
+    /// 设置界面的当前子选项卡 (0: 硬件与推理, 1: 大模型与 AI 润色, 2: 组件与模型下载)
+    pub(crate) settings_tab: usize,
     /// 全局字幕样式卡片是否收起折叠（默认展开，点击可折叠以给单句精修腾出空间）
     pub(crate) subtitle_style_collapsed: bool,
+    /// 窗口尺寸与位置变化监听订阅句柄
+    pub(crate) bounds_subscription: Option<Subscription>,
     /// 缓存的色相圆环图像
     #[allow(dead_code)]
     pub(crate) cached_color_wheel: Option<Arc<RenderImage>>,
@@ -1447,6 +1484,7 @@ impl MainWindow {
         let metrics_rx = crate::utils::SystemMonitor::spawn_background_monitor();
         let text_focus = cx.focus_handle();
         let subtitle_search_focus = cx.focus_handle();
+        let root_focus = cx.focus_handle();
         let api_base_focus = cx.focus_handle();
         let api_model_focus = cx.focus_handle();
         let api_key_focus = cx.focus_handle();
@@ -1512,8 +1550,13 @@ impl MainWindow {
             ready_qc_open: false,
             outline_dropdown_open: false,
             bg_style_dropdown_open: false,
+            library_sort_dropdown_open: false,
             preview_box_w: preview_box_w_initial,
             preview_drag: None,
+            monitor_subtitle_drag: None,
+            monitor_snap_x: false,
+            monitor_snap_y: false,
+            monitor_subtitle_selected: false,
             editor_split_w: None,
             editor_split_drag: None,
             subtitle_panel: EditorSubtitlePanel::default(),
@@ -1533,6 +1576,7 @@ impl MainWindow {
             library_sizes: HashMap::new(),
             subtitle_search: String::new(),
             subtitle_search_focus,
+            root_focus,
             replace_panel_open: false,
             replace_find: String::new(),
             replace_with: String::new(),
@@ -1599,7 +1643,9 @@ impl MainWindow {
             shortcuts_help_open: false,
             model_manager_tab: default_model_tab,
             custom_color_picker_open: false,
+            settings_tab: 0,
             subtitle_style_collapsed: false,
+            bounds_subscription: None,
             cached_color_wheel: None,
             color_picker_brightness: 1.0,
         };
@@ -2046,6 +2092,7 @@ impl MainWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
                     window.focus(&focus);
                     if this.focused_api_field != Some(field) {
                         this.focused_api_field = Some(field);
@@ -2068,6 +2115,7 @@ impl MainWindow {
                 };
                 let cursor = &mut this.line_edit_cursor;
                 if apply_line_edit(buffer, cursor, event, cx) {
+                    cx.stop_propagation();
                     this.commit_api_field(field, cx);
                     cx.notify();
                 }
@@ -2104,6 +2152,7 @@ impl MainWindow {
             .children(has_content.then(|| {
                 primitives::chip_clickable("清空", false, false)
                     .id(SharedString::from(format!("clear-{id}")))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         match field {
                             ApiField::Base => this.api_base_input.clear(),
@@ -2119,6 +2168,7 @@ impl MainWindow {
             .child(
                 primitives::chip_clickable("粘贴", false, false)
                     .id(SharedString::from(format!("paste-{id}")))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(item) = cx.read_from_clipboard() {
                             if let Some(text) = item.text() {
@@ -2517,6 +2567,7 @@ impl MainWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
                     if let Some(state) = this.command_palette.as_ref() {
                         window.focus(&state.focus);
                     }
@@ -2757,6 +2808,16 @@ impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 脏字幕的延迟落库定时器：首次渲染时起一次，之后常驻。
         self.ensure_segments_flush_ticker(cx);
+        // 监听窗口尺寸变化（包括最大化/还原/拖拽尺寸/贴靠）：
+        // Windows 上当窗口尺寸改变时，强制刷新客户区并驱动 GPUI DirectX 渲染层重绘全幅，
+        // 避免出现「最大化后只渲染局部、截屏/切焦点后才全屏」的画面不同步 Bug。
+        if self.bounds_subscription.is_none() {
+            self.bounds_subscription = Some(cx.observe_window_bounds(window, |_this, window, cx| {
+                #[cfg(target_os = "windows")]
+                crate::ui::components::titlebar::win_drag::force_update_window(window);
+                cx.notify();
+            }));
+        }
         // 必需组件（ffmpeg / whisper-cli）缺失时的自动补下载：进程内只检查一次，
         // 下载是网络活，不能压在首帧之前，但也要在用户动手之前给反馈。
         self.check_required_components_once(cx);
@@ -2786,6 +2847,7 @@ impl Render for MainWindow {
         };
         self.subtitle_search_focused = search_focused;
         self.is_text_focused = text_editor_focused;
+        self.library_search_focused = self.library_search_focus.contains_focused(window, cx);
         self.focused_api_field = if api_base_focused {
             Some(ApiField::Base)
         } else if api_model_focused {
@@ -2813,12 +2875,54 @@ impl Render for MainWindow {
             .h_full()
             .bg(Theme::bg_app())
             .text_color(Theme::text_primary())
+            .track_focus(&self.root_focus)
+            // 点击空白外部失焦：点击非输入框时回收高亮与光标
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if this.any_input_focused(window, cx)
+                        || this.is_text_focused
+                        || this.subtitle_search_focused
+                        || this.library_search_focused
+                        || this.export_template_focused
+                        || this.focused_api_field.is_some()
+                        || this.focused_replace_field.is_some()
+                    {
+                        window.focus(&this.root_focus);
+                        this.is_text_focused = false;
+                        this.subtitle_search_focused = false;
+                        this.library_search_focused = false;
+                        this.export_template_focused = false;
+                        this.focused_api_field = None;
+                        this.focused_replace_field = None;
+                        this.focused_style_field = None;
+                        cx.notify();
+                    }
+                    if this.outline_dropdown_open
+                        || this.bg_style_dropdown_open
+                        || this.library_sort_dropdown_open
+                    {
+                        this.outline_dropdown_open = false;
+                        this.bg_style_dropdown_open = false;
+                        this.library_sort_dropdown_open = false;
+                        cx.notify();
+                    }
+                }),
+            )
             // 全局文件拖放接收层：GPUI 把「从资源管理器拖文件进来」包装成一次内部
             // drag/drop，drag value 类型为 `Arc<ExternalPaths>`，挂在根节点上即可
             // 全窗口任意位置放下都能导入。
+            .on_drop::<ExternalPaths>(cx.listener(
+                |this, paths: &ExternalPaths, _window, cx| {
+                    let dropped: Vec<PathBuf> = paths.paths().to_vec();
+                    tracing::info!("根容器监听到 ExternalPaths 拖放导入: {:?}", dropped);
+                    this.handle_dropped_files(&dropped, cx);
+                },
+            ))
             .on_drop::<Arc<ExternalPaths>>(cx.listener(
                 |this, paths: &Arc<ExternalPaths>, _window, cx| {
                     let dropped: Vec<PathBuf> = paths.paths().to_vec();
+                    tracing::info!("根容器监听到 Arc<ExternalPaths> 拖放导入: {:?}", dropped);
                     this.handle_dropped_files(&dropped, cx);
                 },
             ))
@@ -2977,10 +3081,12 @@ impl Render for MainWindow {
                     if this.is_export_dropdown_open
                         || this.outline_dropdown_open
                         || this.bg_style_dropdown_open
+                        || this.library_sort_dropdown_open
                     {
                         this.is_export_dropdown_open = false;
                         this.outline_dropdown_open = false;
                         this.bg_style_dropdown_open = false;
+                        this.library_sort_dropdown_open = false;
                         cx.notify();
                         return;
                     }
@@ -3110,7 +3216,7 @@ impl Render for MainWindow {
                 }),
             )
             // 1. 顶部自定义标题栏 (极简沉浸式，包含窗口拖拽与控制按钮)
-            .child(self.render_titlebar(cx))
+            .child(self.render_titlebar(cx, window.is_maximized()))
             // 1.5 全局失败提示条：`ProcessStatus::Failed` 的产生点遍布导出 / 预览 /
             // 视频库等各处，而底部状态栏只在「语音转写」页存在。失败时就地在这一条
             // 跨页常驻的横幅上显示，否则用户在其它页面只会看到「点了没反应」。

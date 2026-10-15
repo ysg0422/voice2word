@@ -672,6 +672,12 @@ pub struct SubtitleStyleConfig {
     /// 预览框的手动宽度（px）。
     #[serde(default)]
     pub preview_box_w: Option<f32>,
+    /// 画面水平位置百分比 0.0 ~ 100.0（默认 50.0 居中）
+    #[serde(default = "default_pos_x_percent")]
+    pub pos_x_percent: f32,
+    /// 画面垂直位置百分比 Some(0.0 ~ 100.0)（None 表示按 bottom_margin 贴底计算）
+    #[serde(default)]
+    pub pos_y_percent: Option<f32>,
 
     /// 主文字颜色（十六进制，如 "#FFFFFF"、"#FFD60A"）
     #[serde(default = "default_primary_color")]
@@ -743,6 +749,10 @@ fn default_karaoke_word_highlight() -> bool {
 fn default_margin_lr() -> u32 {
     20
 }
+/// 字幕水平居中默认值（50.0%）
+fn default_pos_x_percent() -> f32 {
+    50.0
+}
 
 /// 水平安全边距上限（px @1080p）。
 ///
@@ -773,6 +783,8 @@ impl Default for SubtitleStyleConfig {
             margin_lr: default_margin_lr(),
             preset_name: "白字黑影".to_string(),
             preview_box_w: None,
+            pos_x_percent: default_pos_x_percent(),
+            pos_y_percent: None,
             primary_color: default_primary_color(),
             outline_width: default_outline_width(),
             outline_color: default_outline_color(),
@@ -1001,6 +1013,8 @@ impl SubtitleStyleConfig {
         self.line_spacing = src.line_spacing;
         self.max_chars_per_line = src.max_chars_per_line;
         self.bottom_margin = src.bottom_margin;
+        self.pos_x_percent = src.pos_x_percent;
+        self.pos_y_percent = src.pos_y_percent;
         self.margin_lr = src.margin_lr;
         self.primary_color = src.primary_color.clone();
         self.outline_width = src.outline_width;
@@ -1171,12 +1185,21 @@ impl SubtitleStyleConfig {
 
     /// 预览用字号（px）
     pub fn preview_font_px(&self) -> f32 {
-        (self.font_size as f32 * Self::PREVIEW_SCALE).clamp(10.0, 26.0)
+        (self.font_size as f32 * Self::PREVIEW_SCALE).clamp(10.0, 24.0)
     }
 
     /// 预览用底边距（画面高度比例）
     pub fn preview_bottom_ratio(&self) -> f32 {
         (self.bottom_margin as f32 / 1080.0).clamp(0.0, 0.25)
+    }
+
+    /// 获取当前字幕在画面中的垂直百分比位置 (0.0 ~ 100.0)。
+    /// 若用户未手动自由拖拽 (pos_y_percent 为 None)，则根据底边距 bottom_margin 等比推导。
+    pub fn current_pos_y_percent(&self) -> f32 {
+        self.pos_y_percent.unwrap_or_else(|| {
+            let bottom_ratio = (self.bottom_margin as f32 / 1080.0).clamp(0.0, 0.4);
+            ((1.0 - bottom_ratio) * 100.0 - 2.5).clamp(5.0, 95.0)
+        })
     }
 
     /// 将主颜色 hex 转为 ASS 格式颜色（&H00BBGGRR）

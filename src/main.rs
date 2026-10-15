@@ -34,6 +34,11 @@ fn main() -> Result<()> {
     }
 
     #[cfg(windows)]
+    {
+        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1");
+    }
+
+    #[cfg(windows)]
     unsafe {
         #[link(name = "user32")]
         extern "system" {

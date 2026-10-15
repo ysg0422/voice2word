@@ -9,11 +9,36 @@ use super::super::MainWindow;
 use crate::app::state::WorkspaceTab;
 
 #[cfg(target_os = "windows")]
-mod win_drag {
+pub(crate) mod win_drag {
     #[link(name = "user32")]
     extern "system" {
         fn ReleaseCapture() -> i32;
         fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+        fn IsZoomed(hwnd: isize) -> i32;
+        fn InvalidateRect(hwnd: isize, lpRect: *const (), bErase: i32) -> i32;
+        fn UpdateWindow(hwnd: isize) -> i32;
+    }
+
+    /// GPUI 内部强制重绘窗口的消息 ID (WM_USER + 5)
+    pub const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = 0x0405;
+
+    /// 强制窗口刷新客户区并驱动 GPUI DirectX 渲染层重新绘制全幅画面
+    pub fn force_update_window(window: &mut gpui::Window) {
+        let raw = match raw_window_handle::HasWindowHandle::window_handle(window) {
+            Ok(handle) => handle,
+            Err(_) => return,
+        };
+        let raw_window_handle::RawWindowHandle::Win32(handle) = raw.as_raw() else {
+            return;
+        };
+        let hwnd = handle.hwnd.get();
+        if hwnd != 0 {
+            unsafe {
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                UpdateWindow(hwnd);
+                PostMessageW(hwnd, WM_GPUI_FORCE_UPDATE_WINDOW, 0, 0);
+            }
+        }
     }
 
     /// 按下标题栏时拖动窗口本体。
@@ -42,11 +67,40 @@ mod win_drag {
             }
         }
     }
+
+    /// 切换窗口最大化与还原状态（向 Win32 消息循环派发标准的 WM_SYSCOMMAND 系统命令）。
+    /// 走系统 WM_SYSCOMMAND 才能让系统正确计算工作区（WorkArea，避让任务栏）并保持与 DefWindowProc 完全同构，
+    /// 绝不能再在后面调用 GPUI 的 zoom_window()（其内部硬编码了 ShowWindowAsync(SW_MAXIMIZE)，会把还原状态再次强行打回最大化）。
+    pub fn toggle_maximize(window: &mut gpui::Window) {
+        let raw = match raw_window_handle::HasWindowHandle::window_handle(window) {
+            Ok(handle) => handle,
+            Err(_) => {
+                window.zoom_window();
+                return;
+            }
+        };
+        let raw_window_handle::RawWindowHandle::Win32(handle) = raw.as_raw() else {
+            window.zoom_window();
+            return;
+        };
+        let hwnd = handle.hwnd.get();
+        if hwnd != 0 {
+            unsafe {
+                const WM_SYSCOMMAND: u32 = 0x0112;
+                const SC_MAXIMIZE: usize = 0xF030;
+                const SC_RESTORE: usize = 0xF120;
+                let is_zoomed = IsZoomed(hwnd) != 0;
+                let cmd = if is_zoomed { SC_RESTORE } else { SC_MAXIMIZE };
+                PostMessageW(hwnd, WM_SYSCOMMAND, cmd, 0);
+            }
+        }
+    }
 }
 
 impl MainWindow {
     /// 渲染顶部现代化自定义标题栏 (支持原生窗口拖拽与系统控制按钮)
-    pub(crate) fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_titlebar(&self, cx: &mut Context<Self>, is_maximized: bool) -> impl IntoElement {
+        let max_icon = if is_maximized { "❐" } else { "▢" };
         div()
             .id("custom-titlebar")
             .w_full()
@@ -114,9 +168,15 @@ impl MainWindow {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .on_mouse_down(MouseButton::Left, |_, window, _| {
+                    .on_mouse_down(MouseButton::Left, |event, window, _| {
                         #[cfg(target_os = "windows")]
-                        win_drag::drag_window(window);
+                        {
+                            if event.click_count >= 2 {
+                                win_drag::toggle_maximize(window);
+                            } else {
+                                win_drag::drag_window(window);
+                            }
+                        }
                     })
                     .child(self.render_top_search(cx)),
             )
@@ -132,22 +192,35 @@ impl MainWindow {
                     .child(
                         primitives::titlebar_btn("—", false)
                             .id("titlebar-btn-min")
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
                             .on_click(cx.listener(|_, _, window, _| {
                                 window.minimize_window();
                             })),
                     )
                     // 最大化 / 还原
                     .child(
-                        primitives::titlebar_btn("▢", false)
+                        primitives::titlebar_btn(max_icon, false)
                             .id("titlebar-btn-max")
-                            .on_click(cx.listener(|_, _, window, _| {
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                #[cfg(target_os = "windows")]
+                                win_drag::toggle_maximize(window);
+                                #[cfg(not(target_os = "windows"))]
                                 window.zoom_window();
+                                cx.notify();
                             })),
                     )
                     // 关闭
                     .child(
                         primitives::titlebar_btn("✕", true)
                             .id("titlebar-btn-close")
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 // 关窗前的脏数据守卫：与系统关窗路径（Alt+F4 / 任务栏右键 /
                                 // 系统关闭按钮，见 `install_window_close_guard`）共用同一份
@@ -197,6 +270,7 @@ impl MainWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
                     if this.state.active_tab != WorkspaceTab::Editor {
                         this.state.active_tab = WorkspaceTab::Editor;
                     }

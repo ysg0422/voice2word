@@ -150,6 +150,7 @@ pub(crate) const SUBTITLE_EXTS: [&str; 10] = [
 /// 「导入字幕」对话框的文件过滤器：比拖拽清单多一个 `txt`——点选文件时用户意图明确，
 /// 纯文本（时间轴由导入侧按字数合成）也允许。除 `txt` 外都取自
 /// `subtitle::reader::SubtitleFormat::from_path` 认识的扩展名，两份清单必须同源。
+#[allow(dead_code)]
 pub(crate) const IMPORT_SUBTITLE_EXTS: [&str; 11] = [
     "srt", "vtt", "txt", "json", "lrc", "ass", "ssa", "ttml", "dfxp", "ttal", "sbv",
 ];
@@ -712,6 +713,7 @@ impl MainWindow {
     }
 
     /// 将单文件就绪卡片转为批量队列并打开选择器添加更多视频
+    #[allow(dead_code)]
     pub(crate) fn convert_ready_to_batch(&mut self, cx: &mut Context<Self>) {
         if let Some(file) = self.state.transcribe_file.take() {
             self.state.enqueue_files(vec![file.clone()]);
@@ -1382,6 +1384,12 @@ impl MainWindow {
         // 避免阻塞这次实体更新闭包。
         self.state.transcribe_duration = 0.0;
         self.state.transcribe_file = Some(file.clone());
+        let fname = file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("媒体文件")
+            .to_string();
+        self.notice = Some(format!("已载入媒体文件：{fname}"));
         // 换了文件 → 「0 秒命中」的缓存结果必然作废。不清理的话，
         // 新文件会沿用上一个文件的缓存命中信息（界面显示错误的句数）。
         self.state.invalidate_cached_transcription();
@@ -1425,6 +1433,7 @@ impl MainWindow {
     ///   同样按字数估算。两者都得明说，否则用户导出 SRT 时会以为时间是准的。
     /// - **不落库**：导入的工程没有对应的媒体记录，`active_task_id` 置 `None`，
     ///   用户要留存就自己导出（或后续接一个「另存为工程」）。
+    #[allow(dead_code)]
     pub(crate) fn import_subtitle_file(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let handle = rfd::AsyncFileDialog::new()
@@ -1903,7 +1912,26 @@ impl MainWindow {
 
     /// 从队列里移除一条（用户手动剔除不想要的片源）
     pub(crate) fn remove_queue_item(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let removed_path = self.state.batch_queue.get(idx).map(|item| item.path.clone());
         if self.state.remove_queue_item(idx) {
+            if let Some(path) = removed_path {
+                if self.state.transcribe_file.as_ref() == Some(&path) {
+                    if let Some(first) = self.state.batch_queue.first() {
+                        self.state.transcribe_file = Some(first.path.clone());
+                        self.state.selected_file = Some(first.path.clone());
+                        self.state.transcribe_duration = first.duration;
+                    } else {
+                        self.state.transcribe_file = None;
+                        self.state.selected_file = None;
+                        self.state.transcribe_duration = 0.0;
+                    }
+                }
+            }
+            if self.state.batch_queue.is_empty() {
+                self.state.transcribe_file = None;
+                self.state.selected_file = None;
+                self.state.transcribe_duration = 0.0;
+            }
             cx.notify();
         }
     }
@@ -1941,6 +1969,8 @@ impl MainWindow {
         }
         self.state.clear_batch_queue();
         self.state.transcribe_file = None;
+        self.state.selected_file = None;
+        self.state.transcribe_duration = 0.0;
         cx.notify();
     }
 

@@ -560,9 +560,154 @@ fn scan_tier_disk() -> Vec<(crate::app::WhisperModelTier, PathBuf, u64)> {
 impl MainWindow {
     /// 渲染性能设置工作台
     pub(crate) fn render_performance_layout(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // 页面外壳统一走 primitives::page_shell：内边距 / 分区间距 / 标题字号
-        // 与其余三个工作台页同源，切页时内容不再横向跳动。
+        let current_tab = self.settings_tab;
+
+        // 顶部子选项卡切换条
+        let tab_bar = div()
+            .flex()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .mb(px(Theme::SPACE_3))
+            .child(
+                div()
+                    .id("settings-subtab-hardware")
+                    .px(px(Theme::SPACE_3))
+                    .py(px(Theme::SPACE_1_5))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .font_weight(if current_tab == 0 { FontWeight::BOLD } else { FontWeight::NORMAL })
+                    .bg(if current_tab == 0 { Theme::accent_mint() } else { Theme::bg_card() })
+                    .text_color(if current_tab == 0 { Theme::text_on_accent() } else { Theme::text_secondary() })
+                    .border_1()
+                    .border_color(if current_tab == 0 { Theme::accent_mint() } else { Theme::border_subtle() })
+                    .hover(|s| if current_tab != 0 { s.bg(Theme::bg_hover()).text_color(Theme::text_primary()) } else { s })
+                    .child("硬件与推理")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.settings_tab = 0;
+                        cx.notify();
+                    }))
+            )
+            .child(
+                div()
+                    .id("settings-subtab-llm")
+                    .px(px(Theme::SPACE_3))
+                    .py(px(Theme::SPACE_1_5))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .font_weight(if current_tab == 1 { FontWeight::BOLD } else { FontWeight::NORMAL })
+                    .bg(if current_tab == 1 { Theme::accent_mint() } else { Theme::bg_card() })
+                    .text_color(if current_tab == 1 { Theme::text_on_accent() } else { Theme::text_secondary() })
+                    .border_1()
+                    .border_color(if current_tab == 1 { Theme::accent_mint() } else { Theme::border_subtle() })
+                    .hover(|s| if current_tab != 1 { s.bg(Theme::bg_hover()).text_color(Theme::text_primary()) } else { s })
+                    .child("翻译与润色")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.settings_tab = 1;
+                        cx.notify();
+                    }))
+            )
+            .child(
+                div()
+                    .id("settings-subtab-download")
+                    .px(px(Theme::SPACE_3))
+                    .py(px(Theme::SPACE_1_5))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .font_weight(if current_tab == 2 { FontWeight::BOLD } else { FontWeight::NORMAL })
+                    .bg(if current_tab == 2 { Theme::accent_mint() } else { Theme::bg_card() })
+                    .text_color(if current_tab == 2 { Theme::text_on_accent() } else { Theme::text_secondary() })
+                    .border_1()
+                    .border_color(if current_tab == 2 { Theme::accent_mint() } else { Theme::border_subtle() })
+                    .hover(|s| if current_tab != 2 { s.bg(Theme::bg_hover()).text_color(Theme::text_primary()) } else { s })
+                    .child("模型与组件")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.settings_tab = 2;
+                        cx.notify();
+                    }))
+            );
+
+        // 自适应响应式内容区：小屏一列、大屏两列自适应
+        let content = match current_tab {
+            0 => {
+                // Tab 0: 硬件与推理加速
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(Theme::SPACE_4))
+                    // 左列（硬件加速模式 + 识别引擎选择）
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(380.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(Theme::SPACE_4))
+                            .child(self.render_hardware_tier_card(cx))
+                            .child(self.render_engine_selection_card(cx))
+                    )
+                    // 右列（并行度 + 音频预处理管道）
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(380.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(Theme::SPACE_4))
+                            .child(self.render_parallelism_card(cx))
+                            .child(self.render_audio_pipeline_card(cx))
+                    )
+                    .into_any_element()
+            }
+            1 => {
+                // Tab 1: 翻译与润色配置
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(Theme::SPACE_4))
+                    // 左列（翻译引擎配置）
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(380.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(Theme::SPACE_4))
+                            .child(self.render_translate_settings_card(cx))
+                    )
+                    // 右列（标点与 AI 润色）
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(380.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(Theme::SPACE_4))
+                            .child(self.render_polish_selection_card(cx))
+                    )
+                    .into_any_element()
+            }
+            _ => {
+                // Tab 2: 组件与模型下载
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Theme::SPACE_4))
+                    .child(self.render_model_manager(false, cx))
+                    .into_any_element()
+            }
+        };
+
         primitives::page_shell("performance-settings-page")
+            .flex_1()
+            .w_full()
             // 1. 页头：标题 + 帮助按钮
             .child(self.render_page_header(cx))
             // 2. 配置说明卡 (右上角问号按钮展开)
@@ -571,20 +716,10 @@ impl MainWindow {
             } else {
                 None
             })
-            // 1.5 硬件加速模式选择（我有 GPU / 纯 CPU 模式）
-            .child(self.render_hardware_tier_card(cx))
-            // 4. 步骤 2: 识别引擎与模型架构选择
-            .child(self.render_engine_selection_card(cx))
-            // 5. 步骤 3: 并行度（线程数 / 进程数滑条，量程按本机核心数推导）
-            .child(self.render_parallelism_card(cx))
-            // 6. 步骤 4: 标点恢复与 AI 文本润色
-            .child(self.render_polish_selection_card(cx))
-            // 6.5 步骤 4.5: 音频前端预处理与救场解码
-            .child(self.render_audio_pipeline_card(cx))
-            // 7. 步骤 5: 字幕翻译引擎（离线 Qwen / 在线 OpenAI 兼容 API）
-            .child(self.render_translate_settings_card(cx))
-            // 8. 步骤 6: 模型与组件（缺什么、一键补齐；全部走国内镜像）
-            .child(self.render_model_manager(false, cx))
+            // 3. 子选项卡导航条
+            .child(tab_bar)
+            // 4. 自适应双列/单列内容
+            .child(content)
     }
 
     /// 硬件加速模式选择卡（我有 GPU / 纯 CPU 模式自由无缝切换）
@@ -697,6 +832,7 @@ impl MainWindow {
                 primitives::chip(if key_visible { "隐藏" } else { "显示" }, false, false)
                     .id("api-key-visible-toggle")
                     .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.api_key_visible = !this.api_key_visible;
                         cx.notify();
