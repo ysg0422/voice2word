@@ -906,6 +906,7 @@ impl FFmpegEngine {
     pub fn get_duration<P: AsRef<Path>>(&self, input_path: P) -> f64 {
         // 探测同样带截止期：坏文件让 ffmpeg -i 悬挂时不再拖死调用方。
         let mut cmd = Command::new(&self.ffmpeg_path);
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
         cmd.arg("-i").arg(input_path.as_ref());
         let output = run_with_deadline(&mut cmd, SUBPROCESS_TIMEOUT);
 
