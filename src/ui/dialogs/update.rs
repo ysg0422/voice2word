@@ -28,16 +28,17 @@ impl MainWindow {
             .as_ref()
             .map(|r| r.published_at.as_str())
             .unwrap_or("");
-        let notes = release
+        let raw_notes = release
             .as_ref()
             .map(|r| r.notes.trim())
             .filter(|s| !s.is_empty())
             .unwrap_or("本次更新包含性能提升与稳定性修复。");
+        let notes = format_release_notes(raw_notes);
 
         let asset_name = target
             .as_ref()
             .map(|(_, name, _)| name.as_str())
-            .unwrap_or("voice2word.exe");
+            .unwrap_or("Voice2Word-Setup.exe");
         let asset_size_mb = target
             .as_ref()
             .map(|(_, _, size)| *size as f64 / 1024.0 / 1024.0)
@@ -395,3 +396,59 @@ impl MainWindow {
             )
     }
 }
+
+/// 清理并美化 Release Notes，去除原生 UI 里丑陋的 Markdown 标记与表格线
+fn format_release_notes(raw: &str) -> String {
+    let mut lines = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if lines.last().map(|s: &String| !s.is_empty()).unwrap_or(false) {
+                lines.push(String::new());
+            }
+            continue;
+        }
+        // 过滤冗余的大标题（如 ## Voice2Word v0.2.9，弹窗顶部已大字展示）
+        if trimmed.starts_with("# ") || trimmed.starts_with("## ") {
+            continue;
+        }
+        // 过滤 Markdown 表格分割线（形如 |:---|:---|）
+        if trimmed.starts_with('|') && trimmed.contains("---") {
+            continue;
+        }
+        // Markdown 表格行：转为整洁的纯文本条目
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            let cells: Vec<&str> = trimmed
+                .trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if cells.is_empty() || cells[0] == "文件" {
+                continue;
+            }
+            let name = cells[0].trim_matches(|c| c == '*' || c == '`');
+            let desc = cells.get(2).copied().or_else(|| cells.get(1).copied()).unwrap_or("");
+            let clean_desc = desc.replace("**", "").replace('`', "");
+            lines.push(format!("• {name}：{clean_desc}"));
+            continue;
+        }
+
+        // 普通小标题与列表：清除 ###、**、` 等原始标记
+        let cleaned = trimmed
+            .trim_start_matches('#')
+            .trim()
+            .replace("**", "")
+            .replace('`', "");
+        if !cleaned.is_empty() {
+            lines.push(cleaned);
+        }
+    }
+    let res = lines.join("\n").trim().to_string();
+    if res.is_empty() {
+        "本次更新包含性能提升与稳定性修复。".to_string()
+    } else {
+        res
+    }
+}
+

@@ -147,46 +147,67 @@ pub fn parse_latest_release(body: &str) -> Result<LatestRelease> {
         .take(MAX_NOTES_CHARS)
         .collect();
 
-    // 从 assets 列表中提取可执行文件或安装包附件直链
+    // 从 assets 列表中提取可执行文件或安装包附件直链：
+    // 优先级策略：
+    // 1. *-Setup.exe（向导安装包，最推荐，能自动升级现有安装并配置好快捷方式）
+    // 2. voice2word.exe（主程序便携版，单文件直接运行）
+    // 3. 其他非 cli 的 .exe
+    // 4. .zip 压缩包
+    // 5. voice2word-cli.exe（纯无头后台命令行工具，仅在别无选择时作为最后备选）
+    let asset_rank = |name: &str| -> i32 {
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("setup") && lower.ends_with(".exe") {
+            100
+        } else if (lower == "voice2word.exe" || lower.starts_with("voice2word-"))
+            && lower.ends_with(".exe")
+            && !lower.contains("cli")
+        {
+            80
+        } else if lower.ends_with(".exe") && !lower.contains("cli") {
+            50
+        } else if lower.ends_with(".zip") {
+            30
+        } else if lower.ends_with(".exe") {
+            10
+        } else {
+            0
+        }
+    };
+
     let mut download_url = String::new();
     let mut asset_name = String::new();
     let mut asset_size: u64 = 0;
     let mut asset_sha256: Option<String> = None;
+    let mut best_rank = 0;
 
     if let Some(assets) = value.get("assets").and_then(|a| a.as_array()) {
         for asset in assets {
             if let Some(name) = asset.get("name").and_then(|n| n.as_str()) {
-                let lower = name.to_ascii_lowercase();
-                if lower.ends_with(".exe") || lower.ends_with(".zip") {
-                    let url = asset
-                        .get("browser_download_url")
-                        .and_then(|u| u.as_str())
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    // 没有直链的附件根本下不下来，必须在这里跳过：否则一个「名字是
-                    // .exe 但 browser_download_url 缺失」的条目会覆盖掉先前选中的
-                    // 有效 .zip，把 download_url 清空、逼出下面的硬编码回退 URL。
-                    if url.is_empty() {
-                        continue;
-                    }
-                    let size = asset.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
-                    // 官方附件元数据里的内容摘要（`sha256:<hex>`）；不认识/缺失即 None。
-                    let digest = asset
-                        .get("digest")
-                        .and_then(|d| d.as_str())
-                        .and_then(normalize_digest);
-                    let is_exe = lower.ends_with(".exe");
-                    // 优先选择 .exe；否则保留第一个可用的候选（zip 等）
-                    if is_exe || download_url.is_empty() {
-                        download_url = url;
-                        asset_name = name.to_string();
-                        asset_size = size;
-                        asset_sha256 = digest;
-                        if is_exe {
-                            break;
-                        }
-                    }
+                let rank = asset_rank(name);
+                if rank == 0 {
+                    continue;
+                }
+                let url = asset
+                    .get("browser_download_url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if url.is_empty() {
+                    continue;
+                }
+                let size = asset.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+                let digest = asset
+                    .get("digest")
+                    .and_then(|d| d.as_str())
+                    .and_then(normalize_digest);
+
+                if rank > best_rank {
+                    best_rank = rank;
+                    download_url = url;
+                    asset_name = name.to_string();
+                    asset_size = size;
+                    asset_sha256 = digest;
                 }
             }
         }
@@ -586,11 +607,13 @@ pub fn download_update_file(
     let expected_digest = advertised_digest(download_url);
 
     // 候选下载镜像（国内加速镜像优先，最后兜底 GitHub 直链）
+    // 候选下载镜像（国内加速镜像优先，最后兜底 GitHub 直链）
     let mut candidate_urls = Vec::new();
     if download_url.starts_with("https://github.com/") {
-        candidate_urls.push(format!("https://ghproxy.net/{download_url}"));
+        candidate_urls.push(format!("https://ghfast.top/{download_url}"));
         candidate_urls.push(format!("https://gh-proxy.com/{download_url}"));
         candidate_urls.push(format!("https://mirror.ghproxy.com/{download_url}"));
+        candidate_urls.push(format!("https://ghproxy.net/{download_url}"));
     }
     candidate_urls.push(download_url.to_string());
 
@@ -602,7 +625,8 @@ pub fn download_update_file(
         }
 
         let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(30 * 60))
+            .timeout_connect(Duration::from_secs(6))
+            .timeout_read(Duration::from_secs(60))
             .try_proxy_from_env(true)
             .build();
 
