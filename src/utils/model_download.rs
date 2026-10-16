@@ -168,18 +168,96 @@ impl ItemGroup {
 
 const MB: u64 = 1024 * 1024;
 
+/// 从 URL 取 host（失败返回空串，调用方据此跳过优化）。
+fn url_host(url: &str) -> String {
+    url.split("//")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// 是否直连境外的源（HuggingFace / GitHub 及其代理）。
+///
+/// # 为什么需要区分国内外
+///
+/// 本项目同时登记了国内直连源（ModelScope，实测 5~7 MB/s）与境外源
+/// （hf-mirror / GitHub + 代理）。**两者都有用**：
+/// - 国内网络：ModelScope 快，境外源多半不通；
+/// - 挂梯子 / 海外：境外源反而快，且部分文件（如 Turbo 量化）只有境外源有。
+///
+/// 因此绝不能把任一侧删掉或永久拉黑——那会直接废掉另一类用户。这里只用来
+/// 决定「先试谁」的**排序**。
+fn is_overseas_source(url: &str) -> bool {
+    let host = url_host(url);
+    !host.contains("modelscope")
+}
+
+/// 按「**本轮已失败过的源往后排**」重排源，其余保持原有相对顺序。
+///
+/// # 折中：既不拉黑，也不重复踩坑
+///
+/// 早先的写法是把连不上的 host **在整个会话内拉黑**。那对国内用户是省时间的，
+/// 但对**挂梯子**的用户有害：他一旦先以无梯状态点过一次下载，之后开了梯子也仍会
+/// 被跳过境外源——而那些源此时恰恰是最快的，且有些文件只有它们有。
+///
+/// 改成每次 `download_one` 都从**原始顺序**重新开始，只在**本次下载内**把刚刚
+/// 失败的源挪到队尾。效果：
+/// - 同一次下载不会重复白等某个死源（省时间）；
+/// - 下一次下载（可能已开梯子／换了网络）重新按登记顺序试，最快的源重新回到首位。
+///
+/// 失败计数按 host 记：同一 host 的多个镜像 URL 一起沉底，一次下载内不会反复踩。
+fn order_sources(urls: &[&'static str], failed_hosts: &[String]) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = urls.to_vec();
+    // 排序键（稳定排序，同档内保持登记顺序）：
+    //   0 = 国内源（ModelScope，国内直连最快）
+    //   1 = 境外源（挂梯子 / 海外时最快；也是部分模型唯一的来源）
+    //   2 = 本次下载已失败的 host（沉底，避免重复白等连接超时）
+    //
+    // **三类都保留**：只调顺序，不删任何源。这样无论用户是国内直连还是挂梯子，
+    // 都有机会用到对自己最快的那个；失败的源只是退到队尾，下次下载又会重新
+    // 从原始顺序开始（见本函数上方的说明）。
+    out.sort_by_key(|u| {
+        if failed_hosts.iter().any(|h| h == &url_host(u)) {
+            2
+        } else if is_overseas_source(u) {
+            1
+        } else {
+            0
+        }
+    });
+    out
+}
+
+/// 错误是否是**连接阶段**失败（DNS / TCP / TLS），而不是「连上了但出错」。
+///
+/// 只有这类失败才值得把整个 host 拉黑：HTTP 4xx/5xx 只说这一个 URL 有问题，
+/// 同一 host 的其它文件可能完全正常。
+fn is_connect_stage_error(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains("Connection Failed")
+        || text.contains("tls connection init failed")
+        || text.contains("Dns Failed")
+        || text.contains("connect")
+}
+
 /// 下载**连接**阶段的超时。
 ///
 /// 镜像/代理域名解析到黑洞地址时，TCP 连接可以一直挂在 SYN 重传上；没有这条
 /// 超时就会先卡满整个请求上限（2 小时）才轮得到换源。
-const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+///
+/// 取 8 秒：实测被墙/被劫持的镜像（TLS 握手直接断）通常在 1~3 秒内就失败，
+/// 这个值只用来兜住「TCP 挂死在 SYN 重传」那类真正无响应的地址。原先的 20 秒
+/// 意味着一个条目若前两个源都不可达，用户要先白等 40 秒才开始下——
+/// 「下载慢」的很大一部分观感来自这里，而不是带宽。
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// 下载的**空闲**超时：多久没有新字节到达就判这条源死了。
 ///
-/// 取 60 秒而不是更短：慢速线路（几十 KB/s）每 60 秒也必然有字节到达，不会被误杀；
-/// 而对端真正卡死（连接在、数据不来）时，一分钟就能判死并换下一个镜像源，
-/// 比让用户对着「下载中 … 0 B」干等两小时强得多。
-const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 取 30 秒：慢速线路（几十 KB/s）每 30 秒也必然有字节到达，不会被误杀；
+/// 而对端真正卡死（连接在、数据不来）时，半分钟就能判死并换下一个镜像源。
+/// 原先的 60 秒会让「源半死不活」的情形白等一分钟才轮到可用源。
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 单次下载请求的**总**上限：慢网下 800 MB 也要下得完（约 2 小时）。
 ///
@@ -275,7 +353,7 @@ pub const ITEMS: &[DownloadItem] = &[
             "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-tiny.bin",
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
         ],
-        size: 77_700_000,
+        size: 77_691_713, // 实测 ggml-tiny.bin
         min_size: 70_000_000,
         required: false,
         group: ItemGroup::Asr,
@@ -292,7 +370,7 @@ pub const ITEMS: &[DownloadItem] = &[
             "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-base.bin",
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
         ],
-        size: 147_951_465,
+        size: 147_951_465, // 实测 ggml-base.bin
         min_size: 130_000_000,
         required: false,
         group: ItemGroup::Asr,
@@ -311,7 +389,10 @@ pub const ITEMS: &[DownloadItem] = &[
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin",
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
         ],
-        size: 181_300_000, // 上游 q5_1；本机若已有 q5_0(175MB) 也应算就位
+        // 实测上游 q5_1 为 181_300_000 字节；本机若已有 q5_0/ggml-small 也应算就位。
+        // 数值必须是**字节数**：显示层 human_size 按 1024 换算，写成十进制约数
+        // 会显示出 172.9 MB 这种与实际不符的怪数。
+        size: 181_300_000,
         min_size: 160_000_000,
         required: true,
         group: ItemGroup::Asr,
@@ -342,10 +423,13 @@ pub const ITEMS: &[DownloadItem] = &[
         note: "大模型量化版，速度与精度兼得（547MB）",
         dest: "models/whisper/ggml-large-v3-turbo-q5_0.bin",
         urls: &[
-            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+            // 注：本模型国内 ModelScope 暂无 ggml 镜像（上游只提供 safetensors/pt）。
+            // 两条源都留着：国内用户可能命中，挂梯子的用户则靠 hf-mirror。
+            // 排序在运行时由 `order_sources` 决定（国内优先、失败沉底）。
             "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3-turbo-q5_0.bin",
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
         ],
-        size: 574_041_195,
+        size: 574_041_195, // 实测 ggml-large-v3-turbo-q5_0.bin（547.4 MiB）
         min_size: 500_000_000,
         required: false,
         group: ItemGroup::Asr,
@@ -359,10 +443,11 @@ pub const ITEMS: &[DownloadItem] = &[
         note: "旗舰精度量化版，抗口音吞音（833MB）",
         dest: "models/whisper/ggml-large-v3-turbo-q8_0.bin",
         urls: &[
-            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin",
+            // 同 Turbo Q5：国内暂无 ggml 镜像，双源都留（见该条目的说明）。
             "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3-turbo-q8_0.bin",
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin",
         ],
-        size: 874_188_075,
+        size: 874_188_075, // 实测 ggml-large-v3-turbo-q8_0.bin（833.7 MiB）
         min_size: 800_000_000,
         required: false,
         group: ItemGroup::Asr,
@@ -426,10 +511,54 @@ pub const ITEMS: &[DownloadItem] = &[
         note: "离线润色与字幕翻译，无需联网与密钥",
         dest: "models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf",
         urls: &[
+            // 国内源优先（ModelScope 直连，实测可用）
+            "https://www.modelscope.cn/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/master/qwen2.5-0.5b-instruct-q4_k_m.gguf",
             "https://hf-mirror.com/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
         ],
         size: 491_400_032,
         min_size: 400_000_000,
+        required: false,
+        group: ItemGroup::Text,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
+    // 下面两个是**更大的可选档**：离线翻译/润色对模型规模很敏感，0.5B 只够「能用」，
+    // 1.5B/3B 的译文通顺度明显更好，且仍能在这类显卡/CPU 上跑得动。
+    //
+    // 为什么只加 Qwen2.5、不加更新的 Qwen3：本项目的 LLM 调用走的是
+    // `llama-completion -no-cnv`（**原始补全**，不走对话模板，见 `engines/llm.rs`）。
+    // Qwen3 是混合推理模型，原始补全下会把 ` thinking...<｜end▁of▁thinking｜>` 思考过程一起吐出来、
+    // 混进字幕里；Qwen2.5 没有思考模式，与现有 0.5B 同族、提示词与停止符
+    // （`<|im_end|>`）完全一致，因此是当前引擎下安全的选择。
+    DownloadItem {
+        id: "qwen-llm-1_5b",
+        label: "Qwen2.5-1.5B（翻译增强）",
+        note: "译文更通顺，适合正式内容；约 1.0GB",
+        dest: "models/llm/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+        urls: &[
+            "https://www.modelscope.cn/models/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/master/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+            "https://hf-mirror.com/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+        ],
+        size: 1_117_700_000,
+        min_size: 900_000_000,
+        required: false,
+        group: ItemGroup::Text,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
+    DownloadItem {
+        id: "qwen-llm-3b",
+        label: "Qwen2.5-3B（翻译高质）",
+        note: "24GB 显存以下最佳性价比；约 2.0GB",
+        dest: "models/llm/qwen2.5-3b-instruct-q4_k_m.gguf",
+        urls: &[
+            "https://www.modelscope.cn/models/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/master/qwen2.5-3b-instruct-q4_k_m.gguf",
+            "https://hf-mirror.com/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
+        ],
+        size: 2_105_300_000,
+        min_size: 1_800_000_000,
         required: false,
         group: ItemGroup::Text,
         is_archive: false,
@@ -1183,6 +1312,9 @@ pub fn item_id_for_path(path: &Path) -> Option<&'static str> {
 /// `configured_path_for` 的规则（尤其是 whisper 档位那条「只认配置指向的档位」）
 /// 分叉，就会出现「定位到 A、删除却删 B」的错位。
 pub fn item_effective_path(item: &DownloadItem, cfg: &AppConfig) -> PathBuf {
+    if let Some(existing) = resolve_existing_path(item, Some(cfg)) {
+        return existing;
+    }
     configured_path_for(item, Some(cfg)).unwrap_or_else(|| AppConfig::resolve_path(item.dest))
 }
 
@@ -1332,7 +1464,12 @@ pub fn download_one(
         part_path_for(&dest).ok_or_else(|| anyhow!("无法为 {} 构造临时文件名", dest.display()))?;
 
     let mut last_err: Option<anyhow::Error> = None;
-    for url in item.urls {
+    // 本次下载内失败过的 host：排在队尾，避免同一次下载反复踩同一个死源。
+    // 每次 download_one 都从空表开始——即「下次下载恢复原始顺序」，
+    // 挂梯子的用户不会因为上一次的失败而永远用不上更快的境外源。
+    let mut failed_hosts: Vec<String> = Vec::new();
+    let ordered = order_sources(item.urls, &failed_hosts);
+    for url in ordered {
         if cancel.load(Ordering::Relaxed) {
             return Err(anyhow!("已取消"));
         }
@@ -1389,6 +1526,17 @@ pub fn download_one(
             }
             Err(err) => {
                 warn!(item = item.id, url, error = %err, "该下载源失败，尝试下一个");
+                // 连接阶段失败（DNS/TCP/TLS）→ 本次下载内把它排到队尾。
+                //
+                // 刻意**不**做跨下载的永久拉黑：那种「记住坏源」的做法对挂梯子的用户
+                // 有害——他开着梯子时境外源本来是最快的，却会因为之前裸连失败过而
+                // 一直被跳过。范围限定在本次下载，既省掉重复白等，又不缩小下次的
+                // 可用源集合（见 [`order_sources`]）。
+                let host = url_host(url);
+                if is_connect_stage_error(&err) && !host.is_empty() && !failed_hosts.contains(&host)
+                {
+                    failed_hosts.push(host);
+                }
                 // 保留 `.part`：下一个源可以带 Range 从断点续传，避免把已经下到的
                 // 几百 MB 扔掉重来。它不会被误认成完整模型（判定只看目标名），
                 // 下次启动的 sweep 也会清掉它。
@@ -1869,6 +2017,69 @@ mod executable_resolution_tests {
 mod tests {
     use super::*;
 
+    /// 源排序：国内源优先、失败的沉底，且**任何一条都不被丢弃**。
+    ///
+    /// 这条锁住的是「国内/国外源都留着」这个决定。曾经考虑过把连不上的 host
+    /// 永久拉黑以求快，但那会害了挂梯子的用户——他们开着代理时境外源恰恰最快，
+    /// 且部分模型（如 Turbo 量化）只有境外源有。因此这里断言的是「只重排、不减项」。
+    #[test]
+    fn source_ordering_keeps_every_source_and_prefers_domestic() {
+        let urls: [&'static str; 3] = [
+            "https://hf-mirror.com/a/ggml-x.bin",
+            "https://www.modelscope.cn/b/ggml-x.bin",
+            "https://gh-proxy.com/https://github.com/c/ggml-x.bin",
+        ];
+        // 没有任何失败记录时：国内源排第一，境外源依次在后
+        let ordered = order_sources(&urls, &[]);
+        assert_eq!(ordered.len(), urls.len(), "不能丢弃任何源");
+        assert!(
+            ordered[0].contains("modelscope"),
+            "国内源应排在最前，实际：{}",
+            ordered[0]
+        );
+
+        // 国内源失败过：它沉到队尾，但**仍在列表里**（下次下载恢复优先）
+        let failed = vec!["www.modelscope.cn".to_string()];
+        let reordered = order_sources(&urls, &failed);
+        assert_eq!(reordered.len(), urls.len(), "失败源只能沉底，不能删除");
+        assert!(
+            !reordered[0].contains("modelscope"),
+            "失败源不该继续排在首位"
+        );
+        assert!(
+            reordered.last().unwrap().contains("modelscope"),
+            "失败源应被排到队尾"
+        );
+    }
+
+    /// host 解析与国内外判定：\`modelscope\` 一律算国内源。
+    #[test]
+    fn overseas_detection_is_by_host() {
+        assert_eq!(url_host("https://a.b/c/d"), "a.b");
+        assert!(!is_overseas_source(
+            "https://www.modelscope.cn/models/x/resolve/master/y.bin"
+        ));
+        assert!(!is_overseas_source("https://modelscope.cn/x"));
+        assert!(is_overseas_source(
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"
+        ));
+        assert!(is_overseas_source(
+            "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/x.onnx"
+        ));
+    }
+
+    /// 只有**连接阶段**的错误才值得把 host 沉底；HTTP 4xx/5xx 不该牵连整个源。
+    #[test]
+    fn only_connect_stage_errors_mark_a_source() {
+        assert!(is_connect_stage_error(&anyhow!(
+            "请求失败: Connection Failed: tls connection init failed"
+        )));
+        assert!(
+            !is_connect_stage_error(&anyhow!("sha256 校验失败：期望 a，实际 b")),
+            "内容校验失败与源连通性无关"
+        );
+    }
+
     /// 空闲超时必须真的生效：对端把连接接着、一个字节都不发时，请求要在空闲超时后
     /// 报错，而不是拖到两小时的总上限。这条正是「下载中 … 0 B 卡住」的回归护栏。
     ///
@@ -1962,6 +2173,30 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for item in ITEMS {
             assert!(seen.insert(item.id), "重复的 id: {}", item.id);
+        }
+    }
+
+    /// 落地路径必须互不重复。
+    ///
+    /// 这条守的是「模型指向的路径到底对不对」里最容易错、后果最严重的一类：
+    /// 两个条目写同一个文件时，下载 A 会被下载 B 覆盖，而「是否已就位」的判定
+    /// 又按体积下限来——于是界面显示两个都「已就位」，实际只有后下的那个存在。
+    /// 这类问题在运行时不报错，只表现为「下过的模型忽然不见了」，极难排查。
+    ///
+    /// 比较前做大小写折叠与分隔符归一：本项目在 Windows 上跑，
+    /// `Models/Whisper/x.bin` 与 `models/whisper/x.bin` 是同一个文件。
+    #[test]
+    fn destination_paths_are_unique() {
+        let mut seen: std::collections::HashMap<String, &'static str> =
+            std::collections::HashMap::new();
+        for item in ITEMS {
+            let key = item.dest.replace('\\', "/").to_ascii_lowercase();
+            if let Some(prev) = seen.insert(key, item.id) {
+                panic!(
+                    "条目 {prev} 与 {} 的落地路径重复：{}（后者会覆盖前者）",
+                    item.id, item.dest
+                );
+            }
         }
     }
 

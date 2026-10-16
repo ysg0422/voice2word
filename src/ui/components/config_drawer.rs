@@ -93,47 +93,7 @@ fn thread_presets(current: u32, cores: u32) -> Vec<u32> {
     values
 }
 
-/// 「识别引擎」卡片的档位顺序。
-///
-/// 只放顺序，不放任何说明文字或元数据：卡片上**只显示模型名**（外加「当前」「已下载/
-/// 需下载」两个状态徽标）。定位句、星级、体积这些附加信息都按用户要求去掉了——体积
-/// 在下单的地方（「模型与组件」）逐项都写着，选型不缺这一处。
-#[allow(dead_code)]
-const TIER_ORDER: [WhisperModelTier; 8] = [
-    WhisperModelTier::SenseVoice,
-    WhisperModelTier::TurboSpeed,
-    WhisperModelTier::Precise,
-    WhisperModelTier::LargeV3,
-    WhisperModelTier::Medium,
-    WhisperModelTier::Balanced,
-    WhisperModelTier::Fast,
-    WhisperModelTier::Tiny,
-];
-
-/// 档位状态徽标文案：下载中 > 已下载 > 需下载。
-fn tier_status_text(present: bool, downloading: bool) -> &'static str {
-    if downloading {
-        "下载中…"
-    } else if present {
-        "已下载"
-    } else {
-        "需下载"
-    }
-}
-
-/// 这一档名下是否有条目正在下载。
-///
-/// SenseVoice 没有单一条目 id（三个文件组成），因此按前缀判定：其中任何一个在下载
-/// 都算这一档在下载，否则会出现「明明在下 SenseVoice 的词表，卡片却说需下载」。
-fn tier_downloading(tier: WhisperModelTier, current: Option<&str>) -> bool {
-    let Some(current) = current else {
-        return false;
-    };
-    match tier.download_item_id() {
-        Some(id) => current == id,
-        None => current.starts_with("sensevoice"),
-    }
-}
+use crate::utils::local_models::paths_equal;
 
 /// 热词输入框的编辑态。
 ///
@@ -583,18 +543,40 @@ impl MainWindow {
         )
     }
 
-    /// 「识别引擎」卡片：动态根据本地实际已下载的模型呈现选项（用户下载啥了就显示啥）。
+    /// 「识别引擎」卡片：列出**磁盘上实际存在的**全部模型（扫目录，不是筛预设枚举）。
+    ///
+    /// # 为什么从「筛枚举」改成「扫目录」
+    ///
+    /// 旧实现是 `available_installed_tiers()`——先在 8 个预设枚举里遍历、再看各自
+    /// 的内置路径在不在。于是用户自己放进 `models/whisper/` 的模型（自量化 q5_1、
+    /// 改名后的权重）**在界面上根本不存在**，看不到也选不了。现在改成扫描目录：
+    /// 有什么文件就列什么，自备模型与下载来的模型一视同仁。
     fn render_engine_card(&mut self, cx: &mut Context<Self>) -> Div {
-        let installed = WhisperModelTier::available_installed_tiers();
+        // 读跨帧快照（渲染路径零 I/O）——与性能页下拉共用同一份扫描结果。
+        let installed = self.local_models_snapshot(cx);
         let mut cards = div().flex().flex_col().gap(px(Theme::SPACE_1_5));
 
-        if !installed.is_empty() {
-            // 用户下载了什么模型，这里就只显示什么模型！
-            for (index, tier) in installed.iter().copied().enumerate() {
-                cards = cards.child(self.tier_card(index, tier, cx));
-            }
-        } else {
-            // 本地尚无已下载模型时，给出清爽的引导
+        // SenseVoice 不是 ggml 权重，不在扫描结果里，单独成卡（未就绪则返回 None）
+        let sensevoice = self.sensevoice_card(cx);
+        let sensevoice_ready = sensevoice.is_some();
+        if let Some(card) = sensevoice {
+            cards = cards.child(card);
+        }
+
+        for (index, model) in installed.iter().enumerate() {
+            cards = cards.child(self.model_card(index, model, cx));
+        }
+
+        // 「一个可用模型都没有」必须**同时**看两条来源：SenseVoice 是
+        // models/sensevoice/ 下的 ONNX 三件套，**不会**出现在 models/whisper/
+        // 的扫描结果里。
+        //
+        // 此前这里只看 installed，于是「只装了 SenseVoice」的用户会看到
+        // SenseVoice 卡片下面紧跟着一句「尚未检测到已下载模型」——自相矛盾
+        // （卡片标题还写着「已就位」）。凡是显示「没有模型」，判据就必须覆盖
+        // 所有来源，否则每加一条来源就多一种自相矛盾的组合。
+        if !sensevoice_ready && installed.is_empty() {
+            // 本地确实一个都没有时，给出清爽的引导
             cards = cards.child(
                 div()
                     .p(px(Theme::SPACE_3))
@@ -627,115 +609,62 @@ impl MainWindow {
 
         primitives::card_sm()
             .gap(px(Theme::SPACE_2))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(primitives::section_title("识别引擎（已就位）"))
-                    .child(
-                        div()
-                            .id("goto-model-manager-link")
-                            .cursor_pointer()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::accent_blue())
-                            .hover(|s| s.text_color(Theme::accent_primary()))
-                            .child("+ 管理/下载更多")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.active_tab = WorkspaceTab::Performance;
-                                cx.notify();
-                            })),
-                    ),
-            )
+            .child(primitives::section_title("识别引擎（已就位）"))
             .child(cards)
     }
 
-    /// 单个档位卡片：**只有档位名 + 状态徽标**（+ 未就位时的行内下载按钮）。
+    /// 单个**已扫到的模型**卡片：模型名 + 体积 + 选中态。
     ///
-    /// 卡片上不再有任何附加文字（定位句、速度/精度星级、体积都去过一版又按用户要求
-    /// 撤掉）：这一栏是「选哪一个」，名称与「当前 / 已下载 / 需下载」就够做决定了，
-    /// 体积在「模型与组件」里逐项都写着。
-    ///
-    /// 点击整卡 = 选中该档位（语义与老胶囊一致：写配置 + 把「模型与组件」页切到
-    /// 对应分栏）；未下载时行内多一个动作按钮，点它不会顺带改档位。
-    fn tier_card(
+    /// 与旧 `tier_card` 的关键差别：这里渲染的是**磁盘上真实存在的文件**，因此不再有
+    /// 「需下载」这个状态——卡片列的每一个都能立刻拿来用。「下没下过」由「模型与组件」
+    /// 页负责，不在这里重复。
+    fn model_card(
         &mut self,
         index: usize,
-        tier: WhisperModelTier,
+        model: &crate::utils::local_models::LocalModel,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let is_sel = self.state.whisper_model_tier == tier;
-        // 「是否就位」一律取 `installed_path()`（= 引擎真正会加载的文件，含档位内
-        // 量化回退），而不是按条目登记的精确文件名判定：后者会在「Turbo 用 Q8 兜底」
-        // 时判为未下载，与「点开始转写其实跑得起来」自相矛盾。
-        let present = tier.installed_path().is_some();
-        let downloading = tier_downloading(tier, self.state.download_current.as_deref());
-        let busy = self.state.is_downloading;
+        let is_sel = paths_equal(&self.state.selected_model_path, &model.path);
+        let size_text = crate::utils::model_download::human_size(model.size_bytes);
 
-        // 名字允许被压缩并省略（`min_w_0` + `truncate`）：这一行同时要放「当前」徽标、
-        // 状态徽标和下载按钮，固定宽度下若不让名字收缩，长档位名会把按钮挤出可见区域。
-        let mut head = div().flex().items_center().gap(px(Theme::SPACE_2)).child(
-            div()
-                .min_w(px(0.0))
-                .truncate()
-                .text_size(px(Theme::TEXT_BODY_LG))
-                .font_weight(if is_sel {
-                    FontWeight::BOLD
-                } else {
-                    FontWeight::MEDIUM
-                })
-                .text_color(if is_sel {
-                    Theme::accent_blue()
-                } else {
-                    Theme::text_primary()
-                })
-                .child(tier.label()),
-        );
-        if is_sel {
-            // 「当前」只表示「配置里选的是它」，与「下没下过」分开显示：
-            // 用户因此能看懂「我选的这档还没下」，而不会以为选择没生效。
-            head = head.child(primitives::badge_accent("当前"));
-        }
-        head = head.child(div().flex_1().min_w(px(0.0))).child(if present {
-            primitives::badge(tier_status_text(present, downloading))
-        } else if downloading {
-            primitives::badge_accent(tier_status_text(present, downloading))
-        } else {
-            primitives::badge_danger(tier_status_text(present, downloading))
-        });
+        // 名字允许被压缩并省略（`min_w_0` + `truncate`）：自备模型的文件名可能很长，
+        // 不让它收缩会把「当前」徽标挤出可见区域。
+        let head = div()
+            .flex()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(Theme::TEXT_BODY_LG))
+                    .font_weight(if is_sel {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .text_color(if is_sel {
+                        Theme::accent_blue()
+                    } else {
+                        Theme::text_primary()
+                    })
+                    .child(model.label.clone()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_muted())
+                    .child(size_text),
+            )
+            .child(div().flex_1().min_w(px(0.0)))
+            // 「当前」只表示「选中的是它」，与「谁下载的」无关：
+            // 用户自备的模型同样会被标出来，证明选择确实生效了。
+            .when(is_sel, |d| d.child(primitives::badge_accent("当前")));
 
-        // 行内下载入口：Whisper 各档是单文件条目，就地能下；SenseVoice 由三个
-        // 条目组成，按钮改成引导到「模型与组件」，避免只下了一半文件还显示就位。
-        if !present && !downloading && !busy {
-            match tier.download_item_id() {
-                Some(item_id) => {
-                    head = head.child(
-                        primitives::mini_btn("下载", true)
-                            .id(("engine-tier-dl", index))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                // 阻止冒泡：否则点「下载」会顺带触发整卡的「选中该档位」。
-                                cx.stop_propagation();
-                                this.start_model_download(item_id, cx);
-                            })),
-                    );
-                }
-                None => {
-                    head = head.child(
-                        primitives::mini_btn("去下载", true)
-                            .id(("engine-tier-guide", index))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.model_manager_tab = crate::ui::ModelManagerTab::SenseVoice;
-                                this.state.active_tab = WorkspaceTab::Performance;
-                                cx.notify();
-                            })),
-                    );
-                }
-            }
-        }
-
+        let target = model.path.clone();
         div()
-            .id(("engine-tier-card", index))
+            .id(("engine-model-card", index))
             .w_full()
             .px(px(Theme::SPACE_2))
             .py(px(Theme::SPACE_2))
@@ -748,10 +677,8 @@ impl MainWindow {
             })
             .bg(if is_sel {
                 Theme::tint_blue_badge()
-            } else if present {
-                Theme::bg_raised()
             } else {
-                Theme::bg_inset()
+                Theme::bg_raised()
             })
             .cursor_pointer()
             .hover(move |s| {
@@ -763,16 +690,88 @@ impl MainWindow {
                 }
             })
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.state.set_whisper_model_tier(tier);
-                this.model_manager_tab = match tier {
-                    crate::app::WhisperModelTier::SenseVoice => {
-                        crate::ui::ModelManagerTab::SenseVoice
-                    }
-                    _ => crate::ui::ModelManagerTab::Whisper,
-                };
+                // 按**路径**选中（不是按档位）：自备模型没有档位可对应，
+                // 走这条路才能被真正加载，配置里也会记下它。
+                this.state.set_selected_model_path(target.clone());
+                // 分块可折叠后，跳转必须顺带把目标块展开，否则收起状态下「点了没反应」。
+                this.expand_model_block(crate::ui::ModelManagerTab::Whisper);
                 cx.notify();
             }))
             .child(head)
+    }
+
+    /// SenseVoice 极速引擎的卡片。
+    ///
+    /// 它不参与 `models/whisper/` 的扫描（模型是 `models/sensevoice/` 下的 ONNX
+    /// 三件套，不是 ggml 权重），因此单独成卡。三项齐全才显示——缺任何一项这个引擎
+    /// 都跑不起来，列出来只会让用户选了之后被开工守卫拦下。
+    fn sensevoice_card(&mut self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let ready = ["sensevoice-model", "sensevoice-tokens", "sensevoice-vad"]
+            .iter()
+            .all(|id| self.state.model_is_present(id));
+        if !ready {
+            return None;
+        }
+        let is_sel = self.state.whisper_model_tier == WhisperModelTier::SenseVoice;
+        let head = div()
+            .flex()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(Theme::TEXT_BODY_LG))
+                    .font_weight(if is_sel {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .text_color(if is_sel {
+                        Theme::accent_blue()
+                    } else {
+                        Theme::text_primary()
+                    })
+                    .child(WhisperModelTier::SenseVoice.label()),
+            )
+            .child(div().flex_1().min_w(px(0.0)))
+            .when(is_sel, |d| d.child(primitives::badge_accent("当前")));
+
+        Some(
+            div()
+                .id("engine-sensevoice-card")
+                .w_full()
+                .px(px(Theme::SPACE_2))
+                .py(px(Theme::SPACE_2))
+                .rounded(px(Theme::RADIUS_LG))
+                .border_1()
+                .border_color(if is_sel {
+                    Theme::tint_blue_border()
+                } else {
+                    Theme::border()
+                })
+                .bg(if is_sel {
+                    Theme::tint_blue_badge()
+                } else {
+                    Theme::bg_raised()
+                })
+                .cursor_pointer()
+                .hover(move |s| {
+                    if is_sel {
+                        s
+                    } else {
+                        s.bg(Theme::tint_neutral())
+                            .border_color(Theme::border_light())
+                    }
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.state
+                        .set_whisper_model_tier(WhisperModelTier::SenseVoice);
+                    this.expand_model_block(crate::ui::ModelManagerTab::SenseVoice);
+                    cx.notify();
+                }))
+                .child(head),
+        )
     }
 
     /// 「转写参数」卡片：识别语言 / 输出格式 / 标点润色 / 转写线程
@@ -1358,8 +1357,8 @@ mod tests {
     // 这里刻意不用 `use super::*`：父模块的 `use gpui::*` 会把 gpui 自带的
     // `test` 属性宏带进来，遮蔽内建的 `#[test]`，导致展开递归超限。
     use super::{
-        apply_hotwords_bare_key, hotwords_display_window, speaker_options, tier_downloading,
-        tier_status_text, HOTWORDS_VIEW_CHARS, OUTPUT_FORMAT_CHOICES, TIER_ORDER,
+        apply_hotwords_bare_key, hotwords_display_window, speaker_options, HOTWORDS_VIEW_CHARS,
+        OUTPUT_FORMAT_CHOICES,
     };
     use crate::app::WhisperModelTier;
     use crate::engines::MAX_SPEAKERS;
@@ -1390,51 +1389,62 @@ mod tests {
         assert!(options.iter().any(|(key, _)| *key == selected));
     }
 
-    /// 五档卡片必须齐：抽屉里少一档，用户就再也选不到那个引擎（老逻辑只列已下载档位，
-    /// 未下载的档位会整块消失，这正是「想选 Turbo 却找不到」的来源）。
+    /// 路径比较必须按 Windows 语义（大小写不敏感 + 分隔符归一）。
+    ///
+    /// 这条锁住的是「当前正在用的模型」能不能被正确标成选中：配置里手写的路径与
+    /// 扫描得到的路径只要有一处大小写或斜杠不同，比较失败就会让界面显示
+    /// 「一个都没选中」，用户会以为自己的选择丢了。
     #[test]
-    fn tier_order_covers_every_tier_once() {
-        let mut covered: Vec<WhisperModelTier> = TIER_ORDER.to_vec();
-        let count = covered.len();
-        covered.sort_by_key(|tier| *tier as u8);
-        covered.dedup();
-        assert_eq!(covered.len(), count, "档位不能重复登记");
-
-        for tier in WhisperModelTier::WHISPER_TIERS {
-            assert!(covered.contains(&tier), "抽屉缺少 {tier:?} 的卡片");
-        }
-        assert!(covered.contains(&WhisperModelTier::SenseVoice));
-        assert_eq!(covered.len(), WhisperModelTier::WHISPER_TIERS.len() + 1);
+    fn paths_equal_is_case_and_separator_insensitive() {
+        use crate::utils::local_models::paths_equal;
+        let a = std::path::Path::new("models/whisper/ggml-small-q5_0.bin");
+        assert!(paths_equal(a, a), "同一路径必须相等");
+        assert!(
+            paths_equal(
+                a,
+                std::path::Path::new("models\\whisper\\ggml-small-q5_0.bin")
+            ),
+            "反斜杠与正斜杠应视为同一路径"
+        );
+        assert!(
+            paths_equal(
+                a,
+                std::path::Path::new("MODELS/Whisper/GGML-Small-Q5_0.BIN")
+            ),
+            "Windows 上大小写不敏感"
+        );
+        assert!(
+            !paths_equal(a, std::path::Path::new("models/whisper/ggml-base.bin")),
+            "不同文件不能相等"
+        );
     }
-    /// 徽标优先级：正在下载的档位不能说成「已下载」，否则用户以为已经能用了。
-    #[test]
-    fn tier_status_text_prefers_downloading_over_present() {
-        assert_eq!(tier_status_text(true, false), "已下载");
-        assert_eq!(tier_status_text(false, false), "需下载");
-        assert_eq!(tier_status_text(false, true), "下载中…");
-        assert_eq!(tier_status_text(true, true), "下载中…");
-    }
 
-    /// 下载态判定：Whisper 档按 id 精确匹配，SenseVoice 按前缀匹配三条目中的任意一个。
+    /// 引擎卡现在列的是**扫到的文件**：自备模型也必须出现在结果里。
+    ///
+    /// 这是本次改造的核心诉求——旧实现遍历 8 个预设枚举，用户自己放进目录的模型
+    /// 永远不在列表里。这条直接对扫描层断言「自备文件被列出且标为自备」。
     #[test]
-    fn tier_downloading_matches_bundle_by_prefix() {
-        assert!(!tier_downloading(WhisperModelTier::Fast, None));
-        assert!(tier_downloading(
-            WhisperModelTier::Fast,
-            Some("whisper-base")
-        ));
-        assert!(!tier_downloading(
-            WhisperModelTier::Fast,
-            Some("whisper-turbo-q5")
-        ));
-        assert!(tier_downloading(
-            WhisperModelTier::SenseVoice,
-            Some("sensevoice-tokens")
-        ));
-        assert!(!tier_downloading(
-            WhisperModelTier::SenseVoice,
-            Some("whisper-base")
-        ));
+    fn scanned_models_include_user_supplied_files() {
+        use crate::utils::local_models::{describe, is_companion_weight, scan_model_dir};
+        // 自备模型：名字不在任何预设里 → 仍应被描述为一个可用模型
+        let custom = describe(
+            std::path::Path::new("models/whisper/my-q5_1.bin"),
+            "my-q5_1.bin",
+            170_000_000,
+        );
+        assert!(!custom.is_known_tier(), "自备模型不应被当成预设档位");
+        assert_eq!(custom.label, "my-q5_1.bin", "应如实显示文件名");
+        // 体积启发式：170MB 落在 small 档区间，用于给出「预计耗时」
+        assert_eq!(
+            custom.estimate_tier(),
+            WhisperModelTier::Balanced,
+            "未知模型应按体积给出可用的估算档位"
+        );
+
+        // VAD 是伴生权重，不能被当成识别模型列出来（选中会直接转写失败）
+        assert!(is_companion_weight("ggml-silero-v6.2.0.bin"));
+        // 空目录 / 不存在的目录：返回空表而不是 panic（首次启动的正常状态）
+        assert!(scan_model_dir(std::path::Path::new("Z:/nope/nowhere")).is_empty());
     }
 
     /// 热词框的裸键编辑核：空格必须能打出来（`apply_line_edit` 的键名判据做不到这一点），

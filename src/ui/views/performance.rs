@@ -7,7 +7,7 @@ use gpui::prelude::*;
 use gpui::*;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -84,72 +84,6 @@ pub(crate) fn local_model_status(
             "模型未就位：填一个 .gguf 路径，或点「下载模型」用内置 Qwen".to_string(),
         ),
     }
-}
-
-/// Whisper 档位下拉里，每一档的**一句话说明**（纯函数，便于单测）。
-///
-/// 为什么要有它：档位菜单里塞的信息最多，而「档位名 → 该怎么选」这层判断如果散落在
-/// 渲染闭包里，就没法断言。抽成纯函数后，单测可以锁住「四档各有说明、不重复、
-/// 不落到空串」，避免以后加档位时漏写说明（表现是菜单里出现一行光秃秃的标题）。
-///
-/// 文案的取法是「定位 + 硬指标」：用户看这一行就是在决定选哪个，所以每档要能一句话
-/// 说清它适合谁（最快 / 均衡 / 较准 / 最准），并带上参数量或提速幅度这类可核对的数。
-#[allow(dead_code)]
-pub(crate) fn tier_menu_desc(tier: crate::app::WhisperModelTier) -> &'static str {
-    use crate::app::WhisperModelTier as T;
-    match tier {
-        T::SenseVoice => "极速识别，SenseVoice 档下不参与选择",
-        T::Tiny => "轻量 · 75M 参数 · 超快秒级响应",
-        T::Fast => "最快 · 39M 参数 · 低配机器首选",
-        T::Balanced => "均衡 · 244M 参数 · CPU 友好，出厂默认",
-        T::Medium => "进阶 · 769M 参数 · 介于 Small 与 Large 之间",
-        T::TurboSpeed => "较准 · 提速 25%~30% · 综合推荐",
-        T::Precise => "高精 · 抗口音吞音 · Q8 旗舰精度",
-        T::LargeV3 => "旗舰 · 1550M 参数 · 3.1GB 全尺寸原版，最强抗噪",
-    }
-}
-
-/// ONNX 执行后端在性能页「引擎选择」卡上的一行状态：(文案, 是否警告色)。
-///
-/// 抽成纯函数是为了单测：三种状态里的「实况」只有真跑一次 runner 才会出现
-/// （请求 `dml` 被 Python 侧回落成 `cpu`），单测里造不出来，所以这里只留
-/// 「实况 → 文案」这一步映射，判定规则与日志层完全同源。
-///
-/// - `requested`：配置里请求的 provider。`GpuConfig::resolve_onnx_provider` 已把
-///   `dml` / `directml` / 其它值归一成 `dml` 或 `cpu`，这里只对空串兜底。
-/// - `actual`：runner 回报的实际生效 provider；`None` = 本次会话还没跑过 ONNX 推理。
-/// - `engine_mounted`：SenseVoice / CT-Punc 至少挂载了一个。两者都没就绪时 provider
-///   根本没机会生效，此时说「回落」是误导。
-///
-/// 返回 `true` 表示这一行要用警告色（琥珀）：唯一命中条件是「请求了非 cpu、实际却
-/// 落到别的值」，与 `engines::sensevoice::provider_fallback_notice` 同一条规则。
-pub(crate) fn provider_status_line(
-    requested: &str,
-    actual: Option<&str>,
-    engine_mounted: bool,
-) -> (String, bool) {
-    if !engine_mounted {
-        return ("未启用（SenseVoice / CT-Punc 均未就位）".to_string(), false);
-    }
-    // 空串兜底成 cpu：与 `resolve_onnx_provider` 的「其余一律 cpu」一致，
-    // 保证这个纯函数对任意输入都有确定输出。
-    let configured = match requested.trim() {
-        "" => "cpu",
-        other => other,
-    };
-    let Some(actual) = actual.map(str::trim) else {
-        // 还没回报实况：只回显配置值，绝不显示成已生效——用户配了 dml 却还没转过，
-        // 看到光秃秃的 dml 很容易以为加速已经在跑。
-        return (format!("{configured}（尚未跑过推理）"), false);
-    };
-    if crate::engines::sensevoice::provider_fallback_notice(configured, actual).is_some() {
-        return (format!("配置 {configured}，实际 {actual}（已回落）"), true);
-    }
-    if configured == "cpu" {
-        // 中性文案顺手解释「为什么不是 dml」，否则用户会以为自己漏了设置
-        return ("CPU（未配置加速）".to_string(), false);
-    }
-    (format!("{configured}（实际生效）"), false)
 }
 
 // ==================== 在线翻译：模型列表拉取 ====================
@@ -371,42 +305,6 @@ fn fetch_model_list(cfg: &TranslateConfig, key: &str) -> Result<ModelFetchOutcom
     Err(model_fetch_error_message(err.status, &err.detail, &err.raw))
 }
 
-/// 从管线里取 ONNX 后端的**实况**（请求值, 实际生效值）。`None` = 尚无引擎回报。
-///
-/// # 为什么现在恒返回 `None`
-///
-/// 引擎侧已经齐了：`SenseVoiceEngine::provider_status()`（`src/engines/sensevoice.rs:259`）
-/// 与 `PunctuationEngine::provider_status()`（`src/engines/punc.rs:146`）都是 `pub`，
-/// 各自只读一个 `Mutex<Option<ProviderStatus>>`。缺的是从 `TaskPipeline` 到它们的
-/// 那一跳：`pipeline.rs` 里持有引擎的 `sensevoice` / `punc` 两个字段是**私有**的
-/// （`src/core/pipeline.rs:172` / `:174`），`TaskPipeline` 也没有导出任何读它们的
-/// `pub` 方法。
-///
-/// # 单点接线（`src/core/pipeline.rs` 不在本文件的改写范围内，故只留这一处）
-///
-/// 在该文件的 `set_llm_threads`（当前在 `:244-246`）之后插入：
-///
-/// ```ignore
-/// /// ONNX 执行后端实况：SenseVoice 优先，回退 CT-Punc；两者都没回报过则是 None。
-/// ///
-/// /// 供性能页把「配置了 dml 却回落 cpu」显示到界面上；引擎不感知 UI。
-/// pub fn onnx_provider_status(&self) -> Option<ProviderStatus> {
-///     self.sensevoice
-///         .as_ref()
-///         .and_then(|e| e.provider_status())
-///         .or_else(|| self.punc.as_ref().and_then(|e| e.provider_status()))
-/// }
-/// ```
-///
-/// 接线后把下面那行 `None` 换成
-/// `pipeline.onnx_provider_status().map(|s| (s.requested, s.actual))` 即可。
-/// 本文件其余部分（渲染、配色、单测）均无需改动。
-fn onnx_provider_actual(pipeline: &crate::core::TaskPipeline) -> Option<(String, String)> {
-    pipeline
-        .onnx_provider_status()
-        .map(|s| (s.requested, s.actual))
-}
-
 /// 并行进程数滑条的量程上限：按当前识别引擎区分。
 ///
 /// 两条转写路径的硬上限是两个不同的常量——Whisper 夹 `MAX_WORKERS`(4)、
@@ -491,73 +389,87 @@ impl Default for ModelPoolScroll {
 
 impl Global for ModelPoolScroll {}
 
-/// Whisper 档位的磁盘快照：每个档位「引擎实际会加载的文件」及其占用。
+/// 本机可用模型的跨帧快照：扫描 `models/whisper/` 的结果 + 每个文件的体积。
 ///
-/// 档位触发器每帧调 `installed_path()`（`exists()` + `is_file()` 两次 stat），
-/// 展开的档位菜单又对每个档位再调一次 `installed_path()` + `disk_size()`——都不该
-/// 出现在渲染路径上。照 `views/library.rs` 的 `ensure_library_sizes` 范式：
-/// 后台探一次写进 GPUI 全局，渲染只读快照。
+/// # 为什么必须有这个快照（而不是渲染时现扫）
 ///
-/// 存在 GPUI 全局而不是 `MainWindow` 字段里：字段定义在并发改动中的 `ui/mod.rs`，
-/// 本模块无权改。
+/// 渲染路径**不做 I/O** 是本项目的硬约定（见 `views/library.rs` 的
+/// `ensure_library_sizes` 范式）。而「列出本机有哪些模型」天然是一次 `read_dir`
+/// 加每个文件一次 `metadata`——菜单打开期间每帧都跑一遍是明确的违规。这里照同一
+/// 范式：键变了才在后台扫一次，渲染只读结果。
+///
+/// 存在 GPUI 全局而不是 `MainWindow` 字段里：字段定义在 `ui/mod.rs`，
+/// 本模块不扩它的面。
 #[derive(Default)]
-struct TierDiskSnapshot {
+struct LocalModelsSnapshot {
     /// 快照基于哪个键算出（`None` = 还没算过）
-    key: Option<TierDiskKey>,
-    /// (档位, 引擎实际加载的文件, 该文件字节数)——只放已就位的档位
-    entries: Vec<(crate::app::WhisperModelTier, PathBuf, u64)>,
-    /// 后台探测进行中：避免每帧重复派发
+    key: Option<ModelsKey>,
+    /// 扫描结果（已排序，故顺序稳定）
+    models: Vec<crate::utils::local_models::LocalModel>,
+    /// 后台扫描进行中：避免每帧重复派发
     inflight: bool,
 }
 
-impl TierDiskSnapshot {
-    /// 该档位引擎实际会加载的文件；`None` = 未就位。
-    fn path(&self, tier: crate::app::WhisperModelTier) -> Option<&Path> {
-        self.entries
-            .iter()
-            .find(|(t, _, _)| *t == tier)
-            .map(|(_, path, _)| path.as_path())
-    }
+impl Global for LocalModelsSnapshot {}
 
-    /// 该档位已就位文件的磁盘占用；`None` = 未就位。
-    fn size(&self, tier: crate::app::WhisperModelTier) -> Option<u64> {
-        self.entries
-            .iter()
-            .find(|(t, _, _)| *t == tier)
-            .map(|(_, _, size)| *size)
-    }
+/// 本机已下载的**离线大模型**（`models/llm/*.gguf`）的跨帧快照。
+///
+/// 与 [`LocalModelsSnapshot`] 同一个范式、同一个理由（渲染路径零 I/O），
+/// 只是扫的是另一个目录、且不需要档位概念。失效键直接复用 [`ModelsKey`]。
+#[derive(Default)]
+struct LlmModelsSnapshot {
+    key: Option<ModelsKey>,
+    models: Vec<crate::utils::local_models::LocalModel>,
+    inflight: bool,
 }
 
-impl Global for TierDiskSnapshot {}
+impl Global for LlmModelsSnapshot {}
 
-/// 档位磁盘快照的失效键（判定抽成纯函数 [`tier_disk_snapshot_stale`]）。
+/// 模型快照的失效键（判定抽成纯函数 [`models_snapshot_stale`]）。
+///
+/// # 为什么用「目录 mtime」而不是「逐条目存在性」
+///
+/// 旧实现（`TierDiskKey`）键的是 `ITEMS` 各条目的就位与否——它只能感知**清单里
+/// 登记过**的文件变化。而本次要支持的恰恰是清单外的自备模型：用户往目录里丢一个
+/// `.bin`，逐条目判定完全看不出来。目录 mtime 对「新增 / 删除 / 改名」都会变，
+/// 一次 `metadata` 就能覆盖两类来源（下载完成 与 手工放置）。
 #[derive(Clone, PartialEq, Eq)]
-struct TierDiskKey {
+struct ModelsKey {
     /// 下载在跑：下载完成 true→false 是「立刻刷新」信号（完成回调在别的文件里）
     downloading: bool,
-    /// 各条目就位快照（按 `ITEMS` 稳定顺序）：删除 / 补齐后
-    /// `AppState::refresh_model_presence` 会改它，从而自动重扫
-    presence: Vec<bool>,
+    /// 模型目录的修改时间；目录不存在时为 `None`
+    dir_mtime: Option<(u64, u32)>,
 }
 
-/// 档位快照是否需要重扫（纯函数，便于单测）：键变了 → 重扫；键不变 → 复用。
-fn tier_disk_snapshot_stale(cached: Option<&TierDiskKey>, current: &TierDiskKey) -> bool {
+/// 模型快照是否需要重扫（纯函数，便于单测）：键变了 → 重扫；键不变 → 复用。
+fn models_snapshot_stale(cached: Option<&ModelsKey>, current: &ModelsKey) -> bool {
     cached != Some(current)
 }
 
-/// 后台探测各档位「实际会加载的文件」及占用（只在快照失效时跑一次）。
-fn scan_tier_disk() -> Vec<(crate::app::WhisperModelTier, PathBuf, u64)> {
-    use crate::app::WhisperModelTier;
-    use crate::utils::model_download::disk_size;
-    WhisperModelTier::WHISPER_TIERS
-        .iter()
-        .copied()
-        .filter_map(|tier| {
-            let path = tier.installed_path()?;
-            let size = disk_size(&path).unwrap_or(0);
-            Some((tier, path, size))
-        })
-        .collect()
+/// 读**大模型目录**的失效键（与 [`models_key`] 同构，只是换目录）。
+fn llm_models_key(downloading: bool) -> ModelsKey {
+    let dir_mtime = std::fs::metadata(crate::utils::local_models::llm_models_dir())
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs(), d.subsec_nanos()));
+    ModelsKey {
+        downloading,
+        dir_mtime,
+    }
+}
+
+/// 读模型目录的失效键。只做一次 `metadata`。
+fn models_key(downloading: bool) -> ModelsKey {
+    let dir_mtime = std::fs::metadata(crate::utils::local_models::models_dir())
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs(), d.subsec_nanos()));
+    ModelsKey {
+        downloading,
+        dir_mtime,
+    }
 }
 
 impl MainWindow {
@@ -642,7 +554,12 @@ impl MainWindow {
                     .flex_row()
                     .flex_wrap()
                     .gap(px(Theme::SPACE_4))
-                    // 左列（硬件加速模式 + 识别引擎选择）
+                    // 左列（只剩硬件加速模式）
+                    //
+                    // 这里曾有「识别引擎」三元组（识别引擎开关 / Whisper 模型档位下拉 /
+                    // ONNX 后端状态行）。模型管理已经集中到「模型与组件」页与右侧抽屉的
+                    // 「识别引擎（已就位）」卡，同一件事在三个地方各有一套入口只会互相打架，
+                    // 因此整卡移除。选中哪个引擎/模型现在只由那两处决定。
                     .child(
                         div()
                             .flex_1()
@@ -651,7 +568,6 @@ impl MainWindow {
                             .flex_col()
                             .gap(px(Theme::SPACE_4))
                             .child(self.render_hardware_tier_card(cx))
-                            .child(self.render_engine_selection_card(cx))
                     )
                     // 右列（并行度 + 音频预处理管道）
                     .child(
@@ -1067,34 +983,28 @@ impl MainWindow {
             .child(Self::render_setting_row("术语表", glossary_control))
     }
 
-    /// 刷新「Whisper 档位磁盘快照」：键变化时后台重扫一次（见 [`TierDiskSnapshot`]）。
+    /// 刷新「本机可用模型」快照：键变化时后台重扫一次（见 [`LocalModelsSnapshot`]）。
     ///
-    /// 渲染路径只读内存：键不变就复用，键变了（下载完成 / 删除 / 补齐）才派发一次
-    /// 后台探测，完成后 `cx.notify()` 自动刷新。
-    fn ensure_tier_disk_snapshot(&self, cx: &mut Context<Self>) {
-        let key = TierDiskKey {
-            downloading: self.state.is_downloading,
-            presence: crate::utils::ITEMS
-                .iter()
-                .map(|item| self.state.model_is_present(item.id))
-                .collect(),
-        };
-        let stale = cx.update_default_global::<TierDiskSnapshot, _>(|state, _| {
-            tier_disk_snapshot_stale(state.key.as_ref(), &key) && !state.inflight
+    /// 渲染路径只读内存：键不变就复用，键变（目录内容变了 / 下载完成）才派发一次
+    /// 后台扫描，完成后 `cx.notify()` 自动刷新。
+    fn ensure_local_models_snapshot(&self, cx: &mut Context<Self>) {
+        let key = models_key(self.state.is_downloading);
+        let stale = cx.update_default_global::<LocalModelsSnapshot, _>(|state, _| {
+            models_snapshot_stale(state.key.as_ref(), &key) && !state.inflight
         });
         if !stale {
             return;
         }
         let key_for_store = key;
-        cx.update_default_global::<TierDiskSnapshot, _>(|state, _| state.inflight = true);
+        cx.update_default_global::<LocalModelsSnapshot, _>(|state, _| state.inflight = true);
         cx.spawn(async move |this, cx| {
-            let entries = cx
+            let models = cx
                 .background_executor()
-                .spawn(async move { scan_tier_disk() })
+                .spawn(async move { crate::utils::local_models::scan_installed_models() })
                 .await;
             let _ = this.update(cx, |_this, cx| {
-                cx.update_default_global::<TierDiskSnapshot, _>(|state, _| {
-                    state.entries = entries;
+                cx.update_default_global::<LocalModelsSnapshot, _>(|state, _| {
+                    state.models = models;
                     state.key = Some(key_for_store);
                     state.inflight = false;
                 });
@@ -1103,6 +1013,56 @@ impl MainWindow {
         })
         .detach();
     }
+
+    /// 当前快照里的模型列表（渲染路径零 I/O；首帧快照未就绪时为空表）。
+    ///
+    /// `pub(crate)`：右侧配置抽屉的「识别引擎」卡也用它——两处必须看**同一份**
+    /// 扫描结果，否则会出现「抽屉里有、下拉里没有」这种自相矛盾的界面。
+    pub(crate) fn local_models_snapshot(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Vec<crate::utils::local_models::LocalModel> {
+        self.ensure_local_models_snapshot(cx);
+        cx.update_default_global::<LocalModelsSnapshot, _>(|state, _| state.models.clone())
+    }
+
+    /// 刷新「本机离线大模型」快照：键变化时后台重扫一次（见 [`LlmModelsSnapshot`]）。
+    fn ensure_llm_models_snapshot(&self, cx: &mut Context<Self>) {
+        let key = llm_models_key(self.state.is_downloading);
+        let stale = cx.update_default_global::<LlmModelsSnapshot, _>(|state, _| {
+            models_snapshot_stale(state.key.as_ref(), &key) && !state.inflight
+        });
+        if !stale {
+            return;
+        }
+        let key_for_store = key;
+        cx.update_default_global::<LlmModelsSnapshot, _>(|state, _| state.inflight = true);
+        cx.spawn(async move |this, cx| {
+            let models = cx
+                .background_executor()
+                .spawn(async move { crate::utils::local_models::scan_llm_models() })
+                .await;
+            let _ = this.update(cx, |_this, cx| {
+                cx.update_default_global::<LlmModelsSnapshot, _>(|state, _| {
+                    state.models = models;
+                    state.key = Some(key_for_store);
+                    state.inflight = false;
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 当前快照里的本机大模型列表（渲染路径零 I/O）。
+    fn llm_models_snapshot(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Vec<crate::utils::local_models::LocalModel> {
+        self.ensure_llm_models_snapshot(cx);
+        cx.update_default_global::<LlmModelsSnapshot, _>(|state, _| state.models.clone())
+    }
+
     /// 页头：标题 + 帮助按钮 (简约，无徽标)
     fn render_page_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let show_help = self.state.show_perf_help;
@@ -1290,15 +1250,10 @@ impl MainWindow {
 
     /// 配置说明卡：由右上角问号按钮展开，逐条介绍各配置项的作用
     fn render_perf_help_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let items: [(&'static str, &'static str); 7] = [
-            (
-                "识别引擎",
-                "SenseVoice：中文极速、自带标点；Whisper：多语种、方言口音更稳。",
-            ),
-            (
-                "Whisper 模型档位",
-                "Base 最快 → Turbo Q8 最精，按「速度换精度」选择，倍速为相对实时倍率。",
-            ),
+        // 「识别引擎」与「Whisper 模型档位」两条已随性能页那张卡一起移除：
+        // 引擎与模型现在只在「模型与组件」页和右侧抽屉里选，帮助卡不该再介绍
+        // 一个页面上根本没有的配置项——照着找只会找不到。
+        let items: [(&'static str, &'static str); 5] = [
             (
                 "转写线程数",
                 "单个识别进程内的 CPU 线程数。SenseVoice 超过 8 线程后收益递减；Whisper 建议设为物理核心数。",
@@ -1563,6 +1518,51 @@ impl MainWindow {
         // 下载按钮」这类自相矛盾回归。
         let (ok, msg) =
             local_model_status(self.local_model_hint.clone(), !missing_model, downloading);
+
+        // 已下载的大模型：每个 `.gguf` 列成一个胶囊，点一下即切换。
+        //
+        // 为什么要有这一行：输入框 + 「浏览…」要求用户**自己找到并抄下**模型路径，
+        // 而路径又长又容易看错（`qwen2.5-1.5b-instruct-q4_k_m.gguf`）。离线模型
+        // 多起来之后（0.5B / 1.5B / 3B）这条路尤其难走。这里直接把扫到的文件列出来，
+        // 点一下就走同一个 `set_local_model_path`，落盘逻辑不分叉。
+        let installed = self.llm_models_snapshot(cx);
+        let current_path =
+            crate::utils::AppConfig::resolve_path(&self.state.config.paths.llm_model);
+        let quick_pick = (!installed.is_empty()).then(|| {
+            let mut row = div()
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(Theme::SPACE_1_5))
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(Theme::text_muted())
+                        .child("本机已下载："),
+                );
+            for (i, m) in installed.iter().enumerate() {
+                let is_sel = crate::utils::local_models::paths_equal(&m.path, &current_path);
+                let target = m.path.clone();
+                row = row.child(
+                    primitives::chip_clickable(
+                        format!(
+                            "{}  {}",
+                            m.label,
+                            crate::utils::model_download::human_size(m.size_bytes)
+                        ),
+                        is_sel,
+                        false,
+                    )
+                    .id(("local-model-pick", i))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_local_model_path(target.to_string_lossy().to_string(), cx);
+                    })),
+                );
+            }
+            row
+        });
+
         div()
             .flex_1()
             .min_w(px(0.0))
@@ -1581,6 +1581,7 @@ impl MainWindow {
                     .children(download)
                     .children(restore),
             )
+            .children(quick_pick)
             .children((!ok).then(|| {
                 div()
                     .w_full()
@@ -1869,422 +1870,6 @@ impl MainWindow {
         primitives::segmented(label, is_sel, false)
             .id(id)
             .on_click(cx.listener(move |this, _, _, cx| on_select(this, cx)))
-    }
-
-    /// ONNX 执行后端在性能页上的落点：挂在「引擎选择」卡的最后一行。
-    ///
-    /// 三态与配色（琥珀色与 `editor.rs` 的术语违规行同源）：
-    /// - 未回落（provider 就是 cpu）→ 中性灰 `text_muted`；
-    /// - 回落（配置 dml、实际 cpu）→ 琥珀 `tint_warn_soft` 底 + `accent_orange` 字，
-    ///   下面再跟一行小字可操作指引；
-    /// - 未启用（SenseVoice / CT-Punc 都没就位）→ 中性灰，并在文案里写明原因。
-    ///
-    /// 为什么自己写一行、而不是走 `render_setting_row`：这里的控件是纯说明文字 + 会
-    /// 换行的指引，塞进那个「左标签 + 右对齐控件」的骨架里会被折成右对齐的窄条；
-    /// 左对齐一列与卡片里其它长说明小字同一观感（写法参照 `render_recommend_card`
-    /// 底部的覆盖告知小字）。
-    ///
-    /// 「是否就位」用的是 `model_present` 缓存快照（`AppState::refresh_model_presence`
-    /// 填充），只查表不碰磁盘——和本页「模型与组件」卡同一套判定，避免逐帧 stat。
-    ///
-    /// 代价：实况那次读取每帧要取一次引擎侧 `Mutex`（`provider_status()`），但锁内只是
-    /// 一次 `Option<ProviderStatus>` 克隆，且本页只在切到该页时渲染，开销可忽略，
-    /// 因此不做跨帧缓存。
-    fn render_onnx_provider_row(&self) -> Div {
-        let (value, fallback) = provider_status_line(
-            self.state.config.gpu.resolve_onnx_provider(),
-            onnx_provider_actual(&self.state.pipeline)
-                .map(|(_, actual)| actual)
-                .as_deref(),
-            self.state.model_is_present("sensevoice-model")
-                || self.state.model_is_present("punc-model"),
-        );
-
-        div()
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(Theme::SPACE_4))
-            .py(px(Theme::SPACE_2))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(Theme::TEXT_BODY_LG))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(Theme::text_primary())
-                    .child("ONNX 后端"),
-            )
-            .child(if fallback {
-                // 琥珀：与 `editor.rs` 术语违规行同源（`tint_warn_soft` / `accent_orange`）
-                primitives::tag_tinted(
-                    value,
-                    Theme::tint_warn_soft(),
-                    Theme::tint_warn_border(),
-                    Theme::accent_orange(),
-                )
-                .max_w(px(Theme::PROBE_MSG_MAX_W))
-                .into_any_element()
-            } else {
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(Theme::TEXT_SMALL))
-                    .text_color(Theme::text_muted())
-                    .child(value)
-                    .into_any_element()
-            })
-    }
-
-    /// 步骤 2：识别引擎与模型架构选择 (每行一个配置项，右侧单行等级选择)
-    ///
-    /// `&mut self`（不是 `&self`）：档位下拉展开后，菜单项里的「下载 / 删除」要
-    /// 起下载任务、弹确认框，都是可变操作；菜单本身也依赖 `&mut` 才能构造。
-    fn render_engine_selection_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::app::WhisperModelTier;
-        let is_sv = self.state.whisper_model_tier == WhisperModelTier::SenseVoice;
-
-        let engine_control = primitives::segmented_cluster()
-            .child(self.seg_option(
-                "perf-engine-pill-sv",
-                "SenseVoice 极速（推荐）",
-                is_sv,
-                cx,
-                |this, cx| {
-                    // 走 setter 落盘（状态 + config.paths.whisper_model 双写）：
-                    // 直接赋值只改内存，重启后会被配置反推覆盖回去。
-                    this.state
-                        .set_whisper_model_tier(WhisperModelTier::SenseVoice);
-                    cx.notify();
-                },
-            ))
-            .child(self.seg_option(
-                "perf-engine-pill-whisper",
-                "OpenAI Whisper 全能",
-                !is_sv,
-                cx,
-                |this, cx| {
-                    // 从 SenseVoice 切回 Whisper 时给一个默认档（Turbo Q5 综合最优）；
-                    // 已在 Whisper 档位系里则保持不变。落盘交给 setter。
-                    let tier = if this.state.whisper_model_tier == WhisperModelTier::SenseVoice {
-                        WhisperModelTier::TurboSpeed
-                    } else {
-                        this.state.whisper_model_tier
-                    };
-                    this.state.set_whisper_model_tier(tier);
-                    cx.notify();
-                },
-            ))
-            .into_any_element();
-
-        // 档位选择改成**下拉**（原来是四个并排胶囊）：胶囊一行最多排四个，
-        // 每档只能塞进「名字 + 速率」六个字，放不下「多大体积 / 是否已下载」这类
-        // 决定用户该选哪个的关键信息；档位一旦再增加就会挤成两行。下拉的每一行
-        // 可以完整展示「名称 · 参数量 · 速度 · 体积 · 就位状态」，并在同一行直接给
-        // 下载 / 删除入口——模型管理从「另一个卡片里去对号入座」变成「就在这里管」。
-        let tier_control = if is_sv {
-            // SenseVoice 档下 Whisper 档位不生效：给置灰的下拉触发器，不展开菜单
-            self.render_tier_trigger(true, cx).into_any_element()
-        } else {
-            self.render_tier_trigger(false, cx).into_any_element()
-        };
-
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(Theme::PAGE_GAP))
-            .child(
-                primitives::card_rows()
-                    .child(Self::render_setting_row("识别引擎", engine_control))
-                    .child(Self::render_setting_divider())
-                    .child(
-                        // 下拉展开时菜单要占满整行：走 setting_row（左标签 + 右对齐控件）
-                        // 会把菜单挤成右侧一条窄缝，所以自己写一行（同上文 ONNX 行）。
-                        div()
-                            .w_full()
-                            .py(px(Theme::SPACE_2))
-                            .flex()
-                            .flex_col()
-                            .gap(px(Theme::SPACE_2))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(Theme::SPACE_4))
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .text_size(px(Theme::TEXT_BODY_LG))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(Theme::text_primary())
-                                            .child("Whisper 模型档位"),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .flex()
-                                            .justify_end()
-                                            .child(tier_control),
-                                    ),
-                            )
-                            .children(self.render_tier_menu(cx)),
-                    )
-                    .child(Self::render_setting_divider())
-                    .child(self.render_onnx_provider_row()),
-            )
-    }
-
-    /// 档位下拉的触发器（收起态的按钮）。`disabled` 为真时置灰且不接交互。
-    ///
-    /// 触发器上直接带一个就位徽标（已就位 / 未下载）：用户收起菜单后仍能看到当前
-    /// 档位能不能用——否则他选完一档、菜单一收，界面又变回「只显示一个档位名」，
-    /// 没下过也看不出来，直到点「开始转写」才被告知。
-    fn render_tier_trigger(&self, disabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ensure_tier_disk_snapshot(cx);
-        let open = self.whisper_dropdown_open && !disabled;
-        // 就位判定走后台快照：`installed_path()` 每帧要两次 stat（见 [`TierDiskSnapshot`]）
-        let tier = self.state.whisper_model_tier;
-        let ready =
-            cx.update_default_global::<TierDiskSnapshot, _>(|state, _| state.path(tier).is_some());
-        div()
-            .id("perf-tier-dropdown-trigger")
-            .min_w(px(210.0))
-            .h(px(Theme::CTRL_H_MD))
-            .px(px(Theme::SPACE_4))
-            .rounded(px(Theme::RADIUS_MD))
-            .bg(Theme::bg_card())
-            .border_1()
-            .border_color(if open {
-                Theme::accent_mint()
-            } else {
-                Theme::border()
-            })
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(Theme::SPACE_3))
-            .when(!disabled, |d| {
-                d.cursor_pointer()
-                    .hover(|s| s.border_color(Theme::accent_mint()))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.whisper_dropdown_open = !this.whisper_dropdown_open;
-                        cx.notify();
-                    }))
-            })
-            .when(disabled, |d| d.opacity(0.5))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(Theme::SPACE_2))
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_BODY))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(Theme::text_primary())
-                            .child(self.state.whisper_model_tier.label()),
-                    )
-                    // SenseVoice 档下 Whisper 档位不生效，不显示就位徽标（会误导）
-                    .when(!disabled, |d| {
-                        d.child(if ready {
-                            primitives::badge("已就位").into_any_element()
-                        } else {
-                            primitives::badge_danger("未下载").into_any_element()
-                        })
-                    }),
-            )
-            .child(
-                div()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(Theme::text_secondary())
-                    .child(if open { "▲" } else { "▼" }),
-            )
-    }
-
-    /// 档位下拉的展开菜单（未展开时返回 `None`，调用方 `children(..)` 直接跳过）。
-    ///
-    /// 菜单项 **不关闭菜单**：用户常常要在同一个菜单里「先看哪档已下 → 选它／没下就
-    /// 直接点下载」，点一下就关会逼他反复展开。选中态与下载态都即时刷新（`cx.notify`）。
-    fn render_tier_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use crate::app::WhisperModelTier;
-        if !self.whisper_dropdown_open
-            || self.state.whisper_model_tier == WhisperModelTier::SenseVoice
-        {
-            return None;
-        }
-        // 就位 / 占用一律读后台快照，渲染路径不再逐档 stat（见 [`TierDiskSnapshot`]）
-        self.ensure_tier_disk_snapshot(cx);
-        let cur = self.state.whisper_model_tier;
-        let downloading = self.state.is_downloading;
-        let mut menu = div()
-            .id("perf-tier-menu")
-            .w_full()
-            .rounded(px(Theme::RADIUS_LG))
-            .bg(Theme::bg_card())
-            .border_1()
-            .border_color(Theme::border())
-            .p(px(Theme::SPACE_1))
-            .flex()
-            .flex_col()
-            .gap(px(Theme::SPACE_0_5));
-
-        for (ti, tier) in WhisperModelTier::WHISPER_TIERS.iter().copied().enumerate() {
-            let canonical_id: Option<&'static str> = tier.download_item_id();
-            let item = canonical_id.and_then(crate::utils::model_download::item_by_id);
-            // 「是否可用」一律取档位后台快照里的 `installed_path()`（= 引擎真正会
-            // 加载的文件，含档位内量化回退），而不是 `model_is_present(canonical_id)`
-            // ——后者按条目登记的精确文件名判定，会在「Turbo 用 q8 兜底 / Balanced
-            // 用 ggml-small 兜底」时判为未下载，与触发器上的徽标自相矛盾。
-            let (present, deletable_id, actual_size) = cx
-                .update_default_global::<TierDiskSnapshot, _>(|state, _| match state.path(tier) {
-                    Some(path) => (
-                        true,
-                        // 删除目标由**实际文件**反查条目：引擎在用的若是
-                        // `ggml-small.bin` 这类没有条目的回退文件，反查得 `None`
-                        // → 不渲染删除按钮（它不在可下载清单里，本就不该由我们代删）。
-                        crate::utils::model_download::item_id_for_path(path)
-                            .filter(|id| crate::utils::model_download::item_is_deletable(id)),
-                        state.size(tier),
-                    ),
-                    None => (false, None, None),
-                });
-            let is_sel = tier == cur;
-
-            // 说明与体积都取「唯一实现处」：说明走 `tier_menu_desc`（纯函数，
-            // 有单测），体积走清单里的期望值（只读常量，不碰磁盘）。已下载时
-            // 优先显示**实际**占用（与清单里的期望值可能不同：本机可能是 q5_1
-            // 或用户自己的量化），用户才知道删这个能腾多少空间——实际值同样来自
-            // 后台快照，不再逐帧 stat。
-            let size_text = item
-                .map(|i| crate::utils::model_download::human_size(i.size))
-                .unwrap_or_default();
-            let actual = actual_size.map(crate::utils::model_download::human_size);
-
-            // 左列：名称 + 选中标记；右列：状态 + 下载/删除
-            let mut info = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(Theme::SPACE_1_5))
-                .child(
-                    div()
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(if is_sel {
-                            Theme::accent_mint()
-                        } else {
-                            Theme::text_muted()
-                        })
-                        .child(tier.label()),
-                );
-            if present {
-                if let Some(actual) = actual {
-                    info = info.child(
-                        div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(Theme::text_muted())
-                            .child(format!("已占 {actual}")),
-                    );
-                }
-            } else if !size_text.is_empty() {
-                info = info.child(
-                    div()
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .text_color(Theme::text_muted())
-                        .child(format!("约 {size_text}")),
-                );
-            }
-            if is_sel {
-                info = info.child(
-                    div()
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(Theme::accent_mint())
-                        .child("[当前]"),
-                );
-            }
-
-            // 行尾：就位状态 + 下载 / 删除（管理动作内联在档位行，见文件头注释）。
-            let mut tail = div()
-                .flex()
-                .items_center()
-                .flex_shrink_0()
-                .gap(px(Theme::SPACE_1_5));
-            if present {
-                tail = tail.child(primitives::badge("已就位"));
-                if let Some(del_id) = deletable_id {
-                    let is_self_build = self.state.model_is_custom_build(del_id);
-                    let name_owned = tier.label().to_string();
-                    // 自编译构建在界面上仍显示按钮但置灰，文案换成「自编译」——
-                    // 比直接消失更能解释「为什么这档删不了」。
-                    let can_delete = !downloading && !is_self_build;
-                    tail = tail.child(
-                        primitives::mini_btn(if is_self_build { "自编译" } else { "删除" }, can_delete)
-                            .id(("perf-tier-del", ti))
-                            .when(can_delete, |d| {
-                                d.on_click(cx.listener(move |this, _, _, cx| {
-                                    // 阻止冒泡：否则点「删除」会顺带触发外层的
-                                    // 「选中该档位」——用户会发现自己只是要删文件，
-                                    // 却把正在用的档位顺手换成了一个没下载的档。
-                                    cx.stop_propagation();
-                                    this.confirm_dialog = Some(crate::ui::types::ConfirmDialogInfo {
-                                        title: format!("删除「{name_owned}」？"),
-                                        message: "将删除本地模型文件。删除后可随时重新下载，已完成的转写工程不受影响。".to_string(),
-                                        confirm_label: "删除".to_string(),
-                                        danger: true,
-                                        action: crate::ui::types::ConfirmAction::DeleteModelFile(
-                                            del_id.to_string(),
-                                        ),
-                                    });
-                                    cx.notify();
-                                }))
-                            }),
-                    );
-                }
-            } else if downloading {
-                tail = tail.child(primitives::badge_accent("下载中"));
-            } else {
-                // 未就位时按**规范 id** 下载（回退文件不是可下载项，不该出现在这里）。
-                let dl_id: &'static str = canonical_id.unwrap_or_default();
-                tail = tail.child(
-                    primitives::mini_btn("下载", true)
-                        .id(("perf-tier-dl", ti))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            // 同上：下载按钮不应顺带改变当前档位。
-                            cx.stop_propagation();
-                            this.start_model_download(dl_id, cx);
-                        })),
-                );
-            }
-
-            // 行首：一个圆点，选中态实心薄荷色（复用与导出下拉一致的视觉语言）
-            let row = div()
-                .id(("perf-tier-row", ti))
-                .px(px(Theme::SPACE_2))
-                .py(px(Theme::SPACE_1_5))
-                .rounded(px(Theme::RADIUS_MD))
-                .cursor_pointer()
-                .bg(if is_sel {
-                    Theme::tint_mint_badge()
-                } else {
-                    Theme::transparent()
-                })
-                .hover(|s| s.bg(Theme::bg_hover()))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.state.set_whisper_model_tier(tier);
-                    cx.notify();
-                }))
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(Theme::SPACE_3))
-                .child(info)
-                .child(tail);
-            menu = menu.child(row);
-        }
-        Some(menu.into_any_element())
     }
 
     /// 步骤 4.5：音频前端预处理与救场解码。
@@ -2939,8 +2524,8 @@ impl MainWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_glossary_count, glossary_count_cached, local_model_status, probe_button_label,
-        tier_disk_snapshot_stale, tier_menu_desc, vad_slider_value, TierDiskKey,
+        effective_glossary_count, glossary_count_cached, local_model_status, models_snapshot_stale,
+        probe_button_label, vad_slider_value, ModelsKey,
     };
     use crate::utils::config::TranslateConfig;
 
@@ -3134,89 +2719,6 @@ mod tests {
             "SenseVoice 页面显示线程数 {shown} 落在有效区间外"
         );
     }
-    /// 回归（P3）：ONNX provider 回落的界面文案必须与日志层的判定完全同源——
-    /// 「请求 dml、实际 cpu」是唯一需要警告色的情形；请求本来就是 cpu 时不该报警。
-    #[test]
-    fn onnx_provider_line_covers_normal_fallback_and_disabled() {
-        use super::provider_status_line;
-
-        // 未回落 · 正常：请求就是 cpu（默认，零回归）
-        assert_eq!(
-            provider_status_line("cpu", Some("cpu"), true),
-            ("CPU（未配置加速）".to_string(), false)
-        );
-        // 未回落 · 正常：请求 dml 且真的吃到了
-        assert_eq!(
-            provider_status_line("dml", Some("dml"), true),
-            ("dml（实际生效）".to_string(), false)
-        );
-        // 回落：请求 dml、runner 回报 cpu —— 这一档才用警告色
-        assert_eq!(
-            provider_status_line("dml", Some("cpu"), true),
-            ("配置 dml，实际 cpu（已回落）".to_string(), true)
-        );
-        // 未启用：SenseVoice / CT-Punc 都没挂载
-        assert_eq!(
-            provider_status_line("dml", None, false),
-            ("未启用（SenseVoice / CT-Punc 均未就位）".to_string(), false)
-        );
-        // 边界：引擎在、但本次会话还没跑过 ONNX 推理
-        assert_eq!(
-            provider_status_line("dml", None, true),
-            ("dml（尚未跑过推理）".to_string(), false)
-        );
-        // 边界：配置为空串时按 cpu 处理（与 `resolve_onnx_provider` 同一收敛规则）
-        assert_eq!(
-            provider_status_line("", Some("cpu"), true),
-            ("CPU（未配置加速）".to_string(), false)
-        );
-    }
-    /// 端到端证据（`#[ignore]`，不进常规 `cargo test --lib`）：
-    ///
-    /// 本机 onnxruntime 只装了 CPU provider（实测
-    /// `['AzureExecutionProvider','CPUExecutionProvider']`），所以**只要真跑一次**标点
-    /// runner 并请求 `directml`，sherpa-onnx 就会在原生日志里回落，runner 也会如实
-    /// 在 stdout 回报 `{"requested":"directml","actual":"cpu"}`。这里把这条实况喂进
-    /// `provider_status_line`，证明界面文案确实会翻成琥珀色的「已回落」。
-    ///
-    /// 依赖 Python 侧 sherpa-onnx；跑法：
-    /// `cargo test --lib -- --ignored onnx_provider_fallback_is_visible_end_to_end`
-    #[test]
-    #[ignore = "端到端实测：需要本机 Python + sherpa-onnx 与 models/punc 模型"]
-    fn onnx_provider_fallback_is_visible_end_to_end() {
-        use super::provider_status_line;
-        use crate::engines::PunctuationEngine;
-        use crate::subtitle::Segment;
-
-        let model = std::path::PathBuf::from("models/punc/model.int8.onnx");
-        let runner = std::path::PathBuf::from("tools/punc_runner.py");
-        assert!(runner.exists(), "缺 runner: {runner:?}");
-        assert!(model.exists(), "缺标点模型: {model:?}（先跑一次模型下载）");
-
-        let engine =
-            PunctuationEngine::with_python_and_provider(&runner, &model, 4, "python", "dml");
-        let segs = vec![Segment::new(1, 0.0, 2.0, "今天天气不错我们出去走走吧")];
-        let out = engine
-            .add_punctuation(segs, None)
-            .expect("标点 runner 应能跑通");
-        assert_eq!(out.len(), 1);
-
-        let status = engine
-            .provider_status()
-            .expect("runner 必须回报 provider 事件");
-        let (line, fallback) =
-            provider_status_line(&status.requested, Some(status.actual.as_str()), true);
-        // 本机无 DirectML：实况必然是 requested=directml / actual=cpu，界面该报琥珀色
-        assert_eq!(status.actual, "cpu", "本机只有 CPU provider，实况应是 cpu");
-        assert!(fallback, "回落必须点亮警告色，实际文案: {line}");
-        assert_eq!(
-            line,
-            format!(
-                "配置 {}，实际 {}（已回落）",
-                status.requested, status.actual
-            )
-        );
-    }
 
     /// 回归：离线模型行「校验结果」与「是否就位」两路信号必须合成一条不矛盾的提示。
     /// 最容易写错的两处：① 校验通过但模型其实没就位（例如自备 GGUF 体积没过
@@ -3270,27 +2772,6 @@ mod tests {
         assert!(msg.contains("找不到模型文件"), "{msg}");
     }
 
-    /// 档位下拉里每档的说明必须非空且互不相同。
-    ///
-    /// 说明文案是用户决定「选哪一档」的唯一依据；漏写会渲染出一行光秃秃的标题，
-    /// 两档写成同一句则等于没写。以后加档位时这条会先红。
-    #[test]
-    fn tier_menu_desc_is_present_and_unique_per_tier() {
-        use crate::app::WhisperModelTier as T;
-        let mut seen = std::collections::HashSet::new();
-        for tier in [
-            T::Fast,
-            T::Balanced,
-            T::TurboSpeed,
-            T::Precise,
-            T::SenseVoice,
-        ] {
-            let desc = tier_menu_desc(tier);
-            assert!(!desc.trim().is_empty(), "{tier:?} 缺少档位说明");
-            assert!(seen.insert(desc), "{tier:?} 的说明与别的档位重复: {desc}");
-        }
-    }
-
     /// 回归（P2）：VAD 配置值越界时，滑条档位必须先夹后取整——
     /// 与引擎 `set_vad_threshold` 的夹取区间对齐：0.15 这类旧配置
     /// 界面上显示的档位要和引擎实际生效的区间一致。
@@ -3305,57 +2786,78 @@ mod tests {
         assert_eq!(vad_slider_value(0.5), 50);
     }
 
-    /// 档位磁盘快照的失效判定：键不变 → 复用（这是「渲染路径不再逐档 stat」的前提）。
+    /// 模型快照的失效判定：键不变 → 复用（这是「渲染路径不 read_dir」的前提）。
     #[test]
-    fn tier_disk_snapshot_reuses_when_key_unchanged() {
-        let k = TierDiskKey {
+    fn models_snapshot_reuses_when_key_unchanged() {
+        let k = ModelsKey {
             downloading: false,
-            presence: vec![true, false],
+            dir_mtime: Some((100, 0)),
         };
-        assert!(!tier_disk_snapshot_stale(Some(&k), &k), "键不变时不该重扫");
+        assert!(!models_snapshot_stale(Some(&k), &k), "键不变时不该重扫");
     }
 
     /// 无缓存（首次渲染）→ 必须重扫一次。
     #[test]
-    fn tier_disk_snapshot_scans_when_never_computed() {
-        let k = TierDiskKey {
+    fn models_snapshot_scans_when_never_computed() {
+        let k = ModelsKey {
             downloading: false,
-            presence: vec![true],
+            dir_mtime: None,
         };
-        assert!(tier_disk_snapshot_stale(None, &k), "首次必须扫一次");
+        assert!(models_snapshot_stale(None, &k), "首次必须扫一次");
     }
 
-    /// 下载完成（downloading true→false）→ 键变化 → 重扫，档位就位徽标自动刷新。
+    /// 下载完成（downloading true→false）→ 键变化 → 重扫，菜单自动刷新。
     #[test]
-    fn tier_disk_snapshot_rescans_after_download_finishes() {
-        let cached = TierDiskKey {
+    fn models_snapshot_rescans_after_download_finishes() {
+        let cached = ModelsKey {
             downloading: true,
-            presence: vec![false, false],
+            dir_mtime: Some((100, 0)),
         };
-        let current = TierDiskKey {
+        let current = ModelsKey {
             downloading: false,
-            presence: vec![true, false],
+            dir_mtime: Some((100, 0)),
         };
         assert!(
-            tier_disk_snapshot_stale(Some(&cached), &current),
+            models_snapshot_stale(Some(&cached), &current),
             "下载完成必须触发重扫"
         );
     }
 
-    /// 就位快照变化（删除 / 补齐）→ 键变化 → 重扫。
+    /// 目录 mtime 变化（用户往目录里丢了个自备模型 / 删掉一个）→ 重扫。
+    ///
+    /// 这是本次改造的关键：旧键只看 `ITEMS` 里登记条目的就位与否，**看不出**清单外
+    /// 的文件增减——而自备模型恰恰都在清单外。
     #[test]
-    fn tier_disk_snapshot_rescans_when_presence_changes() {
-        let cached = TierDiskKey {
+    fn models_snapshot_rescans_when_dir_mtime_changes() {
+        let cached = ModelsKey {
             downloading: false,
-            presence: vec![true, true],
+            dir_mtime: Some((100, 0)),
         };
-        let current = TierDiskKey {
+        let current = ModelsKey {
             downloading: false,
-            presence: vec![true, false],
+            dir_mtime: Some((200, 0)),
         };
         assert!(
-            tier_disk_snapshot_stale(Some(&cached), &current),
-            "就位状态变了必须重扫"
+            models_snapshot_stale(Some(&cached), &current),
+            "目录内容变了必须重扫"
+        );
+    }
+
+    /// 目录从「不存在」变为「存在」也要重扫：用户新建 `models/whisper` 并放模型，
+    /// 不重扫就会一直显示空列表。
+    #[test]
+    fn models_snapshot_rescans_when_dir_appears() {
+        let cached = ModelsKey {
+            downloading: false,
+            dir_mtime: None,
+        };
+        let current = ModelsKey {
+            downloading: false,
+            dir_mtime: Some((100, 0)),
+        };
+        assert!(
+            models_snapshot_stale(Some(&cached), &current),
+            "目录出现必须重扫"
         );
     }
 }

@@ -232,25 +232,10 @@ impl WhisperModelTier {
         Self::LargeV3,
     ];
 
-    /// 全部受支持的引擎档位（含 SenseVoice），用于动态过滤已就位模型。
-    pub const ALL_TIERS: [Self; 8] = [
-        Self::SenseVoice,
-        Self::TurboSpeed,
-        Self::Precise,
-        Self::LargeV3,
-        Self::Medium,
-        Self::Balanced,
-        Self::Fast,
-        Self::Tiny,
-    ];
-
-    /// 返回本地当前所有已经下载就绪的引擎档位列表
-    pub fn available_installed_tiers() -> Vec<Self> {
-        Self::ALL_TIERS
-            .into_iter()
-            .filter(|tier| tier.installed_path().is_some())
-            .collect()
-    }
+    // 注：这里曾有 `ALL_TIERS` 与 `available_installed_tiers()`——「在 8 个预设枚举里
+    // 筛出已下载档位」的实现。它已被 `utils::local_models` 的目录扫描取代：
+    // 枚举只能表达内置预设，扫不出用户自备的模型。枚举现在只提供「友好名 / 估算系数」
+    // 这类元数据，不再充当可用性判据（见 `local_models` 模块头的说明）。
 
     /// 该档位对应的**可下载组件 id**（`utils::model_download::ITEMS` 里的 id）。
     pub fn download_item_id(self) -> Option<&'static str> {
@@ -795,6 +780,17 @@ pub struct AppState {
     pub enable_polish: bool,
     pub polish_mode: PolishMode,
     pub whisper_threads: u32,
+    /// 当前选中的**模型文件绝对路径**——「用哪个模型」的唯一真相。
+    ///
+    /// 为什么不再让 `whisper_model_tier` 当真相：枚举只能表达 8 个内置预设，
+    /// 用户自备的模型（自行量化的 q5_1、改名后的权重）在枚举里根本没有对应值，
+    /// 于是「看不到、选不了、也不会被加载」。改成路径后，磁盘上有什么就能用什么。
+    ///
+    /// 与 `config.paths.whisper_model` 的关系：这里存解析后的绝对路径，
+    /// 配置里存可直接落盘的形式（项目内相对路径 / 目录外绝对路径）。
+    pub selected_model_path: PathBuf,
+    /// 当前选中模型命中的预设档位；认不出预设时按体积启发式给一个估算档位
+    /// （仅供友好名与耗时估算，不再充当可用性判据）。
     pub whisper_model_tier: WhisperModelTier,
 
     /// 用户已点击「终止转写」，等待管线收尾事件（用于区分取消与真实失败）
@@ -1067,8 +1063,18 @@ impl AppState {
         // 也避免把小于 8 的用户设置强行抬到 8 导致滑条取值无法持久化。
         let threads =
             Self::clamp_threads_to_cores(config.pipeline.whisper_threads, Self::logical_cores());
-        let whisper_model_tier =
-            WhisperModelTier::from_model_path(&config.paths.whisper_model).unwrap_or_default();
+        // 选中模型以**配置里的路径**为准（不再「按文件名反推档位、认不出就静默
+        // 回落 Balanced」——那会让配置里的自定义模型被悄悄换成内置小模型，
+        // 界面与命令行也会因此跑不同的模型）。
+        let selected_model_path = AppConfig::resolve_path(&config.paths.whisper_model);
+        // 档位是路径的**派生元数据**（友好名 + 耗时估算），不是可用性判据。
+        let whisper_model_tier = WhisperModelTier::from_model_path(&config.paths.whisper_model)
+            .unwrap_or_else(|| {
+                let size = std::fs::metadata(&selected_model_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                crate::utils::local_models::tier_for_unknown_size(size)
+            });
         // 并行进程数交给管线（0 = 自动，按核数推导）
         pipeline.set_parallel_workers(config.pipeline.parallel_workers as usize);
         // 自动导出用的字幕样式交给管线：转写收尾的落盘拿不到 config，
@@ -1136,6 +1142,7 @@ impl AppState {
             enable_polish: polish,
             polish_mode,
             whisper_threads: threads,
+            selected_model_path,
             whisper_model_tier,
             cancel_requested: false,
             segments_dirty: false,
@@ -1314,7 +1321,8 @@ impl AppState {
         }
     }
 
-    /// 切换 Whisper 模型档位并**落盘**（性能页档位下拉的唯一入口）。
+    /// 切换 Whisper 模型档位并**落盘**（「按档位选内置模型」的语法糖入口，
+    /// 转发给 [`Self::set_selected_model_path`]）。
     ///
     /// 为什么必须落盘：`whisper_model_tier` 只是运行期状态，启动时由
     /// [`WhisperModelTier::from_model_path`] 从 `config.paths.whisper_model` 反推。
@@ -1330,12 +1338,58 @@ impl AppState {
     /// 未下载档位的文件缺失由开工守卫（`MainWindow::missing_engine_reason`）
     /// 在点「开始转写」时明确拦住并给出可操作提示。
     pub fn set_whisper_model_tier(&mut self, tier: WhisperModelTier) {
-        self.whisper_model_tier = tier;
-        self.config.paths.whisper_model = tier.model_relative_path();
+        // 转发给路径版本：档位只是「选哪个内置预设」的语法糖，真正落盘与生效的是
+        // 它解析出的那条路径。两条入口共用一套落盘 + 重算，避免出现
+        // 「从档位进去的选中项不带 selected_model_path」这种半更新状态。
+        let path = AppConfig::resolve_path(&tier.model_relative_path());
+        self.set_selected_model_path(path);
+    }
+
+    /// 按**文件路径**选中一个模型并落盘（唯一真相是路径，不是档位）。
+    ///
+    /// 与 `set_whisper_model_tier` 的区别：那条走「档位 → 内置路径」，只能表达
+    /// 8 个预设；这条接受任意路径，因此用户自备的模型也能被选中并真正加载。
+    ///
+    /// 落盘用 `local_models::to_config_path`：项目内的模型写成相对路径（留在可提交
+    /// 的 `config.toml`），目录外的写成绝对路径（由配置层自动剥离到
+    /// `config.local.toml`）。这样既支持任意位置，又不破坏「共享配置不含机器路径」
+    /// 的既有约定。
+    pub fn set_selected_model_path(&mut self, path: PathBuf) {
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        self.whisper_model_tier =
+            WhisperModelTier::from_model_path(&file_name).unwrap_or_else(|| {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                crate::utils::local_models::tier_for_unknown_size(size)
+            });
+        self.config.paths.whisper_model = crate::utils::local_models::to_config_path(&path);
+        self.selected_model_path = path;
         self.persist_config();
-        // 档位换了，「模型与组件」卡里 whisper 各档的就位判定要跟着重算
+        // 选中项换了，「模型与组件」卡里 whisper 各档的就位判定要跟着重算
         // （`configured_path_for` 只认「配置指向的那个档位」）。
         self.refresh_model_presence();
+    }
+
+    /// 当前选中模型的展示名：命中预设用友好名，自备模型显示文件名。
+    ///
+    /// 界面一律用这个方法而不是 `whisper_model_tier.label()`：后者对自备模型会
+    /// 显示成兜底档位的名字（用户明明选了 `my-q5_1.bin`，界面却写「Whisper
+    /// Small-Q5」），把「你选的到底是哪个文件」这件事糊掉。
+    pub fn selected_model_label(&self) -> String {
+        let file_name = self
+            .selected_model_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        match WhisperModelTier::from_model_path(file_name) {
+            Some(tier) => tier.label().to_string(),
+            // 认不出预设：如实显示文件名，让用户认得出自己放进去的是哪个
+            None if file_name.is_empty() => "未选择模型".to_string(),
+            None => file_name.to_string(),
+        }
     }
 
     /// 切换硬件加速层级（GPU / CPU），联动推理配置并持久化落盘
@@ -2118,7 +2172,22 @@ impl AppState {
     /// 为什么用 `resolve_path` 而不是相对当前目录：程序可能从开始菜单 / 快捷方式
     /// 启动，cwd 会变成 `C:\Windows\System32`，相对路径会把队列文件写到系统目录。
     pub fn queue_file_path() -> std::path::PathBuf {
-        AppConfig::resolve_path(crate::utils::queue_store::QUEUE_FILE_NAME)
+        // 测试隔离：测试里改用**进程专属的临时目录**。
+        //
+        // 不加这一层的话，`cargo test` 会把这个文件写到开发机**真实的项目根**上：
+        // 凡是用到 `persist_queue` 的单测（队列结算、进度定格等好几个）都会顺手
+        // 把用户排好的队列覆盖成测试数据。这不是假设——本项目就发生过：跑完测试后
+        // 项目根下的 `batch_queue.json` 里剩下的是测试用的 `a.mp4`，用户排的队没了。
+        #[cfg(test)]
+        {
+            std::env::temp_dir()
+                .join(format!("v2w_test_queue_{}", std::process::id()))
+                .join(crate::utils::queue_store::QUEUE_FILE_NAME)
+        }
+        #[cfg(not(test))]
+        {
+            AppConfig::resolve_path(crate::utils::queue_store::QUEUE_FILE_NAME)
+        }
     }
 
     /// 把当前队列落盘（原子写）。
@@ -2327,6 +2396,50 @@ impl AppState {
         if matches!(self.status, ProcessStatus::Processing { .. }) {
             self.status = ProcessStatus::Idle;
         }
+    }
+
+    /// 把队列里**路径匹配**的那一条结算为「已完成」。
+    ///
+    /// # 为什么需要它（这是一个真实的功能 bug 的修复）
+    ///
+    /// 队列卡片是可点的：[`Self::select_queue_item`] 会把该文件设成 `transcribe_file`。
+    /// 用户点完队列卡片、再按「开始转写」，走的是**单文件入口**
+    /// `MainWindow::start_processing`——那条路会显式把 `batch_running` 置 false
+    /// （它的注释写明「单文件入口显式退出批量续跑语义」），于是收尾时
+    /// `in_batch` 为假，[`Self::finish_active_queue_item`] 永远不会被调用。
+    ///
+    /// 结果：这一条其实已经转写完成、结果也已入库，队列里却一直停在「等待中」；
+    /// 又因为入队时已按 `pending` 落过盘，**每次重启都会再冒出来**。用户看到的正是
+    /// 「明明转写完了，队列里总挂着一条待转写」。
+    ///
+    /// 按**路径**匹配而不是按下标：单文件入口全程不碰 `batch_active`，且队列在
+    /// 一次转写期间可能被增删（用户边跑边加片子），下标早就不可靠了。
+    ///
+    /// 已经结算过（`Done`）的条目直接返回 `false`：不重复写盘，也不改动
+    /// 已有的真实句数。
+    pub fn settle_queue_item_by_path(&mut self, path: &std::path::Path, segments: usize) -> bool {
+        let key = path.to_string_lossy().to_lowercase();
+        let Some(idx) = self
+            .batch_queue
+            .iter()
+            .position(|i| i.path.to_string_lossy().to_lowercase() == key)
+        else {
+            return false;
+        };
+        if matches!(self.batch_queue[idx].state, QueueState::Done { .. }) {
+            return false;
+        }
+        {
+            let item = &mut self.batch_queue[idx];
+            item.state = QueueState::Done { segments };
+            // 与 \`finish_active_queue_item\` 同口径：进度条定格满格、阶段名清掉，
+            // 避免卡片上还挂着「语音识别」让人以为它仍在跑。
+            item.progress = 100.0;
+            item.stage = None;
+        }
+        // 结算即落盘：与批量结算同一条规则，否则重启后这条又变回「等待中」。
+        self.persist_queue();
+        true
     }
 
     /// 把一次管线进度事件记到**当前正在跑的那一条**队列项上。
@@ -4663,6 +4776,50 @@ mod tests {
         assert_eq!(state.batch_queue[0].progress, 0.0, "重跑必须从 0 开始");
         assert!(state.batch_queue[0].stage.is_none());
         assert_eq!(state.batch_queue[0].state, QueueState::Running);
+    }
+
+    /// 回归：单文件入口跑完**队列里的条目**后，那条必须被结算掉。
+    ///
+    /// 这是「明明转写完了，队列里每次重启都挂着一条待转写」的根因：
+    /// 队列卡片可点（`select_queue_item` 把文件设成 `transcribe_file`），
+    /// 用户点完再按「开始转写」走的是单文件入口，那里 `batch_running` 被显式置 false，
+    /// 收尾时 `in_batch` 为假 → `finish_active_queue_item` 不执行 → 该条永远停在
+    /// `Pending`，并随队列以 `pending` 落盘，于是每次启动都再冒出来。
+    ///
+    /// 这里同时钉住三条：能按路径结算、结算后是 `Done`、重复调用不覆盖已有句数。
+    #[test]
+    fn settling_by_path_marks_the_matching_item_done() {
+        use super::{QueueItem, QueueState};
+        use std::path::{Path, PathBuf};
+
+        let mut state = test_state(Vec::new());
+        state.batch_queue = vec![QueueItem::new(PathBuf::from("a.mp4"))];
+        state.batch_queue[0].progress = 37.0;
+        state.batch_queue[0].stage = Some("语音识别".to_string());
+        assert!(matches!(state.batch_queue[0].state, QueueState::Pending));
+
+        // 大小写不同也要命中：判等走小写归一（与入队去重同一套规则）。
+        assert!(state.settle_queue_item_by_path(Path::new("A.MP4"), 12));
+        assert_eq!(
+            state.batch_queue[0].state,
+            QueueState::Done { segments: 12 }
+        );
+        assert_eq!(state.batch_queue[0].progress, 100.0, "结算后必须满格");
+        assert!(state.batch_queue[0].stage.is_none(), "不能留阶段残影");
+
+        // 已经结算过：不重复返回 true，也不该把真实句数改成别的值。
+        assert!(!state.settle_queue_item_by_path(Path::new("a.mp4"), 99));
+        assert_eq!(
+            state.batch_queue[0].state,
+            QueueState::Done { segments: 12 }
+        );
+
+        // 不在队列里的文件：什么都不动（单文件转写大多数时候确实不在队列里）。
+        assert!(!state.settle_queue_item_by_path(Path::new("other.mp4"), 5));
+        assert_eq!(
+            state.batch_queue[0].state,
+            QueueState::Done { segments: 12 }
+        );
     }
 
     /// 结算时的定格规则：**成功收到 100%，失败保留当下值**。

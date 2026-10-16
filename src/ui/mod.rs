@@ -550,10 +550,14 @@ fn filter_commands(query: &str) -> Vec<usize> {
 pub(crate) enum SubtitleMonitorDragMode {
     /// 自由移动文本框位置
     Move,
-    /// 左右边缘手柄拉宽/拉窄
+    /// 左右边缘手柄：横向拖动改「单行最大字数」（即防换行阈值）
     ResizeHorizontal { is_left: bool },
-    /// 四角手柄等比拉大/缩小框和字号
-    ResizeCorner { is_top: bool, is_left: bool },
+    /// 四角手柄：横向拖动改字号（文字高度）
+    ///
+    /// 刻意**不带** `is_top`：竖向拖动不再有任何作用（用户明确要求「去掉上下的拖拽方向，
+    /// 只能左右」）。上左与下左、上右与下右的行为完全相同，保留四个角只是为了符合
+    /// PPT 式选框的视觉预期。
+    ResizeCorner { is_left: bool },
 }
 
 /// 监视器舞台字幕拖拽会话
@@ -594,12 +598,6 @@ pub struct MainWindow {
     /// 「取消」按钮置位。任务结束后必须复位（引擎在任务开始前也会复位一次，
     /// 双保险），否则下一次翻译一进来就在第一个批次检查点直接退出。
     pub(crate) translate_cancel: Arc<std::sync::atomic::AtomicBool>,
-    /// 性能页「Whisper 模型档位」下拉是否展开。
-    ///
-    /// 与导出格式下拉（`is_export_dropdown_open`）同一套范式：布尔量 + 渲染时内联
-    /// 展开菜单，不引入绝对定位浮层。两者互斥不必特意维护——一个在剪辑台、一个在
-    /// 性能页，同一时刻只可能渲染其中一个。
-    pub(crate) whisper_dropdown_open: bool,
     /// 模型下载的取消标志（与 `translate_cancel` 同一套模式）。
     /// 下载最大 833 MB，慢网下要几十分钟，必须有办法中断。
     pub(crate) model_download_cancel: Arc<std::sync::atomic::AtomicBool>,
@@ -867,8 +865,12 @@ pub struct MainWindow {
     /// 快捷键速查面板 (F1) 是否打开。与命令面板同级的轻量浮层：只影响渲染，
     /// 不碰任何工程状态，关掉即回到原样。
     pub(crate) shortcuts_help_open: bool,
-    /// 模型与组件管理视图分类：SenseVoice 专区 / Whisper 模型库 / 全部组件
-    pub(crate) model_manager_tab: ModelManagerTab,
+    /// 「模型与组件」页三个分块的展开状态，下标 = [`ModelManagerTab`] 的判别值。
+    ///
+    /// 早先这里是「当前选中哪个专区」的单值：三个专区只能看一个，想对比
+    /// Whisper 模型与公用组件得来回点。现在三块同页铺开、各自独立收起，
+    /// 默认全展开——「一页看全」正是改成这样的理由。
+    pub(crate) model_blocks_open: [bool; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1508,10 +1510,9 @@ impl MainWindow {
         // 清掉整棵进程树。这是唯一能覆盖「父进程被强杀」的兜底 —— 单靠退出路径里的
         // kill 逻辑在强杀场景下根本没有机会执行。非 Windows 平台为空实现。
         crate::utils::child_registry::ensure_job_object();
-        let default_model_tab = match state.whisper_model_tier {
-            crate::app::WhisperModelTier::SenseVoice => ModelManagerTab::SenseVoice,
-            _ => ModelManagerTab::Whisper,
-        };
+        // 三块默认全展开：改成一页的本意就是「一眼看全」，默认收起又变回分页了。
+        // 想缩短页面的用户自己点「收起」即可（状态只在本次会话内保持）。
+        let model_blocks_open = [true, true, true];
         // 替换规则集是独立 JSON（与 config.toml 同目录）：读失败不拦启动，把错误留给
         // 替换面板的提示行——规则集读不到不该让整个界面起不来。
         let (replace_rule_sets, replace_rules_status) = match load_replace_rule_sets_default() {
@@ -1540,7 +1541,6 @@ impl MainWindow {
             translate_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             update_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            whisper_dropdown_open: false,
             // 导出格式也是长期偏好（与 `editor_export_mode` 同理）：从配置恢复，
             // 否则每次启动都跳回「剪映草稿」，用户得重选一遍。
             editor_export_format: export_format_initial,
@@ -1641,7 +1641,7 @@ impl MainWindow {
             library_export_busy: false,
             command_palette: None,
             shortcuts_help_open: false,
-            model_manager_tab: default_model_tab,
+            model_blocks_open,
             custom_color_picker_open: false,
             settings_tab: 0,
             subtitle_style_collapsed: false,
@@ -2024,6 +2024,17 @@ impl MainWindow {
     /// 空串 = 恢复内置默认模型：用户把输入框清空就是在表达这个意图，
     /// 比起让 `paths.llm_model` 变成空串（那时 `is_present` 恒假、翻译必失败），
     /// 回退到默认路径更符合直觉。
+    /// 展开「模型与组件」页的某个分块（跳转用）。
+    ///
+    /// 使用场景：用户点右侧抽屉里的模型卡片或「识别引擎」时，目标条目在
+    /// 「模型与组件」页里。分块可折叠之后，若目标块恰好是收起的，跳过去只会看到
+    /// 一个标题——所以跳转必须顺带把它展开，否则「点了没反应」。
+    ///
+    /// 刻意**不滚动**页面：滚动位置由布局决定，这里只管可见性。
+    pub(crate) fn expand_model_block(&mut self, block: ModelManagerTab) {
+        self.model_blocks_open[block as usize] = true;
+    }
+
     pub(crate) fn set_local_model_path(&mut self, raw: String, cx: &mut Context<Self>) {
         let path = raw.trim().to_string();
         // 界面缓冲同步成规范化后的值：粘贴带首尾空格的路径时，输入框不该留着空格。

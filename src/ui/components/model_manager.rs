@@ -19,7 +19,105 @@ use crate::ui::{MainWindow, ModelManagerTab};
 use crate::utils::model_download::human_size;
 use crate::utils::ITEMS;
 
-/// 判断某个组件在用户选择的分类专区下是否需要展示或下载。
+/// 「模型与组件」页的一个分块。
+#[derive(Clone, Copy)]
+struct ModelBlock {
+    /// 分块标识：既是 [`is_item_needed_for_tab`] 的过滤维度，也是
+    /// [`crate::ui::MainWindow::model_blocks_open`] 的下标。
+    tab: ModelManagerTab,
+    /// 分块标题
+    title: &'static str,
+    /// 一句话说明这块是干什么的
+    subtitle: &'static str,
+    /// 块内的分类（小标题 + 条目 id）
+    categories: &'static [ModelCategory],
+}
+
+/// 分块内的一个分类。
+#[derive(Clone, Copy)]
+struct ModelCategory {
+    title: &'static str,
+    item_ids: &'static [&'static str],
+}
+
+/// 三个分块的定义，数组顺序即页面从上到下的顺序。
+///
+/// # 为什么合成一张数据表而不是三个 `match` 分支
+///
+/// 渲染流程（块头 → 分类 → 条目行）三块完全同构，差别只在数据。写成数据表后，
+/// 新增一个分块只需要在这里加一项，渲染代码一行都不用动。早先这里是
+/// `match current_tab { SenseVoice => ..., Whisper => ..., Common => ... }`，
+/// 改一处要同步三处，正是「三个专区只能看一个」这个别扭设计的根源。
+/// Whisper 语音识别可选模型（任选其一即可）的全部条目 ID
+pub const WHISPER_CHOICE_MODEL_IDS: &[&str] = &[
+    "whisper-turbo-q5",
+    "whisper-turbo-q8",
+    "whisper-large-v3",
+    "whisper-medium",
+    "whisper-small",
+    "whisper-base",
+    "whisper-tiny",
+];
+
+const MODEL_BLOCKS: [ModelBlock; 3] = [
+    ModelBlock {
+        tab: ModelManagerTab::SenseVoice,
+        title: "SenseVoice 极速语音识别",
+        subtitle: "推荐引擎：单次前向出字，自带标点与数字规整",
+        categories: &[ModelCategory {
+            title: "识别模型与词表",
+            item_ids: &["sensevoice-model", "sensevoice-tokens", "sensevoice-vad"],
+        }],
+    },
+    ModelBlock {
+        tab: ModelManagerTab::Whisper,
+        title: "Whisper 模型库",
+        subtitle: "全系可选，任下一个即可用；换模型在「性能设置」或右侧抽屉里点选",
+        categories: &[
+            ModelCategory {
+                title: "识别模型（任选其一即可）",
+                item_ids: WHISPER_CHOICE_MODEL_IDS,
+            },
+            ModelCategory {
+                title: "辅助模型（改善断句与长音频速度）",
+                item_ids: &["silero-vad", "punc-model"],
+            },
+            ModelCategory {
+                title: "Whisper 推理程序",
+                item_ids: &["whisper-cli", "whisper-cublas"],
+            },
+        ],
+    },
+    ModelBlock {
+        tab: ModelManagerTab::Common,
+        title: "公用组件",
+        subtitle: "抽音解码、伴音播放，以及离线大模型（翻译 / 润色）",
+        categories: &[
+            ModelCategory {
+                title: "音视频解码与伴音播放（FFmpeg / FFplay）",
+                item_ids: &["ffmpeg", "ffplay"],
+            },
+            ModelCategory {
+                // 推理程序 + **全部离线大模型档位**都列出来，供用户按机器性能挑一个。
+                // 离线翻译/润色对模型规模很敏感：0.5B 只够「能用」，1.5B/3B 的译文
+                // 通顺度明显更好。默认只下 0.5B，其余是可选升级项。
+                title: "本地大模型翻译与润色引擎",
+                item_ids: &["llama-cpp", "qwen-llm", "qwen-llm-1_5b", "qwen-llm-3b"],
+            },
+        ],
+    },
+];
+
+/// 某个组件在指定专区里**是否要展示在列表中**。
+///
+/// # 为什么与「是否缺失」分开
+///
+/// 旧实现把两件事合成一个函数：它返回 false 的条目**既不计入缺项、也不出现在列表里**。
+/// 而它对 Whisper 模型档位的判据是「只认真当前选中的那一档」，于是「模型库」里永远
+/// 只列得出一个识别模型——用户想下 Turbo Q5，得先把档位切过去才看得见它。
+///
+/// 现在拆开：本函数只回答「这个专区该不该显示它」（模型库 = 全部列出，供用户自由挑选），
+/// 缺项计数走 [`is_item_required_now`]，只看真正必需的那几项。
 pub(crate) fn is_item_needed_for_tab(
     item_id: &str,
     tab: ModelManagerTab,
@@ -29,93 +127,82 @@ pub(crate) fn is_item_needed_for_tab(
     match tab {
         ModelManagerTab::SenseVoice => {
             // SenseVoice 专区：核心识别模型、分词表、VAD 专属项，以及音视频解码抽音必需的 FFmpeg 底座
-            if item_id == "ffmpeg" {
-                !state.model_is_present("ffmpeg")
-            } else {
-                matches!(
-                    item_id,
-                    "sensevoice-model" | "sensevoice-tokens" | "sensevoice-vad"
-                )
-            }
+            matches!(
+                item_id,
+                "ffmpeg" | "sensevoice-model" | "sensevoice-tokens" | "sensevoice-vad"
+            )
         }
         ModelManagerTab::Whisper => {
-            // Whisper 专区：Whisper 模型档位、VAD、标点、推理程序，以及音视频解码抽音必需的 FFmpeg 底座
-            let has_cli =
-                state.model_is_present("whisper-cli") || state.model_is_present("whisper-cublas");
-            if item_id == "ffmpeg" {
-                !state.model_is_present("ffmpeg")
-            } else if item_id == "whisper-cli" {
-                // 若本地尚未就位任何可用 CLI，4.1MB 的基础 whisper-cli 为绝对必需
-                !has_cli
-            } else if item_id == "whisper-cublas" {
-                // whisper-cublas 为 435MB 可选 CUDA 极速扩展包，不作为强制阻断项
-                false
-            } else if item_id == "silero-vad" || item_id == "punc-model" {
-                true
-            } else if let Some(current_id) = state.whisper_model_tier.download_item_id() {
-                item_id == current_id
-            } else {
-                item_id == "whisper-turbo-q5" || item_id == "whisper-small"
-            }
+            // Whisper 专区：**全系模型都列出来供用户挑**（数量、体积、就位状态一目了然），
+            // 加上 VAD、标点与推理程序。
+            matches!(
+                item_id,
+                "ffmpeg"
+                    | "whisper-cli"
+                    | "whisper-cublas"
+                    | "whisper-tiny"
+                    | "whisper-base"
+                    | "whisper-small"
+                    | "whisper-medium"
+                    | "whisper-turbo-q5"
+                    | "whisper-turbo-q8"
+                    | "whisper-large-v3"
+                    | "silero-vad"
+                    | "punc-model"
+            )
         }
         ModelManagerTab::Common => {
-            // 公用组件：FFmpeg 媒体流提取、FFplay 伴音播放、本地翻译大模型及 llama.cpp
-            matches!(item_id, "ffmpeg" | "ffplay" | "llama-cpp" | "qwen-llm")
+            // 公用组件：FFmpeg 媒体流提取、FFplay 伴音播放、llama.cpp 推理程序，
+            // 以及全部离线大模型档位（见下方 ModelCategory 的说明）。
+            matches!(
+                item_id,
+                "ffmpeg" | "ffplay" | "llama-cpp" | "qwen-llm" | "qwen-llm-1_5b" | "qwen-llm-3b"
+            )
         }
     }
 }
 
-/// 判断某个组件在用户当前的硬件配置和引擎模式下，是否属于「当前模式所需」的组件。
-pub fn is_item_needed_by_current_config(item_id: &str, state: &crate::app::AppState) -> bool {
-    let _is_gpu = state.config.gpu.is_gpu_tier();
+/// 该组件在**当前配置下是否真的缺**（用于顶部提示与「一键补齐」）。
+///
+/// # 为什么不能复用 [`is_item_needed_for_tab`]
+///
+/// 那个函数现在回答的是「该不该显示」。若拿它当缺失判据，模型库里 6 个没下载的档位
+/// 会被算成「缺 6 项」——而用户只需要其中一个。这里只认**跑起来真正必需**的东西：
+/// 识别引擎本体（且仅当前选中的那一个）、它的运行程序、以及抽音用的 ffmpeg。
+///
+/// 只有 `required: true` 的条目才可能计入（当前是 whisper-small 与 ffmpeg/ffplay），
+/// 外加「当前选中档位对应的那个模型」——用户主动选了某一档却没下，那才算缺。
+pub fn is_item_required_now(item_id: &str, state: &crate::app::AppState) -> bool {
     let is_sv = state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
 
     match item_id {
-        // 音视频抽音解码与伴音播放：任何模式都需要
-        "ffmpeg" | "ffplay" => true,
+        // 抽音解码：任何模式都需要
+        "ffmpeg" => true,
 
-        // GPU 专用的 CUDA 推理程序：435MB 可选深度加速包，不绑架一键补齐
-        "whisper-cublas" => false,
-
-        // 基础版本的 Whisper CLI（4.1MB）：选择 Whisper 且本地尚无任何 CLI 时必须下载！
+        // 基础推理程序：选 Whisper 且本地一个 CLI 都没有时才算缺
         "whisper-cli" => {
             let has_cli =
                 state.model_is_present("whisper-cli") || state.model_is_present("whisper-cublas");
             !is_sv && !has_cli
         }
 
-        // SenseVoice 引擎套件：选择 SenseVoice 极速模式时需要（自包含 ONNX 架构，无需任何 cpp）
+        // SenseVoice 套件：选它时三个文件齐了才跑得起来
         "sensevoice-model" | "sensevoice-tokens" | "sensevoice-vad" => is_sv,
 
-        // Whisper 模型档位与 Silero VAD：选择 Whisper 模式时需要
-        "whisper-tiny"
-        | "whisper-base"
-        | "whisper-small"
-        | "whisper-medium"
-        | "whisper-turbo-q5"
-        | "whisper-turbo-q8"
-        | "whisper-large-v3"
-        | "silero-vad" => {
-            if is_sv {
-                false
-            } else if item_id == "silero-vad" {
-                true
-            } else if let Some(current_id) = state.whisper_model_tier.download_item_id() {
-                item_id == current_id
-            } else {
-                item_id == "whisper-turbo-q5"
-            }
+        // Whisper 各档模型：**只认当前选中的那一档**。没选中的档位是「可选商品」，
+        // 缺与不缺都不该报警——用户下不下由他自己决定。
+        "whisper-tiny" | "whisper-base" | "whisper-small" | "whisper-medium"
+        | "whisper-turbo-q5" | "whisper-turbo-q8" | "whisper-large-v3" => {
+            !is_sv
+                && state
+                    .whisper_model_tier
+                    .download_item_id()
+                    .map(|current| current == item_id)
+                    .unwrap_or(false)
         }
 
-        // 标点模型：开启标点恢复时需要
-        "punc-model" => state.enable_polish,
-
-        // 本地离线大模型：只有在本地离线 Qwen 翻译或 Qwen 深度润色模式下需要
-        "qwen-llm" | "llama-cpp" => {
-            state.config.translate.mode == "offline_qwen"
-                || (state.enable_polish && state.polish_mode == crate::app::PolishMode::QwenDeep)
-        }
-
+        // 其余（VAD / 标点 / 大模型 / 推理程序扩展包 / 播放器）都不是阻断项：
+        // 它们在用到时才生效，缺失只影响对应功能，不该让整个页面标红。
         _ => false,
     }
 }
@@ -209,6 +296,27 @@ impl MainWindow {
     /// 渲染路径只读内存：键不变就直接复用，键变了（下载完成 / 删除 / 改路径）
     /// 才派发一次后台探测，完成后 `cx.notify()` 自动刷新。
     fn model_disk_usage(&self, cx: &mut gpui::Context<Self>) -> (u64, usize) {
+        let sizes = self.model_disk_sizes(cx);
+        sizes
+            .values()
+            .copied()
+            .flatten()
+            .fold((0u64, 0usize), |(bytes, count), size| {
+                (bytes + size, count + 1)
+            })
+    }
+
+    /// 单项的**磁盘实际占用**（`None` = 未就位 / 探测失败）。
+    ///
+    /// # 为什么要显示实际值而不是清单里的声明值
+    ///
+    /// 清单里的 `size` 是「下载预计多大」，用于未下载时的预期；而已经躺在盘上的
+    /// 文件未必就是清单里那个（用户可能自行量化、上游也可能改了产物），此时显示
+    /// 声明值就是在撒谎——用户删掉它腾出的空间与显示的数字对不上。
+    fn model_disk_sizes(
+        &self,
+        cx: &mut gpui::Context<Self>,
+    ) -> std::collections::HashMap<String, Option<u64>> {
         let key = self.model_disk_key();
         let stale = cx.update_default_global::<ModelDiskSnapshot, _>(|state, _| {
             model_disk_snapshot_stale(state.key.as_ref(), &key) && !state.inflight
@@ -233,16 +341,7 @@ impl MainWindow {
             })
             .detach();
         }
-        cx.update_default_global::<ModelDiskSnapshot, _>(|state, _| {
-            state
-                .sizes
-                .values()
-                .copied()
-                .flatten()
-                .fold((0u64, 0usize), |(bytes, count), size| {
-                    (bytes + size, count + 1)
-                })
-        })
+        cx.update_default_global::<ModelDiskSnapshot, _>(|state, _| state.sizes.clone())
     }
     /// 模型管理卡片。`compact` 为真时只显示缺失项与一个「一键补齐」按钮
     /// （用于侧栏），否则显示完整清单（用于独立页面）。
@@ -256,7 +355,6 @@ impl MainWindow {
         let total = self.state.download_total_bytes;
         let status = self.state.download_status_msg.clone();
         let current = self.state.download_current.clone();
-        let current_tab = self.model_manager_tab;
         let _is_gpu = self.state.config.gpu.is_gpu_tier();
 
         // 进度比例：服务端没给 Content-Length 时退化为「不确定」态（用 0 表示）
@@ -266,68 +364,30 @@ impl MainWindow {
             0.0
         };
 
-        // ── 顶部：基于当前选定专区计算缺失项 ──
+        // ── 顶部：只统计**当前配置下真正必需**的缺失项 ──
+        //
+        // 判据是 [`is_item_required_now`] 而不是 [`is_item_needed_for_tab`]：后者管
+        // 「列表里显不显示」，模型库现在全系列出，拿它计数会把「还没决定下哪个」的
+        // 可选档位算成缺项（用户看到红字「缺 6 项」，其实一个都不缺）。
         let active_missing_items: Vec<&crate::utils::DownloadItem> = ITEMS
             .iter()
             .filter(|i| !self.state.model_is_present(i.id))
-            .filter(|i| is_item_needed_for_tab(i.id, current_tab, &self.state))
+            .filter(|i| is_item_required_now(i.id, &self.state))
             .collect();
         let missing = active_missing_items.len();
 
+        // 缺项不再是「错误」：多数用户只会装一个模型，其余档位留着不装是常态。
+        // 底座工具缺失才报红，模型未下提示按需下载即可。
         let missing_badge = if missing == 0 {
-            primitives::badge_accent(match current_tab {
-                ModelManagerTab::SenseVoice => "SenseVoice 组件已就位（推荐引擎）",
-                ModelManagerTab::Whisper => "Whisper 所需组件已就位",
-                ModelManagerTab::Common => "公用支撑组件已就位",
-            })
-        } else if missing == 1 {
-            let item = active_missing_items[0];
-            primitives::badge_danger(format!("缺组件：{}", item.label))
-        } else if missing <= 3 {
-            let names = active_missing_items
-                .iter()
-                .map(|i| i.label)
-                .collect::<Vec<_>>()
-                .join("、");
-            primitives::badge_danger(format!("缺 {missing} 项：{names}"))
+            primitives::badge_accent("所需组件已就位")
         } else {
-            primitives::badge_danger(format!("缺 {missing} 项"))
+            let has_tool_missing = active_missing_items.iter().any(|i| i.id == "ffmpeg" || i.id == "whisper-cli");
+            if has_tool_missing {
+                primitives::badge_danger("需下载基础运行组件")
+            } else {
+                primitives::badge("按需下载模型即可")
+            }
         };
-
-        // 视图切换胶囊：SenseVoice (推荐) vs Whisper 模型库 vs 公用组件
-        let view_toggle = primitives::segmented_cluster()
-            .child(
-                primitives::segmented(
-                    "SenseVoice（推荐）",
-                    current_tab == ModelManagerTab::SenseVoice,
-                    false,
-                )
-                .id("model-tab-sv")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.model_manager_tab = ModelManagerTab::SenseVoice;
-                    cx.notify();
-                })),
-            )
-            .child(
-                primitives::segmented(
-                    "Whisper 模型库",
-                    current_tab == ModelManagerTab::Whisper,
-                    false,
-                )
-                .id("model-tab-whisper")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.model_manager_tab = ModelManagerTab::Whisper;
-                    cx.notify();
-                })),
-            )
-            .child(
-                primitives::segmented("公用组件", current_tab == ModelManagerTab::Common, false)
-                    .id("model-tab-common")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.model_manager_tab = ModelManagerTab::Common;
-                        cx.notify();
-                    })),
-            );
 
         // 占用统计：读后台快照，渲染路径不碰磁盘（见 [`ModelDiskSnapshot`]）
         let (used_bytes, used_count) = self.model_disk_usage(cx);
@@ -356,10 +416,13 @@ impl MainWindow {
                                 )),
                         )
                     }),
-            )
-            .child(view_toggle);
+            );
 
-        // ── 主操作动作条（补齐所需 / 取消下载） ──
+        // ── 顶部动作条：只剩「取消下载」 ──
+        //
+        // 「下载必需组件」按钮此前是全局一个，下什么由「当前专区」决定。现在三块
+        // 同页铺开，每个块头各带一个按钮、只下该块真正必需的条目——比一个全局按钮
+        // 更明确：用户看着哪一块，点的就是哪一块。
         let action_bar = div()
             .w_full()
             .flex()
@@ -379,28 +442,6 @@ impl MainWindow {
                             .store(true, std::sync::atomic::Ordering::SeqCst);
                         this.state.download_status_msg = "正在取消下载…".to_string();
                         cx.notify();
-                    })),
-                )
-            } else if missing > 0 {
-                Some(
-                    primitives::btn_clickable(
-                        match current_tab {
-                            ModelManagerTab::SenseVoice => {
-                                format!("补齐 SenseVoice 所需（{missing} 项）")
-                            }
-                            ModelManagerTab::Whisper => {
-                                format!("补齐 Whisper 所需（{missing} 项）")
-                            }
-                            ModelManagerTab::Common => {
-                                format!("补齐公用组件（{missing} 项）")
-                            }
-                        },
-                        primitives::BtnSize::Sm,
-                        primitives::BtnVariant::Primary,
-                    )
-                    .id("model-dl-all")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.download_all_missing(cx);
                     })),
                 )
             } else {
@@ -467,95 +508,212 @@ impl MainWindow {
             None
         };
 
-        // ── 分类结构 ──
-        struct ModelCategory {
-            title: &'static str,
-            item_ids: &'static [&'static str],
-        }
+        // 各条目的磁盘实际占用（渲染路径零 I/O，读后台快照）
+        let disk_sizes = self.model_disk_sizes(cx);
 
-        let categories = match current_tab {
-            ModelManagerTab::SenseVoice => vec![ModelCategory {
-                title: "SenseVoice 极速语音识别（推荐）",
-                item_ids: &["sensevoice-model", "sensevoice-tokens", "sensevoice-vad"],
-            }],
-            ModelManagerTab::Whisper => vec![
-                ModelCategory {
-                    title: "Whisper 识别模型库（全系可选）",
-                    item_ids: &[
-                        "whisper-turbo-q5",
-                        "whisper-turbo-q8",
-                        "whisper-large-v3",
-                        "whisper-medium",
-                        "whisper-small",
-                        "whisper-base",
-                        "whisper-tiny",
-                        "silero-vad",
-                        "punc-model",
-                    ],
-                },
-                ModelCategory {
-                    title: "Whisper 推理程序",
-                    item_ids: &["whisper-cli", "whisper-cublas"],
-                },
-            ],
-            ModelManagerTab::Common => vec![
-                ModelCategory {
-                    title: "音视频解码与伴音播放（FFmpeg / FFplay）",
-                    item_ids: &["ffmpeg", "ffplay"],
-                },
-                ModelCategory {
-                    title: "本地大模型翻译与润色引擎",
-                    item_ids: &["llama-cpp", "qwen-llm"],
-                },
-            ],
-        };
-
+        // ── 三个分块：同页铺开，各自可折叠 ──
+        //
+        // 块与块之间是**独立**的：展开状态互不影响，块头的「下载必需组件」也只下
+        // 本块真正必需的条目。这样「一眼看全三块」与「逐块动手」可以同时做到。
         let mut list = div().w_full().flex().flex_col().gap(px(Theme::SPACE_3));
-        for cat in categories {
-            let cat_items: Vec<_> = cat
-                .item_ids
+        for block in MODEL_BLOCKS.iter() {
+            let tab = block.tab;
+            let open = self.model_blocks_open[tab as usize];
+
+            let all_ids: Vec<&'static str> = block
+                .categories
                 .iter()
-                .filter_map(|&id| ITEMS.iter().find(|i| i.id == id))
-                .filter(|i| is_item_needed_for_tab(i.id, current_tab, &self.state))
+                .flat_map(|c| c.item_ids.iter().copied())
                 .collect();
-
-            if cat_items.is_empty() {
-                continue;
-            }
-
-            let cat_missing = cat_items
+            let present = all_ids
                 .iter()
-                .filter(|i| {
-                    !self.state.model_is_present(i.id)
-                        && is_item_needed_for_tab(i.id, current_tab, &self.state)
-                })
+                .filter(|id| self.state.model_is_present(id))
                 .count();
 
-            let mut col = div().w_full().flex().flex_col().gap(px(Theme::SPACE_1_5));
-            let title_row = div()
+            // 本块内「当前配置真正必需且缺失」的条目 —— 决定块头那个按钮下什么。
+            // 判据组合：先按块过滤显示范围，再按「真的必需」收窄，避免把整块可选
+            // 档位（Whisper 全系约 5GB）都排进下载队列。
+            let required_missing: Vec<&'static crate::utils::DownloadItem> = ITEMS
+                .iter()
+                .filter(|i| !self.state.model_is_present(i.id))
+                .filter(|i| is_item_needed_for_tab(i.id, tab, &self.state))
+                .filter(|i| is_item_required_now(i.id, &self.state))
+                .collect();
+
+            // 块头：**浅蓝底横条 + 蓝标题**。
+            //
+            // 为什么必须换色：块标题、分类标题、模型名此前全是同一个 `text_primary`
+            // （#f3f4f6），而字号只差 1px（13 / 12 / 12）——一屏几十行看下来根本分不清
+            // 哪一行是标题、哪一行是模型。现在把规则定死为「**蓝色 = 标题，白色 = 模型**」，
+            // 扫一眼就能认出层级，不必逐字去读。
+            let head = div()
+                .w_full()
                 .flex()
                 .items_center()
                 .justify_between()
+                .gap(px(Theme::SPACE_3))
+                .px(px(Theme::CARD_PAD))
+                .py(px(Theme::SPACE_2))
+                .bg(Theme::tint_blue_soft())
                 .child(
                     div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(if cat_missing > 0 {
-                            Theme::accent_red()
-                        } else {
-                            Theme::text_primary()
-                        })
-                        .child(cat.title),
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(Theme::SPACE_0_5))
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_BODY_LG))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(Theme::accent_blue())
+                                .child(block.title),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(Theme::text_secondary())
+                                .child(block.subtitle),
+                        ),
                 )
-                .when(cat_missing > 0, |d| {
-                    d.child(primitives::badge_danger(format!("缺 {cat_missing} 项")))
-                });
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .gap(px(Theme::SPACE_2))
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(Theme::text_muted())
+                                .child(format!("已就位 {present} / {}", all_ids.len())),
+                        )
+                        .children((!required_missing.is_empty() && !is_downloading).then(|| {
+                            let n = required_missing.len();
+                            let btn_label = match tab {
+                                ModelManagerTab::SenseVoice => {
+                                    if n == 1 {
+                                        "下载 SenseVoice 套件".to_string()
+                                    } else {
+                                        format!("下载 SenseVoice（{n} 项）")
+                                    }
+                                }
+                                ModelManagerTab::Whisper => {
+                                    "下载选用模型".to_string()
+                                }
+                                ModelManagerTab::Common => {
+                                    if n == 1 {
+                                        "下载基础组件".to_string()
+                                    } else {
+                                        format!("下载基础组件（{n} 项）")
+                                    }
+                                }
+                            };
+                            primitives::btn_clickable(
+                                btn_label,
+                                primitives::BtnSize::Sm,
+                                primitives::BtnVariant::Primary,
+                            )
+                            .id(("model-block-dl", tab as usize))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.download_all_missing(tab, cx);
+                            }))
+                        }))
+                        .child(
+                            primitives::mini_btn(if open { "收起" } else { "展开" }, true)
+                                .id(("model-block-toggle", tab as usize))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let slot = &mut this.model_blocks_open[tab as usize];
+                                    *slot = !*slot;
+                                    cx.notify();
+                                })),
+                        ),
+                );
 
-            col = col.child(title_row);
-            for item in cat_items {
-                col = col.child(self.render_model_row(item, is_downloading, cx));
+            // 内边距移交给 head 与 body 各自负责：块头要铺满整宽（才能出横条效果），
+            // 不能再让外层统一留白。`overflow_hidden` 负责把横条的方角裁进卡片圆角里。
+            let mut section = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .rounded(px(Theme::CARD_RADIUS))
+                .bg(Theme::bg_card())
+                .border_1()
+                .border_color(Theme::border())
+                .overflow_hidden()
+                .child(head);
+
+            if open {
+                let mut body = div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Theme::SPACE_3))
+                    .p(px(Theme::CARD_PAD));
+                for cat in block.categories {
+                    let cat_items: Vec<_> = cat
+                        .item_ids
+                        .iter()
+                        .filter_map(|&id| ITEMS.iter().find(|i| i.id == id))
+                        .filter(|i| is_item_needed_for_tab(i.id, tab, &self.state))
+                        .collect();
+
+                    if cat_items.is_empty() {
+                        continue;
+                    }
+
+                    // 分类标题不按「缺几项」标红：模型库是一份可选清单，没下完是常态。
+                    // 改为中性统计「已就位 / 共几项」，让用户知道进度而不是被指责。
+                    let cat_present = cat_items
+                        .iter()
+                        .filter(|i| self.state.model_is_present(i.id))
+                        .count();
+                    let cat_total = cat_items.len();
+
+                    let is_choice_cat = cat.title.contains("任选其一");
+                    let choice_lacking = is_choice_cat && cat_present == 0;
+
+                    let mut col = div().w_full().flex().flex_col().gap(px(Theme::SPACE_1_5));
+                    col = col.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(Theme::SPACE_1_5))
+                                    // 小圆点与标题：采用温和的中性蓝/薄荷绿引导，不搞大面积报错红色
+                                    .child(primitives::stat_dot_sm(Theme::accent_blue()))
+                                    .child(
+                                        div()
+                                            .text_size(px(Theme::TEXT_BODY))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::accent_blue())
+                                            .child(cat.title),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_muted())
+                                    .child(if choice_lacking {
+                                        format!("待选其一 · 0 / {cat_total}")
+                                    } else {
+                                        format!("已就位 {cat_present} / {cat_total}")
+                                    }),
+                            ),
+                    );
+                    for item in cat_items {
+                        let actual = disk_sizes.get(item.id).copied().flatten();
+                        col = col.child(self.render_model_row(item, is_downloading, actual, cx));
+                    }
+                    body = body.child(col);
+                }
+                section = section.child(body);
             }
-            list = list.child(col);
+            list = list.child(section);
         }
 
         // ── 底部维护工具栏 ──
@@ -776,6 +934,7 @@ impl MainWindow {
         &mut self,
         item: &'static crate::utils::DownloadItem,
         is_downloading: bool,
+        actual_size: Option<u64>,
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
         let present = self.state.model_is_present(item.id);
@@ -788,22 +947,50 @@ impl MainWindow {
             .unwrap_or(false);
         let row_id = item.id;
         let row_idx = ITEMS.iter().position(|i| i.id == item.id).unwrap_or(0);
+        // 当前配置下是否**真的需要**它（只认真必需的，见 [`is_item_required_now`]）。
+        // 未就位不再一律染红：模型列表是一份可选清单，没下过的档位是「还没装」
+        // 而不是「出错了」。
+        let is_required_now = is_item_required_now(item.id, &self.state);
+        let is_base_tool = item.id == "ffmpeg" || item.id == "whisper-cli";
 
-        let is_needed = is_item_needed_by_current_config(item.id, &self.state);
+        // Whisper 任选其一模型组判定：
+        let is_whisper_choice = WHISPER_CHOICE_MODEL_IDS.contains(&item.id);
+        let any_whisper_choice_present = WHISPER_CHOICE_MODEL_IDS
+            .iter()
+            .any(|&id| self.state.model_is_present(id));
 
-        // 状态徽标：已就位 / 必需 / 可选
+        // 如果用户连一个 Whisper 识别模型都还没下 (0 / 7 就位)：
+        // 这一组全都是候选，全部标红警示「任选其一待下载」；
+        // 一旦用户下载了其中任意一个（any_whisper_choice_present == true），
+        // 这一组的刚性要求即告满足，其它未下的模型恢复中性可选，全部「不红了」！
+        let is_choice_lacking = is_whisper_choice && !any_whisper_choice_present;
+
+        // 仅底座工具缺失时才标红；模型属于可选候选档位，不论 CPU/GPU 均可按需下载，不应整行大红警示
+        let is_row_danger = !present
+            && !is_downloading
+            && (is_base_tool && is_required_now);
+
+        // 状态徽标：已就位 / 必需底座缺失 / 当前选用 / 任选其一 / 可选
         let status_badge = if is_current && is_downloading {
             primitives::badge_accent("下载中")
         } else if custom {
             primitives::badge_accent("已就位（自编译）")
         } else if present {
             primitives::badge_accent("已就位")
-        } else if !is_needed {
-            primitives::badge("未下载（当前模式无需）")
+        } else if is_base_tool && is_required_now {
+            // 真正的运行底座缺失：标红警示
+            primitives::badge_danger("必需组件 · 待下载")
+        } else if is_required_now {
+            // 当前选用的推荐/默认档：主色突出引导
+            primitives::badge_accent("当前选用 · 待下载")
+        } else if is_choice_lacking {
+            // 一个模型都没下时的备选模型：中性徽标，不搞大面积报错红色
+            primitives::badge("任选其一 · 待下载")
         } else if item.required {
-            primitives::badge_danger("核心依赖 · 待补齐")
+            primitives::badge("未下载 · 下载后可用")
         } else {
-            primitives::badge_danger("待下载")
+            // 可选档位：中性徽标，不催不吓（用户想装哪个自己决定）
+            primitives::badge("未下载 · 可选")
         };
 
         // 操作区：未就位显示下载按钮；已就位显示「定位」与「删除」
@@ -822,7 +1009,9 @@ impl MainWindow {
                             "下载"
                         },
                         primitives::BtnSize::Sm,
-                        if is_needed {
+                        // 当前配置必需的、或连一个模型都未就位时的备选模型用主按钮，
+                        // 已就位至少一个后的可选档位用次按钮。
+                        if is_row_danger || is_required_now {
                             primitives::BtnVariant::Primary
                         } else {
                             primitives::BtnVariant::Secondary
@@ -888,7 +1077,7 @@ impl MainWindow {
             .py(px(Theme::SPACE_2))
             .rounded(px(Theme::RADIUS_SM));
 
-        if !present && !is_downloading && is_needed {
+        if is_row_danger {
             row_container = row_container
                 .bg(Theme::tint_red_soft())
                 .border_1()
@@ -915,7 +1104,7 @@ impl MainWindow {
                                 div()
                                     .text_size(px(Theme::TEXT_BODY))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(if !present && is_needed {
+                                    .text_color(if is_row_danger {
                                         Theme::accent_red()
                                     } else {
                                         Theme::text_primary()
@@ -926,7 +1115,13 @@ impl MainWindow {
                                 div()
                                     .text_size(px(Theme::TEXT_CAPTION))
                                     .text_color(Theme::text_muted())
-                                    .child(human_size(item.size)),
+                                    // 已就位显示**磁盘实际占用**（用户据此判断能腾多少空间），
+                                    // 未就位才显示清单里的预计体积。两种口径混用会让
+                                    // 「显示 172.9 MB、删掉却腾出 465 MB」这种事发生。
+                                    .child(match actual_size {
+                                        Some(bytes) => human_size(bytes),
+                                        None => format!("约 {}", human_size(item.size)),
+                                    }),
                             )
                             .child(status_badge),
                     ),
@@ -939,6 +1134,42 @@ impl MainWindow {
 mod tests {
     use super::{model_disk_snapshot_stale, ModelDiskKey};
     use std::path::PathBuf;
+
+    /// 分块表必须自洽：引用的条目 id 都真实存在，且**同一 id 只出现在一个块里**。
+    ///
+    /// 后者是「一页三块」特有的风险。早先按专区切换时，同一个 id 登记在两个专区
+    /// 是无害的（一次只渲染一个）；现在三块同时渲染，重复登记会让同一个模型在页面上
+    /// 出现两次，块头「已就位 N / M」的分母也会被算重。
+    #[test]
+    fn block_table_references_real_items_without_duplicates() {
+        use super::MODEL_BLOCKS;
+        use crate::ui::ModelManagerTab;
+        use crate::utils::ITEMS;
+        use std::collections::HashMap;
+
+        let mut seen: HashMap<&'static str, ModelManagerTab> = HashMap::new();
+        for block in MODEL_BLOCKS.iter() {
+            for cat in block.categories {
+                assert!(!cat.item_ids.is_empty(), "分类「{}」没有条目", cat.title);
+                for &id in cat.item_ids {
+                    assert!(
+                        ITEMS.iter().any(|i| i.id == id),
+                        "分块「{}」引用了不存在的条目 id：{id}",
+                        block.title
+                    );
+                    if let Some(prev) = seen.insert(id, block.tab) {
+                        panic!(
+                            "条目 {id} 被重复登记（已在 {prev:?}，又出现在 {:?}）——\
+                             三块同页渲染时它会出现两次",
+                            block.tab
+                        );
+                    }
+                }
+            }
+        }
+        // 三块必须都在表里：少一块就等于把那个专区藏起来了，正是本次要根治的问题。
+        assert_eq!(MODEL_BLOCKS.len(), 3, "三个分块缺一不可");
+    }
 
     fn key(entries: &[(&str, &str)], downloading: bool, presence: &[bool]) -> ModelDiskKey {
         ModelDiskKey {

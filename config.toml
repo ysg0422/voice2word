@@ -48,14 +48,16 @@ yield_to_desktop = true
 gpu_limit_percent = 100
 
 [subtitle_style]
-font_size = 42
+font_size = 66
 letter_spacing = 9
 line_spacing = 2.1999998092651367
-max_chars_per_line = 25
-bottom_margin = 65
+max_chars_per_line = 20
+bottom_margin = 54
 margin_lr = 20
 preset_name = "白字黑影"
-preview_box_w = 560.0
+preview_box_w = 642.6666870117188
+pos_x_percent = 50.0
+pos_y_percent = 95.0
 primary_color = "#FFD60A"
 outline_width = 0.0
 outline_color = "#000000"

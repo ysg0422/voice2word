@@ -559,6 +559,59 @@ fn min_gap_hint(plan: &GapPlan, applied: bool) -> String {
     text
 }
 
+/// 四角手柄 → 新字号（纯函数，便于单测）。
+///
+/// **只吃 `dx`**：竖向位移不参与任何计算（用户要求「去掉上下的拖拽方向，只能左右」）。
+/// 上一版是 `(dx*sign_x + dy*sign_y) * 0.5` 的等比缩放，上下拖也会改字号，
+/// 这正是「拖拽只能等比例放缩」这个抱怨的来源。
+///
+/// `is_left` 决定符号：左手柄往左拉、右手柄往右拉都算「放大」。少了这一步符号，
+/// 左手柄往外拉会被算成缩小，手感是反的。
+fn font_size_from_horizontal_drag(
+    start_box_w: f32,
+    start_font_size: u32,
+    dx: f32,
+    is_left: bool,
+) -> u32 {
+    let sign_x = if is_left { -1.0 } else { 1.0 };
+    let scale = ((start_box_w + dx * sign_x) / start_box_w.max(40.0)).clamp(0.35, 3.5);
+    ((start_font_size as f32) * scale)
+        .round()
+        .clamp(16.0, 120.0) as u32
+}
+
+/// 左右手柄拖动时的**灵敏度**：框宽增量 = 灵敏度 × 鼠标横向位移。
+///
+/// 不取 2.0 的原因：字幕框是水平居中的，拖一条边时两侧同时向外扩，
+/// 系数 2.0 意味着**拖住的那条边与鼠标 1:1 跟随**——用户实测「太灵敏了」，
+/// 手一抖宽度就跳一大截。取 1.0 时边缘以鼠标一半的速度移动，微调更稳。
+///
+/// 想恢复「边缘严格贴住鼠标」的手感就调回 2.0；想更迟钝就继续往下调。
+const WIDTH_DRAG_SENSITIVITY: f32 = 1.0;
+
+/// 左右手柄 → 新框宽（纯函数，便于单测）。
+///
+/// 只吃 `dx`：竖向位移不参与（同字号那一路）。`is_left` 决定符号——
+/// 左手柄往左拉、右手柄往右拉都是「加宽」。
+fn box_width_from_horizontal_drag(start_box_w: f32, dx: f32, is_left: bool, max_w: f32) -> f32 {
+    let sign_x = if is_left { -1.0 } else { 1.0 };
+    (start_box_w + sign_x * WIDTH_DRAG_SENSITIVITY * dx).clamp(60.0, max_w.max(60.0))
+}
+
+/// 框宽（px）→ 等效的「单行最大字数」（纯函数，便于单测）。
+///
+/// 左右手柄拖的是**框宽**（跟着鼠标走，见 `handle_monitor_subtitle_drag`），
+/// 而右侧面板显示的是「单行最大字数」——这个函数负责把前者折算成后者写回配置，
+/// 否则拖完框变了、右边那格数字还是旧的。
+///
+/// `font_px` 用实时字号（用户可能刚拖过四角改了字号）；两端的 28px 是框的内边距，
+/// 与画面上的框宽公式同一个常数。
+fn max_chars_for_width(box_w: f32, font_px: f32) -> u32 {
+    ((box_w - 28.0) / font_px.max(1.0))
+        .round()
+        .clamp(4.0, 100.0) as u32
+}
+
 impl MainWindow {
     /// 渲染类似剪映 / Premiere 风格的剪辑工作区布局 (左中右之 中：视频与时间轴，右：字幕属性)
     pub(crate) fn render_editor_layout(
@@ -870,6 +923,22 @@ impl MainWindow {
                                 stage.style().aspect_ratio = Some(video_aspect);
                             }
 
+                            // 点画面空白处取消选中。
+                            //
+                            // 选框与手柄现在「点中字幕才出现」，就必须给一个取消出口——
+                            // 否则第一次点过字幕之后那个蓝框与六个手柄会一直挂在画面上，
+                            // 比原来「未播放时常驻」还难摆脱。字幕框自己的 `on_mouse_down`
+                            // 调了 `stop_propagation`，所以点框内不会冒泡到这里。
+                            stage = stage.on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    if this.monitor_subtitle_selected {
+                                        this.monitor_subtitle_selected = false;
+                                        cx.notify();
+                                    }
+                                }),
+                            );
+
                             // 视频画面展示 (实时内嵌播放 vs 静态时间轴帧)
                             stage = stage.child(self.render_monitor_picture(window, cx));
 
@@ -964,9 +1033,26 @@ impl MainWindow {
                                     .max()
                                     .unwrap_or_else(|| display_text.chars().count())
                                     .max(1);
-                                // 严丝合缝贴合字幕文字的文本框尺寸（字数 × 单字宽度 + 边距），像 PPT 一样包裹文字
-                                let content_w = ((max_line_chars as f32 * font_px) + 28.0).clamp(60.0, (fit_w - 16.0).max(60.0));
-                                let box_w = content_w;
+                                // 框宽 = 文字自然宽度 与 「单行最大字数」上限 的**较小者**。
+                                //
+                                // 后半句是「横着拖拽防换行」的落点：左右手柄改的就是
+                                // `max_chars_per_line`，框宽随它收缩，文字被迫在框内折行；
+                                // 往外拖则放开到文字自然宽度、不再折行。此前框宽只由文字
+                                // 实际长度决定，于是拖换行阈值时画面毫无反馈。
+                                let natural_w = (max_line_chars as f32 * font_px) + 28.0;
+                                let limit_w = (style.max_chars_per_line as f32 * font_px) + 28.0;
+                                // 手动拖过左右手柄 → **用户定的宽度说了算**（框就是那么宽，
+                                // 文字在里面折行）；没拖过则贴合文字、并被换行上限约束。
+                                //
+                                // 为什么必须有「手动宽度」这一层：只靠「自然宽与上限宽取小」
+                                // 的话，上限宽（本机 44 字 × 66px ≈ 2900px）远大于文字自然宽，
+                                // 框于是永远贴着文字——往外拖毫无反应，往内拖要拖过上千像素
+                                // 才开始变窄。用户的实际感受就是「左右拉不动」。
+                                let auto_w = natural_w.min(limit_w);
+                                let box_w = self
+                                    .preview_box_w
+                                    .unwrap_or(auto_w)
+                                    .clamp(60.0, (fit_w - 16.0).max(60.0));
 
                                 let cur_x_pct = style.pos_x_percent.clamp(5.0, 95.0);
                                 let cur_y_pct = style.current_pos_y_percent().clamp(5.0, 95.0);
@@ -974,13 +1060,36 @@ impl MainWindow {
                                 let center_y = fit_h * (cur_y_pct / 100.0);
 
                                 let box_left = (center_x - box_w / 2.0).clamp(4.0, (fit_w - box_w - 4.0).max(4.0));
-                                let approx_h = (font_px * style.line_spacing * 1.4 + 16.0).clamp(24.0, 300.0);
+                                // 估算框高必须按**折行后**的行数算。框宽现在会被
+                                // `max_chars_per_line` 收紧（见上），长句会在框内折成好几行；
+                                // 仍按单行估高会让 `box_top = center_y - approx_h / 2` 偏下，
+                                // 字幕整体沉到目标位置以下——拖窄换行阈值时尤其明显。
+                                //
+                                // 单行时 `est_lines == 1`，公式与改动前逐字一致，
+                                // 因此不影响未折行字幕的既有定位。
+                                // 用**实际框宽**折算每行字数：手动拖过之后框宽与
+                                // max_chars_per_line 未必一一对应，按框宽算才准。
+                                let wrap_cols =
+                                    (((box_w - 28.0) / font_px.max(1.0)).floor()).max(1.0);
+                                let est_lines: f32 = display_text
+                                    .lines()
+                                    .map(|l| ((l.chars().count() as f32) / wrap_cols).ceil().max(1.0))
+                                    .sum::<f32>()
+                                    .max(1.0);
+                                let approx_h =
+                                    (font_px * style.line_spacing * 1.4 * est_lines + 16.0)
+                                        .clamp(24.0, 300.0);
                                 let box_top = (center_y - approx_h / 2.0).clamp(4.0, (fit_h - approx_h - 4.0).max(4.0));
 
                                 let is_selected = self.monitor_subtitle_selected;
                                 let is_dragging = self.monitor_subtitle_drag.is_some();
-                                // 未播放时默认常驻展示 PPT 选框与缩放手柄，让用户一眼可见并随时拖拽调节
-                                let show_ppt_frame = !is_playing || is_selected || is_dragging;
+                                // 选框与手柄**只在点中字幕后**出现（用户明确要求）。
+                                //
+                                // 此前是「只要不在播放就常驻画出来」，于是每一帧画面上都挂着
+                                // 一个蓝框和六个手柄，挡住画面本身；而用户点它才算「选中并要
+                                // 编辑」。现在未选中时只有一个悬停高亮作为「这里可以点」的提示
+                                // （见 text_element 的 hover 边框），选了才出框与手柄。
+                                let show_ppt_frame = is_selected || is_dragging;
 
                                 let is_moving = matches!(
                                     self.monitor_subtitle_drag,
@@ -1111,7 +1220,7 @@ impl MainWindow {
                                                 move |this, event: &MouseDownEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     this.begin_monitor_subtitle_drag(
-                                                        SubtitleMonitorDragMode::ResizeCorner { is_top: true, is_left: true },
+                                                        SubtitleMonitorDragMode::ResizeCorner { is_left: true },
                                                         (f32::from(event.position.x), f32::from(event.position.y)),
                                                         box_w,
                                                         cx,
@@ -1142,7 +1251,7 @@ impl MainWindow {
                                                 move |this, event: &MouseDownEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     this.begin_monitor_subtitle_drag(
-                                                        SubtitleMonitorDragMode::ResizeCorner { is_top: true, is_left: false },
+                                                        SubtitleMonitorDragMode::ResizeCorner { is_left: false },
                                                         (f32::from(event.position.x), f32::from(event.position.y)),
                                                         box_w,
                                                         cx,
@@ -1173,7 +1282,7 @@ impl MainWindow {
                                                 move |this, event: &MouseDownEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     this.begin_monitor_subtitle_drag(
-                                                        SubtitleMonitorDragMode::ResizeCorner { is_top: false, is_left: true },
+                                                        SubtitleMonitorDragMode::ResizeCorner { is_left: true },
                                                         (f32::from(event.position.x), f32::from(event.position.y)),
                                                         box_w,
                                                         cx,
@@ -1204,7 +1313,7 @@ impl MainWindow {
                                                 move |this, event: &MouseDownEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     this.begin_monitor_subtitle_drag(
-                                                        SubtitleMonitorDragMode::ResizeCorner { is_top: false, is_left: false },
+                                                        SubtitleMonitorDragMode::ResizeCorner { is_left: false },
                                                         (f32::from(event.position.x), f32::from(event.position.y)),
                                                         box_w,
                                                         cx,
@@ -1278,30 +1387,6 @@ impl MainWindow {
                                         ),
                                 );
 
-                                // 顶部提示胶囊：展示字号、宽度与当前位置
-                                box_container = box_container.child(
-                                    div()
-                                        .id("ppt-info-badge")
-                                        .absolute()
-                                        .bottom_full()
-                                        .mb_1()
-                                        .left_0()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(primitives::tag_tinted(
-                                            format!(
-                                                "字号: {}px | 宽: {}px | X: {:.0}% Y: {:.0}%",
-                                                style.font_size,
-                                                box_w.round() as u32,
-                                                cur_x_pct,
-                                                cur_y_pct,
-                                            ),
-                                            Theme::tint_blue_soft(),
-                                            Theme::tint_blue_border(),
-                                            Theme::accent_blue(),
-                                        )),
-                                );
                             }
 
                             stage = stage.child(box_container);
@@ -2358,12 +2443,19 @@ impl MainWindow {
                                                             |this, cx| {
                                                                 let cur = this.state.config.subtitle_style.max_chars_per_line;
                                                                 this.state.config.subtitle_style.max_chars_per_line = cur.saturating_sub(1).max(4);
+                                                                // 交回给「按字数折行」控制：手动框宽会盖过这个值，
+                                                                // 不清掉的话用户在右侧点步进器会觉得「按了没反应」。
+                                                                this.preview_box_w = None;
+                                                                this.state.config.subtitle_style.preview_box_w = None;
                                                                 this.state.save_subtitle_style();
                                                                 cx.notify();
                                                             },
                                                             |this, cx| {
                                                                 let cur = this.state.config.subtitle_style.max_chars_per_line;
                                                                 this.state.config.subtitle_style.max_chars_per_line = (cur + 1).min(100);
+                                                                // 同上：清掉手动框宽，让字数重新驱动框宽。
+                                                                this.preview_box_w = None;
+                                                                this.state.config.subtitle_style.preview_box_w = None;
                                                                 this.state.save_subtitle_style();
                                                                 cx.notify();
                                                             },
@@ -3869,7 +3961,23 @@ impl MainWindow {
         cx.notify();
     }
 
-    /// 拖拽处理：支持自由移动（带 50% 轴对称磁吸）与手柄缩放（框尺寸与字号联动）
+    /// 拖拽处理：自由移动（带 50% 轴对称磁吸）、四角改字号、左右改单行字数。
+    ///
+    /// # 三种模式都只认横向位移
+    ///
+    /// 竖向拖动不改变任何值。此前四角走的是 `(dx*sign_x + dy*sign_y) * 0.5` 的
+    /// **等比**缩放，上下拖也会改字号，且「框尺寸与字号联动」让用户以为只能在
+    /// 等比与等比之间选（他自己的原话：「为什么拖拽只能是等比例放缩，这不对呀」）。
+    /// 现在改成两个维度各管一件事，且都只吃 dx：
+    ///
+    /// - **四角** → `font_size`（文字高度）
+    /// - **左右** → **框宽**（PPT 式文本框），文字在框内折行
+    ///
+    /// 左右这一路拖的是框宽而不是 `max_chars_per_line`：后者到像素是「一字一档」，
+    /// 66px 字号下一个字就是 66px，而框只有几百 px 宽——拖动量与实际宽度完全脱钩
+    /// （要拖 2000+ px 才少 30 个字），表现就是「拉不动」。改成框宽跟着鼠标走后，
+    /// 再把框宽折算成字数写回 `config.subtitle_style.max_chars_per_line`，
+    /// 右侧面板显示的仍是修改后的值。
     pub(crate) fn handle_monitor_subtitle_drag(
         &mut self,
         mouse_pos: (f32, f32),
@@ -3881,10 +3989,16 @@ impl MainWindow {
             return;
         };
         let dx = mouse_pos.0 - drag.start_mouse.0;
-        let dy = mouse_pos.1 - drag.start_mouse.1;
+
+        // 单字当前在屏幕上的宽度：左右手柄要把横向像素位移换算成「几个字」。
+        // 用**实时**字号换算（用户可能刚拖过四角改了字号），才会与画面上的字一样宽。
+        let video_scale = if fit_h > 0.0 { fit_h / 1080.0 } else { 0.5 };
+        let font_px =
+            (self.state.config.subtitle_style.font_size as f32 * video_scale).clamp(12.0, 96.0);
 
         match drag.mode {
             SubtitleMonitorDragMode::Move => {
+                let dy = mouse_pos.1 - drag.start_mouse.1;
                 let dx_pct = (dx / fit_w.max(1.0)) * 100.0;
                 let dy_pct = (dy / fit_h.max(1.0)) * 100.0;
                 let mut target_x = drag.start_pos_x + dx_pct;
@@ -3916,21 +4030,32 @@ impl MainWindow {
                 self.state.config.subtitle_style.bottom_margin = b_margin;
                 cx.notify();
             }
-            SubtitleMonitorDragMode::ResizeCorner { is_top, is_left } => {
-                let sign_x = if is_left { -1.0 } else { 1.0 };
-                let sign_y = if is_top { -1.0 } else { 1.0 };
-                let delta = (dx * sign_x + dy * sign_y) * 0.5;
-                let scale = ((drag.start_box_w + delta) / drag.start_box_w.max(40.0)).clamp(0.35, 3.5);
-                let new_font_size = ((drag.start_font_size as f32) * scale).round().clamp(16.0, 120.0) as u32;
-                self.state.config.subtitle_style.font_size = new_font_size;
+            SubtitleMonitorDragMode::ResizeCorner { is_left } => {
+                // 四角 → 改**字号**（文字高度）。只吃横向位移：竖向拖动不改任何值。
+                self.state.config.subtitle_style.font_size = font_size_from_horizontal_drag(
+                    drag.start_box_w,
+                    drag.start_font_size,
+                    dx,
+                    is_left,
+                );
                 cx.notify();
             }
             SubtitleMonitorDragMode::ResizeHorizontal { is_left } => {
-                let sign_x = if is_left { -1.0 } else { 1.0 };
-                let delta = dx * sign_x;
-                let scale = ((drag.start_box_w + delta) / drag.start_box_w.max(40.0)).clamp(0.35, 3.5);
-                let new_font_size = ((drag.start_font_size as f32) * scale).round().clamp(16.0, 120.0) as u32;
-                self.state.config.subtitle_style.font_size = new_font_size;
+                // 左右 → 直接定**框宽**（PPT 式文本框）：往外拉更宽，文字就不再折行。
+                //
+                // 为什么不直接拿 max_chars_per_line 当拖拽目标：那个值到像素是
+                // 「一字一档」，本机 66px 字号下一个字就是 66px，而框只有几百 px 宽；
+                // 拖动量与实际宽度完全脱钩（要拖 2000+ px 才少 30 个字），表现就是
+                // 「拉不动」。这里改成框宽跟着鼠标走，再折算成字数写回配置。
+                let new_w = box_width_from_horizontal_drag(
+                    drag.start_box_w,
+                    dx,
+                    is_left,
+                    fit_w - 16.0,
+                );
+                self.preview_box_w = Some(new_w);
+                self.state.config.subtitle_style.max_chars_per_line =
+                    max_chars_for_width(new_w, font_px);
                 cx.notify();
             }
         }
@@ -3941,6 +4066,9 @@ impl MainWindow {
         if self.monitor_subtitle_drag.take().is_some() {
             self.monitor_snap_x = false;
             self.monitor_snap_y = false;
+            // 左右手柄拖出来的框宽一并落盘。`preview_box_w` 正是「用户手定的宽度」
+            // 那个字段（编辑卡的预览条也读它），所以下次启动仍是这个宽度。
+            self.state.config.subtitle_style.preview_box_w = self.preview_box_w;
             self.state.save_subtitle_style();
             cx.notify();
         }
@@ -8147,6 +8275,11 @@ mod tests {
         WordMark, EDITOR_STACK_MONITOR_H, MONITOR_VIDEO_FIT_FRAC, TIMELINE_FULL_DRAW_LIMIT,
         TIMELINE_TRIM_MIN_SECS, TIMELINE_WINDOW_MARGIN_SECS, TIMELINE_ZOOM_MAX, TIMELINE_ZOOM_MIN,
     };
+    // 字幕拖拽的换算函数单独一条 use：并进上面那个大列表会把它撑到换行，
+    // 而 rustfmt 对合并后的顺序有固定要求（见 formatter 检查）。
+    use super::{
+        box_width_from_horizontal_drag, font_size_from_horizontal_drag, max_chars_for_width,
+    };
     use crate::subtitle::segment::WordTiming;
     use crate::subtitle::{ExportMode, GapPlan, Segment};
     use crate::ui::actions::translated_out_count;
@@ -8154,6 +8287,84 @@ mod tests {
     use crate::ui::primitives::should_consume_scroll;
     use crate::ui::theme::Theme;
     use gpui::FontWeight;
+
+    /// 四角手柄：只吃横向位移，左右镜像对称，结果夹在 16..=120。
+    ///
+    /// 「去掉上下的拖拽方向」在纯函数签名里天然成立（根本没有 dy 参数），
+    /// 所以这里改为钉住**对称性**与**夹取**——这两条是手写坐标运算最容易错的地方。
+    #[test]
+    fn corner_drag_scales_font_size_horizontally_only() {
+        // 右手柄往右拉 → 放大
+        let bigger = font_size_from_horizontal_drag(200.0, 48, 40.0, false);
+        assert!(bigger > 48, "右手柄外拉应变大，实际 {bigger}");
+        // 左手柄往左拉（dx 为负）→ 同样放大：符号必须镜像，否则左手柄手感是反的
+        assert_eq!(
+            bigger,
+            font_size_from_horizontal_drag(200.0, 48, -40.0, true),
+            "左右手柄必须镜像对称"
+        );
+        // 反方向 → 缩小
+        assert!(font_size_from_horizontal_drag(200.0, 48, -40.0, false) < 48);
+        // 夹取上限：无论拖多远都不超过 120
+        assert_eq!(
+            font_size_from_horizontal_drag(200.0, 48, 99_999.0, false),
+            120
+        );
+        // 夹取下限：小字号拖到底停在 16（48px 拖到底只到 17，够不到下限）
+        assert_eq!(
+            font_size_from_horizontal_drag(200.0, 32, -99_999.0, false),
+            16
+        );
+    }
+
+    /// 左右手柄灵敏度：拖 100px 只加 100px 宽（不是 200px）。
+    ///
+    /// 这条钉的是**手感**。系数原本是 2.0（拖住的那条边与鼠标 1:1 跟随），
+    /// 用户实测「太灵敏了」；改成 1.0 后边缘以鼠标一半速度移动。
+    /// 谁再改这个值，测试会先红——改动必须是有意的，而不是顺手调数字。
+    #[test]
+    fn side_drag_width_follows_mouse_at_reduced_sensitivity() {
+        // 右手柄往右拖 100px → 宽 +100（而不是 +200）
+        assert_eq!(
+            box_width_from_horizontal_drag(400.0, 100.0, false, 2000.0),
+            500.0
+        );
+        // 左手柄往左拖 100px → 同样 +100（符号必须镜像）
+        assert_eq!(
+            box_width_from_horizontal_drag(400.0, -100.0, true, 2000.0),
+            500.0
+        );
+        // 往内拖 → 变窄
+        assert_eq!(
+            box_width_from_horizontal_drag(400.0, -100.0, false, 2000.0),
+            300.0
+        );
+        // 夹取：不低于 60，不超过可用宽度
+        assert_eq!(
+            box_width_from_horizontal_drag(400.0, -9_999.0, false, 2000.0),
+            60.0
+        );
+        assert_eq!(
+            box_width_from_horizontal_drag(400.0, 9_999.0, false, 900.0),
+            900.0
+        );
+    }
+
+    /// 框宽 → 单行最大字数：右侧面板显示的就是折算后的这个值。
+    ///
+    /// 左右手柄拖的是框宽（跟着鼠标走），配置里存的是字数——这一层换算是两者的桥。
+    /// 算错的表现是「框已经变了，右侧数字没变」，所以把常数与夹取都钉住。
+    #[test]
+    fn box_width_maps_to_char_budget_for_the_side_panel() {
+        // (688 - 28) / 40 = 16.5 → 17 字。两端的 28px 与画面上的框宽公式同一个常数。
+        assert_eq!(max_chars_for_width(688.0, 40.0), 17);
+        // 框窄到只剩内边距：字数为 0，夹到下界
+        assert_eq!(max_chars_for_width(28.0, 40.0), 4);
+        // 夹取上界 100：与右侧步进器同区间，否则面板会显示成步进器给不出的值
+        assert_eq!(max_chars_for_width(99_999.0, 40.0), 100);
+        // font_px 非法（0）时按 1px 兜底，不能除零 panic
+        assert_eq!(max_chars_for_width(1000.0, 0.0), 100);
+    }
 
     /// 回归（P2）：「已全部翻译」的判定必须用**实际译出**口径。
     /// 引擎可能给空串/纯空白译文打上 `translation_lang`（或直接复制原文），

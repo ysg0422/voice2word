@@ -461,7 +461,9 @@ impl MainWindow {
                     let has_dur = self.state.transcribe_duration > 0.0;
                     let cached_opt = self.state.get_cached_transcription();
 
-                    let tier_name = self.state.whisper_model_tier.label();
+                    // 显示真实选中的模型：自备模型要显示自己的文件名，
+                    // 显示成兜底档位名会让用户以为系统换了他的模型。
+                    let tier_name = self.state.selected_model_label();
 
                     // 转写质检摘要 (P1-9)：仅在用户手动展开且「工作区当前载入的字幕就是这张卡片对应的媒体」时展示。
                     // 默认折叠以保持就绪卡片极简清爽、避免信息过载。

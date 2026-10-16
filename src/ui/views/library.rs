@@ -656,7 +656,7 @@ impl MainWindow {
     fn ensure_library_thumbnails(&mut self, demand: &[i64], cx: &mut Context<Self>) {
         // 先收集待派发项（只取 id 与路径），避免在借用 recent_tasks 的同时
         // 修改 library_thumb_inflight，也避免克隆整段字幕数据
-        let mut pending: Vec<(i64, PathBuf)> = self
+        let mut pending: Vec<(i64, PathBuf, f64)> = self
             .state
             .recent_tasks
             .iter()
@@ -664,14 +664,20 @@ impl MainWindow {
                 !self.library_thumbs.contains_key(&t.id)
                     && !self.library_thumb_inflight.contains(&t.id)
             })
-            .map(|t| (t.id, PathBuf::from(&t.file_path)))
+            .map(|t| {
+                (
+                    t.id,
+                    PathBuf::from(&t.file_path),
+                    thumbnail_sample_time(t.duration),
+                )
+            })
             .collect();
 
         // 视口内的卡片排到最前（稳定排序：其余保持列表原序）
         let priority: HashSet<i64> = demand.iter().copied().collect();
-        pending.sort_by_key(|(id, _)| !priority.contains(id));
+        pending.sort_by_key(|(id, _, _)| !priority.contains(id));
 
-        for (task_id, video_path) in pending {
+        for (task_id, video_path, sample_sec) in pending {
             // A render can revisit this method frequently. Bound background
             // ffmpeg work so a large library cannot starve Whisper workers.
             if self.library_thumb_inflight.len() >= MAX_THUMB_WORKERS {
@@ -690,7 +696,7 @@ impl MainWindow {
             cx.spawn(async move |this, cx| {
                 let thumb = cx
                     .background_executor()
-                    .spawn(async move { cache.get_or_extract(&video_path, 0.0, &ffmpeg) })
+                    .spawn(async move { cache.get_or_extract(&video_path, sample_sec, &ffmpeg) })
                     .await;
 
                 let _ = this.update(cx, |this, cx| {
@@ -1165,6 +1171,50 @@ impl MainWindow {
                                 cx.notify();
                             }))
                     }))
+                    // 播放按钮：载入这支片子并**内嵌播放**（画面与字幕都由本应用自绘）。
+                    //
+                    // 与「校对」的区别：校对会把工作区切到这条记录（还会先 flush 当前
+                    // 工程的未落库编辑）；播放只从库里取一份字幕副本喂给播放器，
+                    // **不动当前正在编辑的工程**——用户想「先看一眼效果」时不该被打断。
+                    .child(
+                        primitives::btn_clickable(
+                            "播放",
+                            primitives::BtnSize::Md,
+                            primitives::BtnVariant::Secondary,
+                        )
+                        .id(("lib-play-btn", task_id as usize))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // 点击时才按 id 取完整任务数据（渲染期不再克隆整段字幕）
+                            let Some(shell) = this
+                                .state
+                                .recent_tasks
+                                .iter()
+                                .find(|t| t.id == task_id)
+                                .cloned()
+                            else {
+                                return;
+                            };
+                            let (media, segments, title) = match this
+                                .state
+                                .db
+                                .try_hydrate_task(&shell)
+                            {
+                                Ok(task) => (
+                                    std::path::PathBuf::from(&task.file_path),
+                                    task.segments.clone(),
+                                    task.file_name.clone(),
+                                ),
+                                Err(err) => {
+                                    this.state.status = crate::app::ProcessStatus::Failed(
+                                        format!("读取该记录的字幕失败：{err}"),
+                                    );
+                                    cx.notify();
+                                    return;
+                                }
+                            };
+                            this.open_playback_window(media, segments, title, cx);
+                        })),
+                    )
                     // 剪辑按钮 (主操作)
                     .child(
                         primitives::btn_clickable(
@@ -1357,6 +1407,31 @@ fn library_ext_label(file_name: &str) -> String {
         .to_uppercase()
 }
 
+/// 视频库缩略图的**取样时刻**（秒）。
+///
+/// # 为什么不取 0.0
+///
+/// 0.0 是字面意义的首帧，而大量片子开头是黑场 / 淡入 / 台标，于是缩略图整片黑——
+/// 用户看到一排黑框，完全认不出哪一张是哪一支片子。取片头之后一点点，画面通常
+/// 已经稳定。
+///
+/// 取「时长的 10%」并封顶 `THUMB_SKIP_MAX_SECS`：短片按比例（10 秒的片子取 1 秒），
+/// 长片固定只跳片头一小段——2 小时的片子若按 10% 会跳到第 12 分钟，那里多半已经
+/// 不是「这张封面对应哪一支」的好代表了。
+///
+/// 时长未知（0.0，例如历史记录没写时长）或片子太短时退回 0.0：越过片尾取帧会直接
+/// 失败，那反而连缩略图都没有，比一张黑图更糟。
+fn thumbnail_sample_time(duration_sec: f64) -> f64 {
+    /// 最多跳过片头这么多秒。
+    const THUMB_SKIP_MAX_SECS: f64 = 5.0;
+    /// 短于这个时长就老老实实取首帧（按比例算出来的位置可能已经越过片尾）。
+    const THUMB_SKIP_MIN_DURATION_SECS: f64 = 2.0;
+    if !duration_sec.is_finite() || duration_sec < THUMB_SKIP_MIN_DURATION_SECS {
+        return 0.0;
+    }
+    (duration_sec * 0.10).min(THUMB_SKIP_MAX_SECS)
+}
+
 /// 视频库缩略图**解码结果**的内存上限（张）。
 ///
 /// 卡片改走自解码的 `RenderImage` 之前，GPUI 的资产缓存（`App::fetch_asset`）只增
@@ -1525,11 +1600,31 @@ fn thumb_demand_slice(len: usize, top: usize, bottom: usize, margin: usize) -> R
 mod tests {
     use super::{
         export_spec_for, format_file_size, library_ext_label, library_ordered_tasks,
-        library_sample_preview, library_task_index, thumb_demand_slice, ThumbImageLru,
-        LIBRARY_THUMB_IMAGE_CAP,
+        library_sample_preview, library_task_index, thumb_demand_slice, thumbnail_sample_time,
+        ThumbImageLru, LIBRARY_THUMB_IMAGE_CAP,
     };
     use crate::storage::TaskRecord;
     use std::collections::HashSet;
+
+    /// 缩略图取样时刻：跳过片头黑场，但短片与时长未知时退回首帧。
+    ///
+    /// 这条守的是「视频库一排黑框」的回归。三种边界都要照顾到：按比例取样、
+    /// 长片封顶、以及「跳过头会越过片尾反而没图」的短片兜底。
+    #[test]
+    fn thumbnail_sample_skips_intro_without_overshooting_short_clips() {
+        // 时长未知 / 非法 → 老老实实取首帧
+        assert_eq!(thumbnail_sample_time(0.0), 0.0);
+        assert_eq!(thumbnail_sample_time(-3.0), 0.0);
+        assert_eq!(thumbnail_sample_time(f64::NAN), 0.0);
+        // 太短：按 10% 算出来的位置可能已经越过片尾，取首帧
+        assert_eq!(thumbnail_sample_time(1.5), 0.0);
+        // 短片按比例：10 秒 → 1 秒
+        assert_eq!(thumbnail_sample_time(10.0), 1.0);
+        // 长片封顶 5 秒：2 小时不会跳到第 12 分钟
+        assert_eq!(thumbnail_sample_time(7_200.0), 5.0);
+        // 封顶之前仍是比例增长
+        assert_eq!(thumbnail_sample_time(20.0), 2.0);
+    }
 
     /// 兜底需求必须把「尚未解码」的卡片接上（句柄失灵时首屏外全不解码的回归）。
     ///

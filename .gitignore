@@ -62,6 +62,7 @@ compile_output.txt
 .claudeignore
 .cursorignore
 .cursorindexingignore
+.dsh-reading/
 
 # Windows OS generated
 Thumbs.db

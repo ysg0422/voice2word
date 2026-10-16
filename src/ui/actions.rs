@@ -744,7 +744,7 @@ impl MainWindow {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.display().to_string());
-                self.state.download_status_msg = format!("已删除 {name}，可重新下载");
+                self.state.download_status_msg = format!("已删除 {name}");
                 // 删完立刻重扫就位状态：徽标要从「已就位」翻回「下载」，
                 // 否则用户会以为没删掉（卡片还显示已就位）。重扫对声明了 sha256
                 // 的条目会全文件哈希（同样是长任务），走专用线程。
@@ -1162,18 +1162,7 @@ impl MainWindow {
     /// 打开已下载的新版文件所在文件夹
     pub(crate) fn open_downloaded_update(&mut self, _cx: &mut Context<Self>) {
         if let Some(path) = &self.state.update_downloaded_path {
-            #[cfg(target_os = "windows")]
-            {
-                let _ = std::process::Command::new("explorer")
-                    .arg(format!("/select,{}", path.display()))
-                    .spawn();
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                if let Some(p) = path.parent() {
-                    let _ = open::that(p);
-                }
-            }
+            Self::reveal_path_in_explorer(path);
         }
     }
 
@@ -1296,25 +1285,53 @@ impl MainWindow {
         .detach();
     }
 
+    /// 在系统资源管理器中定位文件并选中；若为目录或文件不存在则打开所在目录。
+    ///
+    /// # Windows 下的特殊处理
+    /// Windows Explorer 的 `/select,<path>` 命令行对斜杠非常敏感：如果路径中含有正斜杠 `/`
+    /// 或被整体引号包裹，Explorer 会解析失败并默认回退打开「我的文档」或「此电脑」。
+    /// 此处将路径统一转为 Windows 原生反斜杠 `\`，并使用 `raw_arg` 传递 `/select,"<path>"`。
+    pub(crate) fn reveal_path_in_explorer(path: &Path) {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            let mut cmd = std::process::Command::new("explorer");
+            if path.is_file() {
+                let norm = path.to_string_lossy().replace('/', "\\");
+                cmd.raw_arg(format!("/select,\"{norm}\""));
+            } else {
+                let target_dir = if path.is_dir() {
+                    path.to_path_buf()
+                } else {
+                    path.parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| crate::utils::AppConfig::resolve_path("."))
+                };
+                let _ = std::fs::create_dir_all(&target_dir);
+                let norm = target_dir.to_string_lossy().replace('/', "\\");
+                cmd.raw_arg(format!("\"{norm}\""));
+            }
+            let _ = cmd.spawn();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let target = if path.is_file() {
+                path.parent().unwrap_or(path)
+            } else {
+                path
+            };
+            let _ = std::fs::create_dir_all(target);
+            let _ = open::that(target);
+        }
+    }
+
     pub(crate) fn open_models_dir(&mut self, cx: &mut Context<Self>) {
         let dir = crate::utils::AppConfig::resolve_path("models");
-        // 全新解压的瘦包里 `models/` 可能还没建：先建出来，否则资源管理器会报
-        // 「找不到路径」——那看起来像程序出错了，而用户只是还没下过东西。
-        let dir = if dir.is_dir() {
-            dir
-        } else {
-            let _ = std::fs::create_dir_all(&dir);
-            dir
-        };
-        let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+        Self::reveal_path_in_explorer(&dir);
         cx.notify();
     }
 
-    /// 在资源管理器里定位某个可下载组件的文件（找不到就退到它所在目录）。
-    ///
-    /// 用 `explorer /select,<path>`：Windows 的资源管理器会打开父目录并**选中**该
-    /// 文件，比只开目录再让用户自己找友好得多。文件不存在时 `/select` 会静默失败，
-    /// 因此先判断存在性，不存在就退成打开目录。
+    /// 在资源管理器里定位某个可下载组件的文件（找不到就退到它所在目录或软件安装根目录）。
     pub(crate) fn reveal_model_file(&mut self, item_id: &str, cx: &mut Context<Self>) {
         let Some(item) = crate::utils::model_download::item_by_id(item_id) else {
             self.state.download_status_msg = format!("未知组件：{item_id}");
@@ -1322,19 +1339,7 @@ impl MainWindow {
             return;
         };
         let path = crate::utils::model_download::item_effective_path(item, &self.state.config);
-        let (dir, select) = if path.is_file() {
-            (path.parent().map(|p| p.to_path_buf()), Some(path))
-        } else {
-            (Some(crate::utils::AppConfig::resolve_path(".")), None)
-        };
-        let Some(dir) = dir else { return };
-        let _ = std::fs::create_dir_all(&dir);
-        let mut cmd = std::process::Command::new("explorer");
-        match select {
-            Some(p) => cmd.arg(format!("/select,{}", p.display())),
-            None => cmd.arg(&dir),
-        };
-        let _ = cmd.spawn();
+        Self::reveal_path_in_explorer(&path);
         cx.notify();
     }
 
@@ -2205,11 +2210,14 @@ impl MainWindow {
         // 两者在正常情形下同结论，但用户把 `paths.whisper_model` 指到一个**非档位
         // 命名**的自备模型时，`model_is_present` 会因「名字对不上任何档位」判为缺失，
         // 而管线其实跑得起来——用实际路径判定就不会误拦。
-        let will_load = crate::utils::AppConfig::resolve_path(&tier.model_relative_path());
+        // 判据取**当前选中的那个文件**（`selected_model_path`），而不是
+        // 「档位 → 内置路径」——后者会让用户自备的模型（配置里指向任意文件）
+        // 被误判为「内置档位没下」，明明能跑却被拦下。
+        let will_load = self.state.selected_model_path.clone();
         if !will_load.is_file() {
             return Some(format!(
-                "{} 模型未就位：请在「性能设置 → Whisper 模型档位」点「下载」，或改选已就位的档位",
-                tier.label()
+                "{} 模型未就位：请在「性能设置 → 模型与组件」下载，或在右侧「识别引擎」卡里改选一个已就位的模型",
+                self.state.selected_model_label()
             ));
         }
 
@@ -2323,11 +2331,11 @@ impl MainWindow {
         let threads = Some(self.state.whisper_threads);
 
         // 根据档位计算运行时模型路径覆盖（绝对路径）
-        let model_override = {
-            let rel = self.state.whisper_model_tier.model_relative_path();
-            let abs = crate::utils::AppConfig::resolve_path(&rel);
-            Some(abs)
-        };
+        // 运行时模型路径 = 用户选中的那个文件。这里**必须**是 selected_model_path
+        // 而不是「档位 → 内置路径」：后者会让 config.toml 里指定的自备模型永远
+        // 不被加载（README 承诺「文件名可在 config.toml 中修改」），而且界面与
+        // 命令行会各自跑不同的模型。
+        let model_override = Some(self.state.selected_model_path.clone());
         let rescue_logprob = self.state.config.pipeline.whisper_rescue_logprob;
         // 音频前端预处理：把配置里的开关映射成管线参数。默认全开——
         // 它改的是「喂给模型的音频量」，是唯一还有量级空间的提速方向。
@@ -2551,9 +2559,9 @@ impl MainWindow {
                                     //    新 id 要等这份结果在回写时确认仍属于当前文档才登记。
                                     //    写库失败不能静默：否则这条转写结果不会出现在历史库里，
                                     //    后续「保存字幕」也会因 active_task_id 为空而无处可写。
-                                    if let Some(path) = file_path {
+                                    if let Some(path) = file_path.as_ref() {
                                         this.state.selected_file = Some(path.clone());
-                                        this.state.preview_source = Some(path);
+                                        this.state.preview_source = Some(path.clone());
                                     }
                                     this.state.segments = segments;
                                     // 登记 `active_task_id` 要用的 id 此刻还在后台，先记下这份
@@ -2653,6 +2661,19 @@ impl MainWindow {
                                         // 波形，纯属白烧解码。
                                         this.state.finish_active_queue_item(Ok(seg_count));
                                     } else {
+                                        // 单文件入口跑的可能正是**队列里的某一条**：用户点了
+                                        // 队列卡片（select_queue_item 会把这个文件设为
+                                        // transcribe_file）再按「开始转写」，走的就是这条路。
+                                        //
+                                        // 这里必须补一次结算：in_batch 为假意味着
+                                        // finish_active_queue_item 不会被调用，那条队列项就会
+                                        // 永远停在「等待中」；而入队时已按 pending 落盘，
+                                        // 于是每次重启它都再冒出来——用户看到的现象是
+                                        // 「明明转写完了，队列里总挂着一条待转写」。
+                                        if let Some(done_path) = file_path.as_deref() {
+                                            this.state
+                                                .settle_queue_item_by_path(done_path, seg_count);
+                                        }
                                         this.ensure_waveform(cx);
 
                                         // 5. 弹出全屏转写完成提醒弹窗 (包含性能基准看板)
@@ -2953,80 +2974,34 @@ impl MainWindow {
         );
     }
 
-    /// 使用 FFplay 播放当前视频，并通过 subtitles 滤镜叠加已生成字幕。
+    /// 播放当前工作区的媒体，**画面与字幕都由本应用自绘**。
+    ///
+    /// # 为什么不再外挂 ffplay
+    ///
+    /// 此前这条路是起一个 `ffplay.exe -vf subtitles=...` 进程：它会额外弹一个控制台
+    /// 窗口，而且字幕是靠滤镜**重新渲染一遍**——与画面上的样式未必一致，用户看到的
+    /// 是「另一个东西在放」。剪辑台的监视器本来就按 `subtitle_style` 自绘字幕
+    /// （见 `render_monitor_picture` 与舞台上的字幕框），那份才与导出同源。
+    ///
+    /// 内嵌播放器画在剪辑台的监视器上，所以这里必须先切到剪辑台：本按钮挂在底部
+    /// 状态栏（只在语音转写页存在），不切页的话用户点了播放却看不到任何东西，
+    /// 表现就是「点了没反应」——这正是它当初被做成独立 ffplay 窗口的原因。
     pub(crate) fn play_video(&mut self, cx: &mut Context<Self>) {
-        let Some(input_file) = self.state.selected_file.clone() else {
+        if self.state.preview_media().is_none() {
+            self.state.status = ProcessStatus::Failed("请先载入视频，再播放预览".to_string());
+            cx.notify();
             return;
-        };
+        }
         if self.state.segments.is_empty() {
             self.state.status = ProcessStatus::Failed("请先完成字幕识别，再播放预览".to_string());
             cx.notify();
             return;
         }
-        self.state.flush_segments_if_dirty();
-
-        let subtitle_path =
-            std::env::temp_dir().join(format!("voice2word_preview_{}.srt", std::process::id()));
-        // 复用同一临时文件名，写新前先清旧，避免历次预览 SRT 在 temp 无限累积
-        let _ = std::fs::remove_file(&subtitle_path);
-        // FFplay 弹窗预览与主界面/导出同源：按当前导出内容模式生成预览字幕。
-        let preview_mode = self.editor_export_mode;
-        // 预览与最终导出同源：带上配置里的字幕样式，按 `max_chars_per_line` 折行。
-        // ffplay 的 `subtitles` 滤镜按 SRT 规范渲染多行 cue，折行对它是**正向**的
-        // （预览看到的分行就是导出得到的分行）；不折反而会让「预览正常、导出超屏」。
-        let preview_style = self.state.config.subtitle_style.clone();
-        if let Err(error) = SubtitleWriter::write_srt_with_style(
-            &self.state.segments,
-            &subtitle_path,
-            preview_mode,
-            &preview_style,
-        ) {
-            self.state.status = ProcessStatus::Failed(format!("生成预览字幕失败：{}", error));
-            cx.notify();
-            return;
+        self.state.active_tab = WorkspaceTab::Editor;
+        if !self.state.is_playing {
+            self.toggle_play_preview(cx);
         }
-
-        let ffmpeg_path = crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
-        let ffplay_path = ffmpeg_path.with_file_name("ffplay.exe");
-        // Run ffplay from the temp directory and pass only the SRT filename.
-        // This avoids Windows drive-letter colons being parsed as filter options.
-        let subtitle_name = subtitle_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("voice2word_preview.srt");
-        let cur_time = format!("{:.3}", self.state.current_time);
-        // 预览播放器是「发起后没人 wait」的短命进程：句柄一丢就成孤儿进程，
-        // 而 `-autoexit` 只在「正常播完」时生效——用户在播放中关窗、或反复点预览，
-        // 都会在系统里留下没人回收的 ffplay.exe（占着视频文件句柄与音频设备）。
-        // 因此：先收掉上一次预览（避免堆积），再把新进程登记到全局表，
-        // 由 main.rs 在应用退出时统一 kill + wait。
-        crate::utils::child_registry::retire_all();
-        match std::process::Command::new(ffplay_path)
-            .arg("-ss")
-            .arg(&cur_time)
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-window_title")
-            .arg("Voice2Word 视频字幕预览")
-            .arg("-vf")
-            .arg(format!("subtitles=filename='{subtitle_name}'"))
-            .arg("-autoexit")
-            .arg(input_file)
-            .current_dir(std::env::temp_dir())
-            .spawn()
-        {
-            Ok(child) => {
-                // 先并入全局作业对象，再登记：这样「本进程被强杀」时 ffplay 也会
-                // 被系统一并清掉，而不仅是靠退出路径里的 retire_all。
-                crate::utils::child_registry::adopt(&child);
-                crate::utils::child_registry::register(child);
-                info!("已启动带字幕视频预览");
-            }
-            Err(error) => {
-                self.state.status = ProcessStatus::Failed(format!("启动视频预览失败：{}", error));
-                cx.notify();
-            }
-        }
+        cx.notify();
     }
 
     /// 请求终止当前转写任务：标记取消并强杀识别子进程。
@@ -4825,21 +4800,38 @@ impl MainWindow {
         cx.notify();
         self.start_model_download(id, cx);
     }
-    /// 一键补齐所有**缺失**的条目（按体积从小到大，先让用户看到进展）。
-    pub(crate) fn download_all_missing(&mut self, cx: &mut Context<Self>) {
+    /// 一键补齐某个分块里**缺失且必需**的条目（按体积从小到大，先让用户看到进展）。
+    ///
+    /// `block` 由调用方（块头那个按钮）传入：三块同页铺开之后，「下什么」不再由
+    /// 全局的「当前专区」决定，而是由用户点的那一块决定。
+    pub(crate) fn download_all_missing(
+        &mut self,
+        block: crate::ui::ModelManagerTab,
+        cx: &mut Context<Self>,
+    ) {
         if self.state.is_downloading {
             return;
         }
-        let current_tab = self.model_manager_tab;
+        let current_tab = block;
+        // 只下**当前配置下真正必需**的组件（见 model_manager::is_item_required_now）。
+        //
+        // 这里刻意不用 is_item_needed_for_tab：那个函数回答的是「列表里显不显示」，
+        // 模型库现在全系列出，用它会把 6 个可选档位（合计约 5 GB）一起排队下载——
+        // 用户点「补齐所需」的本意是「把跑不起来的补齐」，不是「把整个模型库下满」。
         let mut pending: Vec<&'static crate::utils::DownloadItem> = crate::utils::ITEMS
             .iter()
             .filter(|i| !self.state.model_is_present(i.id))
+            // 先收窄到用户点的那一块：三块同页之后，每个块头的按钮只该下自己那块
+            // 的东西，否则点「公用组件」的头会把 Whisper 模型也排进队列。
             .filter(|i| {
                 crate::ui::components::model_manager::is_item_needed_for_tab(
                     i.id,
                     current_tab,
                     &self.state,
                 )
+            })
+            .filter(|i| {
+                crate::ui::components::model_manager::is_item_required_now(i.id, &self.state)
             })
             .collect();
         // 小文件先下：几十 MB 的 VAD/tokens 几秒就完，用户立刻看到进展；
