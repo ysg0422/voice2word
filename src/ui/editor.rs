@@ -3357,6 +3357,10 @@ impl MainWindow {
                                                 let speaker_label = seg.speaker_label();
                                                 let glossary_flagged = glossary_bad.contains(&seg_idx);
                                                 let low_conf_flagged = low_conf.contains(&seg_idx);
+                                                // 选句翻译模式：整行点击 = 勾选/取消勾选，
+                                                // 不再走「选中 + 跳播」那条路径。
+                                                let picked =
+                                                    this.state.is_translate_picked(seg_idx as i64);
 
                                                 div()
                                                     .id(("table-row-seg", seg_idx))
@@ -3368,7 +3372,9 @@ impl MainWindow {
                                                     .border_color(Theme::border_subtle())
                                                     .cursor_pointer()
                                                     .relative()
-                                                    .bg(if is_selected {
+                                                    .bg(if picked {
+                                                        Theme::tint_mint_badge()
+                                                    } else if is_selected {
                                                         Theme::tint_mint_soft()
                                                     } else if glossary_flagged {
                                                         Theme::tint_warn_soft()
@@ -3377,8 +3383,15 @@ impl MainWindow {
                                                     } else {
                                                         Theme::transparent()
                                                     })
-                                                    .hover(|s| s.bg(if is_selected { Theme::tint_mint_badge() } else { Theme::bg_hover() }))
+                                                    .hover(|s| s.bg(if picked || is_selected { Theme::tint_mint_badge() } else { Theme::bg_hover() }))
                                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                                        // 选句模式：只切换勾选，不动播放位置。
+                                                        if this.state.is_picking_translate() {
+                                                            this.state
+                                                                .toggle_translate_pick_one(seg_idx as i64);
+                                                            cx.notify();
+                                                            return;
+                                                        }
                                                         // 点击某行 = 跳播到该句起点。先停掉正在进行的实时播放：
                                                         // 否则播放时钟会在下一帧把 current_time 拉回旧位置、音频也
                                                         // 继续从旧处播放，点击等于没生效（与键盘「上/下句」
@@ -5705,36 +5718,98 @@ impl MainWindow {
                     }),
             );
 
-        // 目标语言：8 个常用语种，窄面板下自动折行
+        // 目标语言：改成**下拉框**（原来是一排 8 个胶囊，窄面板下会把整行挤成两行，
+        // 而且看不出「默认选中的是哪个」）。默认选中项由文档装载时按视频语言设置。
+        let lang_open = self.translate_lang_open;
+        let video_lang = crate::app::state::source_language_label(&self.state.segments);
         let lang_row = div()
             .flex()
-            .items_center()
-            .flex_wrap()
+            .flex_col()
             .gap_1()
             .child(
                 div()
-                    .flex_shrink_0()
-                    .w(px(Theme::FORM_LABEL_W))
-                    .text_size(px(Theme::TEXT_SMALL))
-                    .text_color(Theme::text_secondary())
-                    .child("目标语言"),
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(Theme::FORM_LABEL_W))
+                            .text_size(px(Theme::TEXT_SMALL))
+                            .text_color(Theme::text_secondary())
+                            .child("翻译语言"),
+                    )
+                    .child(
+                        div()
+                            .id("translate-lang-dropdown")
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(Theme::bg_raised())
+                            .border_1()
+                            .border_color(if lang_open {
+                                Theme::accent_mint()
+                            } else {
+                                Theme::border()
+                            })
+                            .cursor_pointer()
+                            .text_size(px(Theme::TEXT_SMALL))
+                            .text_color(Theme::text_primary())
+                            .child(target.clone())
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_muted())
+                                    .child(if lang_open { "▴" } else { "▾" }),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.translate_lang_open = !this.translate_lang_open;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child(match video_lang {
+                                Some(v) => format!("视频语言：{v}"),
+                                None => "视频语言：未识别".to_string(),
+                            }),
+                    ),
             )
-            .children(TRANSLATE_TARGET_LANGS.iter().enumerate().map(|(i, lang)| {
-                let is_sel = target == *lang;
-                let lang_owned = lang.to_string();
-                Self::render_choice_pill(
-                    ("translate-lang", i),
-                    lang,
-                    is_sel,
-                    cx,
-                    move |this, cx| {
-                        // 走 setter 而非直接赋值：目标语言是长期偏好，必须落盘，
-                        // 否则重启后跳回默认语言，用户会以为选择没生效。
-                        this.state.set_translate_target_lang(&lang_owned);
-                        cx.notify();
-                    },
+            // 展开时才渲染语言列表：不展开就一行都不建，翻译卡在长清单滚动时更轻。
+            .when(lang_open, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_1()
+                        .pl(px(Theme::FORM_LABEL_W))
+                        .children(TRANSLATE_TARGET_LANGS.iter().enumerate().map(|(i, lang)| {
+                            let is_sel = target.as_str() == *lang;
+                            let lang_owned = lang.to_string();
+                            Self::render_choice_pill(
+                                ("translate-lang", i),
+                                lang,
+                                is_sel,
+                                cx,
+                                move |this, cx| {
+                                    // 走 setter 而非直接赋值：目标语言是长期偏好，必须落盘，
+                                    // 否则重启后跳回默认语言，用户会以为选择没生效。
+                                    this.state.set_translate_target_lang(&lang_owned);
+                                    // 选完即收起，少一次点击。
+                                    this.translate_lang_open = false;
+                                    cx.notify();
+                                },
+                            )
+                        })),
                 )
-            }));
+            });
 
         let action_row = div()
             .flex()
@@ -5761,6 +5836,36 @@ impl MainWindow {
                 .into_any_element()
             } else {
                 div().into_any_element()
+            })
+            // 选句翻译：开启后下方字幕清单进入勾选态，点句子即高亮，
+            // 「开始翻译」只发送勾中的那几句（在线接口按 token 计费，重译整片很贵）。
+            .child({
+                let picking = self.state.is_picking_translate();
+                let picked_n = self.state.translate_pick_count();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        primitives::btn_clickable(
+                            if picking { "取消选句" } else { "选句翻译" },
+                            primitives::BtnSize::Sm,
+                            primitives::BtnVariant::Secondary,
+                        )
+                        .id("btn-translate-pick")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state.toggle_translate_pick();
+                            cx.notify();
+                        })),
+                    )
+                    .when(picking, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(Theme::accent_mint())
+                                .child(format!("已选 {picked_n} 句")),
+                        )
+                    })
             })
             .child(
                 div()

@@ -819,11 +819,16 @@ fn retry_missing_online(
     let mut recovered = 0usize;
     let mut todo: Vec<usize> = missing.to_vec();
     let mut guard = 0;
+    // 「请求成功、但解析后压根没有这一句」的句子：单句裸译兜底只服务这一类。
+    // 校验判为复制/扩写的句子不算——那是模型给出了内容、只是不合格，改用另一种
+    // 协议去追问，只会把「复制原文」洗成一条看起来合法的错误译文。
+    let mut no_text: Vec<usize> = Vec::new();
     while !todo.is_empty() && guard < 8 {
         guard += 1;
         if cancel.load(Ordering::Relaxed) {
             break;
         }
+        no_text.clear();
         let half = todo.len().div_ceil(2);
         let mut still: Vec<usize> = Vec::new();
         for sub in todo.chunks(half) {
@@ -855,6 +860,7 @@ fn retry_missing_online(
                             }
                         } else {
                             still.push(pos);
+                            no_text.push(pos);
                         }
                     }
                 }
@@ -878,7 +884,179 @@ fn retry_missing_online(
         }
         todo = still;
     }
+
+    // 折半到单句仍然一条都拿不到：编号协议本身就失灵了（推理模型把预算花在思考上、
+    // 或只回一句「以下是翻译：…」），再折半只会永远 0。日志里「0/4 条，折半重试后
+    // 补回 0 条」正是这种死法——用户看到的是「未能译出任何一句」，而实际只差这几句。
+    // 兜底改成「裸译」协议：不带序号，只让模型输出译文本身，几乎必然能拿到文本。
+    if !no_text.is_empty() {
+        warn!(
+            remaining = no_text.len(),
+            "在线翻译：编号协议对这 {} 句反复拿不到任何译文，改用单句裸译兜底",
+            no_text.len()
+        );
+    }
+    for pos in no_text {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        match request_bare_translation(cfg, &segments[pos], target_lang, profile) {
+            Ok(text) => {
+                // 与主路径同一条校验：裸译同样可能把原文吐回来（Echo）或扩写。
+                if validate_translation(&segments[pos].translate_source(), &text)
+                    == RewriteVerdict::Ok
+                {
+                    segments[pos].translation = Some(text);
+                    segments[pos].translation_lang = Some(target_lang.to_string());
+                    recovered += 1;
+                } else {
+                    debug!(
+                        index = segments[pos].index,
+                        "单句裸译结果未通过输出校验，保持未译"
+                    );
+                }
+            }
+            Err(err) => {
+                // 必须记进 last_error：整片一句都没译出时，收尾文案要能说出真实原因。
+                *last_error = Some(err.to_string());
+                debug!(index = segments[pos].index, error = %err, "单句裸译兜底失败");
+            }
+        }
+    }
     recovered
+}
+
+/// 单句「裸译」兜底：不带序号协议，只要求模型直接输出译文本身。
+///
+/// 为什么需要它：编号协议（`[n] 原文` → `[n] 译文`）在成批请求时最省 token，但退化到
+/// 单句时反而容易失灵——模型可能只回「以下是翻译：xxx」或整段思考，按 `[n]` 切分的
+/// 解析器就一条都拿不到。用户日志里的「本批输出不完整（0/4 条，折半重试后补回 0 条）」
+/// 正是这个死法：折到单句仍然 0，于是整片只差几句却报「未能译出任何一句」。
+fn request_bare_translation(
+    cfg: &OnlineApiConfig,
+    seg: &Segment,
+    target_lang: &str,
+    profile: &ModelProfile,
+) -> Result<String> {
+    let src_hint = crate::subtitle::dominant_language(std::iter::once(seg))
+        .map(|code| format!("源语言为{}；", crate::subtitle::language_name(&code)))
+        .unwrap_or_default();
+    let mut payload = serde_json::json!({
+        "model": cfg.model,
+        "messages": [
+            {
+                "role": "system",
+                "content": format!(
+                    "你是专业影视字幕翻译专家。{src_hint}{glossary}把用户给出的这一条字幕翻译为地道的{target_lang}。\
+    【输出格式规范】只输出译文本身：不要序号、不要引号、不要代码块标记、不要原文、不要任何前缀或解释。",
+                    glossary = cfg.glossary_hint
+                )
+            },
+            { "role": "user", "content": seg.translate_source() }
+        ],
+        "temperature": 0.2,
+        "max_tokens": if profile.is_reasoning() {
+            512 + REASONING_THINKING_TOKENS
+        } else {
+            512
+        },
+        "stream": false,
+    });
+    if !supports_temperature(&cfg.model) {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("temperature");
+        }
+    }
+    let value = post_chat_completions(cfg, &payload)?;
+    let content = extract_message_content(&value).unwrap_or_default();
+    let text = clean_bare_translation(&content);
+    if text.is_empty() {
+        return Err(anyhow!("在线接口返回了空内容（单句裸译兜底）"));
+    }
+    Ok(text)
+}
+
+/// 从「裸译」响应里抠出真正的译文：模型即使被要求「只输出译文」，仍可能加引号、
+/// 加「译文：」前缀、套 ``` 围栏，或习惯性带上 `[n]` 序号。
+fn clean_bare_translation(raw: &str) -> String {
+    let mut t = raw.trim().to_string();
+    if t.starts_with("```") {
+        t = t
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string();
+    }
+    // 只取第一行：裸译只问了一句，模型若习惯性把整批又搬回来，多行拼起来会变成
+    // 一句又臭又长的「假译文」，而输出校验对「包含原文的更长文本」未必拦得住。
+    t = t.lines().next().unwrap_or("").trim().to_string();
+    for prefix in [
+        "译文：",
+        "译文:",
+        "翻译：",
+        "翻译:",
+        "Translation:",
+        "translation:",
+    ] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            t = rest.trim().to_string();
+            break;
+        }
+    }
+    for (open, close) in [('"', '"'), ('「', '」'), ('“', '”'), ('\'', '\'')] {
+        let chars: Vec<char> = t.chars().collect();
+        if chars.len() > 1 && chars[0] == open && chars[chars.len() - 1] == close {
+            t = chars[1..chars.len() - 1]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string();
+            break;
+        }
+    }
+    // 习惯性残留的 `[3] 译文`：剥掉序号，别把序号写进字幕。
+    t = strip_leading_index(&t);
+    // 行内还嵌着 `[2]`、`[3]` 这类序号时，说明模型仍在按批回复：截断到第一个序号前，
+    // 否则当前这句会拿到「第一句 + 后面所有句」的拼接结果。
+    if let Some(cut) = first_embedded_index(&t) {
+        t = t[..cut].trim().to_string();
+    }
+    t.replace(['\r', '\n'], " ").trim().to_string()
+}
+
+/// 去掉开头的 `[12] ` / `【12】` 序号。
+fn strip_leading_index(t: &str) -> String {
+    let s = t.trim_start();
+    for (open, close) in [('[', ']'), ('【', '】')] {
+        if let Some(rest) = s.strip_prefix(open) {
+            if let Some(end) = rest.find(close) {
+                let num = &rest[..end];
+                if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                    return rest[end + close.len_utf8()..].trim().to_string();
+                }
+            }
+        }
+    }
+    s.trim().to_string()
+}
+
+/// 找出文本里第一个**不是开头**的 `[数字]` 序号，返回它的字节位置。
+fn first_embedded_index(t: &str) -> Option<usize> {
+    let bytes = t.as_bytes();
+    for (i, _) in t.char_indices().skip(1) {
+        if bytes[i] != b'[' {
+            continue;
+        }
+        if let Some(end) = t[i + 1..].find(']') {
+            let num = &t[i + 1..i + 1 + end];
+            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
 /// 单批重试上限。选 3 而不是更多：429 限流通常需要数秒才恢复，再多轮也是空转，
@@ -2267,6 +2445,123 @@ mod tests {
             2,
             "应为「首次 + 一次反思」共两次请求"
         );
+    }
+
+    /// 回归（用户实测「一点击翻译就显示完成」）：源文是**日语**、目标语言是简体中文时，
+    /// 绝不能落进 `is_source_chinese` → zhconv 字面转换的短路分支。
+    ///
+    /// 那条分支对假名毫无反应，会把日语原文原封不动吐回来并在 0 毫秒内报完成——
+    /// 界面显示「翻译完成（N 句）」、字幕一个字符都没变。这里用真实 mock 服务器
+    /// 钉住三个断言：**真的发出了 HTTP 请求**、译文是接口返回的中文、语言标记正确。
+    #[test]
+    fn japanese_source_to_chinese_hits_the_api_instead_of_zhconv_shortcut() {
+        let reply = serde_json::json!({
+            "choices": [{ "message": { "content": "[1] 概率不等式。\n[2] 下面开始学习。" } }]
+        })
+        .to_string();
+        let (addr, seen) = spawn_mock_server(vec![reply]);
+        let engine = TranslateEngine::online(online_cfg_for(&addr));
+
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "確率不等式です。"),
+            Segment::new(2, 1.0, 2.0, "これから勉強します。"),
+        ];
+        assert!(
+            !crate::subtitle::is_source_chinese(&segs),
+            "含假名的日语源文不应被判为中文，否则会短路到 zhconv"
+        );
+
+        let out = engine
+            .translate_subtitles(segs, "简体中文", None, Arc::new(AtomicBool::new(false)))
+            .expect("日语 → 简体中文 必须走在线接口并成功");
+
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "必须真的向接口发请求；0 次说明又被 zhconv 短路成了假完成"
+        );
+        assert_eq!(out[0].translation.as_deref(), Some("概率不等式。"));
+        assert_eq!(out[1].translation.as_deref(), Some("下面开始学习。"));
+        assert_eq!(out[0].translation_lang.as_deref(), Some("简体中文"));
+        // 译文里不能残留日语句尾（等于「原文被原样复制」）
+        assert!(
+            !out[0].translation.as_deref().unwrap().contains("です"),
+            "译文不得原样复制日语原文"
+        );
+    }
+
+    /// 回归（用户日志 10:13:18「未能译出任何一句（共 4 句待译）」）：整片只剩几句时，
+    /// 编号协议回回解析不出任何一行，折半到单句仍是 0 → 整片报错。裸译兜底必须救回。
+    #[test]
+    fn bare_fallback_revives_sentences_the_numbered_protocol_cannot_parse() {
+        // 前 3 次（主批 + 折半两批）都回「没有序号」的胡话；之后单句兜底返回纯译文。
+        let mut replies: Vec<String> = (0..3)
+            .map(|_| {
+                serde_json::json!({
+                    "choices": [{ "message": { "content": "好的，我来翻译这几句。" } }]
+                })
+                .to_string()
+            })
+            .collect();
+        for text in ["第一句译文。", "第二句译文。", "第三句译文。", "第四句译文。"] {
+            replies.push(
+                serde_json::json!({
+                    "choices": [{ "message": { "content": text } }]
+                })
+                .to_string(),
+            );
+        }
+        let (addr, seen) = spawn_mock_server(replies);
+        let cfg = online_cfg_for(&addr);
+
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "第一句话。"),
+            Segment::new(2, 1.0, 2.0, "第二句话。"),
+            Segment::new(3, 2.0, 3.0, "第三句话。"),
+            Segment::new(4, 3.0, 4.0, "第四句话。"),
+        ];
+        let out = translate_via_online_api(
+            &cfg,
+            segs,
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("裸译兜底之后不应再报「一句都没译出」");
+
+        assert_eq!(out[0].translation.as_deref(), Some("第一句译文。"));
+        assert_eq!(out[1].translation.as_deref(), Some("第二句译文。"));
+        assert_eq!(out[2].translation.as_deref(), Some("第三句译文。"));
+        assert_eq!(out[3].translation.as_deref(), Some("第四句译文。"));
+        assert_eq!(out[3].translation_lang.as_deref(), Some("English"));
+        assert!(
+            seen.lock().unwrap().len() > 3,
+            "必须真的发出过单句兜底请求，而不是只重试编号协议"
+        );
+    }
+
+    /// 裸译响应清理：引号、「译文：」前缀、``` 围栏、残留序号都要剥掉，
+    /// 且一次回了多行时只能取第一行（否则会变成一句巨长的假译文）。
+    #[test]
+    fn bare_translation_cleaning_strips_wrapping_and_keeps_one_line() {
+        assert_eq!(clean_bare_translation("概率不等式。"), "概率不等式。");
+        assert_eq!(clean_bare_translation("译文：概率不等式。"), "概率不等式。");
+        assert_eq!(clean_bare_translation("\"概率不等式。\""), "概率不等式。");
+        assert_eq!(
+            clean_bare_translation("```\n概率不等式。\n```"),
+            "概率不等式。"
+        );
+        assert_eq!(clean_bare_translation("[3] 概率不等式。"), "概率不等式。");
+        // 模型把整批又搬回来：只取第一行，且截断行内残留的序号
+        assert_eq!(
+            clean_bare_translation("[1] 概率不等式。\n[2] 下面开始学习。"),
+            "概率不等式。"
+        );
+        assert_eq!(
+            clean_bare_translation("概率不等式。 [2] 下面开始学习。"),
+            "概率不等式。"
+        );
+        assert_eq!(clean_bare_translation("   "), "");
     }
 
     /// 术语表必须真的注入到发往接口的提示词里（而不是只在本地拼好就丢掉）。

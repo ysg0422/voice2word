@@ -278,6 +278,9 @@ fn install_imported_subtitles(
     state.flush_segments_if_dirty();
 
     state.segments = segs;
+    // 换了文档就把目标语言对齐到这份字幕的语言：上次残留的「日本語」目标配
+    // 一份日语字幕，点翻译等于日语译日语（引擎全判复制 → 整片失败）。
+    state.adopt_source_language_for_translation();
     // 导入的字幕不属于历史库里的任何一条记录：置空避免把编辑
     // 写回到别的工程的库行上（那是静默数据损坏）。
     state.active_task_id = None;
@@ -2564,6 +2567,10 @@ impl MainWindow {
                                         this.state.preview_source = Some(path.clone());
                                     }
                                     this.state.segments = segments;
+                                    // 新转写完成：把「翻译语言」对齐到这份字幕识别出来的语言。
+                                    // 目标语言是长期偏好，但换了视频不改，就会拿上一个视频的
+                                    // 目标语言去译这一个（日语视频配残留的「日本語」= 日语译日语）。
+                                    this.state.adopt_source_language_for_translation();
                                     // 登记 `active_task_id` 要用的 id 此刻还在后台，先记下这份
                                     // 结果的「文档身份」：回写时若对不上，说明用户已经点开了别的
                                     // 工程、或又开了一单转写，那就绝不能把这份 id 挂到当前的
@@ -3730,6 +3737,43 @@ impl MainWindow {
         if self.state.segments.is_empty() || self.state.is_translating {
             return;
         }
+        // 选句模式：只译勾选的那几句。一句都没勾时**不发请求**，直接把话说清楚——
+        // 静默返回会让用户以为按钮坏了。
+        let picked: Option<Vec<i64>> = self
+            .state
+            .translate_pick
+            .as_ref()
+            .map(|set| set.iter().copied().collect());
+        if let Some(ids) = picked.as_ref() {
+            if ids.is_empty() {
+                self.state.translate_status_msg =
+                    "选句翻译：请先在下方字幕清单里勾选要翻译的句子".to_string();
+                cx.notify();
+                return;
+            }
+        }
+        // 目标语言 == 视频语言：这不是翻译而是复制。引擎会把每一句都判成「复制原文」，
+        // 最后整片报「未能译出任何一句」——在入口就说清楚，别让用户白等一轮。
+        if self.state.translate_target_equals_source() {
+            self.state.translate_status_msg = format!(
+                "目标语言与视频语言相同（{}）：请先改用下拉框选择要译成的语言",
+                self.state.translate_target_lang
+            );
+            cx.notify();
+            return;
+        }
+        // 本轮参与翻译的句子：选句模式只取勾选的，否则整篇。
+        // 引擎按 `index` 回填、收尾按 `start` 合并，因此传子集是安全的。
+        let work_segments: Vec<crate::subtitle::Segment> = match picked.as_ref() {
+            Some(ids) => self
+                .state
+                .segments
+                .iter()
+                .filter(|s| ids.contains(&(s.index as i64)))
+                .cloned()
+                .collect(),
+            None => self.state.segments.clone(),
+        };
         // 「已完成」必须按**当前目标语言**判定。用不分语言的 `translated_count()`
         // 会踩到这个坑：用户把目标语言从 English 改成 日本語 后，旧英文译文仍算
         // 「已完成」，于是 100% 时这里直接 return——点「开始翻译」毫无反应，
@@ -3738,8 +3782,8 @@ impl MainWindow {
         let target_now = self.state.translate_target_lang.clone();
         // 「已完成」用**实际译出**口径：分子只认非空译文 + 目标语言匹配，
         // 分母只算源文非空的句子（空源句没有可译内容，计入分母会永远差几句）。
-        let done_now = translated_out_count(&self.state.segments, &target_now);
-        let expected_now = expected_translation_count(&self.state.segments);
+        let done_now = translated_out_count(&work_segments, &target_now);
+        let expected_now = expected_translation_count(&work_segments);
         if expected_now == 0 {
             self.state.translate_status_msg = "没有可翻译的文本（所有字幕行都是空的）".to_string();
             cx.notify();
@@ -3766,7 +3810,7 @@ impl MainWindow {
         };
         cx.notify();
 
-        let segments = self.state.segments.clone();
+        let segments = work_segments;
         let target_lang = self.state.translate_target_lang.clone();
         // 另存一份给收尾统计用：`target_lang` 会被 move 进下面的异步块。
         // 收尾必须按本轮目标语言数：否则用户换语言后，旧语言的译文

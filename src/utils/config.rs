@@ -146,12 +146,19 @@ impl UiConfig {
 pub struct TranslateConfig {
     /// `offline_qwen`（默认） | `online_api`
     pub mode: String,
-    /// 在线接口基址，不含 `/chat/completions`，例如 `https://api.deepseek.com/v1`
+    /// 在线接口基址，不含 `/chat/completions`，例如 `https://api.deepseek.com/v1`。
+    ///
+    /// **默认为空**：这里不预置任何具体网关。`api_base` / `api_model` / `api_key`
+    /// 描述的是「某台具体服务器」（自建网关、局域网 vLLM、朋友的代理），属于
+    /// 机器专属信息——保存时整组拆进 `config.local.toml`（不进版本库），
+    /// `config.toml` 里永远是空值，别人的地址不会被当成默认值发给所有人。
     pub api_base: String,
     /// Bearer 密钥。留空时会回退读取环境变量 `VOICE2WORD_API_KEY`，
     /// 避免把密钥明文写进 config.toml 后误提交。
+    ///
+    /// 无论 `api_base` 是否为空，密钥都**只**写 `config.local.toml` 或环境变量。
     pub api_key: String,
-    /// 模型名，例如 `deepseek-chat` / `gpt-4o-mini` / `qwen-plus`
+    /// 模型名，例如 `deepseek-chat` / `gpt-4o-mini` / `qwen-plus`。默认空（跟 `api_base` 一起走）。
     pub api_model: String,
     /// 单次请求携带的字幕条数。在线接口按 token 计费，批量越大往返次数越少。
     pub batch_size: usize,
@@ -190,9 +197,9 @@ impl Default for TranslateConfig {
     fn default() -> Self {
         Self {
             mode: "offline_qwen".to_string(),
-            api_base: "https://api.deepseek.com/v1".to_string(),
+            api_base: String::new(),
             api_key: String::new(),
-            api_model: "deepseek-chat".to_string(),
+            api_model: String::new(),
             batch_size: 20,
             timeout_secs: 120,
             target_lang: default_translate_target_lang(),
@@ -1749,7 +1756,7 @@ impl Default for AppConfig {
 /// llama_cli = 'A:\cppsoft\llama.cpp\build\bin\Release\llama-completion.exe'
 /// ```
 ///
-/// 设计上只承载「路径」与「GPU 策略」这两类真正因机器而异的东西；
+/// 设计上只承载「换台机器就不成立」的三类东西：路径、GPU 策略、在线翻译接口。
 /// 调参（线程、VAD、润色模式、字幕样式）留在共享配置里，
 /// 免得同一份实验参数被拆到两个文件、A/B 时漏改一处。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1757,6 +1764,7 @@ impl Default for AppConfig {
 pub struct LocalOverride {
     pub paths: Option<LocalPathsOverride>,
     pub gpu: Option<GpuConfig>,
+    pub translate: Option<LocalTranslateOverride>,
 }
 
 /// `[paths]` 的逐字段覆盖。全部为 `Option`，未写的保持共享配置的值。
@@ -1790,6 +1798,32 @@ impl LocalPathsOverride {
             || self.llama_cli.is_some()
             || self.llm_model.is_some()
             || self.python.is_some()
+    }
+}
+
+/// `[translate]` 的逐字段覆盖：在线接口地址 / 密钥 / 模型名。
+///
+/// 为什么要拆：这几个值指向的是**某台具体服务器**（自建网关、局域网 vLLM、
+/// 朋友的代理），和 `ffmpeg = 'A:\...'` 属于同一类东西——「换台机器就不成立」。
+/// 一旦写进被 git 跟踪、又被安装包原样分发的 `config.toml`，别人拿到的默认
+/// 配置里就是「我的服务器」：地址、密钥、模型名全是别人的基础设施。
+/// 拆分后共享配置里这几项**恒为空**，用户自己在 UI 里填也只落到本文件。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalTranslateOverride {
+    pub mode: Option<String>,
+    pub api_base: Option<String>,
+    pub api_key: Option<String>,
+    pub api_model: Option<String>,
+}
+
+impl LocalTranslateOverride {
+    /// 是否记录了任何一项（全空则不必落盘覆盖文件）。
+    pub fn has_any(&self) -> bool {
+        self.mode.is_some()
+            || self.api_base.is_some()
+            || self.api_key.is_some()
+            || self.api_model.is_some()
     }
 }
 
@@ -1841,6 +1875,22 @@ impl LocalOverride {
         if let Some(g) = self.gpu.as_ref() {
             cfg.gpu = g.clone();
             touched.push("gpu");
+        }
+
+        if let Some(t) = self.translate.as_ref() {
+            if let Some(v) = t.mode.as_ref() {
+                cfg.translate.mode = v.clone();
+            }
+            if let Some(v) = t.api_base.as_ref() {
+                cfg.translate.api_base = v.clone();
+            }
+            if let Some(v) = t.api_key.as_ref() {
+                cfg.translate.api_key = v.clone();
+            }
+            if let Some(v) = t.api_model.as_ref() {
+                cfg.translate.api_model = v.clone();
+            }
+            touched.push("translate");
         }
 
         touched
@@ -2028,6 +2078,36 @@ impl AppConfig {
         (shared, local)
     }
 
+    /// 在线翻译接口的规范化：把「某台具体服务器」拆到 `config.local.toml`，
+    /// `config.toml` 只保留空值。
+    ///
+    /// 判定规则只有一条、且是客观的：**`api_base` 非空即视为本机配了一个具体网关**，
+    /// 于是整组（mode / api_base / api_model）搬进本机覆盖，共享配置回到空默认。
+    /// `api_key` 更严格：不管 `api_base` 是否为空，都绝不留进共享配置——它是密钥。
+    ///
+    /// 这样即使 UI 每敲一个字符都触发一次保存，写进 `config.toml` 的 `[translate]`
+    /// 也永远是空的：自建网关的地址不会随一次「保存设置」被提交回去，更不会随
+    /// 安装包变成所有人的默认值。
+    fn split_translate_settings(&self) -> (TranslateConfig, LocalTranslateOverride) {
+        let mut shared = self.translate.clone();
+        let mut local = LocalTranslateOverride::default();
+        let defaults = TranslateConfig::default();
+
+        if !self.translate.api_base.trim().is_empty() {
+            local.mode = Some(self.translate.mode.clone());
+            local.api_base = Some(self.translate.api_base.clone());
+            local.api_model = Some(self.translate.api_model.clone());
+            shared.mode = defaults.mode;
+            shared.api_base = defaults.api_base;
+            shared.api_model = defaults.api_model;
+        }
+        if !self.translate.api_key.trim().is_empty() {
+            local.api_key = Some(self.translate.api_key.clone());
+            shared.api_key = String::new();
+        }
+        (shared, local)
+    }
+
     /// 与 `config.toml` 同目录的 `config.local.toml` 路径。
     fn local_override_path(config_path: &Path) -> PathBuf {
         config_path.with_file_name(Self::LOCAL_OVERRIDE)
@@ -2040,6 +2120,7 @@ impl AppConfig {
         }
 
         let (shared_paths, local_paths) = self.split_machine_paths();
+        let (shared_translate, local_translate) = self.split_translate_settings();
 
         // 顺序很重要：**先落本机覆盖，再写共享配置**。
         // 共享配置里那几项会被换成便携默认值（如 `tools/ffmpeg.exe`），
@@ -2056,18 +2137,26 @@ impl AppConfig {
             .and_then(|local| local.gpu);
 
         let has_paths = local_paths.has_any();
-        if has_paths || existing_gpu.is_some() {
+        let has_translate = local_translate.has_any();
+        if has_paths || has_translate || existing_gpu.is_some() {
             let local = LocalOverride {
                 paths: if has_paths { Some(local_paths) } else { None },
                 gpu: existing_gpu,
+                translate: if has_translate {
+                    Some(local_translate)
+                } else {
+                    None
+                },
             };
             let text = toml::to_string_pretty(&local).with_context(|| "序列化本机配置覆盖失败")?;
             let body = format!(
                 "# 本机专属配置（由程序自动维护，不进版本库）\n\
                  #\n\
-                 # 这里只存「换台机器就不成立」的东西：绝对路径、机器相关的 GPU 策略。\n\
+                 # 这里只存「换台机器就不成立」的东西：绝对路径、机器相关的 GPU 策略、\n\
+                 # 在线翻译接口地址 / 密钥 / 模型名。\n\
                  # 共享调参请写 config.toml；本文件的字段会逐项覆盖它。\n\
-                 # 删除本文件不影响启动，只是路径会回退到 config.toml 里的可移植默认值。\n\n{text}"
+                 # 删除本文件不影响启动，只是路径会回退到 config.toml 里的可移植默认值，\n\
+                 # 在线翻译接口会回退成空（需要重新填写）。\n\n{text}"
             );
             // 内容没变就不重复落盘：UI 上每敲一个键都会走到这里（见 commit_api_field），
             // 而这个文件几乎从不变，没必要每个字符都做一次磁盘写。
@@ -2089,6 +2178,7 @@ impl AppConfig {
 
         let mut on_disk = self.clone();
         on_disk.paths = shared_paths;
+        on_disk.translate = shared_translate;
         let content = toml::to_string_pretty(&on_disk).with_context(|| "序列化配置为 TOML 失败")?;
         // 与本机覆盖同理：内容没变就不重复落盘。UI 上每敲一个键都会走到
         // 这里（见 `commit_api_field`），而在 API Key / 模型名里输入时共享配置并不改变——
@@ -2928,6 +3018,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 在线翻译接口必须走本机覆盖：`config.toml` 里的 `[translate]` 恒为空，
+    /// 自建网关地址 / 密钥只落 `config.local.toml`（不进版本库、不进安装包）。
+    ///
+    /// 这条是那次事故的回归：默认配置里塞了作者的服务器地址，安装包一分发，
+    /// 所有人的「在线翻译」都指向同一台私有网关。
+    #[test]
+    fn translate_endpoint_is_stripped_into_local_override() {
+        let dir = std::env::temp_dir().join(format!("v2w_cfg_trans_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let main_path = dir.join("config.toml");
+        let local_path = dir.join(super::AppConfig::LOCAL_OVERRIDE);
+
+        let mut cfg = super::AppConfig::default();
+        // 默认必须是空：任何具体网关（哪怕公共的）都不该被预置。
+        assert!(
+            cfg.translate.api_base.is_empty(),
+            "默认 api_base 必须为空，实际: {:?}",
+            cfg.translate.api_base
+        );
+        cfg.translate.mode = "online_api".to_string();
+        cfg.translate.api_base = "http://203.0.113.10:3021/v1".to_string();
+        cfg.translate.api_key = "sk-private".to_string();
+        cfg.translate.api_model = "global:fast-model".to_string();
+        cfg.save_to_file(&main_path).expect("save");
+
+        // 共享配置：地址与密钥一个字都不能留
+        let shared_text = std::fs::read_to_string(&main_path).expect("read shared");
+        assert!(
+            !shared_text.contains("203.0.113.10"),
+            "接口地址不应写进 config.toml:\n{shared_text}"
+        );
+        assert!(
+            !shared_text.contains("sk-private"),
+            "密钥不应写进 config.toml:\n{shared_text}"
+        );
+        let parsed: super::AppConfig = toml::from_str(&shared_text).expect("parse shared");
+        assert_eq!(parsed.translate.api_base, "", "共享配置的基址必须为空");
+        assert_eq!(parsed.translate.api_key, "", "共享配置的密钥必须为空");
+
+        // 本机覆盖：接口整组都在
+        let local_text = std::fs::read_to_string(&local_path).expect("read local");
+        assert!(
+            local_text.contains("203.0.113.10"),
+            "接口地址应写进 config.local.toml:\n{local_text}"
+        );
+
+        // 读回来：地址 / 密钥 / 模式 / 模型全部复原
+        let back = super::AppConfig::load_from_file(&main_path).expect("load");
+        assert_eq!(back.translate.api_base, "http://203.0.113.10:3021/v1");
+        assert_eq!(back.translate.api_key, "sk-private");
+        assert_eq!(back.translate.mode, "online_api");
+        assert_eq!(back.translate.api_model, "global:fast-model");
+
+        // 用户清空地址后，「恢复默认」必须真生效：过期的本机覆盖要删掉
+        super::AppConfig::default()
+            .save_to_file(&main_path)
+            .expect("save cleared");
+        assert!(
+            !local_path.exists(),
+            "地址清空后不应再留着带接口地址的覆盖文件"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 只含 `[gpu]` 段的本机覆盖文件必须被保留：`split_machine_paths` 只认绝对路径，
     /// 看不到用户手写的 `[gpu]`；若保存时按「没有绝对路径」直接删文件，用户的 GPU
     /// 策略会在下次启动时被静默丢弃。
@@ -3350,24 +3506,24 @@ gpu_limit_percent = 60
     #[test]
     fn resolved_endpoint_tolerates_slash_v1_and_full_path() {
         let mut cfg = TranslateConfig {
-            api_base: "http://119.29.217.28:3021/v1".to_string(),
+            api_base: "http://203.0.113.10:3021/v1".to_string(),
             ..TranslateConfig::default()
         };
         assert_eq!(
             cfg.resolved_endpoint(),
-            "http://119.29.217.28:3021/v1/chat/completions"
+            "http://203.0.113.10:3021/v1/chat/completions"
         );
         // 尾斜杠
-        cfg.api_base = "http://119.29.217.28:3021/v1/".to_string();
+        cfg.api_base = "http://203.0.113.10:3021/v1/".to_string();
         assert_eq!(
             cfg.resolved_endpoint(),
-            "http://119.29.217.28:3021/v1/chat/completions"
+            "http://203.0.113.10:3021/v1/chat/completions"
         );
         // 基址不带 /v1：不替用户补，原样拼（网关侧 404 时由 online_error_hint 指路）
-        cfg.api_base = "http://119.29.217.28:3021".to_string();
+        cfg.api_base = "http://203.0.113.10:3021".to_string();
         assert_eq!(
             cfg.resolved_endpoint(),
-            "http://119.29.217.28:3021/chat/completions"
+            "http://203.0.113.10:3021/chat/completions"
         );
         // 直接写了完整端点 / 完整端点 + 尾斜杠
         cfg.api_base = "https://api.openai.com/v1/chat/completions".to_string();
@@ -3392,12 +3548,12 @@ gpu_limit_percent = 60
     #[test]
     fn models_url_normalizes_like_chat_endpoint() {
         let mut cfg = TranslateConfig {
-            api_base: "http://119.29.217.28:3021/v1".to_string(),
+            api_base: "http://203.0.113.10:3021/v1".to_string(),
             ..TranslateConfig::default()
         };
-        assert_eq!(cfg.models_url(), "http://119.29.217.28:3021/v1/models");
-        cfg.api_base = "http://119.29.217.28:3021/v1/".to_string();
-        assert_eq!(cfg.models_url(), "http://119.29.217.28:3021/v1/models");
+        assert_eq!(cfg.models_url(), "http://203.0.113.10:3021/v1/models");
+        cfg.api_base = "http://203.0.113.10:3021/v1/".to_string();
+        assert_eq!(cfg.models_url(), "http://203.0.113.10:3021/v1/models");
         cfg.api_base = "https://api.openai.com/v1/chat/completions".to_string();
         assert_eq!(cfg.models_url(), "https://api.openai.com/v1/models");
         cfg.api_base = "https://host/v1/models".to_string();
@@ -3410,17 +3566,17 @@ gpu_limit_percent = 60
     #[test]
     fn models_v1_fallback_only_for_bare_base() {
         let mut cfg = TranslateConfig {
-            api_base: "http://119.29.217.28:3021".to_string(),
+            api_base: "http://203.0.113.10:3021".to_string(),
             ..TranslateConfig::default()
         };
         assert_eq!(
             cfg.models_url_v1_fallback().as_deref(),
-            Some("http://119.29.217.28:3021/v1/models")
+            Some("http://203.0.113.10:3021/v1/models")
         );
         // 已带 /v1 → 不必再试
-        cfg.api_base = "http://119.29.217.28:3021/v1".to_string();
+        cfg.api_base = "http://203.0.113.10:3021/v1".to_string();
         assert_eq!(cfg.models_url_v1_fallback(), None);
-        cfg.api_base = "http://119.29.217.28:3021/v1/".to_string();
+        cfg.api_base = "http://203.0.113.10:3021/v1/".to_string();
         assert_eq!(cfg.models_url_v1_fallback(), None);
         // 完整端点写法：去掉尾段后同样已有 /v1
         cfg.api_base = "https://api.openai.com/v1/chat/completions".to_string();
@@ -3436,7 +3592,7 @@ gpu_limit_percent = 60
     /// 模型列表解析：真实网关响应片段，字段缺失按缺省、脏项跳过。
     #[test]
     fn parse_model_list_handles_real_gateway_shape() {
-        // 摘自实测响应（http://119.29.217.28:3021/v1/models，节选 + 人工构造的缺字段项）
+        // 摘自实测响应（http://203.0.113.10:3021/v1/models，节选 + 人工构造的缺字段项）
         let body = r#"{"data":[
             {"id":"cn:hy4-preview-f","name":"Hy4 preview","object":"model",
              "context_length":1000000,"max_output_tokens":64000,

@@ -233,9 +233,9 @@ parallel_workers  = 0              # 长音频分块并行数，0 表示自动
 
 [translate]
 mode       = "offline_qwen"        # offline_qwen / online_api
-api_base   = "https://api.deepseek.com/v1"
+api_base   = ""                    # 默认留空：在线接口地址属于「本机专属」，见下方说明
 api_key    = ""                    # 留空则读取环境变量 VOICE2WORD_API_KEY
-api_model  = "deepseek-chat"
+api_model  = ""
 
 [ui]
 theme             = "dark"         # 目前只有深色（浅色切换入口已移除，改这里不生效）
@@ -245,6 +245,8 @@ export_name_template = "{name}.{ext}"   # 支持 {name} / {ext} / {date}
 ```
 
 > 机器专属的绝对路径（例如 ffmpeg 安装在别处）无需写入 `config.toml`：程序会自动收集到 `config.local.toml`，该文件不纳入版本库。
+>
+> 在线翻译接口的 `api_base` / `api_model` / `api_key` 是同一类东西：它们指向的是**某台具体服务器**（自建网关、局域网 vLLM、第三方代理），所以默认全部为空，且一旦填写就会被自动拆进 `config.local.toml`。`config.toml` 里这三项恒为空——自建网关的地址与密钥不会被提交，也不会随安装包变成别人的默认值。在「性能设置 → 翻译引擎 → 在线 API」里填一次即可，重启/升级都不丢。
 
 ## 目录结构
 

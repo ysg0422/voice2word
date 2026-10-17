@@ -871,6 +871,13 @@ pub struct AppState {
     /// 翻译引擎档位：本地 Qwen 离线 / 在线 OpenAI 兼容 API。
     /// 与 `config.toml` 的 `[translate].mode` 双向同步，UI 切换后立即落盘。
     pub translate_mode: TranslateMode,
+    /// 「选句翻译」模式：`None` = 关闭（整篇翻译）；`Some(set)` = 开启，`set` 是
+    /// 用户在下方的字幕清单里勾选的句子 `index`。
+    ///
+    /// 为什么要它：整片几百句而只想重译其中某几句时（机翻只错了那几句、或只想
+    /// 先试译一段看模型效果），此前只有「全部翻译」一条路——在线接口按 token
+    /// 计费，重译一遍整片既慢又烧钱。勾选后点「开始翻译」只发送这几句。
+    pub translate_pick: Option<std::collections::BTreeSet<i64>>,
 
     // 硬件与模型资源监控
     pub metrics: ResourceMetrics,
@@ -1016,6 +1023,35 @@ pub struct AppState {
     /// 命中的是否是用户自编译的自包含构建（如手编 Vulkan whisper-cli）。
     /// 与 `model_present` 一样按帧查缓存，避免渲染时反复 stat 磁盘。
     pub model_custom_build: std::collections::HashMap<String, bool>,
+}
+
+/// 从字幕内容判断「当前视频语言」，返回目标语言清单里的显示名。
+///
+/// 判定顺序刻意如此：先问 [`crate::subtitle::is_source_chinese`]（它还带假名/谚文
+/// 反查，能挡住「转写模型把日语误标成 zh」），再按字符特征找日语/韩语，最后才
+/// 落到拉丁字母（英语）。认不出来时返回 `None`——调用方保持当前目标语言不变，
+/// 绝不瞎猜一个语言把用户带偏。
+pub fn source_language_label(segments: &[Segment]) -> Option<&'static str> {
+    if segments.is_empty() {
+        return None;
+    }
+    if crate::subtitle::is_source_chinese(segments) {
+        return Some("简体中文");
+    }
+    let sample: String = segments
+        .iter()
+        .take(40)
+        .map(|seg| seg.translate_source())
+        .collect();
+    if crate::subtitle::contains_japanese_kana(&sample) {
+        Some("日本語")
+    } else if crate::subtitle::contains_korean_hangul(&sample) {
+        Some("한국어")
+    } else if sample.chars().any(|c| c.is_ascii_alphabetic()) {
+        Some("English")
+    } else {
+        None
+    }
 }
 
 impl AppState {
@@ -1166,6 +1202,7 @@ impl AppState {
             translate_status_msg: String::new(),
             translate_target_lang,
             translate_mode,
+            translate_pick: None,
             metrics: ResourceMetrics::default(),
 
             active_tab: WorkspaceTab::Editor, // 默认主界面为剪辑校对工作台
@@ -1764,6 +1801,65 @@ impl AppState {
         self.translate_target_lang = lang.to_string();
         self.config.translate.target_lang = lang.to_string();
         self.save_translate_config();
+    }
+
+    /// 切换「选句翻译」模式：关闭 → 开启（清空上次勾选）；开启 → 关闭。
+    ///
+    /// 开启时**必须**清空上一次的勾选：句子号是按文档编的，沿用上一个工程的
+    /// 勾选会静默译错别的句子。
+    pub fn toggle_translate_pick(&mut self) {
+        self.translate_pick = match self.translate_pick.take() {
+            Some(_) => None,
+            None => Some(std::collections::BTreeSet::new()),
+        };
+    }
+
+    /// 选句模式是否开启。
+    pub fn is_picking_translate(&self) -> bool {
+        self.translate_pick.is_some()
+    }
+
+    /// 某一句是否已被勾选（选句模式关闭时恒为 `false`）。
+    pub fn is_translate_picked(&self, index: i64) -> bool {
+        self.translate_pick
+            .as_ref()
+            .is_some_and(|set| set.contains(&index))
+    }
+
+    /// 勾选 / 取消一句；未处于选句模式时无副作用。
+    pub fn toggle_translate_pick_one(&mut self, index: i64) {
+        if let Some(set) = self.translate_pick.as_mut() {
+            if !set.remove(&index) {
+                set.insert(index);
+            }
+        }
+    }
+
+    /// 已勾选的句数（选句模式关闭时为 0）。
+    pub fn translate_pick_count(&self) -> usize {
+        self.translate_pick.as_ref().map_or(0, |set| set.len())
+    }
+
+    /// 把目标语言改成「当前视频语言」。
+    ///
+    /// 用户明确要求：翻译语言下拉框的默认选中项是**当前视频的语言**，而不是
+    /// `config.toml` 里上次残留的那个。否则日语视频配上残留的「日本語」目标，
+    /// 点「开始翻译」等于日语译日语（引擎会判定为复制并整片失败）。
+    pub fn adopt_source_language_for_translation(&mut self) {
+        // 换文档必须退出选句模式：勾选的是**上一份文档**的句子号，留着它下次
+        // 点「开始翻译」就会去译这份文档里同号的、完全不相干的句子。
+        self.translate_pick = None;
+        let Some(lang) = source_language_label(&self.segments) else {
+            return;
+        };
+        if self.translate_target_lang != lang {
+            self.set_translate_target_lang(lang);
+        }
+    }
+
+    /// 目标语言是否恰好就是这个视频本身的语言（此时翻译没有意义）。
+    pub fn translate_target_equals_source(&self) -> bool {
+        source_language_label(&self.segments).is_some_and(|lang| lang == self.translate_target_lang)
     }
     pub fn set_selected_file(&mut self, path: PathBuf) {
         self.selected_file = Some(path);

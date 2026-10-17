@@ -69,10 +69,10 @@ karaoke_word_highlight = true
 custom_presets = []
 
 [translate]
-mode = "online_api"
-api_base = "http://119.29.217.28:3021/v1"
-api_key = "111111"
-api_model = "global:fast-model"
+mode = "offline_qwen"
+api_base = ""
+api_key = ""
+api_model = ""
 batch_size = 20
 timeout_secs = 120
 target_lang = "日本語"

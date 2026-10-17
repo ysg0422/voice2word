@@ -16,6 +16,15 @@ use super::super::theme::Theme;
 use super::super::MainWindow;
 use crate::utils::config::{ModelInfo, TranslateConfig};
 
+/// 在线翻译「每批条数」滑块的取值区间。
+///
+/// 下限 1（逐条翻译，最保守，适合限流严格的接口）、上限 50（再大单次请求容易
+/// 撞上模型上下文上限或触发 429）。原先只给 10/20/40 三个固定档，用户想试
+/// 25 条这种中间值没有任何入口——批量大小和接口限流、模型上下文、字幕平均
+/// 长度都相关，本来就该连续可调。
+const TRANSLATE_BATCH_MIN: u32 = 1;
+const TRANSLATE_BATCH_MAX: u32 = 50;
+
 /// 术语表**实际生效**的条数（纯函数，便于单测）。
 ///
 /// `TranslateConfig::glossary_entries()` 返回解析出的全部合法条目，而真正注入
@@ -759,30 +768,39 @@ impl MainWindow {
             )
             .into_any_element();
 
-        // 批量条数：在线接口按 token 计费，批量越大往返越少；本地推理则影响不大
-        let batch = self.state.config.translate.batch_size;
-        let batch_control = primitives::segmented_cluster()
-            .children([10usize, 20, 40].into_iter().map(|size| {
-                self.seg_option(
-                    match size {
-                        10 => "perf-translate-batch-10",
-                        20 => "perf-translate-batch-20",
-                        _ => "perf-translate-batch-40",
-                    },
-                    match size {
-                        10 => "10 条/批",
-                        20 => "20 条/批",
-                        _ => "40 条/批",
-                    },
-                    batch == size,
-                    cx,
-                    move |this, cx| {
-                        this.state.config.translate.batch_size = size;
+        // 每批条数：在线接口按 token 计费，批量越大往返越少；本地推理则影响不大。
+        //
+        // 用**滑块**而不是 10/20/40 三档按钮：最优值和接口限流、模型上下文、
+        // 字幕平均长度都相关，三档把「我想试 25 条」这种需求堵死了。
+        // 拖动期间只改内存（`begin_config_drag` 闸门拦住落盘），松手由
+        // `render_slider` 自带的 on_mouse_up 调 `end_config_drag` 统一写一次。
+        let batch = self
+            .state
+            .config
+            .translate
+            .batch_size
+            .clamp(TRANSLATE_BATCH_MIN as usize, TRANSLATE_BATCH_MAX as usize)
+            as u32;
+        let batch_control = self
+            .render_slider(
+                "perf-slider-translate-batch",
+                "每批条数",
+                batch,
+                TRANSLATE_BATCH_MIN,
+                TRANSLATE_BATCH_MAX,
+                format!("{batch} 条/批"),
+                "一次请求携带的字幕条数：越大往返次数越少、越省 token；过大可能撞上下文上限或被限流"
+                    .to_string(),
+                cx,
+                |this, v, cx| {
+                    let v = v as usize;
+                    if this.state.config.translate.batch_size != v {
+                        this.state.config.translate.batch_size = v;
                         this.state.save_translate_config();
                         cx.notify();
-                    },
-                )
-            }))
+                    }
+                },
+            )
             .into_any_element();
 
         let probing = self.is_probing_translate;
@@ -976,7 +994,9 @@ impl MainWindow {
             .child(Self::render_setting_divider())
             .child(Self::render_setting_row("API Key", dim(key_control)))
             .child(Self::render_setting_divider())
-            .child(Self::render_setting_row("每批条数", dim(batch_control)))
+            // 滑块行自带「标签 + 提示 + 步进 + 轨道」，不再套 render_setting_row
+            // （那条骨架是「左标签 + 右对齐控件」，会把整条滑轨压成右侧窄条）。
+            .child(dim(batch_control))
             .child(Self::render_setting_divider())
             .child(Self::render_setting_row("连通性", probe_control))
             .child(Self::render_setting_divider())

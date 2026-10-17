@@ -799,6 +799,8 @@ pub struct MainWindow {
     pub(crate) api_base_input: String,
     pub(crate) api_model_input: String,
     pub(crate) api_key_input: String,
+    /// 翻译语言下拉框是否展开（剪辑台翻译卡里，目标语言从一排胶囊改成下拉）。
+    pub(crate) translate_lang_open: bool,
     pub(crate) api_base_focus: FocusHandle,
     pub(crate) api_model_focus: FocusHandle,
     pub(crate) api_key_focus: FocusHandle,
@@ -1627,6 +1629,7 @@ impl MainWindow {
             style_field_input: String::new(),
             style_field_focus: cx.focus_handle(),
             api_key_visible: false,
+            translate_lang_open: false,
             is_probing_translate: false,
             translate_probe_msg: None,
             library_filter: crate::utils::library_query::LibraryFilter::default(),
