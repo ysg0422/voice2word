@@ -2533,7 +2533,7 @@ fn translate_segments(
     };
     eprintln!("[翻译] 目标语言 {target}，引擎 {}", mode.label());
 
-    let engine = match mode {
+    let mut engine = match mode {
         TranslateMode::OnlineApi => {
             let cfg = online_api_config(config, args)?;
             eprintln!("[翻译] 在线接口 {}（模型 {}）", cfg.endpoint, cfg.model);
@@ -2552,12 +2552,30 @@ fn translate_segments(
     };
 
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Ctrl+C 钩子：整片翻译要跑几分钟，此前 `cancel` 建好后从不置位，用户只能硬杀
+    // 进程——已译好的部分随进程一起蒸发。这里起一个轻量线程监听 ctrl_c，收到就置位，
+    // 引擎在**批次之间**退出并保留已完成的部分。
+    {
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                let _ = rt.block_on(async { tokio::signal::ctrl_c().await });
+                eprintln!("\n[翻译] 收到 Ctrl+C，正在停止并保留已译部分…");
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+    }
     // 进度回调可能被每批调用一次，按 5% 粒度去重，避免刷屏。
     let last = Arc::new(AtomicI64::new(-1));
     let progress_last = last.clone();
     let progress: TextProgressCb = Box::new(move |value, message| {
         let percent = (value.clamp(0.0, 1.0) * 100.0).round() as i64;
-        if percent % 5 != 0 || progress_last.swap(percent, Ordering::Relaxed) == percent {
+        // 只按百分比去重：此前还有一道 `percent % 5 != 0` 的过滤，会把非 5 倍数的
+        // 完成/告警消息（例如质量自愈提示）直接吞掉。
+        if progress_last.swap(percent, Ordering::Relaxed) == percent {
             return;
         }
         if message.trim().is_empty() {
@@ -2567,9 +2585,28 @@ fn translate_segments(
         }
     });
 
-    engine
-        .translate_subtitles(segments, &target, Some(progress), cancel)
-        .context("字幕翻译失败")
+    // 部分结果槽：整片失败（鉴权 / 质量 / 网络）时把已译、已计费的部分合并回去，
+    // 不让一次故障把前面跑过的几十批全部作废。
+    let partial = crate::engines::translate::PartialSink::default();
+    engine.set_partial_sink(partial.clone());
+
+    match engine.translate_subtitles(segments, &target, Some(progress), cancel) {
+        Ok(segs) => Ok(segs),
+        Err(err) => {
+            let salvaged = partial
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            match salvaged.filter(|segs| segs.iter().any(|s| s.has_translation())) {
+                Some(segs) => {
+                    eprintln!("[翻译] 失败：{err}");
+                    eprintln!("[翻译] 已保留本次译出的部分，其余句子保持原文（可再跑一次补齐）");
+                    Ok(segs)
+                }
+                None => Err(err).context("字幕翻译失败"),
+            }
+        }
+    }
 }
 
 /// 组装在线接口配置：命令行覆盖 > `config.toml`（密钥还会回落到环境变量）。

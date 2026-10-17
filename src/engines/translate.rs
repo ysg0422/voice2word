@@ -257,7 +257,15 @@ impl TranslateEngine {
         // 若源字幕是日语（含假名）、韩语（含谚文）、英语（拉丁文）等外语，目标语言为中文时
         // 属于真正的跨语言翻译，绝不能短路到 zhconv（zhconv 对假名与外语毫无反应，
         // 会把外语原文原封不动吐回，导致 0 毫秒假完成且完全没有翻译）。
-        if crate::subtitle::is_source_chinese(&segments) {
+        // 中英混排：只要有**一句**明显不是中文（纯拉丁/含假名等），就整片不走
+        // zhconv。`is_source_chinese` 是整片判定（汉字占比够就算中文），中文视频里
+        // 夹几行英文时它照样命中，于是英文行被 zhconv 原样吐回却打上「简体中文」标记，
+        // 从此被判成「已译」。宁可多走一遍真翻译，也不能静默造假。
+        let all_sentences_chinese = segments.iter().all(|seg| {
+            seg.translate_source().trim().is_empty()
+                || crate::subtitle::is_source_chinese(std::slice::from_ref(seg))
+        });
+        if all_sentences_chinese && crate::subtitle::is_source_chinese(&segments) {
             if let Some(variant) = chinese_variant_target(target_lang) {
                 self.store_rewrite_stats(RewriteStats::default());
                 return convert_chinese_variant(segments, target_lang, variant, progress_cb, &cancel);
@@ -1114,18 +1122,38 @@ fn request_batch_with_retry(
                 if !is_retryable(&err) {
                     return Err(err);
                 }
+                // 退避：优先听服务端的 `Retry-After`（限流时它知道要等多久），
+                // 没有就指数退避（0.6s → 1.2s → 2.4s，封顶 8s）。线性 0.6/1.2/1.8s
+                // 在 429 面前往往太短，三次重试全撞在同一波限流里。
+                // 注意顺序：先算退避再用 `err`，`last_err = Some(err)` 会把 `err` 移走。
+                let backoff = retry_after_hint(&err).unwrap_or_else(|| {
+                    let base = 600u64.saturating_mul(1u64 << attempt.min(4));
+                    Duration::from_millis(base.min(8_000))
+                });
                 warn!(attempt = attempt + 1, total = MAX_BATCH_RETRIES, error = %err, "在线翻译请求失败，准备重试");
                 last_err = Some(err);
-                // 线性退避：失败往往是限流，立刻重发只会继续被拒。
-                // 等待本身必须可中断：用户点「取消」后不该再把这 0.6~1.8s 睡完，
+                // 等待本身必须可中断：用户点「取消」后不该再把这 0.6~8s 睡完，
                 // 更不该睡醒后再发一次请求（[`wait_with_cancel`]）。
-                if !wait_with_cancel(Duration::from_millis(600 * (attempt as u64 + 1)), cancel) {
+                if !wait_with_cancel(backoff, cancel) {
                     return Err(anyhow!("翻译已取消"));
                 }
             }
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("在线翻译请求失败")))
+}
+
+/// 从错误文案里解析服务端建议的等待时间（`Retry-After: 3` / `retry-after=3`）。
+///
+/// 429 限流时服务端知道要等多久，比我们瞎猜的线性退避准得多。文案里没有就当没有，
+/// 由调用方退回指数退避。夹在 1–60 秒：太小等于没等，太大会把「取消」拖到不可接受。
+fn retry_after_hint(err: &anyhow::Error) -> Option<Duration> {
+    let msg = err.to_string().to_lowercase();
+    let idx = msg.find("retry-after")?;
+    let rest = msg[idx + "retry-after".len()..].trim_start_matches([':', ' ', '=']);
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let secs: u64 = digits.parse().ok()?;
+    Some(Duration::from_secs(secs.clamp(1, 60)))
 }
 
 /// 单批失败的**处置类别**：决定上层的下一步动作。
@@ -2570,6 +2598,23 @@ mod tests {
             "概率不等式。"
         );
         assert_eq!(clean_bare_translation("   "), "");
+    }
+
+    /// 429 的 `Retry-After` 必须被采纳：限流时服务端知道要等多久，瞎猜的线性退避
+    /// 常常三次全撞在同一波限流里。解析不出来时返回 `None`（退回指数退避）。
+    #[test]
+    fn retry_after_hint_parses_header_from_error_text() {
+        let e = anyhow!("在线接口返回 HTTP 429: rate limited, retry-after: 7");
+        assert_eq!(retry_after_hint(&e), Some(Duration::from_secs(7)));
+        let e2 = anyhow!("HTTP 429 Retry-After=3");
+        assert_eq!(retry_after_hint(&e2), Some(Duration::from_secs(3)));
+        // 越界夹到 1–60 秒
+        let e3 = anyhow!("retry-after: 0");
+        assert_eq!(retry_after_hint(&e3), Some(Duration::from_secs(1)));
+        let e4 = anyhow!("retry-after: 999");
+        assert_eq!(retry_after_hint(&e4), Some(Duration::from_secs(60)));
+        // 没有这个头
+        assert_eq!(retry_after_hint(&anyhow!("连接超时")), None);
     }
 
     /// 术语表必须真的注入到发往接口的提示词里（而不是只在本地拼好就丢掉）。

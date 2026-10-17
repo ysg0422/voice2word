@@ -5973,6 +5973,27 @@ impl MainWindow {
             } else {
                 div().into_any_element()
             })
+            // 「重译全部」：增量翻译只补未译句（`!translation_matches(target)` 才发请求），
+            // 所以只要译文带对语言标记就永远跳过。换了引擎/模型想重新出一遍时，
+            // 此前只能「清空译文」再翻——那会把语言包里其他语言也一起丢掉。
+            .child(if done > 0 && !is_translating {
+                primitives::btn_clickable(
+                    "重译全部",
+                    primitives::BtnSize::Sm,
+                    primitives::BtnVariant::Secondary,
+                )
+                .id("btn-translate-force-all")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let lang = this.state.translate_target_lang.clone();
+                    let n = this.state.clear_translations_for_lang(&lang);
+                    this.state.translate_status_msg =
+                        format!("已清空 {n} 句{lang}译文，点「开始翻译」重新翻译");
+                    cx.notify();
+                }))
+                .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             // 存在译文且未在翻译中时，提供一键清空译文入口，方便恢复纯净单语状态
             .child(if has_any_trans_overall && !is_translating {
                 primitives::btn_clickable(

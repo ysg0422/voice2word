@@ -3915,6 +3915,12 @@ impl MainWindow {
             cx.spawn(async move |cx| {
                 while let Some((progress, msg)) = rx.recv().await {
                     let _ = progress_this.update(cx, |this, cx| {
+                        // 收尾已经写过最终文案：通道里残留的进度消息不得把它覆盖回去
+                        // （否则「翻译完成（N 句）」会被一条滞后的「在线翻译中: 120/200」
+                        // 冲掉，用户以为没翻完）。
+                        if !this.state.is_translating {
+                            return;
+                        }
                         this.state.translate_progress = progress as f32;
                         this.state.translate_status_msg = msg;
                         cx.notify();

@@ -1882,6 +1882,32 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
         self.doc_epoch = self.doc_epoch.wrapping_add(1);
     }
 
+    /// 清掉某个语言的全部译文（语言包 + 当前展示），用于「重译全部」。
+    ///
+    /// 引擎的增量语义是「`!translation_matches(target)` 才重译」，所以只要译文带对
+    /// 语言标记就永远跳过——换了引擎/模型想重新出一遍时，此前没有任何入口。
+    /// 返回被清理的句数。
+    pub fn clear_translations_for_lang(&mut self, lang: &str) -> usize {
+        let mut touched = 0usize;
+        for seg in self.segments.iter_mut() {
+            let mut hit = seg.translations.remove(lang).is_some();
+            if seg.translation_lang.as_deref() == Some(lang) {
+                seg.translation = None;
+                seg.translation_lang = None;
+                hit = true;
+            }
+            if hit {
+                touched += 1;
+            }
+        }
+        if touched > 0 {
+            self.bump_segments_revision();
+            self.segments_dirty = true;
+            self.defer_segments_flush();
+        }
+        touched
+    }
+
     /// 切换目标语言并落盘。目标语言是长期偏好，必须持久化，
     /// 否则重启后又跳回默认语言，用户会以为设置没生效。
     pub fn set_translate_target_lang(&mut self, lang: &str) {

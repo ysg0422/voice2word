@@ -803,8 +803,32 @@ impl MainWindow {
             )
             .into_any_element();
 
-        let probing = self.is_probing_translate;
-        let probe_msg = self.translate_probe_msg.clone();
+        // 请求超时：慢接口（自建网关、海外代理）常常 30–60 秒才回，默认 120 秒够用，
+        // 但弱网 / 长批时需要能调大。此前只能改 config.toml 或用 CLI 的 --api-timeout。
+        let timeout_secs = self.state.config.translate.timeout_secs.clamp(10, 600) as u32;
+        let timeout_slider = self
+            .render_slider(
+                "perf-slider-translate-timeout",
+                "请求超时",
+                timeout_secs,
+                10,
+                600,
+                format!("{timeout_secs} 秒"),
+                "单批请求的等待上限：接口慢或批量大时调大，避免整批被当成超时失败"
+                    .to_string(),
+                cx,
+                |this, v, cx| {
+                    let v = v as u64;
+                    if this.state.config.translate.timeout_secs != v {
+                        this.state.config.translate.timeout_secs = v;
+                        this.state.save_translate_config();
+                        cx.notify();
+                    }
+                },
+            )
+            .into_any_element();
+
+        let probing = self.is_probing_translate;        let probe_msg = self.translate_probe_msg.clone();
         let probe_control = div()
             .flex()
             .items_center()
@@ -999,6 +1023,8 @@ impl MainWindow {
             .child(dim(batch_control))
             .child(Self::render_setting_divider())
             .child(Self::render_setting_row("连通性", probe_control))
+            .child(Self::render_setting_divider())
+            .child(timeout_slider)
             .child(Self::render_setting_divider())
             .child(Self::render_setting_row("术语表", glossary_control))
     }

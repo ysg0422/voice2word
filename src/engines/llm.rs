@@ -699,6 +699,11 @@ pub(crate) fn convert_chinese_variant(
             info!("中文变体转换被取消，保留已完成的部分（{completed}/{pending_total}）");
             break;
         }
+        // 混排里的非中文行（英文整句、纯数字）：zhconv 对它毫无作用，转完只会
+        // 原样写回并打上「简体中文」标记，从此被判成「已译」。跳过，留作未译。
+        if !crate::subtitle::is_source_chinese(std::slice::from_ref(&segments[pos])) {
+            continue;
+        }
         let converted = zhconv::zhconv(&segments[pos].translate_source(), variant);
         segments[pos].translation = Some(converted);
         segments[pos].translation_lang = Some(target_lang.to_string());
@@ -1882,7 +1887,13 @@ impl LLMEngine {
             // 重试之后仍没译出的复制句，才真正计入复制率。
             copy.rejected += count_untranslated_copies(&segments, &copy_candidates, target_lang);
 
-            completed += chunk.len();
+            // 进度只数**真的译出**的句子：按 `chunk.len()` 累加时，输出被截断或
+            // 校验拒收的句子也算完成，进度条冲到 100% 后收尾又说「部分完成」，
+            // 用户看到「刚跑完又退回 83%」。
+            completed += chunk
+                .iter()
+                .filter(|&&pos| segments[pos].translation_matches(target_lang))
+                .count();
             // 每批刷新增量结果槽：界面每隔几秒合并落盘一次，整片失败时也不丢已译部分。
             self.stash_partial(&segments);
             if let Some(ref cb) = progress_cb {
