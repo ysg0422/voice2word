@@ -22,7 +22,8 @@
 //! 不同——给的是「哪几句值得看一眼」的下标——但同属质检，放在一起是为了让「字幕有
 //! 哪些毛病」这件事只有一处清单；它**只报告、绝不改文本**，理由见该函数的文档。
 
-use crate::subtitle::segment::{QualityCategory, QualityReport, Segment};
+use crate::subtitle::segment::{QualityCategory, QualityReport, Segment, MIN_EDIT_DUR};
+use crate::subtitle::stats::{cps_thresholds, visible_char_count};
 use crate::utils::time::seconds_to_timestamp;
 
 /// 复核表的输出格式。
@@ -424,6 +425,401 @@ fn normalize_for_adjacent_compare(text: &str) -> String {
         .filter(|c| !c.is_whitespace())
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+// ---------------------------------------------------------------------------
+// 「一键修复质检项」的纯函数计划层
+// ---------------------------------------------------------------------------
+//
+// 这一层只负责**算出要改什么**：不碰 IO、不碰 UI、不改输入，也不落库。界面先拿
+// [`plan_repairs`] 显示「将改动 N 句」并让用户预览，确认后再调 [`apply_repairs`]。
+// 拆成两步是为了可撤销：计划本身是一份可审阅的数据（`before` / `after`），用户能看到
+// 每一句会被改成什么样，而不是点一下按钮就让正文和时间轴一起静默变化。
+//
+// 与同模块其它判据（[`missing_terminal_punctuation`] 等）的关系：那些函数**只报告**，
+// 这里则给出**具体改法**。自动补标点在本项目原本是明确禁止的（会猜错语气），因此
+// 本计划只补最保守的「。」/「，」：间隔够大才断句，句中是逗号，不做疑问/感叹猜测。
+
+/// 重叠修复时相邻两句之间保留的空隙（秒）。
+///
+/// 20ms 是「上一句先消失、下一句再出现」的最小可见差；再小就又变成视觉上的相贴。
+const REPAIR_OVERLAP_GAP_SECS: f64 = 0.02;
+
+/// 「下一句隔了这么久就算另起一句」的阈值（秒）。
+///
+/// 低于它的相邻句视为同一段话的延续，补逗号；超过它（或已是片尾）补句号。
+const REPAIR_SENTENCE_GAP_SECS: f64 = 0.8;
+
+/// 时间与速度比较的浮点容差：只用来吸掉 `end - start` 这类减法的尾数，不改变阈值语义。
+const REPAIR_EPS: f64 = 1e-9;
+
+/// 除 [`TERMINAL_MARKS`] 之外、用户已经写下的「不需要再补」句尾符号。
+///
+/// 逗号/分号/冒号在句末不是标准收尾，但**用户写了就是用户的选择**：再补一个「，」
+/// 会变成「，。」这种明显错误。修复计划宁可不碰，也不叠加第二个符号。
+const REPAIR_EXTRA_ENDINGS: &[char] = &['，', '；', '：', '、', ',', ';', ':'];
+
+/// 一条自动修复建议的类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RepairKind {
+    /// 句末缺标点（补「。」或「，」）
+    Punctuation,
+    /// 相邻两句时间重叠
+    Overlap,
+    /// 阅读速度（CPS）超限
+    Cps,
+    /// 相邻重复句（删空文本，不真的删数组元素）
+    Duplicate,
+}
+
+impl RepairKind {
+    /// 固定顺序。`counts()` 与界面胶囊都按它排列，避免每次调用顺序漂移。
+    pub const ALL: [RepairKind; 4] = [
+        RepairKind::Punctuation,
+        RepairKind::Overlap,
+        RepairKind::Cps,
+        RepairKind::Duplicate,
+    ];
+
+    /// 界面用中文名。
+    pub fn label(self) -> &'static str {
+        match self {
+            RepairKind::Punctuation => "句末标点",
+            RepairKind::Overlap => "时间重叠",
+            RepairKind::Cps => "语速超限",
+            RepairKind::Duplicate => "相邻重复",
+        }
+    }
+}
+
+/// 一条修复建议。
+///
+/// `start` / `end` / `text` 三者**只填真正要改的字段**：`None` = 这一项不动它。
+/// [`apply_repairs`] 严格按这个约定落地，所以「计划里没给的字段」永远不会被顺手改掉。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepairItem {
+    /// 修复类型
+    pub kind: RepairKind,
+    /// 句子 `index`（不是列表位置——界面与报告都用 `Segment::index` 对齐）
+    pub index: usize,
+    /// 演示用：修复前的文本（时间类为 `开始–结束` 时间码）
+    pub before: String,
+    /// 演示用：修复后的文本（时间类为时间码，重复句为空串）
+    pub after: String,
+    /// 时间类修复的新起点（`None` = 不动起点）
+    pub start: Option<f64>,
+    /// 时间类修复的新终点（`None` = 不动终点）
+    pub end: Option<f64>,
+    /// 文本类修复的新文本（`Some("")` 表示删空，见 [`RepairKind::Duplicate`]）
+    pub text: Option<String>,
+}
+
+/// 一次「一键修复」的完整计划。顺序即应用顺序（见 [`plan_repairs`]）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RepairPlan {
+    pub items: Vec<RepairItem>,
+}
+
+impl RepairPlan {
+    /// 没有任何可修的项。
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// 按 [`RepairKind::ALL`] 的固定顺序给出每类条数（含 0 条）。
+    pub fn counts(&self) -> [(RepairKind, usize); 4] {
+        let mut out = [
+            (RepairKind::Punctuation, 0usize),
+            (RepairKind::Overlap, 0usize),
+            (RepairKind::Cps, 0usize),
+            (RepairKind::Duplicate, 0usize),
+        ];
+        for item in &self.items {
+            for slot in out.iter_mut() {
+                if slot.0 == item.kind {
+                    slot.1 += 1;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 生成修复计划：缺句末标点、相邻句时间重叠、CPS 超限、相邻重复句。
+///
+/// 纯函数：只读 `segments`，返回新计划；同一份输入永远得到同一份计划。
+///
+/// # 顺序与相互影响
+///
+/// 条目按「时间类在前、文本类在后」生成：重叠 → CPS → 重复句 → 标点。生成时维护一份
+/// 工作用时间轴，后一个判据看到的是前一个判据改过之后的时间，因此计划内部不会互相
+/// 打架（例如 CPS 拉长 `end` 的幅度已按重叠修复后的下一句起点截断）。
+///
+/// - **标点**：只给句末补「。」/「，」——下一句间隔 > 0.8s 或已是片尾补句号，否则补
+///   逗号；已经以 [`TERMINAL_MARKS`] 或 [`REPAIR_EXTRA_ENDINGS`] 收尾的句子、纯符号行
+///   一律跳过。
+/// - **重叠**：只处理相邻两句，把前一句 `end` 压到 `cur.start - 0.02`；若这样会把
+///   前一句压到 [`MIN_EDIT_DUR`] 以下，则改为把后一句 `start` 推到 `prev.end + 0.02`，
+///   保住前一句的完整性（后一句连这个位置都放不下时，退回收前一句，至少消掉重叠）。
+/// - **CPS**：字符数用 [`visible_char_count`]，阈值用 [`cps_thresholds`] 的舒适上限
+///   （中日韩 9、拉丁 17 字符/秒）。超限时把 `end` 拉到 `start + chars / 阈值`，上界
+///   是下一句 `start`（函数签名没有媒体总时长，末句因此只受自身文本约束）。
+/// - **重复**：相邻两句归一化（去空白与标点、小写）后完全相同 → 计划把后一句文本
+///   清空（`text: Some(String::new())`）。**不从数组里删**：删元素会让 `index` 与
+///   界面选中项错位，清空是可撤销的最小动作。
+pub fn plan_repairs(segments: &[Segment]) -> RepairPlan {
+    let mut plan = RepairPlan::default();
+    if segments.is_empty() {
+        return plan;
+    }
+
+    // 工作用时间轴：后续判据基于「前面已计划」的时间，避免两条建议对同一字段给出
+    // 互相矛盾的目标值。
+    let mut times: Vec<(f64, f64)> = segments.iter().map(|s| (s.start, s.end)).collect();
+
+    // 重复句先判定：被计划删空的句子不再参与标点修复，否则「清空」与「补标点」
+    // 会写同一个字段，谁后应用谁说话。
+    let mut duplicate_positions = vec![false; segments.len()];
+    for pos in 1..segments.len() {
+        let a = normalize_for_repair(segments[pos - 1].display_text());
+        let b = normalize_for_repair(segments[pos].display_text());
+        if !a.is_empty() && a == b {
+            duplicate_positions[pos] = true;
+        }
+    }
+
+    // 1. 时间重叠：优先收前一句的 end，收不下才推后一句的 start。
+    for pos in 1..segments.len() {
+        let (prev_start, prev_end) = times[pos - 1];
+        let (cur_start, cur_end) = times[pos];
+        // 与 [`overlapping_segments`] 同口径：浮点噪声级交叠不算问题。
+        if prev_end <= cur_start + OVERLAP_TOLERANCE_SECS {
+            continue;
+        }
+        let compressed_end = cur_start - REPAIR_OVERLAP_GAP_SECS;
+        if compressed_end - prev_start >= MIN_EDIT_DUR {
+            times[pos - 1].1 = compressed_end;
+            plan.items.push(RepairItem {
+                kind: RepairKind::Overlap,
+                index: segments[pos - 1].index,
+                before: range_label(prev_start, prev_end),
+                after: range_label(prev_start, compressed_end),
+                start: None,
+                end: Some(compressed_end),
+                text: None,
+            });
+            continue;
+        }
+
+        let pushed_start = prev_end + REPAIR_OVERLAP_GAP_SECS;
+        if cur_end - pushed_start >= MIN_EDIT_DUR {
+            times[pos].0 = pushed_start;
+            plan.items.push(RepairItem {
+                kind: RepairKind::Overlap,
+                index: segments[pos].index,
+                before: range_label(cur_start, cur_end),
+                after: range_label(pushed_start, cur_end),
+                start: Some(pushed_start),
+                end: None,
+                text: None,
+            });
+        } else {
+            // 两边都放不下：仍然收前一句（用户最直接的诉求是「别叠在一起」），
+            // 哪怕它会短于下限——这比留下可见的重叠更接近目标状态。
+            times[pos - 1].1 = compressed_end;
+            plan.items.push(RepairItem {
+                kind: RepairKind::Overlap,
+                index: segments[pos - 1].index,
+                before: range_label(prev_start, prev_end),
+                after: range_label(prev_start, compressed_end),
+                start: None,
+                end: Some(compressed_end),
+                text: None,
+            });
+        }
+    }
+
+    // 2. 阅读速度：按字符集分档，拉长 end 直到读得完，但不越过下一句起点。
+    for pos in 0..segments.len() {
+        let (start, end) = times[pos];
+        let text = segments[pos].display_text();
+        let chars = visible_char_count(text);
+        if chars == 0 {
+            continue;
+        }
+        let (comfortable, _too_fast) = cps_thresholds(text);
+        if !comfortable.is_finite() || comfortable <= 0.0 {
+            continue;
+        }
+        let duration = end - start;
+        let cps = if duration > REPAIR_EPS {
+            chars as f64 / duration
+        } else {
+            f64::INFINITY
+        };
+        if cps <= comfortable + REPAIR_EPS {
+            continue;
+        }
+        let wanted_end = start + chars as f64 / comfortable;
+        // 上界 = 下一句 start：签名里没有媒体总时长，末句只能按自身文本拉长。
+        let upper_bound = times
+            .get(pos + 1)
+            .map(|&(next_start, _)| next_start)
+            .unwrap_or(f64::INFINITY);
+        let new_end = wanted_end.min(upper_bound);
+        if !new_end.is_finite() || new_end <= end + REPAIR_EPS || new_end <= start {
+            continue;
+        }
+        times[pos].1 = new_end;
+        plan.items.push(RepairItem {
+            kind: RepairKind::Cps,
+            index: segments[pos].index,
+            before: range_label(start, end),
+            after: range_label(start, new_end),
+            start: None,
+            end: Some(new_end),
+            text: None,
+        });
+    }
+
+    // 3. 相邻重复句：清空后一句的文本（不删元素）。
+    for pos in 1..segments.len() {
+        if !duplicate_positions[pos] {
+            continue;
+        }
+        let seg = &segments[pos];
+        plan.items.push(RepairItem {
+            kind: RepairKind::Duplicate,
+            index: seg.index,
+            before: seg.display_text().to_string(),
+            after: String::new(),
+            start: None,
+            end: None,
+            text: Some(String::new()),
+        });
+    }
+
+    // 4. 句末标点：片尾或间隔够大补「。」，否则补「，」。
+    for pos in 0..segments.len() {
+        if duplicate_positions[pos] {
+            continue;
+        }
+        let text = segments[pos].display_text();
+        // 与 [`plan_punctuation_fix`] 同口径：数不出字母/汉字/数字的行不是句子。
+        if !text.chars().any(char::is_alphanumeric) {
+            continue;
+        }
+        if ends_with_any_punctuation(text) {
+            continue;
+        }
+        let end = times[pos].1;
+        let mark = match times.get(pos + 1) {
+            None => '。',
+            Some(&(next_start, _)) if next_start - end > REPAIR_SENTENCE_GAP_SECS => '。',
+            Some(_) => '，',
+        };
+        let after = format!("{text}{mark}");
+        plan.items.push(RepairItem {
+            kind: RepairKind::Punctuation,
+            index: segments[pos].index,
+            before: text.to_string(),
+            after: after.clone(),
+            start: None,
+            end: None,
+            text: Some(after),
+        });
+    }
+
+    plan
+}
+
+/// 应用计划，返回**被实际改动的句子条数**（同一句多个字段只算一条）。
+///
+/// 只改 `item` 里给了值的字段；找不到 `index` 的条目静默跳过（与复核表的孤儿行同
+/// 策略：计划与片段可能来自两次快照，不该为一条过期建议 panic）。
+///
+/// 文本字段的落点：删除（空文本）同时清 `text` 与 `polished`；新增/替换文本时优先写
+/// 非空的 `polished`（界面展示的就是它），没有润色文本才写 `text`，避免把原始转写
+/// 覆盖成「带标点的展示文本」。
+///
+/// 幂等：同一份计划连续应用两次，第二次返回 0——每条建议写的都是**绝对值**，不是
+/// 「在原值上追加」。
+pub fn apply_repairs(segments: &mut [Segment], plan: &RepairPlan) -> usize {
+    let mut touched = vec![false; segments.len()];
+    for item in &plan.items {
+        let Some(pos) = segments.iter().position(|s| s.index == item.index) else {
+            continue;
+        };
+        let seg = &mut segments[pos];
+        let before_start = seg.start;
+        let before_end = seg.end;
+        let before_text = seg.text.clone();
+        let before_polished = seg.polished.clone();
+
+        if let Some(start) = item.start {
+            seg.start = start;
+        }
+        if let Some(end) = item.end {
+            seg.end = end;
+        }
+        if let Some(text) = &item.text {
+            if text.trim().is_empty() {
+                seg.text.clear();
+                seg.polished.clear();
+            } else if seg.polished.trim().is_empty() {
+                seg.text = text.clone();
+            } else {
+                seg.polished = text.clone();
+            }
+        }
+
+        let changed = seg.start != before_start
+            || seg.end != before_end
+            || seg.text != before_text
+            || seg.polished != before_polished;
+        if changed {
+            touched[pos] = true;
+        }
+    }
+    touched.into_iter().filter(|changed| *changed).count()
+}
+
+/// 时间码区间文案（演示用 `开始–结束`，与计划项的 `before` / `after` 同格式）。
+fn range_label(start: f64, end: f64) -> String {
+    format!(
+        "{}–{}",
+        seconds_to_timestamp(start),
+        seconds_to_timestamp(end)
+    )
+}
+
+/// 句子结尾是否已经有任意标点（[`TERMINAL_MARKS`] 或 [`REPAIR_EXTRA_ENDINGS`]）。
+///
+/// 与 [`ends_with_terminal_punctuation`] 一样先跳过空白与包裹符号：`他说"好，"` 的
+/// 句尾是逗号，不该再补一个。
+fn ends_with_any_punctuation(text: &str) -> bool {
+    if ends_with_terminal_punctuation(text) {
+        return true;
+    }
+    for c in text.chars().rev() {
+        if c.is_whitespace() || CLOSERS.contains(&c) {
+            continue;
+        }
+        return REPAIR_EXTRA_ENDINGS.contains(&c);
+    }
+    false
+}
+
+/// 重复句归一化：只保留字母/汉字/数字，再整体小写。
+///
+/// 与 [`normalize_for_adjacent_compare`] 不同，这里连标点一起丢掉——修复计划要**删**
+/// 句子，判定必须比「只报告」更严格：`你好。` 与 `你好！` 归一化后相同，确实该删其一；
+/// 而报告路径保留标点差异，避免误报消耗清单可信度。
+fn normalize_for_repair(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
 }
 
 #[cfg(test)]
@@ -970,5 +1366,211 @@ mod overlap_duplicate_tests {
             seg(9_000, 2.0, 3.0, "RePeAt"),
         ];
         assert_eq!(duplicate_neighbors(&dups), vec![9, 9_000]);
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    // 与其它测试模块一致：只依赖公开接口，实现改名不连累断言。
+    use super::{apply_repairs, plan_repairs, RepairItem, RepairKind};
+    use crate::subtitle::segment::{Segment, MIN_EDIT_DUR};
+
+    fn seg(index: usize, start: f64, end: f64, text: &str) -> Segment {
+        Segment::new(index, start, end, text)
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    fn items_of(plan: &super::RepairPlan, kind: RepairKind) -> Vec<&RepairItem> {
+        plan.items.iter().filter(|i| i.kind == kind).collect()
+    }
+
+    /// 标点：间隔 > 0.8s 或片尾补「。」，间隔不足补「，」；已有标点的句子跳过。
+    #[test]
+    fn punctuation_plan_chooses_period_or_comma() {
+        let segs = [
+            seg(1, 0.0, 1.0, "第一句"),   // 与下一句隔 1.2s → 。
+            seg(2, 2.2, 3.0, "第二句"),   // 与下一句隔 0.2s → ，
+            seg(3, 3.2, 4.0, "第三句，"), // 已有逗号 → 跳过
+            seg(4, 4.0, 5.0, "OK"),       // 片尾 → 。
+        ];
+        let plan = plan_repairs(&segs);
+        let punctuation = items_of(&plan, RepairKind::Punctuation);
+        let texts: Vec<(usize, &str, &str)> = punctuation
+            .iter()
+            .map(|i| (i.index, i.before.as_str(), i.after.as_str()))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![(1, "第一句", "第一句。"), (2, "第二句", "第二句，"), (4, "OK", "OK。")],
+            "只有缺标点的句子入选，且句号/逗号按间隔分档"
+        );
+        assert!(
+            punctuation.iter().all(|i| i.text.is_some()),
+            "文本类修复必须给出新文本"
+        );
+    }
+
+    /// 重叠：优先把前一句 end 压到后一句 start - 0.02；前一句会被压没时改为推后一句起点。
+    #[test]
+    fn overlap_plan_prefers_compressing_but_never_crushes_previous() {
+        let normal = [
+            seg(1, 0.0, 1.5, "前一句。"),
+            seg(2, 1.0, 2.0, "后一句。"),
+        ];
+        let plan = plan_repairs(&normal);
+        let overlap = items_of(&plan, RepairKind::Overlap);
+        assert_eq!(overlap.len(), 1);
+        assert_eq!(overlap[0].index, 1, "默认改前一句的终点");
+        assert_eq!(overlap[0].start, None, "没给的字段不许写");
+        assert!(close(overlap[0].end.unwrap(), 0.98));
+        assert!(overlap[0].before.contains('–') && overlap[0].after.contains('–'));
+
+        let mut applied = normal.to_vec();
+        let changed = apply_repairs(&mut applied, &plan);
+        assert!(changed >= 1);
+        assert!(close(applied[0].end, 0.98), "前一句终点被收短");
+        assert!(applied[0].end <= applied[1].start, "应用后不允许再重叠");
+        assert!(
+            applied[0].end - applied[0].start >= MIN_EDIT_DUR - 1e-9,
+            "收短后仍须够 MIN_EDIT_DUR"
+        );
+
+        // 前一句只有 0.2s（< MIN_EDIT_DUR）：压不了，只能推后一句的起点。
+        let tight = [
+            seg(1, 0.0, 0.20, "短句。"),
+            seg(2, 0.10, 2.0, "后一句。"),
+        ];
+        let tight_plan = plan_repairs(&tight);
+        let tight_items = items_of(&tight_plan, RepairKind::Overlap);
+        assert_eq!(tight_items.len(), 1);
+        assert_eq!(tight_items[0].index, 2, "改为改后一句的起点");
+        assert_eq!(tight_items[0].end, None);
+        assert!(close(tight_items[0].start.unwrap(), 0.22));
+    }
+
+    /// CPS：超限时拉长 end，但绝不越过下一句起点；正常语速不产项。
+    #[test]
+    fn cps_plan_extends_end_without_crossing_next_start() {
+        // 20 个可见字符、0.5s → 40 cps，远超拉丁 17。
+        let fast = [
+            seg(1, 0.0, 0.5, "abcdefghij klmnopqrs."),
+            seg(2, 5.0, 6.0, "next line."),
+        ];
+        let plan = plan_repairs(&fast);
+        let cps = items_of(&plan, RepairKind::Cps);
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].index, 1);
+        assert_eq!(cps[0].text, None);
+        let wanted = 20.0 / 17.0;
+        assert!(close(cps[0].end.unwrap(), wanted), "按舒适阈值 17 字符/秒拉长");
+
+        // 需要 5.88s 才能读完，但下一句 2.0s 就开始：只能拉到 2.0，绝不越界。
+        let long_text = "a".repeat(100);
+        let capped = [
+            seg(1, 0.0, 0.1, &long_text),
+            seg(2, 2.0, 3.0, "next line."),
+        ];
+        let capped_plan = plan_repairs(&capped);
+        let capped_cps = items_of(&capped_plan, RepairKind::Cps);
+        assert_eq!(capped_cps.len(), 1);
+        assert!(close(capped_cps[0].end.unwrap(), 2.0));
+        assert!(capped_cps[0].end.unwrap() <= capped[1].start + 1e-9);
+
+        // 10 字符 / 2s = 5 cps：不超限，不该产项。
+        let calm = [
+            seg(1, 0.0, 2.0, "abcdefghij."),
+            seg(2, 2.5, 3.0, "ok."),
+        ];
+        assert!(
+            items_of(&plan_repairs(&calm), RepairKind::Cps).is_empty(),
+            "正常语速不报"
+        );
+    }
+
+    /// 相邻重复句：去空白/标点、小写后相同 → 计划删空后一句（绝不删数组元素）。
+    #[test]
+    fn duplicate_plan_clears_text_without_removing_segment() {
+        let segs = [
+            seg(1, 0.0, 1.0, "Hello, world!"),
+            seg(2, 1.0, 2.0, "  hello world  "),
+        ];
+        let plan = plan_repairs(&segs);
+        let dups = items_of(&plan, RepairKind::Duplicate);
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].index, 2);
+        assert_eq!(dups[0].before, "  hello world  ");
+        assert_eq!(dups[0].after, "");
+        assert_eq!(dups[0].text.as_deref(), Some(""));
+        assert!(
+            items_of(&plan, RepairKind::Punctuation).is_empty(),
+            "要删空的句子不该再补标点，否则两条建议写同一个字段"
+        );
+
+        let mut applied = segs.to_vec();
+        applied[1].polished = "已润色".to_string();
+        // 用指向第 2 条的 plan 断言 polished 也被清掉。
+        let changed = apply_repairs(&mut applied, &plan);
+        assert!(changed >= 1);
+        assert_eq!(applied[1].text, "", "text 被删空");
+        assert_eq!(applied[1].polished, "", "polished 一并清空");
+        assert_eq!(applied.len(), 2, "计划从不从数组里删元素");
+
+        let distinct = [
+            seg(1, 0.0, 1.0, "你好。"),
+            seg(2, 1.0, 2.0, "再见。"),
+        ];
+        assert!(
+            items_of(&plan_repairs(&distinct), RepairKind::Duplicate).is_empty(),
+            "内容不同不删"
+        );
+    }
+
+    /// 计划纯函数（不改输入）+ 应用幂等（同一 plan 第二次返回 0）+ 计数自洽。
+    #[test]
+    fn plan_is_pure_and_apply_is_idempotent() {
+        let segs = [
+            seg(1, 0.0, 2.0, "你好世界"),
+            seg(2, 1.0, 3.0, "再见"),
+        ];
+        let snapshot = segs.to_vec();
+        let plan = plan_repairs(&segs);
+        assert_eq!(segs.as_slice(), snapshot, "plan_repairs 不得修改输入");
+        assert!(!plan.is_empty());
+
+        let counts = plan.counts();
+        assert_eq!(
+            counts.map(|(kind, _)| kind),
+            RepairKind::ALL,
+            "计数顺序固定"
+        );
+        assert_eq!(
+            counts.iter().map(|(_, n)| *n).sum::<usize>(),
+            plan.items.len(),
+            "四类计数之和 = 条目总数"
+        );
+
+        let mut applied = segs.to_vec();
+        let first = apply_repairs(&mut applied, &plan);
+        assert!(first > 0, "第一次应用应有改动");
+        let after_first = applied.clone();
+        let second = apply_repairs(&mut applied, &plan);
+        assert_eq!(second, 0, "同一计划第二次应用必须无改动");
+        assert_eq!(applied, after_first, "第二次应用不得引入额外变化");
+    }
+
+    /// 干净输入：计划为空、四类计数都是 0。
+    #[test]
+    fn clean_input_yields_empty_plan() {
+        let segs = [
+            seg(1, 0.0, 2.0, "第一句。"),
+            seg(2, 2.5, 4.0, "第二句！"),
+        ];
+        let plan = plan_repairs(&segs);
+        assert!(plan.is_empty(), "没有可修项：{:?}", plan.items);
+        assert!(plan.counts().iter().all(|(_, n)| *n == 0));
+        assert_eq!(apply_repairs(&mut segs.to_vec(), &plan), 0);
     }
 }

@@ -140,6 +140,34 @@ fn format_interval(span: (f64, f64)) -> String {
     format!("{:.3}-{:.3}", span.0, span.1)
 }
 
+/// 从编辑记录里取出可用于错别字学习的 `(before, after)` 文本对；不是**文本级替换**
+/// 则返回 `None`。
+///
+/// 这是审计模块与 `utils::typo_memory` 之间唯一的接缝：记忆库不认识 [`EditRecord`]
+/// （依赖方向只能是 `subtitle → utils`），由这里把一条记录翻译成「整句改前 / 改后」，
+/// 调用方随后把结果喂给 `TypoMemory::learn_from_edit` 即可。
+///
+/// 只认 [`EditKind::Text`]，理由逐条：
+///
+/// - `Translation` 改的是译文，把「译法变了」学成错别字映射，会在下一次翻译时把正确
+///   译法替换成用户这次临时改的措辞；
+/// - `Timing` / `Split` / `Merge` / `Delete` / `Retime` 的 `before`/`after` 是时间区间
+///   或空串，根本不是可替换的文本；
+/// - `Replace` 是一次**批量**替换，一条记录里通常含多组改动，公共前后缀只能圈出其中
+///   一段，学到的半截规则会在别处误伤（逐句改写的 `Text` 记录才是可靠来源）。
+///
+/// 空白/相同文本也返回 `None`：学习是**抽样**，宁可少学一条，也不要喂进一条什么
+/// 都说明不了的记录。
+pub fn typo_learning_pair(record: &EditRecord) -> Option<(String, String)> {
+    if record.kind != EditKind::Text {
+        return None;
+    }
+    if record.before.is_empty() || record.after.is_empty() || record.before == record.after {
+        return None;
+    }
+    Some((record.before.clone(), record.after.clone()))
+}
+
 /// 编辑日志（有界）。
 #[derive(Debug, Clone, Default)]
 pub struct EditLog {
@@ -758,5 +786,68 @@ mod tests {
             "整行形状不对：\n{csv}"
         );
         assert!(csv.ends_with('\n'), "行尾要带换行，方便追加导出");
+    }
+
+    /// 文本记录能原样翻译成学习用的 `(before, after)`。
+    ///
+    /// Why：这是错别字记忆库的唯一入口。若这里把 before/after 弄反或截断，学到的
+    /// 会是「把正确写法改成错误写法」——记忆库从此稳定地把用户刚改对的地方改坏。
+    #[test]
+    fn typo_learning_pair_takes_text_records() {
+        let rec = EditRecord::text(
+            3,
+            "我们明天去天安门广场",
+            "我们明天去天安门厂场",
+            fixed_time(),
+        );
+        assert_eq!(
+            typo_learning_pair(&rec),
+            Some((
+                "我们明天去天安门广场".to_string(),
+                "我们明天去天安门厂场".to_string()
+            )),
+            "方向必须是 改前 → 改后"
+        );
+    }
+
+    /// 非文本编辑一律 `None`；文本记录的空白/未改动边界也不学。
+    ///
+    /// Why：时间记录存的是 `1.000-2.000` 这种区间文本，把它当错别字学进来会把字幕
+    /// 里的数字全换掉；批量替换一条含多组改动，只能圈出其中一段，学到的是半截规则。
+    #[test]
+    fn typo_learning_pair_rejects_non_text_edits() {
+        let ts = fixed_time();
+        assert!(
+            typo_learning_pair(&EditRecord::timing(1, (0.0, 1.0), (0.0, 2.0), ts)).is_none(),
+            "调时间不是文本替换"
+        );
+
+        for kind in [
+            EditKind::Translation,
+            EditKind::Split,
+            EditKind::Merge,
+            EditKind::Delete,
+            EditKind::Replace,
+            EditKind::Retime,
+        ] {
+            let rec = EditRecord {
+                index: 0,
+                kind,
+                before: "甲".to_string(),
+                after: "乙".to_string(),
+                at: ts,
+            };
+            assert!(
+                typo_learning_pair(&rec).is_none(),
+                "{kind:?} 不该被当成错别字学习"
+            );
+        }
+
+        assert!(typo_learning_pair(&EditRecord::text(0, "", "乙", ts)).is_none());
+        assert!(typo_learning_pair(&EditRecord::text(0, "甲", "", ts)).is_none());
+        assert!(
+            typo_learning_pair(&EditRecord::text(0, "甲", "甲", ts)).is_none(),
+            "没改动的记录没有可学的差异"
+        );
     }
 }

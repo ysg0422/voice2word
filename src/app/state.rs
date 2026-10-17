@@ -1901,6 +1901,57 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
         self.doc_epoch = self.doc_epoch.wrapping_add(1);
     }
 
+    /// 错别字记忆库文件（放在应用根，随备份一起走）。
+    fn typo_memory_path() -> std::path::PathBuf {
+        crate::utils::AppConfig::app_root_dir().join("typo_memory.json")
+    }
+
+    /// 把一次手工订正（before → after）沉淀进错别字记忆库并落盘。
+    ///
+    /// 同一个人名/术语被 ASR 反复写错，是本地化场景最烦的事；用户每改一次就学一次，
+    /// 下次转写/导入自动纠正。只在差异片段干净（非纯标点/数字）时才会被采纳，
+    /// 判定在 `TypoMemory::learn_from_edit` 里。
+    pub fn learn_typo_from_edit(&mut self, before: &str, after: &str) {
+        if before == after {
+            return;
+        }
+        let path = Self::typo_memory_path();
+        let mut memory = crate::utils::typo_memory::TypoMemory::load(&path);
+        if memory.learn_from_edit(before, after) > 0 {
+            if let Err(err) = memory.save(&path) {
+                tracing::warn!(error = %err, "错别字记忆库保存失败");
+            }
+        }
+    }
+
+    /// 把记忆库里学会的替换应用到全部字幕（文档装载时调用），返回改动句数。
+    pub fn apply_typo_memory(&mut self) -> usize {
+        let memory = crate::utils::typo_memory::TypoMemory::load(&Self::typo_memory_path());
+        if memory.is_empty() {
+            return 0;
+        }
+        let mut changed = 0usize;
+        for seg in self.segments.iter_mut() {
+            if let Some(fixed) = memory.apply(&seg.text) {
+                if fixed != seg.text {
+                    seg.text = fixed;
+                    changed += 1;
+                }
+            }
+            if !seg.polished.is_empty() {
+                if let Some(fixed) = memory.apply(&seg.polished) {
+                    seg.polished = fixed;
+                }
+            }
+        }
+        if changed > 0 {
+            self.bump_segments_revision();
+            self.segments_dirty = true;
+            self.defer_segments_flush();
+        }
+        changed
+    }
+
     /// 清掉某个语言的全部译文（语言包 + 当前展示），用于「重译全部」。
     ///
     /// 引擎的增量语义是「`!translation_matches(target)` 才重译」，所以只要译文带对

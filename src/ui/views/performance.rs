@@ -629,6 +629,7 @@ impl MainWindow {
                     .flex_col()
                     .gap(px(Theme::SPACE_4))
                     .child(self.render_model_manager(false, cx))
+                    .child(self.render_project_audit_card(cx))
                     .into_any_element()
             }
         };
@@ -1107,6 +1108,99 @@ impl MainWindow {
     ) -> Vec<crate::utils::local_models::LocalModel> {
         self.ensure_llm_models_snapshot(cx);
         cx.update_default_global::<LlmModelsSnapshot, _>(|state, _| state.models.clone())
+    }
+
+    /// 工程体检卡：列出当前工程的阶段产物、占用空间与「是否可复用」（指纹）。
+    ///
+    /// 阶段产物（`.voice2word-stages/<stem>/03_transcribe.json` 等）是续跑缓存：
+    /// 参数变了或旧版本留下的产物会被判为过期，但**留在磁盘上**没人看得见。
+    /// 这里把它们摊开，并给一个「清理过期产物」的出口。
+    fn render_project_audit_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::utils::project_audit as pa;
+        let Some(audit) = self
+            .state
+            .selected_file
+            .as_deref()
+            .map(pa::audit_media)
+            .filter(|a| !a.artifacts.is_empty())
+        else {
+            return div().into_any_element();
+        };
+
+        let stale = audit
+            .artifacts
+            .iter()
+            .filter(|a| a.fingerprint_ok != Some(true))
+            .count();
+        let rows: Vec<AnyElement> = audit
+            .artifacts
+            .iter()
+            .take(8)
+            .map(|a| {
+                let (label, color) = match a.fingerprint_ok {
+                    Some(true) => ("可复用", Theme::accent_mint()),
+                    Some(false) => ("过期", Theme::accent_red()),
+                    None => ("无法识别", Theme::text_muted()),
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_secondary())
+                            .child(format!("{}（{}）", a.stage, pa::human_bytes(a.bytes))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(color)
+                            .child(label),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        primitives::card_sm()
+            .flex_none()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(Theme::text_primary())
+                    .child("工程体检"),
+            )
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_muted())
+                    .child(format!(
+                        "阶段产物 {} 个，占用 {}（其中 {} 个过期）",
+                        audit.artifacts.len(),
+                        pa::human_bytes(audit.total_bytes),
+                        stale
+                    )),
+            )
+            .children(rows)
+            .child(
+                primitives::btn_clickable(
+                    "清理过期产物",
+                    primitives::BtnSize::Sm,
+                    primitives::BtnVariant::Secondary,
+                )
+                .id("perf-audit-clear-stale")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(media) = this.state.selected_file.clone() {
+                        let audit = crate::utils::project_audit::audit_media(&media);
+                        let cleared = crate::utils::project_audit::clear_stale(&audit);
+                        this.notice = Some(format!("已清理 {cleared} 个过期阶段产物"));
+                    }
+                    cx.notify();
+                })),
+            )
+            .into_any_element()
     }
 
     /// 页头：标题 + 帮助按钮 (简约，无徽标)

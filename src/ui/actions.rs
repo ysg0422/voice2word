@@ -283,6 +283,8 @@ fn install_imported_subtitles(
     state.adopt_source_language_for_translation();
     // 代次 +1：正在跑的翻译任务收尾时会比对它，避免把结果并进这份新文档。
     state.bump_doc_epoch();
+    // 错别字记忆：把用户以前订正过的「错→对」应用进来（导入的字幕同样适用）。
+    state.apply_typo_memory();
     // 导入的字幕不属于历史库里的任何一条记录：置空避免把编辑
     // 写回到别的工程的库行上（那是静默数据损坏）。
     state.active_task_id = None;
@@ -2589,6 +2591,10 @@ impl MainWindow {
                                     // 目标语言去译这一个（日语视频配残留的「日本語」= 日语译日语）。
                                     this.state.adopt_source_language_for_translation();
                                     this.state.bump_doc_epoch();
+                                    // 转写完成后套用错别字记忆（用户以前改过的同音错字）。
+                                    if this.state.apply_typo_memory() > 0 {
+                                        info!("已应用错别字记忆库纠正");
+                                    }
                                     // 登记 `active_task_id` 要用的 id 此刻还在后台，先记下这份
                                     // 结果的「文档身份」：回写时若对不上，说明用户已经点开了别的
                                     // 工程、或又开了一单转写，那就绝不能把这份 id 挂到当前的

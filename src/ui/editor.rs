@@ -4815,6 +4815,102 @@ impl MainWindow {
                             })),
                     ),
             )
+            // 一键修复质检项：缺句末标点 / 相邻重叠 / CPS 超限 / 相邻重复句。
+            // 先算计划再应用，一次落一个撤销点（Ctrl+Z 可整体退回）。
+            .child({
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .flex_shrink_0()
+                            .child("质检修复"),
+                    )
+                    .child(
+                        primitives::chip_clickable("一键修复", false, false)
+                            .id("qc-repair-all")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let plan =
+                                    crate::subtitle::qc::plan_repairs(&this.state.segments);
+                                if plan.is_empty() {
+                                    this.notice = Some("没有可自动修复的项目".to_string());
+                                    cx.notify();
+                                    return;
+                                }
+                                let total = plan.items.len();
+                                this.state.snapshot_for_undo();
+                                let applied = crate::subtitle::qc::apply_repairs(
+                                    &mut this.state.segments,
+                                    &plan,
+                                );
+                                this.state.bump_segments_revision();
+                                this.state.segments_dirty = true;
+                                this.state.flush_segments_if_dirty();
+                                this.notice = Some(format!(
+                                    "已修复 {applied} 处（计划 {total} 项），可 Ctrl+Z 撤销"
+                                ));
+                                cx.notify();
+                            })),
+                    )
+            })
+            // 自动章节：按 5 分钟切段、标题取该段首句，导出 YouTube 章节文本。
+            .child({
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .flex_shrink_0()
+                            .child("章节"),
+                    )
+                    .child(
+                        primitives::chip_clickable("导出章节 TXT", false, false)
+                            .id("export-chapters-txt")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let Some(media) = this.state.selected_file.clone() else {
+                                    this.notice =
+                                        Some("请先打开视频（章节按字幕时间生成）".to_string());
+                                    cx.notify();
+                                    return;
+                                };
+                                let chapters = crate::utils::chapters::plan_chapters(
+                                    &this.state.segments,
+                                    crate::utils::chapters::DEFAULT_TARGET_SECS,
+                                );
+                                if chapters.is_empty() {
+                                    this.notice = Some("没有可生成章节的字幕".to_string());
+                                    cx.notify();
+                                    return;
+                                }
+                                let stem = media
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("subtitles")
+                                    .to_string();
+                                let out = media.with_file_name(format!("{stem}.chapters.txt"));
+                                match crate::subtitle::writer::write_chapters_file(
+                                    &chapters,
+                                    &out,
+                                ) {
+                                    Ok(()) => {
+                                        this.notice = Some(format!(
+                                            "已导出 {} 个章节：{}",
+                                            chapters.len(),
+                                            out.display()
+                                        ))
+                                    }
+                                    Err(e) => this.notice = Some(format!("章节导出失败：{e}")),
+                                }
+                                cx.notify();
+                            })),
+                    )
+            })
             // 格式选择 + 导出按钮
             .child(
                 div()

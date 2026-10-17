@@ -1,5 +1,6 @@
 pub mod background_thread;
 pub mod backup;
+pub mod chapters;
 pub mod child_registry;
 pub mod config;
 pub mod crash_report;
@@ -16,10 +17,12 @@ pub mod model_download;
 pub mod monitor;
 pub mod path_safety;
 pub mod pe_imports;
+pub mod project_audit;
 pub mod queue_store;
 pub mod temp_cleanup;
 pub mod temp_guard;
 pub mod time;
+pub mod typo_memory;
 pub mod update_check;
 pub mod zip_extract;
 

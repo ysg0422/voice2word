@@ -135,6 +135,18 @@ impl SubtitleWriter {
                 Self::write_txt_with_timecodes_wrapped(segments, path, mode, wrap)
             }
             "txt" => Self::write_txt_with_mode(segments, path, mode),
+            // ── 自动章节（YouTube 章节列表）──
+            // 章节不是逐句字幕：一行是「时间 + 标题」，没有 segment → 行 的对应关系。
+            // 通用导出链路只拿得到 `segments`，所以这里用兜底分组（按默认 300s 切、
+            // 标题取每组首句）；要带模型生成的标题，调用方直接走
+            // [`write_chapters_file`]（它吃的是 `Chapter` 列表）。
+            "chapters" | "youtube-chapters" | "chapter" => {
+                let chapters = crate::utils::chapters::plan_chapters(
+                    segments,
+                    crate::utils::chapters::DEFAULT_TARGET_SECS,
+                );
+                Self::write_chapters_inner(&chapters, path)
+            }
             "fcpxml" => super::fcpxml::FcpXmlExporter::write_to_file(
                 segments,
                 path,
@@ -718,6 +730,48 @@ Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bol
         }
         Ok(())
     }
+
+    /// 章节文本的实际写盘（不含原子包装）。
+    ///
+    /// 章节不是「段 → 行」的子集，所以这里不遍历 `segments`，只把
+    /// [`crate::utils::chapters::to_youtube_chapters`] 的结果落盘。空章节列表写成
+    /// 空文件（而不是不创建文件）：调用方明确要了 `.txt`，缺文件比空文件更难解释。
+    fn write_chapters_inner(
+        chapters: &[crate::utils::chapters::Chapter],
+        path: &Path,
+    ) -> Result<()> {
+        let mut file = File::create(path).with_context(|| "创建章节文件失败")?;
+        let text = crate::utils::chapters::to_youtube_chapters(chapters);
+        if !text.is_empty() {
+            // 末尾补一个换行：POSIX 文本惯例，用户往后追加内容时也不会和时间戳粘成一行。
+            writeln!(file, "{}", text)?;
+        }
+        Ok(())
+    }
+}
+
+/// 把「已定稿的章节列表」写成 YouTube 章节文本（`.txt`）。
+///
+/// # 为什么是独立入口，而不是给 `write_to_file` 加参数
+///
+/// `write_to_file` 的输入是 `&[Segment]`（逐句字幕），章节的输入是
+/// `&[Chapter]`（时间 + 标题）。二者的数据模型对不上：章节可能来自模型、可能被
+/// 用户手改过，标题与任何一句字幕都不是一一对应的。硬塞进同一个签名，只能靠
+/// 「传空 segments + 全局状态」这种把戏。所以分成两条路：
+///
+/// - 手上有 `Vec<Chapter>`（模型已给标题 / 用户已改标题）→ 调本函数；
+/// - 只有 `segments` → 调 `write_to_file(segments, path, "chapters")`，走兜底分组。
+///
+/// 原子性与其它格式一致（[`SubtitleWriter::write_atomic`]：先写 `.part`，全部
+/// 成功后才 rename 覆盖），失败不会毁掉用户原有的 `.txt`。
+pub fn write_chapters_file<P: AsRef<Path>>(
+    chapters: &[crate::utils::chapters::Chapter],
+    path: P,
+) -> Result<()> {
+    let path = path.as_ref();
+    SubtitleWriter::write_atomic(path, |target| {
+        SubtitleWriter::write_chapters_inner(chapters, target)
+    })
 }
 
 /// 导出格式说明：`(扩展名, 系统文件对话框的过滤器名)`。
@@ -730,9 +784,10 @@ Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bol
 /// 这类静默不一致（本函数就是从 `src/ui/views/library.rs` 收敛上来的）。
 ///
 /// 约定：
-/// - 返回的扩展名**同时也是** [`SubtitleWriter::write_to_file_with_mode`] 的
+/// - 返回的扩展名默认**也是** [`SubtitleWriter::write_to_file_with_mode`] 的
 ///   `format` 参数：取值全部来自 `write_in_place` 认的规范名，调用方可以
-///   「拿到什么就写什么」，扩展名与内容天然一致。
+///   「拿到什么就写什么」，扩展名与内容天然一致。**同扩展名、不同格式名**的那几项
+///   （`txt-ts`、`chapters`）必须走 [`canonical_write_format`]。
 /// - 认 writer 的拼写别名：`ebu-tt-d`/`ebutt` 与 `ttml` 同源、`netflix-ttal`
 ///   与 `ttal` 同源。别名只在这里归一，写盘仍用规范扩展名，否则手改过
 ///   `config.toml` 的用户会拿到「扩展名与内容对不上」的文件。
@@ -743,8 +798,8 @@ Style: Default,Microsoft YaHei,{size},{primary},&H000000FF,{outline},{back},{bol
 ///   报错）。剪映 / FCPXML / Premiere XML 走剪辑台的专用导出链路（整目录导出
 ///   或各自的文件对话框），不属于配置项「字幕输出格式」的取值，故同样回落 `srt`。
 ///
-/// 注意这里返回的**第一个值是扩展名**（不是格式名）：`txt-ts` 的扩展名就是 `txt`。
-/// 写盘时该传哪一个见 [`canonical_write_format`]。
+/// 注意这里返回的**第一个值是扩展名**（不是格式名）：`txt-ts` 与 `chapters`
+/// 的扩展名都是 `txt`。写盘时该传哪一个见 [`canonical_write_format`]。
 pub fn export_spec_for(fmt: &str) -> (&'static str, &'static str) {
     match fmt.trim().to_lowercase().as_str() {
         "ass" => ("ass", "ASS 特效字幕"),
@@ -753,6 +808,8 @@ pub fn export_spec_for(fmt: &str) -> (&'static str, &'static str) {
         "lrc" => ("lrc", "LRC 唱词"),
         "txt-ts" | "txtts" => ("txt", "带时间码纯文本"),
         "txt" => ("txt", "TXT 纯文本"),
+        // 章节的扩展名也是 `txt`，但写盘格式名是 `chapters`（见 [`canonical_write_format`]）。
+        "chapters" | "youtube-chapters" | "chapter" => ("txt", "YouTube 章节列表"),
         "json" => ("json", "JSON 结构化字幕"),
         "ttml" | "ebu-tt-d" | "ebutt" => ("ttml", "EBU-TT-D 广播字幕"),
         "ttal" | "netflix-ttal" => ("ttal", "Netflix TTAL 字幕"),
@@ -770,7 +827,8 @@ pub fn export_spec_for(fmt: &str) -> (&'static str, &'static str) {
 /// 导出内容却是纯文本——文件名对、内容错，而且是静默发生的。
 ///
 /// 这两件事从此各归各位：**扩展名**只用于文件名与对话框过滤器，
-/// **规范格式名**只用于写盘。`txt` 与 `txt-ts` 这对同扩展名的组合就是判据。
+/// **规范格式名**只用于写盘。`txt` 与 `txt-ts` 这对同扩展名的组合就是判据
+/// （`chapters` 同理：扩展名是 `txt`，格式名是 `chapters`）。
 pub fn canonical_write_format(fmt: &str) -> &'static str {
     match fmt.trim().to_lowercase().as_str() {
         "ass" => "ass",
@@ -779,6 +837,8 @@ pub fn canonical_write_format(fmt: &str) -> &'static str {
         "lrc" => "lrc",
         "txt-ts" | "txtts" => "txt-ts",
         "txt" => "txt",
+        // 章节：写盘内容由 `Chapter` 列表决定，`write_to_file` 只用 segments 走兜底分组。
+        "chapters" | "youtube-chapters" | "chapter" => "chapters",
         "json" => "json",
         "ttml" | "ebu-tt-d" | "ebutt" => "ttml",
         "ttal" | "netflix-ttal" => "ttal",
@@ -3348,5 +3408,49 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// 章节导出：`write_chapters_file` 写出 YouTube 章节文本（首章强制 00:00），
+    /// 走原子写盘（目录里不留 `.part`）；只拿得到 segments 的通用链路也能落兜底章节。
+    #[test]
+    fn chapters_export_writes_youtube_text() {
+        let chapters = vec![
+            crate::utils::chapters::Chapter {
+                start_secs: 12.0,
+                title: "正片开始".to_string(),
+            },
+            crate::utils::chapters::Chapter {
+                start_secs: 95.0,
+                title: "第二段".to_string(),
+            },
+        ];
+        let dir = tmp_dir("chapters");
+        let out = dir.join("chapters.txt");
+        write_chapters_file(&chapters, &out).expect("章节导出应成功");
+
+        let content = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(content, "00:00 正片开始\n01:35 第二段\n");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应残留 .part: {leftovers:?}");
+
+        // 格式名映射：扩展名是 txt，但写盘格式名必须仍是 chapters
+        assert_eq!(export_spec_for("chapters").0, "txt");
+        assert_eq!(canonical_write_format("youtube-chapters"), "chapters");
+
+        // 没有 Chapter 列表、只有 segments 的链路：走兜底分组，照样产出可发布的章节
+        let fallback = dir.join("fallback.txt");
+        SubtitleWriter::write_to_file(&sample(), &fallback, "chapters").unwrap();
+        let fallback_text = std::fs::read_to_string(&fallback).unwrap();
+        assert!(
+            fallback_text.starts_with("00:00 "),
+            "兜底章节首行必须是 00:00: {fallback_text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
