@@ -281,6 +281,8 @@ fn install_imported_subtitles(
     // 换了文档就把目标语言对齐到这份字幕的语言：上次残留的「日本語」目标配
     // 一份日语字幕，点翻译等于日语译日语（引擎全判复制 → 整片失败）。
     state.adopt_source_language_for_translation();
+    // 代次 +1：正在跑的翻译任务收尾时会比对它，避免把结果并进这份新文档。
+    state.bump_doc_epoch();
     // 导入的字幕不属于历史库里的任何一条记录：置空避免把编辑
     // 写回到别的工程的库行上（那是静默数据损坏）。
     state.active_task_id = None;
@@ -2571,6 +2573,7 @@ impl MainWindow {
                                     // 目标语言是长期偏好，但换了视频不改，就会拿上一个视频的
                                     // 目标语言去译这一个（日语视频配残留的「日本語」= 日语译日语）。
                                     this.state.adopt_source_language_for_translation();
+                                    this.state.bump_doc_epoch();
                                     // 登记 `active_task_id` 要用的 id 此刻还在后台，先记下这份
                                     // 结果的「文档身份」：回写时若对不上，说明用户已经点开了别的
                                     // 工程、或又开了一单转写，那就绝不能把这份 id 挂到当前的
@@ -3810,6 +3813,13 @@ impl MainWindow {
         };
         cx.notify();
 
+        // 收尾合并的冲突基线（S4）+ 文档代次（S1）：翻译要跑几分钟，这段时间里
+        // 用户可能改了原文/手写译文，也可能直接切到别的工程。没有这两样，收尾
+        // 就会把机翻结果盖到用户的手工劳动上，或写进另一个文档的库行。
+        let baseline = std::sync::Arc::new(
+            crate::app::state::TranslationBaseline::capture(&work_segments),
+        );
+        let epoch_at_start = self.state.doc_epoch;
         let segments = work_segments;
         let target_lang = self.state.translate_target_lang.clone();
         // 另存一份给收尾统计用：`target_lang` 会被 move 进下面的异步块。
@@ -3835,6 +3845,42 @@ impl MainWindow {
         // 译文就会随一次网络抖动全部作废。
         let partial_sink = crate::engines::translate::PartialSink::default();
         let partial_sink_for_task = partial_sink.clone();
+
+        // 增量落盘（S3）：翻译要跑几分钟，此前译文只在收尾写库，中途关窗/崩溃等于
+        // 整段工作归零。这里每 3 秒把引擎刷新的增量结果合并进当前字幕表并落库；
+        // 文档已切换或任务已结束就立刻停（S1：绝不把结果写进别的文档）。
+        {
+            let sink = partial_sink.clone();
+            let base = baseline.clone();
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(3))
+                    .await;
+                let snapshot = {
+                    let guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.clone()
+                };
+                let keep_running = this
+                    .update(cx, |this, cx| {
+                        if this.state.doc_epoch != epoch_at_start || !this.state.is_translating {
+                            return false;
+                        }
+                        if let Some(done) = snapshot {
+                            this.state
+                                .merge_translations_checked(done, Some(base.as_ref()));
+                            this.state.segments_dirty = true;
+                            this.state.flush_segments_if_dirty();
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_running {
+                    break;
+                }
+            })
+            .detach();
+        }
 
         cx.spawn(async move |this, cx| {
             let handle = cx.background_executor().spawn(async move {
@@ -3945,7 +3991,25 @@ impl MainWindow {
                         // 编辑会被静默回滚——改了半天，翻译一结束全没了。
                         // `merge_translations` 只把译文按 index 并回去，原文/时间
                         // 等用户改动原样保留。
-                        this.state.merge_translations(translated_segs);
+                        // S1：收尾前先确认还停在同一个文档上。期间用户导入字幕、
+                        // 又跑了一单转写或打开别的工程，这份结果属于上一个文档，
+                        // 合并进来就是「译文写进别的工程」的静默数据污染。
+                        if this.state.doc_epoch != epoch_at_start {
+                            tracing::warn!(
+                                "翻译完成时文档已切换，结果已丢弃（不合并、不落库）"
+                            );
+                            this.state.translate_status_msg =
+                                "翻译结果已丢弃：期间切换了工程或重新导入了字幕".to_string();
+                            return;
+                        }
+                        // S4：带冲突判定的合并——期间被改过原文的句子、以及用户手写
+                        // 的译文都不覆盖，只并「原文没变且译文没动过」的那些。
+                        let skipped = this
+                            .state
+                            .merge_translations_checked(translated_segs, Some(baseline.as_ref()));
+                        if skipped > 0 {
+                            tracing::info!("翻译收尾跳过 {skipped} 句：期间原文或译文被编辑过");
+                        }
                         // 译出新译文后，若当前处于「仅原文」模式，自动切为「双语对照」，
                         // 让用户一眼在监视器画面与导出栏看到刚刚译出的目标语言。
                         if done > 0 && this.editor_export_mode == crate::subtitle::ExportMode::RawOnly {
@@ -3973,10 +4037,23 @@ impl MainWindow {
                         };
                         if let Some(segs) = partial {
                             if segs.iter().any(|s| s.has_translation()) {
-                                info!("翻译中止，合并本次已译出的部分译文");
-                                this.state.merge_translations(segs);
-                                this.state.segments_dirty = true;
-                                this.state.flush_segments_if_dirty();
+                                if this.state.doc_epoch != epoch_at_start {
+                                    // 期间切走了工程：这份部分结果属于上一个文档，丢弃。
+                                    tracing::warn!("翻译中止但文档已切换，部分译文不予合并");
+                                } else {
+                                    info!("翻译中止，合并本次已译出的部分译文");
+                                    let skipped = this.state.merge_translations_checked(
+                                        segs,
+                                        Some(baseline.as_ref()),
+                                    );
+                                    if skipped > 0 {
+                                        tracing::info!(
+                                            "部分译文合并跳过 {skipped} 句：期间原文或译文被编辑过"
+                                        );
+                                    }
+                                    this.state.segments_dirty = true;
+                                    this.state.flush_segments_if_dirty();
+                                }
                             }
                         }
                         tracing::warn!("字幕多语言翻译过程报错：{}", e);

@@ -878,6 +878,11 @@ pub struct AppState {
     /// 先试译一段看模型效果），此前只有「全部翻译」一条路——在线接口按 token
     /// 计费，重译一遍整片既慢又烧钱。勾选后点「开始翻译」只发送这几句。
     pub translate_pick: Option<std::collections::BTreeSet<i64>>,
+    /// 文档代次：**每次整份替换字幕表**（导入、转写完成、打开工程）就 +1。
+    ///
+    /// 翻译任务开工时记下代次，收尾/增量落盘时比对：不一致说明用户已经切走了，
+    /// 这份结果属于上一个工程，绝不能并进现在这张表——那是最难排查的数据污染。
+    pub doc_epoch: u64,
 
     // 硬件与模型资源监控
     pub metrics: ResourceMetrics,
@@ -1054,8 +1059,36 @@ pub fn source_language_label(segments: &[Segment]) -> Option<&'static str> {
     }
 }
 
-impl AppState {
-    /// 本机逻辑核心数。设置页滑条量程与线程数收敛共用同一来源，
+/// 翻译任务开工时的句子基线：收尾合并与增量落盘时的冲突判定依据
+/// （见 [`AppState::merge_translations_checked`]）。
+#[derive(Clone, Default)]
+pub struct TranslationBaseline {
+    /// `Segment::index` -> 开工时的源文本（`translate_source()`）
+    pub source: std::collections::HashMap<i64, String>,
+    /// `Segment::index` -> 开工时的译文（空串视为 `None`）
+    pub translation: std::collections::HashMap<i64, Option<String>>,
+}
+
+impl TranslationBaseline {
+    pub fn capture(segments: &[Segment]) -> Self {
+        let mut source = std::collections::HashMap::with_capacity(segments.len());
+        let mut translation = std::collections::HashMap::with_capacity(segments.len());
+        for seg in segments {
+            let idx = seg.index as i64;
+            source.insert(idx, seg.translate_source());
+            translation.insert(
+                idx,
+                seg.translation.clone().filter(|t| !t.trim().is_empty()),
+            );
+        }
+        Self {
+            source,
+            translation,
+        }
+    }
+}
+
+impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数收敛共用同一来源，
     /// 避免 UI 显示的上限与实际生效值不一致。
     pub fn logical_cores() -> u32 {
         std::thread::available_parallelism()
@@ -1203,6 +1236,7 @@ impl AppState {
             translate_target_lang,
             translate_mode,
             translate_pick: None,
+            doc_epoch: 0,
             metrics: ResourceMetrics::default(),
 
             active_tab: WorkspaceTab::Editor, // 默认主界面为剪辑校对工作台
@@ -1774,6 +1808,23 @@ impl AppState {
     ///
     /// 只搬**非空**译文，不碰用户可能已改动的原文 / 时间 / 说话人。
     pub fn merge_translations(&mut self, translated: Vec<Segment>) {
+        self.merge_translations_checked(translated, None);
+    }
+
+    /// 收尾合并（带冲突判定）：`baseline` 是开工时抓的句子基线。
+    ///
+    /// 判定规则（任一命中就**丢弃**这一条的机翻结果，保留用户当前的内容）：
+    /// 1. **原文被改过**：开工时那句是 A、现在是 B，机翻时看到的是 A，套到 B 上就是
+    ///    张冠李戴（这是唯一会静默毁掉用户手工劳动的路径）；
+    /// 2. **译文被用户手改过**：句中译文与开工时不同，说明翻译这几分钟里用户自己
+    ///    改/写了一条，机翻不该覆盖它。
+    ///
+    /// 返回被跳过的条数，供上层提示「N 句因期间编辑过而保留原样」。
+    pub fn merge_translations_checked(
+        &mut self,
+        translated: Vec<Segment>,
+        baseline: Option<&TranslationBaseline>,
+    ) -> usize {
         use std::collections::HashMap;
         // 毫秒取整做键：快照与当前表里的 start 是**逐字节复制**的同一 f64，
         // 取整后必然相等；同时规避 -0.0 / 0.0 之类的位级差异。
@@ -1782,24 +1833,53 @@ impl AppState {
         for seg in translated {
             by_start.insert(key(seg.start), seg);
         }
+        let mut skipped = 0usize;
         for seg in self.segments.iter_mut() {
-            if let Some(src) = by_start.get(&key(seg.start)) {
-                // 引擎解析失败时可能回填空串，用它覆盖用户已有的好译文会让
-                // 「翻译一结束译文变空白」，故只认非空译文。
-                if src.has_translation() {
-                    // 先进语言包，再投影成「当前展示」：换目标语言重译时，旧语言的
-                    // 那一份留在 `translations` 里，用户随时能在「字幕语言包」切回去。
-                    if let (Some(lang), Some(text)) =
-                        (src.translation_lang.as_deref(), src.translation.as_deref())
-                    {
-                        seg.set_translation_pack(lang, text);
+            let Some(src) = by_start.get(&key(seg.start)) else {
+                continue;
+            };
+            // 引擎解析失败时可能回填空串，用它覆盖用户已有的好译文会让
+            // 「翻译一结束译文变空白」，故只认非空译文。
+            if !src.has_translation() {
+                continue;
+            }
+            if let Some(base) = baseline {
+                let idx = seg.index as i64;
+                // ① 原文被改过：这条译文对不上现在的原文
+                if let Some(then_src) = base.source.get(&idx) {
+                    if then_src != &seg.translate_source() {
+                        skipped += 1;
+                        continue;
                     }
-                    seg.translation = src.translation.clone();
-                    seg.translation_lang = src.translation_lang.clone();
+                }
+                // ② 译文被用户手改过：不覆盖
+                let now = seg.translation.clone().filter(|t| !t.trim().is_empty());
+                let then = base.translation.get(&idx).cloned().flatten();
+                let incoming = src.translation.clone().filter(|t| !t.trim().is_empty());
+                // `now == incoming` 是本函数上一次写下的值（增量落盘会反复合并同一份
+                // 快照），不能误判成「人手改过」而跳过，否则第二次合并就全部失效。
+                if now != then && now != incoming {
+                    skipped += 1;
+                    continue;
                 }
             }
+            // 先进语言包，再投影成「当前展示」：换目标语言重译时，旧语言的
+            // 那一份留在 `translations` 里，用户随时能在「字幕语言包」切回去。
+            if let (Some(lang), Some(text)) =
+                (src.translation_lang.as_deref(), src.translation.as_deref())
+            {
+                seg.set_translation_pack(lang, text);
+            }
+            seg.translation = src.translation.clone();
+            seg.translation_lang = src.translation_lang.clone();
         }
         self.bump_segments_revision();
+        skipped
+    }
+
+    /// 文档代次 +1：整份替换字幕表时调用（导入 / 转写完成 / 打开工程）。
+    pub fn bump_doc_epoch(&mut self) {
+        self.doc_epoch = self.doc_epoch.wrapping_add(1);
     }
 
     /// 切换目标语言并落盘。目标语言是长期偏好，必须持久化，
@@ -5771,6 +5851,73 @@ mod tests {
     }
     /// 回归：翻译收尾必须**按句合并**，不能整表覆盖。
     ///
+    /// S4：翻译期间用户改了**原文**，收尾不得把「按旧原文译出的结果」盖上去。
+    #[test]
+    fn merge_skips_translations_whose_source_changed() {
+        use crate::subtitle::Segment;
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "原始第一句")]);
+        let baseline = super::TranslationBaseline::capture(&state.segments);
+
+        // 翻译跑的同时用户把原文改了
+        state.segments[0].text = "用户改过的第一句".to_string();
+        let mut translated = state.segments.clone();
+        translated[0].translation = Some("First sentence.".to_string());
+        translated[0].translation_lang = Some("English".to_string());
+
+        let skipped = state.merge_translations_checked(translated, Some(&baseline));
+        assert_eq!(skipped, 1, "原文变了的句子必须被跳过");
+        assert!(
+            state.segments[0].translation.is_none(),
+            "旧原文的译文不能贴到新原文上: {:?}",
+            state.segments[0].translation
+        );
+    }
+
+    /// S4：翻译期间用户手写了译文，收尾不得覆盖。
+    #[test]
+    fn merge_keeps_user_handwritten_translation() {
+        use crate::subtitle::Segment;
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "原始第一句")]);
+        let baseline = super::TranslationBaseline::capture(&state.segments);
+
+        // 翻译期间用户自己写了译文
+        state.segments[0].translation = Some("我自己写的".to_string());
+        state.segments[0].translation_lang = Some("English".to_string());
+        let mut translated = state.segments.clone();
+        translated[0].translation = Some("Machine text.".to_string());
+
+        let skipped = state.merge_translations_checked(translated, Some(&baseline));
+        assert_eq!(skipped, 1, "手写译文必须被保留");
+        assert_eq!(state.segments[0].translation.as_deref(), Some("我自己写的"));
+    }
+
+    /// 增量落盘会**反复**合并同一份快照：第二次不能因为「译文已不是开工值」
+    /// 就被误判成手改而全部跳过，否则「翻译一会落盘一点」只会生效一次。
+    #[test]
+    fn merge_is_idempotent_across_incremental_flushes() {
+        use crate::subtitle::Segment;
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "原始第一句")]);
+        let baseline = super::TranslationBaseline::capture(&state.segments);
+
+        let mut translated = state.segments.clone();
+        translated[0].translation = Some("First sentence.".to_string());
+        translated[0].translation_lang = Some("English".to_string());
+
+        assert_eq!(
+            state.merge_translations_checked(translated.clone(), Some(&baseline)),
+            0
+        );
+        assert_eq!(
+            state.merge_translations_checked(translated, Some(&baseline)),
+            0,
+            "同一份快照重复合并应当都生效（幂等），不能被当成手改而跳过"
+        );
+        assert_eq!(
+            state.segments[0].translation.as_deref(),
+            Some("First sentence.")
+        );
+    }
+
     /// 语言包：换目标语言重译**不能**把旧语言的译文覆盖掉，切回去要能原样还原。
     ///
     /// 这就是「字幕语言包」面板的数据基础：此前只有 `translation` 一份，译成英文

@@ -1011,6 +1011,14 @@ pub struct LLMEngine {
     /// 与 `glossary` 同一套理由用 `Mutex` 持有：引擎挂在 `Arc` 后面共享、
     /// 写回时拿不到 `&mut self`；每批写一次，开销可忽略。
     rewrite_stats: Mutex<RewriteStats>,
+    /// 增量结果槽：每译完一批就把**当前整份字幕表**写进这个共享槽。
+    ///
+    /// 两个用途（对应审计里的 S2 / S3）：
+    /// 1. 整片失败（复制率过高、一句都没译出）时，上层能拿到已译好的部分，
+    ///    而不是随 `Err` 一起丢掉几百句的成果；
+    /// 2. 界面每隔几秒读一次，把已译部分合并进当前字幕表并落库——翻译要跑几分钟，
+    ///    中途关窗/崩溃不再等于整段工作归零。
+    partial_sink: Mutex<Option<crate::engines::translate::PartialSink>>,
 }
 
 impl LLMEngine {
@@ -1028,6 +1036,20 @@ impl LLMEngine {
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             glossary: Mutex::new(String::new()),
             rewrite_stats: Mutex::new(RewriteStats::default()),
+            partial_sink: Mutex::new(None),
+        }
+    }
+
+    /// 注入增量结果槽（翻译面板在起手前调用）。
+    pub fn set_partial_sink(&self, sink: crate::engines::translate::PartialSink) {
+        *self.partial_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    }
+
+    /// 把当前字幕表整份塞进结果槽（只做克隆；每批一次，代价可忽略）。
+    fn stash_partial(&self, segments: &[Segment]) {
+        let guard = self.partial_sink.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sink) = guard.as_ref() {
+            *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(segments.to_vec());
         }
     }
 
@@ -1861,6 +1883,8 @@ impl LLMEngine {
             copy.rejected += count_untranslated_copies(&segments, &copy_candidates, target_lang);
 
             completed += chunk.len();
+            // 每批刷新增量结果槽：界面每隔几秒合并落盘一次，整片失败时也不丢已译部分。
+            self.stash_partial(&segments);
             if let Some(ref cb) = progress_cb {
                 let progress = completed as f64 / pending_total.max(1) as f64;
                 cb(

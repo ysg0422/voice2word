@@ -284,6 +284,11 @@ impl TranslateEngine {
                 }
                 // 取消标志下沉到引擎：润色/翻译都是分批长循环，取消必须能在批次之间生效
                 engine.install_cancel_flag(cancel);
+                // 离线链路同样要能「翻译一会落盘一点」+ 失败时保住已译部分（S2/S3）：
+                // 把同一个增量结果槽交给 LLM 引擎，它在每批结束时刷新。
+                if let Some(sink) = self.partial_sink.clone() {
+                    engine.set_partial_sink(sink);
+                }
                 let result = engine.translate(segments, target_lang, progress_cb);
                 // 离线链路的自愈统计在引擎内累积，这里读出来统一暴露给上层。
                 self.store_rewrite_stats(engine.last_rewrite_stats());
@@ -723,6 +728,9 @@ fn translate_via_online_api_with_stats(
             .iter()
             .filter(|&&pos| segments[pos].translation_matches(target_lang))
             .count();
+        // 每批都把当前结果刷新到共享槽：界面据此「翻译一会就落盘一点」，
+        // 整片失败时也能把已译、已计费的部分合并回去（S2/S3）。
+        stash_partial(partial, &segments);
         if let Some(ref cb) = progress_cb {
             let progress = completed as f64 / pending_total.max(1) as f64;
             cb(
