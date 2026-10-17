@@ -1363,6 +1363,163 @@ pub fn build_replace_audio_args(
     args
 }
 
+// ─────────── 内嵌字幕（软字幕轨）封装 ───────────
+
+/// 语言显示名 → ISO 639-2/T 代码，写进字幕轨的 `language` 元数据。
+pub fn iso639_2(lang: &str) -> &'static str {
+    match lang.trim() {
+        "简体中文" | "繁体中文" | "中文" => "chi",
+        "English" => "eng",
+        "日本語" => "jpn",
+        "한국어" => "kor",
+        "Русский" => "rus",
+        "Français" => "fra",
+        "Deutsch" => "deu",
+        "Español" => "spa",
+        "Italiano" => "ita",
+        _ => "und",
+    }
+}
+
+/// mp4/m4v 只能装 `mov_text`，其余容器（mkv 等）用 `srt`。
+fn subtitle_codec_for(output: &std::path::Path) -> &'static str {
+    match output
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("mp4") | Some("m4v") => "mov_text",
+        _ => "srt",
+    }
+}
+
+/// 组装「把若干字幕轨封装进视频」的 ffmpeg 参数（纯函数，便于单测）。
+///
+/// 视频与音频一律 `-c copy`（不重编码，分钟级素材也只要几秒）；只对新增的
+/// 字幕轨指定编码。`tracks` 的顺序就是字幕轨顺序，第 0 条通常放原文。
+pub fn mux_subtitle_args(
+    input: &std::path::Path,
+    tracks: &[(String, std::path::PathBuf)],
+    output: &std::path::Path,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    args.push("-y".into());
+    args.push("-i".into());
+    args.push(input.as_os_str().to_os_string());
+    for (_, path) in tracks {
+        args.push("-i".into());
+        args.push(path.as_os_str().to_os_string());
+    }
+    // 保留输入的全部音视频流，再逐条挂上字幕文件的第一条流。
+    args.push("-map".into());
+    args.push("0".into());
+    for i in 0..tracks.len() {
+        args.push("-map".into());
+        args.push(format!("{}:0", i + 1).into());
+    }
+    args.push("-c".into());
+    args.push("copy".into());
+    args.push("-c:s".into());
+    args.push(subtitle_codec_for(output).into());
+    for (i, (label, _)) in tracks.iter().enumerate() {
+        args.push(format!("-metadata:s:s:{i}").into());
+        args.push(format!("language={}", iso639_2(label)).into());
+    }
+    args.push(output.as_os_str().to_os_string());
+    args
+}
+
+impl FFmpegEngine {
+    /// 把若干字幕轨封装进视频（软字幕，播放器里可切换）。
+    ///
+    /// 不重编码：视频/音频 `-c copy`，只新增字幕流，因此大文件也是秒级。
+    pub fn mux_subtitles(
+        &self,
+        input: &std::path::Path,
+        tracks: &[(String, std::path::PathBuf)],
+        output: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        if tracks.is_empty() {
+            anyhow::bail!("没有可封装的字幕轨");
+        }
+        if !input.exists() {
+            anyhow::bail!("媒体文件不存在：{}", input.display());
+        }
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        cmd.args(mux_subtitle_args(input, tracks, output));
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let out = cmd.output().context("启动 ffmpeg 封装字幕失败")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!(
+                "封装字幕失败：{}",
+                stderr.lines().last().unwrap_or("ffmpeg 返回非零退出码")
+            );
+        }
+        if !output.exists() {
+            anyhow::bail!("封装字幕失败：未生成输出文件");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mux_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn iso_codes_cover_supported_languages() {
+        assert_eq!(iso639_2("简体中文"), "chi");
+        assert_eq!(iso639_2("繁体中文"), "chi");
+        assert_eq!(iso639_2("English"), "eng");
+        assert_eq!(iso639_2("日本語"), "jpn");
+        assert_eq!(iso639_2("한국어"), "kor");
+        assert_eq!(iso639_2("未知语言"), "und");
+    }
+
+    #[test]
+    fn mux_args_map_source_and_tracks_in_order() {
+        let args = mux_subtitle_args(
+            Path::new("in.mp4"),
+            &[
+                ("简体中文".to_string(), PathBuf::from("zh.srt")),
+                ("English".to_string(), PathBuf::from("en.srt")),
+            ],
+            Path::new("out.mkv"),
+        );
+        let s: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(s[0], "-y");
+        assert_eq!(&s[1..3], &["-i", "in.mp4"]);
+        assert_eq!(&s[3..5], &["-i", "zh.srt"]);
+        assert_eq!(&s[5..7], &["-i", "en.srt"]);
+        assert!(s.contains(&"-c".to_string()));
+        assert!(s.contains(&"copy".to_string()));
+        assert!(s.iter().any(|x| x == "language=chi"));
+        assert!(s.iter().any(|x| x == "language=eng"));
+        assert_eq!(s.last().unwrap(), "out.mkv");
+    }
+
+    #[test]
+    fn mp4_output_uses_mov_text_and_mkv_uses_srt() {
+        let tracks = vec![("English".to_string(), PathBuf::from("en.srt"))];
+        let mp4 = mux_subtitle_args(Path::new("a.mp4"), &tracks, Path::new("b.mp4"));
+        let mkv = mux_subtitle_args(Path::new("a.mp4"), &tracks, Path::new("b.mkv"));
+        let has = |args: &Vec<std::ffi::OsString>, v: &str| {
+            args.iter().any(|a| a.to_string_lossy() == v)
+        };
+        assert!(has(&mp4, "mov_text"), "mp4 必须用 mov_text");
+        assert!(has(&mkv, "srt"), "mkv 必须用 srt");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

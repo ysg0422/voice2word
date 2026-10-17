@@ -4794,6 +4794,27 @@ impl MainWindow {
                             })),
                     ),
             )
+            // 内嵌字幕：把原文 + 各语言译文封成软字幕轨，交付/上传时可直接切轨。
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .flex_shrink_0()
+                            .child("内嵌字幕"),
+                    )
+                    .child(
+                        primitives::chip_clickable("封装为 MKV", false, false)
+                            .id("export-embedded-mkv")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_embedded_subtitles(cx);
+                            })),
+                    ),
+            )
             // 格式选择 + 导出按钮
             .child(
                 div()

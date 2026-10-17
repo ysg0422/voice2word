@@ -2879,6 +2879,121 @@ impl MainWindow {
         .detach();
     }
 
+    /// 内嵌字幕导出：把「原文 + 各语言译文」作为**软字幕轨**封装进 mkv。
+    ///
+    /// 交付/上传时需要的是「一个能直接播、能切语言」的文件，而此前只能导出外挂
+    /// 字幕，用户还得自己再跑一遍 ffmpeg。这里 `-c copy` 不重编码，大文件也是秒级。
+    pub(crate) fn export_embedded_subtitles(&mut self, cx: &mut Context<Self>) {
+        const MEDIA_EXT: [&str; 9] = ["mp4", "mkv", "mov", "avi", "flv", "webm", "m4v", "ts", "wmv"];
+        let Some(media) = self.state.selected_file.clone() else {
+            self.notice = Some("内嵌字幕需要先打开一个视频文件".to_string());
+            cx.notify();
+            return;
+        };
+        let is_media = media
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| MEDIA_EXT.contains(&e.to_ascii_lowercase().as_str()))
+            .unwrap_or(false);
+        if !is_media || !media.exists() {
+            self.notice = Some("当前选中的不是视频文件（导入的字幕没有媒体可封装）".to_string());
+            cx.notify();
+            return;
+        }
+        if self.state.segments.is_empty() {
+            return;
+        }
+
+        let style = self.state.config.subtitle_style.clone();
+        let segments = self.state.segments.clone();
+        let packs = self.state.translation_packs();
+        let source_lang = crate::app::state::source_language_label(&segments)
+            .unwrap_or("原文")
+            .to_string();
+        let stem = media
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("subtitles")
+            .to_string();
+        let out = media.with_file_name(format!("{stem}.embedded.mkv"));
+        let dir = std::env::temp_dir().join(format!("v2w-embed-{}", std::process::id()));
+
+        let mut tracks: Vec<(String, std::path::PathBuf)> = Vec::new();
+        let mut build = || -> anyhow::Result<()> {
+            std::fs::create_dir_all(&dir)?;
+            // 第 0 轨：原文
+            let mut src_segs = segments.clone();
+            for seg in src_segs.iter_mut() {
+                seg.show_source_only();
+            }
+            let src_path = dir.join("00-source.srt");
+            crate::subtitle::SubtitleWriter::write_to_file_with_style(
+                &src_segs,
+                &src_path,
+                "srt",
+                crate::subtitle::ExportMode::RawOnly,
+                &style,
+            )?;
+            tracks.push((source_lang.clone(), src_path));
+            // 其余轨：每种语言各一份
+            for (i, (lang, _)) in packs.iter().enumerate() {
+                let mut segs = segments.clone();
+                for seg in segs.iter_mut() {
+                    if !seg.show_translation_pack(lang) {
+                        seg.show_source_only();
+                    }
+                }
+                let path = dir.join(format!("{:02}-{i}.srt", i + 1));
+                crate::subtitle::SubtitleWriter::write_to_file_with_style(
+                    &segs,
+                    &path,
+                    "srt",
+                    crate::subtitle::ExportMode::TranslationOnly,
+                    &style,
+                )?;
+                tracks.push((lang.clone(), path));
+            }
+            Ok(())
+        };
+        if let Err(e) = build() {
+            self.notice = Some(format!("内嵌字幕导出失败：{e}"));
+            cx.notify();
+            return;
+        }
+
+        let ffmpeg_path =
+            crate::utils::config::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
+        self.notice = Some(format!(
+            "正在封装 {} 条字幕轨到 {}…",
+            tracks.len(),
+            out.display()
+        ));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    let engine = crate::engines::FFmpegEngine::new(ffmpeg_path);
+                    engine.mux_subtitles(&media, &tracks, &out)?;
+                    Ok::<std::path::PathBuf, anyhow::Error>(out)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match res {
+                    Ok(path) => {
+                        info!("内嵌字幕视频已导出: {:?}", path);
+                        this.notice = Some(format!("已导出内嵌字幕视频：{}", path.display()));
+                    }
+                    Err(e) => {
+                        this.notice = Some(format!("内嵌字幕导出失败：{e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 导出剪映草稿至指定独立文件夹
     pub(crate) fn export_jianying_folder(&mut self, cx: &mut Context<Self>) {
         if self.state.segments.is_empty() {
