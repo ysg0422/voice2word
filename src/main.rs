@@ -70,6 +70,10 @@ fn main() -> Result<()> {
     info!("Voice2Word 启动中 (Rust + GPUI Edition)...");
     info!("==========================================");
 
+    // 1.2 单实例探测（F6）：只警告、绝不阻断启动。guard 必须活到进程结束，
+    //     drop 即释放端口，因此绑定成功本身就成了「已有实例在跑」的判据。
+    let _instance_guard = probe_single_instance();
+
     // 1.5 清扫上次运行崩溃/取消时留在 %TEMP% 的中间产物（压实 WAV、切块目录、
     // whisper JSON、预览代理视频等）。转写管线的删除逻辑只在正常路径执行，
     // 报错/取消路径会漏删，因此这里加一道启动兜底，避免 TEMP 无限膨胀。
@@ -93,7 +97,17 @@ fn main() -> Result<()> {
             return Err(err);
         }
     };
-    info!("配置加载成功: {:?}", config);
+    // 配置摘要：**绝不**整份 `{:?}` 打印。`AppConfig` 里有 `translate.api_key`，
+    // 一旦随日志写进 `logs/latest.txt`，而崩溃横幅恰好请用户外发日志，密钥就只能吊销。
+    // 摘要只保留排障真正需要的几项；`TranslateConfig` 的 `Debug` 也已对密钥打码（双保险）。
+    info!(
+        engine = %config.paths.whisper_model,
+        mode = %config.translate.mode,
+        threads = config.pipeline.whisper_threads,
+        processors = config.pipeline.whisper_processors,
+        language = %config.pipeline.language,
+        "配置加载成功"
+    );
     startup.mark("config_load");
     // 主题必须在任何界面构建之前设定：颜色 token 在渲染时才读取全局开关。
     //
@@ -408,6 +422,41 @@ fn main() -> Result<()> {
     db_for_shutdown.maintain_on_shutdown();
 
     Ok(())
+}
+
+/// 单实例探测（F6）：用「绑定固定本地端口」当锁，**不引新依赖**。
+///
+/// 为什么是 `TcpListener`：`std` 自带；Windows 上端口独占是内核语义，进程退出
+/// （含崩溃 / 任务管理器结束）端口立即释放，不会像锁文件那样留下「僵尸锁」，
+/// 也不需要往项目根写任何东西。
+///
+/// # 语义：**只警告，绝不阻断**
+///
+/// - bind 成功 → 返回 listener，由 `main` 持有到进程结束，这就是「本进程是唯一实例」
+///   的凭据；
+/// - bind 失败 → 可能是已有实例，也可能是端口被别的程序占用 / 系统策略禁止监听
+///   （防火墙、受限容器）。两者无法区分，因此**绝不能**据此退出：让程序因为
+///   「端口被占」起不来，比两个实例并发写库的损害大得多。只记一条警告。
+///
+/// # 已知局限（为什么不顺便把已有窗口前置）
+///
+/// 这里在首个窗口创建**之前**执行，主窗口还不存在；跨进程激活已有窗口要按标题
+/// 枚举 `user32` 窗口并处理最小化/多桌面/权限隔离等分支，在启动路径上并不可靠。
+/// 宁可只做「记录警告」这一半，也不做半吊子的窗口激活。
+fn probe_single_instance() -> Option<std::net::TcpListener> {
+    /// 固定探测端口：仅用于「同一台机器上是否已有本应用」，不对外服务。
+    const PROBE_PORT: u16 = 39217;
+    match std::net::TcpListener::bind(("127.0.0.1", PROBE_PORT)) {
+        Ok(listener) => Some(listener),
+        Err(err) => {
+            warn!(
+                %err,
+                port = PROBE_PORT,
+                "单实例探测：端口已被占用（可能已有另一个 Voice2Word 在运行）。继续启动——但两个实例同时写 voice2word.db 可能互相覆盖，建议只保留一个窗口"
+            );
+            None
+        }
+    }
 }
 
 /// 启动关键路径的**致命**错误出口：写日志 + 原生弹窗。

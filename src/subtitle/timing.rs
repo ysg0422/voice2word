@@ -89,12 +89,47 @@ pub fn resolve_overlaps(times: &[(f64, f64)]) -> Vec<(f64, f64)> {
     let mut out: Vec<(f64, f64)> = times.to_vec();
     // 按 start 升序；起点相等时保持原顺序，NaN 用 Equal 兜底以免 panic。
     out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    resolve_overlaps_sorted(out)
+}
 
+/// 与 [`resolve_overlaps`] 同一套去重叠规则，但**输出逐下标对应输入**。
+///
+/// 整轨重定时是「按输入顺序逐条 zip 回去」的：`plan_retime` 保持原顺序，若这里再
+/// 交给会排序的 [`resolve_overlaps`]，调用方拿到的第 i 条就变成了排序后第 i 条的
+/// 时间——乱序轨（start 300/100/200）会把 A 句的时间写到 B 句上。本函数内部仍按
+/// 时间顺序裁决重叠，但把结果写回各自原来的下标，**绝不重排**。
+///
+/// 结果集合仍满足「时间轴升序、无重叠、每条 >= [`MIN_EDIT_DUR`]、start >= 0」；
+/// 只是元素的**存放顺序**与调用方传入的顺序一致。
+pub fn resolve_overlaps_in_place(times: &mut [(f64, f64)]) {
+    if times.len() < 2 {
+        // 单条也要走一遍自身合法化（负起点 / 过短 / 倒挂），与 resolve_overlaps 同口径。
+        if let Some(cue) = times.first_mut() {
+            *cue = normalize_one(*cue);
+        }
+        return;
+    }
+
+    let mut order: Vec<usize> = (0..times.len()).collect();
+    // 稳定排序：起点相等时保持原顺序，NaN 用 Equal 兜底（与 resolve_overlaps 同口径）。
+    order.sort_by(|&a, &b| {
+        times[a]
+            .0
+            .partial_cmp(&times[b].0)
+            .unwrap_or(Ordering::Equal)
+    });
+    let sorted: Vec<(f64, f64)> = order.iter().map(|&i| times[i]).collect();
+    let resolved = resolve_overlaps_sorted(sorted);
+    for (slot, &original_index) in order.iter().enumerate() {
+        times[original_index] = resolved[slot];
+    }
+}
+
+/// 已按 start 升序排好的序列的去重叠内核。调用方负责排序/回写下标。
+fn resolve_overlaps_sorted(mut out: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     // 先让每条自身合法：起点 >= 0，终点至少比起点晚 MIN_EDIT_DUR。
     for cue in out.iter_mut() {
-        let start = cue.0.max(0.0);
-        cue.0 = start;
-        cue.1 = cue.1.max(start + MIN_EDIT_DUR);
+        *cue = normalize_one(*cue);
     }
 
     // 逐条把 start 抬到前一条 end；抬完若自己短于下限，就改为收前一条的 end，
@@ -125,6 +160,12 @@ pub fn resolve_overlaps(times: &[(f64, f64)]) -> Vec<(f64, f64)> {
         cursor = end;
     }
     out
+}
+
+/// 单条区间的自身合法化：起点 >= 0，时长 >= [`MIN_EDIT_DUR`]（倒挂区间一并修正）。
+fn normalize_one(cue: (f64, f64)) -> (f64, f64) {
+    let start = cue.0.max(0.0);
+    (start, cue.1.max(start + MIN_EDIT_DUR))
 }
 
 /// 相邻字幕之间要求的**最小空隙**（秒）。
@@ -818,6 +859,60 @@ mod tests {
     #[test]
     fn resolve_overlaps_of_empty_is_empty() {
         assert!(resolve_overlaps(&[]).is_empty());
+        let mut empty: Vec<(f64, f64)> = Vec::new();
+        resolve_overlaps_in_place(&mut empty);
+        assert!(empty.is_empty());
+    }
+
+    /// F10：乱序字幕 + 0 秒平移，去重叠后仍必须逐下标对应。
+    ///
+    /// `plan_retime` 的输出与输入同序；若把它交给会排序的 `resolve_overlaps`，
+    /// 调用方再按下标 zip 回去，300/100/200 三句就会拿到排序后的时间，等于把
+    /// 后一句的时间写到前一句上。`resolve_overlaps_in_place` 必须写回原下标。
+    #[test]
+    fn retime_zero_shift_on_unsorted_track_keeps_each_index() {
+        let segs = [
+            seg(1, 300.0, 305.0),
+            seg(2, 100.0, 105.0),
+            seg(3, 200.0, 210.0),
+        ];
+        let plan = plan_retime(&segs, TimeShift::ShiftAll { delta: 0.0 });
+        let mut resolved = plan.times.clone();
+        resolve_overlaps_in_place(&mut resolved);
+        assert_eq!(
+            resolved,
+            vec![(300.0, 305.0), (100.0, 105.0), (200.0, 210.0)],
+            "乱序输入必须按下标拿回自己的时间，不能静默重排"
+        );
+        // 对照：会排序的旧 API 确实把顺序改了——这正是不能用于 zip 的原因。
+        assert_eq!(
+            resolve_overlaps(&plan.times),
+            vec![(100.0, 105.0), (200.0, 210.0), (300.0, 305.0)]
+        );
+    }
+
+    /// 乱序且真有重叠时也按原下标回写：排序视图里被后挪的是第二条（原下标 0），
+    /// 不能把排序后的第一条时间写到原下标 0 上。
+    #[test]
+    fn resolve_overlaps_in_place_writes_back_to_original_indices() {
+        let mut times = [(300.0, 310.0), (100.0, 305.0)];
+        resolve_overlaps_in_place(&mut times);
+        // 时间顺序是 (100,305) 后接被抬到 305 的 (305,310)；原下标 0 拿到后者。
+        assert_eq!(times[1], (100.0, 305.0), "原下标 1 保持自己的区间");
+        assert_eq!(
+            times[0],
+            (305.0, 310.0),
+            "原下标 0 拿到的是自己那条被抬后的起点，而不是排序后第 0 条"
+        );
+    }
+
+    /// 单条也要与 `resolve_overlaps` 一样做自身合法化（负起点 / 倒挂 / 过短）。
+    #[test]
+    fn resolve_overlaps_in_place_normalizes_single_cue() {
+        let mut times = [(-2.0, -1.0)];
+        resolve_overlaps_in_place(&mut times);
+        assert_eq!(times[0].0, 0.0);
+        assert!(times[0].1 - times[0].0 >= MIN_EDIT_DUR - 1e-9);
     }
 
     /// describe 是纯函数：同样的输入永远给同样的中文摘要（界面直接显示这句）。

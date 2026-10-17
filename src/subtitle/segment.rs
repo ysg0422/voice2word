@@ -770,8 +770,10 @@ pub fn is_source_chinese(segments: &[Segment]) -> bool {
 
 /// 智能优化字幕时间轴与消除鬼影/闪烁：
 /// 1. 按起始时间升序排序
-/// 2. 剔除无效片段 (duration <= 0.05s) 以及模型幻读重叠鬼影 (< 0.25s 且与后句同时间启动)
-/// 3. 消除时间戳倒退与重叠冲突（前句尾部不超出后句头部）
+/// 2. 剔除无效片段 (duration <= 0.05s) 以及模型幻读鬼影（< 0.25s、与后句几乎同时启动，
+///    **且文本只有 1~2 个字符并与后句高度相似**）
+/// 3. 消除时间戳倒退与重叠冲突（前句尾部不超出后句头部；优先保留文本更长的那条，
+///    万不得已才删文本更短的那条，且绝不把幸存者压到 [`MIN_EDIT_DUR`] 以下）
 /// 4. 长句自动拆分：超过 6 秒 / 60 字的大句按标点就近均分，时间按字数比例分配
 /// 5. 用第 2 步同一判据复扫一遍：消重叠/拆分都只动边界，可能在本次造出新的无效或鬼影片段
 /// 6. 广播级极短句平滑：短句 (< 0.8s) 在间隙允许范围内适当延展，避免 0.1s~0.4s 闪烁过快导致人眼无法阅读
@@ -802,23 +804,19 @@ pub fn optimize_segments(segments: &mut Vec<Segment>) {
         filtered.push(segments[i].clone());
     }
 
-    // 3. 消除时间重叠
-    for j in 0..filtered.len().saturating_sub(1) {
-        if filtered[j].end > filtered[j + 1].start {
-            if filtered[j + 1].start > filtered[j].start {
-                filtered[j].end = (filtered[j].start + 0.1).max(filtered[j + 1].start);
-            } else {
-                filtered[j + 1].start = filtered[j].end;
-            }
-        }
-    }
+    // 3. 消除时间重叠：优先保留文本更长的句子。
+    //
+    // 旧实现无条件把前句终点压到 `start + 0.1`（再交给第 5 步当鬼影删掉），
+    // 于是一条先开始的 3 秒完整台词会被后一句 1 秒短句"截肢"后整句消失。
+    // 这里改成按文本长度裁决：长句保住完整区间，短句让位；短句让不开
+    // （让完不足 MIN_EDIT_DUR）时删短句，而不是压长句。
+    resolve_overlaps_prefer_longer(&mut filtered);
 
     // 4. 长句自动拆分：转写初始阶段就把 8 秒级大句按标点切短，句长可控且画面字幕不超屏
     let filtered = split_long_segments(filtered);
 
-    // 5. 复扫：第 3 步消重叠只改边界，可能把前句尾部收到 `start + 0.1`，
-    // 造出一条「时长过短 + 与后句几乎同时开始」的鬼影碎片；第 4 步拆分也可能
-    // 留下类似的短碎片。若留到下一次载入才由第 2 步剔除，用户看到的就是
+    // 5. 复扫：第 3 步消重叠只改边界（且在改的时候已保证不短于 `MIN_EDIT_DUR`），
+    // 第 4 步拆分也可能留下短碎片。若留到下一次载入才由第 2 步剔除，用户看到的就是
     // 「点开一次两条、再点开少一条」，而且那条碎条的文本被静默丢弃。
     // 这里用与第 2 步完全相同的判据复扫到稳定（复扫只会删、不会改边界）。
     //
@@ -862,6 +860,60 @@ pub fn optimize_segments(segments: &mut Vec<Segment>) {
     *segments = filtered;
 }
 
+/// 消重叠时的文本长度口径：按字符计、忽略空白（标点算字符，因为「嗯？」比「嗯」
+/// 更像一句真实台词，不该因为标点被当成更短的一方优先删掉）。
+fn overlap_text_len(seg: &Segment) -> usize {
+    seg.display_text()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .count()
+}
+
+/// 按「文本更长者优先」消除相邻重叠，必要时删掉文本更短的那条。
+///
+/// 与旧的「无条件压前句」相比，这里守两条不变量：
+/// * 只要两段都还能保住 [`MIN_EDIT_DUR`]，就都留下（长句保留完整区间，短句让位）；
+/// * 短句让不开时删的是**文本更短**的那条，绝不把长句压成 0.1s 的鬼影候选。
+///
+/// 全程要求输入已按 start 升序（[`optimize_segments`] 第 1 步保证）。被调整/删除后
+/// 的邻居关系会重新检查，因此删除短句后暴露出的新重叠也会在同一趟解决。
+fn resolve_overlaps_prefer_longer(filtered: &mut Vec<Segment>) {
+    // 浮点毛刺不算重叠，也用来容忍「恰好等于下限」的边界。否则 1e-12 秒的接缝
+    // 就会走进删除分支，把一条正常台词当成让不开的短句删掉。
+    const TIME_EPS: f64 = 1e-9;
+
+    let mut j = 0;
+    while j + 1 < filtered.len() {
+        if filtered[j].end <= filtered[j + 1].start + TIME_EPS {
+            j += 1;
+            continue;
+        }
+
+        let keep_prev = overlap_text_len(&filtered[j]) >= overlap_text_len(&filtered[j + 1]);
+        if keep_prev {
+            // 后句文本不更长：让它整体后移到前句终点之后（起点可以变，终点不变）。
+            let prev_end = filtered[j].end;
+            if filtered[j + 1].end - prev_end >= MIN_EDIT_DUR - TIME_EPS {
+                filtered[j + 1].start = prev_end;
+                j += 1;
+            } else {
+                // 让完会短于下限：删文本更短的后句，保住前句完整区间。
+                filtered.remove(j + 1);
+            }
+        } else {
+            // 后句文本更长：收前句尾部到后句起点。
+            let next_start = filtered[j + 1].start;
+            if next_start - filtered[j].start >= MIN_EDIT_DUR - TIME_EPS {
+                filtered[j].end = next_start;
+                j += 1;
+            } else {
+                // 前句让完会短于下限：删文本更短的它；原后句留在 j 位继续与下一条比较。
+                filtered.remove(j);
+            }
+        }
+    }
+}
+
 /// 把 seg.words 收敛到 [seg.start, seg.end]：与段区间无交集的词丢弃，部分越界的裁剪。
 ///
 /// [optimize_segments] 的边界调整不重算词时间，这里统一收口，保证「段 → 词」自洽。
@@ -891,13 +943,41 @@ fn should_drop_segment(seg: &Segment, next: Option<&Segment>) -> bool {
     if seg.end - seg.start <= 0.05 || seg.display_text().trim().is_empty() {
         return true;
     }
-    // 同时间段重叠的极短鬼影碎片：例如消重叠后被压到 0.1s、又与后句起点只差 50ms
+    // 同时间段重叠的极短鬼影碎片：例如「对吧？」被模型同时吐成一个 0.1s 碎片和整句。
+    //
+    // 判据必须**同时**满足时长、起点、文本三条：只按时长+起点会误删真实台词
+    // ——先开始的长句在消重叠时被压短后，正好落进这个组合里被整句丢掉。
+    // 文本条件要求「≤2 字符且与后句高度相似」，把「嗯」「对」这类同句碎片与
+    // 独立的短台词区分开。
     match next {
         Some(n) => {
-            seg.end - seg.start < GHOST_MAX_DUR && (n.start - seg.start).abs() < GHOST_START_TOL
+            seg.end - seg.start < GHOST_MAX_DUR
+                && (n.start - seg.start).abs() < GHOST_START_TOL
+                && is_ghost_text_of(seg, n)
         }
         None => false,
     }
+}
+
+/// 鬼影碎片与后句的文本相似度：只认「1~2 个有效字符且是后句的前缀/同一句」。
+///
+/// 归一化去掉空白与标点（`对吧？` / `对吧` 视为同一句），但保留字母/汉字/数字。
+fn is_ghost_text_of(seg: &Segment, next: &Segment) -> bool {
+    let ghost = ghost_text_key(seg.display_text());
+    let ghost_chars = ghost.chars().count();
+    if ghost_chars == 0 || ghost_chars > GHOST_MAX_CHARS {
+        return false;
+    }
+    let next = ghost_text_key(next.display_text());
+    !next.is_empty() && (next == ghost || next.starts_with(&ghost))
+}
+
+/// 鬼影判据的文本归一化：只留字母 / 汉字 / 数字，并统一小写。
+fn ghost_text_key(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
 }
 
 /// 反复用 [`should_drop_segment`] 过滤，直到一轮下来不再删任何片段。
@@ -1109,6 +1189,12 @@ const GHOST_MAX_DUR: f64 = 0.25;
 
 /// 鬼影判定里的「几乎同时开始」容差（秒）。
 const GHOST_START_TOL: f64 = 0.15;
+
+/// 鬼影判定里的文本长度上限（有效字符数）。
+///
+/// 只有「嗯」「对」「好的」这类 1~2 字的同句碎片才可能是模型重复吐字；完整台词
+/// （哪怕被裁到 0.1s）不该仅凭时长与起点就被删掉。
+const GHOST_MAX_CHARS: usize = 2;
 
 /// 微调后允许的最短时长。
 ///
@@ -1438,9 +1524,10 @@ mod tests {
 
     #[test]
     fn optimize_segments_is_idempotent_on_overlapping_input() {
-        // 两条几乎同时开始、又互相重叠的片段：第 3 步消重叠会把前一条的尾部收到
-        // `start + 0.1`，若不在此次就按鬼影判据删掉，下一次载入（`AppState::load_task_with`
-        // 会再跑一遍 `optimize_segments`）数量就会变少，且那条碎条的文本无从找回。
+        // 两条几乎同时开始、又互相重叠的片段：第 3 步消重叠会保留文本更长的前句、
+        // 删掉让不开的短句。删除必须发生在**本次**调用内，否则下一次载入
+        // （`AppState::load_task_with` 会再跑一遍 `optimize_segments`）数量还会变，
+        // 且那条被删句的文本无从找回。
         let mut segs = vec![
             Segment::new(1, 0.0, 3.0, "第一句很长足够长的一句话"),
             Segment::new(2, 0.05, 3.0, "第二句"),
@@ -1464,11 +1551,15 @@ mod tests {
         );
     }
 
-    /// 消重叠压出来的 0.1s 碎条必须**当次**就清掉，而不是留到下次载入。
-    /// 修前：一次跑完剩两条 `[(31.0,31.1),(31.05,34.0)]`，再跑一遍只剩一条，
-    /// 而且被删那条的文本「第一句很长足够长的一句话」直接消失。
+    /// 两条几乎同时开始、文本一长一短时，必须**保留文本更长的那条**。
+    ///
+    /// 修前：旧实现无条件把前句终点压到 `start + 0.1`，再把这条 0.1s 碎条按
+    /// 「时长 <0.25s 且与后句起点差 <0.15s」当鬼影删掉——结果是 3 秒的完整台词
+    /// 「第一句很长足够长的一句话」整句消失，只留下 2 个字的「第二句」。这违背直觉：
+    /// 重叠时该让位/被删的是信息更少的那条。现在改成优先保留长文本，删除短文本，
+    /// 并且一次跑完就稳定（不会下次载入再变）。
     #[test]
-    fn overlap_trim_does_not_leave_a_ghost_stub() {
+    fn overlap_trim_keeps_longer_text_and_drops_shorter() {
         let mut segs = vec![
             Segment::new(1, 31.0, 34.0, "第一句很长足够长的一句话"),
             Segment::new(2, 31.05, 34.0, "第二句"),
@@ -1477,14 +1568,60 @@ mod tests {
         assert_eq!(
             segs.len(),
             1,
-            "被消重叠压成 0.1s、又与后句起点只差 50ms 的碎条应本次剔除: {segs:?}"
+            "重叠且短句让不开时应删文本更短的「第二句」，而不是删长句: {segs:?}"
         );
-        assert_eq!(segs[0].text, "第二句");
+        assert_eq!(segs[0].text, "第一句很长足够长的一句话");
         // 一次跑完即稳定：再跑一遍数量与内容都不变
         let mut again = segs.clone();
         optimize_segments(&mut again);
         assert_eq!(again.len(), 1);
-        assert_eq!(again[0].text, "第二句");
+        assert_eq!(again[0].text, "第一句很长足够长的一句话");
+    }
+
+    /// F12 回归：前者是 3 秒完整长句、后者是 1 秒短文本，二者重叠时必须保留前者。
+    /// 旧行为会把前者裁成 0.1s 再当鬼影删除，用户载入工程时就永久少一句台词。
+    #[test]
+    fn overlap_keeps_three_second_line_over_one_second_short_line() {
+        let mut segs = vec![
+            Segment::new(1, 100.0, 103.0, "这是一句完整的三秒台词"),
+            Segment::new(2, 100.5, 101.5, "短句"),
+        ];
+        optimize_segments(&mut segs);
+        assert_eq!(segs.len(), 1, "短句让不开时应被删除: {segs:?}");
+        assert_eq!(segs[0].text, "这是一句完整的三秒台词");
+        assert!(
+            segs[0].end - segs[0].start >= 2.9,
+            "长句的完整时长不能被重叠消解压掉: {segs:?}"
+        );
+    }
+
+    /// 鬼影判据收紧后的正例：1~2 字、与后句高度相似的碎片才删。
+    #[test]
+    fn ghost_rule_still_drops_short_similar_fragment() {
+        let mut segs = vec![
+            Segment::new(1, 10.0, 12.0, "第一句话"),
+            Segment::new(2, 12.0, 12.1, "对"),
+            Segment::new(3, 12.0, 15.0, "对，我们继续讲第二句话"),
+        ];
+        optimize_segments(&mut segs);
+        assert_eq!(segs.len(), 2, "1 个字的同句碎片应被当鬼影删掉: {segs:?}");
+        assert_eq!(segs[0].text, "第一句话");
+        assert_eq!(segs[1].text, "对，我们继续讲第二句话");
+    }
+
+    /// 鬼影判据收紧后的反例：时长与起点都像鬼影，但文本是完整的独立台词，不能删。
+    #[test]
+    fn ghost_rule_keeps_real_short_line_with_unrelated_text() {
+        let mut segs = vec![
+            Segment::new(1, 10.0, 12.0, "第一句话"),
+            // 0.1s、与后句起点只差 0.12s，旧判据会直接删掉；但「现在开始」是四个字，
+            // 不是同句碎片，收紧后必须作为独立短句保留。
+            Segment::new(2, 12.0, 12.1, "现在开始"),
+            Segment::new(3, 12.12, 15.0, "下一句完全不同的话"),
+        ];
+        optimize_segments(&mut segs);
+        assert_eq!(segs.len(), 3, "独立短句不能被鬼影判据删掉: {segs:?}");
+        assert!(segs.iter().any(|s| s.text == "现在开始"));
     }
 
     /// 幂等性 + 不变量：对若干「重叠 / 等起点 / 三连叠」的恶意输入，
@@ -1498,7 +1635,7 @@ mod tests {
                 Segment::new(1, 0.0, 2.0, "甲句内容比较长一些"),
                 Segment::new(2, 0.0, 5.0, "乙句内容也不短"),
             ],
-            // 前一条被压成 0.1s 的碎条
+            // 短句紧贴长句起点（旧实现会把长句压成 0.1s 碎条）
             vec![
                 Segment::new(1, 10.0, 13.0, "第一句很长足够长的一句话"),
                 Segment::new(2, 10.08, 13.0, "第二句"),

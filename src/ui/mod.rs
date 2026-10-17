@@ -1712,6 +1712,26 @@ impl MainWindow {
     pub(crate) fn flush_segments_before_close(&mut self, cx: &mut Context<Self>) -> bool {
         let had_dirty = self.state.segments_dirty;
         self.state.flush_segments_if_dirty();
+        // F1：导入字幕的工程没有库主键，flush **无处可写**（不是「已保存」）。
+        // 以前这条路径被当成保存成功，于是关窗/切工程把一整份校对静默清零。
+        // 这里第一次拦下并给出出路（先导出），第二次放行 = 用户明确放弃修改。
+        if had_dirty && self.state.active_task_id.is_none() && self.state.segments_dirty {
+            if !self.state.draft_close_warned {
+                self.state.draft_close_warned = true;
+                self.state.db_write_error = Some(
+                    "导入的字幕还不是一个工程，改动没有可写回的库记录：直接关闭会丢失本次编辑。\
+                     请先「导出」保存字幕；再次关闭将放弃这些修改。"
+                        .to_string(),
+                );
+                tracing::warn!("导入字幕有未保存编辑，已阻止关闭并给出保存出路");
+                cx.notify();
+                return false;
+            }
+            self.state.draft_close_warned = false;
+            self.state.db_write_error = None;
+            tracing::warn!("用户二次确认：放弃导入字幕的未保存编辑");
+            return true;
+        }
         if had_dirty && self.state.db_write_error.is_some() {
             // 取舍：**阻止关闭**而不是「记日志后照关」。字幕写库失败通常是持久性
             // 原因（磁盘满 / 数据库只读），一旦关窗这次编辑就永久丢了；留在窗口里，
@@ -2433,7 +2453,7 @@ impl MainWindow {
         shift: crate::subtitle::timing::TimeShift,
         cx: &mut Context<Self>,
     ) {
-        use crate::subtitle::timing::{plan_retime, resolve_overlaps};
+        use crate::subtitle::timing::{plan_retime, resolve_overlaps_in_place};
         if self.state.segments.is_empty() {
             return;
         }
@@ -2444,7 +2464,9 @@ impl MainWindow {
             return;
         }
         self.state.snapshot_for_undo();
-        let resolved = resolve_overlaps(&plan.times);
+        // 原地消重叠（不排序）：乱序导入的字幕不能被重排后 zip 回去。
+        let mut resolved = plan.times.clone();
+        resolve_overlaps_in_place(&mut resolved);
         for (seg, (start, end)) in self.state.segments.iter_mut().zip(resolved) {
             seg.start = start;
             seg.end = end;

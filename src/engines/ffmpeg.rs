@@ -384,6 +384,135 @@ pub fn plan_segment_clip(
     })
 }
 
+/// 从 ffmpeg 路径推出同目录的 ffprobe 路径。
+///
+/// ffprobe 是可选组件（`doctor` 里也标为可选）：同目录有就用，没有就依次试
+/// `ffprobe` 与 `PATH`；都不存在时返回同目录候选路径，调用方 spawn 失败后自然
+/// 退回 `ffmpeg -i` 解析（见 [`FFmpegEngine::get_audio_duration`]）。
+fn resolve_ffprobe_path(ffmpeg: &Path) -> PathBuf {
+    let with_ext = match ffmpeg.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => ffmpeg.with_file_name(format!("ffprobe.{ext}")),
+        None => ffmpeg.with_file_name("ffprobe"),
+    };
+    if with_ext.is_file() {
+        return with_ext;
+    }
+    let bare = ffmpeg.with_file_name("ffprobe");
+    if bare.is_file() {
+        return bare;
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in ["ffprobe.exe", "ffprobe"] {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    bare
+}
+
+/// 严格解析「秒」形式的时间值（`123.456` / 整数）。非正、非有限、`N/A` 一律 None。
+fn parse_seconds_value(text: &str) -> Option<f64> {
+    let secs: f64 = text.trim().parse().ok()?;
+    (secs.is_finite() && secs > 0.0).then_some(secs)
+}
+
+/// 解析 `HH:MM:SS.mmm`。`N/A`、字段缺失、非法数字一律 None（未知就是未知，不把
+/// 0.0 当合法时长——0 会被下游当成「音轨不存在」）。
+fn parse_hhmmss_value(text: &str) -> Option<f64> {
+    let parts: Vec<&str> = text.trim().split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let h: f64 = parts[0].trim().parse().ok()?;
+    let m: f64 = parts[1].trim().parse().ok()?;
+    let s: f64 = parts[2].trim().parse().ok()?;
+    let secs = h * 3600.0 + m * 60.0 + s;
+    (secs.is_finite() && secs > 0.0).then_some(secs)
+}
+
+/// 纯解析：容器级 `Duration: HH:MM:SS.mmm, start: ...`（`ffmpeg -i` 的 stderr）。
+///
+/// `Duration: N/A` 表示容器没写时长（流式 / 损坏 / 分段 MP4），必须返回 None，不能
+/// 误当成 0.0 继续参与切块规划。
+fn parse_ffmpeg_container_duration(text: &str) -> Option<f64> {
+    for line in text.lines() {
+        let Some(pos) = line.find("Duration:") else {
+            continue;
+        };
+        let rest = line[pos + "Duration:".len()..].trim();
+        let token = rest.split(',').next().unwrap_or_default().trim();
+        // 容器时长只认一行：`ffmpeg -i` 至多输出一个容器 `Duration:`，解析失败即
+        // 「未知」，不再继续找下一行。
+        return parse_hhmmss_value(token).or_else(|| parse_seconds_value(token));
+    }
+    None
+}
+
+/// 纯解析 `ffprobe -select_streams a:0 -show_entries stream=duration
+/// -of default=nw=1:nk=1` 的输出：正常是单行秒数；无音轨 / 未知时长时是空输出或
+/// `N/A`。
+fn parse_ffprobe_stream_duration(text: &str) -> Option<f64> {
+    text.lines().find_map(parse_seconds_value)
+}
+
+/// 纯解析 `ffmpeg -i` 的 stderr，**优先音频流（`Audio:`）行里的 duration**，再退回
+/// `Stream #0:0` 行、最后退回容器 `Duration:`。
+///
+/// 为什么必须优先流时长：容器 Duration 记的是「整段媒体」的长度，视频轨比音轨长时
+/// （片尾留白 / 片尾字幕 / 音轨提前结束），按容器时长切块会在音轨结束之后继续切出
+/// 空片。流行里的 duration 才是这条音轨自己的长度。
+///
+/// 为什么先找 `Audio:` 而不是死认 `Stream #0:0`：ffmpeg 的流下标是**全局**顺序，
+/// 视频常占 `#0:0`、音频是 `#0:1`（甚至更后）。`#0:0` 的 duration 是视频轨的，拿它
+/// 当音轨时长会重犯同一个错误；纯音频 WAV（切块实际探测的对象）里两者等价。
+///
+/// 兼容行内两种写法：`duration: 00:00:42.50` 与 `duration=42.5`（部分封装 / 版本的
+/// `-i` 输出会带）；都没有时返回 None，交给容器兜底。
+fn parse_ffmpeg_i_audio_duration(text: &str) -> Option<f64> {
+    let mut stream0_duration = None;
+    let mut audio_duration = None;
+    for line in text.lines() {
+        let is_stream = line.contains("Stream #0:");
+        if !is_stream {
+            continue;
+        }
+        if let Some(pos) = line.find("Stream #0:0") {
+            stream0_duration = stream0_duration
+                .or_else(|| duration_on_stream_line(&line[pos + "Stream #0:0".len()..]));
+        }
+        // 输出顺序里第一条 Audio 流就是 `a:0`；取到就定案，不再看后面的流。
+        if let Some(pos) = line.find("Audio:") {
+            if let Some(secs) = duration_on_stream_line(&line[pos + "Audio:".len()..]) {
+                audio_duration = Some(secs);
+                break;
+            }
+        }
+    }
+    audio_duration
+        .or(stream0_duration)
+        .or_else(|| parse_ffmpeg_container_duration(text))
+}
+
+/// 从一条流描述里取 `duration:` / `duration=` 后面的时间值；没有就 None。
+fn duration_on_stream_line(rest: &str) -> Option<f64> {
+    // `to_ascii_lowercase` 只改 ASCII 字节，字节下标与 `rest` 完全对齐。
+    let lower = rest.to_ascii_lowercase();
+    let dpos = lower.find("duration")?;
+    let after = rest[dpos + "duration".len()..]
+        .trim_start()
+        .trim_start_matches([':', '=']);
+    let token = after
+        .trim()
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    parse_hhmmss_value(token).or_else(|| parse_seconds_value(token))
+}
+
 pub struct FFmpegEngine {
     ffmpeg_path: PathBuf,
 }
@@ -902,33 +1031,67 @@ impl FFmpegEngine {
         Ok(child)
     }
 
-    /// 获取视频/音频的时长 (秒)
+    /// 获取视频/音频的时长 (秒)：容器级 `Duration:` 行。
+    ///
+    /// 这是**容器**时长，不等于音轨时长；切块规划请用 [`Self::get_audio_duration`]。
     pub fn get_duration<P: AsRef<Path>>(&self, input_path: P) -> f64 {
         // 探测同样带截止期：坏文件让 ffmpeg -i 悬挂时不再拖死调用方。
         let mut cmd = Command::new(&self.ffmpeg_path);
         super::media_pipeline::apply_default_child_flags(&mut cmd);
         cmd.arg("-i").arg(input_path.as_ref());
-        let output = run_with_deadline(&mut cmd, SUBPROCESS_TIMEOUT);
-
-        if let Ok(out) = output {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            for line in stderr.lines() {
-                if let Some(pos) = line.find("Duration:") {
-                    let dur_part = &line[pos + 9..];
-                    if let Some(comma_pos) = dur_part.find(',') {
-                        let dur_str = dur_part[..comma_pos].trim();
-                        let parts: Vec<&str> = dur_str.split(':').collect();
-                        if parts.len() == 3 {
-                            let h: f64 = parts[0].parse().unwrap_or(0.0);
-                            let m: f64 = parts[1].parse().unwrap_or(0.0);
-                            let s: f64 = parts[2].parse().unwrap_or(0.0);
-                            return h * 3600.0 + m * 60.0 + s;
-                        }
-                    }
-                }
+        match run_with_deadline(&mut cmd, SUBPROCESS_TIMEOUT) {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                parse_ffmpeg_container_duration(&stderr).unwrap_or(0.0)
             }
+            Err(_) => 0.0,
         }
-        0.0
+    }
+
+    /// 获取**第 0 条音轨**的时长（秒）；探测失败返回 0.0。
+    ///
+    /// 与 [`Self::get_duration`]（容器时长）的区别见 [`parse_ffmpeg_i_audio_duration`]：
+    /// 容器时长可能是视频轨的长度，音轨更短时按容器时长规划切块会切出空片，音轨更长
+    /// 时又会提前收尾丢片尾内容。探测顺序：
+    /// 1. `ffprobe -select_streams a:0 -show_entries stream=duration`（精准到流）；
+    /// 2. ffprobe 不可用 / 拿不到时长时退回 `ffmpeg -i`：优先流行 duration，再退回
+    ///    容器 `Duration:`。
+    pub fn get_audio_duration<P: AsRef<Path>>(&self, input_path: P) -> f64 {
+        let input_path = input_path.as_ref();
+        if let Some(secs) = self.probe_audio_stream_duration(input_path) {
+            return secs;
+        }
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
+        cmd.arg("-i").arg(input_path);
+        match run_with_deadline(&mut cmd, SUBPROCESS_TIMEOUT) {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                parse_ffmpeg_i_audio_duration(&stderr).unwrap_or(0.0)
+            }
+            Err(_) => 0.0,
+        }
+    }
+
+    /// 用 ffprobe 取第 0 条音轨时长；ffprobe 缺失 / 失败 / 输出 `N/A` 时返回 None。
+    fn probe_audio_stream_duration(&self, input_path: &Path) -> Option<f64> {
+        let ffprobe = resolve_ffprobe_path(&self.ffmpeg_path);
+        let mut cmd = Command::new(&ffprobe);
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
+        cmd.args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(input_path);
+        let out = run_with_deadline(&mut cmd, SUBPROCESS_TIMEOUT).ok()?;
+        // 非零退出也可能是「没有音轨」：stdout 为空时解析自然失败，统一走 None。
+        parse_ffprobe_stream_duration(&String::from_utf8_lossy(&out.stdout))
     }
 
     /// 探测视频真实分辨率 (宽, 高)。解析 `ffmpeg -i` 元数据输出中首个视频流的尺寸；
@@ -1479,6 +1642,88 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("{prefix}_{}_{nanos}", std::process::id())
+    }
+}
+
+/// 时长解析的纯函数测试：容器时长与音轨时长必须能分开，且 `Duration: N/A` 不得被
+/// 当成 0 秒继续参与切块规划。
+#[cfg(test)]
+mod duration_probe_tests {
+    use super::{
+        parse_ffmpeg_container_duration, parse_ffmpeg_i_audio_duration,
+        parse_ffprobe_stream_duration,
+    };
+
+    /// 容器时长已知、流行没有 duration：退回容器时长。
+    const CONTAINER_ONLY: &str = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'lesson.mp4':
+  Metadata:
+    major_brand     : isom
+  Duration: 00:02:05.50, start: 0.000000, bitrate: 128 kb/s
+  Stream #0:0(und): Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, stereo, fltp, 128 kb/s (default)
+  Stream #0:1(und): Video: h264 (High), yuv420p, 1920x1080, 2000 kb/s, 25 fps
+";
+
+    /// 容器没写时长（流式 / 损坏 / 分段 MP4）：必须报「未知」，不能返回 0 秒。
+    const NA_DURATION: &str = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'broken.mp4':
+  Duration: N/A, start: 0.000000, bitrate: N/A
+  Stream #0:0(und): Audio: aac (LC), 44100 Hz, stereo, fltp, 128 kb/s
+";
+
+    /// 流行带 duration，且比容器短（视频轨更长）：必须优先取流时长。
+    const STREAM_DURATION: &str = "\
+Input #0, matroska,webm, from 'lecture.mkv':
+  Duration: 00:10:00.00, start: 0.000000, bitrate: 2000 kb/s
+  Stream #0:0: Audio: aac (LC), 44100 Hz, stereo, fltp, duration: 00:00:42.50
+  Stream #0:1: Video: h264 (High), yuv420p, 1920x1080, 2000 kb/s, 25 fps
+";
+
+    /// 流 duration 存在时优先用它，而不是容器时长。
+    #[test]
+    fn ffmpeg_i_prefers_stream_duration_over_container() {
+        assert_eq!(parse_ffmpeg_i_audio_duration(STREAM_DURATION), Some(42.5));
+        // 容器本身也解析得出来，证明确实是「优先」而不是唯一来源
+        assert_eq!(
+            parse_ffmpeg_container_duration(STREAM_DURATION),
+            Some(600.0)
+        );
+    }
+
+    /// 视频占 `#0:0`、音频是 `#0:1`（常见 mp4）：必须取音频流时长，不能取视频流的。
+    const VIDEO_FIRST: &str = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'video.mp4':
+  Duration: 00:10:00.00, start: 0.000000, bitrate: 2000 kb/s
+  Stream #0:0: Video: h264 (High), yuv420p, 1920x1080, 2000 kb/s, 25 fps, duration: 00:09:58.00
+  Stream #0:1: Audio: aac (LC), 44100 Hz, stereo, fltp, duration: 00:00:42.50
+";
+
+    /// 音频不是 `#0:0` 时也要取到音频流，而不是 `#0:0` 的视频流时长。
+    #[test]
+    fn ffmpeg_i_picks_the_audio_stream_even_when_video_is_first() {
+        assert_eq!(parse_ffmpeg_i_audio_duration(VIDEO_FIRST), Some(42.5));
+    }
+
+    /// 流 duration 缺失时退回容器 `Duration:`。
+    #[test]
+    fn ffmpeg_i_falls_back_to_container_duration() {
+        assert_eq!(parse_ffmpeg_i_audio_duration(CONTAINER_ONLY), Some(125.5));
+        assert_eq!(parse_ffmpeg_container_duration(CONTAINER_ONLY), Some(125.5));
+    }
+
+    /// `Duration: N/A` 表示未知：两种解析都必须给 None（调用方再退回容器/音轨探测）。
+    #[test]
+    fn ffmpeg_i_na_duration_is_unknown_not_zero() {
+        assert_eq!(parse_ffmpeg_i_audio_duration(NA_DURATION), None);
+        assert_eq!(parse_ffmpeg_container_duration(NA_DURATION), None);
+    }
+
+    /// ffprobe 的流时长输出：单行秒数可用，`N/A` / 空输出不可用。
+    #[test]
+    fn ffprobe_stream_duration_parses_seconds_or_reports_unknown() {
+        assert_eq!(parse_ffprobe_stream_duration("123.456000\n"), Some(123.456));
+        assert_eq!(parse_ffprobe_stream_duration("N/A\n"), None);
+        assert_eq!(parse_ffprobe_stream_duration(""), None);
     }
 }
 

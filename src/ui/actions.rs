@@ -873,6 +873,12 @@ impl MainWindow {
                         outcome.skipped_existing.join("、")
                     ));
                 }
+                // 数据库只在启动时打开一次（`main.rs`），运行中恢复的新库不会被当前
+                // 进程读取。以前只说「已恢复 N 个文件」，用户以为生效了，接着把字幕
+                // 编辑写进了那份已被替换掉的旧库。必须明确要求重启。
+                if outcome.restored.iter().any(|f| f.contains("voice2word.db")) {
+                    msg.push_str("；请**退出并重新启动** Voice2Word，恢复的数据库才会被加载");
+                }
                 self.state.download_status_msg = msg;
                 // 恢复的是库与配置：下次启动才读，这里只刷新界面上的就位/库视图。
                 // 重扫同样可能触发 sha256 全文件读（长任务），走专用线程。
@@ -1145,8 +1151,17 @@ impl MainWindow {
             return;
         }
 
-        // 保存未保存的字幕数据
-        let _ = self.flush_segments_before_close(cx);
+        // 保存未保存的字幕数据。**必须看返回值**：flush 失败（库被外部锁住、
+        // 磁盘满）或存在未保存的导入草稿时不能退出——否则点「立即退出并安装升级」
+        // 就等于把最后一段字幕直接丢掉，与关窗守卫的取舍自相矛盾。
+        if !self.flush_segments_before_close(cx) {
+            self.state.update_download_status = Some(
+                "还有未保存的字幕改动，已取消退出更新。请先按提示条处理好保存问题（或先导出字幕）再重试。"
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
 
         #[cfg(target_os = "windows")]
         {
@@ -2821,15 +2836,19 @@ impl MainWindow {
             .unwrap_or("Voice2Word")
             .to_string();
 
+        // 媒体时长：剪映草稿的视频轨必须用**真实媒体时长**，不能用最后一句字幕的
+        // end（字幕只覆盖前 20 分钟时，草稿会把素材裁短）。
+        let media_duration = self.state.total_duration;
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    crate::subtitle::JianYingExporter::inject_to_local_jianying(
-                        &segments,
-                        video_path.as_deref(),
-                        &stem,
-                        mode,
+                    let media = crate::subtitle::jianying::DraftMedia {
+                        path: video_path.clone(),
+                        duration_secs: (media_duration > 0.0).then_some(media_duration),
+                    };
+                    crate::subtitle::JianYingExporter::inject_to_local_jianying_with_media(
+                        &segments, &media, &stem, mode,
                     )
                 })
                 .await;
@@ -2877,6 +2896,9 @@ impl MainWindow {
             .and_then(|s| s.to_str())
             .unwrap_or("Voice2Word")
             .to_string();
+        // 媒体时长在 `move` 闭包外取：闭包里拿不到 `self`，而草稿的视频轨必须用
+        // 真实媒体时长（不能用最后一句字幕的 end，否则素材会被裁短）。
+        let media_duration = self.state.total_duration;
 
         cx.spawn(async move |this, cx| {
             let handle = rfd::AsyncFileDialog::new()
@@ -2888,12 +2910,12 @@ impl MainWindow {
                 let res = cx
                     .background_executor()
                     .spawn(async move {
-                        crate::subtitle::JianYingExporter::export_to_folder(
-                            &segments,
-                            video_path.as_deref(),
-                            &target_dir,
-                            &stem,
-                            mode,
+                        let media = crate::subtitle::jianying::DraftMedia {
+                            path: video_path.clone(),
+                            duration_secs: (media_duration > 0.0).then_some(media_duration),
+                        };
+                        crate::subtitle::JianYingExporter::export_to_folder_with_media(
+                            &segments, &media, &target_dir, &stem, mode,
                         )
                     })
                     .await;

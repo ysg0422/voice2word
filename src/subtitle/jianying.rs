@@ -15,6 +15,73 @@ use super::segment::{ExportMode, Segment};
 
 pub struct JianYingExporter;
 
+/// 剪映草稿的媒体来源：视频路径 + 真实媒体时长。
+///
+/// 为什么必须与字幕分开：字幕轨的末句时间不是片子长度。60 分钟的成片只有前
+/// 20 分钟有字幕时，用 `segments.last().end` 当视频素材时长，会把后 40 分钟
+/// 素材裁掉，草稿的视频轨只到 20 分钟。
+///
+/// - `path` 为 `None` 或空路径 = 媒体位置未知：此时**不生成视频轨**，只写字幕轨，
+///   避免把 `.srt` / `.txt` 之类的字幕文件路径当成视频素材塞进草稿。
+/// - `duration_secs` 为 `None` / 非正 / 非有限 = 未知：回落到 `segments.last().end`，
+///   与旧调用点的行为一致。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DraftMedia {
+    pub path: Option<PathBuf>,
+    pub duration_secs: Option<f64>,
+}
+
+impl DraftMedia {
+    /// 显式构造：`duration_secs` 允许为 `None`（回落到字幕末句）。
+    pub fn new(path: Option<PathBuf>, duration_secs: Option<f64>) -> Self {
+        Self {
+            path,
+            duration_secs,
+        }
+    }
+
+    /// 可用的视频路径：`None` 与空路径都视为「未知」。
+    fn video_path(&self) -> Option<&Path> {
+        self.path.as_deref().filter(|p| !p.as_os_str().is_empty())
+    }
+
+    /// 有效媒体时长：非法值一律回落到 `fallback`（字幕末句）。
+    fn duration_or(&self, fallback: f64) -> f64 {
+        self.duration_secs
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .unwrap_or(fallback)
+    }
+
+    fn has_video(&self) -> bool {
+        self.video_path().is_some()
+    }
+}
+
+/// 字幕轨的末句终点（旧行为里被误当成媒体时长的那一项）。
+fn subtitle_end(segments: &[Segment]) -> f64 {
+    segments.last().map(|s| s.end).unwrap_or(0.0)
+}
+
+/// 秒 → 微秒。负值 / NaN / inf 一律记 0，绝不写出一个巨大的垃圾时长。
+fn secs_to_micros(secs: f64) -> u64 {
+    if secs.is_finite() && secs > 0.0 {
+        (secs * 1_000_000.0) as u64
+    } else {
+        0
+    }
+}
+
+/// 草稿总时长：有视频时取媒体时长（字幕比媒体还长时取较大者，避免裁掉字幕），
+/// 没有视频轨时只按字幕末句。
+fn draft_duration(segments: &[Segment], media: &DraftMedia) -> f64 {
+    let end = subtitle_end(segments);
+    if media.has_video() {
+        media.duration_or(end).max(end)
+    } else {
+        end
+    }
+}
+
 impl JianYingExporter {
     /// XML 特殊字符转义：字幕文本直接拼入 content 的内嵌 XML，
     /// 未转义的 & < > " 会使剪映解析草稿失败。
@@ -82,14 +149,37 @@ impl JianYingExporter {
         }
     }
 
-    /// 构造 draft_content.json 数据结构
+    /// 构造 draft_content.json 数据结构（兼容旧调用点）。
+    ///
+    /// `total_duration_sec` 沿用旧语义：有视频路径时它就是媒体时长；传 0 / NaN
+    /// 或没有视频路径时，时长回落到 `segments.last().end`。新调用点请改用
+    /// [`Self::build_draft_content_with_media`] 显式给出媒体时长与路径。
     pub fn build_draft_content(
         segments: &[Segment],
         video_path: Option<&Path>,
         total_duration_sec: f64,
         mode: ExportMode,
     ) -> Value {
-        let duration_us = (total_duration_sec * 1_000_000.0) as u64;
+        let media = DraftMedia {
+            path: video_path.map(Path::to_path_buf),
+            duration_secs: Some(total_duration_sec).filter(|d| d.is_finite() && *d > 0.0),
+        };
+        Self::build_draft_content_with_media(segments, &media, mode)
+    }
+
+    /// 构造 draft_content.json：媒体时长与字幕时长分离。
+    ///
+    /// 视频素材 / 视频段的 `duration` 与两侧 timerange 一律用**媒体时长**；字幕段
+    /// 仍按每句自己的 `start`/`end`。`media.path` 为空时不生成视频轨，只写字幕轨，
+    /// 避免把 `.srt` / `.txt` 当成视频素材塞进草稿。
+    pub fn build_draft_content_with_media(
+        segments: &[Segment],
+        media: &DraftMedia,
+        mode: ExportMode,
+    ) -> Value {
+        let media_duration_sec = media.duration_or(subtitle_end(segments));
+        let duration_us = secs_to_micros(draft_duration(segments, media));
+        let media_duration_us = secs_to_micros(media_duration_sec);
 
         let mut texts = Vec::new();
         let mut text_segments = Vec::new();
@@ -98,11 +188,11 @@ impl JianYingExporter {
         for (i, seg) in segments.iter().enumerate() {
             let text_id = Uuid::new_v4().to_string().to_uppercase();
             let seg_id = Uuid::new_v4().to_string().to_uppercase();
-            let mut start_us = (seg.start * 1_000_000.0) as u64;
+            let mut start_us = secs_to_micros(seg.start);
             if start_us < last_end_us {
                 start_us = last_end_us;
             }
-            let raw_end_us = (seg.end * 1_000_000.0) as u64;
+            let raw_end_us = secs_to_micros(seg.end);
             let end_us = raw_end_us.max(start_us + 100_000);
             let dur_us = end_us - start_us;
             last_end_us = end_us;
@@ -244,7 +334,7 @@ impl JianYingExporter {
         let mut speeds = Vec::new();
         let mut canvases = Vec::new();
 
-        if let Some(vpath) = video_path {
+        if let Some(vpath) = media.video_path() {
             let video_id = Uuid::new_v4().to_string().to_uppercase();
             let seg_id = Uuid::new_v4().to_string().to_uppercase();
             let speed_id = Uuid::new_v4().to_string().to_uppercase();
@@ -270,7 +360,7 @@ impl JianYingExporter {
                 },
                 "crop_ratio": "free",
                 "crop_scale": 1.0,
-                "duration": duration_us,
+                "duration": media_duration_us,
                 "extra_type_option": 0,
                 "formula_id": "",
                 "freeze": null,
@@ -386,13 +476,13 @@ impl JianYingExporter {
                         },
                         "reverse": false,
                         "source_timerange": {
-                            "duration": duration_us,
+                            "duration": media_duration_us,
                             "start": 0
                         },
                         "speed": 1.0,
                         "state": 0,
                         "target_timerange": {
-                            "duration": duration_us,
+                            "duration": media_duration_us,
                             "start": 0
                         },
                         "template_id": "",
@@ -555,7 +645,10 @@ impl JianYingExporter {
         })
     }
 
-    /// 导出草稿文件夹至任意指定路径
+    /// 导出草稿文件夹至任意指定路径（兼容旧调用点）。
+    ///
+    /// 只有视频路径、没有媒体时长：草稿的视频段会回落到字幕末句时长。新调用点
+    /// 应改用 [`Self::export_to_folder_with_media`] 并传入 [`DraftMedia`]。
     pub fn export_to_folder<P: AsRef<Path>>(
         segments: &[Segment],
         video_path: Option<&Path>,
@@ -563,14 +656,41 @@ impl JianYingExporter {
         draft_name: &str,
         mode: ExportMode,
     ) -> Result<PathBuf> {
+        let media = DraftMedia {
+            path: video_path.map(Path::to_path_buf),
+            duration_secs: None,
+        };
+        Self::export_to_folder_with_media(segments, &media, target_dir, draft_name, mode)
+    }
+
+    /// 导出草稿文件夹至任意指定路径，显式指定媒体路径与媒体时长。
+    pub fn export_to_folder_with_media<P: AsRef<Path>>(
+        segments: &[Segment],
+        media: &DraftMedia,
+        target_dir: P,
+        draft_name: &str,
+        mode: ExportMode,
+    ) -> Result<PathBuf> {
         let target_dir = target_dir.as_ref();
+        Self::write_draft_files(segments, media, target_dir, draft_name, mode)?;
+        Ok(target_dir.to_path_buf())
+    }
+
+    /// 写 draft_content.json + draft_meta_info.json（导出与注入共用）。
+    fn write_draft_files(
+        segments: &[Segment],
+        media: &DraftMedia,
+        target_dir: &Path,
+        draft_name: &str,
+        mode: ExportMode,
+    ) -> Result<()> {
         fs::create_dir_all(target_dir).with_context(|| "创建目标草稿文件夹失败")?;
 
-        let total_dur = segments.last().map(|s| s.end).unwrap_or(0.0);
-        let duration_us = (total_dur * 1_000_000.0) as u64;
+        // 视频段的时长是媒体时长，不是末句字幕时间；meta 里的 tm_duration 同理。
+        let duration_us = secs_to_micros(draft_duration(segments, media));
         let draft_id = Uuid::new_v4().to_string().to_uppercase();
 
-        let content_json = Self::build_draft_content(segments, video_path, total_dur, mode);
+        let content_json = Self::build_draft_content_with_media(segments, media, mode);
         let mut meta_json = Self::build_draft_meta_info(&draft_id, draft_name, duration_us);
 
         let norm_target_dir = target_dir.to_string_lossy().replace('\\', "/");
@@ -593,13 +713,30 @@ impl JianYingExporter {
         let mut meta_file = File::create(&meta_path)?;
         meta_file.write_all(serde_json::to_string_pretty(&meta_json)?.as_bytes())?;
 
-        Ok(target_dir.to_path_buf())
+        Ok(())
     }
 
-    /// 一键直接注入本机剪映草稿库（自动更新 root_meta_info.json，开箱即剪）
+    /// 一键直接注入本机剪映草稿库（自动更新 root_meta_info.json，开箱即剪）。
+    ///
+    /// 兼容旧调用点：没有媒体时长，视频段回落到字幕末句。新调用点应改用
+    /// [`Self::inject_to_local_jianying_with_media`]。
     pub fn inject_to_local_jianying(
         segments: &[Segment],
         video_path: Option<&Path>,
+        base_name: &str,
+        mode: ExportMode,
+    ) -> Result<PathBuf> {
+        let media = DraftMedia {
+            path: video_path.map(Path::to_path_buf),
+            duration_secs: None,
+        };
+        Self::inject_to_local_jianying_with_media(segments, &media, base_name, mode)
+    }
+
+    /// 一键注入本机剪映草稿库，显式指定媒体路径与媒体时长。
+    pub fn inject_to_local_jianying_with_media(
+        segments: &[Segment],
+        media: &DraftMedia,
         base_name: &str,
         mode: ExportMode,
     ) -> Result<PathBuf> {
@@ -613,12 +750,11 @@ impl JianYingExporter {
 
         fs::create_dir_all(&project_dir)?;
 
-        let total_dur = segments.last().map(|s| s.end).unwrap_or(0.0);
-        let duration_us = (total_dur * 1_000_000.0) as u64;
+        let duration_us = secs_to_micros(draft_duration(segments, media));
         let draft_id = Uuid::new_v4().to_string().to_uppercase();
         let now_us = Utc::now().timestamp_micros() as u64;
 
-        let content_json = Self::build_draft_content(segments, video_path, total_dur, mode);
+        let content_json = Self::build_draft_content_with_media(segments, media, mode);
         let mut meta_json = Self::build_draft_meta_info(&draft_id, &project_name, duration_us);
 
         let norm_project_dir = project_dir.to_string_lossy().replace('\\', "/");
@@ -745,6 +881,115 @@ mod tests {
         assert_eq!(val["tracks"].as_array().unwrap().len(), 1);
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// F9：视频素材 / 视频段的时长与 timerange 必须用**媒体时长**，不是末句字幕时间。
+    /// 60 分钟片子只有前 20 分钟有字幕时，旧实现会把视频轨裁到 20 分钟。
+    #[test]
+    fn video_track_uses_media_duration_not_last_subtitle_end() {
+        let segs = vec![
+            Segment::new(1, 0.0, 60.0, "第一句"),
+            Segment::new(2, 1200.0, 1202.0, "最后一句"),
+        ];
+        let media = DraftMedia {
+            path: Some(PathBuf::from(r"C:\media\long_video.mp4")),
+            duration_secs: Some(3600.0),
+        };
+        let val =
+            JianYingExporter::build_draft_content_with_media(&segs, &media, ExportMode::RawOnly);
+
+        let tracks = val["tracks"].as_array().unwrap();
+        assert_eq!(tracks.len(), 2, "有媒体路径时应同时有视频轨与字幕轨");
+        let video_track = tracks
+            .iter()
+            .find(|t| t["type"] == "video")
+            .expect("缺视频轨");
+        let video_seg = &video_track["segments"][0];
+        assert_eq!(
+            video_seg["target_timerange"]["duration"].as_u64(),
+            Some(3_600_000_000),
+            "视频段 target_timerange 必须用媒体时长 3600s，而不是字幕末句 1202s"
+        );
+        assert_eq!(
+            video_seg["source_timerange"]["duration"].as_u64(),
+            Some(3_600_000_000),
+            "视频段 source_timerange 也必须用媒体时长"
+        );
+        assert_eq!(
+            val["materials"]["videos"][0]["duration"].as_u64(),
+            Some(3_600_000_000),
+            "视频素材的 duration 必须是媒体时长"
+        );
+        assert_eq!(
+            val["duration"].as_u64(),
+            Some(3_600_000_000),
+            "草稿总时长应覆盖完整媒体"
+        );
+
+        // 字幕段仍按各自句子：最后一句 2 秒，不能被媒体时长覆盖。
+        let text_track = tracks
+            .iter()
+            .find(|t| t["type"] == "text")
+            .expect("缺字幕轨");
+        assert_eq!(
+            text_track["segments"][1]["target_timerange"]["duration"].as_u64(),
+            Some(2_000_000),
+            "字幕段时长必须仍按句子本身"
+        );
+    }
+
+    /// F9：媒体路径未知（None 或空路径）时只生成字幕轨，绝不把字幕文件当视频素材。
+    #[test]
+    fn unknown_media_path_skips_video_track() {
+        let segs = vec![
+            Segment::new(1, 0.0, 10.0, "第一句"),
+            Segment::new(2, 10.0, 20.0, "第二句"),
+        ];
+        let no_path = DraftMedia {
+            path: None,
+            duration_secs: Some(3600.0),
+        };
+        let val =
+            JianYingExporter::build_draft_content_with_media(&segs, &no_path, ExportMode::RawOnly);
+        assert_eq!(
+            val["tracks"].as_array().unwrap().len(),
+            1,
+            "媒体路径未知时不应生成视频轨"
+        );
+        assert_eq!(val["tracks"][0]["type"], "text");
+        assert!(
+            val["materials"]["videos"].as_array().unwrap().is_empty(),
+            "媒体路径未知时不应有视频素材"
+        );
+        assert_eq!(
+            val["duration"].as_u64(),
+            Some(20_000_000),
+            "无视频时按字幕末句"
+        );
+
+        let empty_path = DraftMedia {
+            path: Some(PathBuf::new()),
+            duration_secs: Some(3600.0),
+        };
+        let val = JianYingExporter::build_draft_content_with_media(
+            &segs,
+            &empty_path,
+            ExportMode::RawOnly,
+        );
+        assert_eq!(
+            val["tracks"].as_array().unwrap().len(),
+            1,
+            "空路径同样视为未知，不应生成视频轨"
+        );
+    }
+
+    /// 兼容旧 API：没有媒体时长时回落到 `segments.last().end`。
+    #[test]
+    fn legacy_build_draft_content_falls_back_to_last_subtitle_end() {
+        let segs = vec![Segment::new(1, 0.0, 5.0, "一句话")];
+        let val = JianYingExporter::build_draft_content(&segs, None, 0.0, ExportMode::RawOnly);
+        assert_eq!(val["duration"].as_u64(), Some(5_000_000));
+        assert_eq!(val["tracks"].as_array().unwrap().len(), 1);
     }
 
     #[test]

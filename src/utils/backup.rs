@@ -16,15 +16,23 @@
 //! 手工拷贝在应用运行时是**不安全**的：SQLite 开了 WAL 后，最近的写入可能还在
 //! `voice2word.db-wal` 里没合并进主库，此刻按文件复制只会拿到一个**写到一半的主库**
 //! （甚至是不含最近几次编辑的旧主库），拷出来的备份看起来成功、实际是坏的。
-//! 本模块因此产出**一个带时间戳的归档**，并且把同名的 `-wal` / `-shm` 一并打进去，
-//! 用户可以把它当作一个文件保存 / 搬运 / 回退。
+//! 更糟的是「读主库、再读 `-wal`、再读 `-shm`」这三次读之间没有任何快照点：应用
+//! 正好在这中间 checkpoint 一次，归档里就是「新主库 + 旧 WAL」的撕裂组合，恢复后
+//! `quick_check` 不过，库会被隔离成一个空库——用户以为备份救了他，实际什么都没了。
+//!
+//! 因此数据库**不裸读**，而是让 SQLite 自己产出一份一致快照：只读连接上执行
+//! `VACUUM INTO '<临时文件>'`（见 [`snapshot_database`]），把快照文件放进归档。
+//! 快照是一个**独立、自洽的单文件库**：既包含 WAL 里尚未合并的写入，也不再需要
+//! `-wal` / `-shm` 陪伴，恢复时直接落一个 `.db` 即可。
+//!
+//! 本模块因此产出**一个带时间戳的归档**，用户可以把它当作一个文件保存 / 搬运 / 回退。
 //!
 //! # 职责边界
 //!
-//! 这里**只做文件搬运**：读文件、写 zip、再写回文件。不认识「任务」是什么，
-//! 不碰 SQLite API，不弹界面。好处是这一层可以被纯单测覆盖（临时目录里造几个
-//! 文件就能验证全部行为），而界面 / 业务层只需调用 [`create_backup`] 与
-//! [`restore_backup`] 并展示返回结构。
+//! 这里只做「取快照 + 文件搬运」：对数据库只调用 `VACUUM INTO`（不改源库一个字节，
+//! 连接是只读的），其余是读文件、写 zip、再写回文件。不认识「任务」是什么，不弹界面。
+//! 好处是这一层可以被单测覆盖（临时目录里造几个文件 / 一个真库就能验证全部行为），
+//! 而界面 / 业务层只需调用 [`create_backup`] 与 [`restore_backup`] 并展示返回结构。
 //!
 //! # 为什么手写 STORED zip 而不是加 `zip` crate
 //!
@@ -50,7 +58,10 @@ use anyhow::{bail, Context, Result};
 use tracing::{info, warn};
 
 /// 备份里包含的文件（相对项目根）。顺序即写入归档的顺序。
-pub const BACKUP_ENTRIES: [&str; 3] = ["voice2word.db", "config.toml", "config.local.toml"];
+pub const BACKUP_ENTRIES: [&str; 3] = [DB_ENTRY, "config.toml", "config.local.toml"];
+
+/// 数据库在归档里的条目名（也是项目根下的默认文件名）。
+const DB_ENTRY: &str = "voice2word.db";
 
 /// 一次备份的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,16 +85,22 @@ pub struct RestoreOutcome {
 
 /// 把数据目录里的关键文件打包成一个 zip 归档。
 ///
-/// - `root`：项目根（文件从 `root` 下按 [`BACKUP_ENTRIES`] 取）。
+/// - `root`：项目根（配置文件从 `root` 下取；数据库默认是 `root/voice2word.db`）。
 /// - `dest`：归档落点（例如 `root/backups/voice2word-backup-<时间戳>.zip`）；
 ///   父目录不存在会自动创建。**同秒重名不覆盖**：若 `dest` 已存在（连点两次
 ///   备份、或两个窗口同时备份），自动改用 `-1` / `-2`… 后缀的派生文件名，
 ///   并把它作为 [`BackupOutcome::archive`] 返回（调用方据此展示真实落点）。
+/// - 数据库先经 [`snapshot_database`] 取**一致快照**，再把快照文件放进归档；
+///   **不再**打包 `-wal` / `-shm`——快照本身已包含 WAL 里未合并的写入，
+///   再带上伴随文件反而会把两份快照混在一起。
 /// - 不存在的条目**跳过并记日志**，不算失败（瘦包里可能还没有 `config.local.toml`）；
 ///   但**一个都没有**时返回 `Err`（空归档没有任何意义，静默产出一个 0 条目的 zip
 ///   会让用户以为备份成功了）。
-/// - 同一路径的 `-wal` / `-shm` 若存在也一并打进归档：SQLite 的 WAL 模式下
-///   主库文件可能还没吸收最近的写入，只备份 `.db` 会丢最后几次编辑。
+/// - 快照失败（库被锁 / 损坏 / 打不开）是**硬错误**，绝不退回裸读文件的老路：
+///   一份可能撕裂的备份比「明确告诉你备份失败」危险得多。
+///
+/// 旧签名保持不变，等价于
+/// `create_backup_with_db(root, &root.join("voice2word.db"), dest)`。
 ///
 /// 以排他方式在 `dest`（或其派生别名）上创建一个新归档文件。
 ///
@@ -126,6 +143,17 @@ fn create_unique_archive_file(dest: &Path) -> Result<(PathBuf, std::fs::File)> {
 }
 
 pub fn create_backup(root: &Path, dest: &Path) -> Result<BackupOutcome> {
+    // 数据库默认就在项目根：界面层旧调用点只需传 root，行为与改前一致。
+    create_backup_with_db(root, &root.join(DB_ENTRY), dest)
+}
+
+/// 同 [`create_backup`]，但数据库位置由调用方**显式**给出。
+///
+/// 为什么需要它：库路径由 `AppConfig::resolve_path("voice2word.db")` 解析（项目根
+/// 可能来自 `VOICE2WORD_HOME` 等覆盖），而归档落点 `root` 与库所在目录未必相同。
+/// 把路径作为参数传进来，比在备份模块里再实现一遍根解析更可靠——根解析只应有
+/// 一处实现，且备份模块不该读环境变量。
+pub fn create_backup_with_db(root: &Path, db_path: &Path, dest: &Path) -> Result<BackupOutcome> {
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -133,12 +161,35 @@ pub fn create_backup(root: &Path, dest: &Path) -> Result<BackupOutcome> {
         }
     }
 
-    // 先收集 (归档内名字, 文件字节)。注意顺序：先 BACKUP_ENTRIES 本体，
-    // 每个本体后面紧跟它的 -wal / -shm 伴随文件（如果存在）。
+    // 先收集 (归档内名字, 文件字节)。配置文件按 BACKUP_ENTRIES 顺序原样读；
+    // 数据库走「先快照、再读快照字节」，绝不直接读活着的 `.db` / `-wal` / `-shm`。
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     let mut included: Vec<String> = Vec::new();
 
+    // 快照临时目录按需创建（库不存在时不必碰 %TEMP%），由 RAII 负责清理。
+    let mut snapshot_dir: Option<SnapshotDir> = None;
+
     for name in BACKUP_ENTRIES {
+        if name == DB_ENTRY {
+            if !db_path.is_file() {
+                // 与旧行为一致：瘦包 / 首次运行的目录里可能还没有库，跳过而非失败。
+                warn!(entry = name, db = %db_path.display(), "备份数据库不存在，已跳过");
+                continue;
+            }
+            if snapshot_dir.is_none() {
+                snapshot_dir = Some(SnapshotDir::new()?);
+            }
+            let dir = snapshot_dir.as_ref().expect("刚创建");
+            let snapshot = dir.path.join("snapshot.db");
+            snapshot_database(db_path, &snapshot)?;
+            let bytes = std::fs::read(&snapshot)
+                .with_context(|| format!("读取数据库快照失败: {}", snapshot.display()))?;
+            entries.push((name.to_string(), bytes));
+            included.push(name.to_string());
+            continue;
+        }
+
+        // `config.toml` / `config.local.toml` 不是数据库，保持原来的原样拷贝。
         let path = root.join(name);
         if path.is_file() {
             let bytes = std::fs::read(&path)
@@ -149,17 +200,6 @@ pub fn create_backup(root: &Path, dest: &Path) -> Result<BackupOutcome> {
             // 跳过而不是失败：瘦包 / 新装环境本就没有 config.local.toml。
             // 但一定要打日志，避免「备份成功但少文件」变成无声事实。
             warn!(entry = name, root = %root.display(), "备份条目不存在，已跳过");
-        }
-        // WAL 模式下 -wal 里可能压着最近未合并的写入，-shm 是配套的索引文件。
-        // 两者都跟着主库走，否则还原出来的库可能缺最后一次编辑。
-        for suffix in ["-wal", "-shm"] {
-            let companion = root.join(format!("{name}{suffix}"));
-            if companion.is_file() {
-                let bytes = std::fs::read(&companion)
-                    .with_context(|| format!("读取备份伴随文件失败: {}", companion.display()))?;
-                entries.push((format!("{name}{suffix}"), bytes));
-                included.push(format!("{name}{suffix}"));
-            }
         }
     }
 
@@ -199,6 +239,79 @@ pub fn create_backup(root: &Path, dest: &Path) -> Result<BackupOutcome> {
     })
 }
 
+/// 快照临时目录的 RAII 守卫：离开作用域即整目录删除。
+///
+/// 为什么不用「用完手动删」：快照之后还有读字节、建 zip、写归档几步，任何一步
+/// `?` 提前返回都会跳过手写清理，在 `%TEMP%` 里留下一个与库等大的 `.db`。
+struct SnapshotDir {
+    path: PathBuf,
+}
+
+impl SnapshotDir {
+    fn new() -> Result<Self> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "voice2word-backup-snapshot-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("创建快照临时目录失败: {}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for SnapshotDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// 用 `VACUUM INTO` 生成数据库的**一致快照**（写入 `out`；该文件必须不存在）。
+///
+/// # 为什么是 `VACUUM INTO` 而不是拷文件
+///
+/// - 它在源库上开一个**读事务**：快照对应「开始读的那一刻」的完整状态，运行中的
+///   写入不会把主库 / `-wal` / `-shm` 撕成互不一致的三份（这正是旧实现
+///   「三次 `fs::read` 之间没有快照点」会产出的撕裂备份）；
+/// - WAL 里尚未合并的写入会被包含进去，所以恢复后不丢最后几次编辑；
+/// - 产物是**自洽单文件**，不需要 `-wal` / `-shm` 陪伴，也就不会出现「旧快照的 WAL
+///   落到新库旁边」的混搭。
+///
+/// 连接**只读**打开：备份这条路不该有任何机会修改用户正在用的库。
+/// 失败（库被锁、损坏、根本不是 SQLite 文件）一律向上返回明确错误，**绝不**退回
+/// 裸读——那正是本模块要消灭的撕裂备份来源。
+fn snapshot_database(db_path: &Path, out: &Path) -> Result<()> {
+    use rusqlite::OpenFlags;
+
+    // `to_string_lossy` 是这里唯一可行的传参方式（SQLite 的 VACUUM INTO 只收
+    // UTF-8 路径）。若路径含无法编码的字节，SQLite 会以「无法创建文件」报错，
+    // 仍然落在下面这条明确的错误信息里，而不是静默产出坏备份。
+    let out_str = out.to_string_lossy().to_string();
+    let conn = rusqlite::Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("以只读方式打开数据库失败: {}", db_path.display()))?;
+    // 与 `storage::db` 的 5 s 窗口保持一致：用户很可能在转写进行中点备份，
+    // 短暂等锁比直接判失败更贴合真实场景；超时则返回明确错误。
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    conn.execute("VACUUM INTO ?1", rusqlite::params![out_str])
+        .with_context(|| {
+            format!(
+                "生成数据库一致快照失败（库可能被其他进程锁定，或文件已损坏）。\
+                 为避免产出撕裂的备份，本次备份已中止: {}",
+                db_path.display()
+            )
+        })?;
+    if !out.is_file() {
+        bail!(
+            "生成数据库快照失败：SQLite 未产出快照文件（{}）",
+            out.display()
+        );
+    }
+    Ok(())
+}
+
 /// 从归档恢复：把归档里的条目写回 `root`。
 ///
 /// - **不覆盖已有文件**：目标已存在时**不**写入，并把它记进
@@ -209,6 +322,8 @@ pub fn create_backup(root: &Path, dest: &Path) -> Result<BackupOutcome> {
 /// - **按组判断**：主库与它的 `-wal` / `-shm` 属于同一份快照，组内**任一**名字
 ///   已存在就整组跳过。否则「主库已存在（跳过）+ 伴随文件不存在（写入）」会把旧
 ///   快照的 WAL 留在用户当前的库旁边，下次启动由 SQLite 回放进当前主库。
+///   新归档里只有一份自洽的 `.db` 快照（不带伴随文件），但**旧版本产出的归档**里
+///   可能还有 `-wal` / `-shm`，这条组保护必须继续生效。
 /// - 归档里不认识的条目忽略（不写入、不报错）。
 /// - 归档损坏 / 不是 zip → `Err`。
 pub fn restore_backup(archive: &Path, root: &Path) -> Result<RestoreOutcome> {
@@ -599,6 +714,56 @@ mod tests {
         dir
     }
 
+    /// 造一个**真实**的 SQLite 库。
+    ///
+    /// 数据库现在走 `VACUUM INTO` 快照，假字节会被 SQLite 判为
+    /// `file is not a database`——旧测试用 `b"db"` 当库内容，改完后必须换成真库，
+    /// 否则测的只是「快照失败路径」。
+    fn make_db(path: &Path, notes: &[&str]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("创建库所在目录");
+        }
+        let conn = rusqlite::Connection::open(path).expect("打开库");
+        // 与生产一致用 WAL：快照必须能把 -wal 里尚未合并的写入一起带走。
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, note TEXT NOT NULL);",
+        )
+        .expect("建表");
+        for note in notes {
+            conn.execute(
+                "INSERT INTO tasks (note) VALUES (?1)",
+                rusqlite::params![note],
+            )
+            .expect("插行");
+        }
+    }
+
+    /// 读库里的全部 note。用「数据」而不是「文件字节」验证快照内容：
+    /// `VACUUM INTO` 会重排页面，字节不可能与源文件相同。
+    fn db_notes(path: &Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(path).expect("打开库");
+        let mut stmt = conn
+            .prepare("SELECT note FROM tasks ORDER BY id")
+            .expect("准备查询");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("查询")
+            .map(|r| r.expect("取行"))
+            .collect();
+        rows
+    }
+
+    /// 从归档里取出某个条目（不存在即测试失败）。
+    fn archive_entry(archive: &Path, name: &str) -> Vec<u8> {
+        read_stored_zip(&std::fs::read(archive).expect("读归档"))
+            .expect("解析归档")
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, data)| data)
+            .unwrap_or_else(|| panic!("归档里应有 {name}"))
+    }
+
     /// 文件名格式必须是 `voice2word-backup-YYYYMMDD-HHMMSS.zip`，界面直接展示它。
     #[test]
     fn backup_file_name_is_stable() {
@@ -611,18 +776,13 @@ mod tests {
         );
     }
 
-    /// 往返：备份 → 清空 root → 还原，字节必须完全一致。
-    /// 这是本模块存在的意义：换机器 / 回退后数据不能有任何偏差。
+    /// 往返：备份 → 清空 root → 还原。数据库内容与配置字节都不能有任何偏差。
+    /// 这是本模块存在的意义：换机器 / 回退后数据必须完整可用。
     #[test]
-    fn round_trip_restores_bytes() {
+    fn round_trip_restores_database_and_config() {
         let dir = tmp_dir("roundtrip");
         let root = dir.join("root");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            root.join("voice2word.db"),
-            b"SQLite format 3\0fake db bytes",
-        )
-        .unwrap();
+        make_db(&root.join("voice2word.db"), &["第一句", "第二句"]);
         std::fs::write(root.join("config.toml"), b"language = \"zh\"\n").unwrap();
 
         let archive = dir.join("backups").join("snap.zip");
@@ -631,6 +791,19 @@ mod tests {
         assert_eq!(outcome.included, vec!["voice2word.db", "config.toml"]);
         assert!(outcome.bytes > 0);
 
+        // 归档里的库必须是**独立快照**：能单独打开、数据完整，且不带 -wal/-shm。
+        let db_bytes = archive_entry(&archive, "voice2word.db");
+        let snapshot = dir.join("inspect.db");
+        std::fs::write(&snapshot, &db_bytes).unwrap();
+        assert_eq!(db_notes(&snapshot), vec!["第一句", "第二句"]);
+        assert!(
+            read_stored_zip(&std::fs::read(&archive).unwrap())
+                .unwrap()
+                .iter()
+                .all(|(name, _)| !name.ends_with("-wal") && !name.ends_with("-shm")),
+            "快照已是自洽单文件，归档里不应再有 -wal/-shm"
+        );
+
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::create_dir_all(&root).unwrap();
 
@@ -638,8 +811,8 @@ mod tests {
         assert_eq!(restored.restored, vec!["voice2word.db", "config.toml"]);
         assert!(restored.skipped_existing.is_empty());
         assert_eq!(
-            std::fs::read(root.join("voice2word.db")).unwrap(),
-            b"SQLite format 3\0fake db bytes"
+            db_notes(&root.join("voice2word.db")),
+            vec!["第一句", "第二句"]
         );
         assert_eq!(
             std::fs::read(root.join("config.toml")).unwrap(),
@@ -654,14 +827,117 @@ mod tests {
     fn missing_entries_are_skipped() {
         let dir = tmp_dir("missing");
         let root = dir.join("root");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("voice2word.db"), b"db").unwrap();
+        make_db(&root.join("voice2word.db"), &["only"]);
 
         let archive = dir.join("snap.zip");
         let outcome = create_backup(&root, &archive).unwrap();
         assert!(outcome.included.contains(&"voice2word.db".to_string()));
         assert!(!outcome.included.contains(&"config.local.toml".to_string()));
         assert!(archive.is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **F4 核心回归**：源库正被另一条连接写入（最新数据只在 `-wal` 里）时，
+    /// 快照必须包含那次写入，且归档里**不能**再出现 `-wal` / `-shm`。
+    ///
+    /// 旧实现直接 `fs::read` 三次（主库 / wal / shm），中间没有快照点；一旦应用在
+    /// 这期间 checkpoint，归档里就是「新主库 + 旧 WAL」的撕裂组合。
+    #[test]
+    fn snapshot_includes_live_wal_writes_and_drops_companions() {
+        let dir = tmp_dir("wal_snapshot");
+        let root = dir.join("root");
+        make_db(&root.join("voice2word.db"), &["committed"]);
+
+        // 保持连接存活：这次写入只会落在 -wal 里（SQLite 只在最后一个连接关闭时
+        // checkpoint 并删除 -wal），正好模拟「应用正在运行、用户点备份」。
+        let live = rusqlite::Connection::open(root.join("voice2word.db")).unwrap();
+        let _ = live.pragma_update(None, "journal_mode", "WAL");
+        live.execute("INSERT INTO tasks (note) VALUES ('wal-only')", [])
+            .expect("写入 WAL");
+        assert!(
+            root.join("voice2word.db-wal").is_file(),
+            "前置条件：最新写入应在 -wal 里"
+        );
+
+        let archive = dir.join("snap.zip");
+        let outcome = create_backup(&root, &archive).unwrap();
+        assert_eq!(
+            outcome.included,
+            vec!["voice2word.db"],
+            "不得再把 -wal/-shm 打进归档"
+        );
+
+        let snapshot = dir.join("snapshot.db");
+        std::fs::write(&snapshot, archive_entry(&archive, "voice2word.db")).unwrap();
+        assert_eq!(
+            db_notes(&snapshot),
+            vec!["committed", "wal-only"],
+            "快照必须包含只存在于 -wal 里的写入"
+        );
+
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 快照失败（库不是 SQLite / 已损坏）时必须是**明确错误**，不能退回裸读，
+    /// 也不能留下一个「看起来成功」的归档。
+    #[test]
+    fn corrupt_database_is_an_error_not_a_raw_copy() {
+        let dir = tmp_dir("corrupt");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("voice2word.db"),
+            b"SQLite format 3\0not really a database",
+        )
+        .unwrap();
+        std::fs::write(root.join("config.toml"), b"language = \"zh\"\n").unwrap();
+
+        let archive = dir.join("snap.zip");
+        let err = create_backup(&root, &archive).expect_err("坏库必须让备份失败");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("一致快照"),
+            "错误信息应说清是快照失败而不是普通 IO: {msg}"
+        );
+        assert!(!archive.exists(), "失败时不能留下归档（哪怕只含配置文件）");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 归档里只有配置、没有库时仍可备份（瘦包首次运行）——库缺失是「跳过」而不是失败。
+    #[test]
+    fn config_only_backup_is_allowed() {
+        let dir = tmp_dir("config_only");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.toml"), b"language = \"zh\"\n").unwrap();
+
+        let archive = dir.join("snap.zip");
+        let outcome = create_backup(&root, &archive).unwrap();
+        assert_eq!(outcome.included, vec!["config.toml"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 新签名允许数据库不在 `root` 下：调用方把 `AppConfig::resolve_path` 的结果传进来，
+    /// 归档里的条目名仍是 `voice2word.db`（恢复时按这个名字落盘）。
+    #[test]
+    fn create_backup_with_db_takes_explicit_database_path() {
+        let dir = tmp_dir("explicit_db");
+        let root = dir.join("data_dir");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = dir.join("elsewhere").join("custom.db");
+        make_db(&db_path, &["external"]);
+
+        let archive = dir.join("snap.zip");
+        let outcome = create_backup_with_db(&root, &db_path, &archive).unwrap();
+        assert_eq!(outcome.included, vec!["voice2word.db"]);
+
+        let snapshot = dir.join("snapshot.db");
+        std::fs::write(&snapshot, archive_entry(&archive, "voice2word.db")).unwrap();
+        assert_eq!(db_notes(&snapshot), vec!["external"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -685,46 +961,49 @@ mod tests {
     fn restore_does_not_overwrite_existing() {
         let dir = tmp_dir("nooverwrite");
         let root = dir.join("root");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("voice2word.db"), b"OLD-BACKUP-CONTENT").unwrap();
+        make_db(&root.join("voice2word.db"), &["OLD-BACKUP-CONTENT"]);
 
         let archive = dir.join("snap.zip");
         create_backup(&root, &archive).unwrap();
 
         // 用户在当前工程里继续干活，主库已经变了。
-        std::fs::write(root.join("voice2word.db"), b"LIVE-CURRENT-DATA").unwrap();
+        let live = rusqlite::Connection::open(root.join("voice2word.db")).unwrap();
+        live.execute("UPDATE tasks SET note = 'LIVE-CURRENT-DATA'", [])
+            .unwrap();
+        drop(live);
 
         let outcome = restore_backup(&archive, &root).unwrap();
         assert!(outcome.restored.is_empty());
         assert_eq!(outcome.skipped_existing, vec!["voice2word.db"]);
         assert_eq!(
-            std::fs::read(root.join("voice2word.db")).unwrap(),
-            b"LIVE-CURRENT-DATA"
+            db_notes(&root.join("voice2word.db")),
+            vec!["LIVE-CURRENT-DATA"]
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// WAL 模式下的伴随文件必须一起进归档，否则还原出来的库可能缺最后一次编辑。
+    /// **旧版本归档**（带 `-wal`/`-shm`）仍必须能整组还原到一个全新目录：
+    /// 兼容性不能因为新归档改成单文件快照就丢掉。
     #[test]
-    fn wal_and_shm_companions_are_included() {
-        let dir = tmp_dir("wal");
+    fn legacy_archive_with_companions_restores_whole_group() {
+        let dir = tmp_dir("legacy_group");
         let root = dir.join("root");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("voice2word.db"), b"db").unwrap();
-        std::fs::write(root.join("voice2word.db-wal"), b"wal-bytes").unwrap();
-        std::fs::write(root.join("voice2word.db-shm"), b"shm").unwrap();
-
+        let bytes = build_stored_zip(&[
+            ("voice2word.db".to_string(), b"db".to_vec()),
+            ("voice2word.db-wal".to_string(), b"wal-bytes".to_vec()),
+            ("voice2word.db-shm".to_string(), b"shm".to_vec()),
+        ])
+        .unwrap();
         let archive = dir.join("snap.zip");
-        let outcome = create_backup(&root, &archive).unwrap();
+        std::fs::write(&archive, bytes).unwrap();
+
+        let restored = restore_backup(&archive, &root).unwrap();
         assert_eq!(
-            outcome.included,
+            restored.restored,
             vec!["voice2word.db", "voice2word.db-wal", "voice2word.db-shm"]
         );
-
-        std::fs::remove_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&root).unwrap();
-        let restored = restore_backup(&archive, &root).unwrap();
         assert!(restored.skipped_existing.is_empty());
         assert_eq!(
             std::fs::read(root.join("voice2word.db-wal")).unwrap(),
@@ -792,7 +1071,7 @@ mod tests {
     fn same_second_backup_does_not_overwrite_existing_archive() {
         let dir = tmp_dir("collision");
         let root = dir.join("root");
-        std::fs::create_dir_all(&root).unwrap();
+        make_db(&root.join("voice2word.db"), &["first"]);
 
         // 固定时间戳：模拟「同一秒里连点两次备份」产生的同名 dest。
         let fixed = chrono::Local
@@ -800,11 +1079,13 @@ mod tests {
             .unwrap();
         let dest = dir.join("backups").join(backup_file_name(fixed));
 
-        std::fs::write(root.join("voice2word.db"), b"first").unwrap();
         let first = create_backup(&root, &dest).unwrap();
         assert_eq!(first.archive, dest);
 
-        std::fs::write(root.join("voice2word.db"), b"second").unwrap();
+        let live = rusqlite::Connection::open(root.join("voice2word.db")).unwrap();
+        live.execute("UPDATE tasks SET note = 'second'", [])
+            .unwrap();
+        drop(live);
         let second = create_backup(&root, &dest).unwrap();
         assert_ne!(
             second.archive, dest,
@@ -813,24 +1094,25 @@ mod tests {
         assert!(dest.exists(), "第一份归档必须原样保留");
         assert!(second.archive.exists(), "第二份归档必须落盘");
 
-        let db_bytes = |archive: &std::path::Path| {
-            read_stored_zip(&std::fs::read(archive).unwrap())
-                .unwrap()
-                .into_iter()
-                .find(|(name, _)| name == "voice2word.db")
-                .map(|(_, data)| data)
-                .expect("归档里应有 voice2word.db")
+        let notes_of = |archive: &std::path::Path| {
+            let inspect = dir.join(format!(
+                "inspect-{}.db",
+                archive.file_name().unwrap().to_string_lossy()
+            ));
+            std::fs::write(&inspect, archive_entry(archive, "voice2word.db")).unwrap();
+            db_notes(&inspect)
         };
-        assert_eq!(db_bytes(&dest), b"first".to_vec());
-        assert_eq!(db_bytes(&second.archive), b"second".to_vec());
+        assert_eq!(notes_of(&dest), vec!["first"]);
+        assert_eq!(notes_of(&second.archive), vec!["second"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **核心反例**：当前目录里的主库还活着（且已 checkpoint，没有 `-wal`），
-    /// 归档里带着同一份旧快照的 `-wal`。还原必须**整组**放弃——绝不能把旧快照的
-    /// WAL 写进当前目录，那会让 SQLite 下次启动拿它回放当前主库。
+    /// 旧版本归档里带着同一份旧快照的 `-wal`。还原必须**整组**放弃——绝不能把旧
+    /// 快照的 WAL 写进当前目录，那会让 SQLite 下次启动拿它回放当前主库。
     ///
+    /// 新归档已不再带伴随文件，但旧归档仍可能流落在用户手里，这条保护必须保留。
     /// 逐个文件判断的旧实现会在这里失败：`voice2word.db` 被跳过，而
     /// `voice2word.db-wal` 因为目标不存在而被写入，界面还报「已恢复 1 个文件」。
     #[test]
@@ -838,15 +1120,18 @@ mod tests {
         let dir = tmp_dir("wal_mix");
         let root = dir.join("root");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("voice2word.db"), b"old-db").unwrap();
-        std::fs::write(root.join("voice2word.db-wal"), b"old-wal").unwrap();
 
+        // 旧版本产出的归档：主库 + 同一份快照的 -wal
         let archive = dir.join("snap.zip");
-        create_backup(&root, &archive).unwrap();
+        let bytes = build_stored_zip(&[
+            ("voice2word.db".to_string(), b"old-db".to_vec()),
+            ("voice2word.db-wal".to_string(), b"old-wal".to_vec()),
+        ])
+        .unwrap();
+        std::fs::write(&archive, bytes).unwrap();
 
-        // 归档之后用户继续干活：WAL 被合并进主库，伴随文件随之消失。
+        // 归档之后用户继续干活：当前目录里的库还在，且已 checkpoint（没有 -wal）。
         std::fs::write(root.join("voice2word.db"), b"LIVE-CURRENT-DATA").unwrap();
-        std::fs::remove_file(root.join("voice2word.db-wal")).unwrap();
 
         let outcome = restore_backup(&archive, &root).unwrap();
         assert!(outcome.restored.is_empty(), "主库已存在时整组都不能还原");
@@ -874,14 +1159,18 @@ mod tests {
         let dir = tmp_dir("wal_only");
         let root = dir.join("root");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("voice2word.db"), b"old-db").unwrap();
-        std::fs::write(root.join("voice2word.db-wal"), b"old-wal").unwrap();
 
+        // 旧版本产出的归档（带 -wal）
         let archive = dir.join("snap.zip");
-        create_backup(&root, &archive).unwrap();
+        let bytes = build_stored_zip(&[
+            ("voice2word.db".to_string(), b"old-db".to_vec()),
+            ("voice2word.db-wal".to_string(), b"old-wal".to_vec()),
+        ])
+        .unwrap();
+        std::fs::write(&archive, bytes).unwrap();
 
         // 主库没了、只剩下没人认领的 WAL（手工删库 / 半途中断都会留下这种残局）。
-        std::fs::remove_file(root.join("voice2word.db")).unwrap();
+        std::fs::write(root.join("voice2word.db-wal"), b"old-wal").unwrap();
 
         let outcome = restore_backup(&archive, &root).unwrap();
         assert!(outcome.restored.is_empty(), "同组里有残留就不能还原");
@@ -899,17 +1188,20 @@ mod tests {
     }
 
     /// 正向面：全新目录（换机器）里必须把整组都还原出来——组保护不能把正常场景
-    /// 一起挡掉。
+    /// 一起挡掉（用旧版本归档验证，新归档里只有单文件快照）。
     #[test]
     fn restore_writes_whole_group_on_fresh_root() {
         let dir = tmp_dir("fresh_group");
         let root = dir.join("root");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("voice2word.db"), b"db-bytes").unwrap();
-        std::fs::write(root.join("voice2word.db-wal"), b"wal-bytes").unwrap();
 
         let archive = dir.join("snap.zip");
-        create_backup(&root, &archive).unwrap();
+        let bytes = build_stored_zip(&[
+            ("voice2word.db".to_string(), b"db-bytes".to_vec()),
+            ("voice2word.db-wal".to_string(), b"wal-bytes".to_vec()),
+        ])
+        .unwrap();
+        std::fs::write(&archive, bytes).unwrap();
 
         let fresh = dir.join("fresh");
         let outcome = restore_backup(&archive, &fresh).unwrap();

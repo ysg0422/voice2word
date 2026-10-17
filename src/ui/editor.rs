@@ -4358,7 +4358,7 @@ impl MainWindow {
     /// 与 `render_retime_card` 的预览用**同一份** `plan_retime` 调用参数，避免
     /// 「预览说改 190 句、应用却改了 189 句」这种自相矛盾。
     fn apply_retime(&mut self, cx: &mut Context<Self>) {
-        use crate::subtitle::timing::{plan_retime, resolve_overlaps, TimeShift};
+        use crate::subtitle::timing::{plan_retime, resolve_overlaps_in_place, TimeShift};
         if self.state.segments.is_empty() {
             return;
         }
@@ -4378,7 +4378,10 @@ impl MainWindow {
         let plan = plan_retime(&self.state.segments, shift);
         // 应用前记快照：整轨操作一改几百句，点错了必须有路可退。
         self.state.snapshot_for_undo();
-        let resolved = resolve_overlaps(&plan.times);
+        // 按下标**原地**消重叠：`resolve_overlaps` 会按时间排序，而导入的 cue 可能
+        // 本来就不按时间序，排序后 zip 回去会把每句的时间写到别的句子上（整轨错位）。
+        let mut resolved = plan.times.clone();
+        resolve_overlaps_in_place(&mut resolved);
         for (seg, (start, end)) in self.state.segments.iter_mut().zip(resolved) {
             seg.start = start;
             seg.end = end;

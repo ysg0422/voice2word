@@ -166,6 +166,41 @@ pub fn plan_chunks_target(total_duration: f64, target_sec: f64) -> Vec<AudioChun
         .collect()
 }
 
+/// 规划切块时优先使用**实测的第 0 条音轨时长**，探测失败才退回调用方给的时长。
+///
+/// 容器时长并不等于音轨时长：视频轨比音轨长（片尾留白、片尾字幕、音轨提前结束）时，
+/// 按容器时长切出的末尾几块会落在音轨结束之后——ffmpeg 切出 0 字节空片，转写器直接
+/// 报错；反过来容器时长偏短时规划会提前收尾，片尾最后一句根本不在任何块里。两种偏差
+/// 都来自同一个错误来源：拿容器时长当音轨时长用。
+///
+/// 传进来的 `wav_path` 已经是待转写的整轨 WAV，它的音轨时长就是切块该用的时长。
+fn plan_duration_for(ffmpeg: &FFmpegEngine, wav_path: &Path, fallback: f64) -> f64 {
+    let audio = ffmpeg.get_audio_duration(wav_path);
+    if audio.is_finite() && audio > 0.0 {
+        audio
+    } else {
+        fallback
+    }
+}
+
+/// 按音轨时长规划切块，并丢弃「起点已在音频结束之后」的空片。
+///
+/// [`plan_chunks_target`] 生成的块都在 `[0, duration]` 内，正常输入不会产生空片；
+/// 但调用方传入的时长仍可能落后于素材（缓存时长过期 / 素材被替换），此后的块切出来
+/// 必然是 0 字节文件，转写时只会得到一条「没有音轨」的报错。这里统一挡掉，让
+/// 「本来就没有声音的区间」不再变成一次转写失败。
+pub fn plan_chunks_within(duration: f64, target_sec: f64) -> Vec<AudioChunk> {
+    let effective = if duration.is_finite() && duration > 0.0 {
+        duration
+    } else {
+        0.0
+    };
+    plan_chunks_target(effective, target_sec)
+        .into_iter()
+        .filter(|chunk| chunk.start < effective)
+        .collect()
+}
+
 /// SenseVoice 多进程并行的 worker 数：每 2 个核心一个进程，上限 6。
 /// 抽成独立函数以便管线展示与基准测试复用同一份策略。
 pub fn sensevoice_worker_count(cores: u32) -> usize {
@@ -216,14 +251,19 @@ fn per_process_threads(threads: u32, workers: usize) -> u32 {
     (threads / workers.max(1) as u32).max(1)
 }
 
-/// 拼接各块的片段表：跨块重叠区的同一句话合并成一条，块内的重复句原样保留。
+/// 拼接各块的片段表：跨块重叠区的同一句话合并成一条，块内时间上不重叠的重复句原样保留。
 ///
 /// 切块时相邻块共享 [`CHUNK_OVERLAP_SEC`] 秒音频，于是压在交界上的整句会被两块各转
 /// 一次。这里对**跨块**且落在重叠窗口内的一对做模糊匹配（[`merge_overlap`]）：判为
-/// 同一句就合并成一条（保留更早的起点、取较晚的终点，避免合并后短了一截），判为
-/// 不同就都保留。**只对跨块的一对生效**——块内不存在重叠来源，块内时间上并不重叠的
-/// 重复句是说话人真的重复了一遍（跟读 / 听写类课程极常见），无差别套用会把那句静默
-/// 吃掉。块内的真重叠（时间上互相压着）仍按更严格的包含式判定丢弃。
+/// 同一句就合并成一条（保留**文本更长**的那条、时间取并集），判为不同就都保留。
+///
+/// 两条硬规则，都是为了「宁可重复，不可丢句」：
+/// - 块内时间上并不重叠的重复句一律保留：那是说话人真的重复了一遍（跟读 / 听写类
+///   课程极常见），无差别去重会把第二句静默吃掉；
+/// - 时间上真正互相压住时，只有**文本高度相似**（[`OVERLAP_DROP_THRESHOLD`]）才允许
+///   把后一条并进前一条；文本不像就是两句不同的话被时间戳挤在一起，两条都保留，只把
+///   后一条的起点钳到前一条终点。旧实现在这里用 `seg.end <= prev.end + 0.15` 静默丢
+///   整句，边界上「后块整句落在已接受片段区间内」会整句消失。
 pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment> {
     parts.sort_by_key(|(idx, _, _)| *idx);
     // 所有块的最大结束时间（按各自偏移还原到全局时间轴）。用于兜住「末块整体落在
@@ -243,7 +283,7 @@ pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment>
                 let cross_chunk = last_chunk != Some(chunk_idx);
                 let gap = seg.start - prev.end;
                 // 跨块 + 落在重叠窗口内：模糊匹配把「同一句话的两次识别」合并成一条。
-                // 命中即吃掉当前这条（保留更早的 start、取较晚的 end），不新增片段。
+                // 命中即吃掉当前这条（保留更长文本、时间取并集），不新增片段。
                 // 窗口上加 0.4s 容差，吸收两侧时间戳的抖动。
                 if cross_chunk && gap < CHUNK_OVERLAP_SEC + MERGE_GAP_TOLERANCE {
                     if let MergeDecision::Merged(m) =
@@ -253,28 +293,29 @@ pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment>
                         continue;
                     }
                 }
-                // 块内的真重叠或已越过重叠窗口的跨块重叠：仍按更严格的包含式判定丢弃，
-                // 避免把只是「像」的两句话连成一条。块内时间上不重叠的重复句不在此列，
-                // 原样保留。
-                if gap < -0.25 {
-                    if text_similar(prev.display_text(), seg.display_text())
-                        || seg.end <= prev.end + 0.15
+                // 时间上确实压住了上一条：只有文本高度相似才允许把后一条并掉。
+                // 时间重叠本身不再是丢弃依据（见函数文档）。
+                if gap < 0.0 {
+                    if let MergeDecision::Merged(m) =
+                        merge_overlap(prev, &seg, OVERLAP_DROP_THRESHOLD)
                     {
+                        *prev = m;
                         continue;
                     }
-                    if seg.start < prev.end {
-                        seg.start = prev.end;
-                        for w in &mut seg.words {
-                            if w.start < seg.start {
-                                w.start = seg.start;
-                            }
-                            if w.end <= w.start {
-                                w.end = (w.start + 0.05).min(seg.end);
-                            }
+                    // 不相似：两条都留。把后一条的起点钳到前一条终点，时间轴不倒挂；
+                    // 钳完若已没有正长度（整段落在上一条区间里），给它一个最小时长，
+                    // 绝不因为「时间太挤」丢掉整句。
+                    seg.start = prev.end;
+                    if seg.end <= seg.start {
+                        seg.end = seg.start + MIN_KEPT_SEG_SEC;
+                    }
+                    let (start, end) = (seg.start, seg.end);
+                    for w in &mut seg.words {
+                        w.start = w.start.clamp(start, end);
+                        w.end = w.end.clamp(start, end);
+                        if w.end <= w.start {
+                            w.end = (w.start + MIN_KEPT_SEG_SEC).min(end);
                         }
-                    }
-                    if seg.end - seg.start < 0.12 {
-                        continue;
                     }
                 }
             }
@@ -282,22 +323,11 @@ pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment>
             last_chunk = Some(chunk_idx);
         }
     }
-    // 末块整体被上面的重叠判定吞掉时的兜底：若已接受字幕整体提前于全部块的真实
-    // 结束时间收尾，说明末尾那段语音被判成了「重叠重复」而丢弃，而它其实是片尾
-    // 最后一句——直接丢掉会让字幕凭空少一截。末条正是被压得最长的那一句
-    // （相邻重叠触发 `seg.end <= prev.end + 0.15` 而 continue 时，它的 end 至少
-    // 比真实结尾短 0.15s），因此把它的终点拉回到全局结尾即可，不新增片段。
-    //
-    // 但延展必须有上限：`global_end` 是「全部块的最大结束时间」，若整个末块都被
-    // 判成重复而丢弃，`global_end - last.end` 会是整块的跨度（Whisper 目标块长
-    // 360s），把一条字幕无上限地拉长几十秒到几分钟。真实漏删只是末尾一两句
-    // （见 `TAIL_EXTEND_MAX_SEC`），超过上限就说明不是「漏了最后一句」而是末块
-    // 整体失效，此时保留原 `end` 更诚实（不伪造时间轴），交给下游/人工处理。
+    // 末块整体被上面的重叠判定合并掉时的兜底：若已接受字幕整体提前于全部块的真实
+    // 结束时间收尾，说明末尾那段语音没能落到任何一条字幕的终点上——不补会让字幕
+    // 凭空少一截。是否延展、延展多少由 [`extend_tail_end`] 决定（有上限）。
     if let Some(last) = out.last_mut() {
-        let extension = global_end - last.end;
-        if extension > 0.05 && extension <= TAIL_EXTEND_MAX_SEC {
-            last.end = global_end;
-        }
+        extend_tail_end(last, global_end);
     }
     for (i, seg) in out.iter_mut().enumerate() {
         seg.index = i + 1;
@@ -305,21 +335,18 @@ pub fn stitch_chunks(mut parts: Vec<(usize, f64, Vec<Segment>)>) -> Vec<Segment>
     out
 }
 
-fn text_similar(a: &str, b: &str) -> bool {
-    let a = a.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-    let b = b.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-    if a.is_empty() || b.is_empty() {
-        return false;
+/// 末段兜底：把最后一条字幕的终点延展到音频真实结尾（`global_end`）。
+///
+/// 只在上限 [`TAIL_EXTEND_MAX_SEC`] 内生效：`global_end` 是「全部块的最大结束时间」，
+/// 若整个末块都被判成重复而丢弃，`global_end - last.end` 会是整块的跨度（Whisper 目标
+/// 块长 360s），无上限延展会把一条字幕拉长几十秒到几分钟。真实漏删只是末尾一两句，
+/// 超过上限就说明不是「漏了最后一句」而是末块整体失效，此时保留原 `end` 更诚实
+/// （不伪造时间轴），交给下游/人工处理。
+fn extend_tail_end(last: &mut Segment, global_end: f64) {
+    let extension = global_end - last.end;
+    if extension > 0.05 && extension <= TAIL_EXTEND_MAX_SEC {
+        last.end = global_end;
     }
-    if a == b {
-        return true;
-    }
-    let (short, long) = if a.len() <= b.len() {
-        (&a, &b)
-    } else {
-        (&b, &a)
-    };
-    long.contains(short.as_str()) && short.chars().count() >= 4
 }
 
 /// 归一化文本后按「最长公共子序列占比」算相似度（0.0~1.0）。
@@ -377,19 +404,38 @@ fn lcs_len(a: &[char], b: &[char]) -> usize {
 /// 断句字符）。取 0.7 留出余量：边界上常见的「半句 vs 整句」「丢一两个字」仍能命中；
 /// 低于它多半是两块各自识别出的不同内容，不该并成一条。阈值只作用于**跨块**的一对
 /// （见 [`stitch_chunks`]），块内重复句不受影响。
+///
+/// 注意：命中后合并保留的是**文本更长**的那条、时间取并集，内容不会因为合并而丢失；
+/// 「时间重叠时直接把后一条丢掉」用的是更严格的 [`OVERLAP_DROP_THRESHOLD`]。
 pub const OVERLAP_MATCH_THRESHOLD: f64 = 0.7;
+
+/// 时间重叠的两条字幕里，允许把后一条**并掉**（不再单独保留）的文本相似度下限。
+///
+/// 与 [`OVERLAP_MATCH_THRESHOLD`] 分开：合并只是把同一句的两次识别并成一条并保留
+/// 更长文本 + 时间并集，0.7 足够；而「后一条不再单独存在」必须确认它确实是同一句，
+/// 否则会把边界上两句不同的话里那句被时间戳压短（甚至整段落在前一条区间里）的整句
+/// 丢掉。0.85 是本模块对「同句」的最低可信度：归一化 LCS 占比低于它的两段文本，
+/// 通常是不同句子只共享几个字。
+const OVERLAP_DROP_THRESHOLD: f64 = 0.85;
 
 /// 跨块合并的时间窗口容差（秒）：重叠本身是 [`CHUNK_OVERLAP_SEC`]，再加这点容差吸收
 /// 两侧时间戳抖动。只有落在窗口内的一对才考虑合并——窗口外即便文本偶然相似，也是块后
 /// 的新内容。
 const MERGE_GAP_TOLERANCE: f64 = 0.4;
 
+/// 保留下来的片段允许的最短时长（秒）。
+///
+/// 两句不同的话时间互相压住时，后一条的起点会被钳到前一条终点；若它整段都落在前一条
+/// 区间里，钳完就没有正长度了。「时间太挤」不是丢句子的理由，给它这点最小时长，让
+/// 下游按自己的规则裁剪 / 合并。
+const MIN_KEPT_SEG_SEC: f64 = 0.05;
+
 /// 相邻块边界处一对候选字幕的合并决策。
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum MergeDecision {
-    /// 两条是同一句话的两次识别：合并成一条——起点取更早者、终点取较晚者（避免合并后
-    /// 短了一截），文本等其余字段沿用更早的那条。
+    /// 两条是同一句话的两次识别：合并成一条——保留**文本更长**的那条（避免留下被
+    /// 截短的半句），时间取两者的并集（start 取较早者、end 取较晚者）。
     Merged(Segment),
     /// 两条不是同一句话：都保留（宁可重复，也不丢句子）。
     KeepBoth,
@@ -405,16 +451,26 @@ pub fn merge_overlap(prev_tail: &Segment, next_head: &Segment, threshold: f64) -
     if similarity < threshold {
         return MergeDecision::KeepBoth;
     }
-    // 文本判为同一句：以时间更早的那条为基准（保留它的文本与字段，时间轴上也更靠前），
-    // 终点取两条里较晚的，避免合并后比实际语音短一截。
-    let (earlier, later) = if prev_tail.start <= next_head.start {
-        (prev_tail, next_head)
+    // 文本判为同一句：**取文本更长的那条作基准**，时间取两者的并集。
+    //
+    // 旧实现固定保留时间更早的那条、只把 end 拉长：边界上「前块半句 + 后块整句」时，
+    // 留下的就是半句文本配整句时长——有音无字（字幕只显示半句，语音却一直在说）。
+    // 两条文本长度相同（含完全相同）时保留更早那条，行为与旧实现一致。
+    let keep_next = normalized_text_len(next_head.display_text())
+        > normalized_text_len(prev_tail.display_text());
+    let mut merged = if keep_next {
+        next_head.clone()
     } else {
-        (next_head, prev_tail)
+        prev_tail.clone()
     };
-    let mut merged = earlier.clone();
-    merged.end = earlier.end.max(later.end);
+    merged.start = prev_tail.start.min(next_head.start);
+    merged.end = prev_tail.end.max(next_head.end);
     MergeDecision::Merged(merged)
+}
+
+/// 归一化后（去标点 / 空白 / 大小写）的字符数，用于「保留文本更长的那条」。
+fn normalized_text_len(text: &str) -> usize {
+    normalize_for_match(text).len()
 }
 
 /// 把片段从「块内相对时间」平移到全局时间轴：段边界与**词级时间戳**用同一个偏移量一起挪。
@@ -501,71 +557,110 @@ pub fn run_chunked_parallel(
 
     let progress_cb = progress_cb.map(Arc::new);
     let done = Arc::new(AtomicUsize::new(0));
-    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let total_chunks = slice_paths.len();
 
     let pool = rayon_pool(workers)?;
-    let results: Vec<Result<ChunkResult>> = pool.install(|| {
+    // 每块独立成败：单块失败只丢这一块并记录缺失区间，**不中止剩余块**。
+    // 旧实现用 `failed` 标志让所有 worker 提前放弃、汇总处再 `return Err`，于是长音频
+    // （>405s 必然走分块）任何一块出问题就一条字幕都没有。这里把「失败」降级成
+    // 「这一块没有输出」，其余块照常转写、照常拼接。
+    let results: Vec<(AudioChunk, Result<ChunkResult>)> = pool.install(|| {
         use rayon::prelude::*;
         slice_paths
             .par_iter()
             .map(|(chunk, path)| {
-                if failed.load(Ordering::Relaxed) {
-                    anyhow::bail!("已有分块转写失败，中止剩余任务");
-                }
-                let cb = progress_cb.clone();
-                let done = done.clone();
-                let failed_flag = failed.clone();
-                let (segs, chunk_vad_sec) =
-                    match transcribe_one(path, chunk.duration, per_proc_threads) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            failed_flag.store(true, Ordering::Relaxed);
-                            return Err(e);
-                        }
-                    };
+                let chunk = *chunk;
+                let outcome = transcribe_one(path, chunk.duration, per_proc_threads)
+                    .map(|(segs, vad_sec)| (chunk.index, chunk.start, segs, vad_sec));
+                // 失败也计入完成数：进度条必须走到底，否则失败块会让进度永远停在
+                // 未完成状态，看起来像卡死。
                 let finished = done.fetch_add(1, Ordering::SeqCst) + 1;
                 let ratio = finished as f64 / total_chunks as f64;
-                if let Some(cb) = cb.as_ref() {
-                    for mut seg in segs.iter().cloned() {
-                        shift_segment(&mut seg, chunk.start);
-                        cb(
+                if let Some(cb) = progress_cb.as_ref() {
+                    match &outcome {
+                        Ok((_, _, segs, _)) => {
+                            for mut seg in segs.iter().cloned() {
+                                shift_segment(&mut seg, chunk.start);
+                                cb(
+                                    ratio,
+                                    &format!(
+                                        "块 {}/{} 完成 · {}s",
+                                        finished, total_chunks, seg.end as u32
+                                    ),
+                                    Some(seg),
+                                );
+                            }
+                            if segs.is_empty() {
+                                cb(
+                                    ratio,
+                                    &format!("块 {}/{} 无语音", finished, total_chunks),
+                                    None,
+                                );
+                            }
+                        }
+                        Err(_) => cb(
                             ratio,
                             &format!(
-                                "块 {}/{} 完成 · {}s",
-                                finished, total_chunks, seg.end as u32
+                                "块 {}/{} 失败，已跳过（缺失 {:.1}s–{:.1}s）",
+                                finished,
+                                total_chunks,
+                                chunk.start,
+                                chunk.start + chunk.duration
                             ),
-                            Some(seg),
-                        );
-                    }
-                    if segs.is_empty() {
-                        cb(
-                            ratio,
-                            &format!("块 {}/{} 无语音", finished, total_chunks),
                             None,
-                        );
+                        ),
                     }
                 }
-                Ok((chunk.index, chunk.start, segs, chunk_vad_sec))
+                (chunk, outcome)
             })
             .collect()
     });
 
     let mut parts = Vec::new();
     let mut total_vad_sec = 0.0;
-    for item in results {
+    // 失败块的缺失区间：(块下标, 起点秒, 终点秒)，按块序收集，供日志 / 进度文案。
+    let mut missing: Vec<(usize, f64, f64)> = Vec::new();
+    for (chunk, item) in results {
         match item {
             Ok((idx, start, segs, vad_sec)) => {
                 parts.push((idx, start, segs));
                 total_vad_sec += vad_sec;
             }
             Err(err) => {
-                warn!(error = %err, "切块转写失败");
-                // 失败即清理：守卫在 return 时也会兜底，这里提前删是为了尽快释放磁盘
-                work_dir_guard.remove_now();
-                return Err(err);
+                let start = chunk.start;
+                let end = chunk.start + chunk.duration;
+                warn!(
+                    chunk = chunk.index,
+                    start,
+                    end,
+                    error = %err,
+                    "切块转写失败，丢弃该块并继续（缺失区间已记录）"
+                );
+                missing.push((chunk.index, start, end));
             }
         }
+    }
+    let missing_secs: f64 = missing.iter().map(|(_, s, e)| (e - s).max(0.0)).sum();
+
+    // 只有**全部块都失败**才算整片失败：此时没有任何可用字幕，返回空列表会让上层把
+    // 一次彻底失败当成「音频里没人说话」。部分失败只降级，绝不丢弃已成功的 `parts`。
+    if parts.is_empty() && !missing.is_empty() {
+        // 失败即清理：守卫在 return 时也会兜底，这里提前删是为了尽快释放磁盘
+        work_dir_guard.remove_now();
+        anyhow::bail!(
+            "全部 {} 个切块转写失败，无法生成字幕（缺失区间: {}）",
+            missing.len(),
+            format_missing_ranges(&missing)
+        );
+    }
+    if !missing.is_empty() {
+        warn!(
+            failed_chunks = missing.len(),
+            total_chunks,
+            missing_secs,
+            missing = %format_missing_ranges(&missing),
+            "部分切块转写失败，已降级为丢弃失败块"
+        );
     }
 
     // 全部切片已转写完，立刻删掉整个切块目录释放磁盘
@@ -577,11 +672,35 @@ pub fn run_chunked_parallel(
     // 6 秒内、短句也不平滑，同一台机器换个开关就换一套字幕形态。这里补齐，
     // 让两条路径的最终字幕同形（该函数幂等，管线若再调一次结果不变）。
     crate::subtitle::optimize_segments(&mut merged);
-    info!(segments = merged.len(), total_vad_sec, "切块字幕已拼接");
+    info!(
+        segments = merged.len(),
+        failed_chunks = missing.len(),
+        total_vad_sec,
+        "切块字幕已拼接"
+    );
     if let Some(cb) = progress_cb {
-        cb(1.0, &format!("转写完成，共 {} 个片段", merged.len()), None);
+        let detail = if missing.is_empty() {
+            format!("转写完成，共 {} 个片段", merged.len())
+        } else {
+            format!(
+                "转写完成，共 {} 个片段（{} 个切块失败，缺失约 {:.0}s）",
+                merged.len(),
+                missing.len(),
+                missing_secs
+            )
+        };
+        cb(1.0, &detail, None);
     }
     Ok((merged, total_vad_sec))
+}
+
+/// 把缺失区间整理成 `#2 720.0s–1080.0s, #5 ...` 的一行文案，供错误信息 / 日志使用。
+fn format_missing_ranges(missing: &[(usize, f64, f64)]) -> String {
+    missing
+        .iter()
+        .map(|(idx, start, end)| format!("#{idx} {start:.1}s–{end:.1}s"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// SenseVoice 长音频多进程切块并行。
@@ -617,6 +736,11 @@ pub fn transcribe_chunked_sensevoice(
     // 多进程才是提升方向。总占用 = workers × 2，16 核下 12 线程，留余量给 UI 与系统。
     let per_proc_threads = 2u32;
 
+    // 切块规划吃**音轨时长**，不吃容器时长：容器比音轨长时末尾几块会是空片，偏短时
+    // 片尾整句不在任何块里（见 `plan_duration_for`）。整段路径也沿用这个时长——模型
+    // 拿到的音频长度必须与真实音频一致。
+    let total_duration = plan_duration_for(ffmpeg, wav_path, total_duration);
+
     // 单进程时切块只会反复冷启动加载模型，比整段识别更慢，直接走整段路径
     if workers <= 1 {
         return sensevoice.transcribe(
@@ -635,7 +759,7 @@ pub fn transcribe_chunked_sensevoice(
     // 在跑、其余空转）；同时保证单块不超过 360s，避免单块过长拖尾。
     let chunk_count = sensevoice_chunk_count(total_duration, workers);
     let target = total_duration / chunk_count as f64;
-    let chunks = plan_chunks_target(total_duration, target);
+    let chunks = plan_chunks_within(total_duration, target);
 
     if chunks.len() <= 1 {
         // 音频太短：单进程更划算（省去多份模型加载），线程数按实测饱和点收敛
@@ -687,6 +811,10 @@ pub fn transcribe_chunked(
     workers_override: Option<usize>,
     progress_cb: Option<crate::engines::SegmentProgressCb>,
 ) -> Result<(Vec<Segment>, f64)> {
+    // 切块规划吃**音轨时长**，不吃容器时长：容器比音轨长时末尾几块会是空片（转写
+    // 直接报错），偏短时片尾整句不在任何块里（见 `plan_duration_for`）。
+    let total_duration = plan_duration_for(ffmpeg, wav_path, total_duration);
+
     // GPU 单进程切块只会反复加载模型并丢掉跨块上下文，又慢又不准。
     if use_gpu || total_duration <= chunk_threshold_secs() {
         return whisper.transcribe_with_model(
@@ -699,7 +827,9 @@ pub fn transcribe_chunked(
         );
     }
 
-    let chunks = plan_chunks_whisper(total_duration);
+    // 起点已在音轨结束之后的块一律不生成：切出来必然是 0 字节空片，只会换来一次
+    // 「没有音轨」的转写失败（见 `plan_chunks_within`）。
+    let chunks = plan_chunks_within(total_duration, CHUNK_SEC);
     if chunks.len() <= 1 {
         return whisper.transcribe_with_model(
             wav_path,
@@ -815,51 +945,68 @@ mod tests {
         assert_eq!(out[0].text, "切比雪夫不等式");
     }
 
-    /// 末块唯一一条句子因「与上一块尾部重复」被判丢时，音频的真实结尾不能一起丢：
-    /// 末条已接受片段的终点要拉回到全部块的真实结束时间（不新增片段）。
+    /// 末块唯一一条句子与上一块尾部重复时，合并后的终点必须覆盖音频真实结尾：
+    /// 末条已接受片段不能被停在上一块的 300s（旧实现会另走兜底延展）。
     #[test]
-    fn stitch_recovers_media_end_when_tail_duplicate_is_dropped() {
+    fn stitch_tail_duplicate_merge_keeps_media_end() {
         let head = vec![Segment::new(1, 250.0, 300.0, "切比雪夫不等式")];
-        // 末块（偏移 300s）只剩这一句，文本与上一块尾部相同：按重叠去重规则会被丢弃
+        // 末块（偏移 300s）只剩这一句，文本与上一块尾部相同：判为同一句后合并
         let tail = vec![Segment::new(1, 0.1, 8.0, "切比雪夫不等式")];
         let out = stitch_chunks(vec![(0, 0.0, head), (1, 300.0, tail)]);
-        assert_eq!(out.len(), 1, "重复句仍应被丢掉: {out:?}");
+        assert_eq!(out.len(), 1, "重复句应合并成一条: {out:?}");
         assert_eq!(out[0].text, "切比雪夫不等式");
         assert!(
             (out[0].end - 308.0).abs() < 1e-9,
-            "末条应延展到音频真实结尾，而不是停在 300s: {out:?}"
+            "合并后终点应覆盖音频真实结尾，而不是停在 300s: {out:?}"
         );
     }
 
-    /// 上限内的正常兜底：末尾被误丢的一句只有几秒时仍应补回真实结尾。
+    /// 末块重复句较短（4s）：合并后终点仍应覆盖末块的真实结尾。
     #[test]
-    fn stitch_tail_recovery_within_cap_extends() {
+    fn stitch_tail_duplicate_merge_covers_short_tail() {
         let head = vec![Segment::new(1, 250.0, 300.0, "切比雪夫不等式")];
         let tail = vec![Segment::new(1, 0.1, 4.0, "切比雪夫不等式")];
         let out = stitch_chunks(vec![(0, 0.0, head), (1, 300.0, tail)]);
         assert_eq!(out.len(), 1);
         assert!(
             (out[0].end - 304.0).abs() < 1e-9,
-            "上限内的漏删仍应补回结尾: {out:?}"
+            "合并后终点应覆盖结尾: {out:?}"
         );
     }
 
-    /// 末段兜底延展必须封顶：`global_end` 是「全部块的最大结束时间」，被丢弃的末句若
-    /// 拖得很长，`global_end - last.end` 会远大于真实漏删，旧实现会把一条字幕无上限地
-    /// 拉长几十秒。这里用块内真重叠（时间上互相压着）构造丢弃场景：末句一路拖到 90s，
-    /// 不封顶时 `out[0].end` 会被拉到 90s，须保留原 `end`。
+    /// 块内时间重叠的完全重复句同样合并：保留文本、时间取并集。
+    ///
+    /// 旧实现在这里按「包含式」判定丢弃后一条、只保留上一条终点；新规则下判为同一句
+    /// 就取并集（start 取 min、end 取 max），不会出现「短文本 + 长时长」或反向的
+    /// 「长文本 + 短时长」。
     #[test]
-    fn stitch_tail_recovery_is_capped() {
+    fn stitch_block_internal_duplicate_merges_union_time() {
         let segs = vec![
             Segment::new(1, 0.0, 30.0, "切比雪夫不等式"),
-            // 与上一句时间上互相压着且文本相同：按块内重叠去重丢弃；终点却拖到 90s。
             Segment::new(2, 29.0, 90.0, "切比雪夫不等式"),
         ];
         let out = stitch_chunks(vec![(0, 0.0, segs)]);
-        assert_eq!(out.len(), 1, "块内重叠重复句应被丢弃: {out:?}");
+        assert_eq!(out.len(), 1, "块内重叠重复句应合并成一条: {out:?}");
+        assert!((out[0].start - 0.0).abs() < 1e-9, "{out:?}");
+        assert!((out[0].end - 90.0).abs() < 1e-9, "时间取并集: {out:?}");
+    }
+
+    /// 末段兜底延展必须封顶：`global_end - last.end` 远大于真实漏删时不得把单条字幕
+    /// 拉长几十秒。拼接主流程的合并不再丢句、末条 `end` 始终是已处理片段的最大终点，
+    /// 因此直接测兜底函数本身：上限内生效、超限保持原样。
+    #[test]
+    fn tail_extension_is_capped() {
+        let mut over_cap = Segment::new(1, 0.0, 30.0, "切比雪夫不等式");
+        extend_tail_end(&mut over_cap, 90.0);
         assert!(
-            (out[0].end - 30.0).abs() < 1e-9,
-            "延展超限时必须保留原 end，而不是把单条字幕拉长: {out:?}"
+            (over_cap.end - 30.0).abs() < 1e-9,
+            "延展超限时必须保留原 end，而不是把单条字幕拉长: {over_cap:?}"
+        );
+        let mut within_cap = Segment::new(1, 0.0, 30.0, "切比雪夫不等式");
+        extend_tail_end(&mut within_cap, 35.0);
+        assert!(
+            (within_cap.end - 35.0).abs() < 1e-9,
+            "上限内的漏删仍应补回结尾: {within_cap:?}"
         );
     }
 
@@ -1213,6 +1360,48 @@ mod tests {
         let _ = std::fs::remove_file(&wav);
     }
 
+    /// F13 回归：单块转写失败只丢那一块，其余块的字幕照常保留（旧实现整片失败）。
+    ///
+    /// 长音频（>405s）必然走分块，任何一块出问题就一条字幕都没有，代价与收益完全
+    /// 不成比例。这里让第 0 块必失败、第 1 块成功，断言结果仍有第 1 块的字幕。
+    #[test]
+    fn chunk_failure_degrades_to_partial_output() {
+        let cfg: toml::Value = std::fs::read_to_string("config.toml")
+            .ok()
+            .and_then(|c| toml::from_str(&c).ok())
+            .unwrap_or_else(|| toml::Value::Table(Default::default()));
+        let Some(ffmpeg_path) = cfg["paths"]["ffmpeg"].as_str() else {
+            eprintln!("跳过：config.toml 未配置 ffmpeg");
+            return;
+        };
+        if !Path::new(ffmpeg_path).exists() {
+            eprintln!("跳过：ffmpeg 不存在");
+            return;
+        }
+
+        let wav =
+            std::env::temp_dir().join(format!("v2w_test_chunk_partial_{}.wav", std::process::id()));
+        write_silent_wav(&wav, 100, 16000);
+        let _serial = chunk_test_guard();
+
+        let ffmpeg = FFmpegEngine::new(ffmpeg_path);
+        let chunks = plan_chunks_target(100.0, 50.0);
+        assert_eq!(chunks.len(), 2, "前提：100s 应按 50s 切成两块");
+        let transcribe_one = |p: &Path, _dur: f64, _th: u32| -> Result<(Vec<Segment>, f64)> {
+            if p.file_name().and_then(|n| n.to_str()) == Some("c0.wav") {
+                anyhow::bail!("模拟第 0 块转写失败");
+            }
+            Ok((vec![Segment::new(1, 0.0, 1.0, "幸存块")], 0.0))
+        };
+        let (segs, _vad) = run_chunked_parallel(&ffmpeg, &wav, chunks, 2, 2, None, &transcribe_one)
+            .expect("单块失败不得让整片失败");
+        assert_eq!(segs.len(), 1, "幸存块的字幕必须保留: {segs:?}");
+        assert_eq!(segs[0].text, "幸存块");
+        assert!(segs[0].start > 40.0, "幸存块应带自己的块偏移: {segs:?}");
+
+        let _ = std::fs::remove_file(&wav);
+    }
+
     /// 执行器收尾必须与整段路径同形：跨块拼出的超长句要在 `run_chunked_parallel`
     /// 出口就被拆到 6 秒内。此前切块路径整个跳过了 `optimize_segments`，
     /// 于是「开并行」与「不开并行」得到两套不同粒度的字幕。
@@ -1448,8 +1637,8 @@ mod tests {
 #[cfg(test)]
 mod chunk_boundary_tests {
     use super::{
-        plan_chunks_target, plan_chunks_whisper, sensevoice_chunk_count, stitch_chunks, CHUNK_SEC,
-        MAX_CHUNK_COUNT,
+        plan_chunks_target, plan_chunks_whisper, plan_chunks_within, sensevoice_chunk_count,
+        stitch_chunks, CHUNK_SEC, MAX_CHUNK_COUNT,
     };
     use crate::subtitle::Segment;
 
@@ -1471,6 +1660,27 @@ mod chunk_boundary_tests {
                 chunks[0]
             );
         }
+    }
+
+    /// 切块规划按音轨时长收口：起点已在音频结束之后的块一个都不生成。
+    ///
+    /// 容器比音轨长时（视频轨更长 / 片尾留白），按容器时长切出的末尾块会落在音轨
+    /// 结束之后：ffmpeg 切出 0 字节空片，转写直接报错。这条断言锁住「不生成空片」。
+    #[test]
+    fn plan_chunks_within_never_plans_a_slice_past_the_audio_end() {
+        let audio = 500.0;
+        let chunks = plan_chunks_within(audio, CHUNK_SEC);
+        assert!(chunks.len() >= 2, "500s 应切成多块: {chunks:?}");
+        for c in &chunks {
+            assert!(c.start < audio, "所有块的 start 必须早于音轨结束: {c:?}");
+            assert!(
+                c.start + c.duration <= audio + 1e-9,
+                "块不得越过音轨结束: {c:?}"
+            );
+            assert!(c.duration > 0.0, "不得生成空片: {c:?}");
+        }
+        // 音轨探测失败（0 时长）：不生成任何「空片」，由调用方落回整段路径。
+        assert!(plan_chunks_within(0.0, CHUNK_SEC).is_empty());
     }
 
     /// 极大时长不得让块数无上限：损坏的时长字段（1e9 秒）曾会切出上千万块，
@@ -1685,6 +1895,72 @@ mod overlap_merge_tests {
         for (i, s) in out.iter().enumerate() {
             assert_eq!(s.index, i + 1, "index 必须从 1 连续: {out:?}");
         }
+    }
+
+    // ---------- 跨块合并 / 重叠保留（F14 回归） ----------
+
+    /// 跨块同一句「短 + 长」：必须保留**文本更长**的那条，时间取并集。
+    ///
+    /// 旧实现固定保留时间更早的那条（这里是前块的半句），只把 end 拉长到后块的结尾，
+    /// 于是字幕只有半句、时长却是整句——有音无字。
+    #[test]
+    fn stitch_cross_chunk_same_sentence_keeps_longer_text_and_union_time() {
+        let head = vec![seg(350.0, 358.0, "我们把这句话再读一遍")];
+        // 第二块从 358s 起：头部那句是同一句被截短 / 补全后的版本
+        let tail = vec![seg(0.2, 8.0, "我们把这句话再读一遍好吗")];
+        let out = stitch_chunks(vec![(0, 0.0, head), (1, 358.0, tail)]);
+        assert_eq!(out.len(), 1, "跨块同句应合并成一条: {out:?}");
+        assert_eq!(
+            out[0].text, "我们把这句话再读一遍好吗",
+            "必须保留更长的文本"
+        );
+        assert!(
+            (out[0].start - 350.0).abs() < 1e-9,
+            "start 取并集（较早者）: {out:?}"
+        );
+        assert!(
+            (out[0].end - 366.0).abs() < 1e-9,
+            "end 取并集（较晚者）: {out:?}"
+        );
+    }
+
+    /// 跨块不同句但时间重叠：两条都保留，后一条起点钳到前一条终点。
+    ///
+    /// 旧实现在 `gap < -0.25` 分支里只要 `seg.end <= prev.end + 0.15`（或文本包含）
+    /// 就 `continue`，且不要求文本相似——后块一句本来独立的话会被静默整句丢掉。
+    #[test]
+    fn stitch_cross_chunk_different_sentences_overlapping_are_both_kept() {
+        let head = vec![seg(350.0, 360.0, "我们现在看第二个定理")];
+        let tail = vec![seg(0.0, 5.0, "它的证明用到了柯西不等式")];
+        let out = stitch_chunks(vec![(0, 0.0, head), (1, 358.0, tail)]);
+        assert_eq!(out.len(), 2, "不同句即便时间重叠也必须都保留: {out:?}");
+        assert_eq!(out[0].text, "我们现在看第二个定理");
+        assert_eq!(out[1].text, "它的证明用到了柯西不等式");
+        assert!(
+            (out[1].start - 360.0).abs() < 1e-9,
+            "后一条起点应钳到前一条终点: {out:?}"
+        );
+        assert!(
+            out[1].start < out[1].end,
+            "钳制后仍须保持 start < end: {out:?}"
+        );
+        assert!(
+            out[0].end <= out[1].start + 1e-9,
+            "拼接后不得残留交叉区间: {out:?}"
+        );
+    }
+
+    /// 完全重复（跨块、时间也重叠）：合并成一条，时间取并集，不能留短文本 + 长时长。
+    #[test]
+    fn stitch_fully_duplicate_across_chunks_keeps_one_with_union_time() {
+        let head = vec![seg(350.0, 355.0, "我们把这句话再读一遍")];
+        let tail = vec![seg(352.2, 360.0, "我们把这句话再读一遍")];
+        let out = stitch_chunks(vec![(0, 0.0, head), (1, 0.0, tail)]);
+        assert_eq!(out.len(), 1, "完全重复只应保留一条: {out:?}");
+        assert_eq!(out[0].text, "我们把这句话再读一遍");
+        assert!((out[0].start - 350.0).abs() < 1e-9, "start 取 min: {out:?}");
+        assert!((out[0].end - 360.0).abs() < 1e-9, "end 取 max: {out:?}");
+        assert_eq!(out[0].index, 1, "重新编号必须从 1 开始");
     }
 
     // ---------- 切块规划的边界 ----------

@@ -883,6 +883,9 @@ pub struct AppState {
     /// 翻译任务开工时记下代次，收尾/增量落盘时比对：不一致说明用户已经切走了，
     /// 这份结果属于上一个工程，绝不能并进现在这张表——那是最难排查的数据污染。
     pub doc_epoch: u64,
+    /// 关窗守卫的「二次确认」标记：导入字幕的工程没有库主键，第一次关窗先警告，
+    /// 第二次才放行（否则用户被永久锁在窗口里，只能强杀进程）。
+    pub draft_close_warned: bool,
 
     // 硬件与模型资源监控
     pub metrics: ResourceMetrics,
@@ -1088,6 +1091,21 @@ impl TranslationBaseline {
     }
 }
 
+/// 合并两句原文时的拼接规则：西文之间补一个空格，中日韩/标点直接相连。
+fn join_segment_text(left: &str, right: &str) -> String {
+    if needs_join_space(left, right) {
+        format!("{left} {right}")
+    } else {
+        format!("{left}{right}")
+    }
+}
+
+/// 左串末尾与右串开头都是西文字母/数字时，连接处需要空格。
+fn needs_join_space(left: &str, right: &str) -> bool {
+    left.chars().last().is_some_and(|c| c.is_ascii_alphanumeric())
+        && right.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+}
+
 impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数收敛共用同一来源，
     /// 避免 UI 显示的上限与实际生效值不一致。
     pub fn logical_cores() -> u32 {
@@ -1237,6 +1255,7 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
             translate_mode,
             translate_pick: None,
             doc_epoch: 0,
+            draft_close_warned: false,
             metrics: ResourceMetrics::default(),
 
             active_tab: WorkspaceTab::Editor, // 默认主界面为剪辑校对工作台
@@ -3357,13 +3376,19 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
             // 写库失败不能静默：用户以为改动已保存，重启后却发现全丢了。
             // 记进 `db_write_error`，界面把它渲染成可见的提示条。
             let result = match self.active_task_id {
-                Some(task_id) => self.sync_segments_gated(task_id),
-                // 没有主键（尚未落库）：没有可写回的行，等同已保存。
-                None => Ok(()),
+                Some(task_id) => Some(self.sync_segments_gated(task_id)),
+                // 没有主键（导入字幕的工程）：**不是**「已保存」，而是「无处可写」。
+                // 以前这里返回 Ok 且保持 dirty=false，于是关窗守卫读到「已保存」直接
+                // 放行——一整份校对静默清零。现在保持脏，交给守卫做二次确认。
+                None => None,
             };
             match result {
-                Ok(()) => self.db_write_error = None,
-                Err(err) => {
+                None => {
+                    self.segments_dirty = true;
+                    self.db_write_error = None;
+                }
+                Some(Ok(())) => self.db_write_error = None,
+                Some(Err(err)) => {
                     tracing::warn!(error = %err, "字幕写库失败，改动尚未持久化");
                     self.record_db_write_error(format!("字幕保存失败：{err}"));
                     // 写失败必须把脏标记重新置回：否则下面关窗守卫读到的
@@ -3727,6 +3752,33 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
             None
         };
 
+        // F11：语言包也要按同一 ratio 切开。修前左半保留**整张包**、右半写
+        // `Default::default()`：于是左半挂着整句旧译文、右半没有译文，切语言包时
+        // 同一句上下两半语言还不一致。
+        let mut left_packs: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut right_packs: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (lang, text) in &orig.translations {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let (l, r) = crate::subtitle::segment::split_following(text, ratio);
+            if !l.trim().is_empty() {
+                left_packs.insert(lang.clone(), l);
+            }
+            if let Some(r) = r.filter(|r| !r.trim().is_empty()) {
+                right_packs.insert(lang.clone(), r);
+            }
+        }
+        if let (Some(lang), Some(l)) = (trans_lang.as_deref(), trans_left.as_ref()) {
+            left_packs.insert(lang.to_string(), l.clone());
+        }
+        // 词级时间戳按切点分到两半：左半不能再保留切点之后的词，否则卡拉OK
+        // 会把整句词高亮画到已经被切走的文本上。
+        let (words_left, words_right): (Vec<_>, Vec<_>) =
+            orig.words.iter().cloned().partition(|w| w.start < split_time);
+
         self.snapshot_for_undo();
         self.segments[pos].end = split_time;
         if !self.segments[pos].polished.is_empty() {
@@ -3737,6 +3789,8 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
         // 左半段也要换成切分后的译文；原样保留（修前行为）等于把整条译文复制一份。
         self.segments[pos].translation = trans_left;
         self.segments[pos].translation_lang = trans_lang.clone();
+        self.segments[pos].translations = left_packs;
+        self.segments[pos].words = words_left;
 
         let new_seg = Segment {
             index: orig.index + 1,
@@ -3745,7 +3799,7 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
             text: part2.clone(),
             translation: trans_right,
             translation_lang: trans_lang,
-            translations: Default::default(),
+            translations: right_packs,
             polished: if !orig.polished.is_empty() {
                 part2
             } else {
@@ -3755,9 +3809,8 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
             confidence: orig.confidence,
             speaker: orig.speaker,
             speaker_name: orig.speaker_name.clone(),
-            // 切分出的右半段暂不携带词级时间戳：拆分点未必落在词边界上，
-            // 强行分配会造出跨段的错误词时间；留空由后续需要时再对齐。
-            words: Vec::new(),
+            // 右半承接切点之后的词（之前一律留空，词级高亮会在拆分后整句降级）。
+            words: words_right,
         };
         self.segments.insert(pos + 1, new_seg);
 
@@ -3807,14 +3860,31 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
         );
         let cur = &mut self.segments[pos];
         cur.end = next.end;
-        let combined = format!("{}{}", cur.display_text(), next.display_text());
+        // F11：西文之间补一个空格，否则 "Hello"+"world" 会粘成 "Helloworld"。
+        let joined_text = join_segment_text(cur.display_text(), next.display_text());
         if !cur.polished.is_empty() || !next.polished.is_empty() {
-            cur.polished = combined;
+            cur.polished = joined_text;
         } else {
-            cur.text = combined;
+            cur.text = joined_text;
         }
         cur.translation = merged_translation;
         cur.translation_lang = merged_translation_lang;
+        // 词级时间戳与语言包同样要并进来：以前 `next` 被 remove 后这两样直接消失。
+        cur.words.extend(next.words.iter().cloned());
+        for (lang, text) in next.translations.iter() {
+            if text.trim().is_empty() {
+                continue;
+            }
+            cur.translations
+                .entry(lang.clone())
+                .and_modify(|existing| {
+                    if needs_join_space(existing, text) {
+                        existing.push(' ');
+                    }
+                    existing.push_str(text);
+                })
+                .or_insert_with(|| text.clone());
+        }
 
         self.reindex_segments();
         self.bump_segments_revision();
@@ -5941,6 +6011,98 @@ mod tests {
         assert_eq!(
             state.segments[0].translation.as_deref(),
             Some("First sentence.")
+        );
+    }
+
+    /// F1：导入字幕的工程没有库主键，flush 必须**保持脏**。以前这里清掉脏标记并
+    /// 返回成功，关窗守卫读到的就是「已保存」，一整份校对静默清零。
+    #[test]
+    fn flush_without_task_id_keeps_dirty_flag() {
+        use crate::subtitle::Segment;
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "第一句")]);
+        state.active_task_id = None;
+        state.segments_dirty = true;
+        state.flush_segments_if_dirty();
+        assert!(
+            state.segments_dirty,
+            "没有库主键时不允许把脏标记清成「已保存」"
+        );
+    }
+
+    /// F11：拆句要把语言包与词级时间戳一起切开，右半不能再是空包。
+    #[test]
+    fn split_segment_splits_translation_packs_and_words() {
+        use crate::subtitle::segment::WordTiming;
+        use crate::subtitle::Segment;
+
+        let mut seg = Segment::new(1, 0.0, 4.0, "前半句话后半句话");
+        seg.translation = Some("first half second half".to_string());
+        seg.translation_lang = Some("English".to_string());
+        seg.translations
+            .insert("English".to_string(), "first half second half".to_string());
+        seg.translations
+            .insert("日本語".to_string(), "前半と後半".to_string());
+        seg.words = vec![
+            WordTiming {
+                word: "前半".into(),
+                start: 0.2,
+                end: 1.5,
+            },
+            WordTiming {
+                word: "后半".into(),
+                start: 2.5,
+                end: 3.8,
+            },
+        ];
+        let mut state = test_state(vec![seg]);
+        state.selected_segment_index = Some(1);
+        state.split_selected_segment(None);
+
+        assert_eq!(state.segments.len(), 2, "应拆成两条");
+        let left = &state.segments[0];
+        let right = &state.segments[1];
+        assert!(left.translations.contains_key("English"));
+        assert!(
+            right.translations.contains_key("English"),
+            "右半必须拿到自己那份语言包，而不是空包"
+        );
+        assert_ne!(
+            left.translations["English"], right.translations["English"],
+            "两半不能共用整句译文"
+        );
+        assert!(
+            !left.words.iter().any(|w| w.start > left.end + 0.01),
+            "左半不得保留切点之后的词"
+        );
+    }
+
+    /// F11：合并要保留语言包/词级时间戳，且西文之间补空格。
+    #[test]
+    fn merge_keeps_packs_words_and_inserts_space_for_latin() {
+        use crate::subtitle::Segment;
+        let mut a = Segment::new(1, 0.0, 2.0, "Hello");
+        a.translation = Some("你好".to_string());
+        a.translation_lang = Some("简体中文".to_string());
+        a.translations.insert("简体中文".to_string(), "你好".to_string());
+        let mut b = Segment::new(2, 2.0, 4.0, "world");
+        b.translations.insert("简体中文".to_string(), "世界".to_string());
+
+        let mut state = test_state(vec![a, b]);
+        state.selected_segment_index = Some(1);
+        state.merge_selected_with_next();
+
+        assert_eq!(state.segments.len(), 1);
+        assert_eq!(
+            state.segments[0].display_text(),
+            "Hello world",
+            "西文合并必须补空格，不能粘成 Helloworld"
+        );
+        assert!(
+            state.segments[0]
+                .translations
+                .get("简体中文")
+                .is_some_and(|t| t.contains("世界")),
+            "右半的语言包不能被丢弃"
         );
     }
 

@@ -289,6 +289,47 @@ pub struct StageArtifacts {
     root: PathBuf,
     /// `Some` = 启用归属校验（值 = 本次任务的输入媒体标识）；`None` = 不校验。
     owner: Option<String>,
+    /// `Some` = 启用参数指纹校验（值 = 本次任务的完整参数快照）；`None` = 不校验。
+    ///
+    /// 归属只能回答「是不是同一支片子」，回答不了「是不是同一套参数」：换模型 /
+    /// 换语言 / 开分离后复用旧产物，等于把上一套参数的结果冒充成本次结果。指纹
+    /// 把这类参数一并钉住，不一致就按「没有产物」重算（**不删文件**）。
+    fingerprint: Option<ResumeFingerprint>,
+}
+
+/// 断点续跑的参数指纹：决定「上次落盘的产物还能不能代表本次任务」。
+///
+/// 只收录**会改变产物内容**的参数。翻译模式不在其中：翻译是识别完成之后独立
+/// 的动作，不参与本管线落盘的识别/救场/最终三份片段产物。
+///
+/// 源文件的 `len()` 与 `modified()` 也在其中：同一路径上的媒体被替换成另一份
+/// 时，即便路径字符串完全相同也不能复用它的识别结果。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ResumeFingerprint {
+    /// 模型路径（`None` = 引擎默认模型，用空串表示）
+    pub model: String,
+    /// 识别语言（`None` = 自动检测，用空串表示）
+    pub language: String,
+    pub vad_threshold: f64,
+    /// **钳制后**的音频加速倍率（与实际喂给引擎的一致）
+    pub audio_speed: f64,
+    pub preprocess_enabled: bool,
+    pub preprocess_denoise: bool,
+    pub preprocess_normalize: bool,
+    /// 实际生效的高通截止频率（0 = 关闭；非有限值 / 负值同样记 0）
+    pub preprocess_highpass_hz: u32,
+    pub preprocess_compact: bool,
+    /// 置信度救场阈值（<0 启用，0 关闭）
+    pub rescue_logprob: f64,
+    pub diarization_enabled: bool,
+    pub diarization_speakers: u32,
+    /// 实际会跑的润色模式：关闭时记 `"off"`，否则记 `punc` / `qwen`
+    pub polish_mode: String,
+    /// 源文件字节数（0 = 取不到元数据）
+    pub source_len: u64,
+    /// 源文件修改时间（Unix 毫秒；取不到为 `None`）
+    pub source_modified_ms: Option<u64>,
 }
 
 /// 可续跑片段产物的落盘信封（写入侧）：借用片段，避免整份克隆。
@@ -296,6 +337,9 @@ pub struct StageArtifacts {
 struct OwnedSegmentsRef<'a> {
     /// 产出这份片段的输入媒体（落盘时刻的 `display()` 路径）
     input: &'a str,
+    /// 参数指纹；`None`（无归属句柄）时不写该键，保持旧格式。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<&'a ResumeFingerprint>,
     /// 片段本体
     segments: &'a [Segment],
 }
@@ -304,6 +348,10 @@ struct OwnedSegmentsRef<'a> {
 #[derive(serde::Deserialize)]
 struct OwnedSegments {
     input: String,
+    /// 旧信封没有该字段：`#[serde(default)]` 保证仍能解析，但启用指纹校验的
+    /// 句柄读到 `None` 会按「无产物」处理（只是不复用，绝不删除用户文件）。
+    #[serde(default)]
+    fingerprint: Option<ResumeFingerprint>,
     segments: Vec<Segment>,
 }
 
@@ -331,6 +379,7 @@ impl StageArtifacts {
         Self {
             root: root.into(),
             owner: None,
+            fingerprint: None,
         }
     }
 
@@ -342,7 +391,16 @@ impl StageArtifacts {
         Self {
             root: root.into(),
             owner: Some(input.into()),
+            fingerprint: None,
         }
+    }
+
+    /// 追加参数指纹校验：读取时要求信封里记录的指纹与 `fingerprint` **完全相等**。
+    ///
+    /// 旧信封没有指纹字段 ⇒ 解析为 `None` ⇒ 不复用（但文件保留）。
+    pub fn with_fingerprint(mut self, fingerprint: ResumeFingerprint) -> Self {
+        self.fingerprint = Some(fingerprint);
+        self
     }
 
     pub fn path(&self, stage: Stage) -> PathBuf {
@@ -366,9 +424,23 @@ impl StageArtifacts {
         Ok(())
     }
 
+    /// 片段产物落盘。
+    ///
+    /// **空表不是产物**：取消 / 引擎无输出时这里会被调用，若把空表写进
+    /// `03_transcribe.json`，下次续跑读到 `Some(vec![])` 就会认为「识别已完成」，
+    /// 整段 ASR 被跳过，最终写出空字幕并覆盖用户的成品。因此空表一律不写，
+    /// 让旧产物原样留在盘上（旧产物若参数已变，指纹侧也不会复用）。
     pub fn write_segments(&self, stage: Stage, segments: &[Segment]) -> Result<()> {
+        if segments.is_empty() {
+            warn!(
+                stage = stage.artifact_file(),
+                "阶段产物为空表，跳过落盘并保留旧产物"
+            );
+            return Ok(());
+        }
         let envelope = OwnedSegmentsRef {
             input: self.owner.as_deref().unwrap_or_default(),
+            fingerprint: self.fingerprint.as_ref(),
             segments,
         };
         let data = serde_json::to_vec_pretty(&envelope).context("序列化阶段片段失败")?;
@@ -408,6 +480,36 @@ impl StageArtifacts {
                     "断点续跑：阶段产物不属于本次输入，忽略该产物并重算"
                 );
                 return Ok(None);
+            }
+        }
+        // 空表不是「已完成」，而是「上一次没有产出任何东西」：必须重算，且不能
+        // 把 `resumed` 置位（否则整段 ASR 被跳过，最终导出空字幕覆盖成品）。
+        if envelope.segments.is_empty() {
+            warn!(
+                stage = stage.artifact_file(),
+                "断点续跑：阶段产物为空表，视为无产物并重算"
+            );
+            return Ok(None);
+        }
+        if let Some(expected) = self.fingerprint.as_ref() {
+            match envelope.fingerprint.as_ref() {
+                Some(recorded) if recorded == expected => {}
+                Some(recorded) => {
+                    warn!(
+                        stage = stage.artifact_file(),
+                        recorded = ?recorded,
+                        current = ?expected,
+                        "断点续跑：阶段产物的参数指纹与本次任务不一致，忽略该产物并重算"
+                    );
+                    return Ok(None);
+                }
+                None => {
+                    warn!(
+                        stage = stage.artifact_file(),
+                        "断点续跑：阶段产物是旧格式（缺少参数指纹），无法确认参数一致，忽略并重算"
+                    );
+                    return Ok(None);
+                }
             }
         }
         Ok(Some(envelope.segments))
@@ -831,12 +933,25 @@ impl TaskPipeline {
         let pipeline_started = Instant::now();
         // 本次任务的输入标识：阶段产物的归属键（见 [`StageArtifacts`] 的说明）。
         let input_id = input_file.display().to_string();
-        // 阶段产物落盘句柄：None = 历史行为（不写不读）。带上归属键后，读取任何
-        // 可续跑产物都会校验「落盘时记录的输入」是否就是本次输入，不一致按「没有
-        // 产物」处理（走全流程重算），因此下面几处续跑读取自带归属闸门。
-        let artifacts = self
-            .artifact_dir()
-            .map(|dir| StageArtifacts::owned_by(dir, input_id.clone()));
+        // 阶段产物落盘句柄：None = 历史行为（不写不读）。带上归属键与参数指纹后，
+        // 读取任何可续跑产物都会先校验「落盘时记录的输入」是否就是本次输入、再校验
+        // 「落盘时的参数」是否与本次完全一致；任一不符都按「没有产物」处理（走全流程
+        // 重算），因此下面几处续跑读取自带两道闸门。
+        let artifacts = self.artifact_dir().map(|dir| {
+            let fingerprint = resume_fingerprint(
+                &input_file,
+                model_override.as_deref(),
+                language.as_deref(),
+                audio_speed,
+                options.vad_threshold,
+                &options.preprocess,
+                rescue_logprob,
+                diarization,
+                enable_polish,
+                polish_mode.as_deref(),
+            );
+            StageArtifacts::owned_by(dir, input_id.clone()).with_fingerprint(fingerprint)
+        });
 
         // 断点续跑检测必须早于「音频预处理」决策：命中续跑产物时要整段跳过解码 / 压实。
         // 优先复用「走完全流程」的最终产物（Stage::Write），命中即跳过 ASR + 救场 +
@@ -1490,7 +1605,9 @@ impl TaskPipeline {
         // best-effort 落盘转写产物（写失败只告警，绝不中断流水线）。
         // 只有真正跑了转写（未命中任一续跑产物）才需要写：命中时 `resumed` 为真，
         // 落盘的识别结果已是最终时间轴，无需覆盖。
-        if !resumed {
+        // 空表不写（取消 / 引擎无输出）：否则下次续跑会把空表当成「识别已完成」，
+        // 跳过整段 ASR 并导出空字幕覆盖用户成品（见 write_segments 的说明）。
+        if !resumed && !segments.is_empty() && !self.is_cancelled() {
             if let Some(a) = artifacts.as_ref() {
                 if let Err(e) = a.write_segments(Stage::Transcribe, &segments) {
                     warn!("转写产物落盘失败: {e:#}");
@@ -1644,7 +1761,9 @@ impl TaskPipeline {
         }
         let rescue_sec = rescue_started.elapsed().as_secs_f64();
 
-        if rescue_ran {
+        // 空表 / 取消态都不落盘：救场产物会被下次续跑直接复用，写入半成品或空表
+        // 等于把一次没完成的救场登记成成品（空表则让整段 ASR 被跳过）。
+        if rescue_ran && !segments.is_empty() && !self.is_cancelled() {
             if let Some(a) = artifacts.as_ref() {
                 if let Err(e) = a.write_segments(Stage::Rescue, &segments) {
                     warn!("救场产物落盘失败: {e:#}");
@@ -1948,6 +2067,16 @@ impl TaskPipeline {
         // ── 阶段 4: 输出字幕文件（失败也不阻塞 Finished，避免界面一直转圈）──
         let _ = tx.send(PipelineEvent::StageChanged(Stage::Write.label().into()));
         crate::subtitle::optimize_segments(&mut segments);
+        // 空结果绝不写文件：历史上这里会把一份空字幕原子覆盖用户已有成品，还提示
+        // 「未能识别出任何有效字幕」。改为返回明确错误，已有文件保持原样。
+        if let Err(err) = ensure_exportable_segments(&segments) {
+            warn!(
+                path = %out_path.display(),
+                error = %err,
+                "本次转写没有任何字幕，拒绝覆盖已有字幕文件"
+            );
+            return Err(err);
+        }
         // 断点续跑命中最终产物时，后续阶段全被短路，这里补发一次进度让 UI 有可见反馈。
         if skip_post {
             let _ = tx.send(PipelineEvent::Progress {
@@ -1957,8 +2086,8 @@ impl TaskPipeline {
             });
         }
         // best-effort 落盘最终产物：这是「走完全流程」的最终快照（含说话人标签），
-        // 下次续跑命中它即可整段短路。写失败只告警。
-        if !skip_post {
+        // 下次续跑命中它即可整段短路。写失败只告警。空表 / 取消态不写。
+        if !skip_post && !segments.is_empty() && !self.is_cancelled() {
             if let Some(a) = artifacts.as_ref() {
                 if let Err(e) = a.write_segments(Stage::Write, &segments) {
                     warn!("最终字幕产物落盘失败: {e:#}");
@@ -2363,6 +2492,94 @@ fn normalize_media_path(path: &str) -> String {
 /// 「时长缓存」（[`cached_extract_audio_duration`]），避免两处各写一套比较口径。
 fn resume_owner_matches(recorded: &str, current: &str) -> bool {
     normalize_media_path(recorded) == normalize_media_path(current)
+}
+
+/// 非有限浮点值归一成 0：`NaN != NaN` 会让指纹永远对不上（续跑永久失效），
+/// 而指纹只需要「区分不同参数」，不需要保留非法值本身。
+fn sanitize_f64(value: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
+/// 源文件签名：字节数 + 修改时间（Unix 毫秒）。
+///
+/// 取不到元数据时记 `(0, None)`——两次都取不到就会彼此相等，此时仍由指纹里的
+/// 其余参数负责区分；一次取到一次取不到则必然不相等，按「无产物」重算，方向安全。
+fn source_file_signature(path: &Path) -> (u64, Option<u64>) {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let modified_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            (meta.len(), modified_ms)
+        }
+        Err(_) => (0, None),
+    }
+}
+
+/// 采集本次任务的参数指纹（纯函数，除源文件元数据外不碰外部状态）。
+///
+/// 调用点只有一处：`run_with_options` 构造 [`StageArtifacts`] 时。`audio_speed`
+/// 必须是**钳制后**的值（与真正喂给引擎的一致），否则「配置里写 2.0 实际按 1.5
+/// 跑」会被指纹误判成两套参数。
+#[allow(clippy::too_many_arguments)]
+fn resume_fingerprint(
+    input_file: &Path,
+    model_override: Option<&Path>,
+    language: Option<&str>,
+    audio_speed: f64,
+    vad_threshold: f64,
+    preprocess: &PreprocessOptions,
+    rescue_logprob: f64,
+    diarization: DiarizationOptions,
+    enable_polish: bool,
+    polish_mode: Option<&str>,
+) -> ResumeFingerprint {
+    let (source_len, source_modified_ms) = source_file_signature(input_file);
+    let highpass_hz = preprocess.filters.highpass_hz;
+    ResumeFingerprint {
+        model: model_override
+            .map(|p| normalize_media_path(&p.display().to_string()))
+            .unwrap_or_default(),
+        language: language.unwrap_or_default().trim().to_lowercase(),
+        vad_threshold: sanitize_f64(vad_threshold),
+        audio_speed: sanitize_f64(audio_speed),
+        preprocess_enabled: preprocess.enabled,
+        preprocess_denoise: preprocess.filters.denoise,
+        preprocess_normalize: preprocess.filters.normalize,
+        preprocess_highpass_hz: if highpass_hz.is_finite() && highpass_hz > 0.0 {
+            highpass_hz.round().max(0.0) as u32
+        } else {
+            0
+        },
+        preprocess_compact: preprocess.compact,
+        rescue_logprob: sanitize_f64(rescue_logprob),
+        diarization_enabled: diarization.enabled,
+        diarization_speakers: diarization.speakers,
+        polish_mode: if enable_polish {
+            polish_mode.unwrap_or("punc").trim().to_lowercase()
+        } else {
+            "off".to_string()
+        },
+        source_len,
+        source_modified_ms,
+    }
+}
+
+/// 最终字幕导出前的判空闸门：**空结果绝不写文件**。
+///
+/// 识别没有产出任何字幕时，历史上会写出一份空字幕文件原子覆盖用户已有成品，
+/// 还提示「未能识别出任何有效字幕」。现在改为返回一个明确错误，文件保持原样。
+fn ensure_exportable_segments(segments: &[Segment]) -> Result<()> {
+    if segments.is_empty() {
+        anyhow::bail!("本次转写没有产生任何字幕，未覆盖已有字幕文件");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3469,6 +3686,261 @@ mod tests {
                 .flatten()
                 .is_none(),
             "老格式产物无归属信息，必须保守拒绝（走全流程重算）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── F2：取消后不得写入空产物 ──
+    //
+    // 修复前：引擎被取消后正常返回空表，管线在取消检查**之前**就把空表写进
+    // `03_transcribe.json`；下次续跑读到 `Some(vec![])` 即认为识别已完成，整段
+    // ASR 被跳过，最终写出空字幕原子覆盖用户成品。
+
+    /// 空表不是产物：写入是 no-op（旧产物原样保留），读取视为「没有产物」，
+    /// 且不得因此删除盘上的文件。
+    #[test]
+    fn empty_segments_are_never_written_or_resumed() {
+        let dir = tmp_dir("f2_empty");
+        let artifacts = StageArtifacts::new(dir.clone());
+        let previous = vec![
+            Segment::new(1, 0.0, 1.5, "上一轮已完成的成品"),
+            Segment::new(2, 1.5, 3.0, "第二句"),
+        ];
+        artifacts
+            .write_segments(Stage::Transcribe, &previous)
+            .unwrap();
+        let bytes_before = std::fs::read(artifacts.path(Stage::Transcribe)).unwrap();
+
+        // 空表写入必须是 no-op：旧产物字节完全不动。
+        artifacts.write_segments(Stage::Transcribe, &[]).unwrap();
+        assert_eq!(
+            std::fs::read(artifacts.path(Stage::Transcribe)).unwrap(),
+            bytes_before,
+            "空表不得覆盖旧产物"
+        );
+        assert_eq!(
+            artifacts.read_segments(Stage::Transcribe).unwrap(),
+            Some(previous),
+            "旧产物必须仍可续跑"
+        );
+
+        // 修复前可能已经落盘的空表信封：读取侧必须视为「没有产物」。
+        std::fs::write(
+            artifacts.path(Stage::Rescue),
+            br#"{"input":"","segments":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            artifacts.read_segments(Stage::Rescue).unwrap(),
+            None,
+            "读到空表不得置 resumed"
+        );
+        assert!(
+            artifacts.exists(Stage::Rescue),
+            "读到空表只忽略，不得删除产物文件"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 最终字幕写出前的判空闸门：空结果必须返回明确错误（而不是写空文件）。
+    #[test]
+    fn empty_segments_fail_final_export_with_explicit_error() {
+        let err = ensure_exportable_segments(&[])
+            .expect_err("空结果必须导出失败")
+            .to_string();
+        assert!(
+            err.contains("没有产生任何字幕"),
+            "错误文案要点明没有字幕: {err}"
+        );
+        assert!(
+            err.contains("未覆盖已有字幕文件"),
+            "错误文案要点明已有文件未被覆盖: {err}"
+        );
+
+        let ok = vec![Segment::new(1, 0.0, 1.0, "有字幕")];
+        assert!(
+            ensure_exportable_segments(&ok).is_ok(),
+            "非空结果应允许导出"
+        );
+    }
+
+    // ── F3：续跑必须校验参数指纹 ──
+    //
+    // 修复前：信封只记输入路径，换模型 / 换语言 / 开分离后仍命中旧产物，
+    // `07_write.json` 一命中就 `skip_post`，新参数静默无效。
+
+    /// 指纹覆盖所有会改变产物的参数；任一变化都不得复用旧产物，
+    /// 旧信封（缺指纹）仍可解析但同样不复用，且都不删除文件。
+    #[test]
+    fn resume_fingerprint_mismatch_is_not_reused() {
+        let dir = tmp_dir("f3_fingerprint");
+        let source = dir.join("talk.wav");
+        std::fs::write(&source, b"fake media").unwrap();
+
+        let preprocess = PreprocessOptions::default();
+        let base = resume_fingerprint(
+            &source,
+            Some(Path::new("models/whisper/a.bin")),
+            Some("zh"),
+            1.0,
+            0.5,
+            &preprocess,
+            -0.65,
+            DiarizationOptions::default(),
+            true,
+            Some("punc"),
+        );
+
+        // 同一套参数重复采集必须完全相等（否则续跑永远不可用）。
+        let same = resume_fingerprint(
+            &source,
+            Some(Path::new("models/whisper/a.bin")),
+            Some("zh"),
+            1.0,
+            0.5,
+            &preprocess,
+            -0.65,
+            DiarizationOptions::default(),
+            true,
+            Some("punc"),
+        );
+        assert_eq!(base, same, "同一套参数必须得到同一份指纹");
+        assert_eq!(base.model, "models/whisper/a.bin");
+        assert_eq!(base.language, "zh");
+        assert_eq!(base.source_len, 10);
+        assert!(
+            base.source_modified_ms.is_some(),
+            "源文件修改时间应参与指纹"
+        );
+        assert_eq!(base.polish_mode, "punc");
+
+        // 任何一项参数变化都必须让指纹失效。
+        let mut changed = base.clone();
+        changed.model = "models/whisper/b.bin".to_string();
+        assert_ne!(base, changed, "换模型必须失效");
+
+        let mut changed = base.clone();
+        changed.language = "en".to_string();
+        assert_ne!(base, changed, "换语言必须失效");
+
+        let mut changed = base.clone();
+        changed.vad_threshold = 0.35;
+        assert_ne!(base, changed, "VAD 阈值变化必须失效");
+
+        let mut changed = base.clone();
+        changed.audio_speed = 1.25;
+        assert_ne!(base, changed, "音频加速变化必须失效");
+
+        let mut changed = base.clone();
+        changed.preprocess_denoise = false;
+        assert_ne!(base, changed, "降噪开关变化必须失效");
+
+        let mut changed = base.clone();
+        changed.preprocess_highpass_hz = 0;
+        assert_ne!(base, changed, "高通开关变化必须失效");
+
+        let mut changed = base.clone();
+        changed.preprocess_compact = true;
+        assert_ne!(base, changed, "停顿压实开关变化必须失效");
+
+        let mut changed = base.clone();
+        changed.rescue_logprob = -0.5;
+        assert_ne!(base, changed, "救场阈值变化必须失效（04_rescue.json 亦然）");
+
+        let mut changed = base.clone();
+        changed.diarization_enabled = true;
+        assert_ne!(base, changed, "说话人分离开关变化必须失效");
+
+        let mut changed = base.clone();
+        changed.diarization_speakers = 4;
+        assert_ne!(base, changed, "说话人人数变化必须失效");
+
+        let mut changed = base.clone();
+        changed.polish_mode = "qwen".to_string();
+        assert_ne!(base, changed, "润色模式变化必须失效");
+
+        // 关闭润色用 "off" 表示（与「模式未知」区分开）。
+        let polish_off = resume_fingerprint(
+            &source,
+            Some(Path::new("models/whisper/a.bin")),
+            Some("zh"),
+            1.0,
+            0.5,
+            &preprocess,
+            -0.65,
+            DiarizationOptions::default(),
+            false,
+            None,
+        );
+        assert_eq!(polish_off.polish_mode, "off");
+
+        // 源文件被替换（长度 / 修改时间变化）也必须失效。
+        std::fs::write(&source, b"fake media replaced by another take").unwrap();
+        let replaced = resume_fingerprint(
+            &source,
+            Some(Path::new("models/whisper/a.bin")),
+            Some("zh"),
+            1.0,
+            0.5,
+            &preprocess,
+            -0.65,
+            DiarizationOptions::default(),
+            true,
+            Some("punc"),
+        );
+        assert_ne!(base, replaced, "源文件内容变化必须失效");
+
+        // 落盘 → 同指纹读取可复用；指纹不符按「没有产物」，且不删文件。
+        let segs = vec![Segment::new(1, 0.0, 1.0, "识别结果")];
+        let writer = StageArtifacts::owned_by(dir.clone(), source.display().to_string())
+            .with_fingerprint(base.clone());
+        writer.write_segments(Stage::Write, &segs).unwrap();
+        assert_eq!(
+            writer.read_segments(Stage::Write).unwrap(),
+            Some(segs.clone()),
+            "同一套参数应能续跑"
+        );
+
+        let mut stale = base.clone();
+        stale.rescue_logprob = -0.5;
+        let mismatch = StageArtifacts::owned_by(dir.clone(), source.display().to_string())
+            .with_fingerprint(stale);
+        assert_eq!(
+            mismatch.read_segments(Stage::Write).unwrap(),
+            None,
+            "参数指纹不符必须视为没有产物"
+        );
+        assert!(
+            mismatch.exists(Stage::Write),
+            "指纹不符只忽略，不得删除用户文件"
+        );
+
+        // 旧信封（没有 fingerprint 字段）必须仍能解析，但不复用。
+        std::fs::write(
+            writer.path(Stage::Write),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "input": source.display().to_string(),
+                "segments": segs,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            writer.read_segments(Stage::Write).unwrap(),
+            None,
+            "旧信封缺少指纹，不得复用"
+        );
+        assert!(writer.exists(Stage::Write), "旧信封不得被删除");
+        // 未启用指纹校验的句柄仍能读回旧信封（向后兼容只影响「复用」）。
+        assert_eq!(
+            StageArtifacts::owned_by(dir.clone(), source.display().to_string())
+                .read_segments(Stage::Write)
+                .unwrap()
+                .map(|s| s.len()),
+            Some(1),
+            "旧信封必须仍可解析"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

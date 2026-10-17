@@ -142,7 +142,7 @@ impl UiConfig {
 /// - `offline_qwen`：本地 llama.cpp + Qwen 小模型，免费、断网可用、无需密钥；
 /// - `online_api`：任何 OpenAI 兼容的 `/chat/completions` 接口
 ///   （DeepSeek、OpenAI、通义、Kimi、本地 vLLM / Ollama 均可），质量更高且快得多。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct TranslateConfig {
     /// `offline_qwen`（默认） | `online_api`
     pub mode: String,
@@ -206,6 +206,47 @@ impl Default for TranslateConfig {
             glossary: String::new(),
             max_glossary_entries: default_max_glossary_entries(),
         }
+    }
+}
+
+/// 密钥打码：`Debug` 输出里只留前 4 位（排障时能看出填的是哪家的 key），
+/// 短密钥（≤8 字符）连前 4 位也不给——短串的前 4 位几乎泄露一半。
+///
+/// 与 `engines::translate` 里 `RedactedKey` 是**同一判定口径**，但刻意各写一份：
+/// 那个类型是 `engines` 的私有实现，`utils` 反过来引用会制造跨层依赖（也就模糊了
+/// 「谁能读密钥」的边界）。这里只需要一条打码规则，重复十几行比跨模块耦合更便宜。
+fn redact_api_key(key: &str) -> String {
+    let key = key.trim();
+    if key.is_empty() {
+        return "<empty>".to_string();
+    }
+    if key.chars().count() > 8 {
+        let head: String = key.chars().take(4).collect();
+        return format!("{head}…<redacted>");
+    }
+    "<redacted>".to_string()
+}
+
+/// 手写 `Debug`：`api_key` 打码，`glossary` 只报行数。
+///
+/// 不能 `derive`：`AppConfig` 的 `Debug` 是 derive 的，任何一处
+/// `info!("配置加载成功: {:?}", config)`（历史上的写法）或后来加的 `debug!(?cfg)`
+/// 都会把密钥原文写进 `logs/latest.txt`；而崩溃横幅恰好会请用户把这个日志外发。
+/// 把打码放进 `Debug` 本身，就不再依赖每个调用点自觉脱敏。
+impl std::fmt::Debug for TranslateConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TranslateConfig")
+            .field("mode", &self.mode)
+            .field("api_base", &self.api_base)
+            .field("api_key", &redact_api_key(&self.api_key))
+            .field("api_model", &self.api_model)
+            .field("batch_size", &self.batch_size)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("target_lang", &self.target_lang)
+            // 术语表是用户内容、可能很长：只报行数，避免一行日志被整张表撑爆。
+            .field("glossary_lines", &self.glossary.lines().count())
+            .field("max_glossary_entries", &self.max_glossary_entries)
+            .finish()
     }
 }
 
@@ -1808,7 +1849,7 @@ impl LocalPathsOverride {
 /// 一旦写进被 git 跟踪、又被安装包原样分发的 `config.toml`，别人拿到的默认
 /// 配置里就是「我的服务器」：地址、密钥、模型名全是别人的基础设施。
 /// 拆分后共享配置里这几项**恒为空**，用户自己在 UI 里填也只落到本文件。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LocalTranslateOverride {
     pub mode: Option<String>,
@@ -1824,6 +1865,21 @@ impl LocalTranslateOverride {
             || self.api_base.is_some()
             || self.api_key.is_some()
             || self.api_model.is_some()
+    }
+}
+
+/// 手写 `Debug`：`config.local.toml` 的这段覆盖同样带着 `api_key`，
+/// 任何 `{:?}` 打日志的写法（`LocalOverride` 是 derive 的 `Debug`）都会泄露原文，
+/// 因此与 [`TranslateConfig`] 用同一条打码规则。未设置时显示 `None` 而不是空串，
+/// 与 `Option` 的语义一致。
+impl std::fmt::Debug for LocalTranslateOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalTranslateOverride")
+            .field("mode", &self.mode)
+            .field("api_base", &self.api_base)
+            .field("api_key", &self.api_key.as_deref().map(redact_api_key))
+            .field("api_model", &self.api_model)
+            .finish()
     }
 }
 
@@ -2247,7 +2303,18 @@ impl AppConfig {
     ///    就在 exe 旁边，与 cwd、快捷方式怎么起都无关；
     /// 4. 当前工作目录及其祖先：保留旧逻辑，向后兼容「cd 到仓库根再跑」的用法。
     ///
-    /// 每级判据只有一个：目录下存在 `models/`（见 [`pick_app_root`]）。
+    /// # 判据分两档（为什么不再只看 `models/`）
+    ///
+    /// - **锚点**（环境变量 / 清单目录 / 搜索起点自身）：目录下有 `models/` 即可；
+    /// - **祖先**：必须同时有 `models/` **和** `voice2word.db` 或 `config.toml`
+    ///   （见 [`is_app_root_ancestor`]）。
+    ///
+    /// 旧实现让祖先也只看 `models/`，于是「`D:\` 上碰巧有个 `models/`」会被判成项目根：
+    /// `voice2word.db`、`config.toml`、`logs/` 全部改写到 `D:\`，用户打开界面看到的
+    /// 是一个空库（历史工程都还在原来的目录里）。带上应用自己的落盘物才说明这个
+    /// 目录确实装过本应用的数据。开发态照旧可用：仓库根有 `models/` 也有
+    /// `config.toml`，从 `target/debug/` 向上依然能命中（且 debug 构建还有更靠前的
+    /// 清单目录一级）。
     ///
     /// # 为什么 `models/` 全不命中时要锚到 **exe 目录**、而不是 `current_dir()`
     ///
@@ -2306,17 +2373,84 @@ impl AppConfig {
 /// 向上查找的最大层数（含起点自身）。与旧实现保持一致，避免「深几层就找不到」。
 const ROOT_SEARCH_DEPTH: usize = 5;
 
+/// 应用自己的落盘物：判定「祖先目录是不是真的应用根」时的第二道判据。
+///
+/// 库名与 `main.rs` 打开 `voice2word.db` 时用的相对名一致；配置名与
+/// `load_from_file("config.toml")` / [`AppConfig::LOCAL_OVERRIDE`] 的读取路径一致。
+const APP_DB_FILE: &str = "voice2word.db";
+const APP_CONFIG_FILE: &str = "config.toml";
+
+/// 候选目录的**来源**，决定它要满足哪一档判据。
+///
+/// 为什么必须区分：exe 目录是「用户把应用放在哪」唯一可靠的锚点；它的祖先只是在
+/// **开发态**（`cargo run` 时 exe 在 `target/debug/`，仓库根在上面几层）与
+/// 「绿色版被放进项目子目录」时的兜底。祖先一旦沿用「有 `models/` 就算」的老判据，
+/// 就会把「`D:\` 上碰巧有个 models/」判成项目根——于是 `voice2word.db`、`config.toml`、
+/// `logs/` 全被搬去 `D:\`，用户看到的是「历史库全空」。所以祖先必须额外带着应用
+/// 自己的落盘物（库或配置）才算数，且优先级永远低于 exe 目录本身。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateKind {
+    /// 显式锚点：env / 清单目录 / 搜索起点自身。判据只有 `models/`。
+    Anchor,
+    /// 祖先层级：判据更严，见 [`is_app_root_ancestor`]。
+    Ancestor,
+}
+
+/// 一个项目根候选：目录 + 它的判据档位。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootCandidate {
+    dir: PathBuf,
+    kind: CandidateKind,
+}
+
+impl RootCandidate {
+    /// 显式锚点（环境变量、编译期清单目录、exe/cwd 自身）。
+    fn anchor(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            kind: CandidateKind::Anchor,
+        }
+    }
+
+    /// 祖先层级（exe/cwd 的上级目录）。
+    fn ancestor(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            kind: CandidateKind::Ancestor,
+        }
+    }
+}
+
 /// 一个目录是否是「项目根」：判据只有一个——下面存在 `models/`。
+///
+/// 这条宽判据只用于**显式锚点**（用户直接指定的目录、exe 目录本身）。祖先层级
+/// 必须走更严的 [`is_app_root_ancestor`]。
 fn is_app_root(dir: &Path) -> bool {
     dir.join("models").is_dir()
+}
+
+/// 祖先层级能否当项目根：`models/` **且**至少一件应用自己的落盘物。
+///
+/// 单独一个 `models/` 目录不足以证明「这是我自己的根」：任何项目（甚至解压出来的
+/// 模型包）都可能拥有同名目录。带上 `voice2word.db` 或 `config.toml` 才说明这个目录
+/// 确实装过/正在装本应用的数据。注意**只需要其中之一**：全新安装只有 `config.toml`、
+/// 老用户可能手工把库搬回来而配置在别处。
+fn is_app_root_ancestor(dir: &Path) -> bool {
+    is_app_root(dir) && (dir.join(APP_DB_FILE).is_file() || dir.join(APP_CONFIG_FILE).is_file())
 }
 
 /// 从候选目录里挑第一个「项目根」；一个都不命中返回 `None`。
 ///
 /// 抽成纯函数是为了**可测**：测试用临时目录构造候选即可，完全不必去改进程级的
 /// cwd / 环境变量——那两样是全局状态，并行跑测试时会互相踩踏（见 `mod tests`）。
-fn pick_app_root(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-    candidates.into_iter().find(|dir| is_app_root(dir))
+fn pick_app_root(candidates: impl IntoIterator<Item = RootCandidate>) -> Option<PathBuf> {
+    candidates.into_iter().find_map(|candidate| {
+        let hit = match candidate.kind {
+            CandidateKind::Anchor => is_app_root(&candidate.dir),
+            CandidateKind::Ancestor => is_app_root_ancestor(&candidate.dir),
+        };
+        hit.then_some(candidate.dir)
+    })
 }
 
 /// `base` 起（含自身）向上最多 `depth` 级的目录序列。
@@ -2331,6 +2465,17 @@ fn ancestors_within(base: &Path, depth: usize) -> Vec<PathBuf> {
     out
 }
 
+/// 把一个搜索起点展开成「起点自身（锚点，宽松判据） + 祖先（更严判据）」。
+///
+/// 起点自身的优先级永远高于它的祖先，因此 exe 旁边有 `models/` 时不会被
+/// 更上层的「看起来更像根」的目录抢走。
+fn push_search_chain(out: &mut Vec<RootCandidate>, base: &Path) {
+    let mut chain = ancestors_within(base, ROOT_SEARCH_DEPTH).into_iter();
+    let Some(first) = chain.next() else { return };
+    out.push(RootCandidate::anchor(first));
+    out.extend(chain.map(RootCandidate::ancestor));
+}
+
 /// 按优先级拼出项目根候选序列：环境变量 > 清单目录（仅 debug，由调用处传入）>
 /// exe 所在目录及其祖先 > 当前工作目录及其祖先。
 ///
@@ -2341,18 +2486,18 @@ fn root_candidates(
     manifest_dir: Option<&Path>,
     exe_dir: Option<&Path>,
     cwd: &Path,
-) -> Vec<PathBuf> {
+) -> Vec<RootCandidate> {
     let mut out = Vec::new();
     if let Some(home) = env_home {
-        out.push(home);
+        out.push(RootCandidate::anchor(home));
     }
     if let Some(dir) = manifest_dir {
-        out.push(dir.to_path_buf());
+        out.push(RootCandidate::anchor(dir.to_path_buf()));
     }
     if let Some(dir) = exe_dir {
-        out.extend(ancestors_within(dir, ROOT_SEARCH_DEPTH));
+        push_search_chain(&mut out, dir);
     }
-    out.extend(ancestors_within(cwd, ROOT_SEARCH_DEPTH));
+    push_search_chain(&mut out, cwd);
     out
 }
 
@@ -3264,6 +3409,16 @@ gpu_limit_percent = 60
         dir
     }
 
+    /// 造一个「真的装着本应用」的项目根：`models/` + `config.toml`。
+    ///
+    /// 祖先层级现在要求「`models/` 且至少一件应用落盘物」，所以凡是断言
+    /// 「从 exe 祖先里找到仓库根」的测试都必须用这个（真实仓库根也带着 config.toml）。
+    fn fake_repo_root(tag: &str) -> std::path::PathBuf {
+        let dir = fake_root(tag);
+        std::fs::write(dir.join("config.toml"), "language = \"zh\"\n").expect("写 config.toml");
+        dir
+    }
+
     /// 不像项目根的普通目录（没有 models/）。
     fn plain_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("v2w_plain_{tag}_{}", std::process::id()));
@@ -3272,10 +3427,10 @@ gpu_limit_percent = 60
         dir
     }
 
-    fn idx(candidates: &[std::path::PathBuf], needle: &std::path::Path) -> usize {
+    fn idx(candidates: &[super::RootCandidate], needle: &std::path::Path) -> usize {
         candidates
             .iter()
-            .position(|c| c == needle)
+            .position(|c| c.dir.as_path() == needle)
             .unwrap_or_else(|| panic!("候选里应含 {}: {candidates:?}", needle.display()))
     }
 
@@ -3294,8 +3449,8 @@ gpu_limit_percent = 60
             &cwd,
         );
 
-        assert_eq!(candidates[0], env, "环境变量必须排在第一位");
-        assert_eq!(candidates[1], repo, "清单目录紧随其后（仅 debug 传入）");
+        assert_eq!(candidates[0].dir, env, "环境变量必须排在第一位");
+        assert_eq!(candidates[1].dir, repo, "清单目录紧随其后（仅 debug 传入）");
         // exe 目录自身 + 祖先都在候选里，且整段排在 cwd 段之前
         assert!(idx(&candidates, &exe_dir) < idx(&candidates, &cwd));
         assert!(idx(&candidates, &repo.join("target")) < idx(&candidates, &cwd));
@@ -3317,7 +3472,11 @@ gpu_limit_percent = 60
         let a = plain_dir("pick_a");
         let b = plain_dir("pick_b");
 
-        let picked = super::pick_app_root(vec![a.clone(), root.clone(), b.clone()]);
+        let picked = super::pick_app_root(vec![
+            super::RootCandidate::anchor(a.clone()),
+            super::RootCandidate::anchor(root.clone()),
+            super::RootCandidate::anchor(b.clone()),
+        ]);
         assert_eq!(picked.as_deref(), Some(root.as_path()));
 
         for d in [&root, &a, &b] {
@@ -3330,7 +3489,11 @@ gpu_limit_percent = 60
     fn pick_app_root_returns_none_when_nothing_matches() {
         let a = plain_dir("pick_none_a");
         let b = plain_dir("pick_none_b");
-        assert!(super::pick_app_root(vec![a.clone(), b.clone()]).is_none());
+        assert!(super::pick_app_root(vec![
+            super::RootCandidate::anchor(a.clone()),
+            super::RootCandidate::anchor(b.clone()),
+        ])
+        .is_none());
         for d in [&a, &b] {
             let _ = std::fs::remove_dir_all(d);
         }
@@ -3341,7 +3504,9 @@ gpu_limit_percent = 60
     /// 而不是被无关的 cwd 带偏。
     #[test]
     fn shortcut_launch_with_unrelated_cwd_still_resolves_project_root() {
-        let repo = fake_root("shortcut_repo");
+        // 真实仓库根同时有 `models/` 与 `config.toml`；祖先判据要求两者都在，
+        // 所以 fixture 也必须造出配置来，否则测的就不是「从 target/debug 向上找仓库根」。
+        let repo = fake_repo_root("shortcut_repo");
         let exe_dir = repo.join("target").join("debug");
         std::fs::create_dir_all(&exe_dir).expect("mkdir exe dir");
         // 快捷方式的 cwd：与项目毫无关系
@@ -3360,6 +3525,89 @@ gpu_limit_percent = 60
         );
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// **F7 回归（核心反例）**：exe 目录没有 `models/`，而某个祖先有 `models/`
+    /// 却没有应用落盘物（`voice2word.db` / `config.toml`）——这个祖先**不得**被选中。
+    ///
+    /// 旧实现只看 `models/`：`D:\` 上碰巧有个 `models/` 就会被判成项目根，于是
+    /// `voice2word.db`、`config.toml`、`logs/` 全搬到 `D:\`，用户看到「历史库全空」。
+    #[test]
+    fn ancestor_with_models_but_no_app_data_is_not_selected() {
+        let tmp = std::env::temp_dir().join(format!(
+            "v2w_hijack_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // 「像 D:\ 的祖先」：有 models/，故意不放任何应用落盘物
+        let hijack = tmp.join("drive_like");
+        std::fs::create_dir_all(hijack.join("models")).expect("mkdir models");
+        // 应用实际所在的 exe 目录：瘦包刚解压，没有 models/
+        let exe_dir = hijack.join("Voice2Word");
+        std::fs::create_dir_all(&exe_dir).expect("mkdir exe dir");
+        let cwd = tmp.join("unrelated_cwd");
+        std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+
+        assert!(
+            super::pick_app_root(super::root_candidates(None, None, Some(&exe_dir), &cwd))
+                .is_none(),
+            "祖先只有 models/、没有库或配置时不得被判成项目根"
+        );
+
+        // 与 `app_root_dir` 的兜底组合：必须锚到 exe 目录，绝不能是那个祖先
+        let picked = super::pick_app_root(super::root_candidates(None, None, Some(&exe_dir), &cwd))
+            .or_else(|| Some(exe_dir.clone()))
+            .expect("兜底到 exe 目录");
+        assert_eq!(picked, exe_dir, "瘦包必须锚到 exe 目录");
+        assert_ne!(picked, hijack);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 祖先带齐 `models/` + 应用落盘物时仍可作项目根：老用户手工把库搬回来、
+    /// 或只有库没有 `config.toml` 的现场也必须能起。
+    #[test]
+    fn ancestor_with_models_and_db_is_selected() {
+        let repo = fake_root("ancestor_db_root");
+        std::fs::write(repo.join("voice2word.db"), b"db").expect("写库占位");
+        let exe_dir = repo.join("bin");
+        std::fs::create_dir_all(&exe_dir).expect("mkdir exe dir");
+        let cwd = plain_dir("ancestor_db_cwd");
+
+        let picked = super::pick_app_root(super::root_candidates(None, None, Some(&exe_dir), &cwd));
+        assert_eq!(
+            picked.as_deref(),
+            Some(repo.as_path()),
+            "祖先带 models/ + voice2word.db 时应被采纳"
+        );
+
+        for d in [&repo, &cwd] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// 优先级：exe 目录自身（锚点，判据只看 models/）永远胜过高层的祖先，
+    /// 哪怕祖先的数据更全——避免「根目录看起来更像项目」把 exe 旁边的数据抢走。
+    #[test]
+    fn exe_dir_anchor_wins_over_ancestor_with_app_data() {
+        let ancestor = fake_repo_root("anchor_priority_root");
+        let exe_dir = ancestor.join("app");
+        std::fs::create_dir_all(exe_dir.join("models")).expect("mkdir models");
+        let cwd = plain_dir("anchor_priority_cwd");
+
+        let picked = super::pick_app_root(super::root_candidates(None, None, Some(&exe_dir), &cwd));
+        assert_eq!(
+            picked.as_deref(),
+            Some(exe_dir.as_path()),
+            "exe 目录自身命中时必须优先，不能被更上层的候选抢走"
+        );
+
+        for d in [&ancestor, &cwd] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     /// 绿色版/安装版：exe 与 `models/` 同级，cwd 无关紧要。
@@ -3498,6 +3746,48 @@ gpu_limit_percent = 60
         );
         // 同理，项目根的 config.toml 必须能命中（这就是启动时 load_from_file 走的路）
         assert!(super::AppConfig::resolve_path("config.toml").is_file());
+    }
+
+    /// **F5 回归**：`Debug` 绝不能输出 `api_key` 原文。
+    ///
+    /// 背景：`main.rs` 曾有一行 `info!("配置加载成功: {:?}", config)`，密钥会原样写进
+    /// `logs/latest.txt`；而崩溃横幅恰好请用户把这个日志外发，密钥只能吊销。
+    #[test]
+    fn debug_redacts_translate_api_key() {
+        let mut cfg = TranslateConfig {
+            api_key: "sk-live-verysecret-0123456789".to_string(),
+            ..TranslateConfig::default()
+        };
+        let text = format!("{cfg:?}");
+        assert!(!text.contains("verysecret"), "{text}");
+        assert!(text.contains("sk-l…<redacted>"), "{text}");
+
+        // 包在 AppConfig 里也一样：AppConfig 是 derive 的 Debug，安全性来自字段的
+        // 手写 Debug，而不是某个调用点记得脱敏。
+        let app = super::AppConfig {
+            translate: cfg.clone(),
+            ..super::AppConfig::default()
+        };
+        let app_text = format!("{app:?}");
+        assert!(!app_text.contains("verysecret"), "{app_text}");
+
+        // 短密钥：连前 4 位都不给（短串的前 4 位几乎泄露一半）
+        cfg.api_key = "abc123".to_string();
+        let short = format!("{cfg:?}");
+        assert!(!short.contains("abc1"), "{short}");
+        assert!(short.contains("<redacted>"), "{short}");
+
+        // 空密钥显式标出，避免与「填了但没显示」混淆
+        cfg.api_key = String::new();
+        assert!(format!("{cfg:?}").contains("<empty>"));
+
+        // config.local.toml 的覆盖同样打码（LocalOverride 也是 derive 的 Debug）
+        let local = super::LocalTranslateOverride {
+            api_key: Some("sk-local-verysecret-987654321".to_string()),
+            ..Default::default()
+        };
+        let local_text = format!("{local:?}");
+        assert!(!local_text.contains("verysecret"), "{local_text}");
     }
 
     // ─────────── 在线翻译：端点归一化 / 模型列表 / 错误提示 ───────────
