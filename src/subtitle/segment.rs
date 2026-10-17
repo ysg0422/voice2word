@@ -42,6 +42,14 @@ pub struct Segment {
     /// 「开始翻译」按钮也因 `done == total` 直接拒绝执行。
     #[serde(default)]
     pub translation_lang: Option<String>,
+    /// 多语言译文包：`语言名 -> 译文`。
+    ///
+    /// `translation` / `translation_lang` 仍是「**当前展示 / 导出用的那一份**」，
+    /// 预览、双语导出、统计口径一行都不用改；本字段只是把**译过的每种语言各留一份**，
+    /// 供「字幕语言包」切换。此前换目标语言重译会把旧语言的译文直接覆盖掉，
+    /// 用户再也切不回去，也看不出这部片子到底译过哪几种语言。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub translations: std::collections::BTreeMap<String, String>,
     /// LLM 润色文本 (保留字段兼容)
     #[serde(default, deserialize_with = "null_is_default")]
     pub polished: String,
@@ -98,6 +106,7 @@ impl Segment {
             text: text.into(),
             translation: None,
             translation_lang: None,
+            translations: std::collections::BTreeMap::new(),
             polished: String::new(),
             language: None,
             confidence: None,
@@ -167,6 +176,46 @@ impl Segment {
             .as_deref()
             .map(|t| !t.trim().is_empty())
             .unwrap_or(false)
+    }
+
+    /// 取某个语言包里的译文（空串 / 纯空白视为没有这一份）。
+    pub fn translation_pack(&self, lang: &str) -> Option<&str> {
+        self.translations
+            .get(lang)
+            .map(|s| s.as_str())
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// 记入一份语言包。**只存不切换**：调用方自己决定要不要把它设为当前展示那份
+    /// （翻译收尾时通常就是「设为当前」）。
+    pub fn set_translation_pack(&mut self, lang: &str, text: &str) {
+        let lang = lang.trim();
+        if lang.is_empty() || text.trim().is_empty() {
+            return;
+        }
+        self.translations
+            .insert(lang.to_string(), text.to_string());
+    }
+
+    /// 把某个语言包切换成「当前展示 / 导出用的那一份」。
+    ///
+    /// 预览、双语导出、翻译统计全都只看 `translation` + `translation_lang`，
+    /// 所以「切换语言包」在这里投影一次，下游一行都不用改。
+    pub fn show_translation_pack(&mut self, lang: &str) -> bool {
+        match self.translations.get(lang).cloned() {
+            Some(text) if !text.trim().is_empty() => {
+                self.translation = Some(text);
+                self.translation_lang = Some(lang.to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 回到「只显示原文」：清掉当前展示的译文，但**语言包保留**（还能切回来）。
+    pub fn show_source_only(&mut self) {
+        self.translation = None;
+        self.translation_lang = None;
     }
 
     /// 该段是否带词级时间戳（words 非空即视为可用）。
@@ -1002,6 +1051,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         text: left_text,
         translation: left_trans,
         translation_lang: seg.translation_lang.clone(),
+        translations: Default::default(),
         polished: left_polished,
         language: seg.language.clone(),
         confidence: seg.confidence,
@@ -1016,6 +1066,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         text: right_text,
         translation: right_trans,
         translation_lang: seg.translation_lang.clone(),
+        translations: Default::default(),
         polished: right_polished,
         language: seg.language,
         confidence: seg.confidence,

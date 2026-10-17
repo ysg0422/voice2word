@@ -1007,6 +1007,7 @@ impl MainWindow {
                                     text: "Voice2Word 字幕文本框".to_string(),
                                     translation: None,
                                     translation_lang: None,
+                                    translations: Default::default(),
                                     speaker: None,
                                     speaker_name: None,
                                     words: Vec::new(),
@@ -5641,6 +5642,49 @@ impl MainWindow {
         // 取派生快照（按修订号重建一次），不在渲染路径上现扫全表。
         let has_copied_trans = snapshot.has_copied_translation;
 
+        // ── 字幕语言包 ──────────────────────────────────────────────
+        // 「这部片子到底译过哪几种语言、各多少句」以前完全看不出来：换目标语言重译
+        // 会把旧语言的译文覆盖掉。现在每种语言各留一份（`Segment::translations`），
+        // 这里列出来，点一下就能把它切回「当前展示 / 导出」的那一份。
+        let packs = self.state.translation_packs();
+        let current_pack = self.state.current_display_pack();
+        let pack_row = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_1()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(Theme::FORM_LABEL_W))
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_secondary())
+                    .child("字幕语言包"),
+            )
+            .child(
+                primitives::chip(format!("原文（{total}）"), current_pack.is_none(), false)
+                    .id("translate-pack-source")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.state.apply_translation_pack(None);
+                        this.editor_export_mode = crate::subtitle::ExportMode::RawOnly;
+                        cx.notify();
+                    })),
+            )
+            .children(packs.iter().enumerate().map(|(i, (lang, n))| {
+                let is_sel = current_pack.as_deref() == Some(lang.as_str());
+                let lang_owned = lang.clone();
+                primitives::chip(format!("{lang}（{n}）"), is_sel, false)
+                    .id(("translate-pack", i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.state.apply_translation_pack(Some(&lang_owned));
+                        // 选译文语言包即进双语导出：用户点它就是要看/导出这门语言。
+                        this.editor_export_mode = crate::subtitle::ExportMode::Bilingual;
+                        cx.notify();
+                    }))
+            }));
+
         // 引擎档位：本地 Qwen 免费离线，在线 API 更快更好但需要密钥
         let mode_row = div()
             .flex()
@@ -6030,6 +6074,7 @@ impl MainWindow {
                     ),
             )
             .child(mode_row)
+            .child(pack_row)
             .child(lang_row)
             .child(action_row)
             // 术语表状态 + 快速入口：翻译就在这一面板发生，把「固定译法」的入口放在这里

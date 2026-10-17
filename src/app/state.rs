@@ -1787,6 +1787,13 @@ impl AppState {
                 // 引擎解析失败时可能回填空串，用它覆盖用户已有的好译文会让
                 // 「翻译一结束译文变空白」，故只认非空译文。
                 if src.has_translation() {
+                    // 先进语言包，再投影成「当前展示」：换目标语言重译时，旧语言的
+                    // 那一份留在 `translations` 里，用户随时能在「字幕语言包」切回去。
+                    if let (Some(lang), Some(text)) =
+                        (src.translation_lang.as_deref(), src.translation.as_deref())
+                    {
+                        seg.set_translation_pack(lang, text);
+                    }
                     seg.translation = src.translation.clone();
                     seg.translation_lang = src.translation_lang.clone();
                 }
@@ -1801,6 +1808,74 @@ impl AppState {
         self.translate_target_lang = lang.to_string();
         self.config.translate.target_lang = lang.to_string();
         self.save_translate_config();
+    }
+
+    /// 这卷字幕里已经存在的「语言包」清单：`(语言名, 句数)`，按句数降序。
+    ///
+    /// 只统计**非空**译文。老工程没有语言包字段（只在 `translation` 里存了一份），
+    /// 这里把它当作「只有这一种语言的包」兼容进来，不必等用户重译一遍。
+    pub fn translation_packs(&self) -> Vec<(String, usize)> {
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for seg in &self.segments {
+            for (lang, text) in &seg.translations {
+                if !text.trim().is_empty() {
+                    *counts.entry(lang.clone()).or_insert(0) += 1;
+                }
+            }
+            if let (Some(lang), Some(text)) = (
+                seg.translation_lang.as_deref(),
+                seg.translation.as_deref(),
+            ) {
+                if !text.trim().is_empty() && !seg.translations.contains_key(lang) {
+                    *counts.entry(lang.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
+    /// 当前正被展示的语言包（`None` = 只显示原文）。
+    ///
+    /// 取「句数最多的那个语言」：混排数据（半篇英文半篇日语）下没有唯一答案，
+    /// 但面板上高亮哪个必须有个确定值，否则每次重绘都可能换一个。
+    pub fn current_display_pack(&self) -> Option<String> {
+        let mut counts: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for seg in &self.segments {
+            if seg.has_translation() {
+                if let Some(lang) = seg.translation_lang.as_deref() {
+                    *counts.entry(lang).or_insert(0) += 1;
+                }
+            }
+        }
+        counts
+            .into_iter()
+            .max_by_key(|(_, n)| *n)
+            .map(|(lang, _)| lang.to_string())
+    }
+
+    /// 切换「当前展示 / 导出」的语言包：`Some(lang)` 展示该语言，`None` 只显示原文。
+    ///
+    /// 只改 `translation` / `translation_lang`——预览、双语导出、翻译统计全认这两个
+    /// 字段，所以切语言包不用改下游一行；语言包本身一份都不会丢。
+    pub fn apply_translation_pack(&mut self, lang: Option<&str>) {
+        for seg in self.segments.iter_mut() {
+            match lang {
+                Some(l) => {
+                    // 这一句没有该语言的包：清掉展示，避免留下上一门语言的残余。
+                    if !seg.show_translation_pack(l) {
+                        seg.show_source_only();
+                    }
+                }
+                None => seg.show_source_only(),
+            }
+        }
+        self.bump_segments_revision();
+        self.segments_dirty = true;
+        self.defer_segments_flush();
     }
 
     /// 切换「选句翻译」模式：关闭 → 开启（清空上次勾选）；开启 → 关闭。
@@ -3564,6 +3639,7 @@ impl AppState {
             text: part2.clone(),
             translation: trans_right,
             translation_lang: trans_lang,
+            translations: Default::default(),
             polished: if !orig.polished.is_empty() {
                 part2
             } else {
@@ -5695,6 +5771,53 @@ mod tests {
     }
     /// 回归：翻译收尾必须**按句合并**，不能整表覆盖。
     ///
+    /// 语言包：换目标语言重译**不能**把旧语言的译文覆盖掉，切回去要能原样还原。
+    ///
+    /// 这就是「字幕语言包」面板的数据基础：此前只有 `translation` 一份，译成英文
+    /// 就把中文那遍冲掉了，用户既看不到「译过哪几种语言」，也切不回去。
+    #[test]
+    fn translation_packs_survive_relanguage_and_can_be_switched_back() {
+        use crate::subtitle::Segment;
+
+        let mut state = test_state(vec![Segment::new(1, 0.0, 2.0, "こんにちは")]);
+
+        let mut first = state.segments.clone();
+        first[0].translation = Some("你好".to_string());
+        first[0].translation_lang = Some("简体中文".to_string());
+        state.merge_translations(first);
+        assert_eq!(
+            state.translation_packs(),
+            vec![("简体中文".to_string(), 1)],
+            "译完一门语言应出现一个语言包"
+        );
+
+        // 改译成英文：中文那一份必须留着
+        let mut second = state.segments.clone();
+        second[0].translation = Some("Hello".to_string());
+        second[0].translation_lang = Some("English".to_string());
+        state.merge_translations(second);
+        let packs = state.translation_packs();
+        assert!(
+            packs.iter().any(|(l, n)| l == "简体中文" && *n == 1),
+            "旧语言包被覆盖了: {packs:?}"
+        );
+        assert!(packs.iter().any(|(l, n)| l == "English" && *n == 1));
+        assert_eq!(state.current_display_pack().as_deref(), Some("English"));
+
+        // 切回中文：展示字段被投影回来
+        state.apply_translation_pack(Some("简体中文"));
+        assert_eq!(state.segments[0].translation.as_deref(), Some("你好"));
+        assert_eq!(
+            state.segments[0].translation_lang.as_deref(),
+            Some("简体中文")
+        );
+
+        // 切回原文：展示清空，但两份语言包都还在
+        state.apply_translation_pack(None);
+        assert!(state.segments[0].translation.is_none(), "应回到只显示原文");
+        assert_eq!(state.translation_packs().len(), 2, "语言包一份都不该丢");
+    }
+
     /// 翻译在后台跑几分钟，期间用户仍可编辑字幕。修前收尾是
     /// `self.segments = translated`（开始时的快照），会把用户这几分钟的编辑
     /// 静默回滚。这里模拟「翻译期间用户改了原文」，断言：译文合并进来了，
