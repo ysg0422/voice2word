@@ -259,8 +259,11 @@ impl SnapshotDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        // 下划线前缀：启动清扫只认 `v2w_` / `voice2word_`，旧名字
+        // `voice2word-backup-snapshot-*` 带连字符永远扫不到——而它里面是**一整份
+        // 数据库快照**（含全部字幕），被强杀后会永久留在 %TEMP%（隐私 + 占空间）。
         let path = std::env::temp_dir().join(format!(
-            "voice2word-backup-snapshot-{}-{stamp}",
+            "voice2word_backup_snapshot_{}_{stamp}",
             std::process::id()
         ));
         std::fs::create_dir_all(&path)
