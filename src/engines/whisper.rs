@@ -1063,6 +1063,10 @@ impl WhisperEngine {
         // 原先 read_to_end 全量读入再整体解码，会占用几十 MB 并产生一次大字符串分配。
         // 这里改为逐行处理：只累计 VAD 耗时、保留末尾若干行用于报错信息，其余直接丢弃。
         const STDERR_TAIL_LINES: usize = 40;
+        // whisper.cpp 的致命错误（`error: unknown argument` / `failed to load model`）
+        // 打印在**最前面**，紧跟 60 多行 usage；只留尾部会把它挤出窗口，于是客户
+        // 看到的是「未产出任何识别结果」这种无关文案。头部也留几行。
+        const STDERR_HEAD_LINES: usize = 8;
         let stderr_activity = last_activity.clone();
         let cb_stderr = cb_shared.clone();
         let dur_stderr = total_duration.unwrap_or(0.0);
@@ -1073,6 +1077,7 @@ impl WhisperEngine {
             let mut vad_ms = 0.0f64;
             let mut tail: std::collections::VecDeque<String> =
                 std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES);
+            let mut head: Vec<String> = Vec::with_capacity(STDERR_HEAD_LINES);
             let mut reader = std::io::BufReader::new(err);
             let mut last_pp_pct = 0u32;
             // 读失败（≠ 正常 EOF）时 `read_pipe_lines` 返回 true：诊断日志已不可信，
@@ -1105,6 +1110,9 @@ impl WhisperEngine {
                         }
                     }
                 }
+                if head.len() < STDERR_HEAD_LINES {
+                    head.push(line.to_string());
+                }
                 if tail.len() == STDERR_TAIL_LINES {
                     tail.pop_front();
                 }
@@ -1113,10 +1121,17 @@ impl WhisperEngine {
             if truncated {
                 tail.push_back("[stderr 读取中断：以上日志被截断]".to_string());
             }
-            (
-                vad_ms / 1000.0,
-                tail.into_iter().collect::<Vec<_>>().join("\n"),
-            )
+            let tail_text = tail.into_iter().collect::<Vec<_>>().join("\n");
+            let stderr_text = if head.is_empty() {
+                tail_text
+            } else {
+                format!(
+                    "{}\n…（中间省略）…\n{}",
+                    head.join("\n"),
+                    tail_text
+                )
+            };
+            (vad_ms / 1000.0, stderr_text)
         });
 
         let proc_count = processors;

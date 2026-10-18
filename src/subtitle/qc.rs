@@ -773,6 +773,19 @@ pub fn apply_repairs(segments: &mut [Segment], plan: &RepairPlan) -> usize {
             }
         }
 
+        // 源文一变，**旧译文与词级时间戳立刻失效**：
+        // - 译文是按旧原文翻的，留着会让 `translation_matches` 判「已完成」，
+        //   后续翻译永远跳过它，导出里是「新原文 + 旧译文」的张冠李戴；
+        // - 词级时间戳描述的是旧 token，卡拉OK 会拿旧时长点亮新字。
+        // 这与手工改字（`save_selected_text` 的 P0-2）走同一条失效规则。
+        let text_changed = seg.text != before_text || seg.polished != before_polished;
+        if text_changed {
+            seg.words.clear();
+            seg.translation = None;
+            seg.translation_lang = None;
+            seg.translations.clear();
+        }
+
         let changed = seg.start != before_start
             || seg.end != before_end
             || seg.text != before_text

@@ -27,7 +27,10 @@ pub fn to_cli_safe_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let path_str = normalized.to_string_lossy();
-        if path_str.is_ascii() && !path_str.contains(' ') {
+        // 空格不需要处理：子进程收到的是 argv 数组，Windows 会保留参数内的空格。
+        // 只有**非 ASCII** 才需要考虑别名（历史上这里把空格也判成不安全，导致
+        // 带空格的路径白白走 8.3 / 硬链接 / 整份复制）。
+        if path_str.is_ascii() {
             return normalized;
         }
 
@@ -40,32 +43,29 @@ pub fn to_cli_safe_path(path: &Path) -> PathBuf {
             }
         }
 
-        // 2. 尝试在同驱动器根目录创建纯 ASCII 硬链接别名 (同驱动器 0 拷贝，仅适用于文件)
+        // 2. 兜底：**仅小文件**复制到纯 ASCII 临时目录。
+        //
+        // 这里刻意不再做两件事：
+        // - 不再用 `DefineDosDeviceW` 把父目录映射成盘符。客户机上莫名多出的
+        //   Z: 盘就是这么来的：映射从不删除，泄漏到重启；它还显示为目标目录所在
+        //   卷的大小（与 E: 一样大），极具迷惑性。
+        // - 不再在驱动器根目录建 `.v2w_alias` 硬链接：删除源文件后空间不回收，
+        //   盘根还会多出隐藏目录。
+        // 大文件（视频 / 模型）直接用原路径：ffmpeg、whisper 都是从 argv 取
+        // UTF-8 路径，不需要 ASCII 别名；GB 级复制只会拖慢起播并吃满磁盘。
+        const MAX_SAFE_COPY_BYTES: u64 = 64 * 1024 * 1024;
         if normalized.is_file() {
-            if let Some(alias) = create_safe_file_alias(&normalized) {
-                debug!(original = ?normalized, alias = ?alias, "路径已创建纯 ASCII 安全文件硬链接别名");
-                return alias;
-            }
-        }
-
-        // 3. 尝试使用虚拟驱动器映射（DefineDosDeviceW，将包含中文的父目录映射为纯 ASCII 盘符如 Z:\）
-        if let Some(parent) = normalized.parent() {
-            if let Some(file_name) = normalized.file_name() {
-                if let Some(mapped_root) = map_directory_to_dos_device(parent) {
-                    let safe_mapped = mapped_root.join(file_name);
-                    if safe_mapped.exists() {
-                        debug!(original = ?normalized, mapped = ?safe_mapped, "路径已通过虚拟驱动器映射转换为纯 ASCII 路径");
-                        return safe_mapped;
-                    }
+            let small = normalized
+                .metadata()
+                .map(|m| m.len() <= MAX_SAFE_COPY_BYTES)
+                .unwrap_or(false);
+            if small {
+                if let Some(copied) = copy_to_safe_temp(&normalized) {
+                    debug!(original = ?normalized, copied = ?copied, "小文件已缓存到纯 ASCII 临时目录");
+                    return copied;
                 }
-            }
-        }
-
-        // 4. 终极兜底：复制到 safe_temp_dir()（对于模型等大文件，首次耗时 1 秒复制也比子进程崩溃强一万倍）
-        if normalized.is_file() {
-            if let Some(copied) = copy_to_safe_temp(&normalized) {
-                debug!(original = ?normalized, copied = ?copied, "路径已安全缓存复制到纯 ASCII 临时目录");
-                return copied;
+            } else {
+                debug!(original = ?normalized, "非 ASCII 大文件不做别名、不复制，直接使用原路径");
             }
         }
     }
@@ -151,85 +151,6 @@ fn get_win32_short_path(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn create_safe_file_alias(src: &Path) -> Option<PathBuf> {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    src.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("bin");
-
-    // 优先在源文件相同驱动器的根临时目录创建硬链接（硬链接不可跨卷）
-    // 注意：PrefixComponent.as_os_str() 返回的是 "D:"，必须显式补上 "\" 成为 "D:\" 根目录！
-    // 否则拼接出的 "D:.v2w_alias" 是驱动器相对路径，会被当成不存在的非法路径。
-    let mut components = src.components();
-    if let Some(std::path::Component::Prefix(prefix)) = components.next() {
-        let mut drive_root = PathBuf::from(prefix.as_os_str());
-        drive_root.push("\\");
-        let alias_dir = drive_root.join(".v2w_alias");
-        if std::fs::create_dir_all(&alias_dir).is_ok() {
-            let alias = alias_dir.join(format!("m_{:x}.{}", hash, ext));
-            if alias.exists() {
-                if let (Ok(m1), Ok(m2)) = (src.metadata(), alias.metadata()) {
-                    if m1.len() == m2.len() {
-                        return Some(alias);
-                    }
-                }
-                let _ = std::fs::remove_file(&alias);
-            }
-            if std::fs::hard_link(src, &alias).is_ok() {
-                return Some(alias);
-            }
-        }
-    }
-
-    None
-}
-
-#[cfg(windows)]
-fn map_directory_to_dos_device(dir: &Path) -> Option<PathBuf> {
-    use std::os::windows::ffi::OsStrExt;
-    use std::sync::{Mutex, OnceLock};
-
-    static MAPPED_DRIVES: OnceLock<Mutex<std::collections::HashMap<PathBuf, char>>> =
-        OnceLock::new();
-    let drives_map = MAPPED_DRIVES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-
-    let dir_buf = dir.to_path_buf();
-    let mut mapped = drives_map.lock().unwrap();
-    if let Some(&drive_letter) = mapped.get(&dir_buf) {
-        return Some(PathBuf::from(format!("{}:\\", drive_letter)));
-    }
-
-    extern "system" {
-        fn DefineDosDeviceW(dwFlags: u32, lpDeviceName: *const u16, lpTargetPath: *const u16) -> i32;
-        fn GetLogicalDrives() -> u32;
-    }
-
-    let drives_mask = unsafe { GetLogicalDrives() };
-    // 从 Z 倒序向 D 寻找空闲盘符（跳过 A, B, C）
-    for i in (3..26).rev() {
-        if (drives_mask & (1 << i)) == 0 {
-            let letter = (b'A' + i as u8) as char;
-            if mapped.values().any(|&c| c == letter) {
-                continue;
-            }
-            let dev_name: Vec<u16> = format!("{}:", letter).encode_utf16().chain(Some(0)).collect();
-            let target_path: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
-            let res = unsafe { DefineDosDeviceW(0, dev_name.as_ptr(), target_path.as_ptr()) };
-            if res != 0 {
-                mapped.insert(dir_buf, letter);
-                return Some(PathBuf::from(format!("{}:\\", letter)));
-            }
-        }
-    }
-    None
-}
-
-#[cfg(windows)]
 fn copy_to_safe_temp(src: &Path) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -276,17 +197,24 @@ mod tests {
         assert!(temp.exists());
     }
 
+    /// 回归：**含空格的纯 ASCII 路径必须原样返回**。
+    ///
+    /// 旧实现把空格也判成「不安全」，于是带空格的模型/素材会白白走 8.3、
+    /// 盘根硬链接，最后甚至整份复制到 %TEMP%。客户机上莫名多出的 Z: 盘
+    /// （大小等于 E:）来自那条「把父目录映射成盘符」的策略——已整体删除。
     #[test]
     #[cfg(windows)]
-    fn test_drive_root_slash() {
-        let p = Path::new("D:\\测试目录\\model.bin");
-        let mut components = p.components();
-        if let Some(std::path::Component::Prefix(prefix)) = components.next() {
-            let mut drive_root = PathBuf::from(prefix.as_os_str());
-            drive_root.push("\\");
-            assert_eq!(drive_root.to_str().unwrap(), "D:\\");
-            let alias_dir = drive_root.join(".v2w_alias");
-            assert_eq!(alias_dir.to_str().unwrap(), "D:\\.v2w_alias");
-        }
+    fn ascii_path_with_spaces_is_returned_as_is() {
+        let dir = std::env::temp_dir().join("v2w space test");
+        std::fs::create_dir_all(&dir).ok();
+        let file = dir.join("a b.txt");
+        std::fs::write(&file, b"x").ok();
+        assert_eq!(
+            to_cli_safe_path(&file),
+            file,
+            "含空格但纯 ASCII 的路径不应被转换/复制"
+        );
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
