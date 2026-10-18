@@ -4,10 +4,10 @@
 
 #define MyAppName "Voice2Word"
 #ifndef MyAppVersion
-#define MyAppVersion "0.2.23"
+#define MyAppVersion "0.2.24"
 #endif
 #define MyAppPublisher "Voice2Word"
-#define MyAppURL "https://github.com/ygs0422/Voice2Word"
+#define MyAppURL "https://github.com/ysg0422/voice2word"
 #define MyAppExeName "voice2word.exe"
 
 [Setup]
@@ -38,6 +38,15 @@ DisableProgramGroupPage=yes
 DisableFinishedPage=no
 UninstallDisplayIcon={app}\app.ico
 UninstallDisplayName={#MyAppName}
+; 显式声明卸载能力：此前只是靠 Inno 默认值，客户在「Windows 设置 → 应用」里
+; 找不到本程序时无从排查。这两项保证卸载项（HKCU\...\Uninstall\{AppId}_is1）
+; 一定会被写入。
+Uninstallable=yes
+CreateUninstallRegKey=yes
+; 卸载/升级时若程序仍在运行，交给 Restart Manager 关掉它，避免文件占用导致
+; 「卸不干净」；不自动重启应用。
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "languages\ChineseSimplified.isl"
@@ -74,6 +83,13 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+
+[UninstallDelete]
+; 纯缓存/日志：无论用户是否保留数据，都必须删掉，否则就是「卸不干净」。
+Type: filesandordirs; Name: "{app}\logs"
+Type: filesandordirs; Name: "{app}\cache"
+Type: filesandordirs; Name: "{app}\updates"
+Type: files; Name: "{app}\*.part"
 
 [Code]
 const
@@ -463,5 +479,43 @@ begin
       WizardSelectTasks('!desktopicon')
     else
       WizardSelectTasks('desktopicon');
+  end;
+end;
+
+{ ===== 卸载：清理运行期产物 ===== }
+// 运行期写入的东西（模型、数据库、日志、缓存、配置覆盖、记忆库）都不在安装清单里，
+// 不主动删就会永远留在安装目录。模型/历史数据对用户有价值，所以询问一次；
+// 纯缓存与日志无条件清理，保证「卸不干净」不再出现。
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  AppDir: String;
+begin
+  AppDir := ExpandConstant('{app}');
+
+  if CurUninstallStep = usUninstall then
+  begin
+    if MsgBox('是否同时删除已下载的模型、历史数据库与本地配置？' + #13#10 + #13#10 +
+              '选择「否」会保留它们（以后重新安装仍可继续使用），' + #13#10 +
+              '但日志、缓存与更新包一定会被清理。',
+              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+    begin
+      DelTree(AppDir + '\models', True, True, True);
+      DelTree(AppDir + '\tools', True, True, True);
+      DelTree(AppDir + '\backups', True, True, True);
+      DeleteFile(AppDir + '\voice2word.db');
+      DeleteFile(AppDir + '\voice2word.db-wal');
+      DeleteFile(AppDir + '\voice2word.db-shm');
+      DeleteFile(AppDir + '\config.local.toml');
+      DeleteFile(AppDir + '\typo_memory.json');
+      DeleteFile(AppDir + '\glossary.txt');
+      DeleteFile(AppDir + '\batch_queue.json');
+      DeleteFile(AppDir + '\replace_rule_sets.json');
+    end;
+  end;
+
+  if CurUninstallStep = usPostUninstall then
+  begin
+    // 目录此时只剩「用户选择保留」的数据（或已空）；空就删掉，非空保留。
+    RemoveDir(AppDir);
   end;
 end;

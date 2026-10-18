@@ -5,6 +5,25 @@
 
 ---
 
+## 0.2.24
+
+修「卸载卸不干净 + Windows 设置里找不到本应用」。
+
+- **卸载项显式保证**：`[Setup]` 补 `Uninstallable=yes`、`CreateUninstallRegKey=yes`
+  （此前只靠 Inno 默认值），卸载项固定写到
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{AppId}_is1`。
+- **清掉运行期产物**：新增 `[UninstallDelete]` 无条件删除 `logs/`、`cache/`、`updates/`
+  与 `*.part`；`[Code]` 里新增 `CurUninstallStepChanged`，询问是否同时删除
+  **models/、tools/、voice2word.db、config.local.toml、typo_memory.json** 等运行期
+  数据（默认「否」= 保留数据，纯缓存照删），最后 `RemoveDir` 收掉空目录。
+- 卸载/升级时 `CloseApplications=yes`：程序还在跑就由 Restart Manager 关掉，
+  避免文件占用导致删一半。
+- 顺手修 `MyAppURL` 里的仓库名拼写（`ygs0422` → `ysg0422`），卸载项/帮助链接不再指错。
+
+> 已经装过旧版本、目录里还留着东西的机器：新安装包只保证**以后**卸得干净；
+> 旧的残留需要手动删一次（见回复里的命令）。
+
+---
 ## 0.2.23
 
 - 备份用的数据库快照临时目录改名 `voice2word_backup_snapshot_<pid>_<ns>`：旧名字
