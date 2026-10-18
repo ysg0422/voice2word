@@ -751,6 +751,27 @@ impl WhisperEngine {
             );
         }
 
+        // 魔数校验：下载中断留下的半截文件扩展名仍是 .bin，但内容不是模型。
+        // 客户机上实测过这种「whisper-cli 静默退出（退出码 0、不写 JSON）」，
+        // 上层只能报「未产出任何识别结果」，根本查不到根因。
+        if let Ok(mut f) = std::fs::File::open(&effective_model) {
+            use std::io::Read as _;
+            let mut magic = [0u8; 4];
+            if f.read_exact(&mut magic).is_err() {
+                anyhow::bail!(
+                    "Whisper 模型文件不完整（不足 4 字节）：{:?}，请删除后重新下载。",
+                    effective_model
+                );
+            }
+            if !matches!(&magic, b"ggml" | b"ggmf" | b"ggjt" | b"ggla" | b"gguf") {
+                anyhow::bail!(
+                    "Whisper 模型文件损坏或不是 GGML 模型：{:?}（文件头不是 ggml/gguf）。\
+                     最常见原因是下载中断留下了半截文件——请在「模型与组件」里删除该模型后重新下载。",
+                    effective_model
+                );
+            }
+        }
+
         if let Some(ref cb) = progress_cb {
             cb(0.0, "Whisper 正在加载模型并开始逐句识别...", None);
         }
@@ -2907,7 +2928,10 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        std::fs::write(&p, b"stub").expect("写临时模型文件应成功");
+        // 必须是**合法 GGML 文件头**：`transcribe` 会做魔数校验（下载中断留下的
+        // 半截 .bin 会让 whisper-cli 静默退出），写 "stub" 会先被这条预检拦下，
+        // 于是「取消早退 / spawn 失败」这两条测试测的就不再是它们本来要测的东西。
+        std::fs::write(&p, b"ggml\0\0\0\0").expect("写临时模型文件应成功");
         p
     }
 
