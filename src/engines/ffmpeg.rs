@@ -172,6 +172,9 @@ pub(crate) fn run_with_deadline(cmd: &mut Command, timeout: Duration) -> Result<
     let mut child = cmd
         .spawn()
         .with_context(|| format!("启动子进程 {what} 失败"))?;
+    // 交给全局 Job：主进程被强杀/崩溃时，这个 ffmpeg 会被系统连根终止，
+    // 不会继续占着 GPU、输出文件句柄跑下去。
+    crate::utils::child_registry::adopt(&child);
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();

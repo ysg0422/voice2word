@@ -2925,7 +2925,9 @@ impl MainWindow {
             .unwrap_or("subtitles")
             .to_string();
         let out = media.with_file_name(format!("{stem}.embedded.mkv"));
-        let dir = std::env::temp_dir().join(format!("v2w-embed-{}", std::process::id()));
+        // 下划线而不是连字符：启动清扫只认 `v2w_` / `voice2word_` 前缀，
+        // 旧名字 `v2w-embed-*` 永远不会被清，崩溃一次就永久残留。
+        let dir = std::env::temp_dir().join(format!("v2w_embed_{}", std::process::id()));
 
         let mut tracks: Vec<(String, std::path::PathBuf)> = Vec::new();
         let mut build = || -> anyhow::Result<()> {

@@ -107,7 +107,15 @@ pub fn safe_temp_dir() -> PathBuf {
             }
         }
 
-        // 回退 1: ProgramData（Windows 默认全权限且恒为纯英文）
+        // 回退 1: %LOCALAPPDATA%\Voice2Word\temp（用户私有、通常纯 ASCII）
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let p = PathBuf::from(local).join("Voice2Word").join("temp");
+            if p.to_string_lossy().is_ascii() && std::fs::create_dir_all(&p).is_ok() {
+                return p;
+            }
+        }
+
+        // 回退 2: %ProgramData%\Voice2Word\temp（全机共享，权限宽松）
         if let Ok(prog_data) = std::env::var("ProgramData") {
             let p = PathBuf::from(prog_data).join("Voice2Word").join("temp");
             if std::fs::create_dir_all(&p).is_ok() {
@@ -115,11 +123,18 @@ pub fn safe_temp_dir() -> PathBuf {
             }
         }
 
-        // 回退 2: 系统盘 C:\Temp
-        let c_temp = PathBuf::from("C:\\Temp");
-        if std::fs::create_dir_all(&c_temp).is_ok() {
-            return c_temp;
+        // 回退 3: %PUBLIC%\Voice2Word\temp（C:\Users\Public 几乎恒为 ASCII）
+        if let Ok(public) = std::env::var("PUBLIC") {
+            let p = PathBuf::from(public).join("Voice2Word").join("temp");
+            if p.to_string_lossy().is_ascii() && std::fs::create_dir_all(&p).is_ok() {
+                return p;
+            }
         }
+
+        // 刻意**不再回退到 C:\Temp**：在系统盘根目录凭空建目录属于「对用户系统的
+        // 意外改动」——客户的 Z 盘事故就是同一类问题的另一个版本。宁可沿用原
+        // %TEMP%（哪怕含中文），也不往盘根写。
+        debug!("未找到纯 ASCII 的临时目录回退，沿用系统 %TEMP%");
     }
 
     default_temp
