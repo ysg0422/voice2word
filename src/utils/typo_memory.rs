@@ -296,8 +296,13 @@ fn is_usable_pair(wrong: &str, right: &str) -> bool {
     if chars == 0 || chars > MAX_PAIR_CHARS {
         return false;
     }
+
     let chars = right.chars().count();
     if chars == 0 || chars > MAX_PAIR_CHARS {
+        return false;
+    }
+    // 「AB → ABC」这种「正确结果包含错误片段」的规则会叠加替换（第二次应用变 ABCC）。
+    if right.contains(wrong) {
         return false;
     }
     // 句子级编辑不该跨行：换行进了规则，替换会在字幕里制造出凭空多出来的一行。

@@ -285,6 +285,9 @@ fn install_imported_subtitles(
     state.bump_doc_epoch();
     // 错别字记忆：把用户以前订正过的「错→对」应用进来（导入的字幕同样适用）。
     state.apply_typo_memory();
+    // 这一步不是用户编辑：导入的文档本来就没有库主键，若留着脏标记，关窗守卫会
+    // 弹出「改动会丢失」——而用户一个字都没改过。
+    state.segments_dirty = false;
     // 导入的字幕不属于历史库里的任何一条记录：置空避免把编辑
     // 写回到别的工程的库行上（那是静默数据损坏）。
     state.active_task_id = None;

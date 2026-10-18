@@ -2363,10 +2363,20 @@ impl AppConfig {
     /// `<项目根>/python`，导致「找不到解释器」。
     pub fn resolve_command(cmd: &str) -> PathBuf {
         if cmd.contains('/') || cmd.contains('\\') {
-            Self::resolve_path(cmd)
-        } else {
-            PathBuf::from(cmd)
+            return Self::resolve_path(cmd);
         }
+        // 内置运行时优先：客户机上「系统 Python 残缺」是最高频的环境故障
+        // （`Failed to import encodings module`）。安装包把便携 Python 放在
+        // `tools/python/`，这里优先用它；只有它不存在时才退回 PATH 里的 python。
+        if cmd.eq_ignore_ascii_case("python") || cmd.eq_ignore_ascii_case("python.exe") {
+            for candidate in ["tools/python/python.exe", "runtime/python/python.exe"] {
+                let path = Self::resolve_path(candidate);
+                if path.exists() {
+                    return path;
+                }
+            }
+        }
+        PathBuf::from(cmd)
     }
 }
 

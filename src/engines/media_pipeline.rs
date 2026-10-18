@@ -804,6 +804,28 @@ pub fn apply_default_child_flags(cmd: &mut Command) {
     apply_child_flags(cmd, yield_to_desktop());
 }
 
+/// Python 子进程的环境清洗（只对 Python 用）。
+///
+/// 用户机器上残留的 `PYTHONHOME` / `PYTHONPATH` 会把解释器的库搜索路径带偏：
+/// 典型症状就是客户机上报的 `Could not find platform independent libraries <prefix>`
+/// + `Fatal Python error: Failed to import encodings module`——解释器本身没坏，
+/// 是被环境变量指到了另一个（残缺的）安装。这里统一剥掉，并固定 UTF-8 输出。
+pub fn apply_python_env(cmd: &mut Command) {
+    for key in [
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONEXECUTABLE",
+        "PYTHONCASEOK",
+    ] {
+        cmd.env_remove(key);
+    }
+    cmd.env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1");
+}
+
 /// 统一的子进程启动标志：始终隐藏控制台；`yield_to_desktop` 为真时额外降到
 /// BELOW_NORMAL_PRIORITY_CLASS，把 CPU 与 GPU 调度权重让给桌面与前台程序。
 ///

@@ -461,6 +461,7 @@ impl PunctuationEngine {
         let input_json = serde_json::to_vec(&items).context("序列化字幕输入失败")?;
 
         let mut cmd = Command::new(&self.python_path);
+        super::media_pipeline::apply_python_env(&mut cmd);
         cmd.arg(&self.runner_script)
             .arg("--model")
             .arg(&self.model_path)

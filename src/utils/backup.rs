@@ -58,7 +58,13 @@ use anyhow::{bail, Context, Result};
 use tracing::{info, warn};
 
 /// 备份里包含的文件（相对项目根）。顺序即写入归档的顺序。
-pub const BACKUP_ENTRIES: [&str; 3] = [DB_ENTRY, "config.toml", "config.local.toml"];
+pub const BACKUP_ENTRIES: [&str; 4] = [
+    DB_ENTRY,
+    "config.toml",
+    "config.local.toml",
+    // 用户攒下来的「错→对」规则：换机器/重装时跟着备份走。
+    "typo_memory.json",
+];
 
 /// 数据库在归档里的条目名（也是项目根下的默认文件名）。
 const DB_ENTRY: &str = "voice2word.db";

@@ -580,6 +580,7 @@ impl SenseVoiceEngine {
         } else {
             let mut c = Command::new(&self.python_path);
             super::media_pipeline::apply_default_child_flags(&mut c);
+            super::media_pipeline::apply_python_env(&mut c);
             c.arg(&self.runner_path)
                 .arg("--model")
                 .arg(&self.model_path)
@@ -623,6 +624,7 @@ impl SenseVoiceEngine {
         info!("SenseVoice 启动纯内存管道非自回归推流转写 (0 磁盘 I/O)");
 
         let mut cmd = Command::new(&self.python_path);
+        super::media_pipeline::apply_python_env(&mut cmd);
         // 让路模式必须在这里生效：SenseVoice 走 Python 子进程，长音频下
         // 多进程并行会吃满 CPU。只设 CREATE_NO_WINDOW 等于忽略用户的让路开关。
         super::media_pipeline::apply_default_child_flags(&mut cmd);
@@ -921,7 +923,8 @@ impl SenseVoiceEngine {
             {
                 anyhow::bail!(
                     "SenseVoice 运行环境依赖缺失：\n{}\n\
-                     请打开终端并运行上述 pip install 命令安装所需组件。",
+                     若出现 Failed to import encodings module / Could not find platform independent libraries：当前 Python 不是完整安装（客户机上常见：只剩一个残缺的 python）。请改用完整安装包（自带便携 Python），或在 config.local.toml 里把 paths.python 指向完整的 python.exe。
+             若提示缺少 numpy / sherpa-onnx：在「性能设置 → 模型与组件」一键补齐，或对该 Python 执行 pip install numpy sherpa-onnx。",
                     stderr_trimmed
                 );
             }

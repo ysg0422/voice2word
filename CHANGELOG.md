@@ -5,6 +5,27 @@
 
 ---
 
+## 0.2.18
+
+修客户机上「SenseVoice 一转写就失败」的环境问题：安装包自带便携 Python。
+
+- **根因**：客户机日志里是 `Could not find platform independent libraries <prefix>` +
+  `Fatal Python error: Failed to import encodings module`。这不是模型问题，是**系统 Python
+  残缺 / PYTHONHOME 指错**——而安装包此前只带 `*.py` 运行脚本，不带解释器。
+- **内置便携 Python**：安装包新增 `tools\python\`（CPython 3.11 embeddable + numpy +
+  sherpa-onnx，约 140 MB），由 `scripts/build_python_runtime.ps1` 生成；
+  Release 工作流在打包前自动执行该脚本。
+- **解释器解析顺序**：`tools/python/python.exe` → `runtime/python/python.exe` → PATH 里的
+  `python`。客户机即使没装 Python / 装的是残缺版，也会直接命中内置运行时。
+- **子进程环境清洗**：启动 Python 子进程前统一剥掉 `PYTHONHOME` / `PYTHONPATH` /
+  `PYTHONSTARTUP` / `PYTHONEXECUTABLE` / `PYTHONCASEOK`（另一个 Python 的路径把库搜索
+  路径带偏，正是上述报错的直接来源），并固定 `PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8`、
+  `PYTHONNOUSERSITE=1`。
+- **错误文案可操作**：遇到 encodings / platform libraries 失败时，直接告诉用户
+  「当前 Python 不是完整安装，请用完整安装包或在 config.local.toml 指定 python.exe」，
+  不再只丢一句 pip install。
+
+---
 ## 0.2.17
 
 新功能第二批：一键修复、自动章节、错别字记忆库、工程体检（N2/N4/N5/N6）。

@@ -86,6 +86,14 @@ jobs:
       - name: cargo build --release (voice2word-cli)
         run: cargo build --release --bin voice2word-cli
 
+      # 内置便携 Python（SenseVoice / CT-Punc 的运行环境）。
+      # 网络异常不阻断发布：安装包脚本对该目录是 skipifsourcedoesntexist，
+      # 缺了也能装，只是客户机需要自备完整 Python。
+      - name: Build bundled Python runtime
+        shell: pwsh
+        continue-on-error: true
+        run: pwsh -File scripts/build_python_runtime.ps1
+
       # ---------------------------------------------------------------
       # 组装发布物并调用 Inno Setup 编译标准安装包
       # ---------------------------------------------------------------

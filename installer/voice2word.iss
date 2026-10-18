@@ -4,7 +4,7 @@
 
 #define MyAppName "Voice2Word"
 #ifndef MyAppVersion
-#define MyAppVersion "0.2.17"
+#define MyAppVersion "0.2.18"
 #endif
 #define MyAppPublisher "Voice2Word"
 #define MyAppURL "https://github.com/ygs0422/Voice2Word"
@@ -63,6 +63,9 @@ Source: "..\tools\punc_runner.py"; DestDir: "{app}\tools"; Flags: ignoreversion 
 Source: "..\tools\sensevoice_runner.py"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\tools\ffmpeg.exe"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\tools\ffplay.exe"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+; 内置便携 Python：SenseVoice / CT-Punc 的运行环境，避免客户机「系统 Python 残缺」。
+; 由 scripts/build_python_runtime.ps1 现场生成（tools/ 不进版本库），缺失时跳过。
+Source: "..\tools\python\*"; DestDir: "{app}\tools\python"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\app.ico"

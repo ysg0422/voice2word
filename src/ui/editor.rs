@@ -8025,6 +8025,15 @@ impl MainWindow {
                 }
             }
         } else {
+            // 错别字记忆库的学习入口：必须在覆盖之前拿到旧文本。
+            // 此前 `learn_typo_from_edit` 没有任何调用者，等于「记忆库永远学不到东西」。
+            let old_text = self
+                .state
+                .segments
+                .iter()
+                .find(|s| s.index == seg_idx)
+                .map(|s| s.text.clone())
+                .unwrap_or_default();
             if !new_text.is_empty() {
                 if let Some(seg) = self.state.segments.iter_mut().find(|s| s.index == seg_idx) {
                     seg.text = new_text.clone();
@@ -8033,8 +8042,9 @@ impl MainWindow {
                     }
                 }
                 if self.state.selected_segment_index == Some(seg_idx) {
-                    self.state.editing_text = new_text;
+                    self.state.editing_text = new_text.clone();
                 }
+                self.state.learn_typo_from_edit(&old_text, &new_text);
             }
         }
         self.inline_edit_buffer.clear();

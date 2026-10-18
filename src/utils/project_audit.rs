@@ -289,6 +289,13 @@ fn read_fingerprint_state(path: &Path) -> Option<bool> {
     let bytes = std::fs::read(path).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let object = value.as_object()?;
+    // `01_extract_audio` / `02_*` 这类产物**没有指纹字段**，管线只按归属（input）
+    // 决定能否复用。若一律按「无指纹 = 过期」处理，会把**可复用**的缓存删掉，
+    // 下次续跑白重跑一次音频抽取。
+    let stage = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    if stage.starts_with("01_") || stage.starts_with("02_") {
+        return Some(object.contains_key("input"));
+    }
     Some(match object.get("fingerprint") {
         Some(fingerprint) => !fingerprint.is_null(),
         None => false,
