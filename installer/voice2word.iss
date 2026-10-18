@@ -4,7 +4,7 @@
 
 #define MyAppName "Voice2Word"
 #ifndef MyAppVersion
-#define MyAppVersion "0.2.24"
+#define MyAppVersion "0.2.25"
 #endif
 #define MyAppPublisher "Voice2Word"
 #define MyAppURL "https://github.com/ysg0422/voice2word"
@@ -30,6 +30,12 @@ SetupIconFile=assets\app.ico
 WizardImageFile=assets\wizard_side.bmp
 WizardSmallImageFile=assets\wizard_small.bmp
 PrivilegesRequired=lowest
+; **关键**：不声明这两项时，Inno 以 32 位模式安装，卸载项会被写进
+; `HKCU\Software\WOW6432Node\...\Uninstall\...`（32 位注册表视图），
+; Windows 10/11 的「设置 → 应用」对**每用户安装**的 32 位视图条目经常不展示，
+; 于是客户看到「装了但应用列表里找不到」。声明 64 位安装后条目落进 64 位视图。
+ArchitecturesAllowed=x64
+ArchitecturesInstallIn64BitMode=x64
 ShowLanguageDialog=no
 DisableWelcomePage=no
 DisableReadyPage=yes
@@ -83,6 +89,11 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+
+[Registry]
+; 老版本（0.2.24 及以前）按 32 位视图写的卸载项：升到 64 位安装后它不会再被更新，
+; 留着会让「设置 → 应用」出现两条（一条已经失效）。装新版时顺手删掉。
+Root: HKCU; Subkey: "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\{{D37E84B1-28C9-4C5E-98BF-23F1735BC149}_is1"; Flags: deletekey dontcreatekey
 
 [UninstallDelete]
 ; 纯缓存/日志：无论用户是否保留数据，都必须删掉，否则就是「卸不干净」。

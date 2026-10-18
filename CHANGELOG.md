@@ -5,6 +5,19 @@
 
 ---
 
+## 0.2.25
+
+修「安装包装了，但 Windows 设置 → 应用里找不到」。
+
+- 根因：`.iss` 没有声明架构，Inno 按 **32 位模式**安装，卸载项被写进
+  `HKCU\Software\WOW6432Node\...\Uninstall\{AppId}_is1`（32 位注册表视图）。
+  每用户安装（`PrivilegesRequired=lowest`）+ 32 位视图，Windows 10/11 的
+  「设置 → 应用」经常不展示，于是看起来「找不到这个应用、也没法正常卸载」。
+- 修复：`ArchitecturesAllowed=x64` + `ArchitecturesInstallIn64BitMode=x64`，
+  卸载项改写到 64 位视图，应用列表可见。
+- 升级时顺手删除老版本遗留在 32 位视图的卸载项（否则会出现两条，其中一条失效）。
+
+---
 ## 0.2.24
 
 修「卸载卸不干净 + Windows 设置里找不到本应用」。
