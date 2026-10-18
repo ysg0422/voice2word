@@ -695,6 +695,26 @@ impl WhisperEngine {
             None => self.model_path.clone(),
         };
 
+        // 预检：模型必须存在、且必须是 Whisper 的 GGML 权重。
+        // 客户机上真实踩过：引擎选成 Whisper，但 `paths.whisper_model` 还指着
+        // SenseVoice 的 `model.int8.onnx`——whisper-cli 加载失败后**以退出码 0 结束、
+        // 不产出 JSON**，上层只能报「未产出任何识别结果」，把人引去改语言码。
+        if !effective_model.exists() {
+            anyhow::bail!(
+                "Whisper 模型文件不存在：{}\n请在「性能设置 → Whisper 模型档位」选择已下载的模型，或到「模型与组件」下载。",
+                effective_model.display()
+            );
+        }
+        if effective_model
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
+        {
+            anyhow::bail!(
+                "当前识别模型是 SenseVoice 的 .onnx（{}），但引擎按 Whisper 在跑。\n请在「性能设置 → Whisper 模型档位」重新选一个 ggml-*.bin 模型，或把识别引擎切回 SenseVoice。",
+                effective_model.display()
+            );
+        }
+
         let is_stream = matches!(audio_input, AudioInput::Stream(_));
         info!(
             "Whisper 开始转写: [模式: {}], 语言: {}, 线程数: {} (单实例 {}), 并行处理器: {}, 模型: {:?}, VAD: {:?}",
@@ -1488,7 +1508,7 @@ impl WhisperEngine {
         // 成功退出（退出码 0）却拿不到任何文本来源：必须报错，不能静默返回 Ok(空)。
         // 触发路径与文案见 [`empty_result_error`]。
         if segments.is_empty() {
-            if let Some(msg) = empty_result_error(lang, json_outcome) {
+            if let Some(msg) = empty_result_error(lang, json_outcome, &stderr_str, &effective_model) {
                 anyhow::bail!(msg);
             }
         }
@@ -1833,14 +1853,19 @@ enum JsonOutcome {
 ///     文案里带上 `-l` 的取值，正是因为它比 stderr 尾部更有用。
 ///   - [`JsonOutcome::ParseFailed`]：文件在但读取/解析失败，与语言码无关，文案要指向
 ///     磁盘空间与日志，绝不能引导用户去改「识别语言」。
-fn empty_result_error(lang: &str, json: JsonOutcome) -> Option<String> {
+fn empty_result_error(
+    lang: &str,
+    json: JsonOutcome,
+    stderr: &str,
+    model: &std::path::Path,
+) -> Option<String> {
     match json {
         JsonOutcome::Parsed => None,
         JsonOutcome::Missing => Some(format!(
             "Whisper 未产出任何识别结果：既没有 --output-json 文件，stdout 也没有任何片段。\
              最常见的原因是语言码 `-l {lang}` 不被识别程序接受（它只认 2 字母语言码、语言全名或 auto；\
              遇到未知值只会打印一行 error 后以退出码 0 结束，因此不会走别的报错分支）。\
-             请把「识别语言」改成 auto 或有效代码后重试。"
+             请把「识别语言」改成 auto 或有效代码后重试。\n模型：{model:?}\nwhisper-cli 的 stderr（尾部）：\n{stderr}"
         )),
         JsonOutcome::ParseFailed => Some(
             "Whisper 未产出任何识别结果：--output-json 结果文件存在，但无法读取或解析\
@@ -3637,12 +3662,12 @@ mod argv_and_result_guard_tests {
     #[test]
     fn empty_result_error_attributes_by_json_outcome() {
         assert!(
-            empty_result_error("zh", JsonOutcome::Parsed).is_none(),
+            empty_result_error("zh", JsonOutcome::Parsed, "", std::path::Path::new("m.bin")).is_none(),
             "json 已产出就证明空结果是素材事实，不得报错"
         );
 
         let missing =
-            empty_result_error("zh-CN", JsonOutcome::Missing).expect("没有任何文本来源必须报错");
+            empty_result_error("zh-CN", JsonOutcome::Missing, "", std::path::Path::new("m.bin")).expect("没有任何文本来源必须报错");
         assert!(
             missing.contains("zh-CN"),
             "报错要带上实际传入的 -l 值: {missing}"
@@ -3653,7 +3678,7 @@ mod argv_and_result_guard_tests {
         );
 
         let parse_failed =
-            empty_result_error("zh", JsonOutcome::ParseFailed).expect("解析失败必须报错");
+            empty_result_error("zh", JsonOutcome::ParseFailed, "", std::path::Path::new("m.bin")).expect("解析失败必须报错");
         assert!(
             !parse_failed.contains("语言码") && !parse_failed.contains("-l "),
             "解析失败与语言码无关，不得把用户引向改语言设置: {parse_failed}"
