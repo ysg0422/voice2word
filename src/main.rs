@@ -422,7 +422,24 @@ fn main() -> Result<()> {
     Application::new().run(move |cx: &mut App| {
         // 全局快捷键（F-017）：键位表必须在使用任何窗口之前注册
         ui::shortcuts::bind_default_keys(cx);
-        let bounds = Bounds::centered(None, size(px(1280.0), px(860.0)), cx);
+        let default_size = size(px(1280.0), px(860.0));
+        // 恢复上次的窗口大小与位置（换显示器/改分辨率后会被拉回屏幕内）。
+        // 没有记录、记录损坏、或算出来的位置不合法时，一律回到默认居中。
+        let bounds = utils::window_state::load()
+            .map(|geo| {
+                // 显示器尺寸是物理像素，窗口几何是逻辑像素：除以缩放系数换算。
+                // 只做一次「左上角别跑到屏幕外」的兜底；拿不到显示器信息就跳过。
+                let screen = cx.primary_display().map(|d| {
+                    let s = d.bounds().size;
+                    (f32::from(s.width), f32::from(s.height))
+                });
+                let geo = geo.clamp_origin_to(screen);
+                Bounds {
+                    origin: point(px(geo.x), px(geo.y)),
+                    size: size(px(geo.width), px(geo.height)),
+                }
+            })
+            .unwrap_or_else(|| Bounds::centered(None, default_size, cx));
 
         cx.open_window(
             WindowOptions {

@@ -1123,7 +1123,19 @@ pub(crate) fn apply_line_edit(
 /// 避免两套关窗逻辑漂移。
 pub fn install_window_close_guard(window: &Window, root: &Entity<MainWindow>, cx: &mut App) {
     let root = root.downgrade();
-    window.on_window_should_close(cx, move |_window, cx| {
+    window.on_window_should_close(cx, move |window, cx| {
+        // 关窗前把窗口几何记下来，下次启动直接回到用户摆好的大小与位置。
+        //
+        // 为什么放在关窗这一刻而不是监听 resize/move：GPUI 没有现成的「几何变化」
+        // 回调，而这里读到的就是用户最终确认过的布局；每帧写盘反而是浪费。
+        // 写入是尽力而为的，失败绝不挡关窗。
+        let b = window.bounds();
+        crate::utils::window_state::save(crate::utils::window_state::WindowGeometry {
+            x: f32::from(b.origin.x),
+            y: f32::from(b.origin.y),
+            width: f32::from(b.size.width),
+            height: f32::from(b.size.height),
+        });
         root.update(cx, |view, cx| view.flush_segments_before_close(cx))
             .unwrap_or(true)
     });
