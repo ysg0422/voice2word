@@ -99,7 +99,11 @@ pub(crate) mod win_drag {
 
 impl MainWindow {
     /// 渲染顶部现代化自定义标题栏 (支持原生窗口拖拽与系统控制按钮)
-    pub(crate) fn render_titlebar(&self, cx: &mut Context<Self>, is_maximized: bool) -> impl IntoElement {
+    pub(crate) fn render_titlebar(
+        &self,
+        cx: &mut Context<Self>,
+        is_maximized: bool,
+    ) -> impl IntoElement {
         let max_icon = if is_maximized { "❐" } else { "▢" };
         div()
             .id("custom-titlebar")

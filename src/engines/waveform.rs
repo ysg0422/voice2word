@@ -247,8 +247,11 @@ impl WaveformData {
 fn waveform_cache_path(media: &Path, buckets: usize) -> Option<std::path::PathBuf> {
     let meta = std::fs::metadata(media).ok()?;
     let size = meta.len();
-    let mtime = meta.modified().ok()?
-        .duration_since(std::time::UNIX_EPOCH).ok()?
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
         .as_secs();
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -278,7 +281,9 @@ fn try_read_waveform_cache(media: &Path, buckets: usize) -> Option<WaveformData>
     let mut peaks = Vec::with_capacity(peak_count);
     for i in 0..peak_count {
         let offset = 20 + i * 4;
-        peaks.push(f32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?));
+        peaks.push(f32::from_le_bytes(
+            bytes[offset..offset + 4].try_into().ok()?,
+        ));
     }
     tracing::info!(
         path = %cache_file.display(),

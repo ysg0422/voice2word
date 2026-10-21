@@ -32,6 +32,16 @@ use std::path::{Path, PathBuf};
 /// 整个盘符（如 `C:\`）时把整个磁盘遍历一遍的灾难。
 pub const DEFAULT_MAX_DEPTH: usize = 8;
 
+/// 单次扫描最多收集多少个媒体文件。
+///
+/// 深度上限挡得住「拖了整个盘符」，挡不住「一个又宽又扁的目录」：几万个文件的目录树
+/// 会让 `read_dir` + `canonicalize` 长时间占住调用线程（这个函数在 UI 线程上同步跑），
+/// 界面直接假死。
+///
+/// 5000 已经远超真实批量转写的规模（一节课程几十个文件），到了这个量级
+/// 继续扫描只会把内存和队列撑爆——不如早停并如实告诉用户「请分批导入」。
+pub const DEFAULT_MAX_FILES: usize = 5_000;
+
 /// 为什么某个输入项没有被收进结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
@@ -43,6 +53,8 @@ pub enum SkipReason {
     Unreadable,
     /// 符号链接 / 目录联接（junction）— 不跟随，避免环形链接无限递归
     Symlink,
+    /// 扫描到的文件数已达上限，剩余部分不再收集
+    TooManyFiles,
 }
 
 impl SkipReason {
@@ -61,6 +73,9 @@ impl SkipReason {
             }
             SkipReason::Unreadable => "路径读取失败：可能不存在、没有访问权限，或所在磁盘未连接。",
             SkipReason::Symlink => "这是快捷方式或符号链接，已跳过以避免循环扫描。",
+            SkipReason::TooManyFiles => {
+                "文件夹里的文件太多，已达到单次导入上限；请分成几个子文件夹分批导入。"
+            }
         }
     }
 }
@@ -95,7 +110,21 @@ pub fn collect_media_files(
     exts: &[&str],
     max_depth: usize,
 ) -> ScanOutcome {
+    collect_media_files_capped(inputs, exts, max_depth, DEFAULT_MAX_FILES)
+}
+
+/// 同 [`collect_media_files`]，但显式给出文件数上限。
+///
+/// 生产路径一律用 [`DEFAULT_MAX_FILES`]；单独抽出来是为了让「超限早停」这条
+/// 行为能被单测直接钉住，而不必真的造 5000 个文件。
+pub fn collect_media_files_capped(
+    inputs: &[std::path::PathBuf],
+    exts: &[&str],
+    max_depth: usize,
+    max_files: usize,
+) -> ScanOutcome {
     let mut state = ScanState::new(exts, max_depth);
+    state.max_files = max_files.max(1);
     for input in inputs {
         state.push_input(input);
     }
@@ -179,6 +208,10 @@ struct ScanState {
     seen_files: HashSet<String>,
     /// 已进入过的目录（规范化后的绝对路径），作为环形链接的兜底。
     visited_dirs: HashSet<PathBuf>,
+    /// 单次扫描的文件数上限（见 [`DEFAULT_MAX_FILES`]）。
+    max_files: usize,
+    /// 是否已经因为超限而早停：只记一次跳过，避免刷屏。
+    truncated: bool,
     out: ScanOutcome,
 }
 
@@ -189,6 +222,8 @@ impl ScanState {
             max_depth,
             seen_files: HashSet::new(),
             visited_dirs: HashSet::new(),
+            max_files: DEFAULT_MAX_FILES,
+            truncated: false,
             out: ScanOutcome::default(),
         }
     }
@@ -257,6 +292,11 @@ impl ScanState {
         for file in files {
             self.push_file(&file);
         }
+        // 达到文件数上限就停止深入：继续遍历只是白白占住调用线程
+        // （这个方法在 UI 线程上同步跑），结果也不会再增加。
+        if self.is_truncated() {
+            return;
+        }
         for sub in subdirs {
             // 用 `depth >= max_depth` 而不是 `depth + 1 > max_depth`：后者在
             // max_depth = usize::MAX 时会整型溢出 panic
@@ -272,9 +312,23 @@ impl ScanState {
 
     /// 收下一个文件；按「路径小写」去重，首次出现的写法胜出。
     fn push_file(&mut self, path: &Path) {
+        // 超过上限就早停：继续扫下去只会把 UI 线程占得更久、把队列撑爆。
+        // 只记一次「太多」的跳过（而不是每个文件一条），否则提示会被刷屏。
+        if self.out.files.len() >= self.max_files {
+            if !self.truncated {
+                self.truncated = true;
+                self.skip(path, SkipReason::TooManyFiles);
+            }
+            return;
+        }
         if self.seen_files.insert(dedup_key(path)) {
             self.out.files.push(path.to_path_buf());
         }
+    }
+
+    /// 已经因为文件数超限而停止收集了吗？递归据此提前收尾，不再深入子目录。
+    fn is_truncated(&self) -> bool {
+        self.truncated
     }
 
     fn skip(&mut self, path: &Path, reason: SkipReason) {
@@ -360,6 +414,38 @@ fn sort_by_name(paths: &mut [PathBuf]) {
 
 #[cfg(test)]
 mod tests {
+    /// 文件数上限必须**真的生效**，并且只报一次「太多」，不能逐文件刷屏。
+    #[test]
+    fn scan_stops_at_file_cap_and_reports_once() {
+        let dir = std::env::temp_dir().join(format!("v2w_cap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 造 6 个「媒体」文件（扩展名够用即可，扫描不看内容）。
+        for i in 0..6 {
+            std::fs::write(dir.join(format!("f{i}.mp4")), b"x").unwrap();
+        }
+
+        let inputs = vec![dir.clone()];
+        let out = super::collect_media_files_capped(&inputs, &["mp4"], 4, 2);
+        assert_eq!(out.files.len(), 2, "上限为 2 时只能收 2 个");
+        let capped: Vec<_> = out
+            .skipped
+            .iter()
+            .filter(|(_, r)| *r == super::SkipReason::TooManyFiles)
+            .collect();
+        assert_eq!(capped.len(), 1, "「太多」只记一条，避免刷屏");
+
+        // 上限足够时应当全收，且不留超限记录。
+        let out = super::collect_media_files_capped(&inputs, &["mp4"], 4, 100);
+        assert_eq!(out.files.len(), 6);
+        assert!(!out
+            .skipped
+            .iter()
+            .any(|(_, r)| *r == super::SkipReason::TooManyFiles));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// 每个测试独占一个带 tag 的临时目录，避免并行运行时互相踩。

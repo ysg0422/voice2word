@@ -138,7 +138,14 @@ Source: "..\tools\vcruntime140_1.dll"; DestDir: "{app}\tools"; Flags: ignorevers
 Source: "..\tools\msvcp140.dll"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\tools\vcomp140.dll"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 ; whisper.cpp（官方 CPU 构建）：入口 exe + 同目录 DLL（whisper.dll / ggml*.dll / SDL2.dll）
-Source: "..\tools\whisper-vulkan\whisper-1.8.4-windows-x64\*"; DestDir: "{app}\tools\whisper-vulkan\whisper-1.8.4-windows-x64"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+; 排除 `ggml-vulkan.dll`：它是**自编译 GPU 构建**的产物，依赖显卡驱动提供的
+; vulkan-1.dll。虚拟机 / 服务器 / 精简系统上没有这个 DLL，加载它会失败。
+;
+; 更重要的是「包内容要可复现」：维护者本机跑过 build_whisper_msvc_vulkan.bat 之后，
+; tools/ 里就是 Vulkan 版（56MB），而 CI 下载的是官方 CPU 版——两者同名不同内容，
+; 包的行为就取决于打包机。排除它之后，安装包永远是官方 CPU 基线；
+; 需要 GPU 的用户装完再跑一次那个 .bat（程序会识别为自编译构建，不会被覆盖）。
+Source: "..\tools\whisper-vulkan\whisper-1.8.4-windows-x64\*"; DestDir: "{app}\tools\whisper-vulkan\whisper-1.8.4-windows-x64"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist; Excludes: "ggml-vulkan.dll"
 ; VC++ 可再发行运行库：whisper-cli / whisper.dll / ggml-cpu.dll 都依赖
 ; MSVCP140 / VCRUNTIME140 / VCRUNTIME140_1 / VCOMP140。
 ; Windows 10/11 大多自带，但**任何没装 VC++ Redist 的干净系统**（或企业镜像

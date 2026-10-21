@@ -285,78 +285,76 @@ impl MainWindow {
                     ),
             )
             .children(if sort_open {
-                Some(
-                    gpui::deferred(
-                        div()
-                            .id("library-sort-floating-menu")
-                            .absolute()
-                            .top(px(29.0))
-                            .left_0()
-                            .min_w(px(130.0))
-                            .rounded_md()
-                            .bg(Theme::bg_card())
-                            .border_1()
-                            .border_color(Theme::border_strong())
-                            .shadow_lg()
-                            .p_1()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation();
-                            })
-                            .children(LibrarySort::ALL.into_iter().enumerate().map(|(idx, s)| {
-                                let is_sel = s == sort;
-                                div()
-                                    .id(("library-sort-opt", idx))
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .bg(if is_sel {
-                                        Theme::tint_mint_badge()
-                                    } else {
-                                        Theme::transparent()
-                                    })
-                                    .hover(|st| st.bg(Theme::bg_hover()))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
+                Some(gpui::deferred(
+                    div()
+                        .id("library-sort-floating-menu")
+                        .absolute()
+                        .top(px(29.0))
+                        .left_0()
+                        .min_w(px(130.0))
+                        .rounded_md()
+                        .bg(Theme::bg_card())
+                        .border_1()
+                        .border_color(Theme::border_strong())
+                        .shadow_lg()
+                        .p_1()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .children(LibrarySort::ALL.into_iter().enumerate().map(|(idx, s)| {
+                            let is_sel = s == sort;
+                            div()
+                                .id(("library-sort-opt", idx))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .bg(if is_sel {
+                                    Theme::tint_mint_badge()
+                                } else {
+                                    Theme::transparent()
+                                })
+                                .hover(|st| st.bg(Theme::bg_hover()))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(Theme::TEXT_SMALL))
+                                        .font_weight(if is_sel {
+                                            FontWeight::BOLD
+                                        } else {
+                                            FontWeight::NORMAL
+                                        })
+                                        .text_color(if is_sel {
+                                            Theme::accent_mint()
+                                        } else {
+                                            Theme::text_primary()
+                                        })
+                                        .child(s.label()),
+                                )
+                                .children(if is_sel {
+                                    Some(
                                         div()
                                             .text_size(px(Theme::TEXT_SMALL))
-                                            .font_weight(if is_sel {
-                                                FontWeight::BOLD
-                                            } else {
-                                                FontWeight::NORMAL
-                                            })
-                                            .text_color(if is_sel {
-                                                Theme::accent_mint()
-                                            } else {
-                                                Theme::text_primary()
-                                            })
-                                            .child(s.label()),
+                                            .text_color(Theme::accent_mint())
+                                            .child("✓"),
                                     )
-                                    .children(if is_sel {
-                                        Some(
-                                            div()
-                                                .text_size(px(Theme::TEXT_SMALL))
-                                                .text_color(Theme::accent_mint())
-                                                .child("✓"),
-                                        )
-                                    } else {
-                                        None
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.library_sort = s;
-                                        this.library_query_cache = None;
-                                        this.library_sort_dropdown_open = false;
-                                        cx.stop_propagation();
-                                        cx.notify();
-                                    }))
-                            })),
-                    ),
-                )
+                                } else {
+                                    None
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.library_sort = s;
+                                    this.library_query_cache = None;
+                                    this.library_sort_dropdown_open = false;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }))
+                        })),
+                ))
             } else {
                 None
             });
@@ -1194,24 +1192,21 @@ impl MainWindow {
                             else {
                                 return;
                             };
-                            let (media, segments, title) = match this
-                                .state
-                                .db
-                                .try_hydrate_task(&shell)
-                            {
-                                Ok(task) => (
-                                    std::path::PathBuf::from(&task.file_path),
-                                    task.segments.clone(),
-                                    task.file_name.clone(),
-                                ),
-                                Err(err) => {
-                                    this.state.status = crate::app::ProcessStatus::Failed(
-                                        format!("读取该记录的字幕失败：{err}"),
-                                    );
-                                    cx.notify();
-                                    return;
-                                }
-                            };
+                            let (media, segments, title) =
+                                match this.state.db.try_hydrate_task(&shell) {
+                                    Ok(task) => (
+                                        std::path::PathBuf::from(&task.file_path),
+                                        task.segments.clone(),
+                                        task.file_name.clone(),
+                                    ),
+                                    Err(err) => {
+                                        this.state.status = crate::app::ProcessStatus::Failed(
+                                            format!("读取该记录的字幕失败：{err}"),
+                                        );
+                                        cx.notify();
+                                        return;
+                                    }
+                                };
                             this.open_playback_window(media, segments, title, cx);
                         })),
                     )

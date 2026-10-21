@@ -490,6 +490,10 @@ fn probe_single_instance() -> Option<std::net::TcpListener> {
                 port = PROBE_PORT,
                 "单实例探测：端口已被占用（可能已有另一个 Voice2Word 在运行）。继续启动——但两个实例同时写 voice2word.db 可能互相覆盖，建议只保留一个窗口"
             );
+            // 记下这个事实：界面启动后会据此提示用户，而不是只在日志里留一句。
+            // 两个实例同时写同一个库不会把库写坏（WAL + busy_timeout），
+            // 但会互相覆盖对方的编辑——那是**看不见的丢改动**。
+            voice2word::utils::set_other_instance_running(true);
             None
         }
     }

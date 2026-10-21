@@ -1840,6 +1840,7 @@ impl MainWindow {
         // 顺序即提示里出现的顺序：先讲「扫不动」的（太深），再讲「根本没看」的。
         let mut notable: Vec<String> = Vec::new();
         for reason in [
+            SkipReason::TooManyFiles,
             SkipReason::TooDeep,
             SkipReason::Unreadable,
             SkipReason::Symlink,
@@ -1847,6 +1848,7 @@ impl MainWindow {
             let n = outcome.skipped.iter().filter(|(_, r)| *r == reason).count();
             if n > 0 {
                 let what = match reason {
+                    SkipReason::TooManyFiles => "次导入已达文件数上限，其余文件请分批导入",
                     SkipReason::TooDeep => "个文件夹层级过深未扫",
                     SkipReason::Unreadable => "个路径无法读取",
                     SkipReason::Symlink => "个快捷方式未跟随",

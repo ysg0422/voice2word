@@ -381,7 +381,9 @@ impl MainWindow {
         let missing_badge = if missing == 0 {
             primitives::badge_accent("所需组件已就位")
         } else {
-            let has_tool_missing = active_missing_items.iter().any(|i| i.id == "ffmpeg" || i.id == "whisper-cli");
+            let has_tool_missing = active_missing_items
+                .iter()
+                .any(|i| i.id == "ffmpeg" || i.id == "whisper-cli");
             if has_tool_missing {
                 primitives::badge_danger("需下载基础运行组件")
             } else {
@@ -598,9 +600,7 @@ impl MainWindow {
                                         format!("下载 SenseVoice（{n} 项）")
                                     }
                                 }
-                                ModelManagerTab::Whisper => {
-                                    "下载选用模型".to_string()
-                                }
+                                ModelManagerTab::Whisper => "下载选用模型".to_string(),
                                 ModelManagerTab::Common => {
                                     if n == 1 {
                                         "下载基础组件".to_string()
@@ -615,9 +615,11 @@ impl MainWindow {
                                 primitives::BtnVariant::Primary,
                             )
                             .id(("model-block-dl", tab as usize))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.download_all_missing(tab, cx);
-                            }))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.download_all_missing(tab, cx);
+                                },
+                            ))
                         }))
                         .child(
                             primitives::mini_btn(if open { "收起" } else { "展开" }, true)
@@ -812,11 +814,14 @@ impl MainWindow {
                                         .text_size(px(Theme::TEXT_SMALL))
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(Theme::accent_mint())
-                                        .child(if let Some(status) = &self.state.update_download_status {
-                                            status.clone()
-                                        } else {
-                                            text
-                                        }),
+                                        .child(
+                                            if let Some(status) = &self.state.update_download_status
+                                            {
+                                                status.clone()
+                                            } else {
+                                                text
+                                            },
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -833,24 +838,36 @@ impl MainWindow {
                                         )
                                         .children(if downloaded {
                                             Some(
-                                                primitives::chip_clickable("立即安装升级", true, false)
-                                                    .id("update-install-btn")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.install_downloaded_update(cx);
-                                                    })),
+                                                primitives::chip_clickable(
+                                                    "立即安装升级",
+                                                    true,
+                                                    false,
+                                                )
+                                                .id("update-install-btn")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.install_downloaded_update(cx);
+                                                })),
                                             )
                                         } else if is_downloading {
                                             Some(
-                                                primitives::chip_clickable("正在下载…", false, false)
-                                                    .id("update-downloading-btn"),
+                                                primitives::chip_clickable(
+                                                    "正在下载…",
+                                                    false,
+                                                    false,
+                                                )
+                                                .id("update-downloading-btn"),
                                             )
                                         } else if has_target {
                                             Some(
-                                                primitives::chip_clickable("直接下载更新", true, false)
-                                                    .id("update-direct-download-btn")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.download_app_update(cx);
-                                                    })),
+                                                primitives::chip_clickable(
+                                                    "直接下载更新",
+                                                    true,
+                                                    false,
+                                                )
+                                                .id("update-direct-download-btn")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.download_app_update(cx);
+                                                })),
                                             )
                                         } else {
                                             None
@@ -966,9 +983,7 @@ impl MainWindow {
         let is_choice_lacking = is_whisper_choice && !any_whisper_choice_present;
 
         // 仅底座工具缺失时才标红；模型属于可选候选档位，不论 CPU/GPU 均可按需下载，不应整行大红警示
-        let is_row_danger = !present
-            && !is_downloading
-            && (is_base_tool && is_required_now);
+        let is_row_danger = !present && !is_downloading && (is_base_tool && is_required_now);
 
         // 状态徽标：已就位 / 必需底座缺失 / 当前选用 / 任选其一 / 可选
         let status_badge = if is_current && is_downloading {

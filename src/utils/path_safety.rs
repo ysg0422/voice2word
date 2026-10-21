@@ -172,10 +172,7 @@ fn copy_to_safe_temp(src: &Path) -> Option<PathBuf> {
     src.hash(&mut hasher);
     let hash = hasher.finish();
 
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("bin");
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("bin");
 
     let temp_dest = safe_temp_dir().join(format!("v2w_safe_{:x}.{}", hash, ext));
     if temp_dest.exists() {

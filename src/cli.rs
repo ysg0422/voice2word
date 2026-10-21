@@ -1073,7 +1073,8 @@ fn print_default_config() -> i32 {
     let cfg = crate::utils::AppConfig::default();
     match toml::to_string_pretty(&cfg) {
         Ok(text) => {
-            let header = "# Voice2Word 共享配置（由 `voice2word-cli --print-default-config` 生成）\n\
+            let header =
+                "# Voice2Word 共享配置（由 `voice2word-cli --print-default-config` 生成）\n\
                           #\n\
                           # 这里只放**便携默认值**：路径全部相对程序目录，换台机器即可用。\n\
                           # 机器专属的东西（绝对路径、GPU 策略、在线翻译接口与密钥）会由程序\n\

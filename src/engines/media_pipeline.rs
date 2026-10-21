@@ -628,9 +628,19 @@ impl ProxyManager {
             .clone()
     }
 
+    /// 是否已有现成可用的预览源。**只用缓存里已知的高度，绝不在这里起 ffmpeg 探测。**
+    ///
+    /// 为什么不能用 [`Self::probe_height`]：这个方法会被 **UI 线程同步调用**
+    /// （`ui/actions.rs` 的预览准备、`app/state.rs` 的工程切换）。`probe_height` 会
+    /// 起一个 `ffmpeg -i` 子进程，虽然有 120s 截止期，但最坏情况就是**整窗卡住 120 秒**——
+    /// 网络盘 / 离线盘符上尤其容易发生。
+    ///
+    /// 现在：高度未知时直接返回 `None`，让调用方走后台线程（`v2w-preview-proxy`）去
+    /// 做探测与转码；等后台跑完，高度进了缓存，这里下一次就能命中。
+    /// 代价是**第一次**预览少一次「源本来就够小、不必转码」的短路，可接受。
     pub fn existing_proxy<P: AsRef<Path>>(&self, source: P, height: u32) -> Option<PathBuf> {
         let source = source.as_ref();
-        if let Some(h) = self.probe_height(source) {
+        if let Some(h) = self.cached_height(source) {
             if h <= height {
                 return Some(source.to_path_buf());
             }
@@ -640,6 +650,21 @@ impl ProxyManager {
             Some(out)
         } else {
             None
+        }
+    }
+
+    /// 只读缓存的高度（签名一致才算命中）。不起子进程，可在 UI 线程调用。
+    fn cached_height(&self, source: &Path) -> Option<u32> {
+        let signature = file_signature(source);
+        let cached = self
+            .height_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(source)
+            .copied();
+        match cached {
+            Some((s, h)) if s == signature => h,
+            _ => None,
         }
     }
 
@@ -929,7 +954,7 @@ pub fn apply_default_child_flags(cmd: &mut Command) {
 ///
 /// 用户机器上残留的 `PYTHONHOME` / `PYTHONPATH` 会把解释器的库搜索路径带偏：
 /// 典型症状就是客户机上报的 `Could not find platform independent libraries <prefix>`
-/// + `Fatal Python error: Failed to import encodings module`——解释器本身没坏，
+/// 并伴随 `Fatal Python error: Failed to import encodings module`——解释器本身没坏，
 /// 是被环境变量指到了另一个（残缺的）安装。这里统一剥掉，并固定 UTF-8 输出。
 pub fn apply_python_env(cmd: &mut Command) {
     for key in [

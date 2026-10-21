@@ -122,7 +122,9 @@ impl MainWindow {
                                     .cursor_pointer()
                                     .text_size(px(Theme::TEXT_BODY))
                                     .text_color(Theme::text_muted())
-                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                    .hover(|s| {
+                                        s.bg(Theme::bg_hover()).text_color(Theme::text_primary())
+                                    })
                                     .child("✕")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.update_modal_open = false;
@@ -223,50 +225,52 @@ impl MainWindow {
                             ),
                     )
                     // ── 下载进度与状态条（下载中或下载完成时展示） ──
-                    .children(if is_downloading || downloaded_path.is_some() || progress > 0.0 {
-                        Some(
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_col()
-                                .gap(px(Theme::SPACE_1))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .justify_between()
-                                        .text_size(px(Theme::TEXT_CAPTION))
-                                        .text_color(Theme::text_muted())
-                                        .child(if let Some(msg) = &status_msg {
-                                            msg.clone()
-                                        } else if downloaded_path.is_some() {
-                                            "更新包下载完成，准备就绪".to_string()
-                                        } else {
-                                            "正在下载更新...".to_string()
-                                        })
-                                        .child(format!("{:.0}%", progress * 100.0)),
-                                )
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .h(px(6.0))
-                                        .rounded_full()
-                                        .bg(Theme::bg_raised())
-                                        .child(
-                                            div()
-                                                .h_full()
-                                                .rounded_full()
-                                                .bg(if downloaded_path.is_some() {
-                                                    Theme::accent_mint()
-                                                } else {
-                                                    Theme::accent_blue()
-                                                })
-                                                .w(relative(progress.clamp(0.01, 1.0))),
-                                        ),
-                                ),
-                        )
-                    } else {
-                        None
-                    })
+                    .children(
+                        if is_downloading || downloaded_path.is_some() || progress > 0.0 {
+                            Some(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(Theme::SPACE_1))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .justify_between()
+                                            .text_size(px(Theme::TEXT_CAPTION))
+                                            .text_color(Theme::text_muted())
+                                            .child(if let Some(msg) = &status_msg {
+                                                msg.clone()
+                                            } else if downloaded_path.is_some() {
+                                                "更新包下载完成，准备就绪".to_string()
+                                            } else {
+                                                "正在下载更新...".to_string()
+                                            })
+                                            .child(format!("{:.0}%", progress * 100.0)),
+                                    )
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .h(px(6.0))
+                                            .rounded_full()
+                                            .bg(Theme::bg_raised())
+                                            .child(
+                                                div()
+                                                    .h_full()
+                                                    .rounded_full()
+                                                    .bg(if downloaded_path.is_some() {
+                                                        Theme::accent_mint()
+                                                    } else {
+                                                        Theme::accent_blue()
+                                                    })
+                                                    .w(relative(progress.clamp(0.01, 1.0))),
+                                            ),
+                                    ),
+                            )
+                        } else {
+                            None
+                        },
+                    )
                     // ── 底部操作按钮栏 ──
                     .child(
                         div()
@@ -334,25 +338,26 @@ impl MainWindow {
                                                 .into_any_element(),
                                         ]
                                     } else if is_downloading {
-                                        vec![
-                                            div()
-                                                .id("update-modal-cancel-btn")
-                                                .px(px(Theme::SPACE_3))
-                                                .py(px(Theme::SPACE_1_5))
-                                                .rounded_md()
-                                                .bg(Theme::bg_raised())
-                                                .border_1()
-                                                .border_color(Theme::border_mid())
-                                                .text_size(px(Theme::TEXT_SMALL))
-                                                .text_color(Theme::text_muted())
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                .child("取消下载")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.cancel_update_download(cx);
-                                                }))
-                                                .into_any_element(),
-                                        ]
+                                        vec![div()
+                                            .id("update-modal-cancel-btn")
+                                            .px(px(Theme::SPACE_3))
+                                            .py(px(Theme::SPACE_1_5))
+                                            .rounded_md()
+                                            .bg(Theme::bg_raised())
+                                            .border_1()
+                                            .border_color(Theme::border_mid())
+                                            .text_size(px(Theme::TEXT_SMALL))
+                                            .text_color(Theme::text_muted())
+                                            .cursor_pointer()
+                                            .hover(|s| {
+                                                s.bg(Theme::bg_hover())
+                                                    .text_color(Theme::text_primary())
+                                            })
+                                            .child("取消下载")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.cancel_update_download(cx);
+                                            }))
+                                            .into_any_element()]
                                     } else {
                                         vec![
                                             div()
@@ -366,7 +371,10 @@ impl MainWindow {
                                                 .text_size(px(Theme::TEXT_SMALL))
                                                 .text_color(Theme::text_muted())
                                                 .cursor_pointer()
-                                                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                                .hover(|s| {
+                                                    s.bg(Theme::bg_hover())
+                                                        .text_color(Theme::text_primary())
+                                                })
                                                 .child("暂不更新")
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.update_modal_open = false;
@@ -403,7 +411,11 @@ fn format_release_notes(raw: &str) -> String {
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            if lines.last().map(|s: &String| !s.is_empty()).unwrap_or(false) {
+            if lines
+                .last()
+                .map(|s: &String| !s.is_empty())
+                .unwrap_or(false)
+            {
                 lines.push(String::new());
             }
             continue;
@@ -428,7 +440,11 @@ fn format_release_notes(raw: &str) -> String {
                 continue;
             }
             let name = cells[0].trim_matches(|c| c == '*' || c == '`');
-            let desc = cells.get(2).copied().or_else(|| cells.get(1).copied()).unwrap_or("");
+            let desc = cells
+                .get(2)
+                .copied()
+                .or_else(|| cells.get(1).copied())
+                .unwrap_or("");
             let clean_desc = desc.replace("**", "").replace('`', "");
             lines.push(format!("• {name}：{clean_desc}"));
             continue;
@@ -451,4 +467,3 @@ fn format_release_notes(raw: &str) -> String {
         res
     }
 }
-

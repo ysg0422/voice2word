@@ -1417,7 +1417,11 @@ mod repair_tests {
             .collect();
         assert_eq!(
             texts,
-            vec![(1, "第一句", "第一句。"), (2, "第二句", "第二句，"), (4, "OK", "OK。")],
+            vec![
+                (1, "第一句", "第一句。"),
+                (2, "第二句", "第二句，"),
+                (4, "OK", "OK。")
+            ],
             "只有缺标点的句子入选，且句号/逗号按间隔分档"
         );
         assert!(
@@ -1429,10 +1433,7 @@ mod repair_tests {
     /// 重叠：优先把前一句 end 压到后一句 start - 0.02；前一句会被压没时改为推后一句起点。
     #[test]
     fn overlap_plan_prefers_compressing_but_never_crushes_previous() {
-        let normal = [
-            seg(1, 0.0, 1.5, "前一句。"),
-            seg(2, 1.0, 2.0, "后一句。"),
-        ];
+        let normal = [seg(1, 0.0, 1.5, "前一句。"), seg(2, 1.0, 2.0, "后一句。")];
         let plan = plan_repairs(&normal);
         let overlap = items_of(&plan, RepairKind::Overlap);
         assert_eq!(overlap.len(), 1);
@@ -1452,10 +1453,7 @@ mod repair_tests {
         );
 
         // 前一句只有 0.2s（< MIN_EDIT_DUR）：压不了，只能推后一句的起点。
-        let tight = [
-            seg(1, 0.0, 0.20, "短句。"),
-            seg(2, 0.10, 2.0, "后一句。"),
-        ];
+        let tight = [seg(1, 0.0, 0.20, "短句。"), seg(2, 0.10, 2.0, "后一句。")];
         let tight_plan = plan_repairs(&tight);
         let tight_items = items_of(&tight_plan, RepairKind::Overlap);
         assert_eq!(tight_items.len(), 1);
@@ -1478,14 +1476,14 @@ mod repair_tests {
         assert_eq!(cps[0].index, 1);
         assert_eq!(cps[0].text, None);
         let wanted = 20.0 / 17.0;
-        assert!(close(cps[0].end.unwrap(), wanted), "按舒适阈值 17 字符/秒拉长");
+        assert!(
+            close(cps[0].end.unwrap(), wanted),
+            "按舒适阈值 17 字符/秒拉长"
+        );
 
         // 需要 5.88s 才能读完，但下一句 2.0s 就开始：只能拉到 2.0，绝不越界。
         let long_text = "a".repeat(100);
-        let capped = [
-            seg(1, 0.0, 0.1, &long_text),
-            seg(2, 2.0, 3.0, "next line."),
-        ];
+        let capped = [seg(1, 0.0, 0.1, &long_text), seg(2, 2.0, 3.0, "next line.")];
         let capped_plan = plan_repairs(&capped);
         let capped_cps = items_of(&capped_plan, RepairKind::Cps);
         assert_eq!(capped_cps.len(), 1);
@@ -1493,10 +1491,7 @@ mod repair_tests {
         assert!(capped_cps[0].end.unwrap() <= capped[1].start + 1e-9);
 
         // 10 字符 / 2s = 5 cps：不超限，不该产项。
-        let calm = [
-            seg(1, 0.0, 2.0, "abcdefghij."),
-            seg(2, 2.5, 3.0, "ok."),
-        ];
+        let calm = [seg(1, 0.0, 2.0, "abcdefghij."), seg(2, 2.5, 3.0, "ok.")];
         assert!(
             items_of(&plan_repairs(&calm), RepairKind::Cps).is_empty(),
             "正常语速不报"
@@ -1531,10 +1526,7 @@ mod repair_tests {
         assert_eq!(applied[1].polished, "", "polished 一并清空");
         assert_eq!(applied.len(), 2, "计划从不从数组里删元素");
 
-        let distinct = [
-            seg(1, 0.0, 1.0, "你好。"),
-            seg(2, 1.0, 2.0, "再见。"),
-        ];
+        let distinct = [seg(1, 0.0, 1.0, "你好。"), seg(2, 1.0, 2.0, "再见。")];
         assert!(
             items_of(&plan_repairs(&distinct), RepairKind::Duplicate).is_empty(),
             "内容不同不删"
@@ -1544,10 +1536,7 @@ mod repair_tests {
     /// 计划纯函数（不改输入）+ 应用幂等（同一 plan 第二次返回 0）+ 计数自洽。
     #[test]
     fn plan_is_pure_and_apply_is_idempotent() {
-        let segs = [
-            seg(1, 0.0, 2.0, "你好世界"),
-            seg(2, 1.0, 3.0, "再见"),
-        ];
+        let segs = [seg(1, 0.0, 2.0, "你好世界"), seg(2, 1.0, 3.0, "再见")];
         let snapshot = segs.to_vec();
         let plan = plan_repairs(&segs);
         assert_eq!(segs.as_slice(), snapshot, "plan_repairs 不得修改输入");
@@ -1577,10 +1566,7 @@ mod repair_tests {
     /// 干净输入：计划为空、四类计数都是 0。
     #[test]
     fn clean_input_yields_empty_plan() {
-        let segs = [
-            seg(1, 0.0, 2.0, "第一句。"),
-            seg(2, 2.5, 4.0, "第二句！"),
-        ];
+        let segs = [seg(1, 0.0, 2.0, "第一句。"), seg(2, 2.5, 4.0, "第二句！")];
         let plan = plan_repairs(&segs);
         assert!(plan.is_empty(), "没有可修项：{:?}", plan.items);
         assert!(plan.counts().iter().all(|(_, n)| *n == 0));

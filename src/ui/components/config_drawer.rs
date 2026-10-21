@@ -375,7 +375,10 @@ impl MainWindow {
                                     .bg(Theme::bg_card_hover())
                                     .border_1()
                                     .border_color(Theme::border_strong())
-                                    .hover(|s| s.bg(Theme::bg_hover_strong()).text_color(Theme::accent_red()))
+                                    .hover(|s| {
+                                        s.bg(Theme::bg_hover_strong())
+                                            .text_color(Theme::accent_red())
+                                    })
                                     .text_size(px(Theme::TEXT_CAPTION))
                                     .text_color(Theme::text_muted())
                                     .child("✕")

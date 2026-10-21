@@ -523,7 +523,11 @@ mod tests {
     #[test]
     fn ignores_punctuation_whitespace_digits_and_case_only_changes() {
         let mut memory = TypoMemory::new();
-        assert_eq!(memory.learn_from_edit("你好，世界", "你好。世界"), 0, "标点");
+        assert_eq!(
+            memory.learn_from_edit("你好，世界", "你好。世界"),
+            0,
+            "标点"
+        );
         assert_eq!(memory.learn_from_edit("2024年", "2025年"), 0, "数字");
         assert_eq!(memory.learn_from_edit("说 话", "说话"), 0, "空白");
         assert_eq!(memory.learn_from_edit("openai", "OpenAI"), 0, "仅大小写");

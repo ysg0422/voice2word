@@ -1,6 +1,6 @@
 //! UI 页面视图模块
 
 pub mod library;
-pub mod playback;
 pub mod performance;
+pub mod playback;
 pub mod transcribe;

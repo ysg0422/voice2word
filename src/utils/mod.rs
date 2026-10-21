@@ -32,9 +32,32 @@ pub use config::{
 };
 pub use frame_cache::FrameCache;
 pub use glossary::{GlossaryEntry, MergeReport, ParseReport};
-pub use logger::{init_logger, open_latest_log_file, open_logs_folder, record_error_log, ERROR_LOG_NAME};
 pub use local_models::{scan_installed_models, scan_llm_models, LocalModel};
+pub use logger::{
+    init_logger, open_latest_log_file, open_logs_folder, record_error_log, ERROR_LOG_NAME,
+};
 pub use model_download::{DownloadItem, ItemGroup, ITEMS};
 pub use monitor::SystemMonitor;
 pub use path_safety::{normalize_path_slashes, safe_temp_dir, to_cli_safe_path};
+
+// ── 单实例探测的结果（由 `main` 在启动时置位，界面据此提示） ──
+//
+// 为什么要有这道防线：两个实例同时开着，会各写各的 `voice2word.db`。SQLite 本身
+// 有 WAL + busy_timeout，**不会把库写坏**，但用户会在两个窗口里改同一份字幕，
+// 谁后写谁赢——「我刚改的那句怎么没了」就是这么来的，而且没有任何提示。
+//
+// 这里刻意**不阻断启动**（用户可能就想开第二个窗口看别的素材），只把事实告诉用户。
+static OTHER_INSTANCE_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 记录「启动时检测到另一个实例在运行」。
+pub fn set_other_instance_running(value: bool) {
+    OTHER_INSTANCE_RUNNING.store(value, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 启动时是否检测到另一个实例在运行。
+pub fn other_instance_running() -> bool {
+    OTHER_INSTANCE_RUNNING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub use temp_guard::TempPathGuard;

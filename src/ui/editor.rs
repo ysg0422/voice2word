@@ -815,9 +815,9 @@ impl MainWindow {
             self.cached_active_segment_index()
                 .and_then(|idx| self.state.segments.get(idx).cloned())
                 .or_else(|| {
-                    self.state.selected_segment_index.and_then(|idx| {
-                        self.state.segments.get(idx).cloned()
-                    })
+                    self.state
+                        .selected_segment_index
+                        .and_then(|idx| self.state.segments.get(idx).cloned())
                 })
                 .or_else(|| self.state.segments.first().cloned())
         };
@@ -879,304 +879,302 @@ impl MainWindow {
 
                 div()
                     .id("monitor-viewport-screen")
-                        .flex_1()
-                        .w_full()
-                        .min_h(px(Theme::VIEWPORT_MIN_H))
-                        .relative()
-                        .bg(Theme::bg_media_deep())
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .overflow_hidden()
-                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                            if event.pressed_button != Some(MouseButton::Left) {
-                                return;
-                            }
-                            this.handle_monitor_subtitle_drag(
-                                (f32::from(event.position.x), f32::from(event.position.y)),
-                                fit_w,
-                                fit_h,
-                                cx,
-                            );
-                        }))
-                        .on_mouse_up(
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(Theme::VIEWPORT_MIN_H))
+                    .relative()
+                    .bg(Theme::bg_media_deep())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                        if event.pressed_button != Some(MouseButton::Left) {
+                            return;
+                        }
+                        this.handle_monitor_subtitle_drag(
+                            (f32::from(event.position.x), f32::from(event.position.y)),
+                            fit_w,
+                            fit_h,
+                            cx,
+                        );
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.end_monitor_subtitle_drag(cx);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.end_monitor_subtitle_drag(cx);
+                        }),
+                    )
+                    // 画面容器 (stage)：与视频画面等比，是字幕覆盖层的定位基准，
+                    // 保证字幕始终压在画面上而不是视口黑边里
+                    .child({
+                        let mut stage = div().relative();
+                        if fit_w > 0.0 && fit_h > 0.0 {
+                            stage = stage.w(px(fit_w)).h(px(fit_h));
+                        } else {
+                            // 尺寸不可得（视口尚未测量 / 比例非法）时退回旧的自适应行为
+                            stage = stage.w_full().max_h_full();
+                            stage.style().aspect_ratio = Some(video_aspect);
+                        }
+
+                        // 点画面空白处取消选中。
+                        //
+                        // 选框与手柄现在「点中字幕才出现」，就必须给一个取消出口——
+                        // 否则第一次点过字幕之后那个蓝框与六个手柄会一直挂在画面上，
+                        // 比原来「未播放时常驻」还难摆脱。字幕框自己的 `on_mouse_down`
+                        // 调了 `stop_propagation`，所以点框内不会冒泡到这里。
+                        stage = stage.on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
-                                this.end_monitor_subtitle_drag(cx);
+                                if this.monitor_subtitle_selected {
+                                    this.monitor_subtitle_selected = false;
+                                    cx.notify();
+                                }
                             }),
-                        )
-                        .on_mouse_up_out(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.end_monitor_subtitle_drag(cx);
-                            }),
-                        )
-                        // 画面容器 (stage)：与视频画面等比，是字幕覆盖层的定位基准，
-                        // 保证字幕始终压在画面上而不是视口黑边里
-                        .child({
-                            let mut stage = div().relative();
-                            if fit_w > 0.0 && fit_h > 0.0 {
-                                stage = stage.w(px(fit_w)).h(px(fit_h));
-                            } else {
-                                // 尺寸不可得（视口尚未测量 / 比例非法）时退回旧的自适应行为
-                                stage = stage.w_full().max_h_full();
-                                stage.style().aspect_ratio = Some(video_aspect);
-                            }
+                        );
 
-                            // 点画面空白处取消选中。
-                            //
-                            // 选框与手柄现在「点中字幕才出现」，就必须给一个取消出口——
-                            // 否则第一次点过字幕之后那个蓝框与六个手柄会一直挂在画面上，
-                            // 比原来「未播放时常驻」还难摆脱。字幕框自己的 `on_mouse_down`
-                            // 调了 `stop_propagation`，所以点框内不会冒泡到这里。
-                            stage = stage.on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    if this.monitor_subtitle_selected {
-                                        this.monitor_subtitle_selected = false;
-                                        cx.notify();
-                                    }
-                                }),
-                            );
+                        // 视频画面展示 (实时内嵌播放 vs 静态时间轴帧)
+                        stage = stage.child(self.render_monitor_picture(window, cx));
 
-                            // 视频画面展示 (实时内嵌播放 vs 静态时间轴帧)
-                            stage = stage.child(self.render_monitor_picture(window, cx));
-
-                            // 对称参考线：水平对称线（X=50% 轴贯穿）
-                            if self.monitor_snap_x {
-                                stage = stage.child(
-                                    div()
-                                        .id("monitor-guide-line-x")
-                                        .absolute()
-                                        .top_0()
-                                        .bottom_0()
-                                        .left(relative(0.5))
-                                        .w(px(1.5))
-                                        .bg(Theme::accent_mint())
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .top(px(8.0))
-                                                .left(px(4.0))
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .rounded_sm()
-                                                .bg(Theme::accent_mint())
-                                                .text_size(px(10.0))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(rgb(0x000000))
-                                                .child("50% 水平居中"),
-                                        ),
-                                );
-                            }
-
-                            // 对称参考线：垂直对称线（Y=50% 轴贯穿）
-                            if self.monitor_snap_y {
-                                stage = stage.child(
-                                    div()
-                                        .id("monitor-guide-line-y")
-                                        .absolute()
-                                        .left_0()
-                                        .right_0()
-                                        .top(relative(0.5))
-                                        .h(px(1.5))
-                                        .bg(Theme::accent_mint())
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .left(px(8.0))
-                                                .top(px(4.0))
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .rounded_sm()
-                                                .bg(Theme::accent_mint())
-                                                .text_size(px(10.0))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(rgb(0x000000))
-                                                .child("50% 垂直居中"),
-                                        ),
-                                );
-                            }
-
-                            // PPT 风格自由移动与缩放的字幕文字框
-                            let sample_seg = if active_seg.is_none() && !is_playing {
-                                Some(Segment {
-                                    index: 0,
-                                    start: 0.0,
-                                    end: 2.0,
-                                    text: "Voice2Word 字幕文本框".to_string(),
-                                    translation: None,
-                                    translation_lang: None,
-                                    translations: Default::default(),
-                                    speaker: None,
-                                    speaker_name: None,
-                                    words: Vec::new(),
-                                    polished: String::new(),
-                                    language: None,
-                                    confidence: None,
-                                })
-                            } else {
-                                None
-                            };
-                            let effective_seg = active_seg.as_ref().or(sample_seg.as_ref());
-
-                            if let Some(seg) = effective_seg {
-                                let export_mode = self.editor_export_mode;
-                                let style = self.state.config.subtitle_style.clone();
-                                let video_scale = if fit_h > 0.0 { fit_h / 1080.0 } else { 0.5 };
-                                let font_px = (style.font_size as f32 * video_scale).clamp(12.0, 96.0);
-                                let (fg, bg, border) = subtitle_computed_colors(&style);
-
-                                let display_text = seg.export_text(export_mode);
-                                let max_line_chars = display_text
-                                    .lines()
-                                    .map(|l| l.chars().count())
-                                    .max()
-                                    .unwrap_or_else(|| display_text.chars().count())
-                                    .max(1);
-                                // 框宽 = 文字自然宽度 与 「单行最大字数」上限 的**较小者**。
-                                //
-                                // 后半句是「横着拖拽防换行」的落点：左右手柄改的就是
-                                // `max_chars_per_line`，框宽随它收缩，文字被迫在框内折行；
-                                // 往外拖则放开到文字自然宽度、不再折行。此前框宽只由文字
-                                // 实际长度决定，于是拖换行阈值时画面毫无反馈。
-                                let natural_w = (max_line_chars as f32 * font_px) + 28.0;
-                                let limit_w = (style.max_chars_per_line as f32 * font_px) + 28.0;
-                                // 手动拖过左右手柄 → **用户定的宽度说了算**（框就是那么宽，
-                                // 文字在里面折行）；没拖过则贴合文字、并被换行上限约束。
-                                //
-                                // 为什么必须有「手动宽度」这一层：只靠「自然宽与上限宽取小」
-                                // 的话，上限宽（本机 44 字 × 66px ≈ 2900px）远大于文字自然宽，
-                                // 框于是永远贴着文字——往外拖毫无反应，往内拖要拖过上千像素
-                                // 才开始变窄。用户的实际感受就是「左右拉不动」。
-                                let auto_w = natural_w.min(limit_w);
-                                let box_w = self
-                                    .preview_box_w
-                                    .unwrap_or(auto_w)
-                                    .clamp(60.0, (fit_w - 16.0).max(60.0));
-
-                                let cur_x_pct = style.pos_x_percent.clamp(5.0, 95.0);
-                                let cur_y_pct = style.current_pos_y_percent().clamp(5.0, 95.0);
-                                let center_x = fit_w * (cur_x_pct / 100.0);
-                                let center_y = fit_h * (cur_y_pct / 100.0);
-
-                                let box_left = (center_x - box_w / 2.0).clamp(4.0, (fit_w - box_w - 4.0).max(4.0));
-                                // 估算框高必须按**折行后**的行数算。框宽现在会被
-                                // `max_chars_per_line` 收紧（见上），长句会在框内折成好几行；
-                                // 仍按单行估高会让 `box_top = center_y - approx_h / 2` 偏下，
-                                // 字幕整体沉到目标位置以下——拖窄换行阈值时尤其明显。
-                                //
-                                // 单行时 `est_lines == 1`，公式与改动前逐字一致，
-                                // 因此不影响未折行字幕的既有定位。
-                                // 用**实际框宽**折算每行字数：手动拖过之后框宽与
-                                // max_chars_per_line 未必一一对应，按框宽算才准。
-                                let wrap_cols =
-                                    (((box_w - 28.0) / font_px.max(1.0)).floor()).max(1.0);
-                                let est_lines: f32 = display_text
-                                    .lines()
-                                    .map(|l| ((l.chars().count() as f32) / wrap_cols).ceil().max(1.0))
-                                    .sum::<f32>()
-                                    .max(1.0);
-                                let approx_h =
-                                    (font_px * style.line_spacing * 1.4 * est_lines + 16.0)
-                                        .clamp(24.0, 300.0);
-                                let box_top = (center_y - approx_h / 2.0).clamp(4.0, (fit_h - approx_h - 4.0).max(4.0));
-
-                                let is_selected = self.monitor_subtitle_selected;
-                                let is_dragging = self.monitor_subtitle_drag.is_some();
-                                // 选框与手柄**只在点中字幕后**出现（用户明确要求）。
-                                //
-                                // 此前是「只要不在播放就常驻画出来」，于是每一帧画面上都挂着
-                                // 一个蓝框和六个手柄，挡住画面本身；而用户点它才算「选中并要
-                                // 编辑」。现在未选中时只有一个悬停高亮作为「这里可以点」的提示
-                                // （见 text_element 的 hover 边框），选了才出框与手柄。
-                                let show_ppt_frame = is_selected || is_dragging;
-
-                                let is_moving = matches!(
-                                    self.monitor_subtitle_drag,
-                                    Some(SubtitleMonitorDrag { mode: SubtitleMonitorDragMode::Move, .. })
-                                );
-
-                                let mut box_container = div()
-                                    .id("monitor-subtitle-movable-box")
+                        // 对称参考线：水平对称线（X=50% 轴贯穿）
+                        if self.monitor_snap_x {
+                            stage = stage.child(
+                                div()
+                                    .id("monitor-guide-line-x")
                                     .absolute()
-                                    .left(px(box_left))
-                                    .top(px(box_top))
-                                    .w(px(box_w))
-                                    .when(show_ppt_frame, |d| {
-                                        d.bg(rgba(0x38bdf80d))
-                                            .hover(|s| s.bg(rgba(0x38bdf81a)))
-                                    })
-                                    .cursor(if is_moving {
-                                        CursorStyle::ClosedHand
-                                    } else {
-                                        CursorStyle::OpenHand
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener({
-                                            let box_w = box_w;
-                                            move |this, event: &MouseDownEvent, _, cx| {
-                                                cx.stop_propagation();
-                                                this.begin_monitor_subtitle_drag(
-                                                    SubtitleMonitorDragMode::Move,
-                                                    (f32::from(event.position.x), f32::from(event.position.y)),
-                                                    box_w,
-                                                    cx,
-                                                );
-                                            }
-                                        }),
-                                    );
+                                    .top_0()
+                                    .bottom_0()
+                                    .left(relative(0.5))
+                                    .w(px(1.5))
+                                    .bg(Theme::accent_mint())
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top(px(8.0))
+                                            .left(px(4.0))
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .bg(Theme::accent_mint())
+                                            .text_size(px(10.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(rgb(0x000000))
+                                            .child("50% 水平居中"),
+                                    ),
+                            );
+                        }
 
-                                let text_element = div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(bg)
-                                    .border_1()
-                                    .border_color(border)
-                                    .hover(|s| s.border_1().border_color(rgb(0x38bdf8)))
-                                    .text_size(px(font_px))
-                                    .font_weight(if style.is_bold {
-                                        FontWeight::BOLD
-                                    } else {
-                                        FontWeight::NORMAL
-                                    })
-                                    .text_color(fg)
-                                    .text_align(match style.alignment.as_str() {
-                                        "left" => TextAlign::Left,
-                                        "right" => TextAlign::Right,
-                                        _ => TextAlign::Center,
-                                    })
-                                    .line_height(px(font_px * style.line_spacing))
+                        // 对称参考线：垂直对称线（Y=50% 轴贯穿）
+                        if self.monitor_snap_y {
+                            stage = stage.child(
+                                div()
+                                    .id("monitor-guide-line-y")
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .top(relative(0.5))
+                                    .h(px(1.5))
+                                    .bg(Theme::accent_mint())
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .left(px(8.0))
+                                            .top(px(4.0))
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .bg(Theme::accent_mint())
+                                            .text_size(px(10.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(rgb(0x000000))
+                                            .child("50% 垂直居中"),
+                                    ),
+                            );
+                        }
+
+                        // PPT 风格自由移动与缩放的字幕文字框
+                        let sample_seg = if active_seg.is_none() && !is_playing {
+                            Some(Segment {
+                                index: 0,
+                                start: 0.0,
+                                end: 2.0,
+                                text: "Voice2Word 字幕文本框".to_string(),
+                                translation: None,
+                                translation_lang: None,
+                                translations: Default::default(),
+                                speaker: None,
+                                speaker_name: None,
+                                words: Vec::new(),
+                                polished: String::new(),
+                                language: None,
+                                confidence: None,
+                            })
+                        } else {
+                            None
+                        };
+                        let effective_seg = active_seg.as_ref().or(sample_seg.as_ref());
+
+                        if let Some(seg) = effective_seg {
+                            let export_mode = self.editor_export_mode;
+                            let style = self.state.config.subtitle_style.clone();
+                            let video_scale = if fit_h > 0.0 { fit_h / 1080.0 } else { 0.5 };
+                            let font_px = (style.font_size as f32 * video_scale).clamp(12.0, 96.0);
+                            let (fg, bg, border) = subtitle_computed_colors(&style);
+
+                            let display_text = seg.export_text(export_mode);
+                            let max_line_chars = display_text
+                                .lines()
+                                .map(|l| l.chars().count())
+                                .max()
+                                .unwrap_or_else(|| display_text.chars().count())
+                                .max(1);
+                            // 框宽 = 文字自然宽度 与 「单行最大字数」上限 的**较小者**。
+                            //
+                            // 后半句是「横着拖拽防换行」的落点：左右手柄改的就是
+                            // `max_chars_per_line`，框宽随它收缩，文字被迫在框内折行；
+                            // 往外拖则放开到文字自然宽度、不再折行。此前框宽只由文字
+                            // 实际长度决定，于是拖换行阈值时画面毫无反馈。
+                            let natural_w = (max_line_chars as f32 * font_px) + 28.0;
+                            let limit_w = (style.max_chars_per_line as f32 * font_px) + 28.0;
+                            // 手动拖过左右手柄 → **用户定的宽度说了算**（框就是那么宽，
+                            // 文字在里面折行）；没拖过则贴合文字、并被换行上限约束。
+                            //
+                            // 为什么必须有「手动宽度」这一层：只靠「自然宽与上限宽取小」
+                            // 的话，上限宽（本机 44 字 × 66px ≈ 2900px）远大于文字自然宽，
+                            // 框于是永远贴着文字——往外拖毫无反应，往内拖要拖过上千像素
+                            // 才开始变窄。用户的实际感受就是「左右拉不动」。
+                            let auto_w = natural_w.min(limit_w);
+                            let box_w = self
+                                .preview_box_w
+                                .unwrap_or(auto_w)
+                                .clamp(60.0, (fit_w - 16.0).max(60.0));
+
+                            let cur_x_pct = style.pos_x_percent.clamp(5.0, 95.0);
+                            let cur_y_pct = style.current_pos_y_percent().clamp(5.0, 95.0);
+                            let center_x = fit_w * (cur_x_pct / 100.0);
+                            let center_y = fit_h * (cur_y_pct / 100.0);
+
+                            let box_left =
+                                (center_x - box_w / 2.0).clamp(4.0, (fit_w - box_w - 4.0).max(4.0));
+                            // 估算框高必须按**折行后**的行数算。框宽现在会被
+                            // `max_chars_per_line` 收紧（见上），长句会在框内折成好几行；
+                            // 仍按单行估高会让 `box_top = center_y - approx_h / 2` 偏下，
+                            // 字幕整体沉到目标位置以下——拖窄换行阈值时尤其明显。
+                            //
+                            // 单行时 `est_lines == 1`，公式与改动前逐字一致，
+                            // 因此不影响未折行字幕的既有定位。
+                            // 用**实际框宽**折算每行字数：手动拖过之后框宽与
+                            // max_chars_per_line 未必一一对应，按框宽算才准。
+                            let wrap_cols = (((box_w - 28.0) / font_px.max(1.0)).floor()).max(1.0);
+                            let est_lines: f32 = display_text
+                                .lines()
+                                .map(|l| ((l.chars().count() as f32) / wrap_cols).ceil().max(1.0))
+                                .sum::<f32>()
+                                .max(1.0);
+                            let approx_h = (font_px * style.line_spacing * 1.4 * est_lines + 16.0)
+                                .clamp(24.0, 300.0);
+                            let box_top = (center_y - approx_h / 2.0)
+                                .clamp(4.0, (fit_h - approx_h - 4.0).max(4.0));
+
+                            let is_selected = self.monitor_subtitle_selected;
+                            let is_dragging = self.monitor_subtitle_drag.is_some();
+                            // 选框与手柄**只在点中字幕后**出现（用户明确要求）。
+                            //
+                            // 此前是「只要不在播放就常驻画出来」，于是每一帧画面上都挂着
+                            // 一个蓝框和六个手柄，挡住画面本身；而用户点它才算「选中并要
+                            // 编辑」。现在未选中时只有一个悬停高亮作为「这里可以点」的提示
+                            // （见 text_element 的 hover 边框），选了才出框与手柄。
+                            let show_ppt_frame = is_selected || is_dragging;
+
+                            let is_moving = matches!(
+                                self.monitor_subtitle_drag,
+                                Some(SubtitleMonitorDrag {
+                                    mode: SubtitleMonitorDragMode::Move,
+                                    ..
+                                })
+                            );
+
+                            let mut box_container = div()
+                                .id("monitor-subtitle-movable-box")
+                                .absolute()
+                                .left(px(box_left))
+                                .top(px(box_top))
+                                .w(px(box_w))
+                                .when(show_ppt_frame, |d| {
+                                    d.bg(rgba(0x38bdf80d)).hover(|s| s.bg(rgba(0x38bdf81a)))
+                                })
+                                .cursor(if is_moving {
+                                    CursorStyle::ClosedHand
+                                } else {
+                                    CursorStyle::OpenHand
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener({
+                                        move |this, event: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.begin_monitor_subtitle_drag(
+                                                SubtitleMonitorDragMode::Move,
+                                                (
+                                                    f32::from(event.position.x),
+                                                    f32::from(event.position.y),
+                                                ),
+                                                box_w,
+                                                cx,
+                                            );
+                                        }
+                                    }),
+                                );
+
+                            let text_element = div()
+                                .w_full()
+                                .min_w_0()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(bg)
+                                .border_1()
+                                .border_color(border)
+                                .hover(|s| s.border_1().border_color(rgb(0x38bdf8)))
+                                .text_size(px(font_px))
+                                .font_weight(if style.is_bold {
+                                    FontWeight::BOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .text_color(fg)
+                                .text_align(match style.alignment.as_str() {
+                                    "left" => TextAlign::Left,
+                                    "right" => TextAlign::Right,
+                                    _ => TextAlign::Center,
+                                })
+                                .line_height(px(font_px * style.line_spacing))
                                 .child({
                                     let display_text = seg.export_text(export_mode);
                                     let raw_text = seg.display_text();
-                                    let highlights = raw_line_byte_start(
-                                        &display_text,
-                                        raw_text,
-                                        export_mode,
-                                    )
-                                    .map(
-                                        |base| -> Vec<(Range<usize>, HighlightStyle)> {
-                                            karaoke_word_marks(
-                                                raw_text, &seg.words, cur_time,
-                                                seg.start, seg.end,
-                                            )
-                                            .into_iter()
-                                            .map(|(range, mark)| {
-                                                (
-                                                    base + range.start
-                                                        ..base + range.end,
-                                                    karaoke_mark_style(mark),
+                                    let highlights =
+                                        raw_line_byte_start(&display_text, raw_text, export_mode)
+                                            .map(|base| -> Vec<(Range<usize>, HighlightStyle)> {
+                                                karaoke_word_marks(
+                                                    raw_text, &seg.words, cur_time, seg.start,
+                                                    seg.end,
                                                 )
+                                                .into_iter()
+                                                .map(|(range, mark)| {
+                                                    (
+                                                        base + range.start..base + range.end,
+                                                        karaoke_mark_style(mark),
+                                                    )
+                                                })
+                                                .collect()
                                             })
-                                            .collect()
-                                        },
-                                    )
-                                    .unwrap_or_default();
+                                            .unwrap_or_default();
                                     if highlights.is_empty() {
                                         display_text.into_any_element()
                                     } else {
@@ -1217,12 +1215,16 @@ impl MainWindow {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener({
-                                                let box_w = box_w;
                                                 move |this, event: &MouseDownEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     this.begin_monitor_subtitle_drag(
-                                                        SubtitleMonitorDragMode::ResizeCorner { is_left: true },
-                                                        (f32::from(event.position.x), f32::from(event.position.y)),
+                                                        SubtitleMonitorDragMode::ResizeCorner {
+                                                            is_left: true,
+                                                        },
+                                                        (
+                                                            f32::from(event.position.x),
+                                                            f32::from(event.position.y),
+                                                        ),
                                                         box_w,
                                                         cx,
                                                     );
@@ -1248,12 +1250,16 @@ impl MainWindow {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener({
-                                                let box_w = box_w;
                                                 move |this, event: &MouseDownEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     this.begin_monitor_subtitle_drag(
-                                                        SubtitleMonitorDragMode::ResizeCorner { is_left: false },
-                                                        (f32::from(event.position.x), f32::from(event.position.y)),
+                                                        SubtitleMonitorDragMode::ResizeCorner {
+                                                            is_left: false,
+                                                        },
+                                                        (
+                                                            f32::from(event.position.x),
+                                                            f32::from(event.position.y),
+                                                        ),
                                                         box_w,
                                                         cx,
                                                     );
@@ -1279,12 +1285,16 @@ impl MainWindow {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener({
-                                                let box_w = box_w;
                                                 move |this, event: &MouseDownEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     this.begin_monitor_subtitle_drag(
-                                                        SubtitleMonitorDragMode::ResizeCorner { is_left: true },
-                                                        (f32::from(event.position.x), f32::from(event.position.y)),
+                                                        SubtitleMonitorDragMode::ResizeCorner {
+                                                            is_left: true,
+                                                        },
+                                                        (
+                                                            f32::from(event.position.x),
+                                                            f32::from(event.position.y),
+                                                        ),
                                                         box_w,
                                                         cx,
                                                     );
@@ -1310,12 +1320,16 @@ impl MainWindow {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener({
-                                                let box_w = box_w;
                                                 move |this, event: &MouseDownEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     this.begin_monitor_subtitle_drag(
-                                                        SubtitleMonitorDragMode::ResizeCorner { is_left: false },
-                                                        (f32::from(event.position.x), f32::from(event.position.y)),
+                                                        SubtitleMonitorDragMode::ResizeCorner {
+                                                            is_left: false,
+                                                        },
+                                                        (
+                                                            f32::from(event.position.x),
+                                                            f32::from(event.position.y),
+                                                        ),
                                                         box_w,
                                                         cx,
                                                     );
@@ -1342,12 +1356,16 @@ impl MainWindow {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener({
-                                                let box_w = box_w;
                                                 move |this, event: &MouseDownEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     this.begin_monitor_subtitle_drag(
-                                                        SubtitleMonitorDragMode::ResizeHorizontal { is_left: true },
-                                                        (f32::from(event.position.x), f32::from(event.position.y)),
+                                                        SubtitleMonitorDragMode::ResizeHorizontal {
+                                                            is_left: true,
+                                                        },
+                                                        (
+                                                            f32::from(event.position.x),
+                                                            f32::from(event.position.y),
+                                                        ),
                                                         box_w,
                                                         cx,
                                                     );
@@ -1374,12 +1392,16 @@ impl MainWindow {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener({
-                                                let box_w = box_w;
                                                 move |this, event: &MouseDownEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     this.begin_monitor_subtitle_drag(
-                                                        SubtitleMonitorDragMode::ResizeHorizontal { is_left: false },
-                                                        (f32::from(event.position.x), f32::from(event.position.y)),
+                                                        SubtitleMonitorDragMode::ResizeHorizontal {
+                                                            is_left: false,
+                                                        },
+                                                        (
+                                                            f32::from(event.position.x),
+                                                            f32::from(event.position.y),
+                                                        ),
                                                         box_w,
                                                         cx,
                                                     );
@@ -1387,7 +1409,6 @@ impl MainWindow {
                                             }),
                                         ),
                                 );
-
                             }
 
                             stage = stage.child(box_container);
@@ -4040,7 +4061,9 @@ impl MainWindow {
 
                 self.state.config.subtitle_style.pos_x_percent = target_x;
                 self.state.config.subtitle_style.pos_y_percent = Some(target_y);
-                let b_margin = (((100.0 - target_y) / 100.0) * 1080.0).round().clamp(10.0, 950.0) as u32;
+                let b_margin = (((100.0 - target_y) / 100.0) * 1080.0)
+                    .round()
+                    .clamp(10.0, 950.0) as u32;
                 self.state.config.subtitle_style.bottom_margin = b_margin;
                 cx.notify();
             }
@@ -4061,12 +4084,8 @@ impl MainWindow {
                 // 「一字一档」，本机 66px 字号下一个字就是 66px，而框只有几百 px 宽；
                 // 拖动量与实际宽度完全脱钩（要拖 2000+ px 才少 30 个字），表现就是
                 // 「拉不动」。这里改成框宽跟着鼠标走，再折算成字数写回配置。
-                let new_w = box_width_from_horizontal_drag(
-                    drag.start_box_w,
-                    dx,
-                    is_left,
-                    fit_w - 16.0,
-                );
+                let new_w =
+                    box_width_from_horizontal_drag(drag.start_box_w, dx, is_left, fit_w - 16.0);
                 self.preview_box_w = Some(new_w);
                 self.state.config.subtitle_style.max_chars_per_line =
                     max_chars_for_width(new_w, font_px);
@@ -4833,8 +4852,7 @@ impl MainWindow {
                         primitives::chip_clickable("一键修复", false, false)
                             .id("qc-repair-all")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                let plan =
-                                    crate::subtitle::qc::plan_repairs(&this.state.segments);
+                                let plan = crate::subtitle::qc::plan_repairs(&this.state.segments);
                                 if plan.is_empty() {
                                     this.notice = Some("没有可自动修复的项目".to_string());
                                     cx.notify();
@@ -4894,10 +4912,8 @@ impl MainWindow {
                                     .unwrap_or("subtitles")
                                     .to_string();
                                 let out = media.with_file_name(format!("{stem}.chapters.txt"));
-                                match crate::subtitle::writer::write_chapters_file(
-                                    &chapters,
-                                    &out,
-                                ) {
+                                match crate::subtitle::writer::write_chapters_file(&chapters, &out)
+                                {
                                     Ok(()) => {
                                         this.notice = Some(format!(
                                             "已导出 {} 个章节：{}",

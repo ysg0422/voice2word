@@ -1539,7 +1539,12 @@ impl MainWindow {
             benchmark_dialog: None,
             confirm_dialog: None,
             update_modal_open: false,
-            notice: None,
+            // 启动时若检测到另一个实例，直接把提示摆到界面上（而不是只写日志）。
+            // 用户不会去翻 logs/，但一定会看到窗口顶部那条横幅。
+            notice: crate::utils::other_instance_running().then(|| {
+                "检测到另一个 Voice2Word 实例正在运行：两个窗口会同时写同一份历史库，".to_string()
+                    + "互相覆盖对方的编辑。建议只保留一个窗口。"
+            }),
             translate_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             update_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2848,11 +2853,12 @@ impl Render for MainWindow {
         // Windows 上当窗口尺寸改变时，强制刷新客户区并驱动 GPUI DirectX 渲染层重绘全幅，
         // 避免出现「最大化后只渲染局部、截屏/切焦点后才全屏」的画面不同步 Bug。
         if self.bounds_subscription.is_none() {
-            self.bounds_subscription = Some(cx.observe_window_bounds(window, |_this, window, cx| {
-                #[cfg(target_os = "windows")]
-                crate::ui::components::titlebar::win_drag::force_update_window(window);
-                cx.notify();
-            }));
+            self.bounds_subscription =
+                Some(cx.observe_window_bounds(window, |_this, window, cx| {
+                    #[cfg(target_os = "windows")]
+                    crate::ui::components::titlebar::win_drag::force_update_window(window);
+                    cx.notify();
+                }));
         }
         // 必需组件（ffmpeg / whisper-cli）缺失时的自动补下载：进程内只检查一次，
         // 下载是网络活，不能压在首帧之前，但也要在用户动手之前给反馈。
@@ -2948,13 +2954,11 @@ impl Render for MainWindow {
             // 全局文件拖放接收层：GPUI 把「从资源管理器拖文件进来」包装成一次内部
             // drag/drop，drag value 类型为 `Arc<ExternalPaths>`，挂在根节点上即可
             // 全窗口任意位置放下都能导入。
-            .on_drop::<ExternalPaths>(cx.listener(
-                |this, paths: &ExternalPaths, _window, cx| {
-                    let dropped: Vec<PathBuf> = paths.paths().to_vec();
-                    tracing::info!("根容器监听到 ExternalPaths 拖放导入: {:?}", dropped);
-                    this.handle_dropped_files(&dropped, cx);
-                },
-            ))
+            .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                let dropped: Vec<PathBuf> = paths.paths().to_vec();
+                tracing::info!("根容器监听到 ExternalPaths 拖放导入: {:?}", dropped);
+                this.handle_dropped_files(&dropped, cx);
+            }))
             .on_drop::<Arc<ExternalPaths>>(cx.listener(
                 |this, paths: &Arc<ExternalPaths>, _window, cx| {
                     let dropped: Vec<PathBuf> = paths.paths().to_vec();

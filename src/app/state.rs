@@ -173,7 +173,7 @@ pub enum WhisperModelTier {
     Tiny,       // 尝鲜 Tiny — ggml-tiny.bin (75MB 超轻量)
     Fast,       // 极速 Base — ggml-base.bin (148MB)
     #[default]
-    Balanced,   // 均衡 Small — ggml-small.bin / ggml-small-q5_0.bin (181MB)
+    Balanced, // 均衡 Small — ggml-small.bin / ggml-small-q5_0.bin (181MB)
     Medium,     // 进阶 Medium — ggml-medium.bin (1.5GB)
     TurboSpeed, // 极速 Turbo — ggml-large-v3-turbo-q5_0.bin (547MB)
     Precise,    // 高精 Turbo — ggml-large-v3-turbo-q8_0.bin (833MB)
@@ -303,9 +303,17 @@ impl WhisperModelTier {
             Self::TurboSpeed => {
                 let preferred = "models/whisper/ggml-large-v3-turbo-q5_0.bin".to_string();
                 if !crate::utils::AppConfig::resolve_path(&preferred).exists() {
-                    if crate::utils::AppConfig::resolve_path("models/whisper/ggml-large-v3-turbo-q8_0.bin").exists() {
+                    if crate::utils::AppConfig::resolve_path(
+                        "models/whisper/ggml-large-v3-turbo-q8_0.bin",
+                    )
+                    .exists()
+                    {
                         "models/whisper/ggml-large-v3-turbo-q8_0.bin".to_string()
-                    } else if crate::utils::AppConfig::resolve_path("models/whisper/ggml-large-v3.bin").exists() {
+                    } else if crate::utils::AppConfig::resolve_path(
+                        "models/whisper/ggml-large-v3.bin",
+                    )
+                    .exists()
+                    {
                         "models/whisper/ggml-large-v3.bin".to_string()
                     } else {
                         preferred
@@ -318,7 +326,6 @@ impl WhisperModelTier {
             Self::LargeV3 => "models/whisper/ggml-large-v3.bin".to_string(),
         }
     }
-
 
     /// CPU 下相对视频时长的转写耗时系数（校准自 32 分钟样片）。
     fn cpu_realtime_factor(self) -> f64 {
@@ -1102,11 +1109,17 @@ fn join_segment_text(left: &str, right: &str) -> String {
 
 /// 左串末尾与右串开头都是西文字母/数字时，连接处需要空格。
 fn needs_join_space(left: &str, right: &str) -> bool {
-    left.chars().last().is_some_and(|c| c.is_ascii_alphanumeric())
-        && right.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+    left.chars()
+        .last()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && right
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
 }
 
-impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数收敛共用同一来源，
+impl AppState {
+    /// 本机逻辑核心数。设置页滑条量程与线程数收敛共用同一来源，
     /// 避免 UI 显示的上限与实际生效值不一致。
     pub fn logical_cores() -> u32 {
         std::thread::available_parallelism()
@@ -1999,10 +2012,9 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
                     *counts.entry(lang.clone()).or_insert(0) += 1;
                 }
             }
-            if let (Some(lang), Some(text)) = (
-                seg.translation_lang.as_deref(),
-                seg.translation.as_deref(),
-            ) {
+            if let (Some(lang), Some(text)) =
+                (seg.translation_lang.as_deref(), seg.translation.as_deref())
+            {
                 if !text.trim().is_empty() && !seg.translations.contains_key(lang) {
                     *counts.entry(lang.to_string()).or_insert(0) += 1;
                 }
@@ -2018,8 +2030,7 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
     /// 取「句数最多的那个语言」：混排数据（半篇英文半篇日语）下没有唯一答案，
     /// 但面板上高亮哪个必须有个确定值，否则每次重绘都可能换一个。
     pub fn current_display_pack(&self) -> Option<String> {
-        let mut counts: std::collections::BTreeMap<&str, usize> =
-            std::collections::BTreeMap::new();
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         for seg in &self.segments {
             if seg.has_translation() {
                 if let Some(lang) = seg.translation_lang.as_deref() {
@@ -2275,9 +2286,14 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
                 let h = self
                     .proxy_manager
                     .preview_height(src, !self.hardware.use_gpu_pipeline());
-                if let Some(existing) = self.proxy_manager.existing_proxy(src, h) {
-                    self.preview_source = Some(existing);
-                }
+                // `existing_proxy` 现在只读缓存高度（不在这里起 ffmpeg 探测）。
+                // 没有现成代理时先把预览源设回**原片**：这是本函数唯一安全的兜底——
+                // 保持旧值会让界面继续播上一个工程的视频。
+                self.preview_source = Some(
+                    self.proxy_manager
+                        .existing_proxy(src, h)
+                        .unwrap_or_else(|| src.clone()),
+                );
             }
         }
     }
@@ -3426,13 +3442,12 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
             self.segments_dirty = false;
             // 写库失败不能静默：用户以为改动已保存，重启后却发现全丢了。
             // 记进 `db_write_error`，界面把它渲染成可见的提示条。
-            let result = match self.active_task_id {
-                Some(task_id) => Some(self.sync_segments_gated(task_id)),
-                // 没有主键（导入字幕的工程）：**不是**「已保存」，而是「无处可写」。
-                // 以前这里返回 Ok 且保持 dirty=false，于是关窗守卫读到「已保存」直接
-                // 放行——一整份校对静默清零。现在保持脏，交给守卫做二次确认。
-                None => None,
-            };
+            // 没有主键（导入字幕的工程）时 `map` 得到 `None`：那**不是**「已保存」，
+            // 而是「无处可写」。以前这里返回 Ok 且保持 dirty=false，于是关窗守卫读到
+            // 「已保存」直接放行——一整份校对静默清零。现在保持脏，交给守卫做二次确认。
+            let result = self
+                .active_task_id
+                .map(|task_id| self.sync_segments_gated(task_id));
             match result {
                 None => {
                     self.segments_dirty = true;
@@ -3827,8 +3842,11 @@ impl AppState {    /// 本机逻辑核心数。设置页滑条量程与线程数
         }
         // 词级时间戳按切点分到两半：左半不能再保留切点之后的词，否则卡拉OK
         // 会把整句词高亮画到已经被切走的文本上。
-        let (words_left, words_right): (Vec<_>, Vec<_>) =
-            orig.words.iter().cloned().partition(|w| w.start < split_time);
+        let (words_left, words_right): (Vec<_>, Vec<_>) = orig
+            .words
+            .iter()
+            .cloned()
+            .partition(|w| w.start < split_time);
 
         self.snapshot_for_undo();
         self.segments[pos].end = split_time;
@@ -6134,9 +6152,11 @@ mod tests {
         let mut a = Segment::new(1, 0.0, 2.0, "Hello");
         a.translation = Some("你好".to_string());
         a.translation_lang = Some("简体中文".to_string());
-        a.translations.insert("简体中文".to_string(), "你好".to_string());
+        a.translations
+            .insert("简体中文".to_string(), "你好".to_string());
         let mut b = Segment::new(2, 2.0, 4.0, "world");
-        b.translations.insert("简体中文".to_string(), "世界".to_string());
+        b.translations
+            .insert("简体中文".to_string(), "世界".to_string());
 
         let mut state = test_state(vec![a, b]);
         state.selected_segment_index = Some(1);

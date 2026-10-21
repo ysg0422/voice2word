@@ -500,17 +500,39 @@ impl MainWindow {
                     .rounded_md()
                     .cursor_pointer()
                     .text_size(px(Theme::TEXT_BODY))
-                    .font_weight(if current_tab == 0 { FontWeight::BOLD } else { FontWeight::NORMAL })
-                    .bg(if current_tab == 0 { Theme::accent_mint() } else { Theme::bg_card() })
-                    .text_color(if current_tab == 0 { Theme::text_on_accent() } else { Theme::text_secondary() })
+                    .font_weight(if current_tab == 0 {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .bg(if current_tab == 0 {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::bg_card()
+                    })
+                    .text_color(if current_tab == 0 {
+                        Theme::text_on_accent()
+                    } else {
+                        Theme::text_secondary()
+                    })
                     .border_1()
-                    .border_color(if current_tab == 0 { Theme::accent_mint() } else { Theme::border_subtle() })
-                    .hover(|s| if current_tab != 0 { s.bg(Theme::bg_hover()).text_color(Theme::text_primary()) } else { s })
+                    .border_color(if current_tab == 0 {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::border_subtle()
+                    })
+                    .hover(|s| {
+                        if current_tab != 0 {
+                            s.bg(Theme::bg_hover()).text_color(Theme::text_primary())
+                        } else {
+                            s
+                        }
+                    })
                     .child("硬件与推理")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.settings_tab = 0;
                         cx.notify();
-                    }))
+                    })),
             )
             .child(
                 div()
@@ -520,17 +542,39 @@ impl MainWindow {
                     .rounded_md()
                     .cursor_pointer()
                     .text_size(px(Theme::TEXT_BODY))
-                    .font_weight(if current_tab == 1 { FontWeight::BOLD } else { FontWeight::NORMAL })
-                    .bg(if current_tab == 1 { Theme::accent_mint() } else { Theme::bg_card() })
-                    .text_color(if current_tab == 1 { Theme::text_on_accent() } else { Theme::text_secondary() })
+                    .font_weight(if current_tab == 1 {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .bg(if current_tab == 1 {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::bg_card()
+                    })
+                    .text_color(if current_tab == 1 {
+                        Theme::text_on_accent()
+                    } else {
+                        Theme::text_secondary()
+                    })
                     .border_1()
-                    .border_color(if current_tab == 1 { Theme::accent_mint() } else { Theme::border_subtle() })
-                    .hover(|s| if current_tab != 1 { s.bg(Theme::bg_hover()).text_color(Theme::text_primary()) } else { s })
+                    .border_color(if current_tab == 1 {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::border_subtle()
+                    })
+                    .hover(|s| {
+                        if current_tab != 1 {
+                            s.bg(Theme::bg_hover()).text_color(Theme::text_primary())
+                        } else {
+                            s
+                        }
+                    })
                     .child("翻译与润色")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.settings_tab = 1;
                         cx.notify();
-                    }))
+                    })),
             )
             .child(
                 div()
@@ -540,17 +584,39 @@ impl MainWindow {
                     .rounded_md()
                     .cursor_pointer()
                     .text_size(px(Theme::TEXT_BODY))
-                    .font_weight(if current_tab == 2 { FontWeight::BOLD } else { FontWeight::NORMAL })
-                    .bg(if current_tab == 2 { Theme::accent_mint() } else { Theme::bg_card() })
-                    .text_color(if current_tab == 2 { Theme::text_on_accent() } else { Theme::text_secondary() })
+                    .font_weight(if current_tab == 2 {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .bg(if current_tab == 2 {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::bg_card()
+                    })
+                    .text_color(if current_tab == 2 {
+                        Theme::text_on_accent()
+                    } else {
+                        Theme::text_secondary()
+                    })
                     .border_1()
-                    .border_color(if current_tab == 2 { Theme::accent_mint() } else { Theme::border_subtle() })
-                    .hover(|s| if current_tab != 2 { s.bg(Theme::bg_hover()).text_color(Theme::text_primary()) } else { s })
+                    .border_color(if current_tab == 2 {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::border_subtle()
+                    })
+                    .hover(|s| {
+                        if current_tab != 2 {
+                            s.bg(Theme::bg_hover()).text_color(Theme::text_primary())
+                        } else {
+                            s
+                        }
+                    })
                     .child("模型与组件")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.settings_tab = 2;
                         cx.notify();
-                    }))
+                    })),
             );
 
         // 自适应响应式内容区：小屏一列、大屏两列自适应
@@ -576,7 +642,7 @@ impl MainWindow {
                             .flex()
                             .flex_col()
                             .gap(px(Theme::SPACE_4))
-                            .child(self.render_hardware_tier_card(cx))
+                            .child(self.render_hardware_tier_card(cx)),
                     )
                     // 右列（并行度 + 音频预处理管道）
                     .child(
@@ -587,7 +653,7 @@ impl MainWindow {
                             .flex_col()
                             .gap(px(Theme::SPACE_4))
                             .child(self.render_parallelism_card(cx))
-                            .child(self.render_audio_pipeline_card(cx))
+                            .child(self.render_audio_pipeline_card(cx)),
                     )
                     .into_any_element()
             }
@@ -607,7 +673,7 @@ impl MainWindow {
                             .flex()
                             .flex_col()
                             .gap(px(Theme::SPACE_4))
-                            .child(self.render_translate_settings_card(cx))
+                            .child(self.render_translate_settings_card(cx)),
                     )
                     // 右列（标点与 AI 润色）
                     .child(
@@ -617,7 +683,7 @@ impl MainWindow {
                             .flex()
                             .flex_col()
                             .gap(px(Theme::SPACE_4))
-                            .child(self.render_polish_selection_card(cx))
+                            .child(self.render_polish_selection_card(cx)),
                     )
                     .into_any_element()
             }
@@ -815,8 +881,7 @@ impl MainWindow {
                 10,
                 600,
                 format!("{timeout_secs} 秒"),
-                "单批请求的等待上限：接口慢或批量大时调大，避免整批被当成超时失败"
-                    .to_string(),
+                "单批请求的等待上限：接口慢或批量大时调大，避免整批被当成超时失败".to_string(),
                 cx,
                 |this, v, cx| {
                     let v = v as u64;
@@ -829,7 +894,8 @@ impl MainWindow {
             )
             .into_any_element();
 
-        let probing = self.is_probing_translate;        let probe_msg = self.translate_probe_msg.clone();
+        let probing = self.is_probing_translate;
+        let probe_msg = self.translate_probe_msg.clone();
         let probe_control = div()
             .flex()
             .items_center()

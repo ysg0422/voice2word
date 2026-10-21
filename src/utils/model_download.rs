@@ -1436,7 +1436,9 @@ pub type ProgressFn = Box<dyn Fn(u64, u64, &str) + Send + Sync>;
 fn available_space_for(path: &std::path::Path) -> Option<u64> {
     use sysinfo::Disks;
     let disks = Disks::new_with_refreshed_list();
-    let target = std::fs::canonicalize(path).ok().unwrap_or_else(|| path.to_path_buf());
+    let target = std::fs::canonicalize(path)
+        .ok()
+        .unwrap_or_else(|| path.to_path_buf());
     let mut best: Option<(usize, u64)> = None;
     for disk in disks.list() {
         let mount = disk.mount_point();

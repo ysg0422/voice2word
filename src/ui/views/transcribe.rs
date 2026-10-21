@@ -33,17 +33,18 @@ impl MainWindow {
             .w_full()
             .h_full()
             .overflow_hidden()
-            .on_drop::<ExternalPaths>(cx.listener(
-                |this, paths: &ExternalPaths, _window, cx| {
-                    let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
-                    tracing::info!("转写页面根容器监听到 ExternalPaths 拖放导入: {:?}", dropped);
-                    this.handle_dropped_files(&dropped, cx);
-                },
-            ))
+            .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
+                tracing::info!("转写页面根容器监听到 ExternalPaths 拖放导入: {:?}", dropped);
+                this.handle_dropped_files(&dropped, cx);
+            }))
             .on_drop::<Arc<ExternalPaths>>(cx.listener(
                 |this, paths: &Arc<ExternalPaths>, _window, cx| {
                     let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
-                    tracing::info!("转写页面根容器监听到 Arc<ExternalPaths> 拖放导入: {:?}", dropped);
+                    tracing::info!(
+                        "转写页面根容器监听到 Arc<ExternalPaths> 拖放导入: {:?}",
+                        dropped
+                    );
                     this.handle_dropped_files(&dropped, cx);
                 },
             ))
@@ -90,13 +91,13 @@ impl MainWindow {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.queue_sidebar_open = true;
                         cx.notify();
-                    }))
+                    })),
             )
             .child(
                 div()
                     .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(Theme::text_muted())
-                    .child("队列")
+                    .child("队列"),
             )
             .children(if total > 0 {
                 Some(primitives::badge(format!("{total}")))
@@ -1353,7 +1354,10 @@ impl MainWindow {
     ///
     /// 经典左中右布局的左翼：竖直排布任务卡片，展示文件名、时长、状态与阶段进度条，
     /// 支持上下拖拽排序与单项删除，彻底告别顶部横向压扁的难看排版。
-    pub(crate) fn render_batch_queue_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_batch_queue_sidebar(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let is_processing = matches!(self.state.status, ProcessStatus::Processing { .. });
         let batch_running = self.state.batch_running;
         let total = self.state.batch_queue.len();

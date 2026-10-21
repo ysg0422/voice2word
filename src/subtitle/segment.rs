@@ -193,8 +193,7 @@ impl Segment {
         if lang.is_empty() || text.trim().is_empty() {
             return;
         }
-        self.translations
-            .insert(lang.to_string(), text.to_string());
+        self.translations.insert(lang.to_string(), text.to_string());
     }
 
     /// 把某个语言包切换成「当前展示 / 导出用的那一份」。
@@ -698,12 +697,14 @@ pub fn export_text_for(seg: &Segment, mode: ExportMode, with_speaker: bool) -> S
 
 /// 是否包含日文假名（平假名 / 片假名 / 片假名音标扩展）
 pub fn contains_japanese_kana(s: &str) -> bool {
-    s.chars().any(|c| matches!(c as u32, 0x3040..=0x309F | 0x30A0..=0x30FF | 0x31F0..=0x31FF))
+    s.chars()
+        .any(|c| matches!(c as u32, 0x3040..=0x309F | 0x30A0..=0x30FF | 0x31F0..=0x31FF))
 }
 
 /// 是否包含韩文（谚文字母 / 谚文音节）
 pub fn contains_korean_hangul(s: &str) -> bool {
-    s.chars().any(|c| matches!(c as u32, 0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F))
+    s.chars()
+        .any(|c| matches!(c as u32, 0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F))
 }
 
 /// 是否包含假名或韩文（常用于检测目标语言为中文时是否被原样复制或错转）
@@ -723,7 +724,15 @@ pub fn is_source_chinese(segments: &[Segment]) -> bool {
     let dominant = dominant_language(segments);
     if let Some(ref lang) = dominant {
         let l = lang.trim().to_ascii_lowercase();
-        if l == "ja" || l == "en" || l == "ko" || l == "ru" || l == "fr" || l == "de" || l == "es" || l == "it" {
+        if l == "ja"
+            || l == "en"
+            || l == "ko"
+            || l == "ru"
+            || l == "fr"
+            || l == "de"
+            || l == "es"
+            || l == "it"
+        {
             return false;
         }
         if l.starts_with("zh") || l.starts_with("cmn") || l.starts_with("yue") {
@@ -752,7 +761,8 @@ pub fn is_source_chinese(segments: &[Segment]) -> bool {
                 continue;
             }
             total_chars += 1;
-            if matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FA1F) {
+            if matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FA1F)
+            {
                 cjk_chars += 1;
             } else if c.is_ascii_alphabetic() {
                 latin_chars += 1;
@@ -1959,11 +1969,21 @@ mod tests {
     #[test]
     fn is_source_chinese_accuracy() {
         // 纯中文
-        let zh_segs = vec![Segment::new(1, 0.0, 1.0, "今天的天气真好，我们一起去公园散步吧。")];
+        let zh_segs = vec![Segment::new(
+            1,
+            0.0,
+            1.0,
+            "今天的天气真好，我们一起去公园散步吧。",
+        )];
         assert!(is_source_chinese(&zh_segs));
 
         // 日文（含假名）
-        let ja_segs = vec![Segment::new(1, 0.0, 1.0, "こんにちは、今日はいい天気ですね。")];
+        let ja_segs = vec![Segment::new(
+            1,
+            0.0,
+            1.0,
+            "こんにちは、今日はいい天気ですね。",
+        )];
         assert!(!is_source_chinese(&ja_segs));
 
         // 英文（纯拉丁）

@@ -281,7 +281,10 @@ impl MainWindow {
                             .cursor_pointer()
                             .text_size(px(Theme::TEXT_SMALL))
                             .text_color(Theme::accent_red())
-                            .hover(|s| s.bg(Theme::tint_red_border()).text_color(Theme::text_primary()))
+                            .hover(|s| {
+                                s.bg(Theme::tint_red_border())
+                                    .text_color(Theme::text_primary())
+                            })
                             .on_click(cx.listener(|_this, _, _, _cx| {
                                 crate::utils::open_latest_log_file();
                             }))
@@ -300,7 +303,10 @@ impl MainWindow {
                             .cursor_pointer()
                             .text_size(px(Theme::TEXT_SMALL))
                             .text_color(Theme::accent_red())
-                            .hover(|s| s.bg(Theme::tint_red_border()).text_color(Theme::text_primary()))
+                            .hover(|s| {
+                                s.bg(Theme::tint_red_border())
+                                    .text_color(Theme::text_primary())
+                            })
                             .on_click(cx.listener(|_this, _, _, _cx| {
                                 crate::utils::open_logs_folder();
                             }))
@@ -319,9 +325,14 @@ impl MainWindow {
                             .cursor_pointer()
                             .text_size(px(Theme::TEXT_SMALL))
                             .text_color(Theme::accent_red())
-                            .hover(|s| s.bg(Theme::tint_red_border()).text_color(Theme::text_primary()))
+                            .hover(|s| {
+                                s.bg(Theme::tint_red_border())
+                                    .text_color(Theme::text_primary())
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(msg_for_copy.clone()));
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    msg_for_copy.clone(),
+                                ));
                                 this.notice = Some("已成功复制报错详情至剪贴板".to_string());
                                 cx.notify();
                             }))
