@@ -69,6 +69,34 @@ function Expand-ZipTo {
     }
 }
 
+# 版式无关的解压：在解出来的目录树里**递归找 exe/dll**，扁平拷进目标目录。
+#
+# 为什么不能复用 Expand-ZipTo：那个函数会「剥掉每层路径的第一段」，本意是去掉
+# zip 自带的包装目录（whisper 的 Release/、llama 的 llama-xxx/）。但 BtbN 的
+# ffmpeg 包版式是 ffmpeg-master-.../bin/ffmpeg.exe —— 剥一段之后变成 bin/ffmpeg.exe，
+# 落盘到 tools/bin/ 下，而程序找的是 tools/ffmpeg.exe，等于没装。
+# 这里改成「不管它在哪一层，只按文件名摊平」，三种包都能正确落位。
+function Expand-ZipFlat {
+    param(
+        [Parameter(Mandatory = $true)][string]$ZipPath,
+        [Parameter(Mandatory = $true)][string]$DestDir
+    )
+    $tmp = Join-Path $env:TEMP ("v2w_flat_" + [guid]::NewGuid().ToString("N"))
+    try {
+        Expand-Archive -LiteralPath $ZipPath -DestinationPath $tmp -Force
+        $copied = 0
+        Get-ChildItem -LiteralPath $tmp -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in @('.exe', '.dll') } |
+            ForEach-Object {
+                Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $DestDir $_.Name) -Force
+                $copied++
+            }
+        Write-Host ("解压完成（扁平）：{0} 个 exe/dll -> {1}" -f $copied, $DestDir)
+    } finally {
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-Complete {
     param(
         [Parameter(Mandatory = $true)][string]$EntryExe,
@@ -196,7 +224,7 @@ if ($Force -or -not $trioOk) {
         foreach ($url in $ffmpegUrls) {
             try {
                 Get-RemoteFile -Url $url -OutFile $zip
-                Expand-ZipTo -ZipPath $zip -DestDir $tools
+                Expand-ZipFlat -ZipPath $zip -DestDir $tools
                 if ((Test-ExeRuns $ffmpegExe) -and (Test-ExeRuns $ffplayExe) -and (Test-ExeRuns $ffprobeExe)) {
                     $satisfied = $true
                     break
