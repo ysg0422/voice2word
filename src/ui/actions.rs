@@ -4879,67 +4879,145 @@ impl MainWindow {
         let t0 = std::time::Instant::now();
         let span_start = first_seg.start;
         let span_end = last_seg.end;
-        self.notice = Some(format!(
-            "正在重转 {}（{} – {}）…",
-            if lo == hi {
-                format!("第 {lo} 句")
-            } else {
-                format!("{lo}–{hi} 共 {} 句", picked.len())
-            },
-            crate::ui::format_mm_ss(span_start),
-            crate::ui::format_mm_ss(span_end)
-        ));
+        let label = if lo == hi {
+            format!("第 {lo} 句")
+        } else {
+            format!("{lo}–{hi} 共 {} 句", picked.len())
+        };
+        // 超过单次上限的选区拆成多段重转：早先 respan_window 会静默截断到前
+        // 120 秒，用户以为整段都重转了，错的地方如果在后面就会被漏掉。
+        let windows = crate::core::pipeline::respan_windows(span_start, span_end);
+        if windows.is_empty() {
+            // 与旧路径同文案：respan_window 对同样的区间也只会报这一句
+            self.notice = Some(format!(
+                "重转失败：重转区间无效：{span_start:.2}s → {span_end:.2}s"
+            ));
+            cx.notify();
+            return;
+        }
+        // 段数触顶说明选区超过 128 分钟，respan_windows 只覆盖了前 64 段。
+        // 多句路径是整段替换（replace_segment_span），后半段没转到的句子会被
+        // 一并删掉——宁可明确拒绝，也不做「看起来成功」的局部替换。
+        if windows.last().is_some_and(|w| w.1 < span_end - 1e-9) {
+            let limit_min = (crate::core::pipeline::RESTT_MAX_WINDOWS as f64
+                * crate::core::pipeline::RESTT_MAX_SPAN
+                / 60.0) as u32;
+            self.notice = Some(format!(
+                "选中的区间超过 {limit_min} 分钟，请缩小范围后分段重转"
+            ));
+            cx.notify();
+            return;
+        }
+        let segmented = windows.len() > 1;
+        self.notice = Some(if segmented {
+            // 首段在派发前就先亮出来，别让用户对着旧提示等第一段跑完
+            format!(
+                "正在分段重转 1/{}（{} – {}）…",
+                windows.len(),
+                crate::ui::format_mm_ss(windows[0].0),
+                crate::ui::format_mm_ss(windows[0].1)
+            )
+        } else {
+            format!(
+                "正在重转 {label}（{} – {}）…",
+                crate::ui::format_mm_ss(span_start),
+                crate::ui::format_mm_ss(span_end)
+            )
+        });
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let res = cx
-                .background_executor()
-                .spawn(async move {
-                    pipeline.retranscribe_window(
-                        &media,
-                        span_start,
-                        span_end,
-                        language.as_deref(),
-                        Some(threads),
-                        Some(model.as_path()),
-                    )
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                match res {
-                    Ok(segs) if !segs.is_empty() => {
-                        let ok = if lo == hi {
-                            // 单句：只换文字、绝不动时间轴（时间是用户按画面卡好的）
-                            let text = segs
-                                .iter()
-                                .map(|s| s.display_text().to_string())
-                                .collect::<Vec<_>>()
-                                .join("");
-                            this.state.replace_segment_text(lo, text)
-                        } else {
-                            // 多句：分句数通常会变，整段换掉（时间钳在被替换区间内）
-                            this.state.replace_segment_span(lo, hi, segs)
-                        };
-                        if ok {
+            // 串行逐段重转：引擎不是并发安全的（共用子进程表与取消标志），
+            // 几段 ffmpeg + 识别同时跑也只会互相抢 CPU，并不比顺序快。
+            let total = windows.len();
+            let mut merged: Vec<Segment> = Vec::new();
+            let mut failure: Option<(usize, String)> = None;
+            for (i, (from, to)) in windows.into_iter().enumerate() {
+                if segmented {
+                    // 一段最长 120 秒，解码加识别通常要几十秒。只在首尾各刷一次
+                    // 的话，用户中途既看不出还在动、也不知道进度到哪，很容易以为
+                    // 卡死又点一次重转，所以在每段开始前刷新提示条。
+                    let alive = this
+                        .update(cx, |this, cx| {
                             this.notice = Some(format!(
-                                "已重转 {}（耗时 {:.1} 秒）",
-                                if lo == hi {
-                                    format!("第 {lo} 句")
-                                } else {
-                                    format!("{lo}–{hi} 共 {} 句", picked.len())
-                                },
-                                t0.elapsed().as_secs_f64()
+                                "正在分段重转 {}/{}（{} – {}）…",
+                                i + 1,
+                                total,
+                                crate::ui::format_mm_ss(from),
+                                crate::ui::format_mm_ss(to)
                             ));
-                        } else {
-                            this.notice = Some("重转结果与原文相同".to_string());
-                        }
+                            cx.notify();
+                        })
+                        .is_ok();
+                    if !alive {
+                        // 窗口已经关掉，剩下的段跑了也没人看
+                        return;
                     }
-                    Ok(_) => {
-                        this.notice = Some("这一段没有识别出内容".to_string());
-                    }
+                }
+                let pipeline = pipeline.clone();
+                let media = media.clone();
+                let language = language.clone();
+                let model = model.clone();
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        pipeline.retranscribe_window(
+                            &media,
+                            from,
+                            to,
+                            language.as_deref(),
+                            Some(threads),
+                            Some(model.as_path()),
+                        )
+                    })
+                    .await;
+                match res {
+                    // 每段的时间轴已经还原成原片时间，按窗口顺序拼起来就是整段结果
+                    Ok(segs) => merged.extend(segs),
                     Err(err) => {
-                        this.notice = Some(format!("重转失败：{err}"));
+                        failure = Some((i + 1, err.to_string()));
+                        break;
                     }
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                // 任何一段失败都整体放弃、不动文档：半新半旧的文档比「什么都没变」
+                // 更难收拾——用户分不清哪几句是新结果、哪几句还是旧的，而且改动
+                // 可能已经随自动保存落盘；保留原文则还能原样再点一次重转。
+                if let Some((k, err)) = failure {
+                    // 单窗口沿用旧文案：未超限时用户看到的每一个字都不该变
+                    this.notice = Some(if total == 1 {
+                        format!("重转失败：{err}")
+                    } else {
+                        format!("第 {k} 段重转失败：{err}")
+                    });
+                    cx.notify();
+                    return;
+                }
+                if merged.is_empty() {
+                    this.notice = Some("这一段没有识别出内容".to_string());
+                    cx.notify();
+                    return;
+                }
+                let ok = if lo == hi {
+                    // 单句：只换文字、绝不动时间轴（时间是用户按画面卡好的）
+                    let text = merged
+                        .iter()
+                        .map(|s| s.display_text().to_string())
+                        .collect::<Vec<_>>()
+                        .join("");
+                    this.state.replace_segment_text(lo, text)
+                } else {
+                    // 多句：分句数通常会变，整段换掉（时间钳在被替换区间内）
+                    this.state.replace_segment_span(lo, hi, merged)
+                };
+                if ok {
+                    this.notice = Some(format!(
+                        "已重转 {label}（耗时 {:.1} 秒）",
+                        t0.elapsed().as_secs_f64()
+                    ));
+                } else {
+                    this.notice = Some("重转结果与原文相同".to_string());
                 }
                 cx.notify();
             });

@@ -754,7 +754,13 @@ pub struct TaskPipeline {
 /// 窗口前后各留的余量（秒）：太贴边会把一个字的起音切掉，识别结果从第一个音节就错。
 const RESTT_SPAN_PAD: f64 = 0.30;
 /// 单次重转的最长区间（秒）：挡住误传进来的「一小时」这种值。
-const RESTT_MAX_SPAN: f64 = 120.0;
+pub(crate) const RESTT_MAX_SPAN: f64 = 120.0;
+/// 一次重转最多切出的窗口数。按 120 秒一段，64 段已经覆盖 128 分钟。
+///
+/// 设上限不是为了省事，而是挡住脏数据：时间轴若被写成 1e9 秒，按段数直接
+/// 循环会排出上万个窗口，界面会在几千次 ffmpeg + 引擎调用里卡死。触顶时
+/// 只覆盖前 64 段，末窗终点会早于 `end`，调用方据此就能发现没转全。
+pub(crate) const RESTT_MAX_WINDOWS: usize = 64;
 
 /// 把用户选的 `[start, end]` 换算成 ffmpeg 要抽的 `(起点, 时长)`。
 ///
@@ -769,6 +775,63 @@ fn respan_window(start: f64, end: f64) -> Option<(f64, f64)> {
     let from = (start - RESTT_SPAN_PAD).max(0.0);
     let want = (span + (start - from) + RESTT_SPAN_PAD).max(0.3);
     Some((from, want))
+}
+
+/// 把用户选中的 `[start, end)` 切成若干段、每段都不超过 [`RESTT_MAX_SPAN`] 的窗口。
+///
+/// 为什么需要它：单次重转的上限是硬约束（挡住误传进来的长区间），但用户选中的
+/// 区间可以远超它。早先的做法是静默截断——用户以为整段都重转了，实际只有前
+/// 120 秒，错的地方如果在后面，会以为「重转没用」。这里把切分独立成纯函数，
+/// 由调用方逐段重转再拼回来。
+///
+/// 切法约定：
+/// - 各窗口首尾相接，无空隙、无重叠；首窗起点就是 `start`，末窗终点就是 `end`
+///   （被 [`RESTT_MAX_WINDOWS`] 截断时除外，见下）；
+/// - 均分，而不是「前面每段吃满 120 秒、末尾剩个碎片」：121 秒的选区切成两段
+///   60.5 秒，而不是 120 + 1——后者的第二段几乎只剩 ffmpeg 与引擎的冷启动开销，
+///   而且那一秒音频本来就在第一段前后 0.3 秒的余量里解过一遍；
+/// - 不在窗口之间额外留重叠：`retranscribe_window` 抽音频时本来就前后各多解
+///   [`RESTT_SPAN_PAD`]，切字风险已由它兜住；而每段结果又会被裁回各自的窗口
+///   边界，重叠区会被相邻两段各报一次，拼起来就是重复的字幕；
+/// - 段数超过 [`RESTT_MAX_WINDOWS`] 时每段仍按上限切、只覆盖前 64 段，末窗
+///   终点因此小于 `end`——调用方据此拒绝「只转了前半段却整段替换」的危险操作。
+///
+/// 非法输入（非有限 / `end <= start`）返回空：这个区间连一段都切不出来。
+pub(crate) fn respan_windows(start: f64, end: f64) -> Vec<(f64, f64)> {
+    if !start.is_finite() || !end.is_finite() || end <= start {
+        return Vec::new();
+    }
+    let total = end - start;
+    if total <= RESTT_MAX_SPAN {
+        return vec![(start, end)];
+    }
+    // `ceil` 保证未触顶时 `total / count <= RESTT_MAX_SPAN`；触顶时不能把段
+    // 拉长去凑满区间（那等于把上限又丢了），只能让最后一窗提前结束。
+    let needed = (total / RESTT_MAX_SPAN).ceil();
+    let capped = needed > RESTT_MAX_WINDOWS as f64;
+    let count = if capped {
+        RESTT_MAX_WINDOWS
+    } else {
+        needed as usize
+    };
+    let step = if capped {
+        RESTT_MAX_SPAN
+    } else {
+        total / count as f64
+    };
+    let mut windows = Vec::with_capacity(count);
+    let mut at = start;
+    for i in 0..count {
+        // 末窗直接贴住 `end`：`at + step` 的浮点误差会在末尾留下一丁点缝。
+        let to = if i + 1 == count && !capped {
+            end
+        } else {
+            (at + step).min(end)
+        };
+        windows.push((at, to));
+        at = to;
+    }
+    windows
 }
 
 impl TaskPipeline {
@@ -3234,6 +3297,67 @@ mod tests {
         assert!(super::respan_window(6.0, 5.0).is_none());
         assert!(super::respan_window(f64::NAN, 5.0).is_none());
         assert!(super::respan_window(0.0, f64::INFINITY).is_none());
+    }
+
+    /// 超长选区按上限切段：首尾贴边、无缝无叠、每段不超 120 秒。
+    #[test]
+    fn respan_windows_splits_long_span_without_gaps() {
+        fn check(start: f64, end: f64, windows: &[(f64, f64)]) {
+            assert!(!windows.is_empty(), "合法区间至少要切出一段");
+            assert_eq!(windows[0].0, start, "首窗必须从选区起点开始");
+            assert_eq!(windows.last().unwrap().1, end, "末窗必须贴住选区终点");
+            for (from, to) in windows {
+                assert!(to > from, "窗口不能为空：{from} → {to}");
+                assert!(
+                    to - from <= super::RESTT_MAX_SPAN + 1e-9,
+                    "单段超过上限：{from} → {to}"
+                );
+            }
+            for pair in windows.windows(2) {
+                assert_eq!(pair[0].1, pair[1].0, "窗口之间不能有缝也不能重叠");
+            }
+        }
+
+        // 短区间与恰好 120 秒：只切一段（未超限的单窗口路径不能被拆开）
+        assert_eq!(super::respan_windows(10.0, 11.0), vec![(10.0, 11.0)]);
+        assert_eq!(super::respan_windows(0.0, 120.0), vec![(0.0, 120.0)]);
+
+        // 121 秒：两段均分，而不是 120 + 1 的碎片窗口
+        let windows = super::respan_windows(0.0, 121.0);
+        assert_eq!(windows.len(), 2);
+        check(0.0, 121.0, &windows);
+        assert!((windows[0].1 - 60.5).abs() < 1e-9);
+
+        // 600 秒：5 段，每段 120 秒
+        let windows = super::respan_windows(0.0, 600.0);
+        assert_eq!(windows.len(), 5);
+        check(0.0, 600.0, &windows);
+        for (from, to) in &windows {
+            assert!(
+                (to - from - super::RESTT_MAX_SPAN).abs() < 1e-9,
+                "600 秒应均分成 120 秒一段，实得 {from} → {to}"
+            );
+        }
+        // 起点不是整数时也不能把起点算丢
+        check(7.25, 307.25, &super::respan_windows(7.25, 307.25));
+
+        // 段数上限：再长的区间也只排 RESTT_MAX_WINDOWS 段，末窗早于 end
+        let huge = super::respan_windows(0.0, 1_000_000.0);
+        assert_eq!(huge.len(), super::RESTT_MAX_WINDOWS);
+        for (from, to) in &huge {
+            assert!(to - from <= super::RESTT_MAX_SPAN + 1e-9);
+        }
+        assert!(
+            huge.last().unwrap().1 < 1_000_000.0,
+            "触顶后要从末窗终点看出没覆盖到 end"
+        );
+
+        // 非法区间一律空：调用方据此判断连一段都切不出来
+        assert!(super::respan_windows(5.0, 5.0).is_empty());
+        assert!(super::respan_windows(6.0, 5.0).is_empty());
+        assert!(super::respan_windows(f64::NAN, 5.0).is_empty());
+        assert!(super::respan_windows(0.0, f64::INFINITY).is_empty());
+        assert!(super::respan_windows(f64::NEG_INFINITY, 1.0).is_empty());
     }
 
     /// 覆盖时长不许超过媒体总时长：末块延展 / 幻觉时间戳都会把区间推到片尾之后。
