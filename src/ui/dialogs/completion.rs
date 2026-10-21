@@ -174,12 +174,15 @@ impl MainWindow {
                                     ))
                                     .child(Self::render_batch_stat(
                                         "音频传输管道",
-                                        "纯内存 0 I/O".to_string(),
+                                        Self::short_audio_pipe(
+                                            m.audio_process_name.as_deref(),
+                                            m.ffmpeg_audio_sec,
+                                        ),
                                         Theme::accent_blue(),
                                     ))
                                     .child(Self::render_batch_stat(
                                         "字幕规范",
-                                        "高精标点".to_string(),
+                                        Self::short_polish(m.polish_engine_name.as_deref()),
                                         Theme::text_primary(),
                                     )),
                             )
@@ -219,7 +222,7 @@ impl MainWindow {
                                     // 不单列的话只能从「阶段 3 很慢」里猜。
                                     .children(if m.asr_startup_sec > 0.0 {
                                         Some(Self::render_sub_metric_row(
-                                            "引擎启动（进程 + 模型加载）",
+                                            "首字延迟（到第一句字幕）",
                                             m.asr_startup_sec,
                                             m.total_elapsed_sec,
                                         ))
@@ -470,7 +473,7 @@ impl MainWindow {
 
     /// 「上一行的一部分」子行：缩进、小字号、无圆点。
     ///
-    /// 用于阶段 3 下面的「引擎启动（进程 + 模型加载）」：它**是**阶段 3 的一部分，
+    /// 用于阶段 3 下面的「首字延迟（到第一句字幕）」：它**是**阶段 3 的一部分，
     /// 用子行呈现既保留「各行相加 ≈ 总耗时」的直觉，又让启动开销一眼可见。
     pub(crate) fn render_sub_metric_row(
         label: impl Into<SharedString>,
@@ -512,6 +515,42 @@ impl MainWindow {
                             .child(time_str),
                     ),
             )
+    }
+
+    /// 「音频传输管道」磁贴的短标签，由**真实**的通道名派生。
+    ///
+    /// 以前这里写死 `纯内存 0 I/O`，于是同一次运行里出现两句互相打脸的话：
+    /// 磁贴说「纯内存 0 I/O」，下面那一行却写着「FFmpeg 抽取临时 WAV 文件」——
+    /// 切块并行、Whisper、以及带音频增强的路径都会真的落一个临时 WAV。
+    pub(crate) fn short_audio_pipe(name: Option<&str>, audio_sec: f64) -> String {
+        let name = name.unwrap_or("");
+        if name.contains("内存") || name.contains("管道") {
+            "纯内存 0 I/O".to_string()
+        } else if name.contains("WAV") {
+            "临时 WAV 文件".to_string()
+        } else if audio_sec > 0.0 {
+            "FFmpeg 抽取".to_string()
+        } else {
+            "未启用".to_string()
+        }
+    }
+
+    /// 「字幕规范」磁贴的短标签，由**真实**的标点/润色引擎名派生。
+    ///
+    /// 同理：写死 `高精标点` 会在「SenseVoice 原生标点」或「已关闭润色」时撒谎。
+    pub(crate) fn short_polish(name: Option<&str>) -> String {
+        let name = name.unwrap_or("");
+        if name.is_empty() || name.contains("跳过") || name.contains("未启用") {
+            "未启用".to_string()
+        } else if name.contains("原生") {
+            "原生标点".to_string()
+        } else if name.contains("Qwen") || name.contains("润色") {
+            "AI 润色".to_string()
+        } else if name.contains("标点") {
+            "高精标点".to_string()
+        } else {
+            "已处理".to_string()
+        }
     }
 
     pub(crate) fn render_metric_row(
@@ -559,5 +598,43 @@ impl MainWindow {
                             .child(format!("({:.0}%)", pct)),
                     ),
             )
+    }
+}
+
+// 刻意**不写** `use super::*`：本文件导入了 `gpui::*`，把整套类型拉进测试模块会让
+// `#[test]` 宏展开直接撞上递归上限（recursion limit reached while expanding `#[test]`）。
+// 这两个标签函数只需 `MainWindow` 一个名字，单独导入即可。
+#[cfg(test)]
+mod label_tests {
+    use crate::ui::MainWindow;
+
+    /// 磁贴文案必须跟着**真实**指标走，否则同一屏会出现两句互相打脸的描述：
+    /// 磁贴说「纯内存 0 I/O」，下面那行却写着「FFmpeg 抽取临时 WAV 文件」。
+    #[test]
+    fn tiles_follow_real_metrics_instead_of_hardcoded_text() {
+        // 切块并行 / Whisper / 带音频增强的路径都会真的落一个临时 WAV。
+        assert_eq!(
+            MainWindow::short_audio_pipe(Some("FFmpeg 抽取临时 WAV 文件"), 1.4),
+            "临时 WAV 文件"
+        );
+        assert_eq!(
+            MainWindow::short_audio_pipe(Some("纯内存 PCM 匿名管道推流 (0 物理磁盘 I/O)"), 0.0),
+            "纯内存 0 I/O"
+        );
+
+        // 标点：原生 / CT-Punc / 关闭 三种真实状态各给各的标签。
+        assert_eq!(
+            MainWindow::short_polish(Some("SenseVoice 原生标点与 ITN (免二次后处理)")),
+            "原生标点"
+        );
+        assert_eq!(
+            MainWindow::short_polish(Some("CT-Punc 极速标点 (INT8)")),
+            "高精标点"
+        );
+        assert_eq!(
+            MainWindow::short_polish(Some("标点/AI润色 (跳过)")),
+            "未启用"
+        );
+        assert_eq!(MainWindow::short_polish(None), "未启用");
     }
 }

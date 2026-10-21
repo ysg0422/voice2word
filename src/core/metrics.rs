@@ -54,7 +54,7 @@ pub struct PipelinePerformanceMetrics {
     /// 产出的字幕片段总数量
     #[serde(default)]
     pub segment_count: usize,
-    /// 首字延迟 (秒)：从「进入语音识别阶段」到「引擎吐出第一段输出」的时间。
+    /// 首字延迟 (秒)：从「进入语音识别阶段」到「产出**第一句字幕**」的时间。
     ///
     /// 这一项把**子进程启动 + 模型加载**从「阶段 3」里单独拎出来：
     /// - SenseVoice / CT-Punc 是 Python 冷启动 + ONNX 会话创建（几百 MB 权重从磁盘读入）；
@@ -154,7 +154,7 @@ impl PipelinePerformanceMetrics {
         // 只有确实测到才打这一行（断点续跑 / 复用产物时没有引擎启动）。
         let startup_line = if self.asr_startup_sec > 0.0 {
             format!(
-                "          └ 其中 引擎启动（进程 + 模型加载）：{:>6.1} 秒 ({:>4.1}%)",
+                "          └ 其中 首字延迟（到第一句字幕）：{:>6.1} 秒 ({:>4.1}%)",
                 self.asr_startup_sec, startup_pct
             )
         } else {
@@ -301,8 +301,8 @@ mod tests {
         };
         let text = m.format_summary_block();
         assert!(
-            text.contains("引擎启动"),
-            "报告里必须有「引擎启动」一行，实得：\n{text}"
+            text.contains("首字延迟"),
+            "报告里必须有「首字延迟」一行，实得：\n{text}"
         );
         assert!(text.contains("9.5"), "要显示测到的启动秒数：\n{text}");
         assert!(
@@ -319,7 +319,7 @@ mod tests {
             total_elapsed_sec: 5.2,
             ..Default::default()
         };
-        assert!(!m.format_summary_block().contains("引擎启动"));
+        assert!(!m.format_summary_block().contains("首字延迟"));
     }
 
     /// 各阶段之和与总耗时的差额必须被显式交代，不能留成「莫名消失的 N 秒」。

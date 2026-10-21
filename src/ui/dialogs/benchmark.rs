@@ -124,7 +124,7 @@ impl MainWindow {
                             // 首字延迟：进程启动 + 模型加载（阶段 3 的一部分）。
                             .children(if m.asr_startup_sec > 0.0 {
                                 Some(Self::render_sub_metric_row(
-                                    "引擎启动（进程 + 模型加载）",
+                                    "首字延迟（到第一句字幕）",
                                     m.asr_startup_sec,
                                     m.total_elapsed_sec,
                                 ))

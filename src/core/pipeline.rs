@@ -1485,8 +1485,11 @@ impl TaskPipeline {
                                     None
                                 },
                                 Some(Box::new(move |p, info, opt_seg| {
-                                    note_first_output(&slot_a, transcription_started);
+                                    // 只在**真的产出字幕**时打点：切块路径开跑时会先发一条
+                                    // 「切成 N 块」的纯进度通知（opt_seg 为 None），把它当成首字
+                                    // 会让「首字延迟」显示 1~2 秒，而用户其实还在空等。
                                     if let Some(seg) = opt_seg {
+                                        note_first_output(&slot_a, transcription_started);
                                         let _ = tx_cb.send(PipelineEvent::SegmentStream(seg));
                                     }
                                     let _ = tx_cb.send(PipelineEvent::Progress {
@@ -1550,8 +1553,11 @@ impl TaskPipeline {
                                 },
                                 model_override_stream.as_deref(),
                                 Some(Box::new(move |p, info, opt_seg| {
-                                    note_first_output(&asr_startup_slot_ws, transcription_started);
                                     if let Some(mut seg) = opt_seg {
+                                        note_first_output(
+                                            &asr_startup_slot_ws,
+                                            transcription_started,
+                                        );
                                         scale_segment_to_original_time(
                                             &mut seg,
                                             audio_speed,
@@ -1601,8 +1607,8 @@ impl TaskPipeline {
                     let (segs, v_sec) = tokio::task::spawn_blocking(move || {
                         let cb: Option<crate::engines::SegmentProgressCb> =
                             Some(Box::new(move |p, info, opt_seg| {
-                                note_first_output(&asr_startup_slot_ck, transcription_started);
                                 if let Some(mut seg) = opt_seg {
+                                    note_first_output(&asr_startup_slot_ck, transcription_started);
                                     // 流式预览也必须回映射，否则界面上会看到压实时间轴上的错位时间
                                     cb_restorer.restore(&mut seg);
                                     let _ = tx_whisper.send(PipelineEvent::SegmentStream(seg));
