@@ -1393,6 +1393,8 @@ impl TaskPipeline {
             .set_need_token_probs_for_quality(!caps.sensevoice());
 
         let transcription_started = Instant::now();
+        // 首字延迟的落点（见 `note_first_output`）：三个转写分支各自在首次回调时打点。
+        let asr_startup_slot: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
         let (mut segments, vad_sec, pure_whisper_sec) = if let Some(segs) = resumed_segments {
             info!("断点续跑：复用已落盘的识别结果（{} 段）", segs.len());
             (segs, 0.0, 0.0)
@@ -1408,8 +1410,10 @@ impl TaskPipeline {
                     let ffmpeg_stream = ffmpeg.clone();
                     let tx_sv = tx.clone();
                     let lang_sv = lang_clone.clone();
+                    let asr_startup_slot_sv = asr_startup_slot.clone();
 
-                    let (segs, elapsed) =
+                    // 引擎返回的 `elapsed` 不再作为阶段 3 的口径（改用墙钟，理由见下方注释）。
+                    let (segs, _engine_elapsed) =
                         tokio::task::spawn_blocking(move || -> Result<(Vec<Segment>, f64)> {
                             let mut ffmpeg_child =
                                 ffmpeg_stream.spawn_audio_stream(&in_file_stream)?;
@@ -1428,6 +1432,7 @@ impl TaskPipeline {
                             let mut reaper = ChildReaper(ffmpeg_child);
 
                             let tx_cb = tx_sv.clone();
+                            let slot_a = asr_startup_slot_sv.clone();
                             let res = sv_engine.transcribe_stream(
                                 Box::new(ffmpeg_stdout),
                                 lang_sv.as_deref(),
@@ -1438,6 +1443,7 @@ impl TaskPipeline {
                                     None
                                 },
                                 Some(Box::new(move |p, info, opt_seg| {
+                                    note_first_output(&slot_a, transcription_started);
                                     if let Some(seg) = opt_seg {
                                         let _ = tx_cb.send(PipelineEvent::SegmentStream(seg));
                                     }
@@ -1452,7 +1458,11 @@ impl TaskPipeline {
                             res
                         })
                         .await??;
-                    (segs, 0.0, elapsed)
+                    // 量**墙钟**而不是引擎内部计时：引擎的计时从子进程起来之后才开始，
+                    // 会把「进程启动 + 模型加载」漏在阶段 3 之外。统一到 `transcription_started`
+                    // 之后，本条与 Whisper / Chunked 两支口径一致，
+                    // 「首字延迟」才能真正作为阶段 3 的子集呈现。
+                    (segs, 0.0, transcription_started.elapsed().as_secs_f64())
                 }
                 TranscribeRoute::WhisperStream => {
                     let in_file_stream = input_file.clone();
@@ -1462,6 +1472,7 @@ impl TaskPipeline {
                     // 语音增强链在这里就地生效；`chain_with_speed` 已含 atempo，
                     // 因此它同时取代了原先单独的变速推流，输出时长仍为 dur / speed。
                     let chain_stream = enhance_chain.clone();
+                    let asr_startup_slot_ws = asr_startup_slot.clone();
 
                     let (segs, v_sec) =
                         tokio::task::spawn_blocking(move || -> Result<(Vec<Segment>, f64)> {
@@ -1497,6 +1508,7 @@ impl TaskPipeline {
                                 },
                                 model_override_stream.as_deref(),
                                 Some(Box::new(move |p, info, opt_seg| {
+                                    note_first_output(&asr_startup_slot_ws, transcription_started);
                                     if let Some(mut seg) = opt_seg {
                                         scale_segment_to_original_time(
                                             &mut seg,
@@ -1541,10 +1553,12 @@ impl TaskPipeline {
                     // 否则会把短音频误判成长音频、切出一堆无语音的碎块。
                     let plan_duration = asr_duration;
                     let cb_restorer = restorer.clone();
+                    let asr_startup_slot_ck = asr_startup_slot.clone();
 
                     let (segs, v_sec) = tokio::task::spawn_blocking(move || {
                         let cb: Option<crate::engines::SegmentProgressCb> =
                             Some(Box::new(move |p, info, opt_seg| {
+                                note_first_output(&asr_startup_slot_ck, transcription_started);
                                 if let Some(mut seg) = opt_seg {
                                     // 流式预览也必须回映射，否则界面上会看到压实时间轴上的错位时间
                                     cb_restorer.restore(&mut seg);
@@ -2168,6 +2182,11 @@ impl TaskPipeline {
                 });
             }
         }
+        // 首字延迟：三个转写分支都可能在首次回调时打点；断点续跑不会打点（就是 0）。
+        let asr_startup_sec = asr_startup_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or(0.0);
         let srt_export_sec = writing_started.elapsed().as_secs_f64();
         let total_elapsed_sec = pipeline_started.elapsed().as_secs_f64();
 
@@ -2206,6 +2225,7 @@ impl TaskPipeline {
             srt_export_sec,
             export_name: Some(export_name),
             segment_count: segments.len(),
+            asr_startup_sec,
             total_elapsed_sec,
         };
 
@@ -2323,6 +2343,22 @@ fn restore_final_timeline(
         return;
     }
     restorer.restore_all(segments);
+}
+
+/// 记录「引擎吐出第一段输出」的时刻（只记第一次）。
+///
+/// 用途：把**子进程启动 + 模型加载**从「阶段 3」的总时长里单独量出来。
+/// 用户体感里「点了开始要等半天才开始出字」就是这一段——
+/// SenseVoice/CT-Punc 是 Python 冷启动 + ONNX 权重载入，
+/// Whisper 是 whisper-cli 载入 ggml + 后端初始化。
+///
+/// 用「第一次回调」作为判定点：三个后端都在拿到首句（或首个进度）时才回调，
+/// 之前的时间就是纯启动开销。
+fn note_first_output(slot: &Mutex<Option<f64>>, started: Instant) {
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(started.elapsed().as_secs_f64());
+    }
 }
 
 /// 计算字幕/语音区间的并集时长，避免相邻或重叠片段重复计时。

@@ -54,6 +54,16 @@ pub struct PipelinePerformanceMetrics {
     /// 产出的字幕片段总数量
     #[serde(default)]
     pub segment_count: usize,
+    /// 首字延迟 (秒)：从「进入语音识别阶段」到「引擎吐出第一段输出」的时间。
+    ///
+    /// 这一项把**子进程启动 + 模型加载**从「阶段 3」里单独拎出来：
+    /// - SenseVoice / CT-Punc 是 Python 冷启动 + ONNX 会话创建（几百 MB 权重从磁盘读入）；
+    /// - Whisper 是 whisper-cli 载入 ggml 权重 + Vulkan/CPU 后端初始化。
+    ///
+    /// 用户体感里「点了开始要等半天才开始出字」就是这一项；此前它被并进阶段 3 的
+    /// 总时长，报告里看不出来，容易误判成「识别本身很慢」。
+    #[serde(default)]
+    pub asr_startup_sec: f64,
     /// 全流程总耗时 (秒)
     pub total_elapsed_sec: f64,
 }
@@ -82,6 +92,7 @@ impl Hash for PipelinePerformanceMetrics {
         self.srt_export_sec.to_bits().hash(state);
         self.export_name.hash(state);
         self.segment_count.hash(state);
+        self.asr_startup_sec.to_bits().hash(state);
         self.total_elapsed_sec.to_bits().hash(state);
     }
 }
@@ -127,6 +138,28 @@ impl PipelinePerformanceMetrics {
         let export_desc = self.export_name.as_deref().unwrap_or("字幕文件写出");
 
         let total = self.total_elapsed_sec.max(0.001);
+        // 各阶段之和之外的「碎片时间」：阶段切换、optimize_segments 整理、
+        // 阶段产物落盘、取消检查等。以前它完全不体现在报告里，于是
+        // 「各阶段加起来 12s、总耗时 18s」时用户只能猜那 6 秒去哪了。
+        let accounted = self.ffmpeg_audio_sec
+            + self.vad_sec
+            + self.whisper_sec
+            + self.rescue_sec
+            + self.qwen_sec
+            + self.diarization_sec
+            + self.srt_export_sec;
+        let overhead_sec = (total - accounted).max(0.0);
+        let overhead_pct = (overhead_sec / total * 100.0).clamp(0.0, 100.0);
+        let startup_pct = (self.asr_startup_sec / total * 100.0).clamp(0.0, 100.0);
+        // 只有确实测到才打这一行（断点续跑 / 复用产物时没有引擎启动）。
+        let startup_line = if self.asr_startup_sec > 0.0 {
+            format!(
+                "          └ 其中 引擎启动（进程 + 模型加载）：{:>6.1} 秒 ({:>4.1}%)",
+                self.asr_startup_sec, startup_pct
+            )
+        } else {
+            String::new()
+        };
         let audio_pct = (self.ffmpeg_audio_sec / total * 100.0).clamp(0.0, 100.0);
         let vad_pct = (self.vad_sec / total * 100.0).clamp(0.0, 100.0);
         let asr_pct = (self.whisper_sec / total * 100.0).clamp(0.0, 100.0);
@@ -162,11 +195,13 @@ impl PipelinePerformanceMetrics {
 [阶段 1] 音频通道：    {:>6.1} 秒 ({:>4.1}%) | {audio_desc}
 [阶段 2] 语音活性检测：{:>6.1} 秒 ({:>4.1}%) | {vad_desc}
 [阶段 3] 语音转写识别：{:>6.1} 秒 ({:>4.1}%) | {asr_desc}
+{startup_line}
 [阶段 3+]置信度救场：  {:>6.1} 秒 ({:>4.1}%) | {rescue_desc}
 [阶段 4] 标点与语法：  {:>6.1} 秒 ({:>4.1}%) | {polish_desc}
 [阶段 4+]说话人分离：  {:>6.1} 秒 ({:>4.1}%) | {diarization_desc}
 [阶段 5] 字幕导出写出：{:>6.1} 秒 ({:>4.1}%) | {export_desc}
 
+未计入各阶段的开销：  {:>6.1} 秒 ({:>4.1}%) | 阶段切换 / 字幕整理 / 产物落盘
 全流程总耗时：       {:>6.1} 秒
 ===================================================================
 "#,
@@ -191,6 +226,8 @@ impl PipelinePerformanceMetrics {
             diarization_pct,
             self.srt_export_sec,
             export_pct,
+            overhead_sec,
+            overhead_pct,
             self.total_elapsed_sec,
         )
     }
@@ -242,6 +279,69 @@ impl PipelinePerformanceMetrics {
 
 #[cfg(test)]
 mod tests {
+
+    /// 首字延迟必须真的出现在报告里，且**作为阶段 3 的子集**呈现。
+    ///
+    /// 这条是用户的原始诉求：模型加载要等十几秒，但报告里看不到，
+    /// 于是误以为「识别本身很慢」。
+    #[test]
+    fn summary_prints_engine_startup_under_stage3() {
+        let m = PipelinePerformanceMetrics {
+            video_duration: 60.0,
+            voiced_duration_sec: 55.0,
+            ffmpeg_audio_sec: 1.0,
+            vad_sec: 0.5,
+            whisper_sec: 12.0,    // 阶段 3 总时长
+            asr_startup_sec: 9.5, // 其中 9.5s 是进程启动 + 模型加载
+            qwen_sec: 1.0,
+            srt_export_sec: 0.5,
+            segment_count: 20,
+            total_elapsed_sec: 16.0,
+            ..Default::default()
+        };
+        let text = m.format_summary_block();
+        assert!(
+            text.contains("引擎启动"),
+            "报告里必须有「引擎启动」一行，实得：\n{text}"
+        );
+        assert!(text.contains("9.5"), "要显示测到的启动秒数：\n{text}");
+        assert!(
+            text.contains("12.0"),
+            "阶段 3 的数值不能被启动时间顶掉：\n{text}"
+        );
+    }
+
+    /// 没有测到启动时间（断点续跑 / 复用产物）时，不该凭空打印一行 0.0。
+    #[test]
+    fn summary_omits_startup_line_when_not_measured() {
+        let m = PipelinePerformanceMetrics {
+            whisper_sec: 5.0,
+            total_elapsed_sec: 5.2,
+            ..Default::default()
+        };
+        assert!(!m.format_summary_block().contains("引擎启动"));
+    }
+
+    /// 各阶段之和与总耗时的差额必须被显式交代，不能留成「莫名消失的 N 秒」。
+    #[test]
+    fn summary_accounts_for_time_outside_stages() {
+        let m = PipelinePerformanceMetrics {
+            ffmpeg_audio_sec: 1.0,
+            vad_sec: 1.0,
+            whisper_sec: 4.0,
+            qwen_sec: 1.0,
+            srt_export_sec: 1.0,
+            total_elapsed_sec: 10.0, // 各阶段合计 8.0 → 差 2.0
+            ..Default::default()
+        };
+        let text = m.format_summary_block();
+        assert!(
+            text.contains("未计入各阶段的开销"),
+            "必须交代阶段之外的耗时：\n{text}"
+        );
+        assert!(text.contains("2.0"), "差额应打印为 2.0 秒：\n{text}");
+    }
+
     use super::*;
 
     /// 打印名额的三种情形**必须放在同一个用例里**：`LAST_PRINTED` 是进程内全局状态，

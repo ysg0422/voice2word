@@ -112,6 +112,15 @@ impl MainWindow {
                         };
                         let saved_mins =
                             (info.total_duration - m.total_elapsed_sec).max(0.0) / 60.0;
+                        // 各阶段之和之外的碎片时间，口径与终端报告 `format_summary_block` 一致。
+                        let accounted = m.ffmpeg_audio_sec
+                            + m.vad_sec
+                            + m.whisper_sec
+                            + m.rescue_sec
+                            + m.qwen_sec
+                            + m.diarization_sec
+                            + m.srt_export_sec;
+                        let overhead = (m.total_elapsed_sec - accounted).max(0.0);
                         primitives::card_with_pad(Theme::SPACE_4)
                             .w_full()
                             .bg(Theme::bg_sidebar())
@@ -205,6 +214,18 @@ impl MainWindow {
                                         m.total_elapsed_sec,
                                         Theme::accent_mint(),
                                     ))
+                                    // 首字延迟：进程启动 + 模型加载。
+                                    // 用户体感里「点了开始要等半天才出字」就是这一段，
+                                    // 不单列的话只能从「阶段 3 很慢」里猜。
+                                    .children(if m.asr_startup_sec > 0.0 {
+                                        Some(Self::render_sub_metric_row(
+                                            "引擎启动（进程 + 模型加载）",
+                                            m.asr_startup_sec,
+                                            m.total_elapsed_sec,
+                                        ))
+                                    } else {
+                                        None
+                                    })
                                     .child(Self::render_metric_row(
                                         m.polish_engine_name
                                             .clone()
@@ -220,7 +241,18 @@ impl MainWindow {
                                         m.srt_export_sec,
                                         m.total_elapsed_sec,
                                         Theme::text_muted(),
-                                    )),
+                                    ))
+                                    // 阶段之外的开销（阶段切换 / 字幕整理 / 产物落盘）：
+                                    // 以前各行加起来总比总耗时少一截，用户只能猜。
+                                    .children(if overhead > 0.05 {
+                                        Some(Self::render_sub_metric_row(
+                                            "阶段外开销（切换 / 整理 / 落盘）",
+                                            overhead,
+                                            m.total_elapsed_sec,
+                                        ))
+                                    } else {
+                                        None
+                                    }),
                             )
                     }))
                     // 操作按钮组
@@ -423,6 +455,65 @@ impl MainWindow {
             )
     }
 
+    /// 秒数的统一短格式（毫秒/秒），两个弹窗共用一套口径。
+    pub(crate) fn format_sec_short(sec: f64) -> String {
+        if sec <= 0.00001 {
+            "0 ms".to_string()
+        } else if sec < 0.001 {
+            "< 1 ms".to_string()
+        } else if sec < 0.1 {
+            format!("{:.0} ms", (sec * 1000.0).round())
+        } else {
+            format!("{:.1} 秒", sec)
+        }
+    }
+
+    /// 「上一行的一部分」子行：缩进、小字号、无圆点。
+    ///
+    /// 用于阶段 3 下面的「引擎启动（进程 + 模型加载）」：它**是**阶段 3 的一部分，
+    /// 用子行呈现既保留「各行相加 ≈ 总耗时」的直觉，又让启动开销一眼可见。
+    pub(crate) fn render_sub_metric_row(
+        label: impl Into<SharedString>,
+        sec: f64,
+        total: f64,
+    ) -> impl IntoElement {
+        let label_str: SharedString = label.into();
+        let pct = if total > 0.0 {
+            (sec / total * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let time_str = Self::format_sec_short(sec);
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .text_size(px(Theme::TEXT_CAPTION))
+            .pl(px(Theme::SPACE_5))
+            .child(
+                div()
+                    .text_color(Theme::text_muted())
+                    .child(format!("└ 其中 {label_str}")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(Theme::SPACE_2))
+                    .child(
+                        div()
+                            .text_color(Theme::text_secondary())
+                            .child(format!("{:.0}%", pct)),
+                    )
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(Theme::text_secondary())
+                            .child(time_str),
+                    ),
+            )
+    }
+
     pub(crate) fn render_metric_row(
         label: impl Into<SharedString>,
         sec: f64,
@@ -435,15 +526,7 @@ impl MainWindow {
         } else {
             0.0
         };
-        let time_str = if sec <= 0.00001 {
-            "0 ms".to_string()
-        } else if sec < 0.001 {
-            "< 1 ms".to_string()
-        } else if sec < 0.1 {
-            format!("{:.0} ms", (sec * 1000.0).round())
-        } else {
-            format!("{:.1} 秒", sec)
-        };
+        let time_str = Self::format_sec_short(sec);
 
         div()
             .flex()

@@ -18,6 +18,15 @@ impl MainWindow {
     ) -> impl IntoElement {
         let m = &info.metrics;
         let dur_str = format_duration_short(m.video_duration);
+        // 各阶段之和之外的碎片时间（阶段切换 / 字幕整理 / 产物落盘）。
+        let accounted = m.ffmpeg_audio_sec
+            + m.vad_sec
+            + m.whisper_sec
+            + m.rescue_sec
+            + m.qwen_sec
+            + m.diarization_sec
+            + m.srt_export_sec;
+        let overhead = (m.total_elapsed_sec - accounted).max(0.0);
 
         // 键盘支持：注册全局按键拦截（幂等），取回面板 + 两个按钮的焦点句柄。
         keyboard::ensure_handler(cx);
@@ -112,6 +121,16 @@ impl MainWindow {
                                 m.total_elapsed_sec,
                                 Theme::accent_mint(),
                             ))
+                            // 首字延迟：进程启动 + 模型加载（阶段 3 的一部分）。
+                            .children(if m.asr_startup_sec > 0.0 {
+                                Some(Self::render_sub_metric_row(
+                                    "引擎启动（进程 + 模型加载）",
+                                    m.asr_startup_sec,
+                                    m.total_elapsed_sec,
+                                ))
+                            } else {
+                                None
+                            })
                             .child(Self::render_metric_row(
                                 format!(
                                     "4. {}",
@@ -130,6 +149,16 @@ impl MainWindow {
                                 m.total_elapsed_sec,
                                 Theme::text_muted(),
                             ))
+                            // 阶段之外的开销，口径与终端报告一致。
+                            .children(if overhead > 0.05 {
+                                Some(Self::render_sub_metric_row(
+                                    "阶段外开销（切换 / 整理 / 落盘）",
+                                    overhead,
+                                    m.total_elapsed_sec,
+                                ))
+                            } else {
+                                None
+                            })
                             .child(
                                 div()
                                     .pt(px(Theme::SPACE_2))
