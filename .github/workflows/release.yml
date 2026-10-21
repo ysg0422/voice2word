@@ -159,39 +159,14 @@ jobs:
           Copy-Item target/release/voice2word.exe dist/voice2word.exe -Force
           Copy-Item target/release/voice2word-cli.exe dist/voice2word-cli.exe -Force
 
-          # 确保 tools 目录存在并尝试抓取 ffmpeg/ffplay/ffprobe。
-          #
-          # **ffprobe 必须一起抓**：时长探测优先用 `ffprobe -select_streams a:0`，
-          # 缺了它会退回解析 `ffmpeg -i` 的 stderr——能工作但精度更差、耗时更长，
-          # 长素材上会明显拖慢启动。
-          #
-          # 网络异常不阻断打包流程：安装包对这些文件是 skipifsourcedoesntexist，
-          # 软件自带一键补齐。
-          New-Item -ItemType Directory -Path tools -Force | Out-Null
-          # **必须是静态构建**：上面这个源里的 ffplay.exe 是 `--enable-shared` 构建，
-          # 依赖 7 个 av*/sw* DLL（avcodec-62 / avformat-62 / avutil-60 / avdevice-62 /
-          # avfilter-11 / swresample-6 / swscale-9），而包里一个都没有。
-          # 开发机上它能跑，只是因为那些 DLL 恰好在 PATH 上；客户机 PATH 上没有 ffmpeg，
-          # `tools\ffplay.exe` 就是唯一候选 → 以 0xC0000135 秒退，
-          # **音频管线被整个静默跳过**，用户看到的是「视频能播但没声音」。
-          #
-          # 静态构建（gyan.dev 的 essentials 变体）把全部依赖编进 exe，单文件可用。
-          $ffBinaries = @{
-            "ffmpeg.exe"  = "https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-essentials_build\bin\ffmpeg.exe"
-            "ffplay.exe"  = "https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-essentials_build\bin\ffplay.exe"
-            "ffprobe.exe" = "https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-essentials_build\bin\ffprobe.exe"
-          }
-          foreach ($name in $ffBinaries.Keys) {
-            $dest = Join-Path "tools" $name
-            if (Test-Path $dest) { continue }
-            try {
-              Write-Host "Downloading $name for installer..." -ForegroundColor Cyan
-              Invoke-WebRequest -Uri $ffBinaries[$name] -OutFile $dest -TimeoutSec 60 -ErrorAction Stop
-            } catch {
-              Write-Host "下载 $name 失败或跳过（安装包将按缺省配置打包，由客户端按需补齐）：$($_.Exception.Message)" -ForegroundColor Yellow
+          # FFmpeg 三件套由上一步的预取脚本负责（含 av*/sw* DLL）。
+          # 这里只做**存在性断言**，不再自己下载——两处各自下载过同名文件时，
+          # 打包结果会取决于谁先跑，正是「本机好使、别人电脑不好使」的成因。
+          foreach ($need in @('tools/ffmpeg.exe', 'tools/ffplay.exe', 'tools/ffprobe.exe')) {
+            if (-not (Test-Path $need)) {
+              throw "缺 $need：预取步骤应当已经准备好它。若刚改过预取源，请检查上一步日志。"
             }
           }
-
           # 编译安装包之前先自检：确认「会打进包的东西」真的能用。
           # 失败即中止发布——发出一个必然在客户机上失败的包没有意义。
           Write-Host "Running package self-check..." -ForegroundColor Cyan
