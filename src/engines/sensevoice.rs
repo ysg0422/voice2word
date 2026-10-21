@@ -377,6 +377,68 @@ fn provider_report_outcome(
     }
 }
 
+/// 识别模型族：决定 runner 的 `--model-type`，以及是否需要额外的 decoder 文件。
+///
+/// 为什么需要它：sherpa-onnx 这一个运行时能承载多个模型族（Dolphin / Paraformer /
+/// FireRedASR / NeMo…），它们的 onnx 结构不同，runner 必须知道按哪种方式建会话。
+/// **缺省必须是 SenseVoice**：现有配置与调用点都按它工作，加这个枚举不能改变任何
+/// 既有行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelFamily {
+    /// 阿里 SenseVoice（现状；也是 `--model-type` 的缺省值）
+    #[default]
+    SenseVoice,
+    /// 阿里 Paraformer（非自回归，中文工业档）
+    Paraformer,
+    /// 小红书 FireRedASR（encoder + decoder 两个 onnx）
+    FireRedAsr,
+    /// DataoceanAI Dolphin（多语种，单 onnx）
+    DolphinCtc,
+    /// NVIDIA NeMo CTC（单 onnx）
+    NemoCtc,
+    /// NVIDIA NeMo Canary（encoder + decoder 两个 onnx）
+    NemoCanary,
+}
+
+impl ModelFamily {
+    /// runner 认的 `--model-type` 取值。
+    pub fn runner_model_type(self) -> &'static str {
+        match self {
+            Self::SenseVoice => "sensevoice",
+            Self::Paraformer => "paraformer",
+            Self::FireRedAsr => "fire-red-asr",
+            Self::DolphinCtc => "dolphin-ctc",
+            Self::NemoCtc => "nemo-ctc",
+            Self::NemoCanary => "nemo-canary",
+        }
+    }
+
+    /// 该族是否必须额外给一个 decoder 文件。
+    pub fn needs_decoder(self) -> bool {
+        matches!(self, Self::FireRedAsr | Self::NemoCanary)
+    }
+
+    /// 追加到 runner 命令行的额外参数。
+    ///
+    /// **SenseVoice 恒为空**：runner 的 `--model-type` 缺省就是它。显式再传一遍虽然
+    /// 等价，但会让「改造前后命令行逐字节一致」这条回归断言失去意义——保持空表，
+    /// 老命令行原样不变。
+    pub fn runner_extra_args(self, decoder: Option<&Path>) -> Vec<String> {
+        if self == Self::SenseVoice {
+            return Vec::new();
+        }
+        let mut args = vec![
+            "--model-type".to_string(),
+            self.runner_model_type().to_string(),
+        ];
+        if let Some(path) = decoder {
+            args.push("--decoder".to_string());
+            args.push(path.display().to_string());
+        }
+        args
+    }
+}
+
 #[derive(Clone)]
 pub struct SenseVoiceEngine {
     runner_path: PathBuf,
@@ -386,6 +448,10 @@ pub struct SenseVoiceEngine {
     threads: u32,
     /// 运行 runner 脚本的 Python 解释器（默认 "python"，可配置为绝对路径）
     python_path: PathBuf,
+    /// 识别模型族（缺省 SenseVoice，与改造前完全一致）。
+    family: ModelFamily,
+    /// 少数模型族（FireRedASR / Canary）需要的 decoder 文件。
+    decoder_path: Option<std::path::PathBuf>,
     /// ONNX 执行后端：`cpu` | `dml`。默认 `cpu`（零回归）；
     /// `dml` 只有在 Python 环境装了 DirectML 版 sherpa-onnx 时才真正生效，
     /// 否则 runner 会静默回落 cpu。收敛规则与 `GpuConfig::resolve_onnx_provider` 一致。
@@ -477,6 +543,8 @@ impl SenseVoiceEngine {
             vad_model_path: vad_model_path.as_ref().to_path_buf(),
             threads: clamp_threads(threads),
             python_path: python_path.as_ref().to_path_buf(),
+            family: ModelFamily::default(),
+            decoder_path: None,
             provider,
             provider_status: Arc::new(Mutex::new(None)),
             fallback_reported: Arc::new(AtomicBool::new(false)),
@@ -624,6 +692,24 @@ impl SenseVoiceEngine {
     }
 
     /// 检查 SenseVoice 所需权重与执行体是否就位（支持纯原生 exe 或 Python runner）
+    /// 指定模型族（缺省 SenseVoice）。构造式接口：不改现有构造函数的签名，
+    /// 老调用点一行都不用动。
+    pub fn with_family(mut self, family: ModelFamily, decoder: Option<std::path::PathBuf>) -> Self {
+        self.family = family;
+        self.decoder_path = decoder;
+        self
+    }
+
+    /// 当前模型族（供 UI/日志判断走的是哪条识别链路）。
+    pub fn family(&self) -> ModelFamily {
+        self.family
+    }
+
+    /// 该引擎要追加给 runner 的参数（SenseVoice 为空表，命令行与改造前逐字节一致）。
+    fn family_args(&self) -> Vec<String> {
+        self.family.runner_extra_args(self.decoder_path.as_deref())
+    }
+
     pub fn is_available(&self) -> bool {
         // 判据不能只看 `exists()`：一次失败的复制/半截下载会留下**存在但内容不全**
         // 的模型，闸门放过去之后，真正的失败发生在 sherpa/onnxruntime 里，报的是一句
@@ -678,6 +764,7 @@ impl SenseVoiceEngine {
             super::media_pipeline::apply_default_child_flags(&mut c);
             super::media_pipeline::apply_python_env(&mut c);
             c.arg(&self.runner_path)
+                .args(self.family_args())
                 .arg("--model")
                 .arg(&self.model_path)
                 .arg("--tokens")
@@ -727,6 +814,7 @@ impl SenseVoiceEngine {
 
         let th = clamp_threads(threads.unwrap_or(self.threads));
         cmd.arg(&self.runner_path)
+            .args(self.family_args())
             .arg("--model")
             .arg(&self.model_path)
             .arg("--tokens")
@@ -1414,6 +1502,40 @@ fn consume_stdout<R: std::io::BufRead>(
 }
 #[cfg(test)]
 mod tests {
+
+    /// SenseVoice 是缺省族，**不能**往命令行里加任何参数——
+    /// 否则「改造前后命令行逐字节一致」这条回归就失去意义。
+    #[test]
+    fn sensevoice_family_adds_no_runner_args() {
+        assert!(super::ModelFamily::SenseVoice
+            .runner_extra_args(None)
+            .is_empty());
+        assert!(super::ModelFamily::SenseVoice
+            .runner_extra_args(Some(std::path::Path::new("dec.onnx")))
+            .is_empty());
+    }
+
+    /// 其它族必须显式声明 --model-type；需要 decoder 的族还要带上 --decoder。
+    #[test]
+    fn other_families_pass_model_type_and_decoder() {
+        use super::ModelFamily;
+        assert_eq!(
+            ModelFamily::DolphinCtc.runner_extra_args(None),
+            vec!["--model-type", "dolphin-ctc"]
+        );
+        assert_eq!(
+            ModelFamily::Paraformer.runner_extra_args(None),
+            vec!["--model-type", "paraformer"]
+        );
+        assert_eq!(
+            ModelFamily::FireRedAsr.runner_extra_args(Some(std::path::Path::new("dec.onnx"))),
+            vec!["--model-type", "fire-red-asr", "--decoder", "dec.onnx"]
+        );
+        assert!(ModelFamily::FireRedAsr.needs_decoder());
+        assert!(ModelFamily::NemoCanary.needs_decoder());
+        assert!(!ModelFamily::NemoCtc.needs_decoder());
+    }
+
     use super::*;
     use crate::engines::whisper::take_live_pids;
 
