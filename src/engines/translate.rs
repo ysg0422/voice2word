@@ -2034,6 +2034,13 @@ pub(crate) fn post_chat_completions(
     }
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(cfg.timeout_secs.clamp(10, 600)))
+        // 继承环境里的 HTTP_PROXY / HTTPS_PROXY —— 与 `model_download` /
+        // `update_check` 保持同一套行为。
+        //
+        // 此前这里没有开：企业 / 校园网里出网必须走代理，于是出现「模型能下载、
+        // 在线翻译却一直连不上」的割裂现象，而错误文案只会说「无法连接」，
+        // 用户第一反应是密钥或地址填错了。
+        .try_proxy_from_env(true)
         .build();
 
     let mut req = agent

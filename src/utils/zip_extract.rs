@@ -223,6 +223,20 @@ pub fn extract_zip(bytes: &[u8], dest_dir: &Path) -> Result<usize> {
                 out.len()
             );
         }
+        // CRC32 校验：只有「长度对、内容错」的损坏（传输位翻转、镜像返回被截断又补齐的包）
+        // 会被长度检查漏掉，落到磁盘上就是**静默损坏的 DLL**——加载时报的错会离谱到
+        // 完全指不回这里。上游发布的 zip 都带真实 CRC，所以这一条能真正兜住。
+        if e.crc32 != 0 {
+            let actual = crc32_ieee(&out);
+            if actual != e.crc32 {
+                bail!(
+                    "解压条目 CRC32 校验失败: {}（声明 {:08x}，实际 {:08x}）——压缩包可能已损坏",
+                    name,
+                    e.crc32,
+                    actual
+                );
+            }
+        }
         total_out = total_out.saturating_add(out.len() as u64);
         if total_out > MAX_TOTAL_UNCOMPRESSED {
             bail!("解压总输出超过 {MAX_TOTAL_UNCOMPRESSED} 字节上限，已中止");
@@ -258,6 +272,9 @@ struct ZipEntry {
     comp_size: u32,
     uncomp_size: u32,
     local_off: u32,
+    /// 中央目录里声明的 CRC32。`0` 视为「未提供」（本仓库自己的备份 zip 就写 0），
+    /// 此时跳过校验；上游发布的包都会带真实的 CRC。
+    crc32: u32,
 }
 
 /// 解析中央目录，返回全部条目。
@@ -287,6 +304,7 @@ fn parse_central_directory(bytes: &[u8]) -> Result<Vec<ZipEntry>> {
             bail!("中央目录条目签名不正确（偏移 {p}）");
         }
         let method = read_u16(bytes, p + 10)?;
+        let crc32 = read_u32(bytes, p + 16)?;
         let comp_size = read_u32(bytes, p + 20)?;
         let uncomp_size = read_u32(bytes, p + 24)?;
         let name_len = read_u16(bytes, p + 28)? as usize;
@@ -310,6 +328,7 @@ fn parse_central_directory(bytes: &[u8]) -> Result<Vec<ZipEntry>> {
             comp_size,
             uncomp_size,
             local_off,
+            crc32,
         });
     }
     Ok(entries)
@@ -349,6 +368,29 @@ fn common_prefix(entries: &[ZipEntry]) -> Option<String> {
     Some(format!("{p}/"))
 }
 
+/// 标准 CRC-32（IEEE 802.3，与 zip 用的多项式一致）。
+///
+/// 自己实现而不是引 `crc32fast`：本模块的整体设计就是「离线可构建、不引新依赖」
+/// （zip 解析本身也是手写的）。表驱动实现足够快——解压是 IO 主导，CRC 只占很小的比例。
+fn crc32_ieee(data: &[u8]) -> u32 {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+            *slot = c;
+        }
+        t
+    });
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = table[((crc ^ u32::from(b)) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
 /// 从已解析的条目中取出压缩数据（按本地头算出数据起始偏移）。
 fn read_entry_data<'a>(bytes: &'a [u8], e: &ZipEntry) -> Result<&'a [u8]> {
     let local_off = e.local_off as usize;
@@ -367,7 +409,92 @@ fn read_entry_data<'a>(bytes: &'a [u8], e: &ZipEntry) -> Result<&'a [u8]> {
 mod tests {
     use super::*;
 
-    /// 手工构造一个最小 zip：n 个「存储」条目。用来验证解析与写盘。
+    /// CRC32 必须与已知向量一致（`123456789` → `0xCBF43926`），否则校验会全部失败。
+    #[test]
+    fn crc32_matches_known_vector() {
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32_ieee(b""), 0);
+    }
+
+    /// 内容被改坏但长度不变时，必须靠 CRC 拦住——这正是不校验时最危险的情形：
+    /// 落盘一个「长度正确、内容损坏」的 DLL，加载时报的错完全指不回压缩包。
+    #[test]
+    fn rejects_entry_whose_crc_does_not_match() {
+        let dir = std::env::temp_dir().join(format!("v2w_crc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let payload = b"hello world".to_vec();
+        // 内容正确、但中央目录里声明的 CRC 是错的 —— 模拟传输位翻转。
+        let bad_crc = crc32_ieee(&payload) ^ 0xFFFF_FFFF;
+        let zip = build_stored_zip_declaring_crc("a.txt", &payload, bad_crc);
+
+        let err = extract_zip(&zip, &dir).expect_err("CRC 不符必须拒绝");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("CRC32"), "错误文案应点名 CRC：{msg}");
+        assert!(
+            !dir.join("a.txt").exists(),
+            "校验失败的条目不得落盘（否则就是静默损坏）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 构造一个单条目（存储法）zip，并**按调用方给的 CRC** 写进本地头与中央目录。
+    ///
+    /// 与 `build_stored_zip` 的区别就这一点：那个一律写 0（= 未提供，跳过校验），
+    /// 这个用来构造「声明了 CRC」的包，好验证校验逻辑本身。
+    fn build_stored_zip_declaring_crc(name: &str, data: &[u8], crc: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        let local_off = 0u32;
+        out.extend_from_slice(&SIG_LOCAL.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // stored
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+
+        central.extend_from_slice(&SIG_CENTRAL.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&local_off.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+
+        let cd_off = out.len() as u32;
+        let cd_size = central.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&SIG_EOCD.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    /// 手工构造一个最小 zip：n 个「存储」条目。用来验证解析与写盘。    /// 手工构造一个最小 zip：n 个「存储」条目。用来验证解析与写盘。    /// 手工构造一个最小 zip：n 个「存储」条目。用来验证解析与写盘。
     fn build_stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut central = Vec::new();

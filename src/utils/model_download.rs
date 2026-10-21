@@ -1429,6 +1429,54 @@ pub type ProgressFn = Box<dyn Fn(u64, u64, &str) + Send + Sync>;
 /// 先写 `<dest>.part`，成功（含大小校验、可选的 sha256 校验）后原子 rename
 /// 到目标名。因此**任何中断都不会留下一个看起来完好的模型文件**。
 /// `.part` 已存在且未下满时会带 Range 续传；校验失败会删除 `.part` 并换下一个源。
+/// 目标路径所在卷的可用空间（字节）。拿不到时返回 `None`（不因此阻断下载）。
+///
+/// 用 `sysinfo` 枚举磁盘再按挂载点前缀匹配：这是跨平台且**零新依赖**的做法
+/// （`sysinfo` 本来就在 `Cargo.toml` 里，监控面板在用）。
+fn available_space_for(path: &std::path::Path) -> Option<u64> {
+    use sysinfo::Disks;
+    let disks = Disks::new_with_refreshed_list();
+    let target = std::fs::canonicalize(path).ok().unwrap_or_else(|| path.to_path_buf());
+    let mut best: Option<(usize, u64)> = None;
+    for disk in disks.list() {
+        let mount = disk.mount_point();
+        // 用「挂载点是不是目标路径的前缀」来归属；取**最长**前缀，
+        // 避免 C:\ 把挂在 C:\mnt\data 的卷抢走。
+        if target.starts_with(mount) {
+            let len = mount.as_os_str().len();
+            let space = disk.available_space();
+            if best.map(|(l, _)| len >= l).unwrap_or(true) {
+                best = Some((len, space));
+            }
+        }
+    }
+    best.map(|(_, space)| space)
+}
+
+/// 下载前的磁盘空间预检。
+///
+/// 为什么要有这一步：模型动辄几百 MB（全部补齐约 800 MB）。盘快满时下载会在跑到
+/// 一半时失败，虽然 `.part` 支持续传，但用户看到的是「下载失败」+ 一堆 io 错误，
+/// 完全联想不到「磁盘满了」——而这恰恰是最容易提前说清楚的一类失败。
+///
+/// 预检**尽力而为**：拿不到磁盘信息时放行（不能因为枚举磁盘失败就不让下载）。
+fn ensure_free_space(dest: &std::path::Path, needed_bytes: u64) -> Result<()> {
+    // 留一点余量：分片写入、解压、临时文件都要占位置。
+    const MARGIN: u64 = 256 * 1024 * 1024;
+    let Some(available) = available_space_for(dest) else {
+        return Ok(());
+    };
+    let required = needed_bytes.saturating_add(MARGIN);
+    if available < required {
+        anyhow::bail!(
+            "磁盘空间不足：所在磁盘仅剩 {}，本次下载需要约 {}（含临时文件余量）。\
+             请清理磁盘或把程序移到空间更大的位置后重试。",
+            human_size(available),
+            human_size(required)
+        );
+    }
+    Ok(())
+}
 pub fn download_one(
     item: &DownloadItem,
     cancel: &Arc<AtomicBool>,
@@ -1446,6 +1494,9 @@ pub fn download_one(
             hint.replace("{}", &parent.display().to_string())
         })?;
     }
+    // 空间预检放在「目录已建好」之后、「开始下载」之前：
+    // 这样路径解析与可写性已经过，剩下的失败几乎只可能是空间不足。
+    ensure_free_space(&dest, item.size)?;
     // 已经存在**自编译的自包含构建**时拒绝覆盖：官方包是「启动桩 + DLL」，
     // 直接下载会把用户的单文件构建换成启动桩（尤其是手编的 Vulkan 版，
     // GPU 支持会凭空消失且毫无提示）。让他先自行处理，或把 config 指向别处。
@@ -1949,7 +2000,38 @@ fn fetch_to_file(
 }
 
 #[cfg(test)]
-mod executable_resolution_tests {
+mod disk_space_tests {
+    use super::{available_space_for, ensure_free_space};
+
+    /// 预检必须**尽力而为**：拿不到磁盘信息就放行，绝不因为枚举失败而挡住下载。
+    #[test]
+    fn free_space_check_never_blocks_when_disk_info_is_unavailable() {
+        let dir = std::env::temp_dir();
+        // 需要 0 字节 → 任何有空间的卷都应该通过。
+        assert!(ensure_free_space(&dir, 0).is_ok(), "0 字节需求必须放行");
+        // 枚举磁盘本身不得 panic（容器 / 受限环境里可能拿不到列表）。
+        let _ = available_space_for(&dir);
+    }
+
+    /// 需要天文数字时必须报「磁盘空间不足」，而不是让下载跑到一半才失败。
+    #[test]
+    fn absurd_requirement_reports_clear_error() {
+        let dir = std::env::temp_dir();
+        let Some(_avail) = available_space_for(&dir) else {
+            // 拿不到磁盘信息：按设计放行，这里直接跳过断言。
+            return;
+        };
+        let err = ensure_free_space(&dir, u64::MAX / 4).expect_err("不可能有这么多空间");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("磁盘空间不足"),
+            "错误文案必须点名磁盘空间，实得：{msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod item_and_presence_tests {
     use super::{
         executable_is_usable, is_command_available, missing_required_executables,
         resolve_configured_executable, ITEMS,

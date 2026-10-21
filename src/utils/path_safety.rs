@@ -179,10 +179,23 @@ fn copy_to_safe_temp(src: &Path) -> Option<PathBuf> {
 
     let temp_dest = safe_temp_dir().join(format!("v2w_safe_{:x}.{}", hash, ext));
     if temp_dest.exists() {
-        if let (Ok(m1), Ok(m2)) = (src.metadata(), temp_dest.metadata()) {
-            if m1.len() == m2.len() {
-                return Some(temp_dest);
+        // 复用判据不能只看**字节数相等**：源文件被同长度改写（重新导出、覆盖同名素材、
+        // 修图后另存）时，副本会永久停留在旧内容上——CLI 于是拿着上一版文件去干活，
+        // 而且不报任何错。
+        //
+        // 这里改成「长度 + 修改时间」双判据。小文件场景下再算内容哈希当然更严谨，
+        // 但这批文件最大 64 MiB，哈希的代价与直接重拷相当；mtime 已经足够覆盖
+        // 「同长度但内容变了」这个真实场景。
+        let same = match (src.metadata(), temp_dest.metadata()) {
+            (Ok(m1), Ok(m2)) => {
+                m1.len() == m2.len()
+                    && m1.modified().ok().is_some()
+                    && m1.modified().ok() == m2.modified().ok()
             }
+            _ => false,
+        };
+        if same {
+            return Some(temp_dest);
         }
         let _ = std::fs::remove_file(&temp_dest);
     }

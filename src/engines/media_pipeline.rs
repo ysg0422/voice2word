@@ -19,6 +19,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -452,23 +453,28 @@ pub struct ProxyManager {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileSignature {
     len: u64,
-    modified_secs: u64,
+    /// 修改时间的**纳秒**精度。
+    ///
+    /// 用秒精度会出真问题：同一秒内被覆盖的同名同大小素材签名完全相同，
+    /// 于是代理路径不变，`proxy_ready` 直接把**上一版视频的代理**当成可用，
+    /// 预览里播的是别的画面。
+    modified_nanos: u128,
 }
 
 fn file_signature(path: &Path) -> FileSignature {
     match std::fs::metadata(path) {
         Ok(meta) => FileSignature {
             len: meta.len(),
-            modified_secs: meta
+            modified_nanos: meta
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
+                .map(|d| d.as_nanos())
                 .unwrap_or(0),
         },
         Err(_) => FileSignature {
             len: 0,
-            modified_secs: 0,
+            modified_nanos: 0,
         },
     }
 }
@@ -478,8 +484,38 @@ fn file_signature(path: &Path) -> FileSignature {
 /// 1KB 是原 `ensure_proxy` / `existing_proxy` 里就有的「完整代理」判据（`-y`
 /// 写到一半被中断的截断 mp4 远小于它）。抽成一个函数，是为了让**无锁快路径**
 /// 与**等锁后的复查**共用同一判据，不会再出现两处阈值各改各的。
+/// 代理文件是否**确实可用**。
+///
+/// 判据不能只看「大于 1KB」：转码被超时 kill / 进程崩溃时，ffmpeg 已经写出的
+/// 半截 mp4 通常有几十 MB，于是这条弱判据会把它当成合格代理，下一次预览直接复用，
+/// 播放器打不开、用户以为「预览坏了」，而且**换素材前一直好不了**。
+///
+/// 真正的完成信号是 `moov` 原子：`proxy_args` 用了 `-movflags +faststart`，
+/// ffmpeg 会在编码**全部结束**后把 moov 搬到文件头部。所以「前 1MB 内出现 moov」
+/// 等价于「这次转码跑到了最后」；半截文件里根本不存在 moov（它本来在文件末尾，
+/// 而 faststart 的重排发生在收尾阶段）。
+///
+/// 代价是一次最多 1MB 的读取，比再起一个 ffprobe 便宜得多，也够快——
+/// 这条路径会被 UI 线程同步调用（`existing_proxy`）。
 fn proxy_ready(out: &Path) -> bool {
-    out.exists() && out.metadata().map(|m| m.len() > 1024).unwrap_or(false)
+    const HEAD_BYTES: u64 = 1024 * 1024;
+    let Ok(meta) = out.metadata() else {
+        return false;
+    };
+    if meta.len() <= 1024 {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(out) else {
+        return false;
+    };
+    use std::io::Read;
+    let mut head = Vec::with_capacity(HEAD_BYTES as usize);
+    if file.take(HEAD_BYTES).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    // MP4 的原子是 4 字节大端长度 + 4 字节类型；直接在头部字节里找 `moov` 即可
+    // （对比 8 字节序列，避免把内容是文本的 mdat 误判）。
+    head.windows(4).any(|w| w == b"moov")
 }
 
 impl ProxyManager {
@@ -565,9 +601,15 @@ impl ProxyManager {
             })
             .collect();
         let signature = file_signature(source);
+        // 路径也要进键：只有「stem + 字节数 + mtime」时，两个**不同目录**下同名、
+        // 同大小、同一秒写入的文件会算出同一个代理路径，第二个文件的预览会播
+        // 第一个文件的画面——而且不报错，用户只觉得「预览串了」。
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        let path_hash = hasher.finish();
         std::env::temp_dir().join(format!(
-            "voice2word_proxy_{}_{}_{}_{}p.mp4",
-            safe, signature.len, signature.modified_secs, height
+            "voice2word_proxy_{}_{:016x}_{}_{}_{}p.mp4",
+            safe, path_hash, signature.len, signature.modified_nanos, height
         ))
     }
 
@@ -2338,8 +2380,13 @@ mod tests {
         drop(gate_d);
 
         // 2) 缓存命中不等锁：先把 out 写成「完整代理」
-        std::fs::write(&out, [0u8; 4096]).expect("写入假代理文件");
-        assert!(proxy_ready(&out), "前提：假代理应被判定为可用");
+        //
+        // 判据要求文件头里有 `moov`（faststart 完成后 moov 会在文件开头）。
+        // 只写全零字节的假文件会被判为半成品，缓存快路径根本不会命中。
+        let mut fake = vec![0u8; 4096];
+        fake[16..20].copy_from_slice(b"moov");
+        std::fs::write(&out, &fake).expect("写入假代理文件");
+        assert!(proxy_ready(&out), "前提：带 moov 的假代理应被判定为可用");
 
         // 先把闸门绑定到局部变量：`transcode_gate` 返回的 Arc 若是临时值，语句结束后即释放，
         // guard 借用它去 lock 会触发 E0716（temporary value dropped while borrowed）。
@@ -2410,9 +2457,15 @@ mod media_pipeline_robustness_tests {
         let dir = temp_dir("settle_proxy");
         let out = dir.join("proxy.mp4");
 
-        // 前提：半成品（无 moov 的截断 mp4）在判据眼里就是「可用代理」
+        // 前提：半成品（无 moov 的截断 mp4）**不得**被判为可用代理。
+        //
+        // 旧判据只看「>1KB」，于是转码被超时 kill 后留下的几十 MB 半截文件会被
+        // 当成合格代理反复复用，预览一直坏到用户换素材——这是本节要防的核心问题。
         std::fs::write(&out, vec![0u8; 4096]).expect("写入半成品");
-        assert!(proxy_ready(&out), "前提：>1KB 的文件会被判为可用代理");
+        assert!(
+            !proxy_ready(&out),
+            "无 moov 的半成品必须判为不可用（否则会被当成合格代理复用）"
+        );
 
         // 退出码非零：清理
         let ok = settle_proxy_attempt(&out, Ok(false)).expect("非零退出码不上抛错误");
@@ -2432,10 +2485,14 @@ mod media_pipeline_robustness_tests {
             "超时残留的半成品必须被清理，否则会被当成合格代理"
         );
 
-        // 成功时必须保留刚转好的代理
-        std::fs::write(&out, vec![0u8; 4096]).expect("写入代理");
+        // 成功时必须保留刚转好的代理（这里写成带 moov 的「完整」形态，顺带证明
+        // 成功产物确实会被判为可用）。
+        let mut complete = vec![0u8; 4096];
+        complete[16..20].copy_from_slice(b"moov");
+        std::fs::write(&out, &complete).expect("写入代理");
         assert!(settle_proxy_attempt(&out, Ok(true)).expect("成功路径不上抛"));
         assert!(out.exists(), "成功时不得删除代理文件");
+        assert!(proxy_ready(&out), "成功产物必须被判为可用代理");
 
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_dir_all(&dir);

@@ -1452,10 +1452,21 @@ impl FFmpegEngine {
         }
         let mut cmd = Command::new(&self.ffmpeg_path);
         cmd.args(mux_subtitle_args(input, tracks, output));
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let out = cmd.output().context("启动 ffmpeg 封装字幕失败")?;
+        cmd.stdin(Stdio::null());
+        // 走统一执行器：**这是本文件最后一个还在裸用 `cmd.output()` 的地方**。
+        //
+        // 裸调的三个代价，都已实际发生过：
+        // 1. 没有截止期 —— 坏素材 / 被占用的输出文件会让这个线程永久挂住，
+        //    界面上的「内嵌字幕导出」一直转圈，只能杀进程；
+        // 2. 没有 `child_registry::adopt` —— 主程序被强杀/崩溃时这个 ffmpeg 变成孤儿，
+        //    继续占着视频文件句柄，用户连改名都改不了；
+        // 3. 没有 `apply_default_child_flags` —— Windows 上会**弹出一个黑窗口**，
+        //    与其余所有调用点不一致。
+        //
+        // 封装是 `-c copy`，耗时与文件大小成正比但远小于转码，用长任务预算即可。
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
+        let out = run_with_deadline(&mut cmd, SUBPROCESS_LONG_TIMEOUT)
+            .context("启动 ffmpeg 封装字幕失败")?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             anyhow::bail!(
