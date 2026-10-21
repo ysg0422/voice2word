@@ -554,6 +554,27 @@ pub fn run_chunked_parallel(
     let work_dir = work_dir_path.as_path();
     std::fs::create_dir_all(work_dir)?;
 
+    // 切块会把**整段音频对应的所有块 WAV 一次性**写进 TEMP：16 kHz 单声道 = 32 KB/s，
+    // 4 小时课程约 460 MB。空间不够时不会在第 0 块就报错，而是在第 k 次 ffmpeg 切片时
+    // 才失败，留下的是一句「There is not enough space on the disk」和一个半满的目录。
+    // 提前按块总时长算一次预算，失败时直接说清楚差多少。
+    let total_chunk_secs: f64 = chunks.iter().map(|c| c.duration).sum();
+    let need_bytes = (total_chunk_secs * 32_000.0 * 1.1) as u64;
+    if let Some(avail) = crate::utils::model_download::available_space_for(&std::env::temp_dir()) {
+        if avail < need_bytes {
+            let hint = "临时目录空间不足：切块转写需要约 ".to_string()
+                + &format!("{} MB", need_bytes / 1024 / 1024)
+                + &format!(
+                    "（{} 分钟音频，{} 块）",
+                    (total_chunk_secs / 60.0).round() as u64,
+                    chunks.len()
+                )
+                + &format!("，当前仅剩 {} MB。", avail / 1024 / 1024)
+                + "请清理系统盘或把 TEMP 指向空间更大的磁盘后重试。";
+            anyhow::bail!(hint);
+        }
+    }
+
     let mut slice_paths: Vec<(AudioChunk, PathBuf)> = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
         let out = work_dir.join(format!("c{}.wav", chunk.index));

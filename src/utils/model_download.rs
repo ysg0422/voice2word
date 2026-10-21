@@ -1433,7 +1433,7 @@ pub type ProgressFn = Box<dyn Fn(u64, u64, &str) + Send + Sync>;
 ///
 /// 用 `sysinfo` 枚举磁盘再按挂载点前缀匹配：这是跨平台且**零新依赖**的做法
 /// （`sysinfo` 本来就在 `Cargo.toml` 里，监控面板在用）。
-fn available_space_for(path: &std::path::Path) -> Option<u64> {
+pub(crate) fn available_space_for(path: &std::path::Path) -> Option<u64> {
     use sysinfo::Disks;
     let disks = Disks::new_with_refreshed_list();
     let target = std::fs::canonicalize(path)

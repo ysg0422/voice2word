@@ -625,10 +625,20 @@ impl SenseVoiceEngine {
 
     /// 检查 SenseVoice 所需权重与执行体是否就位（支持纯原生 exe 或 Python runner）
     pub fn is_available(&self) -> bool {
-        self.model_path.exists()
-            && self.tokens_path.exists()
+        // 判据不能只看 `exists()`：一次失败的复制/半截下载会留下**存在但内容不全**
+        // 的模型，闸门放过去之后，真正的失败发生在 sherpa/onnxruntime 里，报的是一句
+        // 与「文件不完整」毫不相干的话。这里按体积兜一道——ONNX 权重最小也有几十 MB，
+        // 取 1 MB 作为下限，既能挡住 0 字节/被截断，又不会误伤任何真实模型。
+        const MIN_MODEL_BYTES: u64 = 1024 * 1024;
+        fn big_enough(path: &std::path::Path, min: u64) -> bool {
+            std::fs::metadata(path)
+                .map(|m| m.len() >= min)
+                .unwrap_or(false)
+        }
+        big_enough(&self.model_path, MIN_MODEL_BYTES)
+            && big_enough(&self.tokens_path, 1)
             && (Self::find_native_cli().is_some()
-                || (self.runner_path.exists() && self.vad_model_path.exists()))
+                || (big_enough(&self.runner_path, 1) && big_enough(&self.vad_model_path, 1)))
     }
 
     /// 转写本地 WAV 音频文件
