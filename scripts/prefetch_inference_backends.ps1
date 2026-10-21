@@ -138,7 +138,7 @@ $ffprobeExe = Join-Path $tools "ffprobe.exe"
 
 # 【关键】在**隔离的 PATH** 下试跑。
 #
-# 直接用当前 PATH 试跑会骗自己：本机 `A:\cppsoft\ffmpeg-6.9\bin` 在 PATH 上时，
+# 直接用当前 PATH 试跑会骗自己：打包机上 ffmpeg 所在目录恰好在 PATH 上时，
 # `tools/ffplay.exe`（shared 构建）能找齐那 7 个 DLL，测试通过——但它孤零零地
 # 打进安装包后在客户机上必然 0xC0000135。
 # 所以这里把 PATH 收窄到「exe 自己所在目录 + System32」，模拟客户机环境。
@@ -198,9 +198,8 @@ if ($Force -or -not $trioOk) {
     if ($probe) { $localDirs += (Split-Path -Parent $probe.Source) }
     $ff = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
     if ($ff) { $localDirs += (Split-Path -Parent $ff.Source) }
-    foreach ($d in @('A:\cppsoft\ffmpeg-6.9\bin', 'C:\ffmpeg\bin', 'C:\Program Files\ffmpeg\bin')) {
-        if (Test-Path $d) { $localDirs += $d }
-    }
+    # 只探测 **PATH 上找到的** ffmpeg 目录；不再写死任何具体机器的安装位置。
+    # （打包机上常见的 `C:\ffmpeg\bin` 之类位置本来就会进 PATH，探测前者即可。）
 
     $satisfied = $false
     foreach ($d in ($localDirs | Select-Object -Unique)) {

@@ -10,7 +10,10 @@
 import re
 import pathlib
 
-UI = pathlib.Path("A:/Linux/Voice2Word/src/ui")
+# 以**脚本自身位置**为锚点推导项目根，不写死任何机器路径：
+# 以前这里硬编码的是某台机器上的绝对路径，换台机器跑就会对着一个空集合统计，
+# 而这是个会改源码的破坏性工具——静默「什么都没改」比报错更难发现。
+UI = pathlib.Path(__file__).resolve().parent.parent / "src" / "ui"
 
 # ---- 1. 角色优先的精确替换（先做，避免被通用表覆盖）----
 ROLE_FIRST = [

@@ -2613,11 +2613,14 @@ mod tests {
 
     #[test]
     fn test_in_memory_stream_transcribe() {
-        let cli_path =
-            PathBuf::from("tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe");
-        let model_path = PathBuf::from("models/whisper/ggml-base.bin");
-        let ffmpeg_path = PathBuf::from("A:\\cppsoft\\ffmpeg-6.9\\bin\\ffmpeg.exe");
-        let sample_media = PathBuf::from("resources/sample/sample.mp4");
+        // 一律经 `AppConfig::resolve_path` 锚到**项目根**，不写死任何机器路径：
+        // 相对路径是相对进程 cwd 解析的，而 cwd 取决于谁跑的测试。
+        let cli_path = crate::utils::AppConfig::resolve_path(
+            "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe",
+        );
+        let model_path = crate::utils::AppConfig::resolve_path("models/whisper/ggml-base.bin");
+        let ffmpeg_path = crate::utils::AppConfig::resolve_path("tools/ffmpeg.exe");
+        let sample_media = crate::utils::AppConfig::resolve_path("resources/sample/sample.mp4");
 
         // 集成性质测试：四个外部依赖（Vulkan whisper-cli、模型、ffmpeg、样片）
         // 缺任何一个都不跑，而不是 fail——干净 CI / 新机器上这些都不存在。

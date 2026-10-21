@@ -61,11 +61,15 @@ fn main() -> Result<()> {
     let no_compact = args.iter().any(|a| a == "--no-compact");
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let ffmpeg_path = if Path::new("A:\\cppsoft\\ffmpeg-6.9\\bin\\ffmpeg.exe").exists() {
-        PathBuf::from("A:\\cppsoft\\ffmpeg-6.9\\bin\\ffmpeg.exe")
-    } else {
-        root.join("A:/cppsoft/ffmpeg-6.9/bin/ffmpeg.exe")
-    };
+    // ffmpeg 一律按**项目根**解析（`tools/ffmpeg.exe`，与 config.toml 的默认值一致）。
+    //
+    // 以前这里写死的是某台机器上的绝对路径，连 fallback 都是
+    // `root.join("<绝对路径>")`——`Path::join` 遇到绝对串会**直接覆盖** root，
+    // 所以在别的机器上它拼出来仍是一条不存在的路径，基准脚本必然跑不起来。
+    // 需要指向别处时用环境变量覆盖，不要把机器路径写回仓库。
+    let ffmpeg_path = std::env::var_os("VOICE2WORD_FFMPEG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("tools/ffmpeg.exe"));
     let ffmpeg = FFmpegEngine::new(&ffmpeg_path);
 
     let cli = root.join("tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe");
