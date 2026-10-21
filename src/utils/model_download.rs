@@ -344,6 +344,32 @@ pub const ITEMS: &[DownloadItem] = &[
         // 因此这里做**强校验**：拿到 HTML 错误页 / 被替换的文件都会当场暴露。
         sha256: Some("9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"),
     },
+    // ── 本地识别引擎：同一套 sherpa-onnx 运行时承载的其它模型族 ──
+    //
+    // 这些包的形态是 .tar.bz2（解压后 model.int8.onnx + tokens.txt 平铺在目标目录），
+    // 由 `archive_kind_from_url` 自动识别、`extract_tar_bz2` 用内置便携 Python 解开，
+    // 并剥掉包里那层版本号目录。companion 填 tokens.txt：它与模型同目录、缺一个都跑不起来。
+    DownloadItem {
+        id: "asr-dolphin",
+        label: "Dolphin Base（多语种·40 种语言）",
+        note: "DataoceanAI 出品，专攻东亚/东南亚语种（日韩泰越印尼等），仅 77MB，小而快",
+        dest: "models/dolphin/model.int8.onnx",
+        urls: &[
+            // 官方只发在 GitHub Release：走两个免梯子代理（与 whisper-cli 同一套做法）。
+            // 仓库里有一条测试禁止直连 github.com —— 不挂梯子的用户会卡死在那里。
+            "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-dolphin-base-ctc-multi-lang-int8-2025-04-02.tar.bz2",
+            "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-dolphin-base-ctc-multi-lang-int8-2025-04-02.tar.bz2",
+        ],
+        size: 80_671_385, // 实测 Content-Length（压缩包）
+        // 判定的是**解压后**的 model.int8.onnx，比压缩包小得多；给一个宽松下限即可。
+        min_size: 60_000_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: true,
+        // 与模型同目录的词表：缺它这个族跑不起来，所以一并算「已就位」的判据。
+        companion: Some("tokens.txt"),
+        sha256: None,
+    },
     DownloadItem {
         id: "whisper-tiny",
         label: "Whisper Tiny（轻量尝鲜）",

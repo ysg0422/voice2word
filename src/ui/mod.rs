@@ -878,7 +878,7 @@ pub struct MainWindow {
     /// 早先这里是「当前选中哪个专区」的单值：三个专区只能看一个，想对比
     /// Whisper 模型与公用组件得来回点。现在三块同页铺开、各自独立收起，
     /// 默认全展开——「一页看全」正是改成这样的理由。
-    pub(crate) model_blocks_open: [bool; 3],
+    pub(crate) model_blocks_open: [bool; 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -886,6 +886,8 @@ pub(crate) enum ModelManagerTab {
     #[default]
     SenseVoice,
     Whisper,
+    /// 同一套 sherpa-onnx 运行时承载的其它模型族（Dolphin 等），与 Whisper 并列。
+    LocalAsr,
     Common,
 }
 
@@ -1534,7 +1536,7 @@ impl MainWindow {
         crate::utils::child_registry::ensure_job_object();
         // 三块默认全展开：改成一页的本意就是「一眼看全」，默认收起又变回分页了。
         // 想缩短页面的用户自己点「收起」即可（状态只在本次会话内保持）。
-        let model_blocks_open = [true, true, true];
+        let model_blocks_open = [true, true, true, true];
         // 替换规则集是独立 JSON（与 config.toml 同目录）：读失败不拦启动，把错误留给
         // 替换面板的提示行——规则集读不到不该让整个界面起不来。
         let (replace_rule_sets, replace_rules_status) = match load_replace_rule_sets_default() {

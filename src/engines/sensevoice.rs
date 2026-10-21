@@ -377,6 +377,18 @@ fn provider_report_outcome(
     }
 }
 
+/// 从下载条目的 id 反查它属于哪个识别模型族（`None` = 不是 Local-ASR 条目）。
+///
+/// 放在这里而不是 `model_download`：`ModelFamily` 属于引擎层，utils 不该反向依赖
+/// engines。而 UI 侧本来就已经同时依赖两边，查表成本为零。
+pub fn model_family_for_item(item_id: &str) -> Option<ModelFamily> {
+    Some(match item_id {
+        // Dolphin：DataoceanAI 的多语种 CTC 模型，单 onnx + tokens。
+        "asr-dolphin" => ModelFamily::DolphinCtc,
+        _ => return None,
+    })
+}
+
 /// 识别模型族：决定 runner 的 `--model-type`，以及是否需要额外的 decoder 文件。
 ///
 /// 为什么需要它：sherpa-onnx 这一个运行时能承载多个模型族（Dolphin / Paraformer /

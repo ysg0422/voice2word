@@ -5434,6 +5434,7 @@ impl MainWindow {
             self.state.download_status_msg = match current_tab {
                 crate::ui::ModelManagerTab::SenseVoice => "SenseVoice 所需组件均已就位".to_string(),
                 crate::ui::ModelManagerTab::Whisper => "Whisper 所需组件均已就位".to_string(),
+                crate::ui::ModelManagerTab::LocalAsr => "本地识别引擎所需组件均已就位".to_string(),
                 crate::ui::ModelManagerTab::Common => "公用支撑组件均已就位".to_string(),
             };
             cx.notify();

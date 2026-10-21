@@ -91,7 +91,7 @@ pub const WHISPER_CHOICE_MODEL_IDS: &[&str] = &[
     "whisper-tiny",
 ];
 
-const MODEL_BLOCKS: [ModelBlock; 3] = [
+const MODEL_BLOCKS: [ModelBlock; 4] = [
     ModelBlock {
         tab: ModelManagerTab::SenseVoice,
         title: "SenseVoice 极速语音识别",
@@ -127,6 +127,15 @@ const MODEL_BLOCKS: [ModelBlock; 3] = [
                 item_ids: &["whisper-cli", "whisper-cublas"],
             },
         ],
+    },
+    ModelBlock {
+        tab: ModelManagerTab::LocalAsr,
+        title: "本地识别引擎",
+        subtitle: "同一套 sherpa-onnx 运行时承载的其它模型族；体积小、语种多，按需下载",
+        categories: &[ModelCategory {
+            title: "多语种（东亚 / 东南亚，约 40 种语言）",
+            item_ids: &["asr-dolphin"],
+        }],
     },
     ModelBlock {
         tab: ModelManagerTab::Common,
@@ -182,6 +191,10 @@ pub(crate) fn is_item_needed_for_tab(
                 item_id,
                 "ffmpeg" | "whisper-cli" | "whisper-cublas" | "silero-vad" | "punc-model"
             ) || WHISPER_CHOICE_MODEL_IDS.contains(&item_id)
+        }
+        ModelManagerTab::LocalAsr => {
+            // 本地识别引擎（非 Whisper、非 SenseVoice）：模型 + 词表 + FFmpeg 抽音。
+            matches!(item_id, "ffmpeg" | "asr-dolphin")
         }
         ModelManagerTab::Common => {
             // 公用组件：FFmpeg 媒体流提取、FFplay 伴音播放、llama.cpp 推理程序，
@@ -570,6 +583,7 @@ impl MainWindow {
                                     }
                                 }
                                 ModelManagerTab::Whisper => "下载选用模型".to_string(),
+                                ModelManagerTab::LocalAsr => "下载本地识别模型".to_string(),
                                 ModelManagerTab::Common => {
                                     if n == 1 {
                                         "下载基础组件".to_string()
@@ -1180,8 +1194,22 @@ mod tests {
                 }
             }
         }
-        // 三块必须都在表里：少一块就等于把那个专区藏起来了，正是本次要根治的问题。
-        assert_eq!(MODEL_BLOCKS.len(), 3, "三个分块缺一不可");
+        // 每块都必须出现在表里：少一块就等于把那个专区藏起来了，正是本次要根治的问题。
+        // 数量随之变成 4（新增「本地识别引擎」），断言跟着改——但「缺一不可」的语义不变。
+        assert_eq!(MODEL_BLOCKS.len(), 4, "四个分块缺一不可");
+        // 每个 tab 恰好出现一次，避免漏加或重复加。
+        for tab in [
+            ModelManagerTab::SenseVoice,
+            ModelManagerTab::Whisper,
+            ModelManagerTab::LocalAsr,
+            ModelManagerTab::Common,
+        ] {
+            assert_eq!(
+                MODEL_BLOCKS.iter().filter(|b| b.tab == tab).count(),
+                1,
+                "分块表里 {tab:?} 必须恰好出现一次"
+            );
+        }
     }
 
     fn key(entries: &[(&str, &str)], downloading: bool, presence: &[bool]) -> ModelDiskKey {
