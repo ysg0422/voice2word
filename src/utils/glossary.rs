@@ -91,6 +91,88 @@ pub fn parse_report(text: &str) -> ParseReport {
     report
 }
 
+/// 从字幕原文里挑「看起来像术语」的候选词，供用户补译文。
+///
+/// # 为什么只挑拉丁字母/数字
+///
+/// 中文专名没有可靠的字面特征（「张老师」和「这个」同形），靠字频或词性猜出来的
+/// 东西九成是噪声，塞进术语表反而会把整篇译文污染掉。英文缩写、驼峰名、型号
+/// （`GPU` / `PyTorch` / `RTX4090`）才是真正「必须统一写法」的那一类，也最容易漏。
+///
+/// # 判定规则（宁可少报，不可错报）
+///
+/// - 长度 ≥ 2，只由 `[A-Za-z0-9_.-]` 组成；
+/// - 满足其一：2~6 个字符的**全大写缩写**、含**内部大写**（驼峰）、或字母与数字混排；
+/// - 全篇出现 **≥ 2 次**（只出现一次的多半是随手一写，不值得进术语表）；
+/// - 已在术语表里的（忽略大小写）不再给出。
+///
+/// 返回 `(候选词, 出现次数)`，按次数降序、同次数按字母序，最多 `limit` 条。
+pub fn term_candidates(
+    texts: &[&str],
+    existing: &[GlossaryEntry],
+    limit: usize,
+) -> Vec<(String, usize)> {
+    use std::collections::HashMap;
+    let known: std::collections::HashSet<String> =
+        existing.iter().map(|e| e.source.to_lowercase()).collect();
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for text in texts {
+        for token in latin_tokens(text) {
+            if !looks_like_term(token) {
+                continue;
+            }
+            if known.contains(&token.to_lowercase()) {
+                continue;
+            }
+            *counts.entry(token.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let mut out: Vec<(String, usize)> = counts.into_iter().filter(|(_, n)| *n >= 2).collect();
+    // 次数降序；同次数按字母序，保证同一份字幕两次提取结果一致（便于测试与复现）。
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out.truncate(limit);
+    out
+}
+
+/// 按「字母数字 + `_.-`」切出连续 token；其它字符（中文、标点）都是一刀两断。
+fn latin_tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+        .filter(|t| !t.is_empty())
+}
+
+/// [`term_candidates`] 的逐词判据（拆出来便于单测，也便于将来调宽/收紧）。
+fn looks_like_term(token: &str) -> bool {
+    let chars: Vec<char> = token.chars().collect();
+    if chars.len() < 2 || chars.len() > 48 {
+        return false;
+    }
+    // 纯数字（`2024`、`3.5`）不是术语。
+    if chars.iter().all(|c| c.is_ascii_digit() || *c == '.') {
+        return false;
+    }
+    let has_digit = chars.iter().any(|c| c.is_ascii_digit());
+    let has_alpha = chars.iter().any(|c| c.is_ascii_alphabetic());
+    // 字母数字混排：`RTX4090` / `v2` / `H.264`
+    if has_digit && has_alpha {
+        return true;
+    }
+    if !has_alpha {
+        return false;
+    }
+    // 全大写缩写：`GPU` / `CPU` / `TPU`（限 2~6 个字符，再长的多半是路径或乱码）
+    if chars.len() <= 6
+        && chars
+            .iter()
+            .all(|c| !c.is_ascii_alphabetic() || c.is_ascii_uppercase())
+    {
+        return true;
+    }
+    // 内部含大写：`PyTorch` / `iPhone` / `DeepSeek`（首字母不算）
+    chars.iter().skip(1).any(|c| c.is_ascii_uppercase())
+}
+
 /// 解析术语表文本，只取条目（跳过的行号见 [`parse_report`]）。
 pub fn parse(text: &str) -> Vec<GlossaryEntry> {
     parse_report(text).entries
@@ -391,6 +473,63 @@ pub fn validate(entries: &[GlossaryEntry]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 提取规则的核心：只挑真正需要统一写法的「专名」，且宁少勿滥。
+    #[test]
+    fn term_candidates_picks_proper_nouns_only() {
+        let texts = [
+            "我们用 PyTorch 训练，GPU 加速很明显",
+            "PyTorch 和 GPU 都是重点",
+            "这张卡是 RTX4090，跑得很快",
+            "再补一句 RTX4090",
+            "普通的中文句子，没有术语",
+            "only lowercase words here and there",
+        ];
+        let got = super::term_candidates(&texts, &[], 40);
+        let names: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(names.contains(&"PyTorch"), "驼峰名应入选: {names:?}");
+        assert!(names.contains(&"GPU"), "全大写缩写应入选: {names:?}");
+        assert!(names.contains(&"RTX4090"), "字母数字混排应入选: {names:?}");
+        // 普通小写单词、中文都不是候选
+        assert!(!names.contains(&"words"), "普通小写词不算术语: {names:?}");
+        assert_eq!(
+            got.iter().find(|(t, _)| t == "GPU").map(|(_, n)| *n),
+            Some(2)
+        );
+    }
+
+    /// 只出现一次的候选不报（噪声太大），已在术语表里的也不报。
+    #[test]
+    fn term_candidates_respects_threshold_and_existing_glossary() {
+        let texts = ["只用了一次 TensorRT", "GPU 出现两次，GPU 很重要"];
+        let got = super::term_candidates(&texts, &[], 40);
+        let names: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(!names.contains(&"TensorRT"), "只出现一次的不报: {names:?}");
+        assert!(names.contains(&"GPU"));
+
+        // 已经写进术语表的（忽略大小写）不再重复推荐
+        let existing = vec![super::GlossaryEntry {
+            source: "gpu".to_string(),
+            target: "图形处理器".to_string(),
+        }];
+        let got = super::term_candidates(&texts, &existing, 40);
+        assert!(
+            !got.iter().any(|(t, _)| t == "GPU"),
+            "已在术语表里的不该再推荐: {got:?}"
+        );
+    }
+
+    /// 纯数字 / 单字符 / 超长垃圾串都不是术语。
+    #[test]
+    fn term_candidates_rejects_numeric_and_junk() {
+        assert!(!super::looks_like_term("2024"));
+        assert!(!super::looks_like_term("3.5"));
+        assert!(!super::looks_like_term("G"));
+        assert!(!super::looks_like_term(&"A".repeat(60)));
+        assert!(super::looks_like_term("H.264"));
+        assert!(super::looks_like_term("DeepSeek"));
+    }
+
     // 刻意不用 `use super::*`：测试只依赖本模块的公开接口，任何一条实现细节改名都
     // 不会让测试「跟着一起改」，也就不会掩盖真正的行为变化。
     use super::{from_csv, merge, parse, parse_report, to_csv, to_text, validate, GlossaryEntry};

@@ -4837,6 +4837,28 @@ impl MainWindow {
     }
 
     /// 从术语表临时文件读回内容并落盘。
+    /// 从当前字幕提取候选术语（英文缩写 / 驼峰名 / 型号），写进术语表并打开文件。
+    pub(crate) fn extract_glossary_candidates(&mut self, cx: &mut Context<Self>) {
+        match self.state.append_glossary_candidates() {
+            Ok(0) => {
+                self.glossary_status = Some(
+                    "没有发现新的候选术语（英文专名/缩写需要在字幕里出现至少两次）".to_string(),
+                );
+                cx.notify();
+            }
+            Ok(n) => {
+                self.glossary_status = Some(format!(
+                    "已把 {n} 个候选词追加到术语表（以 # 注释）：补上译文、去掉行首 # 后，回来点「应用术语表」"
+                ));
+                self.open_glossary_editor(cx);
+            }
+            Err(err) => {
+                self.glossary_status = Some(format!("写入术语表失败：{err}"));
+                cx.notify();
+            }
+        }
+    }
+
     pub(crate) fn apply_glossary_from_file(&mut self, cx: &mut Context<Self>) {
         match self.state.reload_glossary_from_temp_file() {
             Ok(n) => {

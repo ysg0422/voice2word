@@ -1759,6 +1759,46 @@ impl AppState {
         Ok(self.config.translate.glossary_entries().len())
     }
 
+    /// 从当前字幕里提取候选术语，以**注释行**追加到术语表，返回追加条数。
+    ///
+    /// 为什么写成注释（`# term（出现 N 次）`）而不是直接 `term=`：注释行不会被
+    /// `glossary::parse` 当成条目，用户补上译文、删掉行首 `#` 就生效；反过来直接
+    /// 写 `term=` 会产生「译文为空」的**非法条目**，让整份术语表多出一批跳过行。
+    ///
+    /// 追加而不是覆盖：用户手写的条目一个字都不能动。
+    pub fn append_glossary_candidates(&mut self) -> std::io::Result<usize> {
+        let sources: Vec<String> = self.segments.iter().map(|s| s.translate_source()).collect();
+        let refs: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
+        // `glossary_entries()` 给的是 `(原文, 译文)` 元组；候选提取只需要原文，
+        // 但仍按 `GlossaryEntry` 传进去，让「已在表里的不再推荐」这条与解析口径同源。
+        let existing: Vec<crate::utils::glossary::GlossaryEntry> = self
+            .config
+            .translate
+            .glossary_entries()
+            .into_iter()
+            .map(|(source, target)| crate::utils::glossary::GlossaryEntry { source, target })
+            .collect();
+        let candidates = crate::utils::glossary::term_candidates(&refs, &existing, 40);
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut text = self.config.translate.glossary.clone();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push('\n');
+        text.push_str("# ==== 从当前字幕提取的候选词：补上「原文=译文」、去掉行首 # 即生效 ====\n");
+        for (term, n) in &candidates {
+            text.push_str(&format!("# {term}（出现 {n} 次）\n"));
+        }
+        self.config.translate.glossary = text;
+        self.save_translate_config();
+        // 让磁盘上的 glossary.txt 与内存一致，用户打开编辑器就能看到新候选。
+        self.write_glossary_temp_file()?;
+        Ok(candidates.len())
+    }
+
     /// 从 `.txt` / `.csv` 导入术语表并与现有表合并（同名以导入的为准）。
     ///
     /// 解析规则见 `utils::glossary`：`.csv`（不分大小写）走 `glossary::from_csv`，

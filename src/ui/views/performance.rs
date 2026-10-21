@@ -977,6 +977,16 @@ impl MainWindow {
                         this.apply_glossary_from_file(cx);
                     })),
             )
+            // 候选词提取：术语表最大的门槛是「想不起来要加哪些词」。
+            // 从当前字幕里把英文缩写 / 驼峰名 / 型号捞出来，以注释形式追加，
+            // 用户补上译文即可生效——不自动写入条目，避免污染译文。
+            .child(
+                primitives::chip_clickable("提取候选词", false, false)
+                    .id("glossary-extract-btn")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.extract_glossary_candidates(cx);
+                    })),
+            )
             // 导入 / 导出：术语表在本页（翻译配置区）才有归属，转写页不重复放一份，
             // 免得两处入口行为不一致。导入走异步文件对话框（`.txt` / `.csv`），
             // 导出复用「另存为 + 后台写盘」那一条出口，这里只挂点击。
