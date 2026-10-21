@@ -243,6 +243,120 @@ def read_audio_samples(input_path: str):
     samples_float32 = samples_int16.astype(np.float32) / 32768.0
     return samples_float32, rate
 
+#: 支持 / 需要额外 decoder 的模型族。放成常量是为了让「参数校验」和「构造」共用一份，
+#: 不会出现「校验放过、构造时报错」或反过来。
+SUPPORTED_MODEL_TYPES = (
+    "sensevoice",
+    "sense-voice",
+    "paraformer",
+    "fire-red-asr",
+    "fireredasr",
+    "dolphin",
+    "dolphin-ctc",
+    "nemo-ctc",
+    "nemo",
+    "canary",
+    "nemo-canary",
+)
+NEEDS_DECODER = ("fire-red-asr", "fireredasr", "canary", "nemo-canary")
+
+
+def validate_model_type(args):
+    """在**接管 fd 2 之前**校验模型族与必需文件。
+
+    为什么必须提前：进入推理后 `_begin_native_capture()` 会把 fd 2 接管去抓 C++ 日志，
+    那时再 `print(..., file=sys.stderr)` 会写进捕获缓冲区、用户什么都看不到。
+    """
+    kind = (args.model_type or "sensevoice").strip().lower().replace("_", "-")
+    if kind not in SUPPORTED_MODEL_TYPES:
+        print(
+            f"不支持的 --model-type: {args.model_type}（可用的：sensevoice / paraformer / "
+            "fire-red-asr / dolphin-ctc / nemo-ctc / nemo-canary）",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if kind in NEEDS_DECODER and not args.decoder:
+        print(f"{args.model_type} 需要 --decoder（encoder/decoder 两个 onnx）", file=sys.stderr)
+        sys.exit(1)
+
+
+def build_recognizer(sherpa_onnx, args, provider, language):
+    """按 --model-type 构造识别器。
+
+    这里的参数名全部照抄内置 sherpa-onnx 1.13.8 的真实签名（用
+    inspect.signature 逐个核对过），不靠猜：签名对不上会在 import 之后立刻 TypeError。
+
+    缺省分支必须与改造前**完全一致**——老版本 Rust 侧不传 --model-type。
+    """
+    kind = (args.model_type or "sensevoice").strip().lower().replace("_", "-")
+
+    if kind in ("sensevoice", "sense-voice"):
+        return sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=args.model,
+            tokens=args.tokens,
+            num_threads=args.threads,
+            use_itn=True,
+            language=language,
+            provider=provider,
+        )
+
+    if kind == "paraformer":
+        return sherpa_onnx.OfflineRecognizer.from_paraformer(
+            paraformer=args.model,
+            tokens=args.tokens,
+            num_threads=args.threads,
+            provider=provider,
+        )
+
+    if kind in ("fire-red-asr", "fireredasr"):
+        if not args.decoder:
+            print("FireRedASR 需要 --decoder（encoder/decoder 两个 onnx）", file=sys.stderr)
+            sys.exit(1)
+        return sherpa_onnx.OfflineRecognizer.from_fire_red_asr(
+            encoder=args.model,
+            decoder=args.decoder,
+            tokens=args.tokens,
+            num_threads=args.threads,
+            provider=provider,
+        )
+
+    if kind in ("dolphin", "dolphin-ctc"):
+        return sherpa_onnx.OfflineRecognizer.from_dolphin_ctc(
+            model=args.model,
+            tokens=args.tokens,
+            num_threads=args.threads,
+            provider=provider,
+        )
+
+    if kind in ("nemo-ctc", "nemo"):
+        return sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
+            model=args.model,
+            tokens=args.tokens,
+            num_threads=args.threads,
+            provider=provider,
+        )
+
+    if kind in ("canary", "nemo-canary"):
+        if not args.decoder:
+            print("Canary 需要 --decoder（encoder/decoder 两个 onnx）", file=sys.stderr)
+            sys.exit(1)
+        # Canary 的 src/tgt 是语言代码；本项目 --language 传的是 zh/en 这类短码，
+        # 直接透传，取不到就退回 "en"（Canary 只支持欧洲语系 + 英语）。
+        src = (language or "en") if language not in ("", "auto") else "en"
+        return sherpa_onnx.OfflineRecognizer.from_nemo_canary(
+            encoder=args.model,
+            decoder=args.decoder,
+            tokens=args.tokens,
+            src_lang=src,
+            tgt_lang=src,
+            num_threads=args.threads,
+            provider=provider,
+        )
+
+    print(f"不支持的 --model-type: {args.model_type}（尚未接入该模型族）", file=sys.stderr)
+    sys.exit(1)
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -258,12 +372,21 @@ def main():
     parser.add_argument("--language", default="auto", help="Language: auto, zh, en, etc.")
     parser.add_argument("--total-duration", type=float, default=0.0, help="Total media duration in seconds")
     parser.add_argument("--provider", default="cpu", help="ONNX execution provider: cpu | dml")
+    # 模型族。**缺省即 sensevoice**：老版本 Rust 侧不传这个参数，行为必须与以前逐字节一致。
+    parser.add_argument("--model-type", default="sensevoice",
+                        help="sensevoice | paraformer | fire-red-asr | dolphin-ctc | nemo-ctc | nemo-canary")
+    # 少数模型族（FireRedASR / Canary）是 encoder + decoder 两个 onnx，多给一个路径。
+    parser.add_argument("--decoder", default="", help="FireRedASR / Canary 的 decoder 路径")
     args = parser.parse_args()
 
     provider = resolve_provider(args.provider)
+    validate_model_type(args)
 
     if not os.path.exists(args.model):
-        print(f"SenseVoice 模型未找到: {args.model}", file=sys.stderr)
+        print(f"识别模型未找到: {args.model}", file=sys.stderr)
+        sys.exit(1)
+    if args.decoder and not os.path.exists(args.decoder):
+        print(f"decoder 模型未找到: {args.decoder}", file=sys.stderr)
         sys.exit(1)
     if not os.path.exists(args.tokens):
         print(f"SenseVoice 词表未找到: {args.tokens}", file=sys.stderr)
@@ -280,13 +403,11 @@ def main():
     try:
         import sherpa_onnx
 
-        recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=args.model,
-            tokens=args.tokens,
-            num_threads=args.threads,
-            use_itn=True,
-            language=args.language if args.language else "auto",
-            provider=provider
+        recognizer = build_recognizer(
+            sherpa_onnx,
+            args,
+            provider,
+            args.language if args.language else "auto",
         )
     finally:
         _native_log = _native_log_text()
