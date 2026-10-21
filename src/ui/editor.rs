@@ -2575,18 +2575,21 @@ impl MainWindow {
                                                 // 「重转此句」：只解目标窗口那几秒音频，
                                                 // 长视频改一句不用整片重跑。锁定的句子不参与，
                                                 // 免得把用户定稿的文本又覆盖掉。
-                                                .child(
-                                                    primitives::mini_btn(
-                                                        "重转此句",
-                                                        self.state.selected_segment_index.is_some(),
-                                                    )
-                                                    .id("btn-retranscribe-seg")
-                                                    .when(self.state.selected_segment_index.is_some(), |d| {
-                                                        d.on_click(cx.listener(|this, _, _, cx| {
-                                                            this.retranscribe_selected_segment(cx);
-                                                        }))
-                                                    }),
-                                                )
+                                                .child({
+                                                    // 没有媒体文件就置灰：此时点了只会弹一句
+                                                    // 「找不到媒体」，属于假按钮。
+                                                    let has_media = self.state.selected_file.is_some()
+                                                        || self.state.transcribe_file.is_some();
+                                                    let can_respan = self.state.selected_segment_index.is_some()
+                                                        && has_media;
+                                                    primitives::mini_btn("重转此句", can_respan)
+                                                        .id("btn-retranscribe-seg")
+                                                        .when(can_respan, |d| {
+                                                            d.on_click(cx.listener(|this, _, _, cx| {
+                                                                this.retranscribe_selected_segment(cx);
+                                                            }))
+                                                        })
+                                                })
                                                 // 「已校对」开关：锁定后重新翻译/润色不会覆盖这一句。
                                                 // 放在「保存修改」旁边：用户点完保存顺手就能锁上，
                                                 // 不用再去别处找。

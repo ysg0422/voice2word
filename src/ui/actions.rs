@@ -4874,7 +4874,12 @@ impl MainWindow {
         let language = (self.state.language != "auto").then(|| self.state.language.clone());
         let threads = self.state.whisper_threads;
         let model = self.state.selected_model_path.clone();
-        self.notice = Some(format!("正在重转第 {index} 句…"));
+        let t0 = std::time::Instant::now();
+        self.notice = Some(format!(
+            "正在重转第 {index} 句（{} – {}）…",
+            crate::ui::format_mm_ss(seg.start),
+            crate::ui::format_mm_ss(seg.end)
+        ));
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -4900,7 +4905,10 @@ impl MainWindow {
                             .collect::<Vec<_>>()
                             .join("");
                         if this.state.replace_segment_text(index, text) {
-                            this.notice = Some(format!("已重转第 {index} 句"));
+                            this.notice = Some(format!(
+                                "已重转第 {index} 句（耗时 {:.1} 秒）",
+                                t0.elapsed().as_secs_f64()
+                            ));
                         } else {
                             this.notice = Some(format!("第 {index} 句重转结果与原文相同"));
                         }
