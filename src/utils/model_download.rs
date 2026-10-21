@@ -1762,7 +1762,7 @@ pub fn download_one(
                 // 压缩包类组件（如 llama.cpp）：下载物是 zip，真正的程序在包内。
                 // 必须解压到 dest 的父目录并校验关键文件都在，才算成功。
                 if item.is_archive {
-                    match unpack_archive(item, &part, &dest) {
+                    match unpack_archive(item, &part, &dest, url) {
                         Ok(()) => {
                             let dir = dest.parent().unwrap_or(dest.as_path());
                             info!(item = item.id, dir = %dir.display(), "下载并解压完成");
@@ -1816,6 +1816,95 @@ pub fn download_one(
     Err(last_err.unwrap_or_else(|| anyhow!("没有可用的下载源")))
 }
 
+/// 压缩包类型：由下载 URL 的扩展名判断。
+///
+/// 为什么从 URL 推、而不是给 `DownloadItem` 加字段：该结构有 30+ 个字面量
+/// （含测试夹具），每加一个字段都要全改一遍，改动面大且容易漏。而「这条链接下的是
+/// zip 还是 tar.bz2」在 URL 里本来就写着（sherpa-onnx 的发布包一律 `.tar.bz2`），
+/// 同一条目的多个镜像也总是同一种打包方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveKind {
+    Zip,
+    TarBz2,
+}
+
+fn archive_kind_from_url(url: &str) -> ArchiveKind {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains(".tar.bz2") || lower.ends_with(".tbz2") {
+        ArchiveKind::TarBz2
+    } else {
+        ArchiveKind::Zip
+    }
+}
+
+/// `.tar.bz2` 的解压脚本（交给内置便携 Python 执行）。
+///
+/// 为什么用 Python 而不是加 tar/bz2 依赖：便携 Python 本来就随包分发（SenseVoice
+/// 运行器要用），`tarfile` 是标准库——零新依赖、零额外体积。
+///
+/// 安全：便携 Python 是 3.11，`extractall(filter="data")` 要 3.12 才有，所以这里
+/// **逐成员校验**：绝对路径、`..` 穿越、盘符开头的名字，以及符号链接 / 硬链接 /
+/// 设备文件一律跳过。不校验就会重演 zip 那套「解压到目标目录之外」的问题。
+///
+/// 输出：成功解出的**普通文件数**（解析 stdout 得到），供调用方判断是否空包。
+const TAR_BZ2_SCRIPT: &str = r#"
+import sys, tarfile
+
+src, dst = sys.argv[1], sys.argv[2]
+
+def is_safe(name):
+    n = name.replace("\\", "/")
+    if not n or n.startswith("/") or n.startswith("../") or n == "..":
+        return False
+    if "/../" in n or n.endswith("/.."):
+        return False
+    # Windows 盘符（C:/...）同样是绝对路径
+    if len(n) > 1 and n[1] == ":":
+        return False
+    return True
+
+count = 0
+with tarfile.open(src, "r:bz2") as tf:
+    for m in tf.getmembers():
+        if m.issym() or m.islnk() or m.isdev() or not is_safe(m.name):
+            continue
+        tf.extract(m, dst)
+        if m.isfile():
+            count += 1
+print(count)
+"#;
+
+/// 用内置便携 Python 解压 `.tar.bz2`，返回解出的普通文件数。
+fn extract_tar_bz2(part: &Path, dir: &Path) -> Result<usize> {
+    // 与 SenseVoice 运行器同一套解释器解析规则：优先内置便携 Python，
+    // 别指望客户机 PATH 上有 python。
+    let python = crate::utils::AppConfig::resolve_command("python");
+    let mut cmd = std::process::Command::new(&python);
+    cmd.arg("-c")
+        .arg(TAR_BZ2_SCRIPT)
+        .arg(part)
+        .arg(dir)
+        .stdin(std::process::Stdio::null());
+    // 去掉用户环境里残留的 PYTHONHOME/PYTHONPATH 并固定 UTF-8 输出：
+    // 否则某些机器上解释器会去找另一份（残缺的）标准库。
+    crate::engines::media_pipeline::apply_python_env(&mut cmd);
+    // 1.5 GB 的 bz2 在慢 CPU 上解压要几分钟；给足预算，但不能无限等。
+    let out = crate::engines::ffmpeg::run_with_deadline(&mut cmd, Duration::from_secs(1800))
+        .with_context(|| format!("启动解压进程失败: {}", python.display()))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "解压 .tar.bz2 失败（退出码 {:?}）：{}",
+            out.status.code(),
+            stderr.trim().chars().take(400).collect::<String>()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(0))
+}
+
 /// 把已下载到 `part` 的 zip 解压到 `dest` 的父目录，并校验关键文件都落盘。
 ///
 /// 抽成独立函数是因为这几步**顺序敏感**，混在 `download_one` 里容易改错：
@@ -1823,13 +1912,22 @@ pub fn download_one(
 /// 2. 校验入口文件（`dest`）与伴生文件（`companion`）确实存在；
 /// 3. 全部校验通过后才删除 `.part`。中途失败则保留 `.part`，
 ///    既不会留下半成品目录，也能被 `sweep_parts_for` 在下次启动时清掉。
-fn unpack_archive(item: &DownloadItem, part: &Path, dest: &Path) -> Result<()> {
+fn unpack_archive(item: &DownloadItem, part: &Path, dest: &Path, url: &str) -> Result<()> {
     let dir = dest
         .parent()
         .ok_or_else(|| anyhow!("目标路径没有父目录: {}", dest.display()))?;
-    let bytes = fs::read(part).with_context(|| format!("读取压缩包失败: {}", part.display()))?;
-    let n = super::zip_extract::extract_zip(&bytes, dir)
-        .with_context(|| format!("解压失败: {}", part.display()))?;
+    // 按 URL 的扩展名选解压器：.tar.bz2 走便携 Python，其余沿用内置 zip 解析器。
+    let n = match archive_kind_from_url(url) {
+        ArchiveKind::TarBz2 => {
+            extract_tar_bz2(part, dir).with_context(|| format!("解压失败: {}", part.display()))?
+        }
+        ArchiveKind::Zip => {
+            let bytes =
+                fs::read(part).with_context(|| format!("读取压缩包失败: {}", part.display()))?;
+            super::zip_extract::extract_zip(&bytes, dir)
+                .with_context(|| format!("解压失败: {}", part.display()))?
+        }
+    };
     if n == 0 {
         bail!("压缩包里没有可用的文件: {}", part.display());
     }
@@ -2515,6 +2613,82 @@ mod tests {
         Box::leak(s.into_boxed_str())
     }
 
+    /// 压缩包类型从 URL 推断：sherpa-onnx 的发布包一律 .tar.bz2，其余按 zip。
+    #[test]
+    fn archive_kind_follows_url_extension() {
+        use super::archive_kind_from_url;
+        use super::ArchiveKind;
+        assert_eq!(
+            archive_kind_from_url("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-2024-03-09.tar.bz2"),
+            ArchiveKind::TarBz2
+        );
+        // 大小写混排 / 带查询串也要认得出
+        assert_eq!(
+            archive_kind_from_url("https://x/y/Model.TAR.BZ2?download=1"),
+            ArchiveKind::TarBz2
+        );
+        assert_eq!(
+            archive_kind_from_url("https://x/y/pkg.tbz2"),
+            ArchiveKind::TarBz2
+        );
+        assert_eq!(
+            archive_kind_from_url("https://x/y/pkg.zip"),
+            ArchiveKind::Zip
+        );
+        assert_eq!(
+            archive_kind_from_url("https://x/y/pkg.exe"),
+            ArchiveKind::Zip
+        );
+    }
+
+    /// .tar.bz2 解压必须跳过「跑到目标目录之外」的成员（路径穿越）。
+    ///
+    /// 便携 Python 是 3.11，而 extractall 的 filter="data" 要 3.12 才有，
+    /// 所以安全靠脚本里自己逐成员校验——这条测试盯的就是那段校验别被改坏。
+    #[test]
+    fn tar_bz2_extraction_skips_escaping_members() {
+        let dir = std::env::temp_dir().join(format!("v2w_tarbz2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("ok.txt"), b"hello").unwrap();
+
+        let archive = dir.join("pkg.tar.bz2");
+        let script = r#"
+import sys, tarfile, io, os
+src_dir, out = sys.argv[1], sys.argv[2]
+with tarfile.open(out, "w:bz2") as tf:
+    tf.add(os.path.join(src_dir, "ok.txt"), arcname="ok.txt")
+    info = tarfile.TarInfo("../evil.txt")
+    info.size = 4
+    tf.addfile(info, io.BytesIO(b"evil"))
+"#;
+        let python = crate::utils::AppConfig::resolve_command("python");
+        let built = std::process::Command::new(&python)
+            .arg("-c")
+            .arg(script)
+            .arg(&src_dir)
+            .arg(&archive)
+            .output();
+        // 没有可用的 Python（例如精简 CI 环境）：跳过，而不是让测试失败。
+        let Ok(built) = built else { return };
+        if !built.status.success() {
+            return;
+        }
+
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let n = super::extract_tar_bz2(&archive, &out_dir).expect("解压应成功");
+        assert_eq!(n, 1, "只应解出一个正常文件");
+        assert!(out_dir.join("ok.txt").exists(), "正常文件必须解出");
+        assert!(
+            !dir.join("evil.txt").exists(),
+            "路径穿越成员必须被跳过（否则能写到目标目录之外）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 登记值过期时必须改信服务端：否则上游换了更大的量化版本，正常下载会被自己的上限拦死。
     #[test]
     fn size_bound_falls_back_to_server_when_registry_is_stale() {
@@ -3030,7 +3204,7 @@ mod tests {
         .unwrap();
         let dest = dir.join("tool.exe");
 
-        unpack_archive(&item, &part, &dest).unwrap();
+        unpack_archive(&item, &part, &dest, "https://example.invalid/x.zip").unwrap();
         assert!(dest.exists(), "入口文件应已解压落盘");
         assert!(dir.join("tool-server.exe").exists(), "伴生文件应已解压落盘");
         assert!(!part.exists(), "成功后 .part 必须被删除");
@@ -3065,7 +3239,7 @@ mod tests {
         let dest = dir.join("tool.exe");
 
         assert!(
-            unpack_archive(&item, &part, &dest).is_err(),
+            unpack_archive(&item, &part, &dest, "https://example.invalid/x.zip").is_err(),
             "缺伴生文件应报错"
         );
         assert!(part.exists(), "失败时 .part 应保留以便清理");
