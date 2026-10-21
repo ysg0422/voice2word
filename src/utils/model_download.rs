@@ -1604,6 +1604,9 @@ pub fn download_one(
     let part =
         part_path_for(&dest).ok_or_else(|| anyhow!("无法为 {} 构造临时文件名", dest.display()))?;
 
+    // 本次下载**累计的网络传输量**（跨重试与换源）。它才是用户真正花的流量：
+    // 一次失败可能已经白传了几百 MB，界面上却只显示文件大小。
+    let mut net_bytes: u64 = 0;
     let mut last_err: Option<anyhow::Error> = None;
     // 本次下载内失败过的 host：排在队尾，避免同一次下载反复踩同一个死源。
     // 每次 download_one 都从空表开始——即「下次下载恢复原始顺序」，
@@ -1614,7 +1617,15 @@ pub fn download_one(
         if cancel.load(Ordering::Relaxed) {
             return Err(anyhow!("已取消"));
         }
-        match fetch_to_file(url, &part, item.size, item.id, cancel, progress) {
+        match fetch_to_file(
+            url,
+            &part,
+            item.size,
+            item.id,
+            cancel,
+            progress,
+            &mut net_bytes,
+        ) {
             Ok(()) => {
                 // 内容哈希强校验（仅当条目声明了 sha256）。不符时删 `.part` 换源，
                 // 绝不 rename —— 把损坏文件落到正式名比下载失败更难排查。
@@ -1667,6 +1678,14 @@ pub fn download_one(
             }
             Err(err) => {
                 warn!(item = item.id, url, error = %err, "该下载源失败，尝试下一个");
+                // 换源前先算账：累计传输已经超过登记大小的 3 倍还在失败，说明所有源
+                // 都在反复给错误内容，继续换下去只是继续烧用户的流量。
+                if retry_budget_exhausted(net_bytes, item.size) {
+                    let over = "累计传输已超过登记大小的 3 倍，停止重试：这一项的所有下载源"
+                        .to_string()
+                        + "都在反复返回错误内容，请稍后再试或检查网络代理";
+                    return Err(anyhow!(over));
+                }
                 // 连接阶段失败（DNS/TCP/TLS）→ 本次下载内把它排到队尾。
                 //
                 // 刻意**不**做跨下载的永久拉黑：那种「记住坏源」的做法对挂梯子的用户
@@ -1922,6 +1941,24 @@ fn send_get(
 }
 
 /// 从单个 URL 流式下载到文件，支持断点续传，并做大小校验。
+/// 写入量是否已**明显超出**登记大小（超过 5%）。
+///
+/// 为什么必须有上限：流式写法是「服务端给多少写多少」，而对端并不总是老实——
+/// 镜像返回一个 HTML 错误页、代理忽略了 `Range` 又拼上了完整体、URL 过期后换成了
+/// 别的资产，都会让 `.part` 无限增长。实测症状是「界面显示 400 MB，实际下载了 2 GB」。
+/// 登记大小未知（0）时恒为 `false`：不能拿 0 当上限把正常下载掐死。
+fn exceeds_expected(written: u64, expected: u64) -> bool {
+    expected > 0 && written > expected.saturating_add(expected / 20)
+}
+
+/// 多次换源重试的**累计传输**是否已经离谱（超过登记大小的 3 倍）。
+///
+/// 每次源失败都会白传一部分字节，多源轮下来用户的数据流量可以是文件大小的好几倍。
+/// 到 3 倍还没成功，说明「所有源都在反复给我们错东西」，继续换源只是继续烧流量。
+fn retry_budget_exhausted(transferred: u64, expected: u64) -> bool {
+    expected > 0 && transferred > expected.saturating_mul(3)
+}
+
 fn fetch_to_file(
     url: &str,
     part: &Path,
@@ -1929,6 +1966,7 @@ fn fetch_to_file(
     item_id: &str,
     cancel: &Arc<AtomicBool>,
     progress: Option<&ProgressFn>,
+    net_bytes: &mut u64,
 ) -> Result<()> {
     // 大文件（最大 833 MB）在慢网下需要足够长的**总**上限；但只有总上限是不够的：
     // 连接建好之后对端不再发数据时，总超时会把界面卡在「下载中 … 0 B」上整整两小时，
@@ -1946,15 +1984,28 @@ fn fetch_to_file(
     // 已不小于期望大小：多半是上次下完但没来得及 rename（进程被杀）。
     // 直接跳过网络、交给上层做大小 / 哈希校验，省下一次几百 MB 的重下。
     if expected_size > 0 && existing >= expected_size {
-        info!(
-            item = item_id,
-            bytes = existing,
-            "已有完整的临时文件，跳过下载直接校验"
-        );
-        if let Some(cb) = progress {
-            cb(existing, existing, item_id);
+        // 超过登记大小说明这份 `.part` 根本不是我们要的东西（错误页 / 别的资产 /
+        // 代理把两段拼在了一起）。这里必须删掉重下——否则上层会把它 rename 成正式
+        // 文件名，用户拿到一个「大小不对但没人报错」的模型。
+        if exceeds_expected(existing, expected_size) {
+            warn!(
+                item = item_id,
+                bytes = existing,
+                expected = expected_size,
+                "临时文件大于登记大小，判为损坏并丢弃"
+            );
+            let _ = fs::remove_file(part);
+        } else {
+            info!(
+                item = item_id,
+                bytes = existing,
+                "已有完整的临时文件，跳过下载直接校验"
+            );
+            if let Some(cb) = progress {
+                cb(existing, existing, item_id);
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     let requested_resume = resume_offset(existing, expected_size);
@@ -2040,8 +2091,22 @@ fn fetch_to_file(
         if n == 0 {
             break;
         }
+        // 先算「写完会有多少」，超限就**不写**：宁可少写一次，也不要为了报错先把
+        // 几百 MB 的错误内容落到盘上。
+        let prospective = written.saturating_add(n as u64);
+        if exceeds_expected(prospective, expected_size) {
+            drop(file);
+            let _ = fs::remove_file(part);
+            return Err(anyhow!(
+                "下载内容超出登记大小：已收到 {:.1} MB，登记 {:.1} MB（疑似镜像返回了错误内容）",
+                prospective as f64 / MB as f64,
+                expected_size as f64 / MB as f64
+            ));
+        }
         file.write_all(&buf[..n]).context("写入文件失败")?;
         written += n as u64;
+        // 累计**网络**字节（跨重试 / 换源），用来判断「是不是所有源都在反复给错东西」。
+        *net_bytes = net_bytes.saturating_add(n as u64);
 
         // 限流上报：进度条不需要每 256KB 刷一次，100ms 一次足够顺滑，
         // 也能让 UI 线程少做无谓的重绘。
@@ -2296,6 +2361,28 @@ mod tests {
     /// 测试里泄漏几个短字符串无所谓，换来的是测试不再向仓库树写东西。
     fn leak_str(s: String) -> &'static str {
         Box::leak(s.into_boxed_str())
+    }
+
+    /// 超限判据：只挡「明显超出」（>105%），不误伤正常的小幅偏差。
+    #[test]
+    fn exceeds_expected_only_when_clearly_over() {
+        // 登记大小未知：不设上限，否则会把正常下载掐死
+        assert!(!super::exceeds_expected(100, 0));
+        // 105% 以内放行（服务端多吐几个字节是常态）
+        assert!(!super::exceeds_expected(105, 100));
+        assert!(super::exceeds_expected(106, 100));
+        assert!(!super::exceeds_expected(400_000_000, 400_000_000));
+        // 实测症状：登记 400 MB，实际收到 2 GB
+        assert!(super::exceeds_expected(2_000_000_000, 400_000_000));
+    }
+
+    /// 换源预算：累计传输超过登记大小 3 倍就停手，不再继续烧流量。
+    #[test]
+    fn retry_budget_trips_at_three_times() {
+        assert!(!super::retry_budget_exhausted(300, 0), "未知大小不设预算");
+        assert!(!super::retry_budget_exhausted(300, 100));
+        assert!(super::retry_budget_exhausted(301, 100));
+        assert!(super::retry_budget_exhausted(2_000_000_000, 400_000_000));
     }
 
     /// 目录求和必须递归：解压型条目的占用全在子目录里，只算顶层等于没算。
