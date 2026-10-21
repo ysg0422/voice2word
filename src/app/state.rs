@@ -465,6 +465,12 @@ impl WhisperModelTier {
 pub struct EditSnapshot {
     pub segments: Vec<Segment>,
     pub selected_segment_index: Option<usize>,
+    /// 范围选择的锚点：按住 Shift 连点时，从这一句一直选到当前句。
+    ///
+    /// 只存一个 `usize` 而不是一组下标：字幕 `index` 恒为 1..=n 的连续编号
+    /// （每次增删都会 `reindex_segments`），因此「一段区间」用首尾两个下标就够，
+    /// 不必再维护一个会与 `segments` 失步的集合。
+    pub selection_anchor: Option<usize>,
     pub current_time: f64,
     pub editing_text: String,
 }
@@ -937,6 +943,8 @@ pub struct AppState {
     pub total_duration: f64,
     pub is_playing: bool,
     pub selected_segment_index: Option<usize>,
+    /// 范围选择的锚点：按住 Shift 连点时，从这一句一直选到当前句（见 `selected_span`）。
+    pub selection_anchor: Option<usize>,
     pub preview_frame_path: Option<PathBuf>,
     /// 当前定位帧**自己解码**好的图像（BGRA，可直接当 GPU 纹理上传）。
     ///
@@ -1313,6 +1321,7 @@ impl AppState {
             total_duration: 0.0,
             is_playing: false,
             selected_segment_index: None,
+            selection_anchor: None,
             preview_frame_path: None,
             preview_frame_image: None,
             timeline_zoom: 1.0,
@@ -3170,6 +3179,36 @@ impl AppState {
 
     /// 选中指定索引的字幕片段
     pub fn select_segment(&mut self, index: usize) {
+        self.selection_anchor = Some(index);
+        self.set_active_segment(index);
+    }
+
+    /// 带修饰键的选中：`extend = true`（Shift 连点）时从锚点扩展到 `index`。
+    ///
+    /// 锚点缺失时退回「从当前选中项开始」，再退回 `index` 本身——
+    /// 这样从菜单 / 快捷键进来的选中也不会把范围算歪。
+    pub fn select_segment_with(&mut self, index: usize, extend: bool) {
+        if extend {
+            let anchor = self
+                .selection_anchor
+                .or(self.selected_segment_index)
+                .unwrap_or(index);
+            self.selection_anchor = Some(anchor);
+            self.set_active_segment(index);
+        } else {
+            self.select_segment(index);
+        }
+    }
+
+    /// 当前选中的句子区间（首尾都**含**），按 `index` 升序。未选中时为 `None`。
+    pub fn selected_span(&self) -> Option<(usize, usize)> {
+        let active = self.selected_segment_index?;
+        let anchor = self.selection_anchor.unwrap_or(active);
+        Some((active.min(anchor), active.max(anchor)))
+    }
+
+    /// 只改「当前句 + 编辑缓冲 + 播放头」，不动范围锚点。
+    fn set_active_segment(&mut self, index: usize) {
         // 切句前把上一句的编辑登记为「稍后落库」：逐句跳转时每跳一次都序列化整份工程
         // 太贵（5000 句约 10~30ms），写库交给停手 1.2s 后的定时器
         // （见 `SEGMENTS_FLUSH_IDLE`）。关窗 / 换工程仍会立刻写，不会丢。
@@ -3822,6 +3861,7 @@ impl AppState {
         EditSnapshot {
             segments: self.segments.clone(),
             selected_segment_index: self.selected_segment_index,
+            selection_anchor: self.selection_anchor,
             current_time: self.current_time,
             editing_text: self.editing_text.clone(),
         }
@@ -3901,6 +3941,7 @@ impl AppState {
     fn restore_snapshot(&mut self, snap: EditSnapshot) {
         self.segments = snap.segments;
         self.selected_segment_index = snap.selected_segment_index;
+        self.selection_anchor = snap.selection_anchor;
         self.current_time = snap.current_time;
         self.editing_text = snap.editing_text;
         self.segments_dirty = true;
@@ -4194,6 +4235,70 @@ impl AppState {
     }
 
     /// 删除当前选中的字幕片段
+    /// 用「局部重转」的结果整段替换 `[from, to]` 这些句子。
+    ///
+    /// 与单句版本的区别：多句重转时新结果的分句数**通常与原句数不同**（一句话被
+    /// 切成两句、或两句被并成一句），逐句对位必然错位。所以这里整段换掉：删掉
+    /// 原来的 N 句、插入新的 M 句，时间轴取自新结果并**钳在被替换区间内**——
+    /// 区间外的句子时间一律不动。
+    ///
+    /// 返回是否发生了替换（无选中 / 新结果为空 / 区间越界都返回 `false`）。
+    pub fn replace_segment_span(
+        &mut self,
+        from: usize,
+        to: usize,
+        new_segments: Vec<Segment>,
+    ) -> bool {
+        if new_segments.is_empty() {
+            return false;
+        }
+        let (lo, hi) = (from.min(to), from.max(to));
+        let positions: Vec<usize> = self
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.index >= lo && s.index <= hi)
+            .map(|(i, _)| i)
+            .collect();
+        let (Some(&first), Some(&last)) = (positions.first(), positions.last()) else {
+            return false;
+        };
+        let (span_start, span_end) = (self.segments[first].start, self.segments[last].end);
+
+        self.snapshot_for_undo();
+        let before: String = positions
+            .iter()
+            .map(|i| self.segments[*i].display_text())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let after: String = new_segments
+            .iter()
+            .map(|s| s.display_text())
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.audit(crate::subtitle::audit::EditKind::Text, lo, before, after);
+
+        let mut incoming = new_segments;
+        for seg in incoming.iter_mut() {
+            // 新结果的时间轴来自同一段音频，理论上已落在区间内；这里再钳一次，
+            // 防止引擎给出越界时间戳把邻居的句子顶开。
+            seg.start = seg.start.clamp(span_start, span_end);
+            seg.end = seg.end.clamp(seg.start, span_end);
+            // 重转出来的句子是「机器新写的」，不能继承原来的已校对标记。
+            seg.locked = false;
+        }
+        self.segments.splice(first..=last, incoming);
+        self.reindex_segments();
+        self.segments_dirty = true;
+        self.bump_segments_revision();
+        // 选中新插入的第一句（原区间起点位置）。
+        if let Some(seg) = self.segments.get(first) {
+            let idx = seg.index;
+            self.select_segment(idx);
+        }
+        true
+    }
+
     /// 用「局部重转」的结果替换某一句的原文；返回是否真的改了。
     ///
     /// 只动 `text`（并清掉已失效的 `polished`），**不动**起止时间：时间轴是用户
@@ -6397,6 +6502,33 @@ mod tests {
             state.segments[1].text, "这是正确句子",
             "未锁定句应被记忆库改写"
         );
+    }
+
+    /// Shift 连点扩选：锚点固定，当前句移动，区间取两者之间。
+    #[test]
+    fn selected_span_extends_from_anchor() {
+        use crate::subtitle::Segment;
+        let mut state = test_state(vec![
+            Segment::new(1, 0.0, 1.0, "一"),
+            Segment::new(2, 1.0, 2.0, "二"),
+            Segment::new(3, 2.0, 3.0, "三"),
+            Segment::new(4, 3.0, 4.0, "四"),
+        ]);
+
+        state.select_segment(2);
+        assert_eq!(state.selected_span(), Some((2, 2)), "单选时区间就是这一句");
+
+        // Shift 点到第 4 句：从锚点 2 扩到 4
+        state.select_segment_with(4, true);
+        assert_eq!(state.selected_span(), Some((2, 4)));
+
+        // 反向扩选（往上点）：锚点不动，区间变成 1..=2
+        state.select_segment_with(1, true);
+        assert_eq!(state.selected_span(), Some((1, 2)));
+
+        // 不带 Shift 的点击重置锚点
+        state.select_segment(3);
+        assert_eq!(state.selected_span(), Some((3, 3)));
     }
 
     /// 锁定（已校对）的句子：重新翻译**不得覆盖**它的译文。

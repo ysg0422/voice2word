@@ -4842,20 +4842,22 @@ impl MainWindow {
     /// 走后台线程 + `background_executor`：ffmpeg 抽窗与引擎调用都是秒级阻塞，
     /// 放 UI 线程上会卡住整个窗口。
     pub(crate) fn retranscribe_selected_segment(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.state.selected_segment_index else {
+        // 选中区间（Shift 连点可跨多句）；单句时就是那一句。
+        let Some((lo, hi)) = self.state.selected_span() else {
             return;
         };
-        let Some(seg) = self
+        let picked: Vec<crate::subtitle::Segment> = self
             .state
             .segments
             .iter()
-            .find(|s| s.index == index)
+            .filter(|s| s.index >= lo && s.index <= hi)
             .cloned()
-        else {
+            .collect();
+        let (Some(first_seg), Some(last_seg)) = (picked.first(), picked.last()) else {
             return;
         };
-        if seg.locked {
-            self.notice = Some("这一句已标为「已校对」，先解锁再重转".to_string());
+        if picked.iter().any(|s| s.locked) {
+            self.notice = Some("选中的句子里有「已校对」的，先解锁再重转".to_string());
             cx.notify();
             return;
         }
@@ -4875,10 +4877,17 @@ impl MainWindow {
         let threads = self.state.whisper_threads;
         let model = self.state.selected_model_path.clone();
         let t0 = std::time::Instant::now();
+        let span_start = first_seg.start;
+        let span_end = last_seg.end;
         self.notice = Some(format!(
-            "正在重转第 {index} 句（{} – {}）…",
-            crate::ui::format_mm_ss(seg.start),
-            crate::ui::format_mm_ss(seg.end)
+            "正在重转 {}（{} – {}）…",
+            if lo == hi {
+                format!("第 {lo} 句")
+            } else {
+                format!("{lo}–{hi} 共 {} 句", picked.len())
+            },
+            crate::ui::format_mm_ss(span_start),
+            crate::ui::format_mm_ss(span_end)
         ));
         cx.notify();
 
@@ -4888,8 +4897,8 @@ impl MainWindow {
                 .spawn(async move {
                     pipeline.retranscribe_window(
                         &media,
-                        seg.start,
-                        seg.end,
+                        span_start,
+                        span_end,
                         language.as_deref(),
                         Some(threads),
                         Some(model.as_path()),
@@ -4899,22 +4908,34 @@ impl MainWindow {
             let _ = this.update(cx, |this, cx| {
                 match res {
                     Ok(segs) if !segs.is_empty() => {
-                        let text = segs
-                            .iter()
-                            .map(|s| s.display_text().to_string())
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if this.state.replace_segment_text(index, text) {
+                        let ok = if lo == hi {
+                            // 单句：只换文字、绝不动时间轴（时间是用户按画面卡好的）
+                            let text = segs
+                                .iter()
+                                .map(|s| s.display_text().to_string())
+                                .collect::<Vec<_>>()
+                                .join("");
+                            this.state.replace_segment_text(lo, text)
+                        } else {
+                            // 多句：分句数通常会变，整段换掉（时间钳在被替换区间内）
+                            this.state.replace_segment_span(lo, hi, segs)
+                        };
+                        if ok {
                             this.notice = Some(format!(
-                                "已重转第 {index} 句（耗时 {:.1} 秒）",
+                                "已重转 {}（耗时 {:.1} 秒）",
+                                if lo == hi {
+                                    format!("第 {lo} 句")
+                                } else {
+                                    format!("{lo}–{hi} 共 {} 句", picked.len())
+                                },
                                 t0.elapsed().as_secs_f64()
                             ));
                         } else {
-                            this.notice = Some(format!("第 {index} 句重转结果与原文相同"));
+                            this.notice = Some("重转结果与原文相同".to_string());
                         }
                     }
                     Ok(_) => {
-                        this.notice = Some(format!("第 {index} 句这一段没有识别出内容"));
+                        this.notice = Some("这一段没有识别出内容".to_string());
                     }
                     Err(err) => {
                         this.notice = Some(format!("重转失败：{err}"));

@@ -2582,7 +2582,17 @@ impl MainWindow {
                                                         || self.state.transcribe_file.is_some();
                                                     let can_respan = self.state.selected_segment_index.is_some()
                                                         && has_media;
-                                                    primitives::mini_btn("重转此句", can_respan)
+                                                    let span_len = self
+                                                        .state
+                                                        .selected_span()
+                                                        .map(|(lo, hi)| hi.saturating_sub(lo) + 1)
+                                                        .unwrap_or(0);
+                                                    let label = if span_len > 1 {
+                                                        format!("重转 {span_len} 句")
+                                                    } else {
+                                                        "重转此句".to_string()
+                                                    };
+                                                    primitives::mini_btn(label, can_respan)
                                                         .id("btn-retranscribe-seg")
                                                         .when(can_respan, |d| {
                                                             d.on_click(cx.listener(|this, _, _, cx| {
@@ -3395,6 +3405,8 @@ impl MainWindow {
                                     row_count,
                                     cx.processor(move |this, visible_range: std::ops::Range<usize>, _window, cx| {
                                         let sel = this.state.selected_segment_index;
+                                        // 选中区间（含 Shift 扩选）：行高亮与「重转 N 句」都读它。
+                                        let span = this.state.selected_span();
                                         let cur_time = this.state.current_time;
                                         let glossary_bad = glossary_bad.clone();
                                         let low_conf = low_conf.clone();
@@ -3415,6 +3427,11 @@ impl MainWindow {
                                                 };
                                                 let seg_idx = seg.index;
                                                 let is_selected = sel == Some(seg_idx);
+                                                // 范围高亮：Shift 连点选中的整段都要变底色，
+                                                // 否则用户看不出「这一下会重转多少句」。
+                                                let in_span = span
+                                                    .map(|(lo, hi)| seg_idx >= lo && seg_idx <= hi)
+                                                    .unwrap_or(false);
                                                 let is_playing_here = is_playing_at(seg.start, seg.end, cur_time);
                                                 let start_ts = seconds_to_timestamp_short(seg.start);
                                                 let end_ts = seconds_to_timestamp_short(seg.end);
@@ -3443,7 +3460,7 @@ impl MainWindow {
                                                     .relative()
                                                     .bg(if picked {
                                                         Theme::tint_mint_badge()
-                                                    } else if is_selected {
+                                                    } else if in_span {
                                                         Theme::tint_mint_soft()
                                                     } else if glossary_flagged {
                                                         Theme::tint_warn_soft()
@@ -3453,7 +3470,12 @@ impl MainWindow {
                                                         Theme::transparent()
                                                     })
                                                     .hover(|s| s.bg(if picked || is_selected { Theme::tint_mint_badge() } else { Theme::bg_hover() }))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                                        // Shift 连点 = 从锚点扩选到这一句（范围重转用）。
+                                                        let extend = matches!(
+                                                            event,
+                                                            ClickEvent::Mouse(m) if m.down.modifiers.shift
+                                                        );
                                                         // 选句模式：只切换勾选，不动播放位置。
                                                         if this.state.is_picking_translate() {
                                                             this.state
@@ -3466,7 +3488,7 @@ impl MainWindow {
                                                         // 继续从旧处播放，点击等于没生效（与键盘「上/下句」
                                                         // `jump_prev/next_segment` 同一套「先停再选」语义）。
                                                         this.halt_preview_playback();
-                                                        this.state.select_segment(seg_idx);
+                                                        this.state.select_segment_with(seg_idx, extend);
                                                         // 选中即把播放位置归位到该句起点；再显式 seek 一次做边界钳制，
                                                         // 随后 `trigger_extract_frame` 抽帧，画面即落到这一句。
                                                         if let Some(target) =
