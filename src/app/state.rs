@@ -1414,8 +1414,24 @@ impl AppState {
     /// 程序占用）于是完全静默：用户改完设置、重启、发现设置又变回去了，却没有任何
     /// 线索。这与字幕写库失败是同一类「用户以为保存了」的缺陷，处理方式也一致——
     /// 挂到跨页常驻的提示条上，**不重试**（失败通常是持久性原因，重试只会再失败）。
+    /// 落盘到 `config.toml`。
+    ///
+    /// **单测里整个方法被编译成空实现**：`test_state` 用的是 `AppConfig::default()`，
+    /// 而设置页 / 翻译 / 线程数这些 setter 都会调它。原先「跑一遍测试」就会把仓库根的
+    /// `config.toml` 覆盖成默认值——用户改过的 `target_lang` 之类被静默清零，且没有
+    /// 任何提示（这条是实测踩到的：跑完测试后 `target_lang` 从「日本語」变回「简体中文」）。
+    ///
+    /// 需要验证落盘行为的测试请用 [`Self::persist_config_to`] 指到临时目录，
+    /// 那也是本文件其余「可注入路径」方法的既有约定。
+    #[cfg(not(test))]
     pub(crate) fn persist_config(&mut self) {
         self.persist_config_to("config.toml");
+    }
+
+    /// 单测版本：不写盘（见上方说明）。
+    #[cfg(test)]
+    pub(crate) fn persist_config(&mut self) {
+        let _ = self;
     }
 
     /// 打开「拖动中」落盘闸门：此后到 [`Self::end_config_drag`] 之前，
@@ -1430,8 +1446,15 @@ impl AppState {
     ///
     /// 幂等：没在拖动时是空操作，重复调用只会在第一次真正写盘（之后
     /// `save_to_file` 见内容未变也不再重写）。
+    #[cfg(not(test))]
     pub(crate) fn end_config_drag(&mut self) {
         self.end_config_drag_to("config.toml");
+    }
+
+    /// 单测版本：只关闸门、不写盘。
+    #[cfg(test)]
+    pub(crate) fn end_config_drag(&mut self) {
+        self.config_drag_active = false;
     }
 
     /// [`Self::end_config_drag`] 的可注入路径版本（单测用）。
