@@ -472,6 +472,115 @@ pub const ITEMS: &[DownloadItem] = &[
         companion: None,
         sha256: None,
     },
+
+    // ── 高精度档（比 Turbo 更准，慢一些；按需下载即可，不占必需集）──
+    //
+    // 这批是 whisper.cpp 官方仓库里「精度优先」的几档。登记大小全部用
+    // `curl -IL` 实测的 Content-Length 填的——下载器现在有「超过登记大小 105%
+    // 就中止」的保护，这里写错一个数字，用户就再也下不动那个模型。
+    DownloadItem {
+        id: "whisper-large-v3-q5_0",
+        label: "Whisper Large-V3 Q5（高精·省空间）",
+        note: "比 Turbo 更准，体积只有旗舰的三分之一；追求准确率又不想吃满 3GB 时选它",
+        dest: "models/whisper/ggml-large-v3-q5_0.bin",
+        urls: &[
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3-q5_0.bin",
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin",
+        ],
+        size: 1_081_140_203, // 实测 ggml-large-v3-q5_0.bin
+        min_size: 1_000_000_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
+    DownloadItem {
+        id: "whisper-large-v3-turbo-f16",
+        label: "Whisper Turbo 全精度（F16）",
+        note: "Turbo 的未量化版本（1.6GB）；量化会掉一点精度，设备够快时用它最稳",
+        dest: "models/whisper/ggml-large-v3-turbo.bin",
+        urls: &[
+            // ModelScope 上没有这个文件（实测 404），只给镜像源，避免白等一次 404。
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+        ],
+        size: 1_624_555_275, // 实测 ggml-large-v3-turbo.bin
+        min_size: 1_500_000_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
+    DownloadItem {
+        id: "whisper-large-v2",
+        label: "Whisper Large-V2（全精度）",
+        note: "上一代旗舰全尺寸；某些语种/口音比 v3 更稳，代价是慢",
+        dest: "models/whisper/ggml-large-v2.bin",
+        urls: &[
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v2.bin",
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v2.bin",
+        ],
+        size: 3_094_623_691, // 实测 ggml-large-v2.bin
+        min_size: 3_000_000_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
+    DownloadItem {
+        id: "whisper-medium-q8",
+        label: "Whisper Medium Q8（高精·中档）",
+        note: "Medium 的 8bit 量化版；比 Small 准、比 Large 省，笔记本上的折中之选",
+        dest: "models/whisper/ggml-medium-q8_0.bin",
+        urls: &[
+            // ModelScope 上没有这个文件（实测 404）。
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-medium-q8_0.bin",
+        ],
+        size: 823_369_779, // 实测 ggml-medium-q8_0.bin
+        min_size: 780_000_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
+    // ── 英语专用档（.en 模型在纯英文素材上明显更准，中文素材别选）──
+    DownloadItem {
+        id: "whisper-medium-en",
+        label: "Whisper Medium.en（英语专用）",
+        note: "只认英文，纯英文素材上比同尺寸多语种模型更准；中文素材请勿选",
+        dest: "models/whisper/ggml-medium.en.bin",
+        urls: &[
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-medium.en.bin",
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin",
+        ],
+        size: 1_533_774_781, // 实测 ggml-medium.en.bin
+        min_size: 1_450_000_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
+    DownloadItem {
+        id: "whisper-small-en",
+        label: "Whisper Small.en（英语专用·轻）",
+        note: "只认英文的轻量档（465MB），英文播客/网课的首选",
+        dest: "models/whisper/ggml-small.en.bin",
+        urls: &[
+            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-small.en.bin",
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
+        ],
+        size: 487_614_201, // 实测 ggml-small.en.bin
+        min_size: 460_000_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
     DownloadItem {
         id: "silero-vad",
         label: "Silero VAD（静音检测）",

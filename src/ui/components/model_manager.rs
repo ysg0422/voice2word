@@ -49,10 +49,42 @@ struct ModelCategory {
 /// `match current_tab { SenseVoice => ..., Whisper => ..., Common => ... }`，
 /// 改一处要同步三处，正是「三个专区只能看一个」这个别扭设计的根源。
 /// Whisper 语音识别可选模型（任选其一即可）的全部条目 ID
+/// 「快速 / 均衡」档：日常首选，体积与速度友好。
+const WHISPER_FAST_IDS: &[&str] = &[
+    "whisper-turbo-q5",
+    "whisper-turbo-q8",
+    "whisper-medium",
+    "whisper-small",
+    "whisper-base",
+    "whisper-tiny",
+];
+
+/// 「高精度」档：同尺寸下更准，但更慢、更大。按需自行下载。
+const WHISPER_ACCURATE_IDS: &[&str] = &[
+    "whisper-large-v3",
+    "whisper-large-v3-q5_0",
+    "whisper-large-v3-turbo-f16",
+    "whisper-large-v2",
+    "whisper-medium-q8",
+];
+
+/// 「英语专用」档：`.en` 模型只认英文，纯英文素材上比同尺寸多语种模型更准。
+const WHISPER_ENGLISH_IDS: &[&str] = &["whisper-medium-en", "whisper-small-en"];
+
+/// Whisper 语音识别可选模型（任选其一即可）的**全部**条目 ID。
+///
+/// 由上面三档拼成：界面按档位分区展示，而「是不是可选的 Whisper 模型」这类判断
+/// 只需要一个全集，不必让调用方知道分区细节。
 pub const WHISPER_CHOICE_MODEL_IDS: &[&str] = &[
     "whisper-turbo-q5",
     "whisper-turbo-q8",
     "whisper-large-v3",
+    "whisper-large-v3-q5_0",
+    "whisper-large-v3-turbo-f16",
+    "whisper-large-v2",
+    "whisper-medium-q8",
+    "whisper-medium-en",
+    "whisper-small-en",
     "whisper-medium",
     "whisper-small",
     "whisper-base",
@@ -75,8 +107,16 @@ const MODEL_BLOCKS: [ModelBlock; 3] = [
         subtitle: "全系可选，任下一个即可用；换模型在「性能设置」或右侧抽屉里点选",
         categories: &[
             ModelCategory {
-                title: "识别模型（任选其一即可）",
-                item_ids: WHISPER_CHOICE_MODEL_IDS,
+                title: "识别模型 · 快速与均衡（日常首选）",
+                item_ids: WHISPER_FAST_IDS,
+            },
+            ModelCategory {
+                title: "识别模型 · 高精度（更准、更慢、更大）",
+                item_ids: WHISPER_ACCURATE_IDS,
+            },
+            ModelCategory {
+                title: "识别模型 · 英语专用（纯英文素材更准）",
+                item_ids: WHISPER_ENGLISH_IDS,
             },
             ModelCategory {
                 title: "辅助模型（改善断句与长音频速度）",
@@ -135,21 +175,13 @@ pub(crate) fn is_item_needed_for_tab(
         ModelManagerTab::Whisper => {
             // Whisper 专区：**全系模型都列出来供用户挑**（数量、体积、就位状态一目了然），
             // 加上 VAD、标点与推理程序。
+            // 直接查常量表，而不是在这里再抄一份 id 列表：
+            // 加一个模型只要改 `WHISPER_CHOICE_MODEL_IDS`，不会再出现
+            // 「列表里有、下载时被过滤掉」这种两处漂移。
             matches!(
                 item_id,
-                "ffmpeg"
-                    | "whisper-cli"
-                    | "whisper-cublas"
-                    | "whisper-tiny"
-                    | "whisper-base"
-                    | "whisper-small"
-                    | "whisper-medium"
-                    | "whisper-turbo-q5"
-                    | "whisper-turbo-q8"
-                    | "whisper-large-v3"
-                    | "silero-vad"
-                    | "punc-model"
-            )
+                "ffmpeg" | "whisper-cli" | "whisper-cublas" | "silero-vad" | "punc-model"
+            ) || WHISPER_CHOICE_MODEL_IDS.contains(&item_id)
         }
         ModelManagerTab::Common => {
             // 公用组件：FFmpeg 媒体流提取、FFplay 伴音播放、llama.cpp 推理程序，
