@@ -73,6 +73,14 @@ Source: "assets\wizard_bg.bmp"; Flags: dontcopy
 ; 核心程序与工具底座
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\voice2word-cli.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; 主程序自己的 VC++ 运行库：voice2word.exe / voice2word-cli.exe 的 PE 导入表里
+; **直接**写着 vcruntime140.dll（Rust 的 MSVC 目标默认动态链接 CRT）。
+; 它**不是** Windows 自带组件——干净的 Windows 上没有这个文件，
+; 此前只把它放到 {app}\tools\ 里（那是给 whisper / llama 用的），
+; 结果主程序在没装过 VC++ Redist 的机器上会以 0xC0000135 起不来。
+; 必须放在**与 exe 同一目录**。
+Source: "..\tools\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\vcruntime140_1.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; 共享配置：**不打包**仓库里的 config.toml。
 ;
 ; `config.toml` 在仓库里是被跟踪的，而开发机上的取值往往是**本机专属**的
@@ -621,6 +629,12 @@ begin
   // 1) FFmpeg：必需。缺了连音频都抽不出来。
   if not FileExists(AppDir + '\tools\ffmpeg.exe') then
     Missing := Missing + #13#10 + '  - FFmpeg（tools\ffmpeg.exe）：必需，音频提取与转码都依赖它';
+
+  // 1.5) 主程序自己的 VC++ 运行库必须在 exe 同目录。
+  //      voice2word.exe 的导入表里直接写着 vcruntime140.dll；干净 Windows 上没有它。
+  if not FileExists(AppDir + '\vcruntime140.dll') then
+    Missing := Missing + #13#10 +
+      '  - 主程序运行库 vcruntime140.dll（应在安装目录根部）：缺失时程序无法启动（0xC0000135）';
 
   // 2) llama.cpp：入口 exe 只有几 KB，真正代码在同目录 DLL。
   //    **只查 exe 会漏判**——这正是「本机好使、别人电脑不好使」的成因。

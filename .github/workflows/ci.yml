@@ -186,6 +186,19 @@ jobs:
           }
           Write-Host '安装包已声明随包分发的运行时 DLL'
 
+      - name: Main exe runtime must sit next to it
+        shell: pwsh
+        run: |
+          # voice2word.exe 的 PE 导入表里**直接**写着 vcruntime140.dll（Rust 的 MSVC
+          # 目标默认动态链接 CRT），而它不是 Windows 自带组件。只把它放进 tools\
+          # 是给 whisper / llama 用的，主程序在没装 VC++ Redist 的机器上会 0xC0000135。
+          $iss = Get-Content installer/voice2word.iss -Raw -Encoding UTF8
+          $needle = 'Source: "..\tools\vcruntime140.dll"; DestDir: "{app}";'
+          if (-not $iss.Contains($needle)) {
+            throw '安装包没有把 vcruntime140.dll 放到 {app}（主程序同目录）：干净 Windows 上主程序会起不来。'
+          }
+          Write-Host '主程序运行库已放在 exe 同目录'
+
       - name: Packaging scripts must be usable from PowerShell 5.1
         shell: pwsh
         run: |
