@@ -1863,11 +1863,33 @@ def is_safe(name):
         return False
     return True
 
-count = 0
 with tarfile.open(src, "r:bz2") as tf:
-    for m in tf.getmembers():
-        if m.issym() or m.islnk() or m.isdev() or not is_safe(m.name):
-            continue
+    members = [m for m in tf.getmembers()
+               if not (m.issym() or m.islnk() or m.isdev()) and is_safe(m.name)]
+
+    # 剥掉唯一的顶层目录：sherpa-onnx 的发布包几乎都是
+    # <模型名>/model.int8.onnx + <模型名>/tokens.txt 这种结构，不剥的话
+    # 登记路径就得写成 models/xxx/<那一长串版本号>/model.int8.onnx，
+    # 版本号一变就全部失效。与 zip 那套 extract_zip 的 common_prefix 同语义。
+    top = None
+    uniform = True
+    for m in members:
+        parts = m.name.split("/")
+        if len(parts) < 2 or not parts[0]:
+            uniform = False
+            break
+        if top is None:
+            top = parts[0]
+        elif parts[0] != top:
+            uniform = False
+            break
+
+    count = 0
+    for m in members:
+        if uniform and top:
+            m.name = m.name[len(top) + 1:]
+            if not m.name:
+                continue
         tf.extract(m, dst)
         if m.isfile():
             count += 1
@@ -2639,6 +2661,49 @@ mod tests {
             archive_kind_from_url("https://x/y/pkg.exe"),
             ArchiveKind::Zip
         );
+    }
+
+    /// 带唯一顶层目录的 tar.bz2 要剥掉那一层，否则登记路径会被版本号绑死。
+    #[test]
+    fn tar_bz2_strips_single_top_level_dir() {
+        let dir = std::env::temp_dir().join(format!("v2w_tarbz2p_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("model.int8.onnx"), b"m").unwrap();
+        std::fs::write(src_dir.join("tokens.txt"), b"t").unwrap();
+
+        let archive = dir.join("pkg.tar.bz2");
+        let script = r#"
+import sys, tarfile, os
+src_dir, out = sys.argv[1], sys.argv[2]
+with tarfile.open(out, "w:bz2") as tf:
+    for name in ("model.int8.onnx", "tokens.txt"):
+        tf.add(os.path.join(src_dir, name), arcname="pkg-dir/" + name)
+"#;
+        let python = crate::utils::AppConfig::resolve_command("python");
+        let built = std::process::Command::new(&python)
+            .arg("-c")
+            .arg(script)
+            .arg(&src_dir)
+            .arg(&archive)
+            .output();
+        let Ok(built) = built else { return };
+        if !built.status.success() {
+            return;
+        }
+
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let n = super::extract_tar_bz2(&archive, &out_dir).expect("解压应成功");
+        assert_eq!(n, 2);
+        assert!(
+            out_dir.join("model.int8.onnx").exists(),
+            "顶层目录必须被剥掉，模型要直接落在目标目录下"
+        );
+        assert!(!out_dir.join("pkg-dir").exists(), "不应保留那层包装目录");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// .tar.bz2 解压必须跳过「跑到目标目录之外」的成员（路径穿越）。
