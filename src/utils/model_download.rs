@@ -1951,6 +1951,31 @@ fn exceeds_expected(written: u64, expected: u64) -> bool {
     expected > 0 && written > expected.saturating_add(expected / 20)
 }
 
+/// 决定「这次下载最多允许写到多少字节」。
+///
+/// 返回 `(上限, 登记值是否已过期)`。
+///
+/// 为什么要留这条退路：登记大小是**写死在源码里的常量**，而模型文件会变（上游换量化、
+/// 重新打包、换仓库）。一旦上游把 874 MB 的 q8 换成 1.2 GB，硬按 105% 拦就会变成
+/// 「正常文件永远下不下来」——比放过一次异常更糟。
+///
+/// 判据：
+/// - 服务端没声明总大小 → 用登记值（此外没有可信来源）；
+/// - 服务端声明的大小在登记值 105% 以内 → 用登记值；
+/// - 服务端声明的大小明显更大 → 认为**登记过期**，改用服务端的大小并置 `true`，
+///   让调用方记一条警告。真正的「镜像返回错误内容」通常大出好几倍（一个 HTML 错误页
+///   不会恰好比模型大 20%），而那种极端放大仍会被 [`retry_budget_exhausted`] 挡住。
+fn resolve_size_bound(registry: u64, server_declared: u64) -> (u64, bool) {
+    if registry == 0 || server_declared == 0 {
+        return (registry, false);
+    }
+    if exceeds_expected(server_declared, registry) {
+        (server_declared, true)
+    } else {
+        (registry, false)
+    }
+}
+
 /// 多次换源重试的**累计传输**是否已经离谱（超过登记大小的 3 倍）。
 ///
 /// 每次源失败都会白传一部分字节，多源轮下来用户的数据流量可以是文件大小的好几倍。
@@ -2058,14 +2083,32 @@ fn fetch_to_file(
     };
 
     // 进度条的总字节数一律用**登记大小**：206 响应里 `Content-Length` 只是剩余
-    // 长度，直接当总数会让进度从 0 跳变甚至倒退。未登记大小时才退回响应头估算。
-    let total = if expected_size > 0 {
-        expected_size
+    // 长度，直接当总数会让进度从 0 跳变甚至倒退。
+    let remaining = resp
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    // 服务端声明的**整文件**大小只在 200（整文件响应）时可推：206 的 Content-Length
+    // 只是剩余部分。续传时 written 里已含前缀，两者相加才是完整大小。
+    let server_declared = if status == 200 && remaining > 0 {
+        written.saturating_add(remaining)
     } else {
-        let remaining = resp
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
+        0
+    };
+    // 上限以登记大小为准，但**登记值过期时以服务端为准**（见 `resolve_size_bound`）——
+    // 否则上游换了更大的量化版本之后，正常下载会被自己的上限拦死。
+    let (bound, registry_stale) = resolve_size_bound(expected_size, server_declared);
+    if registry_stale {
+        warn!(
+            item = item_id,
+            registry = expected_size,
+            server = server_declared,
+            "登记大小与服务端不一致（多半是上游换了文件），本次按服务端大小放行"
+        );
+    }
+    let total = if bound > 0 {
+        bound
+    } else {
         written + remaining
     };
     // 本次实际下载的字节数（用于测速）；`written` 里含续传前已有的部分。
@@ -2094,13 +2137,13 @@ fn fetch_to_file(
         // 先算「写完会有多少」，超限就**不写**：宁可少写一次，也不要为了报错先把
         // 几百 MB 的错误内容落到盘上。
         let prospective = written.saturating_add(n as u64);
-        if exceeds_expected(prospective, expected_size) {
+        if exceeds_expected(prospective, bound) {
             drop(file);
             let _ = fs::remove_file(part);
             return Err(anyhow!(
                 "下载内容超出登记大小：已收到 {:.1} MB，登记 {:.1} MB（疑似镜像返回了错误内容）",
                 prospective as f64 / MB as f64,
-                expected_size as f64 / MB as f64
+                bound as f64 / MB as f64
             ));
         }
         file.write_all(&buf[..n]).context("写入文件失败")?;
@@ -2361,6 +2404,24 @@ mod tests {
     /// 测试里泄漏几个短字符串无所谓，换来的是测试不再向仓库树写东西。
     fn leak_str(s: String) -> &'static str {
         Box::leak(s.into_boxed_str())
+    }
+
+    /// 登记值过期时必须改信服务端：否则上游换了更大的量化版本，正常下载会被自己的上限拦死。
+    #[test]
+    fn size_bound_falls_back_to_server_when_registry_is_stale() {
+        const Q8: u64 = 874_188_075;
+
+        // 服务端没声明：只能用登记值
+        assert_eq!(super::resolve_size_bound(Q8, 0), (Q8, false));
+        // 未登记大小：不设上限
+        assert_eq!(super::resolve_size_bound(0, 1_234), (0, false));
+        // 完全一致 / 小幅偏差（5% 内）：用登记值
+        assert_eq!(super::resolve_size_bound(Q8, Q8), (Q8, false));
+        assert_eq!(super::resolve_size_bound(Q8, Q8 + Q8 / 50), (Q8, false));
+        // 服务端明显更大 → 认为登记过期，按服务端放行，并标记为过期
+        let (bound, stale) = super::resolve_size_bound(Q8, 1_200_000_000);
+        assert_eq!(bound, 1_200_000_000);
+        assert!(stale, "必须报告登记值已过期");
     }
 
     /// 超限判据：只挡「明显超出」（>105%），不误伤正常的小幅偏差。
