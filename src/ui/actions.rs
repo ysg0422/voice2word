@@ -2374,12 +2374,42 @@ impl MainWindow {
         // 又由函数开头的 `status != Processing` 守卫兜底，上一轮的取消不会误伤新任务。
         self.state.pipeline.begin_task();
         self.state.transcribe_started_at = Some(std::time::Instant::now());
+        // 步骤看板：点开始就把七步全部铺出来，第一步立刻标成进行中。
+        self.state.reset_stage_rows();
         self.state.status = ProcessStatus::Processing {
             stage: "准备中...".to_string(),
             progress: 0.0,
             detail: "正在启动异步任务管线".to_string(),
         };
         cx.notify();
+
+        // 步骤看板的秒数必须**每秒自己动**：转写期间 `Progress` 只在出字或换阶段时到来，
+        // 而模型加载那一段（短音频下能占九成时间）整段没有任何事件——
+        // 不补这个循环的话，界面会僵在「0.0 秒」上，看起来像卡死。
+        // 循环只做 `cx.notify()`，任务结束或代次变化时自行退出，不留后台线程。
+        let stage_tick = self.state.stage_rows_tick;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            let keep = this
+                .update(cx, |this, cx| {
+                    if this.state.stage_rows_tick != stage_tick {
+                        return false;
+                    }
+                    if !matches!(this.state.status, ProcessStatus::Processing { .. }) {
+                        return false;
+                    }
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        // 刷新循环是「后台自己转」的，不持有句柄：代次变化或任务结束时它自行 break。
+        .detach();
 
         let pipeline = self.state.pipeline.clone();
         let lang = if self.state.language == "auto" {
@@ -2473,6 +2503,7 @@ impl MainWindow {
                     // 永远显示「转写中」，且 `start_processing_for` 的 Processing
                     // 守卫会让用户再也开不了下一单。
                     let _ = this.update(cx, |this, cx| {
+                        this.state.finish_stage_rows();
                         if settle_aborted_transcription(&mut this.state) {
                             this.advance_batch_queue(cx);
                         }
@@ -2497,6 +2528,9 @@ impl MainWindow {
                     for event in events {
                         match event {
                             PipelineEvent::StageChanged(stage) => {
+                                // 步骤看板先推进：它按 `Stage::from_label` 认阶段，
+                                // 认不出的（例如「准备中…」这类自由文本）直接忽略。
+                                this.state.advance_stage_rows(&stage);
                                 if let ProcessStatus::Processing {
                                     stage: ref mut s, ..
                                 } = &mut this.state.status
@@ -2513,6 +2547,7 @@ impl MainWindow {
                                 // 两者用的是同一个事件，但队列卡片要的是「这一条的
                                 // 百分比」，而全局状态只服务单文件进度条/抽屉。
                                 this.state.record_batch_progress(&stage, progress);
+                                this.state.set_stage_row_progress(progress as f32);
                                 this.state.status = ProcessStatus::Processing {
                                     stage,
                                     progress,
@@ -2525,6 +2560,8 @@ impl MainWindow {
                             PipelineEvent::Finished(segments, metrics) => {
                                 this.state.clear_streaming();
                                 this.state.transcribe_started_at = None;
+                                // 收尾时把最后一行定住，否则它会永远停在「进行中」。
+                                this.state.finish_stage_rows();
                                 if this.state.cancel_requested {
                                     // 用户主动终止：静默收尾，不弹完成框、不写历史库
                                     this.state.cancel_requested = false;
@@ -2764,6 +2801,7 @@ impl MainWindow {
                                 terminal = true;
                             }
                             PipelineEvent::Error(err) => {
+                                this.state.finish_stage_rows();
                                 if this.state.cancel_requested {
                                     // 终止导致的子进程报错按取消处理，不显示为失败
                                     this.state.cancel_requested = false;

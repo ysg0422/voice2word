@@ -755,6 +755,29 @@ impl BackgroundWrites {
     }
 }
 
+/// 转写步骤看板里一行的状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageRowState {
+    /// 还没轮到
+    Pending,
+    /// 正在跑（进度条会动、秒数每秒刷新）
+    Running,
+    /// 已完成
+    Done,
+    /// 本次任务不会执行（例如关闭了润色、没触发救场）
+    Skipped,
+}
+
+/// 转写步骤看板的一行：一个流水线阶段 + 它的进度与耗时。
+#[derive(Debug, Clone)]
+pub struct StageRow {
+    pub stage: crate::core::Stage,
+    pub state: StageRowState,
+    /// 该阶段自己的进度 0.0..=1.0（不是全局进度）
+    pub progress: f32,
+    /// 已完成阶段的耗时（秒）。进行中的那一行用 `AppState::stage_row_started_at` 实时算。
+    pub secs: f64,
+}
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
@@ -778,6 +801,17 @@ pub struct AppState {
     /// 界面上「已流式生成 N 句」看起来像卡死了。这里单独计一个
     /// 单调计数器，与缓冲区裁剪解耦。
     pub streaming_segment_count: usize,
+    /// 转写步骤看板：七个流水线阶段一行一个，**点开始就全部列出来**。
+    ///
+    /// 为什么要在状态里存一份而不是直接从 `ProcessStatus` 推导：
+    /// `ProcessStatus` 只有「当前阶段」一个字符串，用户看不出「一共几步、走到第几步、
+    /// 前面几步各花了多久」。步骤明细需要跨事件累积，所以单独维护。
+    pub stage_rows: Vec<StageRow>,
+    /// 当前正在跑的那一步的开始时刻（算实时秒数用）。
+    pub stage_row_started_at: Option<std::time::Instant>,
+    /// 秒数刷新用的代次：每次开始新任务 +1，旧的刷新循环据此自行退出。
+    pub stage_rows_tick: u64,
+
     /// 转写任务启动的绝对时刻，用于实时推算真实剩余耗时（ETA）
     pub transcribe_started_at: Option<std::time::Instant>,
 
@@ -1237,6 +1271,9 @@ impl AppState {
             streaming_current_sec: 0.0,
             streaming_segment_count: 0,
             transcribe_started_at: None,
+            stage_rows: Vec::new(),
+            stage_row_started_at: None,
+            stage_rows_tick: 0,
             language: lang,
             output_format: fmt,
             enable_polish: polish,
@@ -2892,6 +2929,99 @@ impl AppState {
         } else {
             16.0 / 9.0
         }
+    }
+    /// 点「开始转写」那一刻：把七步**全部**列出来，第一步置为进行中。
+    ///
+    /// 用户的要求是「点开始后界面就把步骤全显示出来」，所以这里不做懒加载：
+    /// 一次把 [`Stage::ALL`] 铺满，后面的行先显示「等待」。
+    pub fn reset_stage_rows(&mut self) {
+        self.stage_rows = crate::core::Stage::ALL
+            .into_iter()
+            .map(|stage| StageRow {
+                stage,
+                state: StageRowState::Pending,
+                progress: 0.0,
+                secs: 0.0,
+            })
+            .collect();
+        if let Some(first) = self.stage_rows.first_mut() {
+            first.state = StageRowState::Running;
+        }
+        self.stage_row_started_at = Some(std::time::Instant::now());
+        // 代次 +1：上一轮遗留的秒数刷新循环会看到代次变化后自行退出。
+        self.stage_rows_tick = self.stage_rows_tick.wrapping_add(1);
+    }
+
+    /// 管线报告「进入某阶段」时推进看板。
+    ///
+    /// 目标阶段**之前**还没跑过的行一律记为「跳过」：管线可能整段不执行
+    /// （关掉润色就没有「智能润色」、没有低置信窗口就没有「置信度救场」）。
+    /// 停在第「等待」会让用户以为卡死在那一步。
+    pub fn advance_stage_rows(&mut self, label: &str) {
+        let Some(target) = crate::core::Stage::from_label(label) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let elapsed = self
+            .stage_row_started_at
+            .map(|t| now.duration_since(t).as_secs_f64());
+        let mut entered_new = false;
+        for row in &mut self.stage_rows {
+            if row.stage == target {
+                if row.state != StageRowState::Running {
+                    row.state = StageRowState::Running;
+                    entered_new = true;
+                }
+                break;
+            }
+            match row.state {
+                StageRowState::Running => {
+                    row.state = StageRowState::Done;
+                    row.progress = 1.0;
+                    row.secs = elapsed.unwrap_or(0.0);
+                }
+                StageRowState::Pending => row.state = StageRowState::Skipped,
+                _ => {}
+            }
+        }
+        if entered_new {
+            self.stage_row_started_at = Some(now);
+        }
+    }
+
+    /// 更新**当前进行中那一行**的进度。
+    ///
+    /// 管线给的是全局进度（0.15 起步），直接画会让人以为每步都从头开始，
+    /// 所以按阶段拆开：每行只显示自己那一段的完成度。
+    pub fn set_stage_row_progress(&mut self, progress: f32) {
+        if let Some(row) = self
+            .stage_rows
+            .iter_mut()
+            .find(|r| r.state == StageRowState::Running)
+        {
+            row.progress = progress.clamp(0.0, 1.0);
+        }
+    }
+
+    /// 任务收尾（完成 / 失败 / 取消）：把还在跑的那一行定住，其余未跑的标为跳过。
+    ///
+    /// 失败时**故意不把进度拉满**：留着一个没走完的条，比假装「全部完成」诚实。
+    pub fn finish_stage_rows(&mut self) {
+        let elapsed = self
+            .stage_row_started_at
+            .take()
+            .map(|t| t.elapsed().as_secs_f64());
+        for row in &mut self.stage_rows {
+            match row.state {
+                StageRowState::Running => {
+                    row.state = StageRowState::Done;
+                    row.secs = elapsed.unwrap_or(0.0);
+                }
+                StageRowState::Pending => row.state = StageRowState::Skipped,
+                _ => {}
+            }
+        }
+        self.stage_rows_tick = self.stage_rows_tick.wrapping_add(1);
     }
 
     pub fn whisper_eta_label(&self) -> String {
@@ -4632,7 +4762,7 @@ mod tests {
     use super::{
         apply_segment_write_result, drain_segment_writes, mark_segments_dirty_for_revision,
         write_snapshot_under_gate, AppState, BackgroundWrites, PolishMode, ProcessStatus,
-        SegmentDispatch, SegmentWriteDone, SegmentWriteGate, SegmentWriteSnapshot,
+        SegmentDispatch, SegmentWriteDone, SegmentWriteGate, SegmentWriteSnapshot, StageRowState,
         WhisperModelTier, SEGMENTS_FLUSH_IDLE,
     };
     use crate::subtitle::Segment;
@@ -4644,6 +4774,60 @@ mod tests {
     ///
     /// 用 `HardwareProfile::cpu_only()` 而不是 `AppState::new`：后者会通过 wgpu 枚举
     /// 显卡，单测没必要为了一份硬件档案去初始化图形栈。
+    /// 步骤看板：点开始就要把七步**全部**铺出来，第一步立刻进行中。
+    #[test]
+    fn stage_rows_reset_lists_all_stages_with_first_running() {
+        let mut state = test_state(vec![]);
+        state.reset_stage_rows();
+        assert_eq!(state.stage_rows.len(), crate::core::Stage::ALL.len());
+        assert_eq!(state.stage_rows[0].state, StageRowState::Running);
+        assert!(state.stage_rows[1..]
+            .iter()
+            .all(|r| r.state == StageRowState::Pending));
+        assert!(state.stage_row_started_at.is_some());
+    }
+
+    /// 推进到后面的阶段：前面的行定稿为完成，中间没跑过的标「跳过」。
+    ///
+    /// 这条钉的是「关掉润色 / 没触发救场」这类跳阶段场景——停在「等待」会让人
+    /// 以为卡在那一格。
+    #[test]
+    fn advance_stage_rows_finishes_previous_and_skips_gaps() {
+        let mut state = test_state(vec![]);
+        state.reset_stage_rows();
+        state.advance_stage_rows("语音识别");
+
+        assert_eq!(state.stage_rows[0].state, StageRowState::Done);
+        assert!((state.stage_rows[0].progress - 1.0).abs() < f32::EPSILON);
+        assert_eq!(state.stage_rows[1].state, StageRowState::Skipped);
+        assert_eq!(state.stage_rows[2].state, StageRowState::Running);
+
+        // 认不出的标签（例如管线里的「说话人分离」）不得改动看板
+        let before: Vec<_> = state.stage_rows.iter().map(|r| r.state).collect();
+        state.advance_stage_rows("说话人分离");
+        let after: Vec<_> = state.stage_rows.iter().map(|r| r.state).collect();
+        assert_eq!(before, after, "未知阶段不该改动任何一行");
+    }
+
+    /// 收尾：进行中的行定住、未跑的标跳过；**失败时进度不被拉满**。
+    #[test]
+    fn finish_stage_rows_settles_running_without_faking_completion() {
+        let mut state = test_state(vec![]);
+        state.reset_stage_rows();
+        state.set_stage_row_progress(0.4);
+        state.finish_stage_rows();
+
+        assert_eq!(state.stage_rows[0].state, StageRowState::Done);
+        assert!(
+            (state.stage_rows[0].progress - 0.4).abs() < 1e-6,
+            "异常/取消收尾时进度条要停在真实位置，不能假装走完"
+        );
+        assert!(state.stage_row_started_at.is_none(), "收尾后不再计时");
+        assert!(state.stage_rows[1..]
+            .iter()
+            .all(|r| r.state == StageRowState::Skipped));
+    }
+
     fn test_state(segments: Vec<Segment>) -> AppState {
         use crate::engines::{FFmpegEngine, LLMEngine, WhisperEngine};
         use crate::storage::Database;

@@ -282,6 +282,15 @@ impl Stage {
         }
     }
 
+    /// 从 `StageChanged` 的中文标签反查枚举。
+    ///
+    /// UI 的步骤看板按 [`Stage::ALL`] 顺序一次性列全所有步骤，再据此把事件里的
+    /// 标签映射回行——这样「管线加了新阶段但看板没跟上」会在编译期暴露，
+    /// 而不是运行时悄悄多出一行永远不亮的步骤。
+    pub fn from_label(label: &str) -> Option<Stage> {
+        Stage::ALL.into_iter().find(|s| s.label() == label)
+    }
+
     /// 该阶段产物落盘的文件名（带序号，便于人工排查）。
     pub fn artifact_file(self) -> &'static str {
         match self {

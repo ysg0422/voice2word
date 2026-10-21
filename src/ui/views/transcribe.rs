@@ -7,7 +7,7 @@ use super::super::primitives;
 use super::super::theme::Theme;
 use super::super::types::{ConfirmAction, ConfirmDialogInfo};
 use super::super::MainWindow;
-use crate::app::state::{ProcessStatus, QueueItem, QueueState, WorkspaceTab};
+use crate::app::state::{ProcessStatus, QueueItem, QueueState, StageRowState, WorkspaceTab};
 use crate::ui::format_mm_ss;
 // 「修复常见错误」的命中清单 / 重复句分组都来自 `cleanup.rs` 的纯函数：
 // 这里只把结果画出来，并把它们按「字幕版本 + 勾选规则」缓存起来（见 `TranscribeDerivedCache`）。
@@ -117,530 +117,461 @@ impl MainWindow {
         // 撑满剩余宽度的职责。
         primitives::page_shell("transcribe-main-workspace")
             .flex_1()
-            .on_drop::<ExternalPaths>(cx.listener(
-                |this, paths: &ExternalPaths, _window, cx| {
-                    let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
-                    tracing::info!("主工作区容器监听到 ExternalPaths 拖放导入: {:?}", dropped);
-                    this.handle_dropped_files(&dropped, cx);
-                },
-            ))
+            .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
+                tracing::info!("主工作区容器监听到 ExternalPaths 拖放导入: {:?}", dropped);
+                this.handle_dropped_files(&dropped, cx);
+            }))
             .on_drop::<Arc<ExternalPaths>>(cx.listener(
                 |this, paths: &Arc<ExternalPaths>, _window, cx| {
                     let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
-                    tracing::info!("主工作区容器监听到 Arc<ExternalPaths> 拖放导入: {:?}", dropped);
+                    tracing::info!(
+                        "主工作区容器监听到 Arc<ExternalPaths> 拖放导入: {:?}",
+                        dropped
+                    );
                     this.handle_dropped_files(&dropped, cx);
                 },
             ))
             // 核心工作台展示区
-            .child(
-                if is_processing {
-                    // GPUI 的 `Div::child` 要求文本是 `'static`（内部转 `SharedString`），
-                    // 借不到 `self.state.status` 里的 `&str`。但也不必每帧 clone 两份 `String`：
-                    // 阶段名与详情与上一帧一致时直接复用缓存里的那份（引用计数 +1）。
-                    let (stage_ref, progress, detail_ref): (&str, f64, &str) =
-                        match &self.state.status {
-                            ProcessStatus::Processing { stage, progress, detail } => {
-                                (stage.as_str(), *progress, detail.as_str())
-                            }
-                            _ => ("正在全速转写中…", 0.0, ""),
-                        };
-                    let (stage, detail) =
-                        cx.update_default_global::<TranscribeDerivedCache, _>(|cache, _| {
-                            (
-                                shared_string_cached(&mut cache.progress_stage, stage_ref),
-                                shared_string_cached(&mut cache.progress_detail, detail_ref),
-                            )
-                        });
-                    let total_dur = self.state.transcribe_duration;
-                    let cur_sec = self.state.streaming_current_sec;
-                    // `mm:ss` 换算统一走 `ui::format_mm_ss`：本文件此前手写的三份
-                    // 与状态栏各自维护的同一换算，现在同源。
-                    let eta = self.state.whisper_eta_label();
-                    let seg_count = self.state.streaming_segment_count;
+            .child(if is_processing {
+                // 步骤看板不再需要「当前阶段名 + 详情」这两段小字，只取总体进度。
+                let progress = match &self.state.status {
+                    ProcessStatus::Processing { progress, .. } => *progress,
+                    _ => 0.0,
+                };
+                let total_dur = self.state.transcribe_duration;
+                let cur_sec = self.state.streaming_current_sec;
+                // `mm:ss` 换算统一走 `ui::format_mm_ss`：本文件此前手写的三份
+                // 与状态栏各自维护的同一换算，现在同源。
+                let eta = self.state.whisper_eta_label();
+                let seg_count = self.state.streaming_segment_count;
 
-                    div()
-                        .id("lightweight-processing-dashboard")
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap(px(Theme::SPACE_4))
-                        // 1. 媒体与当前阶段卡片
-                        .child(
-                            // 卡片外壳统一走 card()：内边距 / 圆角 / 底色与其余卡片同源
-                            primitives::card()
-                                .w_full()
-                                .max_w(px(Theme::CONTENT_MAX_W))
-                                .flex_row()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(Theme::SPACE_3))
-                                        .child(
-                                            div()
-                                                .w(px(Theme::ICON_BOX))
-                                                .h(px(Theme::ICON_BOX))
-                                                .rounded(px(Theme::RADIUS_LG))
-                                                .bg(if is_sensevoice { Theme::tint_mint_soft() } else { Theme::tint_blue_soft() })
-                                                .border_1()
-                                                .border_color(if is_sensevoice { Theme::tint_mint_border() } else { Theme::tint_blue_border() })
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(primitives::stat_dot(if is_sensevoice { Theme::accent_mint() } else { Theme::accent_blue() })),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                // 阶段名是看板的主标题，走 panel_title（14px）与其余面板标头一致
-                                                .child(primitives::panel_title(stage))
-                                                .child(
-                                                    div()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .text_color(Theme::text_muted())
-                                                        .child(if detail.trim().is_empty() {
-                                                            let fallback = if is_sensevoice {
-                                                                "SenseVoice 正在通过纯内存音频管道极速识别…"
-                                                            } else {
-                                                                "Whisper 模型正在转写音频流…"
-                                                            };
-                                                            SharedString::from(fallback)
-                                                        } else {
-                                                            detail
-                                                        }),
-                                                ),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(Theme::SPACE_1_5))
-                                        // 引擎标签与总时长都是元信息，统一走徽标原语
-                                        .child(if is_sensevoice {
-                                            primitives::badge_accent("SenseVoice INT8（14x 极速）")
-                                        } else {
-                                            primitives::badge("Whisper Turbo（GPU 加速）")
-                                        })
-                                        .child(primitives::badge(format_mm_ss(total_dur))),
-                                ),
-                        )
-                        // 2. 实时流式字幕视窗卡片
-                        .child(
-                            // 卡片外壳走 card()：圆角 / 内边距 / 底色与其余卡片同源
-                            primitives::card()
-                                .w_full()
-                                .max_w(px(Theme::CONTENT_MAX_W))
-                                .overflow_hidden()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(Theme::SPACE_2))
-                                                // 卡片标头统一走 section_title，与「批量转写队列」等同级
-                                                .child(primitives::stat_dot_sm(Theme::accent_mint()))
-                                                .child(primitives::section_title("实时流式字幕视窗"))
-                                                .child(primitives::badge_accent(format!("已流式生成 {seg_count} 句"))),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(Theme::TEXT_BODY))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(Theme::text_secondary())
-                                                .child(if total_dur > 0.0 {
-                                                    let audio_ratio = if cur_sec > 0.0 {
-                                                        (cur_sec / total_dur).clamp(0.0, 1.0)
-                                                    } else {
-                                                        0.0
-                                                    };
-                                                    if cur_sec > 0.0 {
-                                                        format!(
-                                                            "进度：{} / {}（{:.1}%）",
-                                                            format_mm_ss(cur_sec),
-                                                            format_mm_ss(total_dur),
-                                                            audio_ratio * 100.0
-                                                        )
-                                                    } else {
-                                                        format!(
-                                                            "进度：00:00 / {}（0.0%）",
-                                                            format_mm_ss(total_dur)
-                                                        )
-                                                    }
+                div()
+                    .id("lightweight-processing-dashboard")
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(Theme::SPACE_4))
+                    // 1. 转写步骤看板：七步列全，每步自己的进度条 + 耗时
+                    .child(self.render_stage_board(
+                        is_sensevoice,
+                        total_dur,
+                        eta.clone(),
+                        progress as f32,
+                    ))
+                    // 2. 实时流式字幕视窗卡片
+                    .child(
+                        // 卡片外壳走 card()：圆角 / 内边距 / 底色与其余卡片同源
+                        primitives::card()
+                            .w_full()
+                            .max_w(px(Theme::CONTENT_MAX_W))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(Theme::SPACE_2))
+                                            // 卡片标头统一走 section_title，与「批量转写队列」等同级
+                                            .child(primitives::stat_dot_sm(Theme::accent_mint()))
+                                            .child(primitives::section_title("实时流式字幕视窗"))
+                                            .child(primitives::badge_accent(format!(
+                                                "已流式生成 {seg_count} 句"
+                                            ))),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(Theme::TEXT_BODY))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::text_secondary())
+                                            .child(if total_dur > 0.0 {
+                                                let audio_ratio = if cur_sec > 0.0 {
+                                                    (cur_sec / total_dur).clamp(0.0, 1.0)
                                                 } else {
-                                                    "正在实时推流…".to_string()
-                                                }),
-                                        ),
-                                )
-                                // 平滑大进度条：以真实音频转写比率渲染，首句未出前准确为 0%，杜绝虚假预跑
-                                .child(primitives::progress_bar(if total_dur > 0.0 && cur_sec > 0.0 {
+                                                    0.0
+                                                };
+                                                if cur_sec > 0.0 {
+                                                    format!(
+                                                        "进度：{} / {}（{:.1}%）",
+                                                        format_mm_ss(cur_sec),
+                                                        format_mm_ss(total_dur),
+                                                        audio_ratio * 100.0
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "进度：00:00 / {}（0.0%）",
+                                                        format_mm_ss(total_dur)
+                                                    )
+                                                }
+                                            } else {
+                                                "正在实时推流…".to_string()
+                                            }),
+                                    ),
+                            )
+                            // 平滑大进度条：以真实音频转写比率渲染，首句未出前准确为 0%，杜绝虚假预跑
+                            .child(primitives::progress_bar(
+                                if total_dur > 0.0 && cur_sec > 0.0 {
                                     (cur_sec / total_dur).clamp(0.0, 1.0) as f32
                                 } else {
                                     0.0
-                                }))
-                                // 字幕列表动态滚动流
-                                .child(
-                                    if seg_count == 0 {
+                                },
+                            ))
+                            // 字幕列表动态滚动流
+                            .child(if seg_count == 0 {
+                                div()
+                                    .min_h(px(Theme::STREAM_MIN_H))
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(Theme::TEXT_BODY_LG))
+                                    .text_color(Theme::text_muted())
+                                    // 首句还没出来时不写小字说明：上面的步骤看板已经
+                                    // 说明「现在在哪一步、卡了多久」，这里留空反而干净。
+                                    .child("等待首句字幕…")
+                                    .into_any_element()
+                            } else {
+                                // 只回显最后 `STREAM_TAIL_ROWS` 行：`streaming_segments` 是
+                                // 按到达顺序 push 的，直接取尾部切片即可——原写法
+                                // `rev().take(3)` 收进 `Vec` 再 `rev()` 收了第二遍，每帧两次分配。
+                                let all = &self.state.streaming_segments;
+                                let seg_list = &all[all.len().saturating_sub(STREAM_TAIL_ROWS)..];
+                                let total_items = seg_list.len();
+                                div()
+                                    .min_h(px(Theme::STREAM_MIN_H))
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .justify_end()
+                                    .gap(px(Theme::SPACE_2))
+                                    .children(seg_list.iter().enumerate().map(|(i, seg)| {
+                                        let is_last = is_last_stream_row(i, total_items);
+                                        let time_badge = format!(
+                                            "{} - {}",
+                                            format_mm_ss(seg.start),
+                                            format_mm_ss(seg.end)
+                                        );
+
+                                        if is_last {
+                                            div()
+                                                .w_full()
+                                                .px(px(Theme::SPACE_3))
+                                                .py(px(Theme::SPACE_2))
+                                                .rounded(px(Theme::RADIUS_LG))
+                                                .bg(Theme::tint_mint_soft())
+                                                .border_1()
+                                                .border_color(Theme::tint_mint_border())
+                                                .overflow_hidden()
+                                                .flex()
+                                                .items_start()
+                                                .gap(px(Theme::SPACE_3))
+                                                .child(
+                                                    // 时间戳胶囊：字色与底色都来自薄荷 tint 阶梯
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .mt(px(1.5))
+                                                        .px(px(Theme::SPACE_1_5))
+                                                        .py(px(Theme::SPACE_1))
+                                                        .rounded(px(Theme::RADIUS_MD))
+                                                        .bg(Theme::tint_mint_badge())
+                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(Theme::accent_mint())
+                                                        .child(time_badge),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w(px(0.0))
+                                                        .line_height(relative(1.4))
+                                                        .text_size(px(Theme::TEXT_BODY_LG))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(Theme::text_primary())
+                                                        .child(seg.display_text().to_string()),
+                                                )
+                                        } else {
+                                            div()
+                                                .w_full()
+                                                .px(px(Theme::SPACE_3))
+                                                .py(px(Theme::SPACE_1_5))
+                                                .overflow_hidden()
+                                                .flex()
+                                                .items_start()
+                                                .gap(px(Theme::SPACE_3))
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .mt(px(1.0))
+                                                        .text_size(px(Theme::TEXT_SMALL))
+                                                        .text_color(Theme::text_muted())
+                                                        .child(time_badge),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w(px(0.0))
+                                                        .overflow_hidden()
+                                                        .line_height(relative(1.4))
+                                                        .text_size(px(Theme::TEXT_BODY))
+                                                        .text_color(Theme::text_secondary())
+                                                        .child(seg.display_text().to_string()),
+                                                )
+                                        }
+                                    }))
+                                    .into_any_element()
+                            }),
+                    )
+                    .into_any_element()
+            } else if let Some(ref file) = self.state.transcribe_file.clone().or_else(|| {
+                self.state
+                    .batch_active
+                    .and_then(|idx| self.state.batch_queue.get(idx))
+                    .or_else(|| self.state.batch_queue.first())
+                    .map(|item| item.path.clone())
+            }) {
+                // 已就绪待处理卡片 (用户刚选中了新视频，准备转写)
+                let fname = file
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("视频")
+                    .to_string();
+                let dur_str = format_duration_short(self.state.transcribe_duration);
+                let eta_str = self.state.whisper_eta_label();
+                let has_dur = self.state.transcribe_duration > 0.0;
+                let cached_opt = self.state.get_cached_transcription();
+
+                // 显示真实选中的模型：自备模型要显示自己的文件名，
+                // 显示成兜底档位名会让用户以为系统换了他的模型。
+                let tier_name = self.state.selected_model_label();
+
+                // 转写质检摘要 (P1-9)：仅在用户手动展开且「工作区当前载入的字幕就是这张卡片对应的媒体」时展示。
+                // 默认折叠以保持就绪卡片极简清爽、避免信息过载。
+                let quality_card = if self.ready_qc_open
+                    && self.state.selected_file.as_ref() == self.state.transcribe_file.as_ref()
+                {
+                    self.render_quality_summary(cx)
+                } else {
+                    None
+                };
+
+                div()
+                    .id("transcribe-file-ready-dashboard")
+                    .flex_1()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .p(px(Theme::PAGE_PAD))
+                    .child(
+                        // 就绪卡片外壳走 card()，与其余卡片同圆角 / 同内边距
+                        primitives::card()
+                            .w_full()
+                            .max_w(px(Theme::CONTENT_MAX_W))
+                            .items_center()
+                            .gap(px(Theme::SPACE_4))
+                            // 顶部状态条
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        // 引擎档位是元信息，走 badge 原语（与进度看板同款）
+                                        if is_sensevoice {
+                                            primitives::badge_accent(tier_name)
+                                        } else {
+                                            primitives::badge(tier_name)
+                                        },
+                                    )
+                                    .child(
                                         div()
-                                            .min_h(px(Theme::STREAM_MIN_H))
-                                            .w_full()
                                             .flex()
                                             .items_center()
-                                            .justify_center()
-                                            .text_size(px(Theme::TEXT_BODY_LG))
-                                            .text_color(Theme::text_muted())
-                                            .child(if is_sensevoice {
-                                                "SenseVoice 极速模型正在解析音频流，首句字幕即将秒级呈现…"
-                                            } else {
-                                                "AI 语音引擎正在加载权重并解析音频流，首句字幕即将实时呈现…"
-                                            })
-                                            .into_any_element()
-                                    } else {
-                                        // 只回显最后 `STREAM_TAIL_ROWS` 行：`streaming_segments` 是
-                                        // 按到达顺序 push 的，直接取尾部切片即可——原写法
-                                        // `rev().take(3)` 收进 `Vec` 再 `rev()` 收了第二遍，每帧两次分配。
-                                        let all = &self.state.streaming_segments;
-                                        let seg_list =
-                                            &all[all.len().saturating_sub(STREAM_TAIL_ROWS)..];
-                                        let total_items = seg_list.len();
-                                        div()
-                                            .min_h(px(Theme::STREAM_MIN_H))
-                                            .w_full()
-                                            .flex()
-                                            .flex_col()
-                                            .justify_end()
                                             .gap(px(Theme::SPACE_2))
-                                            .children(seg_list.iter().enumerate().map(|(i, seg)| {
-                                                let is_last = is_last_stream_row(i, total_items);
-                                                let time_badge = format!(
-                                                    "{} - {}",
-                                                    format_mm_ss(seg.start),
-                                                    format_mm_ss(seg.end)
-                                                );
-
-                                                if is_last {
-                                                    div()
-                                                        .w_full()
-                                                        .px(px(Theme::SPACE_3))
-                                                        .py(px(Theme::SPACE_2))
-                                                        .rounded(px(Theme::RADIUS_LG))
-                                                        .bg(Theme::tint_mint_soft())
-                                                        .border_1()
-                                                        .border_color(Theme::tint_mint_border())
-                                                        .overflow_hidden()
-                                                        .flex()
-                                                        .items_start()
-                                                        .gap(px(Theme::SPACE_3))
-                                                        .child(
-                                                            // 时间戳胶囊：字色与底色都来自薄荷 tint 阶梯
-                                                            div()
-                                                                .flex_shrink_0()
-                                                                .mt(px(1.5))
-                                                                .px(px(Theme::SPACE_1_5))
-                                                                .py(px(Theme::SPACE_1))
-                                                                .rounded(px(Theme::RADIUS_MD))
-                                                                .bg(Theme::tint_mint_badge())
-                                                                .text_size(px(Theme::TEXT_SMALL))
-                                                                .font_weight(FontWeight::BOLD)
-                                                                .text_color(Theme::accent_mint())
-                                                                .child(time_badge),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .min_w(px(0.0))
-                                                                .line_height(relative(1.4))
-                                                                .text_size(px(Theme::TEXT_BODY_LG))
-                                                                .font_weight(FontWeight::BOLD)
-                                                                .text_color(Theme::text_primary())
-                                                                .child(seg.display_text().to_string()),
-                                                        )
-                                                } else {
-                                                    div()
-                                                        .w_full()
-                                                        .px(px(Theme::SPACE_3))
-                                                        .py(px(Theme::SPACE_1_5))
-                                                        .overflow_hidden()
-                                                        .flex()
-                                                        .items_start()
-                                                        .gap(px(Theme::SPACE_3))
-                                                        .child(
-                                                            div()
-                                                                .flex_shrink_0()
-                                                                .mt(px(1.0))
-                                                                .text_size(px(Theme::TEXT_SMALL))
-                                                                .text_color(Theme::text_muted())
-                                                                .child(time_badge),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .min_w(px(0.0))
-                                                                .overflow_hidden()
-                                                                .line_height(relative(1.4))
-                                                                .text_size(px(Theme::TEXT_BODY))
-                                                                .text_color(Theme::text_secondary())
-                                                                .child(seg.display_text().to_string()),
-                                                        )
-                                                }
-                                            }))
-                                            .into_any_element()
-                                    }
-                                ),
-                        )
-                        // 3. 底部 4 宫格性能与状态仪表盘
-                        // 底部 4 宫格四格等分：`.flex_1()` 必须与 `.min_w(px(0.0))` 成对出现——
-                        // 只写 `flex_1` 时 flex 项默认的 `min-width:auto` 会按内容最小宽度顶住，
-                        // 「SenseVoice INT8」那一格会把其余三格挤窄。
-                        .child(
-                            div()
-                                .w_full()
-                                .max_w(px(Theme::CONTENT_MAX_W))
-                                .flex()
-                                .items_center()
-                                .gap(px(Theme::SPACE_3))
-                                .child(
-                                    // 统计磁贴外壳统一走 card_sm()：内边距 / 圆角 / 描边同源，
-                                    // 数字用 TEXT_STAT、标签用 TEXT_SMALL 保持四格对齐。
-                                    primitives::card_sm()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .gap(px(Theme::SPACE_0_5))
-                                        .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("总体进度"))
-                                        .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::accent_mint()).child(format!("{:.1}%", progress.clamp(0.0, 1.0) * 100.0)))
-                                        .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child(format!("{} / {}", format_mm_ss(cur_sec), format_mm_ss(total_dur)))),
-                                )
-                                .child(
-                                    primitives::card_sm()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .gap(px(Theme::SPACE_0_5))
-                                        .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("预计耗时"))
-                                        .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::text_primary()).child(eta))
-                                        .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child(if is_sensevoice { "极速 14.5x 实时倍速" } else { "Whisper 并行解码" })),
-                                )
-                                .child(
-                                    primitives::card_sm()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .gap(px(Theme::SPACE_0_5))
-                                        .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("音频推流"))
-                                        .child(div().text_size(px(Theme::TEXT_STAT)).font_weight(FontWeight::BOLD).text_color(Theme::accent_blue()).child("纯内存管道"))
-                                        .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child("0 磁盘 I/O · 0 磨损")),
-                                )
-                                .child(
-                                    primitives::card_sm()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .gap(px(Theme::SPACE_0_5))
-                                        .child(div().text_size(px(Theme::TEXT_SMALL)).text_color(Theme::text_muted()).child("推理引擎"))
-                                        // 引擎名比数字短，降到 TEXT_TITLE 免得撑破磁贴宽度
-                                        .child(div().text_size(px(Theme::TEXT_TITLE)).font_weight(FontWeight::BOLD).text_color(if is_sensevoice { Theme::accent_mint() } else { Theme::accent_blue() }).child(if is_sensevoice { "SenseVoice INT8" } else { "Whisper Turbo" }))
-                                        .child(div().text_size(px(Theme::TEXT_CAPTION)).text_color(Theme::text_secondary()).child(if is_sensevoice { "非自回归 · 自带标点" } else { "多处理器并行" })),
-                                ),
-                        )
-                        .into_any_element()
-                } else if let Some(ref file) = self.state.transcribe_file.clone().or_else(|| {
-                    self.state.batch_active
-                        .and_then(|idx| self.state.batch_queue.get(idx))
-                        .or_else(|| self.state.batch_queue.first())
-                        .map(|item| item.path.clone())
-                }) {
-                    // 已就绪待处理卡片 (用户刚选中了新视频，准备转写)
-                    let fname = file.file_name().and_then(|s| s.to_str()).unwrap_or("视频").to_string();
-                    let dur_str = format_duration_short(self.state.transcribe_duration);
-                    let eta_str = self.state.whisper_eta_label();
-                    let has_dur = self.state.transcribe_duration > 0.0;
-                    let cached_opt = self.state.get_cached_transcription();
-
-                    // 显示真实选中的模型：自备模型要显示自己的文件名，
-                    // 显示成兜底档位名会让用户以为系统换了他的模型。
-                    let tier_name = self.state.selected_model_label();
-
-                    // 转写质检摘要 (P1-9)：仅在用户手动展开且「工作区当前载入的字幕就是这张卡片对应的媒体」时展示。
-                    // 默认折叠以保持就绪卡片极简清爽、避免信息过载。
-                    let quality_card = if self.ready_qc_open && self.state.selected_file.as_ref() == self.state.transcribe_file.as_ref() {
-                        self.render_quality_summary(cx)
-                    } else {
-                        None
-                    };
-
-                    div()
-                        .id("transcribe-file-ready-dashboard")
-                        .flex_1()
-                        .w_full()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .p(px(Theme::PAGE_PAD))
-                        .child(
-                            // 就绪卡片外壳走 card()，与其余卡片同圆角 / 同内边距
-                            primitives::card()
-                                .w_full()
-                                .max_w(px(Theme::CONTENT_MAX_W))
-                                .items_center()
-                                .gap(px(Theme::SPACE_4))
-                                // 顶部状态条
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            // 引擎档位是元信息，走 badge 原语（与进度看板同款）
-                                            if is_sensevoice {
-                                                primitives::badge_accent(tier_name)
-                                            } else {
-                                                primitives::badge(tier_name)
-                                            },
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(Theme::SPACE_2))
-                                                .child(
-                                                    div()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .text_color(Theme::text_secondary())
-                                                        .child(format!("时长：{}", dur_str)),
-                                                )
-                                                .children(if has_dur {
-                                                    // 预估耗时药丸：薄荷档 = 极速引擎，其余走主重音 tint，
-                                                    // 两档配色都取自 Theme 的 tint_* 阶梯；形状走
-                                                    // primitives::tag_tinted，字号 / 字重按原样保留。
-                                                    Some(
-                                                        primitives::tag_tinted(
-                                                            format!("预估 {}", eta_str),
-                                                            if is_sensevoice { Theme::tint_mint_soft() } else { Theme::tint_primary_soft() },
-                                                            if is_sensevoice { Theme::tint_mint_border() } else { Theme::tint_primary_border() },
-                                                            if is_sensevoice { Theme::accent_mint() } else { Theme::accent_primary() },
-                                                        )
-                                                            .font_weight(FontWeight::BOLD)
-                                                            .text_size(px(Theme::TEXT_SMALL)),
+                                            .child(
+                                                div()
+                                                    .text_size(px(Theme::TEXT_SMALL))
+                                                    .text_color(Theme::text_secondary())
+                                                    .child(format!("时长：{}", dur_str)),
+                                            )
+                                            .children(if has_dur {
+                                                // 预估耗时药丸：薄荷档 = 极速引擎，其余走主重音 tint，
+                                                // 两档配色都取自 Theme 的 tint_* 阶梯；形状走
+                                                // primitives::tag_tinted，字号 / 字重按原样保留。
+                                                Some(
+                                                    primitives::tag_tinted(
+                                                        format!("预估 {}", eta_str),
+                                                        if is_sensevoice {
+                                                            Theme::tint_mint_soft()
+                                                        } else {
+                                                            Theme::tint_primary_soft()
+                                                        },
+                                                        if is_sensevoice {
+                                                            Theme::tint_mint_border()
+                                                        } else {
+                                                            Theme::tint_primary_border()
+                                                        },
+                                                        if is_sensevoice {
+                                                            Theme::accent_mint()
+                                                        } else {
+                                                            Theme::accent_primary()
+                                                        },
                                                     )
-                                                } else {
-                                                    None
-                                                })
-                                                .child(
-                                                    div()
-                                                        .id("ready-card-close-btn")
-                                                        .w(px(20.0))
-                                                        .h(px(20.0))
-                                                        .rounded_sm()
-                                                        .cursor_pointer()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .text_size(px(Theme::TEXT_CAPTION))
-                                                        .text_color(Theme::text_muted())
-                                                        .hover(|s| s.bg(Theme::bg_hover_strong()).text_color(Theme::accent_red()))
-                                                        .child("✕")
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.transcribe_file = None;
-                                                            this.state.selected_file = None;
-                                                            this.state.transcribe_duration = 0.0;
-                                                            cx.notify();
-                                                        }))
-                                                ),
-                                        ),
-                                )
-                                // 文件主标题
-                                .child(primitives::page_title(fname))
-                                // 缓存提示卡片
-                                // （`cached_opt` 已是 `Option<Arc<TaskRecord>>`，直接 `map`：
-                                //   写成 `if let Some(..) { Some(..) } else { None }` 会被
-                                //   clippy 判成 `manual_map`。）
-                                .children(cached_opt.as_ref().map(|cached| {
-                                    div()
-                                        .w_full()
-                                        .px(px(Theme::SPACE_3))
-                                        .py(px(Theme::SPACE_1_5))
-                                        .rounded(px(Theme::CARD_RADIUS))
-                                        .bg(Theme::tint_mint_soft())
-                                        .border_1()
-                                        .border_color(Theme::tint_mint_border())
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .gap(px(Theme::SPACE_2))
-                                        .child(primitives::stat_dot_sm(Theme::accent_mint()))
-                                        .child(
-                                            div()
-                                                .text_size(px(Theme::TEXT_BODY))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(Theme::accent_mint())
-                                                .child(format!("命中本地转写缓存（含 {} 句字幕）", cached.segments.len())),
-                                        )
-                                }))
-                                // 核心操作按钮组：主行动 Lg/Primary，其余 Lg/Secondary，
-                                // 放置在缓存提示下方正中，保持视觉聚焦与极简动线
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(Theme::SPACE_3))
-                                        .mt(px(Theme::SPACE_2))
-                                        .children(if let Some(cached) = cached_opt {
-                                            vec![
-                                                primitives::btn("载入缓存", primitives::BtnSize::Lg, primitives::BtnVariant::Secondary)
-                                                    .id("cache-hit-load-btn")
-                                                    .on_click({
-                                                        let cached_clone = cached.clone();
-                                                        cx.listener(move |this, _, _, cx| {
-                                                            this.load_cached_result(cx, cached_clone.clone());
-                                                        })
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_size(px(Theme::TEXT_SMALL)),
+                                                )
+                                            } else {
+                                                None
+                                            })
+                                            .child(
+                                                div()
+                                                    .id("ready-card-close-btn")
+                                                    .w(px(20.0))
+                                                    .h(px(20.0))
+                                                    .rounded_sm()
+                                                    .cursor_pointer()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .text_size(px(Theme::TEXT_CAPTION))
+                                                    .text_color(Theme::text_muted())
+                                                    .hover(|s| {
+                                                        s.bg(Theme::bg_hover_strong())
+                                                            .text_color(Theme::accent_red())
                                                     })
-                                                    .into_any_element(),
-                                                primitives::btn("开始转写当前视频", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
-                                                    .id("ready-start-process-btn")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.start_processing(cx);
-                                                    }))
-                                                    .into_any_element(),
-                                                primitives::btn("取消", primitives::BtnSize::Lg, primitives::BtnVariant::Ghost)
-                                                    .id("ready-cancel-file-btn")
+                                                    .child("✕")
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.state.transcribe_file = None;
                                                         this.state.selected_file = None;
                                                         this.state.transcribe_duration = 0.0;
                                                         cx.notify();
-                                                    }))
-                                                    .into_any_element(),
-                                            ]
-                                        } else {
-                                            vec![
-                                                primitives::btn("开始转写当前视频", primitives::BtnSize::Lg, primitives::BtnVariant::Primary)
-                                                    .id("ready-start-process-btn")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.start_processing(cx);
-                                                    }))
-                                                    .into_any_element(),
-                                                primitives::btn("取消", primitives::BtnSize::Lg, primitives::BtnVariant::Ghost)
-                                                    .id("ready-cancel-file-btn")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.state.transcribe_file = None;
-                                                        this.state.selected_file = None;
-                                                        this.state.transcribe_duration = 0.0;
-                                                        cx.notify();
-                                                    }))
-                                                    .into_any_element(),
-                                            ]
-                                        }),
-                                )
-                                // 可选质检折叠入口：仅在有对应字幕时展示，默认折叠不扰民
-                                .children(if self.state.selected_file.as_ref() == self.state.transcribe_file.as_ref() && !self.state.segments.is_empty() {
+                                                    })),
+                                            ),
+                                    ),
+                            )
+                            // 文件主标题
+                            .child(primitives::page_title(fname))
+                            // 缓存提示卡片
+                            // （`cached_opt` 已是 `Option<Arc<TaskRecord>>`，直接 `map`：
+                            //   写成 `if let Some(..) { Some(..) } else { None }` 会被
+                            //   clippy 判成 `manual_map`。）
+                            .children(cached_opt.as_ref().map(|cached| {
+                                div()
+                                    .w_full()
+                                    .px(px(Theme::SPACE_3))
+                                    .py(px(Theme::SPACE_1_5))
+                                    .rounded(px(Theme::CARD_RADIUS))
+                                    .bg(Theme::tint_mint_soft())
+                                    .border_1()
+                                    .border_color(Theme::tint_mint_border())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap(px(Theme::SPACE_2))
+                                    .child(primitives::stat_dot_sm(Theme::accent_mint()))
+                                    .child(
+                                        div()
+                                            .text_size(px(Theme::TEXT_BODY))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::accent_mint())
+                                            .child(format!(
+                                                "命中本地转写缓存（含 {} 句字幕）",
+                                                cached.segments.len()
+                                            )),
+                                    )
+                            }))
+                            // 核心操作按钮组：主行动 Lg/Primary，其余 Lg/Secondary，
+                            // 放置在缓存提示下方正中，保持视觉聚焦与极简动线
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(Theme::SPACE_3))
+                                    .mt(px(Theme::SPACE_2))
+                                    .children(if let Some(cached) = cached_opt {
+                                        vec![
+                                            primitives::btn(
+                                                "载入缓存",
+                                                primitives::BtnSize::Lg,
+                                                primitives::BtnVariant::Secondary,
+                                            )
+                                            .id("cache-hit-load-btn")
+                                            .on_click({
+                                                let cached_clone = cached.clone();
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.load_cached_result(
+                                                        cx,
+                                                        cached_clone.clone(),
+                                                    );
+                                                })
+                                            })
+                                            .into_any_element(),
+                                            primitives::btn(
+                                                "开始转写当前视频",
+                                                primitives::BtnSize::Lg,
+                                                primitives::BtnVariant::Primary,
+                                            )
+                                            .id("ready-start-process-btn")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.start_processing(cx);
+                                            }))
+                                            .into_any_element(),
+                                            primitives::btn(
+                                                "取消",
+                                                primitives::BtnSize::Lg,
+                                                primitives::BtnVariant::Ghost,
+                                            )
+                                            .id("ready-cancel-file-btn")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.state.transcribe_file = None;
+                                                this.state.selected_file = None;
+                                                this.state.transcribe_duration = 0.0;
+                                                cx.notify();
+                                            }))
+                                            .into_any_element(),
+                                        ]
+                                    } else {
+                                        vec![
+                                            primitives::btn(
+                                                "开始转写当前视频",
+                                                primitives::BtnSize::Lg,
+                                                primitives::BtnVariant::Primary,
+                                            )
+                                            .id("ready-start-process-btn")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.start_processing(cx);
+                                            }))
+                                            .into_any_element(),
+                                            primitives::btn(
+                                                "取消",
+                                                primitives::BtnSize::Lg,
+                                                primitives::BtnVariant::Ghost,
+                                            )
+                                            .id("ready-cancel-file-btn")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.state.transcribe_file = None;
+                                                this.state.selected_file = None;
+                                                this.state.transcribe_duration = 0.0;
+                                                cx.notify();
+                                            }))
+                                            .into_any_element(),
+                                        ]
+                                    }),
+                            )
+                            // 可选质检折叠入口：仅在有对应字幕时展示，默认折叠不扰民
+                            .children(
+                                if self.state.selected_file.as_ref()
+                                    == self.state.transcribe_file.as_ref()
+                                    && !self.state.segments.is_empty()
+                                {
                                     let is_open = self.ready_qc_open;
                                     Some(
                                         div()
@@ -650,7 +581,11 @@ impl MainWindow {
                                             .justify_center()
                                             .child(
                                                 primitives::btn(
-                                                    if is_open { "收起转写质检与修复 ▲" } else { "查看转写质检与修复 (可选) ▾" },
+                                                    if is_open {
+                                                        "收起转写质检与修复 ▲"
+                                                    } else {
+                                                        "查看转写质检与修复 (可选) ▾"
+                                                    },
                                                     primitives::BtnSize::Sm,
                                                     primitives::BtnVariant::Ghost,
                                                 )
@@ -659,99 +594,116 @@ impl MainWindow {
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.ready_qc_open = !this.ready_qc_open;
                                                     cx.notify();
-                                                }))
-                                            )
+                                                })),
+                                            ),
                                     )
                                 } else {
                                     None
-                                })
-                                // 转写质检与修复面板（仅展开时显示）
-                                .children(quality_card),
-                        )
-                        .into_any_element()
-                } else {
-                    // 空闲就绪引导工作区 (精简直观 Dropzone)
-                    div()
-                        .id("lightweight-idle-dashboard")
-                        .flex_1()
-                        .w_full()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .p(px(Theme::PAGE_PAD))
-                        .on_drop::<ExternalPaths>(cx.listener(
-                            |this, paths: &ExternalPaths, _window, cx| {
-                                let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
-                                tracing::info!("空闲看板监听到 ExternalPaths 拖放导入: {:?}", dropped);
-                                this.handle_dropped_files(&dropped, cx);
-                            },
-                        ))
-                        .on_drop::<Arc<ExternalPaths>>(cx.listener(
-                            |this, paths: &Arc<ExternalPaths>, _window, cx| {
-                                let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
-                                tracing::info!("空闲看板监听到 Arc<ExternalPaths> 拖放导入: {:?}", dropped);
-                                this.handle_dropped_files(&dropped, cx);
-                            },
-                        ))
-                        .child(
-                            primitives::card_with_pad(Theme::SPACE_6)
-                                .w_full()
-                                .max_w(px(520.0))
-                                .border_dashed()
-                                .items_center()
-                                .gap(px(Theme::SPACE_3))
-                                .child(
-                                    div()
-                                        .w(px(48.0))
-                                        .h(px(48.0))
-                                        .rounded(px(Theme::RADIUS_LG))
-                                        .bg(Theme::tint_mint_soft())
-                                        .border_1()
-                                        .border_color(Theme::tint_mint_border())
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_size(px(24.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(Theme::accent_mint())
-                                        .child("+"),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .items_center()
-                                        .gap(px(Theme::SPACE_1))
-                                        .child(primitives::section_title("拖拽音视频至此，或浏览本地文件")),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(Theme::SPACE_3))
-                                        .mt(px(Theme::SPACE_1))
-                                        .child(
-                                            primitives::btn_clickable("浏览本地文件", primitives::BtnSize::Md, primitives::BtnVariant::Primary)
-                                                .id("idle-pick-file-btn")
-                                                .px(px(Theme::SPACE_5))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.choose_file(cx);
-                                                })),
+                                },
+                            )
+                            // 转写质检与修复面板（仅展开时显示）
+                            .children(quality_card),
+                    )
+                    .into_any_element()
+            } else {
+                // 空闲就绪引导工作区 (精简直观 Dropzone)
+                div()
+                    .id("lightweight-idle-dashboard")
+                    .flex_1()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .p(px(Theme::PAGE_PAD))
+                    .on_drop::<ExternalPaths>(cx.listener(
+                        |this, paths: &ExternalPaths, _window, cx| {
+                            let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
+                            tracing::info!("空闲看板监听到 ExternalPaths 拖放导入: {:?}", dropped);
+                            this.handle_dropped_files(&dropped, cx);
+                        },
+                    ))
+                    .on_drop::<Arc<ExternalPaths>>(cx.listener(
+                        |this, paths: &Arc<ExternalPaths>, _window, cx| {
+                            let dropped: Vec<std::path::PathBuf> = paths.paths().to_vec();
+                            tracing::info!(
+                                "空闲看板监听到 Arc<ExternalPaths> 拖放导入: {:?}",
+                                dropped
+                            );
+                            this.handle_dropped_files(&dropped, cx);
+                        },
+                    ))
+                    .child(
+                        primitives::card_with_pad(Theme::SPACE_6)
+                            .w_full()
+                            .max_w(px(520.0))
+                            .border_dashed()
+                            .items_center()
+                            .gap(px(Theme::SPACE_3))
+                            .child(
+                                div()
+                                    .w(px(48.0))
+                                    .h(px(48.0))
+                                    .rounded(px(Theme::RADIUS_LG))
+                                    .bg(Theme::tint_mint_soft())
+                                    .border_1()
+                                    .border_color(Theme::tint_mint_border())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(24.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(Theme::accent_mint())
+                                    .child("+"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .gap(px(Theme::SPACE_1))
+                                    .child(primitives::section_title(
+                                        "拖拽音视频至此，或浏览本地文件",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(Theme::SPACE_3))
+                                    .mt(px(Theme::SPACE_1))
+                                    .child(
+                                        primitives::btn_clickable(
+                                            "浏览本地文件",
+                                            primitives::BtnSize::Md,
+                                            primitives::BtnVariant::Primary,
                                         )
-                                        .child(
-                                            primitives::btn_clickable("导入文件夹", primitives::BtnSize::Md, primitives::BtnVariant::Secondary)
-                                                .id("idle-batch-folder-btn")
-                                                .px(px(Theme::SPACE_5))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.choose_batch_folder(cx);
-                                                })),
+                                        .id("idle-pick-file-btn")
+                                        .px(px(Theme::SPACE_5))
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.choose_file(cx);
+                                            }),
                                         ),
-                                ),
-                        )
-                        .into_any_element()
-                },
-            )
+                                    )
+                                    .child(
+                                        primitives::btn_clickable(
+                                            "导入文件夹",
+                                            primitives::BtnSize::Md,
+                                            primitives::BtnVariant::Secondary,
+                                        )
+                                        .id("idle-batch-folder-btn")
+                                        .px(px(Theme::SPACE_5))
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.choose_batch_folder(cx);
+                                            }),
+                                        ),
+                                    ),
+                            ),
+                    )
+                    .into_any_element()
+            })
     }
 
     // ── 转写质检摘要 (P1-9)：把 `segment.rs` 的质检报告变成用户可见的复核清单 ──
@@ -847,6 +799,180 @@ impl MainWindow {
         })
     }
 
+    /// 转写步骤看板：七个阶段**一次性列全**，各自带进度条与耗时。
+    ///
+    /// 为什么不用原来的「当前阶段名字 + 一条全局进度条」：全局进度条把七个阶段的
+    /// 进度揉成一根，模型加载那种「长时间不动」的阶段会让人以为卡死，
+    /// 也看不出「一共几步、走到第几步、前面各花了多久」。
+    ///
+    /// 刻意**不写小字说明**：状态只用心圆点 + 进度条 + 秒数表达。
+    pub(crate) fn render_stage_board(
+        &self,
+        is_sensevoice: bool,
+        total_dur: f64,
+        eta: String,
+        overall: f32,
+    ) -> impl IntoElement {
+        // 进行中那一行的秒数按「从现在往回看」实时算：状态里存的是开始时刻。
+        let live_secs = self
+            .state
+            .stage_row_started_at
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+
+        let rows = self.state.stage_rows.iter().enumerate().map(|(i, row)| {
+            let (secs_text, ratio, bar_color, name_color) = match row.state {
+                StageRowState::Done => {
+                    // 正常收尾时 `advance_stage_rows` 会把进度拉满；异常终止那一行
+                    // 保留真实的部分进度——假装走完比停在半路更误导。
+                    let r = if row.progress >= 0.99 {
+                        1.0
+                    } else {
+                        row.progress
+                    };
+                    (
+                        format!("{:.1} 秒", row.secs),
+                        r,
+                        Theme::accent_mint(),
+                        Theme::text_primary(),
+                    )
+                }
+                StageRowState::Running => (
+                    format!("{:.1} 秒", live_secs.max(row.secs)),
+                    row.progress,
+                    Theme::accent_mint(),
+                    Theme::text_primary(),
+                ),
+                StageRowState::Skipped => (
+                    "跳过".to_string(),
+                    0.0,
+                    Theme::border_mid(),
+                    Theme::text_muted(),
+                ),
+                StageRowState::Pending => (
+                    "等待".to_string(),
+                    0.0,
+                    Theme::border_mid(),
+                    Theme::text_muted(),
+                ),
+            };
+            let is_active = row.state == StageRowState::Running;
+
+            div()
+                .flex()
+                .items_center()
+                .gap(px(Theme::SPACE_3))
+                // 序号 + 阶段名
+                .child(
+                    div()
+                        .w(px(120.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(Theme::SPACE_2))
+                        .child(
+                            div()
+                                .w(px(18.0))
+                                .text_size(px(Theme::TEXT_BODY))
+                                .text_color(Theme::text_muted())
+                                .child(format!("{}", i + 1)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_BODY))
+                                .font_weight(if is_active {
+                                    FontWeight::BOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .text_color(name_color)
+                                .child(row.stage.label()),
+                        ),
+                )
+                // 本步骤自己的进度条
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .h(px(Theme::PROGRESS_H))
+                        .rounded_full()
+                        .bg(Theme::bg_track())
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(ratio.clamp(0.0, 1.0)))
+                                .min_w(px(if ratio > 0.001 { 4.0 } else { 0.0 }))
+                                .rounded_full()
+                                .bg(bar_color),
+                        ),
+                )
+                // 耗时 / 状态
+                .child(
+                    div()
+                        .w(px(72.0))
+                        .text_right()
+                        .text_size(px(Theme::TEXT_BODY))
+                        .font_weight(if is_active {
+                            FontWeight::BOLD
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .text_color(if is_active {
+                            Theme::accent_mint()
+                        } else {
+                            Theme::text_secondary()
+                        })
+                        .child(secs_text),
+                )
+                .into_any_element()
+        });
+
+        primitives::card()
+            .w_full()
+            .max_w(px(Theme::CONTENT_MAX_W))
+            .gap(px(Theme::SPACE_2))
+            // 表头：标题 + 引擎 + 总体进度 + 预计剩余
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(Theme::SPACE_3))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(Theme::SPACE_2))
+                            .child(primitives::section_title("转写步骤"))
+                            .child(if is_sensevoice {
+                                primitives::badge_accent("SenseVoice INT8")
+                            } else {
+                                primitives::badge("Whisper Turbo")
+                            })
+                            .child(primitives::badge(format_mm_ss(total_dur))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(Theme::SPACE_3))
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_TITLE))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(Theme::accent_mint())
+                                    .child(format!("{:.0}%", overall.clamp(0.0, 1.0) * 100.0)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(Theme::text_secondary())
+                                    .child(eta),
+                            ),
+                    ),
+            )
+            .children(rows)
+    }
     /// 质检摘要卡片。返回 `None` 表示这一帧不加任何东西（无字幕 / 不属于转写完成态）。
     ///
     /// 只由「转写完成后的看板」调用（文件就绪卡与空闲引导卡），转写进行中走的是
@@ -2323,8 +2449,6 @@ struct TranscribeDerivedCache {
     /// 「修复常见错误」的结果提示串
     cleanup_note: Option<SharedString>,
     /// 转写看板的阶段名 / 详情
-    progress_stage: Option<SharedString>,
-    progress_detail: Option<SharedString>,
     /// 批量队列每行的文件名 / 阶段名
     queue_text: QueueTextCache,
     /// 质检扩展项（语速超限 / 句尾标点 / 时间重叠 / 重复句）的句下标快照，键见 [`QualityExtrasKey`]
