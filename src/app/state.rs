@@ -1928,6 +1928,13 @@ impl AppState {
             if !src.has_translation() {
                 continue;
             }
+            // 锁定句：译文是用户确认过的定稿，重译不得覆盖。
+            // 这条与下面的 baseline 保护互补——baseline 只在本次运行内有效，
+            // `locked` 随工程落库，重启后依然生效。
+            if seg.locked {
+                skipped += 1;
+                continue;
+            }
             if let Some(base) = baseline {
                 let idx = seg.index as i64;
                 // ① 原文被改过：这条译文对不上现在的原文
@@ -4008,6 +4015,7 @@ impl AppState {
         self.segments[pos].words = words_left;
 
         let new_seg = Segment {
+            locked: false,
             index: orig.index + 1,
             start: split_time,
             end: orig.end,
@@ -4109,6 +4117,22 @@ impl AppState {
     }
 
     /// 删除当前选中的字幕片段
+    /// 切换当前选中句的「已锁定」状态；返回切换后的值（未选中时为 `None`）。
+    ///
+    /// 锁定语义：这一句的译文/文本已经**人工定稿**，重新翻译与润色都不得覆盖。
+    /// 与 `merge_translations_checked` 里的 baseline 保护互补——那个只在本次运行内
+    /// 有效，本标记随工程落库。
+    pub fn toggle_selected_lock(&mut self) -> Option<bool> {
+        let idx = self.selected_segment_index?;
+        let pos = self.segments.iter().position(|s| s.index == idx)?;
+        let seg = self.segments.get_mut(pos)?;
+        seg.locked = !seg.locked;
+        let locked = seg.locked;
+        self.segments_dirty = true;
+        self.bump_segments_revision();
+        Some(locked)
+    }
+
     pub fn delete_selected_segment(&mut self) {
         let Some(idx) = self.selected_segment_index else {
             return;
@@ -6235,6 +6259,41 @@ mod tests {
             state.segments[0].translation.is_none(),
             "旧原文的译文不能贴到新原文上: {:?}",
             state.segments[0].translation
+        );
+    }
+
+    /// 锁定（已校对）的句子：重新翻译**不得覆盖**它的译文。
+    ///
+    /// 与 baseline 保护互补：baseline 只在本次运行内有效（关掉程序就没了），
+    /// 而「已校对」随工程落库，是用户明确表达过的意思。
+    #[test]
+    fn merge_skips_locked_segments() {
+        use crate::subtitle::Segment;
+        let mut a = Segment::new(1, 0.0, 2.0, "第一句");
+        a.translation = Some("我自己定稿的译文".to_string());
+        a.translation_lang = Some("English".to_string());
+        a.locked = true;
+        let b = Segment::new(2, 2.0, 4.0, "第二句");
+        let mut state = test_state(vec![a, b]);
+
+        // 一次重新翻译：两条都带回了新译文
+        let mut translated = state.segments.clone();
+        for seg in translated.iter_mut() {
+            seg.translation = Some("machine translation".to_string());
+            seg.translation_lang = Some("English".to_string());
+        }
+        let skipped = state.merge_translations_checked(translated, None);
+
+        assert_eq!(skipped, 1, "锁定的那句应被计入跳过");
+        assert_eq!(
+            state.segments[0].translation.as_deref(),
+            Some("我自己定稿的译文"),
+            "锁定句的译文不得被覆盖"
+        );
+        assert_eq!(
+            state.segments[1].translation.as_deref(),
+            Some("machine translation"),
+            "未锁定的句子应正常更新"
         );
     }
 

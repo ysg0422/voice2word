@@ -1233,6 +1233,7 @@ fn apply_stream_event(
     match parsed.event.as_str() {
         "segment" => {
             let seg = Segment {
+                locked: false,
                 index: parsed.index,
                 start: parsed.start,
                 end: parsed.end,
@@ -1280,6 +1281,7 @@ fn apply_stream_event(
                         item.polished
                     };
                     summary.segments.push(Segment {
+                        locked: false,
                         index: item.index,
                         start: item.start,
                         end: item.end,
@@ -1305,6 +1307,7 @@ fn apply_stream_event(
             let clean = clean_sensevoice_tags_rs(&parsed.text);
             if !clean.is_empty() {
                 summary.segments.push(Segment {
+                    locked: false,
                     index: summary.segments.len() + 1,
                     start: parsed.start,
                     end: parsed.end,

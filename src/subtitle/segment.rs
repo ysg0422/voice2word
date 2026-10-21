@@ -50,6 +50,17 @@ pub struct Segment {
     /// 用户再也切不回去，也看不出这部片子到底译过哪几种语言。
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub translations: std::collections::BTreeMap<String, String>,
+    /// 已锁定（人工校对完成）：重新翻译 / 润色**不得覆盖**这一句。
+    ///
+    /// 与 `merge_translations_checked` 里的 baseline 保护是两回事：那个只在**同一次
+    /// 运行内**有效（baseline 是翻译开始时的快照），关掉程序就没了。本字段随工程落库，
+    /// 用来表达用户明确的意思——「这句我定稿了，别再动它」。
+    ///
+    /// 反序列化必须宽容：老工程的 JSON 里没有这个键，`serde(default)` 让它读成
+    /// `false`，不需要写迁移。
+    #[serde(default)]
+    pub locked: bool,
+
     /// LLM 润色文本 (保留字段兼容)
     #[serde(default, deserialize_with = "null_is_default")]
     pub polished: String,
@@ -100,6 +111,7 @@ pub enum ExportMode {
 impl Segment {
     pub fn new(index: usize, start: f64, end: f64, text: impl Into<String>) -> Self {
         Self {
+            locked: false,
             index,
             start,
             end,
@@ -1166,6 +1178,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
     let (left_words, right_words) = split_words_at(&seg.words, split_t);
 
     let mut left = Segment {
+        locked: false,
         index: 0,
         start: seg.start,
         end: split_t,
@@ -1181,6 +1194,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         words: left_words,
     };
     let mut right = Segment {
+        locked: false,
         index: 0,
         start: split_t,
         end: seg.end,

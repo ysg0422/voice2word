@@ -1234,6 +1234,7 @@ impl WhisperEngine {
                             let opt_seg = if !clean_text.is_empty() {
                                 streamed_count += 1;
                                 Some(Segment {
+                                    locked: false,
                                     index: streamed_count,
                                     start: start_sec,
                                     end: end_sec,
@@ -1516,6 +1517,7 @@ impl WhisperEngine {
                         }
 
                         let mut seg = Segment {
+                            locked: false,
                             index: i + 1,
                             start,
                             end,
@@ -1796,6 +1798,7 @@ impl WhisperEngine {
                         let start = Self::parse_time_str(parts[0].trim());
                         let end = Self::parse_time_str(parts[1].trim());
                         segments.push(Segment {
+                            locked: false,
                             index: idx,
                             start,
                             end,
@@ -2376,6 +2379,7 @@ mod tests {
     /// 造一条只关心时间轴的片段：正常路径下 `words` 与 `start/end` 应当同轴。
     fn seg_with_words(start: f64, end: f64, words: &[(f64, f64)]) -> Segment {
         Segment {
+            locked: false,
             index: 1,
             start,
             end,

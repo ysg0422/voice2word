@@ -1001,6 +1001,7 @@ impl MainWindow {
                         // PPT 风格自由移动与缩放的字幕文字框
                         let sample_seg = if active_seg.is_none() && !is_playing {
                             Some(Segment {
+                                locked: false,
                                 index: 0,
                                 start: 0.0,
                                 end: 2.0,
@@ -2571,6 +2572,34 @@ impl MainWindow {
                                                         }))
                                                         .child("保存修改"),
                                                 )
+                                                // 「已校对」开关：锁定后重新翻译/润色不会覆盖这一句。
+                                                // 放在「保存修改」旁边：用户点完保存顺手就能锁上，
+                                                // 不用再去别处找。
+                                                .child({
+                                                    let locked = self
+                                                        .state
+                                                        .selected_segment_index
+                                                        .and_then(|idx| {
+                                                            self.state
+                                                                .segments
+                                                                .iter()
+                                                                .find(|s| s.index == idx)
+                                                        })
+                                                        .map(|s| s.locked)
+                                                        .unwrap_or(false);
+                                                    primitives::mini_btn(
+                                                        if locked { "已校对 ✓" } else { "标记已校对" },
+                                                        self.state.selected_segment_index.is_some(),
+                                                    )
+                                                    .id("btn-toggle-seg-lock")
+                                                    .when(self.state.selected_segment_index.is_some(), |d| {
+                                                        d.on_click(cx.listener(|this, _, _, cx| {
+                                                            this.state.toggle_selected_lock();
+                                                            this.state.flush_segments_if_dirty();
+                                                            cx.notify();
+                                                        }))
+                                                    })
+                                                })
                                                 .child(
                                                     primitives::btn_danger("删除", primitives::BtnSize::Sm)
                                                         .id("btn-del-seg")
