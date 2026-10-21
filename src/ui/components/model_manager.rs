@@ -353,18 +353,10 @@ impl MainWindow {
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
         let is_downloading = self.state.is_downloading;
-        let done = self.state.download_done_bytes;
-        let total = self.state.download_total_bytes;
         let status = self.state.download_status_msg.clone();
-        let current = self.state.download_current.clone();
+        // 逐条目的字节进度见 `download_item_progress`（在行内渲染），
+        // 这里不再取全局 done/total —— 并发时它们只代表最后一条。
         let _is_gpu = self.state.config.gpu.is_gpu_tier();
-
-        // 进度比例：服务端没给 Content-Length 时退化为「不确定」态（用 0 表示）
-        let ratio = if total > 0 {
-            (done as f32 / total as f32).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
 
         // ── 顶部：只统计**当前配置下真正必需**的缺失项 ──
         //
@@ -452,66 +444,9 @@ impl MainWindow {
                 None
             });
 
-        // ── 进度条（仅下载中出现）──
-        let progress = if is_downloading {
-            let label = if total > 0 {
-                format!(
-                    "{}  {} / {}",
-                    current.as_deref().unwrap_or("准备中"),
-                    human_size(done),
-                    human_size(total)
-                )
-            } else {
-                format!(
-                    "{}  {}",
-                    current.as_deref().unwrap_or("准备中"),
-                    human_size(done)
-                )
-            };
-            Some(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(Theme::SPACE_1_5))
-                    .py(px(Theme::SPACE_1))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(Theme::TEXT_SMALL))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(Theme::accent_mint())
-                                    .child(label),
-                            )
-                            .when(total > 0, |d| {
-                                d.child(
-                                    div()
-                                        .text_size(px(Theme::TEXT_CAPTION))
-                                        .text_color(Theme::text_muted())
-                                        .child(format!("{:.1}%", ratio * 100.0)),
-                                )
-                            }),
-                    )
-                    .child(if total > 0 {
-                        primitives::progress_bar(ratio)
-                    } else {
-                        div()
-                            .w_full()
-                            .h(px(Theme::PROGRESS_H))
-                            .rounded_full()
-                            .bg(Theme::bg_inset())
-                            .border_1()
-                            .border_color(Theme::border())
-                    }),
-            )
-        } else {
-            None
-        };
-
+        // 进度条已改到**每个条目自己那一行**（见 `render_model_row`）：
+        // 并发下载时顶部的单条进度只能显示其中一个任务，反而误导。
+        // 这里只保留一句总状态文案（`download_status_msg`，在卡片底部渲染）。
         // 各条目的磁盘实际占用（渲染路径零 I/O，读后台快照）
         let disk_sizes = self.model_disk_sizes(cx);
 
@@ -781,10 +716,6 @@ impl MainWindow {
             .child(header)
             .child(action_bar);
 
-        if let Some(p) = progress {
-            card = card.child(p);
-        }
-
         // 版本更新横幅（发现新版本或已是最新版）
         if let Some((newer, text, _url)) = self.state.update_check_result.clone() {
             let is_downloading = self.state.update_download_busy;
@@ -966,6 +897,8 @@ impl MainWindow {
             .unwrap_or(false);
         let row_id = item.id;
         let row_idx = ITEMS.iter().position(|i| i.id == item.id).unwrap_or(0);
+        // 这一条自己的下载进度（没有 = 没在下）。
+        let row_progress = self.state.download_item_progress.get(item.id).copied();
         // 当前配置下是否**真的需要**它（只认真必需的，见 [`is_item_required_now`]）。
         // 未就位不再一律染红：模型列表是一份可选清单，没下过的档位是「还没装」
         // 而不是「出错了」。
@@ -1140,6 +1073,37 @@ impl MainWindow {
                                         None => format!("约 {}", human_size(item.size)),
                                     }),
                             )
+                            // 下载中：进度直接长在**这一条自己**的下面。
+                            // 同时下几条时各看各的，不用去顶部找「现在是谁在跑」。
+                            .children(row_progress.map(|(done, total)| {
+                                let ratio = if total > 0 {
+                                    (done as f32 / total as f32).clamp(0.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                div()
+                                    .w_full()
+                                    .mt(px(Theme::SPACE_1))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(Theme::SPACE_0_5))
+                                    .child(primitives::progress_bar(ratio))
+                                    .child(
+                                        div()
+                                            .text_size(px(Theme::TEXT_CAPTION))
+                                            .text_color(Theme::text_muted())
+                                            .child(if total > 0 {
+                                                format!(
+                                                    "{} / {}",
+                                                    human_size(done),
+                                                    human_size(total)
+                                                )
+                                            } else {
+                                                // 服务端没给 Content-Length：只报已下载量，不假装知道总大小。
+                                                human_size(done)
+                                            }),
+                                    )
+                            }))
                             .child(status_badge),
                     ),
             )

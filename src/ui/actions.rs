@@ -5255,6 +5255,7 @@ impl MainWindow {
         self.state.download_done_bytes = 0;
         self.state.download_total_bytes = 0;
         self.state.download_status_msg = format!("正在下载 {}...", item.label);
+        self.state.download_item_progress.clear();
         self.model_download_cancel
             .store(false, std::sync::atomic::Ordering::SeqCst);
         cx.notify();
@@ -5268,6 +5269,10 @@ impl MainWindow {
                 let _ = this.update(cx, |this, cx| {
                     this.state.download_done_bytes = done;
                     this.state.download_total_bytes = total;
+                    // 单条下载也要喂行内进度，否则点单项时看不到任何进度条。
+                    this.state
+                        .download_item_progress
+                        .insert(id.clone(), (done, total));
                     this.state.download_current = Some(id);
                     cx.notify();
                 });
@@ -5293,6 +5298,7 @@ impl MainWindow {
                 this.state.download_current = None;
                 this.state.download_done_bytes = 0;
                 this.state.download_total_bytes = 0;
+                this.state.download_item_progress.clear();
                 match result {
                     Ok(path) => {
                         info!("模型下载成功: {}", path.display());
@@ -5440,6 +5446,7 @@ impl MainWindow {
         let cancel = self.model_download_cancel.clone();
         cancel.store(false, std::sync::atomic::Ordering::SeqCst);
         self.state.is_downloading = true;
+        self.state.download_item_progress.clear();
         self.state.download_status_msg = format!("正在补齐 {total} 个缺失组件...");
         cx.notify();
 
@@ -5447,8 +5454,19 @@ impl MainWindow {
         cx.spawn(async move |this, cx| {
             while let Some((done, total_b, id)) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
+                    // 哨兵：这一条结束了（成功或失败），把它的进度摘掉。
+                    // 用 `u64::MAX` 而不是新开一种消息，是为了让通道类型保持简单。
+                    if done == u64::MAX {
+                        this.state.download_item_progress.remove(&id);
+                        cx.notify();
+                        return;
+                    }
+                    // 全局字段保留给标题栏的一句话状态；进度条本身按条目各画各的。
                     this.state.download_done_bytes = done;
                     this.state.download_total_bytes = total_b;
+                    this.state
+                        .download_item_progress
+                        .insert(id.clone(), (done, total_b));
                     this.state.download_current = Some(id);
                     cx.notify();
                 });
@@ -5457,38 +5475,54 @@ impl MainWindow {
         .detach();
 
         cx.spawn(async move |this, cx| {
-            // 逐个串行下载：并发下多个大文件抢带宽，反而都变慢，
-            // 且进度条会来回跳（用户无法判断「还剩多少」）。
+            // **分批发起的并发下载**（每批最多 3 个）。
+            //
+            // 之前是严格串行，理由写在旧注释里：「并发抢带宽、进度条来回跳」。
+            // 现在进度条按条目各画一条，第二个理由不成立了；带宽也仍是**有界**的
+            // ——批大小 3 而不是「一次性全发」，避免 8 个条目同时抢同一条宽带上限。
+            //
+            // 注意实现方式：先把一批任务 `spawn` 出去（它们**立刻开始跑**），再依次
+            // `await`。await 的顺序不影响并发，只负责收结果与报错。
+            const BATCH: usize = 3;
             let mut ok = 0usize;
             let mut failed: Vec<&'static str> = Vec::new();
             let mut last_msg = String::new();
-            for item in pending {
+            for chunk in pending.chunks(BATCH) {
                 if cancel.load(std::sync::atomic::Ordering::SeqCst) {
                     last_msg = "批量下载已取消".to_string();
                     break;
                 }
-                let tx_cb = tx.clone();
-                let cancel_cb = cancel.clone();
-                let item_copy = *item;
-                let r = cx
-                    .background_executor()
-                    .spawn(async move {
+                let mut handles = Vec::with_capacity(chunk.len());
+                for item in chunk {
+                    let tx_cb = tx.clone();
+                    let cancel_cb = cancel.clone();
+                    let item_copy = *item;
+                    handles.push(cx.background_executor().spawn(async move {
+                        // 回调要拿走一份 sender，收尾的「已完成」哨兵还要用另一份。
+                        let tx_progress = tx_cb.clone();
                         let cb: crate::utils::model_download::ProgressFn =
                             Box::new(move |done, tot, id| {
-                                let _ = tx_cb.send((done, tot, id.to_string()));
+                                let _ = tx_progress.send((done, tot, id.to_string()));
                             });
-                        crate::utils::model_download::download_one(
-                            &item_copy,
+                        let res = crate::utils::model_download::download_one(
+                            item_copy,
                             &cancel_cb,
                             Some(&cb),
-                        )
-                    })
-                    .await;
-                match r {
-                    Ok(_) => ok += 1,
-                    Err(e) => {
-                        tracing::warn!(item = item.id, error = %e, "批量下载中该项失败");
-                        failed.push(item.label);
+                        );
+                        // 结束（成功或失败）立刻把这一条从进度表里摘掉，
+                        // 否则失败项会永远挂着一个走满的进度条。
+                        let _ = tx_cb.send((u64::MAX, 0, item_copy.id.to_string()));
+                        (item_copy.id, item_copy.label, res)
+                    }));
+                }
+                for handle in handles {
+                    let (id, label, r) = handle.await;
+                    match r {
+                        Ok(_) => ok += 1,
+                        Err(e) => {
+                            tracing::warn!(item = id, error = %e, "批量下载中该项失败");
+                            failed.push(label);
+                        }
                     }
                 }
             }

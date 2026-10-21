@@ -1033,6 +1033,12 @@ pub struct AppState {
     /// 已完成字节 / 总字节（总字节为 0 表示服务端未给 Content-Length）
     pub download_done_bytes: u64,
     pub download_total_bytes: u64,
+    /// 每个条目**自己**的下载进度：`id -> (已下载字节, 总字节)`。
+    ///
+    /// 为什么要有它：以前只有一个全局进度条，串行下载时够用，但用户要的是
+    /// 「进度显示在条目自己那一行」并允许并发——那就必须按 id 分开记。
+    /// 空表示该条目当前没在下（下载完成 / 失败后立刻移除）。
+    pub download_item_progress: std::collections::HashMap<String, (u64, u64)>,
     /// 最近一次下载的结果提示（成功或失败原因）
     pub download_status_msg: String,
     /// 最近一次字幕写库失败的原因（`None` = 一切正常）。
@@ -1363,6 +1369,7 @@ impl AppState {
             download_current: None,
             download_done_bytes: 0,
             download_total_bytes: 0,
+            download_item_progress: std::collections::HashMap::new(),
             download_status_msg: String::new(),
             // 首次扫描放在 `with_hardware` 收尾处（那里能拿到 &mut self）
             cached_transcription: Arc::new(std::sync::Mutex::new(None)),
