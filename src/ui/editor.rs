@@ -4558,7 +4558,10 @@ impl MainWindow {
                 false,
             ))
             .child(row(
-                "已翻译",
+                // 这里统计的是**任意语言**的译文（`SubtitleStats` 的固有语义），
+                // 而旁边的「字幕翻译」面板按**当前目标语言**计数。两者在切换目标语言后
+                // 会给出不同的数：写「已翻译」会让用户以为程序算错了。
+                "已有译文",
                 format!("{} / {} 句", stats.translated_count, stats.segment_count),
                 false,
             ))

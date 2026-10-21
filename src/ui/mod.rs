@@ -1413,11 +1413,13 @@ pub(crate) fn build_derived_snapshot(
         expected_translation: expected_translation_count(segments),
         other_lang_translated: translated_other_lang_count(segments, target_lang),
         stats: crate::subtitle::stats::compute(segments, media_secs, max_chars_per_line),
-        quality_report: Arc::new(crate::subtitle::segment::quality_report(
+        quality_report: Arc::new(crate::subtitle::segment::quality_report_for(
             segments,
             glossary_entries,
             low_confidence_threshold,
             check_untranslated,
+            // 「未翻译」按**当前目标语言**判，与翻译进度/导出模式同一口径。
+            Some(target_lang),
         )),
         // 时间轴窗口索引与上面几项共用同一份快照、同一把失效键，不另开缓存：
         // 它的唯一输入就是 `segments`，revision 一动就整体重建。
@@ -4696,16 +4698,42 @@ mod tests {
             has_distinct_translation(&segments)
         );
         // 质检报告：改造前转写页是「按空术语表算一遍、再用缓存的违规下标填进去」，
-        // 与这里「直接带条目算」必须是同一份报告
-        let mut expected = crate::subtitle::segment::quality_report(
+        // 与这里「直接带条目算」必须是同一份报告。
+        //
+        // 注意用 `quality_report_for(.., Some(target))`：快照的「未翻译」按**当前目标语言**
+        // 判定（与翻译进度同口径），而 `quality_report` 是不带语言上下文的旧接口。
+        // 这份数据里 c 的译文是 Français、target 是 English，两种口径会给出不同结果——
+        // 正是这条断言要盯住的地方。
+        let mut expected = crate::subtitle::segment::quality_report_for(
+            &segments,
+            &[],
+            threshold,
+            translated_count > 0,
+            Some(target),
+        );
+        expected.glossary_violations =
+            crate::subtitle::segment::glossary_violations(&segments, &entries);
+        assert_eq!(*snap.quality_report, expected);
+
+        // 这份夹具里 c 的译文是 Français：按 English 目标它应算「未翻译」，
+        // 而不带语言上下文的旧接口会把它当成已翻译。两者**必须不同**，
+        // 否则说明目标语言根本没参与判定。
+        let legacy = crate::subtitle::segment::quality_report(
             &segments,
             &[],
             threshold,
             translated_count > 0,
         );
-        expected.glossary_violations =
-            crate::subtitle::segment::glossary_violations(&segments, &entries);
-        assert_eq!(*snap.quality_report, expected);
+        assert!(
+            !snap.quality_report.untranslated.is_empty(),
+            "按 English 目标，Français 那句应算未翻译：{:?}",
+            snap.quality_report.untranslated
+        );
+        assert!(
+            !legacy.untranslated.contains(&3),
+            "旧接口按任意语言判，法语译文那句不该入选：{:?}",
+            legacy.untranslated
+        );
 
         // 具体数字也钉一遍，防止「两边一起错」：5 句、3 句有非空译文（含一条与原文
         // 相同的）、当前目标语言实际译出 2 句、另有 1 句法语译文、1 句未翻译。
@@ -4718,7 +4746,10 @@ mod tests {
         assert!(snap.has_distinct_translation);
         assert_eq!(snap.quality_report.low_confidence, vec![1]);
         assert_eq!(snap.quality_report.empty_or_short, vec![2, 4]);
-        assert_eq!(snap.quality_report.untranslated, vec![5]);
+        // 3 = 那句法语译文（目标语言是 English，故未被译出）、5 = 完全没有译文。
+        // 旧实现按「有任意译文」判，这里只会是 [5]——那正是「切了目标语言后
+        // 质检说 0 句未翻译、翻译面板说 0/300 完成」的来源。
+        assert_eq!(snap.quality_report.untranslated, vec![3, 5]);
         assert_eq!(snap.quality_report.glossary_violations, vec![1]);
     }
 

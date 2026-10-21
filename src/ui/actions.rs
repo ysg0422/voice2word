@@ -944,7 +944,7 @@ impl MainWindow {
         format: crate::subtitle::qc::QcFormat,
         cx: &mut Context<Self>,
     ) {
-        use crate::subtitle::segment::quality_report;
+        use crate::subtitle::segment::quality_report_for;
         if self.state.segments.is_empty() {
             return;
         }
@@ -952,7 +952,16 @@ impl MainWindow {
         // 数字与界面上看到的一致——两处各算一遍必然出现「界面 3 句、导出 5 句」。
         let check_untranslated = self.state.translated_count() > 0;
         let threshold = self.state.config.pipeline.whisper_low_confidence;
-        let mut report = quality_report(&self.state.segments, &[], threshold, check_untranslated);
+        // 与翻译面板同一口径（按**当前目标语言**判）：否则切换目标语言后，
+        // 质检会说「未翻译 0 句」而翻译面板说「0/300 完成」。
+        let target_lang = self.state.config.translate.target_lang.clone();
+        let mut report = quality_report_for(
+            &self.state.segments,
+            &[],
+            threshold,
+            check_untranslated,
+            Some(target_lang.as_str()),
+        );
         report.glossary_violations = self.cached_glossary_violations();
         let flagged = report.all_issues().len();
         let total = self.state.segments.len();

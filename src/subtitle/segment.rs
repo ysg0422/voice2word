@@ -578,6 +578,32 @@ pub fn quality_report(
     confidence_threshold: f64,
     check_untranslated: bool,
 ) -> QualityReport {
+    quality_report_for(
+        segments,
+        entries,
+        confidence_threshold,
+        check_untranslated,
+        None,
+    )
+}
+
+/// 同 [`quality_report`]，但**按当前目标语言**判定「未翻译」。
+///
+/// 为什么需要它：`has_translation()` 只问「有没有任意语言的译文」。用户先译成 English
+/// 再切到日本語时，界面会同时出现两句互相矛盾的话——翻译面板「已完成 0/300 句」
+/// （按目标语言算，正确），质检却「未翻译 0 句」（按任意语言算，也对），
+/// 于是用户看到「一句都没译成日文」与「没有未翻译」并列，只能以为程序坏了。
+///
+/// 传 `Some(target)` 时与本文件的 `translation_matches` 同口径，
+/// 与翻译进度、导出模式判定保持同一套定义；传 `None` 时退回旧语义
+/// （CLI / 复核表等没有「当前目标语言」上下文的调用方）。
+pub fn quality_report_for(
+    segments: &[Segment],
+    entries: &[(String, String)],
+    confidence_threshold: f64,
+    check_untranslated: bool,
+    target_lang: Option<&str>,
+) -> QualityReport {
     let mut report = QualityReport::default();
     for seg in segments {
         match seg.confidence {
@@ -591,7 +617,12 @@ pub fn quality_report(
         }
 
         let text_len = seg.display_text().trim().chars().count();
-        if check_untranslated && text_len > 0 && !seg.has_translation() {
+        // 有目标语言就按目标语言判；没有上下文时才退回「任意译文」。
+        let missing_translation = match target_lang {
+            Some(target) => !seg.translation_matches(target),
+            None => !seg.has_translation(),
+        };
+        if check_untranslated && text_len > 0 && missing_translation {
             report.untranslated.push(seg.index);
         }
         if text_len < MIN_SEGMENT_TEXT_CHARS {
@@ -2219,6 +2250,29 @@ mod tests {
         assert_eq!(r.confidence_scored, 0);
         assert_eq!(r.confidence_missing, 0);
         assert!(!r.confidence_unavailable(), "空输入没有能力缺口可言");
+    }
+
+    /// 切了目标语言后，「未翻译」必须按**新目标**重算。
+    ///
+    /// 现场：先译成 English（界面 300/300），再切到日本語 —— 翻译面板显示 0/300，
+    /// 而质检若仍用 `has_translation()`（任意语言）会说「未翻译 0 句」，两句并列自相矛盾。
+    #[test]
+    fn untranslated_follows_current_target_language() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "这是一句比较长的原文");
+        seg.translation = Some("This is an English line".to_string());
+        seg.translation_lang = Some("English".to_string());
+
+        // 目标语言是 English：已译，不算未翻译
+        let en = super::quality_report_for(&[seg.clone()], &[], -0.35, true, Some("English"));
+        assert!(en.untranslated.is_empty());
+
+        // 目标语言换成日本語：这条译文不算数，必须报未翻译
+        let ja = super::quality_report_for(&[seg.clone()], &[], -0.35, true, Some("日本語"));
+        assert_eq!(ja.untranslated, vec![1], "切目标语言后旧译文不得再算完成");
+
+        // 没有目标语言上下文（CLI / 复核表）：保持旧语义，有任意译文即不算未翻译
+        let none = super::quality_report_for(&[seg], &[], -0.35, true, None);
+        assert!(none.untranslated.is_empty());
     }
 
     /// 同一句命中多条：分类列表**不去重**（保留「这句有两个毛病」），
