@@ -123,7 +123,7 @@ Voice2Word 是一款**完全本地运行**的音视频字幕工作台，覆盖�
 | 模型管理 | 查看全部组件体积合计、逐项定位 / 删除、打开目录、一键备份与恢复数据 |
 | 硬件监控 | 实时查看 CPU / 内存占用，支持 GPU 解码与推理卸载开关 |
 | 检查更新 | 点击时查询一次 GitHub Releases，给出下载入口（不会自动替换运行中的程序） |
-| 深色界面 | 界面固定深色（浅色切换入口已移除） |
+| 深色界面 | 固定深色主题 |
 
 ---
 
@@ -281,7 +281,7 @@ api_key    = ""                    # 留空则读取环境变量 VOICE2WORD_API_
 api_model  = ""
 
 [ui]
-theme             = "dark"         # 目前只有深色（浅色切换入口已移除，改这里不生效）
+theme             = "dark"         # 目前仅提供深色主题
 export_mode       = "bilingual"    # raw / translation / bilingual
 export_format     = "jianying"     # 剪辑台导出格式
 export_name_template = "{name}.{ext}"   # 支持 {name} / {ext} / {date}
