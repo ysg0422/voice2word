@@ -1296,12 +1296,17 @@ impl TaskPipeline {
                 Some(Arc::new(
                     crate::engines::SenseVoiceEngine::with_python_and_provider(
                         runner,
-                        model,
+                        model.clone(),
                         tokens,
                         vad,
                         threads.unwrap_or(8),
                         py,
                         provider,
+                    )
+                    // 按模型路径自动识别族：路径认不出时仍是 SenseVoice，行为不变。
+                    .with_family(
+                        crate::engines::sensevoice::model_family_from_path(&model),
+                        None,
                     ),
                 ))
             } else {

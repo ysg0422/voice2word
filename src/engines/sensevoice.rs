@@ -377,6 +377,33 @@ fn provider_report_outcome(
     }
 }
 
+/// 从模型文件路径判定它属于哪个族。
+///
+/// 为什么不加 `asr_family` 配置字段：`AppConfig` 是用户手改的文件，多一个字段就多
+/// 一条迁移与校验路径，而且「选了这个模型却忘了改族」会静默跑错。路径里本来就带着
+/// 目录名（`models/dolphin/`、`models/paraformer/`），据此判定是零配置、零迁移的。
+///
+/// 判定只看**目录/文件名里的关键字**；认不出就按 SenseVoice 处理——这也是现状，
+/// 保证既有安装行为完全不变。
+pub fn model_family_from_path(model_path: &Path) -> ModelFamily {
+    let p = model_path.to_string_lossy().to_ascii_lowercase();
+    if p.contains("dolphin") {
+        ModelFamily::DolphinCtc
+    } else if p.contains("paraformer") {
+        ModelFamily::Paraformer
+    } else if p.contains("canary") {
+        ModelFamily::NemoCanary
+    } else if p.contains("firered") || p.contains("fire-red") {
+        ModelFamily::FireRedAsr
+    } else if p.contains("moonshine") {
+        // Moonshine 是 encoder+decoder+preprocessor 四文件，runner 尚未接入；
+        // 这里仍归到 NeMo CTC 之外的族，避免被当成 SenseVoice 静默跑错。
+        ModelFamily::NemoCtc
+    } else {
+        ModelFamily::SenseVoice
+    }
+}
+
 /// 从下载条目的 id 反查它属于哪个识别模型族（`None` = 不是 Local-ASR 条目）。
 ///
 /// 放在这里而不是 `model_download`：`ModelFamily` 属于引擎层，utils 不该反向依赖
@@ -1514,6 +1541,37 @@ fn consume_stdout<R: std::io::BufRead>(
 }
 #[cfg(test)]
 mod tests {
+
+    /// 路径判定必须把「认不出」收敛到 SenseVoice（现状），否则既有安装会被改行为。
+    #[test]
+    fn model_family_from_path_defaults_to_sensevoice() {
+        use super::model_family_from_path;
+        use super::ModelFamily;
+        use std::path::Path;
+
+        assert_eq!(
+            model_family_from_path(Path::new("models/sensevoice/model.int8.onnx")),
+            ModelFamily::SenseVoice
+        );
+        // 认不出的路径也是 SenseVoice —— 这是「不改变既有行为」的保证
+        assert_eq!(
+            model_family_from_path(Path::new("models/whatever/x.onnx")),
+            ModelFamily::SenseVoice
+        );
+        assert_eq!(
+            model_family_from_path(Path::new("models/dolphin/model.int8.onnx")),
+            ModelFamily::DolphinCtc
+        );
+        assert_eq!(
+            model_family_from_path(Path::new("models/paraformer/model.int8.onnx")),
+            ModelFamily::Paraformer
+        );
+        // 大小写混排也要认
+        assert_eq!(
+            model_family_from_path(Path::new("MODELS/Dolphin/model.onnx")),
+            ModelFamily::DolphinCtc
+        );
+    }
 
     /// SenseVoice 是缺省族，**不能**往命令行里加任何参数——
     /// 否则「改造前后命令行逐字节一致」这条回归就失去意义。
