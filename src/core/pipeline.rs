@@ -751,6 +751,26 @@ pub struct TaskPipeline {
     artifact_dir: Mutex<Option<PathBuf>>,
 }
 
+/// 窗口前后各留的余量（秒）：太贴边会把一个字的起音切掉，识别结果从第一个音节就错。
+const RESTT_SPAN_PAD: f64 = 0.30;
+/// 单次重转的最长区间（秒）：挡住误传进来的「一小时」这种值。
+const RESTT_MAX_SPAN: f64 = 120.0;
+
+/// 把用户选的 `[start, end]` 换算成 ffmpeg 要抽的 `(起点, 时长)`。
+///
+/// 纯函数独立出来的原因：这里的算术最容易错——前后余量、片头钳零、区间上限，
+/// 任何一处差一点，用户拿到的就是「少半个字」或者「把邻居的话带进来」。
+/// 返回 `None` 表示区间本身非法（非有限 / 结束早于开始）。
+fn respan_window(start: f64, end: f64) -> Option<(f64, f64)> {
+    if !start.is_finite() || !end.is_finite() || end <= start {
+        return None;
+    }
+    let span = (end - start).min(RESTT_MAX_SPAN);
+    let from = (start - RESTT_SPAN_PAD).max(0.0);
+    let want = (span + (start - from) + RESTT_SPAN_PAD).max(0.3);
+    Some((from, want))
+}
+
 impl TaskPipeline {
     /// 本次装配是否带上了 SenseVoice 引擎（四项齐全才会装配，见 `cli::build_sensevoice`）。
     ///
@@ -891,6 +911,71 @@ impl TaskPipeline {
                 punc.cancel();
             }
         });
+    }
+
+    /// 只重转一段音频（`[start, end]`），返回该窗口内的片段（时间轴已还原到原片）。
+    ///
+    /// 为什么需要它：长视频里某一句识别错了，现在的唯一办法是整片重跑——32 分钟的
+    /// 素材要等一分半。这里只解码目标窗口（`-ss/-t` 放在 `-i` 之前做输入侧 seek），
+    /// 几秒钟就能拿到新结果。
+    ///
+    /// 语义约定：
+    /// - 前后各留 [`RESTT_SPAN_PAD`] 的余量，避免把一个字的起音切掉；
+    /// - 单次最多 [`RESTT_MAX_SPAN`] 秒，防止误传一个小时的区间；
+    /// - 返回的片段**裁到**用户选的那一段内（防止把邻居的字带进来），并按时间排序。
+    pub fn retranscribe_window(
+        &self,
+        media: &Path,
+        start: f64,
+        end: f64,
+        language: Option<&str>,
+        threads: Option<u32>,
+        model_override: Option<&Path>,
+    ) -> Result<Vec<Segment>> {
+        let (from, want) = respan_window(start, end)
+            .ok_or_else(|| anyhow::anyhow!("重转区间无效：{start:.2}s → {end:.2}s"))?;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let wav = crate::utils::safe_temp_dir().join(format!(
+            "v2w_respan_{}_{}.wav",
+            std::process::id(),
+            unique
+        ));
+        let _guard = crate::utils::TempPathGuard::file(&wav);
+        self.ffmpeg.extract_audio_window(media, from, want, &wav)?;
+
+        let (mut segments, _) = if let Some(sv) = self.sensevoice.as_ref() {
+            sv.transcribe(&wav, language, threads, Some(want), None)?
+        } else {
+            self.whisper.transcribe_with_model(
+                &wav,
+                language,
+                threads,
+                Some(want),
+                model_override,
+                None,
+            )?
+        };
+
+        // 窗口内时间轴 → 原片时间轴
+        for seg in segments.iter_mut() {
+            seg.start += from;
+            seg.end += from;
+        }
+        // 只保留与用户选区相交的部分，并裁掉越界的尾巴
+        segments.retain(|s| s.end > start && s.start < end);
+        for seg in segments.iter_mut() {
+            seg.start = seg.start.clamp(start, end);
+            seg.end = seg.end.clamp(seg.start, end);
+        }
+        segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+        for (i, seg) in segments.iter_mut().enumerate() {
+            seg.index = i + 1;
+        }
+        Ok(segments)
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -3122,6 +3207,33 @@ mod tests {
         assert!(cached_extract_audio_duration(Some(&artifacts), current).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 局部重转的窗口算术：前后余量、片头钳零、区间上限、非法输入。
+    #[test]
+    fn respan_window_adds_padding_clamps_head_and_caps_span() {
+        // 片中一句：前后各留 0.3s
+        let (from, want) = super::respan_window(5.0, 6.0).expect("合法区间");
+        assert!((from - 4.7).abs() < 1e-9, "起点要往前让 0.3s，实得 {from}");
+        assert!(
+            (want - 1.6).abs() < 1e-9,
+            "时长 = 1.0 + 0.3 + 0.3，实得 {want}"
+        );
+
+        // 片头第一句：不能取负起点，且时长只补尾部的余量
+        let (from, want) = super::respan_window(0.0, 2.0).expect("合法区间");
+        assert_eq!(from, 0.0);
+        assert!((want - 2.3).abs() < 1e-9, "实得 {want}");
+
+        // 超长区间按上限截断（防止把一小时传进来）
+        let (_, want) = super::respan_window(10.0, 10.0 + 600.0).expect("合法区间");
+        assert!(want <= super::RESTT_MAX_SPAN + 2.0 * super::RESTT_SPAN_PAD + 1e-9);
+
+        // 非法区间一律 None
+        assert!(super::respan_window(5.0, 5.0).is_none());
+        assert!(super::respan_window(6.0, 5.0).is_none());
+        assert!(super::respan_window(f64::NAN, 5.0).is_none());
+        assert!(super::respan_window(0.0, f64::INFINITY).is_none());
     }
 
     /// 覆盖时长不许超过媒体总时长：末块延展 / 幻觉时间戳都会把区间推到片尾之后。

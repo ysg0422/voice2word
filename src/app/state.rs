@@ -4171,6 +4171,34 @@ impl AppState {
     }
 
     /// 删除当前选中的字幕片段
+    /// 用「局部重转」的结果替换某一句的原文；返回是否真的改了。
+    ///
+    /// 只动 `text`（并清掉已失效的 `polished`），**不动**起止时间：时间轴是用户
+    /// 按画面卡好的，重转只是换文字；改时间会把整条轨道的对齐关系打乱。
+    pub fn replace_segment_text(&mut self, index: usize, text: String) -> bool {
+        let Some(pos) = self.segments.iter().position(|s| s.index == index) else {
+            return false;
+        };
+        let before = self.segments[pos].display_text().to_string();
+        if before == text {
+            return false;
+        }
+        self.snapshot_for_undo();
+        self.audit(
+            crate::subtitle::audit::EditKind::Text,
+            index,
+            before,
+            text.clone(),
+        );
+        let seg = &mut self.segments[pos];
+        seg.text = text;
+        // 旧润色稿是按旧原文生成的，留着会让显示文本还是错的。
+        seg.polished.clear();
+        self.segments_dirty = true;
+        self.bump_segments_revision();
+        true
+    }
+
     /// 切换当前选中句的「已锁定」状态；返回切换后的值（未选中时为 `None`）。
     ///
     /// 锁定语义：这一句的译文/文本已经**人工定稿**，重新翻译与润色都不得覆盖。

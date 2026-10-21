@@ -4837,6 +4837,87 @@ impl MainWindow {
     }
 
     /// 从术语表临时文件读回内容并落盘。
+    /// 只重转当前选中的那一句（长视频改一句不用整片重跑）。
+    ///
+    /// 走后台线程 + `background_executor`：ffmpeg 抽窗与引擎调用都是秒级阻塞，
+    /// 放 UI 线程上会卡住整个窗口。
+    pub(crate) fn retranscribe_selected_segment(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.state.selected_segment_index else {
+            return;
+        };
+        let Some(seg) = self
+            .state
+            .segments
+            .iter()
+            .find(|s| s.index == index)
+            .cloned()
+        else {
+            return;
+        };
+        if seg.locked {
+            self.notice = Some("这一句已标为「已校对」，先解锁再重转".to_string());
+            cx.notify();
+            return;
+        }
+        let Some(media) = self
+            .state
+            .selected_file
+            .clone()
+            .or_else(|| self.state.transcribe_file.clone())
+        else {
+            self.notice = Some("找不到对应的媒体文件，无法重转".to_string());
+            cx.notify();
+            return;
+        };
+
+        let pipeline = self.state.pipeline.clone();
+        let language = (self.state.language != "auto").then(|| self.state.language.clone());
+        let threads = self.state.whisper_threads;
+        let model = self.state.selected_model_path.clone();
+        self.notice = Some(format!("正在重转第 {index} 句…"));
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    pipeline.retranscribe_window(
+                        &media,
+                        seg.start,
+                        seg.end,
+                        language.as_deref(),
+                        Some(threads),
+                        Some(model.as_path()),
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match res {
+                    Ok(segs) if !segs.is_empty() => {
+                        let text = segs
+                            .iter()
+                            .map(|s| s.display_text().to_string())
+                            .collect::<Vec<_>>()
+                            .join("");
+                        if this.state.replace_segment_text(index, text) {
+                            this.notice = Some(format!("已重转第 {index} 句"));
+                        } else {
+                            this.notice = Some(format!("第 {index} 句重转结果与原文相同"));
+                        }
+                    }
+                    Ok(_) => {
+                        this.notice = Some(format!("第 {index} 句这一段没有识别出内容"));
+                    }
+                    Err(err) => {
+                        this.notice = Some(format!("重转失败：{err}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 从当前字幕提取候选术语（英文缩写 / 驼峰名 / 型号），写进术语表并打开文件。
     pub(crate) fn extract_glossary_candidates(&mut self, cx: &mut Context<Self>) {
         match self.state.append_glossary_candidates() {
