@@ -254,13 +254,15 @@ fn model_disk_snapshot_stale(cached: Option<&ModelDiskKey>, current: &ModelDiskK
 /// 与旧渲染路径逐字同源：先 `is_present` 判定就位，再对就位项 `disk_size`，
 /// 区别只是整段搬到了后台线程（`fs::metadata` 在机械盘 / 网络盘上可能卡住）。
 fn scan_model_disk_usage(cfg: &crate::utils::AppConfig) -> HashMap<String, Option<u64>> {
-    use crate::utils::model_download::{disk_size, item_effective_path, PresenceContextRef};
+    use crate::utils::model_download::{item_footprint, PresenceContextRef};
     let presence = PresenceContextRef::new(cfg);
     ITEMS
         .iter()
         .map(|item| {
             let size = if presence.is_present(item) {
-                disk_size(&item_effective_path(item, cfg))
+                // 用 `item_footprint` 而不是单文件的 `disk_size(dest)`：解压型条目
+                // （whisper / llama / sherpa）的 dest 只是入口文件，真实占用在同目录几十个文件里。
+                item_footprint(item, cfg)
             } else {
                 None
             };

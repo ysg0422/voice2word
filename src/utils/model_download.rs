@@ -1279,6 +1279,90 @@ pub fn disk_size(path: &Path) -> Option<u64> {
     fs::metadata(path).ok().map(|m| m.len())
 }
 
+/// 递归统计一个目录里普通文件的字节数；读不到的条目直接跳过（不是为了报错，
+/// 而是「空间占用」这种展示信息不该因为某个子目录没权限就整项失败）。
+fn dir_size(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    total += meta.len();
+                }
+            }
+        }
+    }
+    total
+}
+
+/// 解压型条目的目录是否**只归它一个**。
+///
+/// 只有独占目录才能按「整个目录求和」统计占用：llama.cpp / sherpa 的 zip 是平铺解到
+/// `tools/` 的，与 ffmpeg、python 等条目共用同一层——按目录求和会把别人的体积算进来，
+/// 还会在「合计占用」里重复计数。
+fn archive_root_is_exclusive(
+    archive_dest: &Path,
+    mut other_dests: impl Iterator<Item = PathBuf>,
+) -> bool {
+    let Some(root) = archive_dest.parent() else {
+        return false;
+    };
+    !other_dests.any(|other| other.parent() == Some(root))
+}
+
+/// 某个条目在磁盘上的**实际占用**（`None` = 未就位）。
+///
+/// # 为什么不能只看 `dest`
+///
+/// `disk_size(dest)` 只统计入口文件：`whisper-cli.exe` 才 474 KB，而它所在目录解压出来
+/// 是几十 MB；llama 的 `.exe` 只有 9 KB，真正的代码在同目录几十个 DLL 里。
+/// 于是界面会出现「下载了 40 MB，装完显示 474 KB」「删掉它却腾出 30 MB」这种对不上的数。
+///
+/// 规则：
+/// - 单文件条目：就是该文件大小；
+/// - 解压型条目且**目录独占**：整个目录递归求和（这才是删掉它能腾出的空间）；
+/// - 解压型条目但目录与别的条目共用：退回「入口文件 + 伴生文件」，宁少算也不重复计数。
+pub fn item_footprint(item: &DownloadItem, cfg: &AppConfig) -> Option<u64> {
+    let dest = item_effective_path(item, cfg);
+    let present = dest.exists()
+        || item
+            .companion
+            .map(|name| {
+                dest.parent()
+                    .map(|d| d.join(name).exists())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+    if !present {
+        return None;
+    }
+    if item.is_archive
+        && archive_root_is_exclusive(
+            &dest,
+            ITEMS
+                .iter()
+                .filter(|other| other.id != item.id)
+                .map(|other| item_effective_path(other, cfg)),
+        )
+    {
+        if let Some(root) = dest.parent() {
+            return Some(dir_size(root));
+        }
+    }
+    let mut total = disk_size(&dest).unwrap_or(0);
+    if let (Some(name), Some(root)) = (item.companion, dest.parent()) {
+        total += disk_size(&root.join(name)).unwrap_or(0);
+    }
+    Some(total)
+}
+
 /// 由磁盘上的**实际文件**反查它属于哪个条目；都不匹配则 `None`。
 ///
 /// # 为什么需要「反查」而不是直接用档位的规范 id
@@ -2212,6 +2296,47 @@ mod tests {
     /// 测试里泄漏几个短字符串无所谓，换来的是测试不再向仓库树写东西。
     fn leak_str(s: String) -> &'static str {
         Box::leak(s.into_boxed_str())
+    }
+
+    /// 目录求和必须递归：解压型条目的占用全在子目录里，只算顶层等于没算。
+    #[test]
+    fn dir_size_walks_subdirectories() {
+        let base = std::env::temp_dir().join(format!("v2w_dirsize_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub/deep")).unwrap();
+        std::fs::write(base.join("a.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(base.join("sub/b.bin"), vec![0u8; 200]).unwrap();
+        std::fs::write(base.join("sub/deep/c.bin"), vec![0u8; 300]).unwrap();
+        assert_eq!(super::dir_size(&base), 600, "必须把子目录里的文件都算上");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 共用目录（llama / sherpa 平铺解到 `tools/`）不能按目录求和，
+    /// 否则会把 ffmpeg、python 的体积算进它自己，并在合计里重复计数。
+    #[test]
+    fn archive_root_exclusivity_detects_shared_tools_dir() {
+        use std::path::{Path, PathBuf};
+        let archive = PathBuf::from("tools/llama-completion.exe");
+
+        // 同目录还有别的条目 → 不独占
+        let others = vec![PathBuf::from("tools/ffmpeg.exe")];
+        assert!(
+            !super::archive_root_is_exclusive(&archive, others.into_iter()),
+            "共用 tools/ 时必须判定为非独占"
+        );
+
+        // 独占子目录 → 可以按目录求和
+        let others = vec![PathBuf::from("tools/ffmpeg.exe")];
+        assert!(super::archive_root_is_exclusive(
+            Path::new("tools/whisper-cuda/whisper-cli.exe"),
+            others.into_iter()
+        ));
+
+        // 没有任何兄弟条目 → 独占
+        assert!(super::archive_root_is_exclusive(
+            Path::new("tools/whisper-cuda/whisper-cli.exe"),
+            std::iter::empty()
+        ));
     }
 
     /// 每个条目都必须有 URL、有落地路径、且路径落在预期目录内。
