@@ -594,6 +594,12 @@ pub struct MainWindow {
     /// 这里是「操作成功但需要告知」，走中性配色。用户在剪辑台/视频库做完操作后
     /// 需要知道结果，而底部状态栏只在转写页可见。
     pub(crate) notice: Option<String>,
+    /// 最近一次成功导出的落点（文件或目录）。
+    ///
+    /// 用途只有一个：导出后让用户能一键打开所在文件夹。此前提示条只写
+    /// 「已导出到 X」，用户还得自己去文件管理器里翻——尤其是模板把文件名改成
+    /// `课程01.20261009.srt` 之后，找起来更费劲。
+    pub(crate) last_export_path: Option<std::path::PathBuf>,
     /// 字幕翻译的取消标志。`trigger_llm_translation` 起任务时把它注入引擎，
     /// 「取消」按钮置位。任务结束后必须复位（引擎在任务开始前也会复位一次，
     /// 双保险），否则下一次翻译一进来就在第一个批次检查点直接退出。
@@ -1559,6 +1565,7 @@ impl MainWindow {
                 "检测到另一个 Voice2Word 实例正在运行：两个窗口会同时写同一份历史库，".to_string()
                     + "互相覆盖对方的编辑。建议只保留一个窗口。"
             }),
+            last_export_path: None,
             translate_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             update_download_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),

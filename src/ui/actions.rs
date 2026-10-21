@@ -1353,6 +1353,14 @@ impl MainWindow {
     /// Windows Explorer 的 `/select,<path>` 命令行对斜杠非常敏感：如果路径中含有正斜杠 `/`
     /// 或被整体引号包裹，Explorer 会解析失败并默认回退打开「我的文档」或「此电脑」。
     /// 此处将路径统一转为 Windows 原生反斜杠 `\`，并使用 `raw_arg` 传递 `/select,"<path>"`。
+    /// 记下「最近一次导出的落点」，供「打开文件夹」按钮使用。
+    ///
+    /// 统一走这个口子而不是各处直接赋值：以后新增导出格式只要调一次，
+    /// 就不会出现「有的格式能打开文件夹、有的不能」这种半吊子状态。
+    pub(crate) fn note_exported(&mut self, path: &Path) {
+        self.last_export_path = Some(path.to_path_buf());
+    }
+
     pub(crate) fn reveal_path_in_explorer(path: &Path) {
         #[cfg(target_os = "windows")]
         {
@@ -2880,6 +2888,7 @@ impl MainWindow {
                     match res {
                         Ok(()) => {
                             info!("字幕成功导出至: {:?}", save_path);
+                            this.note_exported(&save_path);
                             // 成功必须给出反馈：此前这里只有一行日志，界面上毫无动静。
                             // 用户点了「导出」、选了路径、然后**什么都没有发生**——
                             // 无法区分「成功」与「没点到」，只能去文件管理器里翻。
@@ -3079,6 +3088,7 @@ impl MainWindow {
                 match res {
                     Ok(path) => {
                         info!("内嵌字幕视频已导出: {:?}", path);
+                        this.note_exported(&path);
                         this.notice = Some(format!("已导出内嵌字幕视频：{}", path.display()));
                     }
                     Err(e) => {

@@ -4973,6 +4973,22 @@ impl MainWindow {
                                     .child(if is_open { "▲" } else { "▼" }),
                             ),
                     )
+                    // 「打开文件夹」：导出成功后才可用。
+                    // 提示条只写「已导出到 X」，文件名还可能被模板改成 `课程01.20261009.srt`，
+                    // 让用户自己去翻很费劲。这里直接把他送到落点（文件会被选中）。
+                    .child({
+                        let has_last = self.last_export_path.is_some();
+                        let last = self.last_export_path.clone();
+                        primitives::mini_btn("打开文件夹", has_last)
+                            .id("editor-open-export-dir-btn")
+                            .when(has_last, |d| {
+                                d.on_click(cx.listener(move |_this, _, _, _cx| {
+                                    if let Some(path) = last.as_deref() {
+                                        Self::reveal_path_in_explorer(path);
+                                    }
+                                }))
+                            })
+                    })
                     .child({
                         // 无字幕时置灰：导出链路（`perform_editor_export` 等）在没有
                         // segments 时都是静默 return，按钮却照常可点，用户会以为程序坏了。
