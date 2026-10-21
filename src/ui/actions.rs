@@ -3258,7 +3258,9 @@ impl MainWindow {
             progress: 1.0,
             detail: "正在终止识别进程，请稍候...".to_string(),
         };
-        self.state.pipeline.cancel();
+        // 走异步版：`cancel()` 会在调用线程上逐个 taskkill 并等它退出，
+        // 切块并行时一次 6 个进程，放在 UI 线程上就是「点了终止界面僵一下」。
+        self.state.pipeline.cancel_async();
         cx.notify();
     }
 

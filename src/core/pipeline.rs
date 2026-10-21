@@ -860,6 +860,34 @@ impl TaskPipeline {
         }
     }
 
+    /// 与 [`Self::cancel`] 同义，但**不在调用线程上起 taskkill**。
+    ///
+    /// `cancel()` 会为每个在册子进程起一次 `taskkill /F /T` 并**等它退出**：`/T` 要
+    /// 遍历进程树，切块并行时一次要杀 6 个 Python 进程，实测能在 UI 线程上卡出
+    /// 两三百毫秒——用户点「终止」后界面明显僵一下，正是这个。
+    ///
+    /// 这里先把取消标志**同步**置位（管线下一轮循环立刻看得见，界面能马上切到
+    /// 「正在终止」），再把真正杀进程的动作挪到后台线程；文本意义上的「取消」
+    /// 已经不依赖进程是否被杀干净。
+    ///
+    /// 保留同步版 [`Self::cancel`] 给退出路径与单测：那里需要「调用返回时子进程
+    /// 一定已经死透」的确定性，慢一点无所谓。
+    pub fn cancel_async(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let whisper = Arc::clone(&self.whisper);
+        let sensevoice = self.sensevoice.clone();
+        let punc = self.punc.clone();
+        std::thread::spawn(move || {
+            whisper.cancel();
+            if let Some(sv) = sensevoice.as_ref() {
+                sv.cancel();
+            }
+            if let Some(punc) = punc.as_ref() {
+                punc.cancel();
+            }
+        });
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
     }

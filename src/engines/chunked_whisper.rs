@@ -12,7 +12,15 @@ use super::{SenseVoiceEngine, WhisperEngine};
 use crate::subtitle::Segment;
 use crate::utils::TempPathGuard;
 
-const CHUNK_SEC: f64 = 360.0;
+const CHUNK_SEC: f64 = 120.0;
+// ↑ 原为 360 秒（6 分钟）。改成 120 秒是为了**首字延迟**：切块并行时字幕是
+// 「一块跑完才吐这一块」，6 分钟的块意味着用户要盯着空窗口等一分钟才看到第一个字。
+// 实测（32 分钟素材 / 6 worker）第一块耗时约等于该块音频时长 / 单进程吞吐，
+// 360s 块 ≈ 60s 才出字，120s 块 ≈ 20s。
+//
+// 代价：块数变多（同一素材 6 块 → 18 块），每条边界都有 10s 重叠要拼接，
+// 且每块多一次模型冷启动（约 2s，分摊到 6 个 worker 并行里）。换来的是
+// 「点了开始几秒到二十秒内就能看到字幕在滚」——这正是用户对「实时转写」的预期。
 /// 相邻块之间显式共享的重叠时长（秒）。
 ///
 /// 为什么必须有重叠：长音频被切成互相独立的块后，压在块交界上的整句会被两块各转
@@ -59,13 +67,20 @@ pub const MAX_SV_WORKERS: usize = 6;
 
 /// 切块并行的最短音频门限（秒）：短于它整轨单进程转写，不做多进程切块。
 ///
-/// `CHUNK_SEC + MIN_CHUNK_SEC` = 360 + 45 = 405s。这是「切块是否划算」的统一判据：
-/// 切块路径内部（[`transcribe_chunked`]）与管线侧决定是否走 0 磁盘内存推流
-/// （`can_stream`）都读这一个函数。此前管线里直接写死 `405.0`，与这里的常量是同一
-/// 门限的两份写法，改动任一处都会让两条路径悄悄分叉——收敛到一处消除该风险。
-/// 该值同时等价于 [`plan_chunks_whisper`] 从单块切到多块的边界。
+/// 这是「切块**是否划算**」的判据，与「单块最长多少秒」（[`CHUNK_SEC`]）是两件事，
+/// 因此写成独立常量、**不再由 `CHUNK_SEC + MIN_CHUNK_SEC` 推导**：
+/// 块长从 6 分钟收到 2 分钟是为了首字延迟（见 [`CHUNK_SEC`] 的注释），
+/// 而 6 分钟以内的素材切块依然不划算——多进程的模型冷启动会吃掉并行收益。
+/// 若继续用推导式，改块长会顺带把门限压到 165s，让 3 分钟的片子也去开多进程。
+///
+/// 这是统一判据：切块路径内部（[`transcribe_chunked`]）与管线侧决定是否走
+/// 0 磁盘内存推流（`can_stream`）都读这一个函数。此前管线里直接写死 `405.0`，
+/// 与这里的常量是同一门限的两份写法，改动任一处都会让两条路径悄悄分叉。
+pub const CHUNK_THRESHOLD_SEC: f64 = 405.0;
+
+/// [`CHUNK_THRESHOLD_SEC`] 的取值函数（历史调用点都用这个形状）。
 pub fn chunk_threshold_secs() -> f64 {
-    CHUNK_SEC + MIN_CHUNK_SEC
+    CHUNK_THRESHOLD_SEC
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -558,6 +573,16 @@ pub fn run_chunked_parallel(
     let progress_cb = progress_cb.map(Arc::new);
     let done = Arc::new(AtomicUsize::new(0));
     let total_chunks = slice_paths.len();
+    // 先把「切成几块」告诉界面：长视频在 CPU 上走分块并行，**第一块要几十秒才出词**，
+    // 期间界面若只是一条不动的进度条，用户完全看不出它是在干活还是卡死了。
+    // 有了「共 N 块 / 已完成 M 块」这两个数，等待就有了尺度。
+    if let Some(cb) = progress_cb.as_ref() {
+        cb(
+            0.0,
+            &format!("切成 {total_chunks} 块并行 · 已完成 0/{total_chunks}"),
+            None,
+        );
+    }
 
     let pool = rayon_pool(workers)?;
     // 每块独立成败：单块失败只丢这一块并记录缺失区间，**不中止剩余块**。
@@ -584,8 +609,8 @@ pub fn run_chunked_parallel(
                                 cb(
                                     ratio,
                                     &format!(
-                                        "块 {}/{} 完成 · {}s",
-                                        finished, total_chunks, seg.end as u32
+                                        "已完成 {finished}/{total_chunks} 块 · 本块 {}s",
+                                        seg.end as u32
                                     ),
                                     Some(seg),
                                 );
@@ -593,7 +618,7 @@ pub fn run_chunked_parallel(
                             if segs.is_empty() {
                                 cb(
                                     ratio,
-                                    &format!("块 {}/{} 无语音", finished, total_chunks),
+                                    &format!("已完成 {finished}/{total_chunks} 块 · 本块无语音"),
                                     None,
                                 );
                             }
@@ -909,14 +934,23 @@ mod tests {
         assert_eq!(c[0].start, 0.0);
     }
 
-    /// 门限是「单块 vs 多块」的统一判据：等于门限时仍是单块，略过即切成多块。
-    /// 管线侧 `can_stream` 与切块路径都读 `chunk_threshold_secs()`，此处锁住它与
-    /// `plan_chunks_whisper` 的边界一致，防止两处再次各写一个数字后悄悄分叉。
+    /// 门限现在是**产品决策**（405s），不再由「单块最长时长」推导。
+    ///
+    /// 历史关系「门限 == 计划出来的单块边界」之所以被拆开：块长从 6 分钟收到
+    /// 2 分钟是为了首字延迟，而「要不要切块」跟块长无关——6 分钟以内的素材
+    /// 切块依然不划算（多进程模型冷启动会吃掉并行收益）。
+    /// 若继续用 `CHUNK_SEC + MIN_CHUNK_SEC` 推导，改块长会把门限一起拖到 165s。
     #[test]
-    fn chunk_threshold_matches_plan_chunks_boundary() {
+    fn chunk_threshold_is_a_product_decision_independent_of_chunk_len() {
         assert_eq!(chunk_threshold_secs(), 405.0);
-        assert_eq!(plan_chunks_whisper(chunk_threshold_secs()).len(), 1);
-        assert!(plan_chunks_whisper(chunk_threshold_secs() + 1.0).len() >= 2);
+        // 门限必须高于「整段只值一块」的区间，否则等于对所有素材都开多进程。
+        assert!(
+            chunk_threshold_secs() > CHUNK_SEC + MIN_CHUNK_SEC,
+            "门限必须明显高于单块区间：threshold={}, CHUNK_SEC={CHUNK_SEC}",
+            chunk_threshold_secs()
+        );
+        // 门限之上必须真的切成多块，否则这条路径没有意义。
+        assert!(plan_chunks_whisper(chunk_threshold_secs()).len() >= 2);
     }
 
     #[test]

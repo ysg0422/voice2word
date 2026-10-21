@@ -134,10 +134,13 @@ impl MainWindow {
             ))
             // 核心工作台展示区
             .child(if is_processing {
-                // 步骤看板不再需要「当前阶段名 + 详情」这两段小字，只取总体进度。
-                let progress = match &self.state.status {
-                    ProcessStatus::Processing { progress, .. } => *progress,
-                    _ => 0.0,
+                // 同时取管线给的实时状态文本：切块并行下它是「块 2/6 完成 · 12s」，
+                // 首句字幕出来之前用它在字幕区兜底，避免界面一动不动。
+                let (progress, live_detail) = match &self.state.status {
+                    ProcessStatus::Processing {
+                        progress, detail, ..
+                    } => (*progress, detail.clone()),
+                    _ => (0.0, String::new()),
                 };
                 let total_dur = self.state.transcribe_duration;
                 let cur_sec = self.state.streaming_current_sec;
@@ -160,6 +163,7 @@ impl MainWindow {
                         total_dur,
                         eta.clone(),
                         progress as f32,
+                        &live_detail,
                     ))
                     // 2. 实时流式字幕视窗卡片
                     .child(
@@ -232,9 +236,15 @@ impl MainWindow {
                                     .justify_center()
                                     .text_size(px(Theme::TEXT_BODY_LG))
                                     .text_color(Theme::text_muted())
-                                    // 首句还没出来时不写小字说明：上面的步骤看板已经
-                                    // 说明「现在在哪一步、卡了多久」，这里留空反而干净。
-                                    .child("等待首句字幕…")
+                                    // 首句还没出来时显示管线给的**实时状态**
+                                    // （切块并行下是「块 2/6 完成 · 12s」）。
+                                    // 不能只写「等待」：长视频在 CPU 上走分块并行，
+                                    // 第一块要几十秒才出词，界面一动不动会让人以为没反应。
+                                    .child(if live_detail.trim().is_empty() {
+                                        SharedString::from("等待首句字幕…")
+                                    } else {
+                                        SharedString::from(live_detail)
+                                    })
                                     .into_any_element()
                             } else {
                                 // 只回显最后 `STREAM_TAIL_ROWS` 行：`streaming_segments` 是
@@ -812,6 +822,7 @@ impl MainWindow {
         total_dur: f64,
         eta: String,
         overall: f32,
+        live_detail: &str,
     ) -> impl IntoElement {
         // 进行中那一行的秒数按「从现在往回看」实时算：状态里存的是开始时刻。
         let live_secs = self
@@ -858,7 +869,7 @@ impl MainWindow {
             };
             let is_active = row.state == StageRowState::Running;
 
-            div()
+            let main_row = div()
                 .flex()
                 .items_center()
                 .gap(px(Theme::SPACE_3))
@@ -923,6 +934,28 @@ impl MainWindow {
                         })
                         .child(secs_text),
                 )
+                .into_any_element();
+            // 进行中的那一步多给一行「实时细分状态」：
+            // 切块并行时它是「切成 6 块并行 · 已完成 2/6」——
+            // 用户要看的正是「切几块、现在第几块」，只给一条进度条等于不说。
+            let detail_line = if is_active && !live_detail.trim().is_empty() {
+                Some(
+                    div()
+                        .pl(px(24.0))
+                        .text_size(px(Theme::TEXT_SMALL))
+                        .text_color(Theme::text_secondary())
+                        .child(live_detail.to_string()),
+                )
+            } else {
+                None
+            };
+
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(Theme::SPACE_1))
+                .child(main_row)
+                .children(detail_line)
                 .into_any_element()
         });
 
