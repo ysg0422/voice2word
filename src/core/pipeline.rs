@@ -2247,7 +2247,8 @@ impl TaskPipeline {
             segments.last().map(|s| s.end).unwrap_or(0.0)
         };
         // 由字幕时间区间求并集，得到有声覆盖时长；不能使用 vad_sec，后者只是 VAD 算法耗时。
-        let voiced_duration_sec = covered_duration(&segments);
+        let voiced_duration_sec =
+            clamp_voiced_to_media(covered_duration(&segments), video_duration);
 
         let audio_process_name = caps.audio_process_name(preprocess_note.as_deref());
 
@@ -2442,6 +2443,24 @@ fn note_first_output(slot: &Mutex<Option<f64>>, started: Instant) {
 
 /// 计算字幕/语音区间的并集时长，避免相邻或重叠片段重复计时。
 /// 这是“识别到的有声覆盖时长”的可复现近似值，不把静音间隔算进去。
+/// 把「有声覆盖时长」钳进媒体总时长以内。
+///
+/// 覆盖时长是各句区间的**并集**，本身不知道片子有多长；而下面两种正常情况都会
+/// 让区间越过片尾：
+/// - 切块并行时末块有 [`TAIL_EXTEND_MAX_SEC`]（12 秒）的兜底延展，用来补回最后一句；
+/// - 引擎在静音段落的幻觉时间戳偶尔会跑到音频结束之后。
+///
+/// 于是「有声 66 秒 / 总长 60 秒 = 110%」这种数会直接印进报告与完成弹窗。
+///
+/// 媒体时长未知（0 / 非有限）时原样返回：宁可不钳，也不要把真实数据抹成 0。
+fn clamp_voiced_to_media(covered: f64, media_secs: f64) -> f64 {
+    if media_secs.is_finite() && media_secs > 0.0 && covered.is_finite() {
+        covered.clamp(0.0, media_secs)
+    } else {
+        covered
+    }
+}
+
 pub fn covered_duration(segments: &[Segment]) -> f64 {
     let mut ranges: Vec<(f64, f64)> = segments
         .iter()
@@ -3103,6 +3122,20 @@ mod tests {
         assert!(cached_extract_audio_duration(Some(&artifacts), current).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 覆盖时长不许超过媒体总时长：末块延展 / 幻觉时间戳都会把区间推到片尾之后。
+    #[test]
+    fn voiced_coverage_never_exceeds_media_duration() {
+        // 60 秒的片子，末句被延展到 66 秒
+        assert!((super::clamp_voiced_to_media(66.0, 60.0) - 60.0).abs() < 1e-9);
+        // 正常情况不动
+        assert!((super::clamp_voiced_to_media(30.0, 60.0) - 30.0).abs() < 1e-9);
+        // 媒体时长未知：原样返回，不抹成 0
+        assert!((super::clamp_voiced_to_media(30.0, 0.0) - 30.0).abs() < 1e-9);
+        assert!((super::clamp_voiced_to_media(30.0, f64::NAN) - 30.0).abs() < 1e-9);
+        // 负覆盖（脏数据）钳到 0，不产生负数时长
+        assert_eq!(super::clamp_voiced_to_media(-5.0, 60.0), 0.0);
     }
 
     #[test]
