@@ -2000,11 +2000,25 @@ impl AppState {
     /// 把记忆库里学会的替换应用到全部字幕（文档装载时调用），返回改动句数。
     pub fn apply_typo_memory(&mut self) -> usize {
         let memory = crate::utils::typo_memory::TypoMemory::load(&Self::typo_memory_path());
+        self.apply_typo_memory_with(&memory)
+    }
+
+    /// [`Self::apply_typo_memory`] 的可注入版本（单测用）。
+    ///
+    /// 与 `import_glossary_file_to` 同一套路：单测不能去读写仓库根的真实记忆库，
+    /// 那会让同进程的其它测试一起看到污染数据。
+    fn apply_typo_memory_with(&mut self, memory: &crate::utils::typo_memory::TypoMemory) -> usize {
         if memory.is_empty() {
             return 0;
         }
         let mut changed = 0usize;
         for seg in self.segments.iter_mut() {
+            // 锁定（已校对）的句子一律不动：这个函数在**装载文档时**自动跑，
+            // 用户看不到它改了什么。把定稿句子再交给记忆库改写，正是那种
+            // 「我明明改好保存了，第二天打开又变回去」的诡异现象。
+            if seg.locked {
+                continue;
+            }
             if let Some(fixed) = memory.apply(&seg.text) {
                 if fixed != seg.text {
                     seg.text = fixed;
@@ -6259,6 +6273,38 @@ mod tests {
             state.segments[0].translation.is_none(),
             "旧原文的译文不能贴到新原文上: {:?}",
             state.segments[0].translation
+        );
+    }
+
+    /// 错别字记忆是**装载文档时自动跑**的：锁定句必须原样保留。
+    ///
+    /// 这条对应最气人的那种体验——打开工程时静默改写原文，用户看不到它动了什么，
+    /// 只会发现「我改好的句子又变回去了」。
+    #[test]
+    fn typo_memory_skips_locked_segments() {
+        use crate::subtitle::Segment;
+        let mut locked = Segment::new(1, 0.0, 2.0, "这是错别字句子");
+        locked.locked = true;
+        let free = Segment::new(2, 2.0, 4.0, "这是错别字句子");
+        let mut state = test_state(vec![locked, free]);
+
+        // 造一条真实规则：错别字 → 错别字正确
+        let mut memory = crate::utils::typo_memory::TypoMemory::default();
+        assert_eq!(
+            memory.learn_from_edit("这是错别字句子", "这是正确句子"),
+            1,
+            "前提：这条编辑应能学出一条规则"
+        );
+
+        let changed = state.apply_typo_memory_with(&memory);
+        assert_eq!(changed, 1, "只有未锁定的那句应被改写");
+        assert_eq!(
+            state.segments[0].text, "这是错别字句子",
+            "锁定句必须原样保留"
+        );
+        assert_eq!(
+            state.segments[1].text, "这是正确句子",
+            "未锁定句应被记忆库改写"
         );
     }
 
