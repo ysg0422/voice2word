@@ -164,8 +164,16 @@ fn prune_old_logs(logs_dir: &Path, keep: usize) {
 
 /// 初始化 txt 文件与控制台双写日志
 pub fn init_logger() -> anyhow::Result<PathBuf> {
-    let logs_dir = crate::utils::AppConfig::app_root_dir().join("logs");
-    fs::create_dir_all(&logs_dir)?;
+    // 日志目录：项目根优先，不可用时退到可写数据目录。
+    //
+    // 此前这里直接 `create_dir_all(...)?`：装在只读目录时**日志系统初始化失败**，
+    // `main` 随之退出——用户看到的是「程序打不开」，而真实原因只是「装的位置不能写」。
+    // 日志写不了不该让程序起不来：诊断能力可以降级，程序不能降级。
+    let mut logs_dir = crate::utils::AppConfig::app_root_dir().join("logs");
+    if fs::create_dir_all(&logs_dir).is_err() {
+        logs_dir = crate::utils::AppConfig::writable_data_dir().join("logs");
+        fs::create_dir_all(&logs_dir)?;
+    }
     prune_old_logs(&logs_dir, KEEP_LOG_FILES);
 
     let now = chrono::Local::now();
@@ -303,7 +311,9 @@ pub fn open_logs_folder() {
     let _ = fs::create_dir_all(&logs_dir);
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("explorer").arg(&logs_dir).spawn();
+        let _ = std::process::Command::new("explorer")
+            .arg(&logs_dir)
+            .spawn();
     }
     #[cfg(target_os = "macos")]
     {
@@ -311,7 +321,9 @@ pub fn open_logs_folder() {
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("xdg-open").arg(&logs_dir).spawn();
+        let _ = std::process::Command::new("xdg-open")
+            .arg(&logs_dir)
+            .spawn();
     }
 }
 

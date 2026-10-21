@@ -44,7 +44,7 @@ voice2word --version | -V
 | `-o`, `--output` | 路径 | 输出字幕路径 | 与输入同目录、同名的 `.<格式>` |
 | `--format` | `srt`/`ass`/`vtt`/`json`/`txt`/`ttml`/`ttal` | 输出格式（不区分大小写，内部转小写） | `srt` |
 | `--lang`, `--language` | 语言代码，如 `zh`/`en`/`ja`/`auto` | 源语言 | 取 `config.toml` 的 `pipeline.language` |
-| `--translate` | 目标语言 | 目标语言（无头模式当前仅记录，翻译阶段未接入） | 无 |
+| `--translate` | 目标语言 | 目标语言（离线 Qwen / 在线 API 均已接线） | 目标语言 |
 | `--model` | 路径 | 覆盖 Whisper 模型文件 | 取 `config.toml` |
 | `--threads` | 正整数 | 推理线程数 | 取 `config.toml` |
 | `--polish` | 布尔（不接受取值） | 强制开启润色/标点 | 取 `config.toml` |

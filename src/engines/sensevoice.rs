@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::subtitle::Segment;
 
-use super::whisper::{join_or_log, take_live_pids, ChildEntry, ChildPidGuard};
+use super::whisper::{join_or_log, live_child_pids, ChildEntry, ChildPidGuard};
 
 /// SenseVoice 单会话线程数上限。
 ///
@@ -36,13 +36,33 @@ fn clamp_threads(threads: u32) -> u32 {
 }
 
 /// 跨平台强杀指定进程及其子进程树（用于用户「终止转写」即时生效）
+///
+/// `taskkill` 的路径加固此前只做在 whisper / punc 两处，本文件是裸
+/// `Command::new("taskkill")`：Windows 创建进程时**当前目录排在系统目录之前**，
+/// 于是应用目录里放一个同名 `taskkill.exe`，就会在用户点「终止转写」时被执行。
+/// 三处口径不一致等于加固等于没有——现在统一取 whisper 那份。
+///
+/// 失败时留一条 warn：此前是 `let _ = ...`，终止信号没送到时用户看到的是
+/// 「点了终止但转写照跑」，日志里没有任何线索可查。
 fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
-        let mut cmd = Command::new("taskkill");
+        let mut cmd = Command::new(super::whisper::taskkill_program());
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let _ = cmd.args(["/F", "/T", "/PID", &pid.to_string()]).output();
+        match cmd.args(["/F", "/T", "/PID", &pid.to_string()]).output() {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => warn!(
+                pid,
+                code = ?out.status.code(),
+                "taskkill 未能终止 SenseVoice 子进程树，转写可能仍在继续"
+            ),
+            Err(err) => warn!(
+                pid,
+                error = %err,
+                "taskkill 启动失败，SenseVoice 子进程树可能仍在运行"
+            ),
+        }
     }
     #[cfg(not(windows))]
     {
@@ -52,6 +72,17 @@ fn kill_process_tree(pid: u32) {
 
 // ───────────────────────── 有界等待、取消与输出收口 ─────────────────────────
 
+/// 【停滞看门狗】进程仍活着、但**连续没有任何输出**达到该时长 ⇒ 判定卡死。
+///
+/// 为什么要有这一层：`wait_budget_for` 是**总时长**上限（按时长缩放），它拦得住
+/// 「跑太久」，但拦不住「早就卡住了却还在等预算耗尽」——比如 onnxruntime 死锁、
+/// 驱动挂起、管道互等。此时界面会一直停在「正在识别」，用户唯一出口是关掉应用。
+///
+/// 判据只能是「停滞」，绝不能是「总耗时」：长音频跑十几分钟是正常的。
+///
+/// 与 `whisper.rs::WHISPER_STALL_BUDGET` 同口径（300s）——三个引擎此前只有
+/// whisper 有这道防线，sensevoice / punc 没有：同一个故障在不同引擎上的表现不一致。
+pub(crate) const SV_STALL_BUDGET: Duration = Duration::from_secs(300);
 /// 有界等待的轮询间隔：50ms 是「取消 / 超时的响应延迟」与「空转开销」的折中
 /// （与 `punc.rs` 的有界等待取同一个值）。
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -110,6 +141,8 @@ enum WaitOutcome {
     TimedOut,
     /// `try_wait` 本身报错（句柄异常），不能死循环。
     WaitFailed,
+    /// 进程仍存活但**连续无输出**达到停滞预算 ⇒ 判定卡死，已强杀进程树。
+    Stalled,
 }
 
 /// 本次轮询是否该退出等待；`None` = 继续等。
@@ -133,11 +166,35 @@ fn wait_outcome(cancelled: bool, past_deadline: bool) -> Option<WaitOutcome> {
 /// 让三条出口都能在单测里用真实子进程 + 极小预算跑一遍，不必等满真实预算，也不依赖
 /// python 与模型文件。本函数**不**负责杀进程与收尸：那是调用方的事（先 kill 再 wait），
 /// 这样「谁在什么时候强杀」在调用点一眼可见。
+#[cfg_attr(not(test), allow(dead_code))]
 fn wait_for_child<F>(
     child: &mut Child,
     budget: Duration,
     poll: Duration,
     cancelled: F,
+) -> (WaitOutcome, Option<std::process::ExitStatus>)
+where
+    F: Fn() -> bool,
+{
+    wait_for_child_with_stall(child, budget, poll, cancelled, None)
+}
+
+/// 带**停滞看门狗**的有界等待。
+///
+/// `stall_tracker` 给出「最后一次收到输出」的时间戳；进程仍活着、但距那次输出已超过
+/// [`SV_STALL_BUDGET`] ⇒ 判定卡死（`WaitOutcome::Stalled`），由调用方强杀进程树。
+///
+/// 为什么不能只靠总时长预算（`wait_budget_for`）：它拦得住「跑太久」，拦不住
+/// 「早就卡住了却还在等预算耗尽」——onnxruntime 死锁、驱动挂起、管道互等都属于后者。
+/// 此时界面会一直停在「正在识别」，用户唯一出口是关掉应用。
+///
+/// 判据是「停滞」不是「总耗时」：长音频跑十几分钟是正常的。
+fn wait_for_child_with_stall<F>(
+    child: &mut Child,
+    budget: Duration,
+    poll: Duration,
+    cancelled: F,
+    stall_tracker: Option<&Arc<std::sync::Mutex<Instant>>>,
 ) -> (WaitOutcome, Option<std::process::ExitStatus>)
 where
     F: Fn() -> bool,
@@ -151,6 +208,18 @@ where
                 // 等待本身出错（句柄异常）时不能死循环：按失败处理，由调用方强杀回收。
                 warn!(error = %err, "等待 SenseVoice 子进程失败，终止该进程");
                 return (WaitOutcome::WaitFailed, None);
+            }
+        }
+        // 停滞看门狗：进程还活着，但已经很久没有任何输出了。
+        if let Some(tracker) = stall_tracker {
+            let last = *tracker.lock().unwrap_or_else(|e| e.into_inner());
+            if Instant::now().saturating_duration_since(last) >= SV_STALL_BUDGET {
+                warn!(
+                    pid = child.id(),
+                    budget_secs = SV_STALL_BUDGET.as_secs(),
+                    "SenseVoice 连续无输出达到停滞预算，判定卡死，强制终止进程树"
+                );
+                return (WaitOutcome::Stalled, None);
             }
         }
         // 判定抽成纯函数：让「取消优先于超时」这条语义能被单测直接钉住。
@@ -172,6 +241,8 @@ where
 pub enum SenseVoiceStageError {
     /// 超过等待上限仍未结束，已强杀进程树。
     TimedOut,
+    /// 进程仍存活但连续无输出达到停滞预算，已强杀进程树。
+    Stalled,
 }
 
 impl std::fmt::Display for SenseVoiceStageError {
@@ -181,6 +252,11 @@ impl std::fmt::Display for SenseVoiceStageError {
                 f,
                 "SenseVoice 识别超时，已终止本次转写；未产出字幕，请重试\
                  （若反复超时，可换更小的模型或降低并行进程数）"
+            ),
+            Self::Stalled => write!(
+                f,
+                "SenseVoice 长时间无输出，已判定卡死并终止本次转写；未产出字幕，请重试\
+                 （若反复卡死，可换更小的模型、降低并行进程数，或检查磁盘与内存）"
             ),
         }
     }
@@ -422,12 +498,22 @@ impl SenseVoiceEngine {
 
     /// 用户请求终止：置位取消标志并强杀正在运行的 runner 子进程
     ///
-    /// 只杀 [`take_live_pids`] 交回的「尚未回收」PID：已被 `wait()` 回收的进程会在
-    /// `wait()` 返回处就被 [`ChildPidGuard::disarm`] 摘掉，因此这里不会对着一个
-    /// 已归还系统、可能被复用给无关进程的号码发信号。
+    /// 只杀「尚未回收」的 PID：已被 `wait()` 回收的进程会在 `wait()` 返回处就被
+    /// [`ChildPidGuard::disarm`] 摘掉，因此这里不会对着一个已归还系统、可能被复用
+    /// 给无关进程的号码发信号。
+    ///
+    /// 这里取的是**快照**（`live_child_pids`）而不是 drain（`take_live_pids`）：
+    /// drain 让「取消」变成一次性动作——用户连点两次「终止转写」，第二次取到的名单
+    /// 是空的，如果第一次的 `taskkill` 因为竞态/权限没把子进程杀掉，用户就再也没有
+    /// 第二次机会，界面表现就是「点了终止，转写照跑」。
+    /// whisper 引擎此前已改成快照，sensevoice / punc 仍停在 drain——三处口径不一致
+    /// 意味着「终止」在哪个引擎上生效取决于选了哪个模型。现在统一为快照。
+    ///
+    /// 快照不削弱「不得杀到陈旧 PID」：登记行仍然只在 `child.wait()` 返回处摘除，
+    /// 而 Windows 上 PID 只有在进程对象最后一个句柄关闭后才可能被复用。
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
-        for pid in take_live_pids(&self.active_children) {
+        for pid in live_child_pids(&self.active_children) {
             kill_process_tree(pid);
         }
     }
@@ -507,13 +593,13 @@ impl SenseVoiceEngine {
     /// 登记子进程 PID，并回报「登记这一刻取消是否已经到达」。
     ///
     /// 收口的是 `cancel()` 与「刚 `spawn()`、尚未登记」之间的竞态：`cancel()` 先
-    /// 置位取消标志，再 `take_live_pids()` 取名单强杀。若它恰好插在 `spawn()` 成功
+    /// 置位取消标志，再取**快照**强杀。若它恰好插在 `spawn()` 成功
     /// 与本次 `register()` 之间，登记表里还没有这一行，取到的名单是空的，这一发
     /// 信号就丢了——runner 会一直占着 GPU 跑到自己结束，用户看来就是「点了终止
     /// 转写却完全没生效」。
     ///
     /// 为什么在登记之后复查标志就能闭合：`cancel()` 的置位与本次复查都是 SeqCst，
-    /// 二者有全序；而 `take_live_pids()` 的 drain 与本次 register 又在同一把 Mutex
+    /// 二者有全序；而快照读取与本次 register 又在同一把 Mutex
     /// 下互斥。若 drain 没看到本行，只能是 drain 早于 register，那么置位也早于
     /// register，复查必然读到 `true`。于是「drain 发信号」与「本处补杀」两条路径
     /// 必有一条命中，不存在都漏。
@@ -720,7 +806,7 @@ impl SenseVoiceEngine {
         // 才可能被复用，而那一刻登记行早已摘掉。
         let (mut child_guard, cancelled_before_register) = self.register_child(child.id());
         // 竞态收口：cancel() 可能恰好插在 spawn() 成功与上面的登记之间——那会儿本行
-        // 还没进表，cancel() 的 take_live_pids() 拿到空名单，强杀信号就丢了，runner
+        // 还没进表，cancel() 的快照拿到空名单，强杀信号就丢了，runner
         // 会一直占着 GPU 跑到自己结束。register_child 已用 SeqCst 全序保证「drain 没
         // 看到本行」必然意味着「本处复查命中」，所以这里补一发即可闭合窗口。
         // 此刻 child 仍持有进程句柄、尚未 wait()，PID 不可能被系统复用给无关进程。
@@ -795,9 +881,12 @@ impl SenseVoiceEngine {
         // 包一层 `Arc` 让两边共享。
         let progress_cb = progress_cb.map(Arc::new);
         let stdout_cb = progress_cb.clone();
+        // 停滞看门狗的活动时间戳：抽干线程每读到一行就刷新，主线程据此判「卡死」。
+        let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let stdout_activity = last_activity.clone();
         let stdout_handle = std::thread::spawn(move || {
             let mut reader = std::io::BufReader::new(stdout);
-            consume_stdout(&mut reader, stdout_cb.as_deref())
+            consume_stdout(&mut reader, stdout_cb.as_deref(), Some(&stdout_activity))
         });
 
         // 有界等待：正常退出 / 取消 / 超时三个出口，出口之后一律 kill + wait 回收。
@@ -805,9 +894,13 @@ impl SenseVoiceEngine {
         // 界面永远停在「正在识别」，唯一出口是关掉应用。
         let child_pid = child.id();
         let budget = wait_budget_for(total_duration);
-        let (outcome, status) = wait_for_child(&mut child, budget, WAIT_POLL_INTERVAL, || {
-            self.is_cancelled()
-        });
+        let (outcome, status) = wait_for_child_with_stall(
+            &mut child,
+            budget,
+            WAIT_POLL_INTERVAL,
+            || self.is_cancelled(),
+            Some(&last_activity),
+        );
         if !matches!(outcome, WaitOutcome::Exited) {
             // 先按进程树强杀（与 whisper / punc 的取消路径同一套：除 Python 之外，
             // onnxruntime 在部分后端会拉起辅助进程），再 kill 句柄兜底。句柄是我们自己
@@ -868,6 +961,17 @@ impl SenseVoiceEngine {
         // （这里刻意**不**返回 Err，理由见 `SenseVoiceStageError` 的说明；这也是既有契约。）
         if self.is_cancelled() {
             return Ok((Vec::new(), 0.0));
+        }
+
+        // 停滞（卡死）：与超时同性质——runner 自己卡住了，必须明确告警，而不是静默
+        // （取消）或按退出码归因成「依赖没装好」（误导）。
+        if outcome == WaitOutcome::Stalled {
+            warn!(
+                seconds = SV_STALL_BUDGET.as_secs(),
+                stderr = %stderr_str,
+                "SenseVoice 连续无输出达到停滞预算，已强杀进程树"
+            );
+            return Err(anyhow::Error::new(SenseVoiceStageError::Stalled));
         }
 
         // 超时：与「用户取消」「普通失败」都不同——runner 自己卡住了，必须明确告警，而不是
@@ -1223,6 +1327,8 @@ fn apply_stream_event(
 fn consume_stdout<R: std::io::BufRead>(
     reader: &mut R,
     progress_cb: Option<&crate::engines::SegmentProgressCb>,
+    // 停滞看门狗的活动时间戳：每读到一行就刷新。None = 不跟踪。
+    activity: Option<&Arc<std::sync::Mutex<Instant>>>,
 ) -> StdoutSummary {
     let mut summary = StdoutSummary::default();
     let mut raw: Vec<u8> = Vec::new();
@@ -1232,6 +1338,12 @@ fn consume_stdout<R: std::io::BufRead>(
             // 正常结束（EOF）。
             Ok(0) => break,
             Ok(_) => {
+                // 每收到一行就刷新活动时间：看门狗据此判断「还在正常吐字」还是「卡住了」。
+                if let Some(tracker) = activity {
+                    if let Ok(mut t) = tracker.lock() {
+                        *t = Instant::now();
+                    }
+                }
                 let line = decode_stdout_line(&raw);
                 if line.is_empty() {
                     continue;
@@ -1290,6 +1402,7 @@ fn consume_stdout<R: std::io::BufRead>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::whisper::take_live_pids;
 
     // ---- ChildPidGuard：子进程 PID 登记的生命周期 ----
     //
@@ -1441,9 +1554,14 @@ mod tests {
         );
     }
 
-    /// 取消路径：`cancel()` 取走并清空登记表，之后守卫析构不应再影响别的条目。
+    /// 取消路径：`cancel()` 取**快照**并强杀，登记表里的行由守卫摘除。
+    ///
+    /// 旧语义是 drain（取走并清空），已改为快照：drain 让「取消」变成一次性动作，
+    /// 用户连点两次「终止转写」时第二次拿到空名单，第一次的 taskkill 若因竞态/权限
+    /// 没杀掉子进程，用户就再没有第二次机会（界面表现是「点了终止，转写照跑」）。
+    /// whisper 引擎此前已改成快照，现在三个引擎口径一致。
     #[test]
-    fn cancel_drains_registry_and_guard_drop_is_afterwards_harmless() {
+    fn cancel_snapshots_registry_and_guard_drop_is_afterwards_harmless() {
         let engine = engine_with_dummy_paths();
         // 登记一个不存在的 PID：cancel() 会去 kill_process_tree 一个空号，
         // 这在 Windows 上只是 taskkill 报「找不到进程」，不会误伤真实进程。
@@ -1452,14 +1570,14 @@ mod tests {
 
         engine.cancel();
         assert!(
-            registered(&engine.active_children).is_empty(),
-            "cancel() 必须取走全部条目，防止同一 PID 被重复强杀"
+            !registered(&engine.active_children).is_empty(),
+            "cancel() 只取快照、不清表：行留给 ChildPidGuard 摘除（取消可重复）"
         );
 
         drop(guard);
         assert!(
             registered(&engine.active_children).is_empty(),
-            "守卫在 cancel 之后析构不应把表弄乱"
+            "守卫析构后表必须为空"
         );
     }
 
@@ -2054,7 +2172,7 @@ mod tests {
     fn consume_stdout_tolerates_empty_truncated_json_and_non_utf8() {
         // 1) 空输出
         let mut empty = std::io::Cursor::new(Vec::<u8>::new());
-        let summary = consume_stdout(&mut empty, None);
+        let summary = consume_stdout(&mut empty, None, None);
         assert_eq!(summary.parsed_lines, 0);
         assert_eq!(summary.malformed_lines, 0);
         assert!(summary.segments.is_empty());
@@ -2074,7 +2192,7 @@ mod tests {
         bytes.extend_from_slice(&[0xB4, 0xED, b'\n']);
         bytes.extend_from_slice(b"{\"event\":\"finished\",\"elapsed_sec\":2.5}\n");
         let mut broken = std::io::Cursor::new(bytes);
-        let summary = consume_stdout(&mut broken, None);
+        let summary = consume_stdout(&mut broken, None, None);
         assert_eq!(
             summary.malformed_lines, 2,
             "半截 JSON 与非 UTF-8 行都必须计入坏行"
@@ -2093,7 +2211,7 @@ mod tests {
 
         // 3) 整段都是坏行 ⇒ 判为不可解析（调用方据此报「runner 版本不匹配」，而不是「空结果」）
         let mut junk = std::io::Cursor::new(vec![0xB4, 0xED, b'\n', b'{', b'\n']);
-        let summary = consume_stdout(&mut junk, None);
+        let summary = consume_stdout(&mut junk, None, None);
         assert_eq!(summary.parsed_lines, 0);
         assert_eq!(summary.malformed_lines, 2);
         assert_eq!(
@@ -2134,7 +2252,7 @@ mod tests {
             b"{\"event\":\"segment\",\"index\":1,\"start\":0.0,\"end\":1.0,\"text\":\"a\"}\n";
         // 对照组：同样的字节读完后正常 EOF ⇒ 不是读失败。
         let mut clean = std::io::Cursor::new(line.to_vec());
-        let summary = consume_stdout(&mut clean, None);
+        let summary = consume_stdout(&mut clean, None, None);
         assert_eq!(summary.segments.len(), 1);
         assert!(!summary.read_failed, "正常 EOF 不是读失败");
         assert_eq!(
@@ -2151,7 +2269,7 @@ mod tests {
             queued: line.to_vec(),
             pos: 0,
         });
-        let summary = consume_stdout(&mut reader, None);
+        let summary = consume_stdout(&mut reader, None, None);
         assert_eq!(summary.segments.len(), 1, "失败前读到的行仍要保留");
         assert!(summary.read_failed, "读失败必须与 EOF 分开表达");
         assert_eq!(
@@ -2179,7 +2297,7 @@ mod tests {
         // 静音 panic 打印，避免测试输出里出现像失败的堆栈。
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let summary = consume_stdout(&mut reader, Some(&cb));
+        let summary = consume_stdout(&mut reader, Some(&cb), None);
         std::panic::set_hook(prev);
 
         assert_eq!(
@@ -2272,7 +2390,7 @@ mod tests {
     fn consume_stdout_parses_native_sherpa_output() {
         let native_line = "{\"text\":\"<|zh|><|NEUTRAL|>原生测试识别内容\"}\n".as_bytes();
         let mut cursor = std::io::Cursor::new(native_line.to_vec());
-        let summary = consume_stdout(&mut cursor, None);
+        let summary = consume_stdout(&mut cursor, None, None);
         assert_eq!(summary.segments.len(), 1);
         assert_eq!(summary.segments[0].text, "原生测试识别内容");
     }

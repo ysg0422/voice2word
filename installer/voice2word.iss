@@ -4,7 +4,7 @@
 
 #define MyAppName "Voice2Word"
 #ifndef MyAppVersion
-#define MyAppVersion "0.2.25"
+#define MyAppVersion "0.2.26"
 #endif
 #define MyAppPublisher "Voice2Word"
 #define MyAppURL "https://github.com/ysg0422/voice2word"
@@ -73,11 +73,76 @@ Source: "assets\wizard_bg.bmp"; Flags: dontcopy
 ; 核心程序与工具底座
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\voice2word-cli.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; 共享配置：**不打包**仓库里的 config.toml。
+;
+; `config.toml` 在仓库里是被跟踪的，而开发机上的取值往往是**本机专属**的
+; （例如 whisper_model 指向 SenseVoice 的 onnx、并行进程数按 16 核调过）。
+; 直接把它打进安装包，客户机拿到的就是一份「按别人机器调好的配置」——
+; 最典型的是 `whisper_model` 指向 SenseVoice 模型：引擎选 Whisper、模型是 ONNX，
+; whisper-cli 读不了这个文件，**退出码 0 且不写 JSON**，上层只能报「未产出任何识别结果」。
+; 这正是 CHANGELOG 0.2.19 记录过的客户机故障。
+;
+; 不打包即可：程序首次启动时用**内置默认值**生成一份，那些默认值全是相对项目根的
+; 便携路径（tools/ffmpeg.exe、tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe、
+; models/whisper/ggml-small-q5_0.bin …），与本机选择无关；
+; 用户在界面里改过的设置则存在 config.local.toml（升级时不覆盖）。
+; 随包默认配置：**必须打包**，否则装在只读目录的客户机每次启动都回到默认值、
+; 界面里改过的设置存不下来。
+;
+; 它的内容由发布流程用 `voice2word-cli --print-default-config` 现场生成——
+; 也就是**代码里的默认值**，而不是仓库里那份被跟踪的开发机配置
+; （那份的 whisper_model 指向 SenseVoice 的 onnx，客户机上 Whisper 引擎会
+; 退出码 0 且不写 JSON）。onlyifdoesntexist：升级时不覆盖用户已改过的配置。
 Source: "..\config.toml"; DestDir: "{app}"; Flags: onlyifdoesntexist skipifsourcedoesntexist
 Source: "..\tools\punc_runner.py"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\tools\sensevoice_runner.py"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+; TTS 配音运行器（与前两个同样是随包分发的胶水脚本）
+Source: "..\tools\edge_tts_runner.py"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\tools\ffmpeg.exe"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\tools\ffplay.exe"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+; ffplay 的共享库依赖（avcodec / avformat / avutil / avdevice / avfilter / swresample / swscale）。
+;
+; **静态构建时这些文件不存在**，skipifsourcedoesntexist 会直接跳过，无副作用；
+; 但若打包机用的是 `--enable-shared` 的 ffplay，这几条是它能在客户机上跑起来的唯一保证——
+; 缺一个 DLL，ffplay 就以 0xC0000135 秒退，而代码只会「静默跳过音频」，
+; 用户看到的是「视频能播但没声音」。
+Source: "..\tools\av*.dll"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\sw*.dll"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+; ---------------------------------------------------------------------------
+; 运行时 DLL（**必须**随包分发，缺了就是「本机好使、别人电脑不好使」）
+;
+; llama.cpp 的入口 exe 只有几 KB（真正代码在同目录 DLL），whisper.cpp 同理：
+; 只发 exe 不发 DLL，客户机启动时进程会立刻以 0xC0000139（STATUS_ENTRYPOINT_NOT_FOUND）
+; 退出，而且**没有任何 stderr**——用户只看到「点了没反应」，日志里也查不到线索。
+;
+; 开发机上 DLL 就在 tools/ 下（本仓库跑过），所以本地怎么测都正常；
+; 打包时若只挑 exe，客户机就必然失败。这三条规则是本安装包最重要的部分。
+; ---------------------------------------------------------------------------
+; llama.cpp：入口 exe + 全部同目录 DLL（llama-common / llama-server-impl / ggml-* …）
+Source: "..\tools\llama*.exe"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\llama*.dll"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\ggml*.dll"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\mtmd.dll"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\libomp140.x86_64.dll"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+; VC++ 可再发行运行库（llama-completion.exe / llama.dll 依赖 VCRUNTIME140）
+Source: "..\tools\vcruntime140.dll"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\vcruntime140_1.dll"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\msvcp140.dll"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\vcomp140.dll"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+; whisper.cpp（官方 CPU 构建）：入口 exe + 同目录 DLL（whisper.dll / ggml*.dll / SDL2.dll）
+Source: "..\tools\whisper-vulkan\whisper-1.8.4-windows-x64\*"; DestDir: "{app}\tools\whisper-vulkan\whisper-1.8.4-windows-x64"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+; VC++ 可再发行运行库：whisper-cli / whisper.dll / ggml-cpu.dll 都依赖
+; MSVCP140 / VCRUNTIME140 / VCRUNTIME140_1 / VCOMP140。
+; Windows 10/11 大多自带，但**任何没装 VC++ Redist 的干净系统**（或企业镜像
+; 精简过的系统）上 whisper-cli 会以 0xC0000139 秒退，且没有任何 stderr。
+; 直接把这几个 DLL 放到 exe 同目录即可，零安装摩擦（微软允许再分发）。
+Source: "..\tools\vcruntime140.dll"; DestDir: "{app}\tools\whisper-vulkan\whisper-1.8.4-windows-x64"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\vcruntime140_1.dll"; DestDir: "{app}\tools\whisper-vulkan\whisper-1.8.4-windows-x64"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\msvcp140.dll"; DestDir: "{app}\tools\whisper-vulkan\whisper-1.8.4-windows-x64"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\vcomp140.dll"; DestDir: "{app}\tools\whisper-vulkan\whisper-1.8.4-windows-x64"; Flags: ignoreversion skipifsourcedoesntexist
+; ffprobe：与 ffmpeg 同目录。缺失时时长探测会退回解析 `ffmpeg -i` 的 stderr（能工作，
+; 但精度更差、耗时更长），因此它是**可选但强烈建议**随包分发。
+Source: "..\tools\ffprobe.exe"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 ; 内置便携 Python：SenseVoice / CT-Punc 的运行环境，避免客户机「系统 Python 残缺」。
 ; 由 scripts/build_python_runtime.ps1 现场生成（tools/ 不进版本库），缺失时跳过。
 Source: "..\tools\python\*"; DestDir: "{app}\tools\python"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
@@ -88,6 +153,11 @@ Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"; 
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon; IconFilename: "{app}\app.ico"
 
 [Run]
+; 安装后自检：**先**把「组件是否齐全」告诉用户，再启动主程序。
+;
+; 为什么必须自检：llama.cpp / whisper.cpp 的入口 exe 依赖同目录 DLL，缺一个就
+; 以 0xC0000139 静默退出。没有这一步，用户装完、点开、点「开始转写」、
+; 程序没反应、日志里也没有线索——只能回头找我们。
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [Registry]
@@ -100,6 +170,8 @@ Root: HKCU; Subkey: "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Unins
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\cache"
 Type: filesandordirs; Name: "{app}\updates"
+; 断点续跑的阶段产物目录（名字以点开头，默认会漏掉，卸载后残留一整块数据目录）。
+Type: filesandordirs; Name: "{app}\.voice2word-stages"
 Type: files; Name: "{app}\*.part"
 
 [Code]
@@ -438,6 +510,10 @@ begin
     WizardForm.FinishedLabel.Font.Color := $00E0E0E0;
     WizardForm.FinishedLabel.Left := ScaleX(48);
     WizardForm.FinishedLabel.Top := ScaleY(100);
+    // 明写「还要下载模型」：安装 ≠ 可用。不说这一句，用户点开就转写失败，
+    // 而错误文案只会说「SenseVoice 组件未就齐」，完全指向不了「装完还要下模型」。
+    WizardForm.FinishedLabel.Caption := '安装完成。首次使用需联网下载语音模型（约 290MB，国内镜像无需梯子）。' + #13#10 +
+      '所有处理都在本机完成，音视频与字幕不会上传。';
 
     // 彻底解决 RunList 黑色文字在黑底看不见的问题 (纯白文字 + 彻底无边框)
     WizardForm.RunList.Color := $161312;
@@ -528,5 +604,82 @@ begin
   begin
     // 目录此时只剩「用户选择保留」的数据（或已空）；空就删掉，非空保留。
     RemoveDir(AppDir);
+  end;
+end;
+
+{ ===== 安装后自检：把「缺什么」当场说清楚 ===== }
+// 逐项检查关键运行时组件是否存在且**完整**（入口 exe + 同目录 DLL）。
+// 只报缺项，不阻止安装：缺 Whisper 仍可用 SenseVoice，缺 llama 只影响离线翻译。
+function CheckRuntimeComponents(AppDir: String): String;
+var
+  Missing: String;
+  DllDir: String;
+  HasLlamaDll, HasWhisperDll: Boolean;
+begin
+  Missing := '';
+
+  // 1) FFmpeg：必需。缺了连音频都抽不出来。
+  if not FileExists(AppDir + '\tools\ffmpeg.exe') then
+    Missing := Missing + #13#10 + '  - FFmpeg（tools\ffmpeg.exe）：必需，音频提取与转码都依赖它';
+
+  // 2) llama.cpp：入口 exe 只有几 KB，真正代码在同目录 DLL。
+  //    **只查 exe 会漏判**——这正是「本机好使、别人电脑不好使」的成因。
+  DllDir := AppDir + '\tools';
+  HasLlamaDll :=
+    FileExists(DllDir + '\llama.dll') and
+    FileExists(DllDir + '\llama-common.dll') and
+    FileExists(DllDir + '\ggml.dll');
+  if FileExists(DllDir + '\llama-completion.exe') and not HasLlamaDll then
+    Missing := Missing + #13#10 +
+      '  - llama.cpp 的同目录 DLL：离线翻译/润色会静默失败（缺 llama.dll / llama-common.dll / ggml.dll）';
+
+  // 3) whisper.cpp：同样要连 DLL 一起查。
+  DllDir := AppDir + '\tools\whisper-vulkan\whisper-1.8.4-windows-x64';
+  HasWhisperDll := FileExists(DllDir + '\whisper.dll') and FileExists(DllDir + '\ggml.dll');
+  if FileExists(DllDir + '\whisper-cli.exe') and not HasWhisperDll then
+    Missing := Missing + #13#10 +
+      '  - whisper.cpp 的同目录 DLL：Whisper 引擎会静默失败（缺 whisper.dll / ggml.dll）';
+
+  // 4) 便携 Python：SenseVoice 与 CT-Punc 的运行环境。
+  if not FileExists(AppDir + '\tools\python\python.exe') then
+    Missing := Missing + #13#10 +
+      '  - 内置便携 Python（tools\python\）：SenseVoice 与标点需要它（可在设置里指定系统 Python）';
+
+  // 5) ffplay + 它的 av*/sw* DLL：预览的声音。
+  //    官方的 ffplay.exe 是**共享库构建**，缺 DLL 就以 0xC0000135 秒退；
+  //    开发机上有这些 DLL 在 PATH 上所以「本机好使」，客户机上则完全无声。
+  if FileExists(AppDir + '\tools\ffplay.exe') then
+  begin
+    DllDir := AppDir + '\tools';
+    if not FileExists(DllDir + '\avcodec-62.dll') and
+       not FileExists(DllDir + '\avcodec-61.dll') and
+       not FileExists(DllDir + '\avcodec-60.dll') then
+      Missing := Missing + #13#10 +
+        '  - ffplay 的同目录 DLL（av*.dll / sw*.dll）：视频预览将没有声音';
+  end;
+
+  // 6) 模型目录为空：首次使用必须联网下载（约 290MB 起）。
+  //    这不是「缺件」，但用户必须知道——否则以为装完就能用。
+  if not DirExists(AppDir + '\models\sensevoice') and
+     not DirExists(AppDir + '\models\whisper') then
+    Missing := Missing + #13#10 +
+      '  - 语音模型（models\）：首次使用需联网下载约 290MB（国内镜像，无需梯子）';
+
+  Result := Missing;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Missing: String;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    Missing := CheckRuntimeComponents(ExpandConstant('{app}'));
+    if Missing <> '' then
+    begin
+      MsgBox('安装完成，但发现以下组件缺失（相关功能会无法使用）：' + #13#10 + Missing + #13#10 + #13#10 +
+             '可以在「性能设置 → 模型与组件」里一键补齐；缺 FFmpeg 时请重新安装本程序。',
+             mbInformation, MB_OK);
+    end;
   end;
 end;

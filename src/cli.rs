@@ -1025,7 +1025,24 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    match parse(args) {
+    // 打包期辅助开关：把**代码里的默认配置**原样打印成 TOML。
+    //
+    // 为什么需要它：安装包必须带一份 `config.toml`，但不能带**仓库里那份**
+    // ——那是被 git 跟踪的开发机配置（`whisper_model` 指向 SenseVoice 的 onnx、
+    // 线程数按 16 核调过）。客户机拿到「引擎选 Whisper、模型是 ONNX」时，
+    // whisper-cli 会**退出码 0 且不写 JSON**，上层只能报「未产出任何识别结果」。
+    //
+    // 手写一份 `default_config.toml` 又会与代码漂移，所以由二进制自己吐出来：
+    // 打包脚本执行 `voice2word-cli --print-default-config > config.toml`，
+    // 内容永远等于 `AppConfig::default()`。
+    //
+    // 刻意在 `parse()` 之前拦截：它不属于用户命令面，不进 `--help`，也不改变
+    // 既有参数语义。
+    let argv: Vec<String> = args.into_iter().map(Into::into).collect();
+    if argv.iter().any(|a| a == "--print-default-config") {
+        return Some(print_default_config());
+    }
+    match parse(argv) {
         Ok(CliAction::Gui) => None,
         Ok(CliAction::Help(topic)) => {
             println!("{}", usage_for(topic));
@@ -1043,6 +1060,36 @@ where
             eprintln!();
             eprintln!("{}", usage());
             Some(EXIT_USAGE)
+        }
+    }
+}
+
+/// 打印内置默认配置（TOML）。打包脚本用它生成随包分发的 `config.toml`。
+///
+/// 输出里**不含**任何机器专属项：`AppConfig::default()` 的路径全是相对项目根的
+/// 便携值（`tools/ffmpeg.exe` / `models/whisper/ggml-small-q5_0.bin` …），
+/// `translate.api_key` / `api_base` / `api_model` 恒为空。
+fn print_default_config() -> i32 {
+    let cfg = crate::utils::AppConfig::default();
+    match toml::to_string_pretty(&cfg) {
+        Ok(text) => {
+            let header = "# Voice2Word 共享配置（由 `voice2word-cli --print-default-config` 生成）\n\
+                          #\n\
+                          # 这里只放**便携默认值**：路径全部相对程序目录，换台机器即可用。\n\
+                          # 机器专属的东西（绝对路径、GPU 策略、在线翻译接口与密钥）会由程序\n\
+                          # 自动写进同目录的 config.local.toml，不会混进本文件。\n\
+                          #\n\
+                          # 一般来说不需要手改本文件——界面里的「性能设置」改的就是这些项。\n\n";
+            print!("{header}{text}");
+            // 末尾补一个换行，避免某些编辑器显示成「文件末尾缺空行」
+            if !text.ends_with('\n') {
+                println!();
+            }
+            EXIT_OK
+        }
+        Err(err) => {
+            eprintln!("序列化默认配置失败: {err}");
+            EXIT_FAILURE
         }
     }
 }
@@ -1066,10 +1113,24 @@ fn run_transcribe(args: &TranscribeArgs) -> i32 {
         Err(err) => {
             let message = format!("{err:#}");
             eprintln!("转写失败: {message}");
-            let mut report = RunReport::failed("transcribe", EXIT_FAILURE, message);
+            // `action` 必须反映**真实执行的动作**，否则机器解析时该字段不可信。
+            //
+            // 此前这里硬编码 `"transcribe"`，但 `--tool-call` 链路的失败也会落到
+            // 这个分支（模型返回不可解析的 JSON、参数校验失败等都会 bail），
+            // 于是报告里写着 "transcribe"、实际做的是 tool_call——调用方按 action
+            // 分流就会走错分支。
+            let action = if args.tool_call.is_some() {
+                "tool_call"
+            } else {
+                "transcribe"
+            };
+            let mut report = RunReport::failed(action, EXIT_FAILURE, message);
             report.input = args.input.as_ref().map(|p| absolute_display(p));
             report.format = Some(args.format.clone());
             report.dry_run = args.dry_run;
+            if args.tool_call.is_some() {
+                report.input_kind = Some("tool_call".to_string());
+            }
             if args.json {
                 println!("{}", report.to_json_line());
             }

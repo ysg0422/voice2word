@@ -5,6 +5,127 @@
 
 ---
 
+## 0.2.26
+
+本轮专治「**本机好使、别人电脑不好使**」：打包缺件、只读目录启动即死、
+以及一批「缺件后静默降级」的路径。
+
+### 打包：安装包终于带上同目录 DLL
+
+- **llama.cpp / whisper.cpp 的 DLL 随包分发**。这两个程序的入口 exe 只有几 KB
+  （`llama-completion.exe` 9 KB），真正代码在同目录 `llama-common.dll` /
+  `llama-server-impl.dll` / `ggml-*.dll` / `whisper.dll` 里。此前 `[Files]` 只发
+  入口 exe，客户机上进程立刻以 `0xC0000139`（STATUS_ENTRYPOINT_NOT_FOUND）退出，
+  **且没有任何 stderr**——用户只看到「点了没反应」。开发机上 DLL 就在仓库 `tools/`
+  下，所以本地永远正常。
+- **新增 `scripts/prefetch_inference_backends.ps1`**：打包前预取 llama.cpp 与
+  whisper.cpp 官方 CPU 构建并自检「入口 exe + 同目录 DLL」是否齐备。预取前**清空
+  目标目录**，杜绝开发机上的自编译 Vulkan/llama 产物混进包——那些文件与 CI 下载的
+  官方 CPU 版**同名不同内容**，不清就会「包内容取决于打包机的历史状态」。
+- **预取失败不再吞掉**（去掉 `continue-on-error`）：宁可发布失败，也不发出一个
+  必然在客户机上失败的包。
+- **ffplay 的共享库依赖**（`av*.dll` / `sw*.dll`）加入 `[Files]`。官方 ffplay 是
+  共享库构建，缺 DLL 就以 `0xC0000135` 秒退；开发机上它们恰好在 PATH 上，所以
+  「本机有声、客户机无声」。释放流程改用静态 ffmpeg 构建（单文件），规则仍保留
+  以兼容共享构建。
+- **ffprobe 一并预取**：时长探测优先用它，缺了会退回解析 `ffmpeg -i`，精度更差。
+- **VC++ 可再发行运行库**（`vcruntime140` / `vcruntime140_1` / `msvcp140` /
+  `vcomp140`）放进 `tools/` 与 `whisper` 目录：干净系统上缺了同样会 `0xC0000139`。
+- **不再打包仓库里的 `config.toml`**。它是被 git 跟踪的开发机配置，
+  `whisper_model` 指向 SenseVoice 的 onnx——客户机拿到「引擎选 Whisper、模型是 ONNX」
+  就会 `退出码 0 且不写 JSON`，上层只能报「未产出任何识别结果」（0.2.19 修过的那类）。
+  现在由程序首次启动时用内置便携默认值生成。
+- **安装后自检**（`CheckRuntimeComponents`）：逐项检查 ffmpeg / llama DLL / whisper DLL /
+  便携 Python / **ffplay 及其 av* DLL** / **models 是否为空**，缺什么当场弹框说清楚，
+  而不是等用户点「开始转写」才发现。
+- **完成页明确写出「首次使用需联网下载约 290MB 模型」**：安装 ≠ 可用。
+- **卸载补删 `.voice2word-stages`**（断点续跑的阶段产物目录，名字以点开头，此前残留）。
+- `scripts/build_python_runtime.ps1` 锁版本（`numpy` / `sherpa-onnx` /
+  `onnxruntime-directml`）：不锁的话不同时间构建出的包内容不同，客户机问题无法复现。
+- 新增 CI 门禁 `packaging-integrity`：断言安装包声明了 llama / ggml / whisper /
+  av* / sw* / VC++ 的随包规则，且预取不会被 `continue-on-error` 吞掉。
+
+### 只读或非标准安装目录不再「启动即死」
+
+- **配置文件写不进去不再是致命错误**：`load_from_file` 在配置缺失时会尝试落盘默认值，
+  此前 `save_to_file(...)?` 会把「拒绝访问」冒泡到 `main`，程序**直接起不来**，
+  只弹一个「读取配置文件 config.toml」的错误框——而配置文件并不存在、也不是坏的。
+  现在照常用默认值跑，只记一条 warn。
+- **数据库回退到可写目录**（`AppConfig::writable_data_dir`）：项目根不可写时退到
+  `%LOCALAPPDATA%\Voice2Word`，而不是报 `unable to open database file` 后退出。
+- **日志目录同样回退**：日志写不了可以降级诊断能力，但程序必须能起。
+- **备份/恢复跟随库的真实位置**：库退到 `%LOCALAPPDATA%` 时，备份不再「成功但里面
+  没有数据库」。
+- 新增「可写性探针」（真的落一个文件再删），ACL 判定比只看权限位准。
+
+### 静默降级改成看得见
+
+- **VAD 模型缺失要告警**：此前 `if vad_path.exists()` 不成立就悄悄不加 `--vad`，
+  用户只觉得「怎么变慢了、静音段也出字幕」。
+- **标点模型缺失不再假装成功**：此前 `return Ok(segments)` 把没标点的结果当成功收尾。
+  现在返回可辨识的错误，管线把「标点未完成」写进进度提示与性能报告（报告里不再留着
+  「CT-Punc 极速标点」这种没发生过的事）。
+- **ffplay 不可用要告诉用户「预览没有声音」**，而不是静默跳过整条音频管线。
+- **llama.cpp 启动体检**：`check_llama_runtime_deps` 用 PE 导入表解析，缺 DLL 时
+  在启动日志里点名（与 whisper 那边同一套机制）。
+- **模型目录不可写时给出可操作提示**（「换个有写权限的目录」），而不是一串 io 错误。
+- **TTS 的 Python 路径修正**：`tools/python.exe` 不存在（真实路径是
+  `tools/python/python.exe`），改用 `resolve_command` 与其它引擎同口径。
+
+### 转写引擎
+
+- **SenseVoice 的长音频多进程切块并行路径终于可达**。`EngineCapabilities::plan` 一直在
+  算 `parallel_chunks`，但 `transcribe_route` 先判 `sensevoice` 直接返回单会话推流，
+  于是 `Chunked { parallel: true }` 对 SenseVoice 是**不可达代码**，
+  `MAX_SV_WORKERS` / `sensevoice_worker_count` / `sensevoice_chunk_count` 一整套参数
+  没有生产调用点，界面上的「并行进程数」滑条对 SenseVoice 完全无效。
+  实测（16 核、6 分钟样本）单会话 8 线程 32.6s、16 线程反而 41.6s，
+  而 6 进程 × 2 线程只要 14.5s。现在按「能不能并行」分流。
+- **SenseVoice / CT-Punc 补停滞看门狗**（`SV_STALL_BUDGET` / `PUNC_STALL_BUDGET` = 300s，
+  与 whisper 同口径）：判据是「连续无输出」而不是总耗时。此前 SenseVoice 的等待预算
+  按时长缩放（1 小时音频 = 1 小时预算），runner 一卡死就要干等一小时。
+- **`-mc` 的取值语义写进注释**：`0`（不携带跨句上下文）与 `-1`（不裁剪）语义**相反**，
+  此前只有一行 `clamp(0,448)`，极易读错。
+
+### 一致性收口
+
+- **`taskkill` 路径加固三处统一**：sensevoice 此前是裸 `Command::new("taskkill")`，
+  Windows 会把**当前目录**排在系统目录之前，应用目录里放一个同名 exe 就能被执行。
+  现在三个引擎统一取 whisper 那份（`%SystemRoot%\System32\taskkill.exe`）。
+- **取消语义统一为快照**：`take_live_pids`（drain）让「终止」变成一次性动作，
+  用户连点两次时第二次拿到空名单。whisper 早已改成快照，sensevoice / punc 现在对齐。
+- **`WhisperEngine::new` 的 VAD 默认路径经 `resolve_path` 锚到项目根**：
+  相对路径按**进程 cwd** 解析，从快捷方式启动时 cwd 可能是 `System32`，
+  于是 VAD 被静默关闭。
+
+### 翻译与润色
+
+- **数字一致性校验**（新增 `RewriteVerdict::NumberMismatch`）：原文的数字在译文里必须
+  找得到。提示词里一直写着「数字原样保留」，但那只是一句约束，模型不遵守时
+  长度比 / 相似度 / 术语检查**都发现不了**，错了直接进成品字幕。
+  按**数值**比对（`2` 与 `2.0` 等价），原文少于 2 个数字时不判（避免误报）。
+- **复制率分母修正**：`copy.checked` 此前用「送出条数」，而 `heal.checked` 用「产出条数」。
+  模型只译出一半时分母被撑大、比率被稀释，`is_alarming()` 可能**永远不触发**——
+  「模型整篇复制原文」这种最该拦下的失败被漏报。现在两者都用产出条数。
+- **`is_local_endpoint` 改为按 host 精确判断**：旧实现 `contains("10.")` 会把
+  `https://api.10.example.com/v1` 判成本地端点 → 跳过 API Key 校验 → 服务端 401 →
+  用户被误导去查密钥。
+
+### 媒体
+
+- **代理转码预算按源时长缩放**（`proxy_timeout_for`）：固定 600s 与素材时长无关，
+  2 小时 4K 转 720p 需 20~40 分钟，必然被 kill，回退链再跑一次同样超时，
+  最终「长素材在无 GPU 机器上永远拿不到代理」。
+
+### 集成
+
+- **MCP 优先用 `voice2word-cli.exe`**：`voice2word.exe` 是 GUI 子系统程序，
+  PowerShell 不等待它，重定向会拿到空文件（os error 232）。MCP 读到的就是空串。
+- MCP 的 `SUPPORTED_FORMATS` 从 7 种补齐到 10 种（漏了 `sbv` / `lrc` / `txt-ts`）。
+- 修正集成文档里「`--translate` 无头模式未接线」的过时说明（实际早已接线）。
+
+---
+
 ## 0.2.25
 
 修「安装包装了，但 Windows 设置 → 应用里找不到」。

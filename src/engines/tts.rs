@@ -38,8 +38,15 @@ pub struct TTSEngine {
 
 impl TTSEngine {
     /// 构造 TTS 引擎实例，自动解析 Python 解释器与 runner 脚本
+    ///
+    /// 解释器必须走 [`AppConfig::resolve_command`]（内置便携 Python 优先 → PATH 兜底），
+    /// 不能用 `resolve_path("tools/python.exe")`：
+    /// - 内置运行时的真实路径是 `tools/python/python.exe`（`tools/python.exe` **不存在**），
+    ///   写死那个路径 → TTS 永远 spawn 失败；
+    /// - `resolve_command` 还会在内置缺失时回退到 PATH 上的系统 Python，
+    ///   与其它引擎（SenseVoice / CT-Punc）保持同一套解析口径。
     pub fn new() -> Self {
-        let python_path = AppConfig::resolve_path("tools/python.exe");
+        let python_path = AppConfig::resolve_command("python");
         let runner_path = AppConfig::resolve_path("tools/edge_tts_runner.py");
         Self {
             python_path,

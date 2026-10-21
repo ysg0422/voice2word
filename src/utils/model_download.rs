@@ -1144,13 +1144,10 @@ fn configured_path_for(item: &DownloadItem, cfg: Option<&AppConfig>) -> Option<P
     let cfg = cfg?;
     let raw: Option<&str> = match item.id {
         "ffmpeg" => Some(cfg.paths.ffmpeg.as_str()),
-        "whisper-tiny"
-        | "whisper-base"
-        | "whisper-small"
-        | "whisper-medium"
-        | "whisper-turbo-q5"
-        | "whisper-turbo-q8"
-        | "whisper-large-v3" => Some(cfg.paths.whisper_model.as_str()),
+        "whisper-tiny" | "whisper-base" | "whisper-small" | "whisper-medium"
+        | "whisper-turbo-q5" | "whisper-turbo-q8" | "whisper-large-v3" => {
+            Some(cfg.paths.whisper_model.as_str())
+        }
         "silero-vad" => cfg.paths.vad_model.as_deref(),
         "punc-model" => cfg.paths.punc_model.as_deref(),
         "sensevoice-model" => cfg.paths.sensevoice_model.as_deref(),
@@ -1439,8 +1436,15 @@ pub fn download_one(
 ) -> Result<PathBuf> {
     let dest = AppConfig::resolve_path(item.dest);
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建目录失败: {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            // 目录建不出来只有一个原因：**装的位置不可写**（Program Files、
+            // 企业策略锁定、只读 U 盘）。这个错误必须自己说清楚，
+            // 否则用户看到的是一串 io 错误，完全想不到「换个位置装就行」。
+            let hint = "无法在 {} 下创建模型目录（该位置可能不可写：Program Files、企业策略锁定、只读介质）。"
+                .to_string()
+                + "请把程序移到有写权限的目录，或在「性能设置 → 模型与组件」里重新下载。";
+            hint.replace("{}", &parent.display().to_string())
+        })?;
     }
     // 已经存在**自编译的自包含构建**时拒绝覆盖：官方包是「启动桩 + DLL」，
     // 直接下载会把用户的单文件构建换成启动桩（尤其是手编的 Vulkan 版，

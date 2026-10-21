@@ -135,6 +135,127 @@ jobs:
           }
 
   # ---------------------------------------------------------------------------
+  # Job 1.6 — 打包完整性：安装包必须带上**同目录 DLL**
+  # ---------------------------------------------------------------------------
+  #
+  # 这道门禁守的是「本机好使、别人电脑不好使」最典型的一种成因：
+  #
+  #   llama.cpp 的 llama-completion.exe 只有 ~9 KB（真正的代码在 llama-common.dll /
+  #   llama-server-impl.dll / ggml-*.dll 里），whisper.cpp 的 whisper-cli.exe 同理。
+  #   安装包若只发入口 exe 不发 DLL，客户机上这两个程序会立刻以 0xC0000139
+  #   (STATUS_ENTRYPOINT_NOT_FOUND) 退出，**且没有任何 stderr**——用户只看到
+  #   「点了没反应」，日志里也查不到任何线索。
+  #
+  # 开发机上 DLL 就在仓库的 tools/ 下（本机跑过），所以本地永远正常；
+  # 打包时漏掉就必然复发。因此这里把它钉成硬门禁。
+  packaging-integrity:
+    name: packaging integrity (installer ships runtime DLLs)
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Installer must ship the runtime DLLs
+        shell: pwsh
+        run: |
+          $iss = Get-Content installer/voice2word.iss -Raw -Encoding UTF8
+          $required = @(
+            'llama*.dll',
+            'ggml*.dll',
+            'llama*.exe',
+            'whisper-vulkan\whisper-1.8.4-windows-x64\*',
+            # ffplay 的共享库依赖：静态构建时文件不存在（skipifsourcedoesntexist 跳过），
+            # 但**规则必须声明**，否则换成 shared 构建时它们的 DLL 会被静默漏掉。
+            'av*.dll',
+            'sw*.dll',
+            # VC++ 可再发行运行库：干净系统上缺了就是 0xC0000139。
+            'vcruntime140.dll',
+            'msvcp140.dll'
+          )
+          $missing = @()
+          foreach ($pattern in $required) {
+            if ($iss -notmatch [regex]::Escape($pattern)) {
+              $missing += $pattern
+            }
+          }
+          if ($missing.Count -gt 0) {
+            throw ('安装包缺少运行时 DLL 规则：' + ($missing -join ', ') +
+                   '。llama.cpp / whisper.cpp 的入口 exe 依赖同目录 DLL，缺了客户机上会' +
+                   '静默以 0xC0000139 退出。请在 installer/voice2word.iss 的 [Files] 段补上。')
+          }
+          Write-Host '安装包已声明随包分发的运行时 DLL'
+
+      - name: Packaging scripts must be usable from PowerShell 5.1
+        shell: pwsh
+        run: |
+          # Windows PowerShell 5.1 无 BOM 时按 ANSI 解码 .ps1，中文注释会破坏字符串
+          # 字面量、直接语法错误跑不起来。仓库里多数脚本带 BOM，新加的不带就会
+          # 「在我机器上能跑」（pwsh 7 默认 UTF-8）、在别人机器上报错。
+          $bad = @()
+          foreach ($f in Get-ChildItem scripts/*.ps1) {
+            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+            $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+            $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+            $nonAscii = $text -match '[^\x00-\x7F]'
+            if ($nonAscii -and -not $hasBom) { $bad += $f.Name }
+          }
+          if ($bad.Count -gt 0) {
+            throw ('以下 .ps1 含中文但缺 UTF-8 BOM，PowerShell 5.1 下会语法错误：' + ($bad -join ', '))
+          }
+          Write-Host '所有含中文的 .ps1 都带 UTF-8 BOM'
+
+      - name: Package self-check script exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path scripts/verify_package.ps1)) {
+            throw '缺 scripts/verify_package.ps1：打包产物没有自检环节。'
+          }
+          $v = Get-Content scripts/verify_package.ps1 -Raw -Encoding UTF8
+          # 自检必须在**隔离 PATH** 下试跑，否则打包机上 ffmpeg 的 DLL 目录恰好在
+          # PATH 里时，缺 DLL 的 ffplay 也能「通过」——自检变成自欺。
+          if ($v -notmatch 'env:PATH') {
+            throw 'verify_package.ps1 没有隔离 PATH：缺 DLL 的组件会被误判为可用。'
+          }
+          Write-Host '打包自检脚本存在且会隔离 PATH'
+          $rel = Get-Content .github/workflows/release.yml -Raw -Encoding UTF8
+          if ($rel -notmatch 'verify_package') {
+            throw 'release.yml 没有调用 verify_package.ps1：自检没进发布流程。'
+          }
+          Write-Host 'release 流程已包含打包自检'
+
+      - name: Prefetch script must not leave dev-machine artifacts
+        shell: pwsh
+        run: |
+          $script = Get-Content scripts/prefetch_inference_backends.ps1 -Raw -Encoding UTF8
+          # 预取前必须清空目标目录：开发机上的自编译 Vulkan/llama 版与 CI 下载的
+          # 官方 CPU 版**文件名相同、内容不同**，不清就会「包内容取决于打包机的历史状态」。
+          if ($script -notmatch 'Remove-Item[^\r\n]*Recurse') {
+            throw 'prefetch_inference_backends.ps1 没有清空目标目录：包内容会取决于打包机的历史状态。'
+          }
+          Write-Host '预取脚本会先清空目标目录'
+
+      - name: Release workflow must not swallow prefetch failures
+        shell: pwsh
+        run: |
+          $rel = Get-Content .github/workflows/release.yml -Raw -Encoding UTF8
+          # 预取失败 = 安装包缺 DLL = 客户机上必然失败。这种失败必须让发布失败，
+          # 而不是 continue-on-error 悄悄出一个坏包。
+          if ($rel -match 'Prefetch inference backends[\s\S]{0,200}continue-on-error') {
+            throw 'release.yml 的预取步骤用了 continue-on-error：预取失败会发出一个必然失败的包。'
+          }
+          Write-Host '预取失败会阻断发布'
+      - name: Release workflow must prefetch inference backends
+        shell: pwsh
+        run: |
+          $rel = Get-Content .github/workflows/release.yml -Raw -Encoding UTF8
+          if ($rel -notmatch 'prefetch_inference_backends') {
+            throw ('release.yml 里没有预取推理后端的步骤：打包机不预取 llama.cpp / ' +
+                   'whisper.cpp，安装包就会缺 DLL —— 正是「本机好使、别人电脑不好使」的成因。')
+          }
+          Write-Host 'release 流程已包含推理后端预取'
+
+  # ---------------------------------------------------------------------------
   # Job 2 — clippy：硬门禁，warning 即 error
   # ---------------------------------------------------------------------------
   clippy:

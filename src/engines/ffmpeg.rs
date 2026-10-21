@@ -441,7 +441,7 @@ fn parse_hhmmss_value(text: &str) -> Option<f64> {
 ///
 /// `Duration: N/A` 表示容器没写时长（流式 / 损坏 / 分段 MP4），必须返回 None，不能
 /// 误当成 0.0 继续参与切块规划。
-fn parse_ffmpeg_container_duration(text: &str) -> Option<f64> {
+pub(crate) fn parse_ffmpeg_container_duration(text: &str) -> Option<f64> {
     for line in text.lines() {
         let Some(pos) = line.find("Duration:") else {
             continue;
@@ -1515,9 +1515,8 @@ mod mux_tests {
         let tracks = vec![("English".to_string(), PathBuf::from("en.srt"))];
         let mp4 = mux_subtitle_args(Path::new("a.mp4"), &tracks, Path::new("b.mp4"));
         let mkv = mux_subtitle_args(Path::new("a.mp4"), &tracks, Path::new("b.mkv"));
-        let has = |args: &Vec<std::ffi::OsString>, v: &str| {
-            args.iter().any(|a| a.to_string_lossy() == v)
-        };
+        let has =
+            |args: &Vec<std::ffi::OsString>, v: &str| args.iter().any(|a| a.to_string_lossy() == v);
         assert!(has(&mp4, "mov_text"), "mp4 必须用 mov_text");
         assert!(has(&mkv, "srt"), "mkv 必须用 srt");
     }

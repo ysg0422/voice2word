@@ -1,4 +1,4 @@
-# 清理 Rust 构建缓存（释放磁盘，不碰源码与 release 产物）
+﻿# 清理 Rust 构建缓存（释放磁盘，不碰源码与 release 产物）
 #
 # 背景：`target\debug\incremental` 是**无上限增长**的增量编译缓存。改代码越频繁、
 #      切换 profile 越多，它叠得越大（本项目一度到 27 GB，把 A 盘吃到只剩 5 GB）。

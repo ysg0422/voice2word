@@ -268,7 +268,13 @@ impl TranslateEngine {
         if all_sentences_chinese && crate::subtitle::is_source_chinese(&segments) {
             if let Some(variant) = chinese_variant_target(target_lang) {
                 self.store_rewrite_stats(RewriteStats::default());
-                return convert_chinese_variant(segments, target_lang, variant, progress_cb, &cancel);
+                return convert_chinese_variant(
+                    segments,
+                    target_lang,
+                    variant,
+                    progress_cb,
+                    &cancel,
+                );
             }
         }
         match self.mode {
@@ -392,14 +398,102 @@ fn translate_via_online_api(
 
 /// 在线翻译主流程：按 `batch_size` 切片，逐批请求并回填 `segment.translation`，
 /// 并返回「输出校验自愈」统计（回退条数 / 反思次数）供上层提示。
+/// 判断接口地址是否指向**本机 / 局域网**，据此决定「能不能不填 API Key」。
+///
+/// # 为什么不能拿整串做子串匹配
+/// 旧实现是 `lower.contains("10.")` / `lower.contains("192.168.")` 这类子串匹配，
+/// 于是 `https://api.10.example.com/v1`、`https://10.0.0.1.example.net/v1` 都会被
+/// 判成「本地端点」→ **跳过 API Key 非空校验**、省掉 Authorization 头 → 服务端回 401 →
+/// 错误分类落到 Fatal → 用户看到「请检查密钥」，但密钥其实完全正确。
+/// 这正是「本机好使、别人电脑不好使」的一类：开发机配的是真本地地址，客户机配的是
+/// 云端地址，一旦云端域名里带了 `10.` 这类片段就被误判。
+///
+/// # 现在的判定
+/// 只看 **host**（URL 里的主机部分），并按 IP 段精确判断：
+/// - `localhost` / `*.localhost` / `127.0.0.1` / `::1`
+/// - 私有网段：`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`
+///   （自建网关常在这三段内；Ollama 11434 / LM Studio 1234 / vLLM 8000 也在其中）
 fn is_local_endpoint(endpoint: &str) -> bool {
     let lower = endpoint.to_lowercase();
-    lower.contains("localhost")
-        || lower.contains("127.0.0.1")
-        || lower.contains("0.0.0.0")
-        || lower.contains("192.168.")
-        || lower.contains("10.")
-        || lower.contains(":11434")
+    // 先把 host 与 port 分开：主机名里混着端口就没法和 `localhost` 比。
+    let (host, port_num) = split_host_port(&endpoint_host(&lower));
+
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    if host == "::1" {
+        return true;
+    }
+    if host == "127.0.0.1" || host == "0.0.0.0" {
+        return true;
+    }
+    if is_private_ipv4(&host) {
+        // 私有网段本身就是「内网」：自建网关常在 10.x / 192.168.x 内网。
+        // 常见本地推理端口（Ollama 11434 / LM Studio 1234 / vLLM 8000）也在这里覆盖到。
+        let _ = port_num;
+        return true;
+    }
+    false
+}
+
+/// 从 URL 里取出主机名（小写）。解析不了就退回「整串去掉协议与路径」，
+/// 宁可判不出本地端点（要求填 Key），也不要误判成本地端点。
+fn endpoint_host(lower_endpoint: &str) -> String {
+    let rest = lower_endpoint
+        .strip_prefix("https://")
+        .or_else(|| lower_endpoint.strip_prefix("http://"))
+        .unwrap_or(lower_endpoint);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
+    // 去掉 userinfo（user:pass@host）
+    let host = match host.rsplit_once('@') {
+        Some((_, h)) => h,
+        None => host,
+    };
+    host.to_string()
+}
+
+/// 把 `host[:port]` 拆成 (纯主机名, 端口)。
+///
+/// IPv6 字面量带方括号：`[::1]:11434` → `("::1", Some(11434))`。
+fn split_host_port(host: &str) -> (String, Option<u16>) {
+    if let Some(rest) = host.strip_prefix('[') {
+        if let Some((ip, tail)) = rest.split_once(']') {
+            let port = tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+            return (ip.to_string(), port);
+        }
+        return (host.to_string(), None);
+    }
+    match host.rsplit_once(':') {
+        Some((ip, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            (ip.to_string(), port.parse::<u16>().ok())
+        }
+        _ => (host.to_string(), None),
+    }
+}
+
+/// 判断 IPv4 字面量是否落在私有网段（10/8、172.16/12、192.168/16）。
+fn is_private_ipv4(ip: &str) -> bool {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let mut nums = [0u32; 4];
+    for (i, part) in parts.iter().enumerate() {
+        match part.parse::<u32>() {
+            Ok(n) if n <= 255 => nums[i] = n,
+            _ => return false,
+        }
+    }
+    if nums[0] == 10 {
+        return true;
+    }
+    if nums[0] == 172 && (16..=31).contains(&nums[1]) {
+        return true;
+    }
+    if nums[0] == 192 && nums[1] == 168 {
+        return true;
+    }
+    false
 }
 
 /// 部分前沿推理模型（如 OpenAI o1 / o3-mini 等）严格禁止自定义 temperature 参数，
@@ -618,8 +712,17 @@ fn translate_via_online_api_with_stats(
         let mut copy_candidates: Vec<usize> = Vec::new();
         // 「改动过大」的可疑译文（长度失控 / 语义漂移）：先反思重试一次，仍不合格才留空。
         let mut suspect_candidates: Vec<usize> = Vec::new();
-        copy.checked += chunk.len();
-        // 校验口径与润色链路一致：`checked` = 本批实际产出、送交校验的条数。
+        // 分母口径：`checked` = 本批**实际产出**的条数，不是送出去的条数。
+        //
+        // 此前这里是 `copy.checked += chunk.len()`（送出的条数），而 `heal.checked`
+        // 用的是 `translations.len()`（产出的条数）——两者口径不一致，后果很具体：
+        // 模型只译出了一半时，复制率的分母被撑大、比率被稀释，于是 `is_alarming()`
+        // （>50% 且 `checked >= 4`）可能**永远不触发**。「模型整篇复制原文」恰恰是
+        // 最该被拦下的失败模式，却因为分母算错而被漏报（离线链路同病，已一并修）。
+        //
+        // 现在两个计数都用「实际产出条数」：模型只吐了一半，分母也只有一半，
+        // 复制率如实反映「产出里的多少是复制」。
+        copy.checked += translations.len();
         heal.checked += translations.len();
         for &pos in &chunk {
             if let Some(text) = translations.get(&segments[pos].index) {
@@ -636,7 +739,10 @@ fn translate_via_online_api_with_stats(
                         heal.echo += 1;
                         copy_candidates.push(pos);
                     }
-                    RewriteVerdict::SuspectTooDifferent => suspect_candidates.push(pos),
+                    // 数字丢失：与「改动过大」同样走反思重试，绝不写回丢了数字的译文。
+                    RewriteVerdict::SuspectTooDifferent | RewriteVerdict::NumberMismatch => {
+                        suspect_candidates.push(pos)
+                    }
                     RewriteVerdict::Empty => heal.empty += 1,
                 }
             }
@@ -2073,6 +2179,84 @@ fn content_to_text(c: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// 本地端点判定必须按 **host** 精确判断，不能拿整串做子串匹配。
+    ///
+    /// 旧实现用 `contains("10.")`，于是 `https://api.10.example.com/v1` 被判成
+    /// 本地端点 → 跳过 API Key 校验 → 服务端 401 → 用户被误导去查密钥。
+    #[test]
+    fn local_endpoint_detection_uses_host_not_substring() {
+        // 真正的本地 / 内网端点：允许不填 Key。
+        for ep in [
+            "http://localhost:8000/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://0.0.0.0:8000/v1",
+            "http://192.168.1.10:8000/v1",
+            "http://10.0.0.5:11434/v1",
+            "http://172.16.3.4:8000/v1",
+            "http://[::1]:8000/v1",
+        ] {
+            assert!(
+                is_local_endpoint(ep),
+                "应当判为本地端点（可不填 Key）：{ep}"
+            );
+        }
+
+        // 云端端点：即使域名/路径里含 `10.` / `192.168.` 片段，也**不得**判成本地。
+        for ep in [
+            "https://api.10.example.com/v1",
+            "https://10.0.0.1.example.net/v1",
+            "https://api.example.com:8000/v1",
+            "https://api.deepseek.com/v1",
+            "https://openrouter.ai/api/v1",
+            "https://192.168.1.1.example.org/v1",
+        ] {
+            assert!(
+                !is_local_endpoint(ep),
+                "不应当判为本地端点（必须要求填 Key）：{ep}"
+            );
+        }
+    }
+
+    /// `host_port` 的拆分：带端口 / 不带端口 / IPv6 字面量。
+    #[test]
+    fn host_port_splits_host_and_port() {
+        assert_eq!(
+            split_host_port("example.com:8080"),
+            ("example.com".to_string(), Some(8080))
+        );
+        assert_eq!(
+            split_host_port("example.com"),
+            ("example.com".to_string(), None)
+        );
+        assert_eq!(
+            split_host_port("[::1]:11434"),
+            ("::1".to_string(), Some(11434))
+        );
+    }
+
+    /// 私有网段判定：只认 10/8、172.16/12、192.168/16。
+    #[test]
+    fn private_ipv4_ranges_are_exact() {
+        for ip in [
+            "10.0.0.1",
+            "10.255.255.255",
+            "172.16.0.1",
+            "172.31.255.1",
+            "192.168.1.1",
+        ] {
+            assert!(is_private_ipv4(ip), "{ip} 应当判为私有网段");
+        }
+        for ip in [
+            "172.15.0.1",
+            "172.32.0.1",
+            "192.169.1.1",
+            "11.0.0.1",
+            "8.8.8.8",
+            "nonsense",
+        ] {
+            assert!(!is_private_ipv4(ip), "{ip} 不应当判为私有网段");
+        }
+    }
     use super::*;
 
     fn sample_cfg() -> OnlineApiConfig {
@@ -2539,7 +2723,12 @@ mod tests {
                 .to_string()
             })
             .collect();
-        for text in ["第一句译文。", "第二句译文。", "第三句译文。", "第四句译文。"] {
+        for text in [
+            "第一句译文。",
+            "第二句译文。",
+            "第三句译文。",
+            "第四句译文。",
+        ] {
             replies.push(
                 serde_json::json!({
                     "choices": [{ "message": { "content": text } }]

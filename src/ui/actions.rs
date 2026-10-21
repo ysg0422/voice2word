@@ -788,13 +788,30 @@ impl MainWindow {
         let root = crate::utils::AppConfig::app_root_dir();
         let name = crate::utils::backup::backup_file_name(chrono::Local::now());
         let dest = root.join("backups").join(&name);
+        // 库的真实位置：项目根**或**回退目录（装在只读目录时库会退到
+        // %LOCALAPPDATA%\Voice2Word）。备份必须按**真实位置**取，否则会出现
+        // 「备份成功但里面没有数据库」——用户拿到的归档里没有历史记录，
+        // 却什么提示都没有。
+        let db_path = crate::utils::AppConfig::resolve_path("voice2word.db");
+        let db_path = if db_path.is_file() {
+            db_path
+        } else {
+            let fallback = crate::utils::AppConfig::writable_data_dir().join("voice2word.db");
+            if fallback.is_file() {
+                fallback
+            } else {
+                db_path
+            }
+        };
         self.state.download_status_msg = "正在备份数据…".to_string();
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { crate::utils::backup::create_backup(&root, &dest) })
+                .spawn(async move {
+                    crate::utils::backup::create_backup_with_db(&root, &db_path, &dest)
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 match result {
@@ -863,7 +880,18 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         let root = crate::utils::AppConfig::app_root_dir();
-        match crate::utils::backup::restore_backup(archive, &root) {
+        // 恢复目标必须与「库的真实位置」一致：项目根可写时是项目根，
+        // 项目根只读时库在 %LOCALAPPDATA%\Voice2Word，恢复也应该写回那里——
+        // 否则用户在一个地方恢复、程序却从另一个地方读，表现为「恢复没生效」。
+        let target_root = {
+            let db = root.join("voice2word.db");
+            if db.is_file() || crate::utils::AppConfig::dir_is_writable(&root) {
+                root.clone()
+            } else {
+                crate::utils::AppConfig::writable_data_dir()
+            }
+        };
+        match crate::utils::backup::restore_backup(archive, &target_root) {
             Ok(outcome) => {
                 let mut msg = if outcome.restored.is_empty() {
                     "没有可恢复的文件".to_string()
@@ -1642,7 +1670,10 @@ impl MainWindow {
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("视频");
-                self.notice = Some(format!("已将「{name}」追加到批量转写队列（共 {} 个）", self.state.batch_queue.len()));
+                self.notice = Some(format!(
+                    "已将「{name}」追加到批量转写队列（共 {} 个）",
+                    self.state.batch_queue.len()
+                ));
                 cx.notify();
                 return;
             }
@@ -1942,7 +1973,11 @@ impl MainWindow {
 
     /// 从队列里移除一条（用户手动剔除不想要的片源）
     pub(crate) fn remove_queue_item(&mut self, idx: usize, cx: &mut Context<Self>) {
-        let removed_path = self.state.batch_queue.get(idx).map(|item| item.path.clone());
+        let removed_path = self
+            .state
+            .batch_queue
+            .get(idx)
+            .map(|item| item.path.clone());
         if self.state.remove_queue_item(idx) {
             if let Some(path) = removed_path {
                 if self.state.transcribe_file.as_ref() == Some(&path) {
@@ -2893,7 +2928,9 @@ impl MainWindow {
     /// 交付/上传时需要的是「一个能直接播、能切语言」的文件，而此前只能导出外挂
     /// 字幕，用户还得自己再跑一遍 ffmpeg。这里 `-c copy` 不重编码，大文件也是秒级。
     pub(crate) fn export_embedded_subtitles(&mut self, cx: &mut Context<Self>) {
-        const MEDIA_EXT: [&str; 9] = ["mp4", "mkv", "mov", "avi", "flv", "webm", "m4v", "ts", "wmv"];
+        const MEDIA_EXT: [&str; 9] = [
+            "mp4", "mkv", "mov", "avi", "flv", "webm", "m4v", "ts", "wmv",
+        ];
         let Some(media) = self.state.selected_file.clone() else {
             self.notice = Some("内嵌字幕需要先打开一个视频文件".to_string());
             cx.notify();
@@ -3041,7 +3078,11 @@ impl MainWindow {
                             duration_secs: (media_duration > 0.0).then_some(media_duration),
                         };
                         crate::subtitle::JianYingExporter::export_to_folder_with_media(
-                            &segments, &media, &target_dir, &stem, mode,
+                            &segments,
+                            &media,
+                            &target_dir,
+                            &stem,
+                            mode,
                         )
                     })
                     .await;
@@ -3964,9 +4005,9 @@ impl MainWindow {
         // 收尾合并的冲突基线（S4）+ 文档代次（S1）：翻译要跑几分钟，这段时间里
         // 用户可能改了原文/手写译文，也可能直接切到别的工程。没有这两样，收尾
         // 就会把机翻结果盖到用户的手工劳动上，或写进另一个文档的库行。
-        let baseline = std::sync::Arc::new(
-            crate::app::state::TranslationBaseline::capture(&work_segments),
-        );
+        let baseline = std::sync::Arc::new(crate::app::state::TranslationBaseline::capture(
+            &work_segments,
+        ));
         let epoch_at_start = self.state.doc_epoch;
         let segments = work_segments;
         let target_lang = self.state.translate_target_lang.clone();

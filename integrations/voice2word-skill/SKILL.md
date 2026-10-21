@@ -103,7 +103,7 @@ voice2word --version
 | `-o` / `--output` | 路径 | 输出字幕文件路径 | 与输入同目录同名，扩展名随格式 |
 | `--format` | `srt`/`ass`/`vtt`/`json`/`txt`/`ttml`/`ttal` | 输出字幕格式，输入大小写不敏感 | `srt` |
 | `--lang` / `--language` | 语言代码，如 `zh`、`en` | 指定识别语言 | 取 `config.toml` 的 `pipeline.language`（示例配置为 `zh`） |
-| `--translate` | 目标语言，如 `en` | 翻译目标语言；无头模式当前仅记录该参数，翻译阶段未接线 | 不翻译 |
+| `--translate` | 目标语言，如 `en` | 翻译目标语言（离线 Qwen / 在线 API 均已接线） | 不翻译 |
 | `--model` | 模型文件路径 | 覆盖默认 Whisper 模型文件 | 配置文件中的默认模型 |
 | `--threads` | 正整数 | 推理线程数 | 取 `config.toml` 的 `pipeline.whisper_threads` |
 | `--polish` | 布尔标志，不取值 | 强制开启润色/标点 | 取 `config.toml` 的 `pipeline.enable_polish`（示例配置为 `false`） |

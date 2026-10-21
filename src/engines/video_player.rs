@@ -469,6 +469,31 @@ impl VideoPlayerEngine {
                 None
             }
         };
+        // ffplay 不可用 → **明确告知用户「预览没有声音」**，不要静默跳过。
+        //
+        // 此前这里只是 `None` 然后整条音频管线被跳过，只留一句没有上下文的 warn：
+        // 用户看到的是「视频能播但没声音」，完全不知道原因，也无从判断是不是自己
+        // 的机器有问题。
+        //
+        // 而 ffplay 缺失在真实客户机上并不罕见：官方的 ffplay.exe 是 **共享库构建**，
+        // 依赖同目录的 avcodec-62 / avformat-62 / avutil-60 / avdevice-62 / avfilter-11 /
+        // swresample-6 / swscale-9 这 7 个 DLL。安装包若只发 ffplay.exe 不发这些 DLL，
+        // 客户机上它会以 0xC0000135 秒退——而开发机上恰好有这些 DLL 在 PATH 上，
+        // 于是「本机好使、别人电脑不好使」。
+        if effective_ffplay.is_none() {
+            let msg = "未找到 ffplay：预览将没有声音。"
+                .to_string()
+                + "（ffplay 需要与 av*/sw* 系列 DLL 同目录；可在「性能设置 → 模型与组件」补齐 ffmpeg 组件）";
+            warn!("{msg}");
+            self.record_failure(PlaybackFailure {
+                path: video_path.display().to_string(),
+                stage: PlaybackStage::FramePipe,
+                hardware_error: None,
+                detail: "预览没有声音：未找到可用的 ffplay。"
+                    .to_string()
+                    + "请在「性能设置 → 模型与组件」中补齐 ffmpeg 组件（ffplay 需要同目录的 av*/sw* DLL）。",
+            });
+        }
 
         let safe_video = crate::utils::to_cli_safe_path(&video_path);
         if let Some(ref ffplay_bin) = effective_ffplay {

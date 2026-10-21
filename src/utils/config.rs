@@ -1753,7 +1753,16 @@ impl Default for AppConfig {
             pipeline: PipelineConfig {
                 language: "zh".to_string(),
                 output_format: "srt".to_string(),
-                enable_polish: false,
+                // 标点默认**开启**：CT-Transformer 是毫秒级操作，而「不带标点的字幕」
+                // 对用户几乎不可用（README 也明确写着「默认启用」）。
+                //
+                // 此前这里写的是 false，与 README、与仓库里被跟踪的 config.toml
+                // （enable_polish = true）都不一致。开发机一直有 config.toml，
+                // 本地看到的永远是 true；而**全新安装**的客户机若拿不到配置文件，
+                // 走的就是这个默认值 —— 于是「别人电脑上产出的字幕一个标点都没有」。
+                // 现在打包改用 --print-default-config 生成 config.toml，
+                // 这个默认值必须与文档一致。
+                enable_polish: true,
                 polish_mode: "punc".to_string(),
                 enable_vad: true,
                 whisper_threads: 16,
@@ -2032,8 +2041,28 @@ impl AppConfig {
             }
             parsed
         } else {
+            // 配置文件不存在：用默认值继续跑，**并尽力**把默认配置落盘。
+            //
+            // 为什么落盘失败不能阻断启动：这是一条非常典型的「本机好使、别人电脑
+            // 不好使」——开发机的项目根可写（默认配置第一次就被写下来了），
+            // 客户机可能把程序装在**只读目录**（Program Files、企业策略、U 盘只读、
+            // 或者从别的用户拷贝过来的目录）。此前 `save_to_file(...)?` 会把
+            // 「拒绝访问」一路冒泡到 `main`，程序**直接起不来**，只弹一个
+            // 「读取配置文件 config.toml」的错误框——而配置文件并不存在、也不是坏的。
+            //
+            // 现在：默认值照常生效（程序能跑），落盘失败只记一条 warn。
+            // 运行期数据（库 / 日志 / 缓存）本来就另有一轮「根目录不可写时的回退」
+            // 逻辑，配置文件不该比它们更脆弱。
             let default_cfg = Self::default();
-            default_cfg.save_to_file(&full_path)?;
+            if let Err(err) = default_cfg.save_to_file(&full_path) {
+                let hint = "配置文件不存在，已用内置默认值继续运行；但无法把它写入磁盘".to_string()
+                    + "（目录可能只读）。设置项在本次会话内仍可修改，但重启后会回到默认值。";
+                tracing::warn!(
+                    path = %full_path.display(),
+                    error = %format!("{err:#}"),
+                    "{hint}"
+                );
+            }
             default_cfg
         };
 
@@ -2344,6 +2373,55 @@ impl AppConfig {
         pick_app_root(candidates)
             .or_else(|| exe_dir.clone())
             .unwrap_or(cwd)
+    }
+
+    /// **可写的数据目录**：项目根不可写时的回退位置。
+    ///
+    /// 背景：程序可能被装在只读目录（Program Files、企业策略锁定、只读 U 盘、
+    /// 从别的用户拷贝过来的目录）。此前 `voice2word.db` 直接开在项目根，
+    /// 目录一不可写 SQLite 就报 `unable to open database file`，`main` 直接退出，
+    /// **用户连界面都看不到**——而错误文案只说「打开 SQLite 数据库失败」，
+    /// 完全指向不了真正的原因（目录只读）。
+    ///
+    /// 现在的策略：
+    /// 1. 项目根可写 → 库仍留在项目根（与历史行为一致，绿色版仍是「整个目录拷走」）；
+    /// 2. 项目根不可写 → 退到 `%LOCALAPPDATA%\Voice2Word`（每用户可写）；
+    /// 3. 还不成 → 退到 `%APPDATA%\Voice2Word`。
+    ///
+    /// 无论退到哪，**日志与缓存也一并跟着走**（见 `writable_data_dir`），
+    /// 免得出现「库在 A 处、日志在 B 处」这种更难排查的分裂。
+    pub fn writable_data_dir() -> PathBuf {
+        let root = Self::app_root_dir();
+        if Self::dir_is_writable(&root) {
+            return root;
+        }
+        for base in [
+            std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+            std::env::var_os("APPDATA").map(PathBuf::from),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let candidate = base.join("Voice2Word");
+            if std::fs::create_dir_all(&candidate).is_ok() && Self::dir_is_writable(&candidate) {
+                return candidate;
+            }
+        }
+        // 全部不可写：仍返回项目根，让调用方拿到一条明确的「目录不可写」错误，
+        // 而不是悄悄落到某个随机位置。
+        root
+    }
+
+    /// 目录是否可写：真正落一个探针文件再删掉（只看权限位不准，ACL 才是准的）。
+    pub fn dir_is_writable(dir: &Path) -> bool {
+        let probe = dir.join(".v2w_write_probe");
+        match std::fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// 解析相对路径为相对于项目根目录的绝对路径
@@ -3444,6 +3522,46 @@ gpu_limit_percent = 60
             .unwrap_or_else(|| panic!("候选里应含 {}: {candidates:?}", needle.display()))
     }
 
+    /// `dir_is_writable` 必须**真的落一个探针文件**再删掉，不能只看权限位：
+    /// Windows 上 ACL 才是准的，只看只读属性位会误判。
+    #[test]
+    fn dir_is_writable_probes_the_filesystem() {
+        let dir = plain_dir("probe");
+        assert!(
+            super::AppConfig::dir_is_writable(&dir),
+            "普通临时目录应当可写"
+        );
+        // 不存在的目录不可写。
+        let missing = dir.join("nope").join("deeper");
+        assert!(!super::AppConfig::dir_is_writable(&missing));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 配置文件不存在时，**落盘失败不得阻断启动**。
+    ///
+    /// 这是一条典型的「本机好使、别人电脑不好使」：开发机的项目根可写，
+    /// 客户机可能把程序装在只读目录（Program Files、企业策略、只读 U 盘）。
+    /// 此前 `save_to_file(...)?` 会把「拒绝访问」一路冒泡到 `main`，
+    /// 程序**直接起不来**，只弹一个「读取配置文件 config.toml」的错误框——
+    /// 而配置文件并不存在、也不是坏的。
+    #[test]
+    fn missing_config_falls_back_to_defaults_when_unwritable() {
+        // 造一个「存在但一定不是目录」的路径，让写文件必然失败。
+        let blocker = plain_dir("cfg_blocker");
+        let not_a_dir = blocker.join("i_am_a_file");
+        std::fs::write(&not_a_dir, b"x").expect("write");
+        let config_path = not_a_dir.join("config.toml");
+
+        // 配置文件不存在 → 走「用默认值 + 尝试落盘」那条路。
+        let cfg = super::AppConfig::load_from_file(&config_path)
+            .expect("配置文件缺失且无法落盘时，必须仍能返回默认配置");
+        assert_eq!(
+            cfg.paths.ffmpeg, "tools/ffmpeg.exe",
+            "必须回落到内置默认路径"
+        );
+
+        let _ = std::fs::remove_dir_all(&blocker);
+    }
     /// 候选顺序即优先级：环境变量 > 清单目录 > exe 目录及祖先 > cwd 及祖先。
     #[test]
     fn root_candidates_order_is_env_manifest_exe_cwd() {

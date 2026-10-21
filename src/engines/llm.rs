@@ -377,7 +377,11 @@ pub(crate) fn classify_retry_outcome(source: &str, translation: &str) -> RetryVe
     match validate_translation(source, translation) {
         RewriteVerdict::Ok => RetryVerdict::Accept,
         RewriteVerdict::Echo => RetryVerdict::RejectCopy,
-        RewriteVerdict::Empty | RewriteVerdict::SuspectTooDifferent => RetryVerdict::RejectOther,
+        // 数字丢失归入「其它不合格」：保持未译（绝不把丢了数字的译文写进成品），
+        // 但**不**计入复制率——那不是「模型没干活」，而是「模型干了但干错了」。
+        RewriteVerdict::Empty
+        | RewriteVerdict::SuspectTooDifferent
+        | RewriteVerdict::NumberMismatch => RetryVerdict::RejectOther,
     }
 }
 
@@ -480,6 +484,9 @@ pub(crate) enum RewriteVerdict {
     Empty,
     /// 与原句几乎完全相同——模型没干活（翻译场景则是复制原文）。
     Echo,
+    /// 译文**丢了原文里的数字**：数字/公式/编号是字幕的硬信息，
+    /// 错了对观众就是硬伤，而长度比 / 相似度都发现不了。
+    NumberMismatch,
 }
 
 /// 校验自愈的统计，供上层提示与日志；字段名即上层可直接读取的口径。
@@ -598,6 +605,108 @@ pub(crate) fn validate_rewrite(original: &str, rewritten: &str) -> RewriteVerdic
 /// 表现为**长度失控**（一句扩写成一段 / 长句压成两个字），复制原文则表现为相似度
 /// 接近 1。三段判定与 [`is_untranslated_copy`] 的守卫同口径（短句、纯拉丁放行），
 /// 保证「OK→OK」「1.3→1.3」这类本就该原样保留的句子不被误伤。
+/// 从一段文本里抽出「数字 token」（含小数、负号、千分位）。
+///
+/// 用途：比对**原文与译文的数字集合**。数字是字幕的硬信息（公式、编号、金额、
+/// 年份），模型把「3 个」译成「三个」、把「2024」译成「2023」，长度比与相似度
+/// **都发现不了**，而用户对这类错误零容忍（观众直接看到错的数字）。
+///
+/// 只抽阿拉伯数字形态：`123` / `1.5` / `-2` / `1,234` / `3.14`。
+/// 中文数字（三、十二）与英文单词（three）**不抽**：
+/// - 中文数字在翻译里本来就可能变成阿拉伯数字（「三个」→「3」是正确翻译）；
+/// - 英文单词形态千变万化（three / three-hundred），抽了只会制造误报。
+fn extract_numbers(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        // 数字起始：数字本身，或前面紧跟负号/小数点
+        let prev_is_alnum = i > 0 && chars[i - 1].is_alphanumeric();
+        let starts_number = c.is_ascii_digit()
+            || ((c == '-' || c == '+' || c == '.')
+                && i + 1 < chars.len()
+                && chars[i + 1].is_ascii_digit()
+                && !prev_is_alnum);
+        if !starts_number {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        // 允许前置符号与小数点
+        if c == '-' || c == '+' {
+            i += 1;
+        }
+        let mut seen_digit = false;
+        let mut seen_dot = false;
+        while i < chars.len() {
+            let d = chars[i];
+            if d.is_ascii_digit() {
+                seen_digit = true;
+                i += 1;
+            } else if d == '.' && !seen_dot && seen_digit {
+                seen_dot = true;
+                i += 1;
+            } else if d == ',' && seen_digit && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()
+            {
+                // 千分位逗号：只有后面还跟数字才当作分隔符，
+                // 否则「句末的逗号」会被吞进数字里。
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if seen_digit {
+            out.push(chars[start..i].iter().collect::<String>());
+        } else {
+            i = start + 1;
+        }
+    }
+    out
+}
+
+/// 译文是否**丢了原文里的数字**。
+///
+/// 判据：原文里的每个数字 token，在译文里必须**至少出现一次**。
+/// 允许译文的数字集合是原文的**超集**（模型多写了数字通常不是错误，
+/// 而「多」这种情况在翻译里几乎不会出现）。
+///
+/// 设计约束（避免误伤）：
+/// - 原文**没有数字**时恒为 false（不判）；
+/// - 原文只有**一个**数字时也放行：单个数字被改写的风险与误报风险同量级，
+///   而「1.3」「2024」这类数字在句子里常被模型顺带调整个小数位，误报代价大；
+/// - 数字 token 按**去掉千分位逗号**后的形式比对（`1,234` 与 `1234` 等价）；
+/// - 纯符号前缀（`-`、`+`）不参与比对（`-2` 与 `2` 在字幕里往往等价）。
+pub(crate) fn translation_drops_numbers(source: &str, translation: &str) -> bool {
+    let src_nums = extract_numbers(source);
+    if src_nums.len() < 2 {
+        return false;
+    }
+    let dst_nums: Vec<f64> = extract_numbers(translation)
+        .into_iter()
+        .filter_map(|n| n.replace(',', "").parse::<f64>().ok())
+        .collect();
+    if dst_nums.is_empty() {
+        // 译文里一个数字都没有：原文有 2 个以上数字时几乎必然是丢了。
+        return true;
+    }
+    // 按**数值**比对而不是按字符串：`2` 与 `2.0` 是同一个数，模型把「2」写成
+    // 「2.0」是正常翻译，不该判成丢数字。
+    let mut missing = Vec::new();
+    for n in src_nums.iter() {
+        let Ok(v) = n.replace(',', "").parse::<f64>() else {
+            // 解析不了的（理论上不该有）按原样字符串比对。
+            if !dst_nums.iter().any(|d| d.to_string() == *n) {
+                missing.push(n.clone());
+            }
+            continue;
+        };
+        if !dst_nums.iter().any(|d| (d - v).abs() < 1e-9) {
+            missing.push(n.clone());
+        }
+    }
+    !missing.is_empty()
+}
 pub(crate) fn validate_translation(source: &str, translation: &str) -> RewriteVerdict {
     if translation.trim().is_empty() {
         return RewriteVerdict::Empty;
@@ -624,6 +733,15 @@ pub(crate) fn validate_translation(source: &str, translation: &str) -> RewriteVe
         if ratio > TRANSLATION_MAX_EXPANSION || ratio < TRANSLATION_MIN_EXPANSION {
             return RewriteVerdict::SuspectTooDifferent;
         }
+    }
+    // ④ 数字丢失：原文的数字在译文里找不到。
+    //
+    // 这一条此前**完全没有防护**：提示词里写了「数字、公式、变量名原样保留」，
+    // 但那只是一句约束，模型不遵守时没有任何机制发现——长度比正常、相似度正常、
+    // 术语检查也不管数字，于是「3 个」被译成「三个」或编号被改掉，一路写进成品字幕。
+    // 数字错乱对观众是硬伤，且用户完全无从察觉。
+    if translation_drops_numbers(source, translation) {
+        return RewriteVerdict::NumberMismatch;
     }
     RewriteVerdict::Ok
 }
@@ -1509,7 +1627,9 @@ impl LLMEngine {
                     }
                 }
                 RewriteVerdict::Empty => stats.empty += 1,
-                RewriteVerdict::SuspectTooDifferent => {
+                // 数字丢失与「改动过大」同处理：走反思重试（要求把数字改回来），
+                // 反思后仍不合格则回退，绝不写回。
+                RewriteVerdict::SuspectTooDifferent | RewriteVerdict::NumberMismatch => {
                     suspects.push((index, original, text));
                 }
             }
@@ -1791,8 +1911,17 @@ impl LLMEngine {
             let mut copy_candidates: Vec<usize> = Vec::new();
             // 「改动过大」的可疑句（长度失控 / 语义漂移）：先反思重试一次，仍不合格才留空。
             let mut suspect_candidates: Vec<usize> = Vec::new();
-            copy.checked += chunk.len();
-            // 校验口径与润色链路一致：`checked` = 本批实际产出、送交校验的条数。
+            // 分母口径：`checked` = 本批**实际产出**的条数，不是送出去的条数。
+            //
+            // 此前这里是 `copy.checked += chunk.len()`（送出的条数），而 `heal.checked`
+            // 用的是 `results.len()`（产出的条数）——两者口径不一致，后果很具体：
+            // 模型只译出了一半时，复制率的分母被撑大、比率被稀释，于是
+            // `is_alarming()`（>50% 且 `checked >= 4`）可能**永远不触发**。
+            // 「模型整篇复制原文」恰恰是最该被拦下的失败模式，却因为分母算错而被漏报。
+            //
+            // 现在两个计数都用「实际产出条数」：模型只吐了一半，分母也只有一半，
+            // 复制率如实反映「产出里的多少是复制」。
+            copy.checked += results.len();
             heal.checked += results.len();
             for &pos in &chunk {
                 match results.get(&segments[pos].index) {
@@ -1808,7 +1937,9 @@ impl LLMEngine {
                                 copy_candidates.push(pos);
                                 missed.push(pos);
                             }
-                            RewriteVerdict::SuspectTooDifferent => {
+                            // 数字丢失：与「改动过大」同样走反思重试，绝不写回丢了数字的译文。
+                            RewriteVerdict::SuspectTooDifferent
+                            | RewriteVerdict::NumberMismatch => {
                                 suspect_candidates.push(pos);
                             }
                             // Empty：解析后基本不会出现（空正文已被解析器拒收），
@@ -2483,13 +2614,13 @@ mod tests {
     use super::{
         batch_char_budget, chinese_variant_target, clamp_ctx_size, clamp_threads,
         classify_retry_outcome, cli_stderr_reports_limit, cli_wait_budget,
-        count_untranslated_copies, drop_truncated_tail, fit_glossary_to_context,
+        count_untranslated_copies, drop_truncated_tail, extract_numbers, fit_glossary_to_context,
         fixed_overhead_exceeds_window, fixed_prompt_tokens, glossary_entry_count,
         is_untranslated_copy, llama_stop_type_is_limit, output_token_budget,
-        plan_translate_batches, similarity, trim_glossary_to_tokens, validate_rewrite,
-        validate_translation, CopyRate, LLMEngine, RetryVerdict, RewriteVerdict, MAX_LLM_THREADS,
-        MAX_SEGMENTS_PER_BATCH, MIN_BATCH_CHARS, MIN_LLM_THREADS, OUTPUT_TOKENS_PER_CHAR,
-        PROMPT_HINT_TOKENS, PROMPT_TOKENS_PER_CHAR,
+        plan_translate_batches, similarity, translation_drops_numbers, trim_glossary_to_tokens,
+        validate_rewrite, validate_translation, CopyRate, LLMEngine, RetryVerdict, RewriteVerdict,
+        MAX_LLM_THREADS, MAX_SEGMENTS_PER_BATCH, MIN_BATCH_CHARS, MIN_LLM_THREADS,
+        OUTPUT_TOKENS_PER_CHAR, PROMPT_HINT_TOKENS, PROMPT_TOKENS_PER_CHAR,
     };
     use crate::subtitle::Segment;
     use std::collections::{HashMap, HashSet};
@@ -3340,6 +3471,82 @@ mod tests {
         // 短句 / 纯数字：本就该原样保留，不得误判为「没干活」
         assert_eq!(validate_translation("OK", "OK"), RewriteVerdict::Ok);
         assert_eq!(validate_translation("1.3", "1.3"), RewriteVerdict::Ok);
+    }
+
+    /// 数字一致性：原文里的数字在译文里必须找得到。
+    ///
+    /// 这一条此前完全没有防护——提示词里的「数字原样保留」只是一句约束，
+    /// 模型不遵守时长度比 / 相似度 / 术语检查都发现不了，错了直接进成品字幕。
+    #[test]
+    fn translation_dropping_numbers_is_detected() {
+        // 典型场景：模型把「3 个」写成「三个」，或把编号改掉。
+        assert_eq!(
+            validate_translation(
+                "这里有 3 个变量和第 2 条结论",
+                "这里有 3 个变量和第 5 条结论"
+            ),
+            RewriteVerdict::NumberMismatch,
+        );
+        // 译文里一个数字都没有：原文有 2 个以上数字时几乎必然是丢了。
+        assert_eq!(
+            validate_translation("从 2023 到 2024", "from twenty twenty-three"),
+            RewriteVerdict::NumberMismatch
+        );
+        // 正常翻译：数字都在 → 放行。
+        assert_eq!(
+            validate_translation(
+                "这里有 3 个变量和第 2 条结论",
+                "There are 3 variables and conclusion 2"
+            ),
+            RewriteVerdict::Ok
+        );
+        // 原文没有数字 → 一律不判。
+        assert_eq!(
+            validate_translation("一句没有数字的话", "A sentence without numbers"),
+            RewriteVerdict::Ok
+        );
+        // 原文只有 1 个数字 → 放行（误报风险与漏报风险同量级）。
+        assert_eq!(
+            validate_translation("概率是 0.5", "probability is 0.7"),
+            RewriteVerdict::Ok
+        );
+    }
+
+    /// 数字抽取的边界：千分位、小数、负号、句末逗号、纯符号。
+    #[test]
+    fn extract_numbers_handles_edge_cases() {
+        assert_eq!(extract_numbers("1,234 and 3.14"), vec!["1,234", "3.14"]);
+        assert_eq!(extract_numbers("-2 plus 5"), vec!["-2", "5"]);
+        // 句末的逗号不是千分位分隔符，不该被吞进数字。
+        assert_eq!(extract_numbers("共 12 个,"), vec!["12"]);
+        // 版本号 v1.2.3 含两个数字（1.2 与 3）——按数字集合比对才正确：
+        assert!(extract_numbers("没有数字").is_empty());
+    }
+
+    /// 数值相等但写法不同（2 与 2.0）→ 不算丢失。
+    #[test]
+    fn number_comparison_is_numeric_not_string() {
+        assert!(!translation_drops_numbers(
+            "系数是 2，第 3 项",
+            "the coefficient is 2.0, item 3"
+        ));
+        // 但把 3 改成 30 就是真丢了。
+        assert!(translation_drops_numbers(
+            "系数是 2，第 3 项",
+            "the coefficient is 2.0, item 30"
+        ));
+    }
+    /// 千分位写法不同但数值相同 → 不算丢失。
+    #[test]
+    fn number_comparison_ignores_thousands_separators() {
+        assert!(!translation_drops_numbers(
+            "一共有 1,200 个样本",
+            "there are 1200 samples"
+        ));
+        assert!(translation_drops_numbers(
+            "一共有 1,200 个样本和 37 个类别",
+            "there are 1200 samples"
+        ));
     }
 
     /// 回退与统计：可疑句被剔除、Echo 在润色场景被采纳，计数准确。

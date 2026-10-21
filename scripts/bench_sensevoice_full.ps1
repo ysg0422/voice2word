@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   全片 SenseVoice 转写 + SRT 导出，供 examples/eval_gold.rs 算全片 CER。
 

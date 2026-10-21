@@ -20,7 +20,9 @@ use super::sensevoice::{provider_fallback_notice, stderr_provider_fallback, Prov
 // 取消强杀与 PID 登记复用 whisper 引擎那一套（SenseVoice 也是同一个复用点）：
 // 登记表按「PID + 唯一序号」记账，子进程被 `wait()` 回收后立刻摘行，`cancel()` 只对着
 // 「尚未回收」的名单强杀，因此不存在拿一个已归还系统的 PID 去误杀无关进程的可能。
-use super::whisper::{take_live_pids, ChildEntry, ChildPidGuard};
+#[cfg(windows)]
+use super::whisper::taskkill_program;
+use super::whisper::{live_child_pids, ChildEntry, ChildPidGuard};
 
 // ───────────────────────── 线程数夹取 ─────────────────────────
 
@@ -52,6 +54,15 @@ fn clamp_threads(threads: u32) -> u32 {
 /// 与 `llm.rs::cli_wait_budget` 同思路：命令行路径没有读超时，上限必须自己带。
 const PUNC_WAIT_BUDGET: Duration = Duration::from_secs(300);
 
+/// 【停滞看门狗】进程仍活着、但**连续没有任何输出**达到该时长 ⇒ 判定卡死。
+///
+/// 为什么不只靠 `PUNC_WAIT_BUDGET`（总时长上限）：它拦得住「跑太久」，拦不住
+/// 「早就卡住了却还在等预算耗尽」——onnxruntime 死锁、驱动挂起、管道互等都属于后者。
+/// 此时界面会一直停在「极速标点」，用户唯一出口是关掉应用。
+///
+/// 判据只能是「停滞」，绝不能是「总耗时」。与 `whisper.rs::WHISPER_STALL_BUDGET`、
+/// `sensevoice.rs::SV_STALL_BUDGET` 同为 300s——三个引擎此前只有 whisper 有这道防线。
+pub(crate) const PUNC_STALL_BUDGET: Duration = Duration::from_secs(300);
 /// 有界等待的轮询间隔：50ms 是「取消/超时的响应延迟」与「空转开销」的折中
 /// （与 `llm.rs` 的命令行等待循环取同一个值）。
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -74,6 +85,8 @@ enum WaitOutcome {
     TimedOut,
     /// `try_wait` 本身报错（句柄异常），不能死循环。
     WaitFailed,
+    /// 进程仍存活但**连续无输出**达到停滞预算 ⇒ 判定卡死，已强杀进程树。
+    Stalled,
 }
 
 /// 本次轮询是否该退出等待；`None` = 继续等。
@@ -97,11 +110,32 @@ fn wait_outcome(cancelled: bool, past_deadline: bool) -> Option<WaitOutcome> {
 /// 为了让三条出口都能在单测里用真实子进程 + 极小预算跑一遍，不必等满 [`PUNC_WAIT_BUDGET`]，
 /// 也不必依赖 python 与模型文件。本函数**不**负责杀进程与收尸：那是调用方的事
 /// （先 kill 再 wait），这样「谁在什么时候强杀」在调用点一眼可见。
+#[cfg_attr(not(test), allow(dead_code))]
 fn wait_for_child<F>(
     child: &mut Child,
     budget: Duration,
     poll: Duration,
     cancelled: F,
+) -> (WaitOutcome, Option<ExitStatus>)
+where
+    F: Fn() -> bool,
+{
+    wait_for_child_with_stall(child, budget, poll, cancelled, None)
+}
+
+/// 带**停滞看门狗**的有界等待。
+///
+/// `stall_tracker` 给出「最后一次收到输出」的时间戳；进程仍活着、但距那次输出已超过
+/// [`PUNC_STALL_BUDGET`] ⇒ 判定卡死（`WaitOutcome::Stalled`），由调用方强杀进程树。
+///
+/// 为什么不能只靠总时长预算：它拦得住「跑太久」，拦不住「早就卡住了却还在等预算耗尽」。
+/// 判据是「停滞」不是「总耗时」。
+fn wait_for_child_with_stall<F>(
+    child: &mut Child,
+    budget: Duration,
+    poll: Duration,
+    cancelled: F,
+    stall_tracker: Option<&Arc<std::sync::Mutex<Instant>>>,
 ) -> (WaitOutcome, Option<ExitStatus>)
 where
     F: Fn() -> bool,
@@ -115,6 +149,18 @@ where
                 // 等待本身出错（句柄异常）时不能死循环：按失败处理，由调用方强杀回收。
                 warn!(error = %err, "等待标点子进程失败，终止该进程");
                 return (WaitOutcome::WaitFailed, None);
+            }
+        }
+        // 停滞看门狗：进程还活着，但已经很久没有任何输出了。
+        if let Some(tracker) = stall_tracker {
+            let last = *tracker.lock().unwrap_or_else(|e| e.into_inner());
+            if Instant::now().saturating_duration_since(last) >= PUNC_STALL_BUDGET {
+                warn!(
+                    pid = child.id(),
+                    budget_secs = PUNC_STALL_BUDGET.as_secs(),
+                    "CT-Punc 连续无输出达到停滞预算，判定卡死，强制终止进程树"
+                );
+                return (WaitOutcome::Stalled, None);
             }
         }
         // 判定抽成纯函数：让「取消优先于超时」这条语义能被单测直接钉住。
@@ -147,13 +193,33 @@ fn missing_index_count(segments: &[Segment], map: &HashMap<usize, String>) -> us
 ///
 /// 管道缓冲区只有几十 KB：没人读的话，子进程写满就阻塞在 write 上，而父进程又在
 /// 等它退出——双方一起卡死（在「有界等待」下会被误判成 runner 挂住而强杀）。
+/// 起一个后台线程把子进程管道抽干，返回线程句柄；`None` = 该管道没有被 pipe。
+///
+/// `activity` 是停滞看门狗的时间戳：管道**每读到一块数据**就刷新一次。
+/// runner 在正常工作时至少会往 stderr 写启动日志，因此「长时间一个字节都没有」
+/// 才是可信的卡死信号。
 fn drain_pipe<P: Read + Send + 'static>(
     pipe: Option<P>,
+    activity: Option<Arc<std::sync::Mutex<Instant>>>,
 ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
     pipe.map(|mut p| {
         std::thread::spawn(move || {
             let mut buf: Vec<u8> = Vec::new();
-            let _ = p.read_to_end(&mut buf);
+            let mut chunk = [0u8; 8192];
+            loop {
+                match p.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Some(tracker) = activity.as_ref() {
+                            if let Ok(mut t) = tracker.lock() {
+                                *t = Instant::now();
+                            }
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    Err(_) => break,
+                }
+            }
             buf
         })
     })
@@ -174,6 +240,8 @@ pub enum PuncStageError {
     Cancelled,
     /// 超过 [`PUNC_WAIT_BUDGET`] 仍未退出，已强杀。
     TimedOut,
+    /// 进程仍存活但连续无输出达到 [`PUNC_STALL_BUDGET`]，判定卡死，已强杀。
+    Stalled,
 }
 
 impl std::fmt::Display for PuncStageError {
@@ -181,6 +249,7 @@ impl std::fmt::Display for PuncStageError {
         match self {
             Self::Cancelled => write!(f, "标点阶段已被用户取消"),
             Self::TimedOut => write!(f, "标点引擎超时，已终止；字幕保持未标点"),
+            Self::Stalled => write!(f, "标点引擎长时间无输出，已判定卡死并终止；字幕保持未标点"),
         }
     }
 }
@@ -206,35 +275,6 @@ fn kill_process_tree(pid: u32) {
     #[cfg(not(windows))]
     {
         let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
-    }
-}
-
-/// 强杀时使用的 `taskkill` 程序路径（Windows）。
-///
-/// 为什么不裸用 `Command::new("taskkill")`：Windows 创建进程时的搜索顺序把**当前目录**
-/// 排在系统目录之前，应用目录里被塞一个同名 `taskkill.exe`，就会在用户点「终止」时
-/// 被执行。这里优先用 `%SystemRoot%\System32\taskkill.exe`，只有它确实不存在时才回退
-/// PATH 查找。与 whisper 引擎的 `kill_process_tree` 同一套加固口径（那边是模块私有函数，
-/// 无法跨模块复用）。
-#[cfg(windows)]
-fn taskkill_program() -> String {
-    let candidate = taskkill_program_from(std::env::var("SystemRoot").ok().as_deref());
-    if Path::new(&candidate).is_file() {
-        candidate
-    } else {
-        "taskkill".to_string()
-    }
-}
-
-/// [`taskkill_program`] 的纯函数部分：只做路径拼装，便于单测（不读环境变量、不碰文件系统）。
-#[cfg(windows)]
-fn taskkill_program_from(system_root: Option<&str>) -> String {
-    match system_root.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(root) => format!(
-            "{}\\System32\\taskkill.exe",
-            root.trim_end_matches(['\\', '/'])
-        ),
-        None => "taskkill".to_string(),
     }
 }
 
@@ -383,12 +423,15 @@ impl PunctuationEngine {
 
     /// 用户请求终止：置位取消标志并强杀正在运行的标点 runner 子进程。
     ///
-    /// 只杀 [`take_live_pids`] 交回的「尚未回收」PID：已被 `wait()` 回收的进程会在
+    /// 只杀「尚未回收」的 PID：已被 `wait()` 回收的进程会在
     /// `wait()` 返回处就被 [`ChildPidGuard::disarm`] 摘掉，因此这里不会对着一个
     /// 已归还系统、可能被复用给无关进程的号码发信号。
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
-        for pid in take_live_pids(&self.active_children) {
+        // 快照而非 drain：drain 让「取消」变成一次性动作，用户连点两次「终止」时第二次
+        // 拿到空名单，第一次的 taskkill 若因竞态/权限没杀掉子进程，用户就再没有第二次机会
+        // （界面表现是「点了终止，转写照跑」）。whisper 引擎此前已改成快照，这里对齐。
+        for pid in live_child_pids(&self.active_children) {
             kill_process_tree(pid);
         }
     }
@@ -408,7 +451,7 @@ impl PunctuationEngine {
     /// 登记 runner PID，并回报「登记这一刻取消是否已经到达」。
     ///
     /// 收口 `cancel()` 与「刚 `spawn()`、尚未登记」之间的竞态：`cancel()` 先置位取消
-    /// 标志，再 `take_live_pids()` 取名单强杀；若它恰好插在 `spawn()` 成功与本次登记
+    /// 标志，再取**快照**强杀；若它恰好插在 `spawn()` 成功与本次登记
     /// 之间，登记表里还没有这一行，那一发信号就丢了，runner 会一直跑到自己结束。
     /// `cancel()` 的置位与本次复查都是 SeqCst，而 drain 与 register 又在同一把 Mutex
     /// 下互斥：drain 没看到本行 ⇒ drain 早于 register ⇒ 置位早于 register ⇒ 此处复查
@@ -431,11 +474,22 @@ impl PunctuationEngine {
         }
 
         if !self.is_available() {
+            // 缺模型 → **报错**，不假装成功。
+            //
+            // 此前这里是 `return Ok(segments)`：调用方看到「成功」，于是把没标点的字幕
+            // 当成正常产物收尾，用户拿到一份**整段没有标点**的字幕却没有任何提示——
+            // 静音降级里最不该的一种（结果是「坏的」，不是「慢一点」）。
+            //
+            // 现在返回可辨识的错误：管线据此把「标点不可用」如实写进性能报告与进度提示，
+            // 字幕仍然保留识别原文继续收尾（不丢工作），但用户看得到原因。
             warn!(
-                "CT-Punc 模型或脚本未就绪: {:?}, 跳过极速标点",
-                self.model_path
+                model = %self.model_path.display(),
+                "CT-Punc 模型或脚本未就绪，无法标点"
             );
-            return Ok(segments);
+            anyhow::bail!(
+                "标点模型未就绪（{}）：无法恢复标点，字幕将保持识别原文。请在「性能设置 → 模型与组件」中下载 CT-Punc 标点模型。",
+                self.model_path.display()
+            );
         }
 
         if let Some(ref cb) = progress_cb {
@@ -505,7 +559,7 @@ impl PunctuationEngine {
             self.register_child(reaper.child_mut().id());
         if cancelled_before_register {
             // cancel() 恰好插在 spawn() 成功与上面的登记之间：那会儿表里还没有本行，
-            // take_live_pids() 拿到空名单，这一发强杀信号就丢了。register_child 的
+            // 快照拿到空名单，这一发强杀信号就丢了。register_child 的
             // SeqCst 复查保证此处必然命中。此刻句柄仍在，PID 不可能被系统复用。
             kill_process_tree(reaper.child_mut().id());
         }
@@ -519,8 +573,13 @@ impl PunctuationEngine {
         // 工作的 runner」。读线程负责抽干。抽干必须排在写 stdin 之前：runner 收尾会把
         // 捕获到的原生日志一次性回灌 stderr，无人读时它写满管道就阻塞，而我们还可能在
         // 写 stdin——父子互等，超时预算根本没机会启动。
-        let stdout_reader = drain_pipe(reaper.child_mut().stdout.take());
-        let stderr_reader = drain_pipe(reaper.child_mut().stderr.take());
+        // 停滞看门狗的活动时间戳：管道每读到一块数据就刷新。
+        let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let stdout_reader = drain_pipe(reaper.child_mut().stdout.take(), None);
+        let stderr_reader = drain_pipe(
+            reaper.child_mut().stderr.take(),
+            Some(last_activity.clone()),
+        );
 
         // stdin 写入同样必须离开本线程：Windows 管道容量只有 64KB，而 runner 是
         // `import sherpa_onnx` + 建好标点会话（见 tools/punc_runner.py）之后才读 stdin。
@@ -544,11 +603,12 @@ impl PunctuationEngine {
         // 永不返回，`spawn_blocking` 也就永不返回，界面永远停在「极速标点」，
         // 唯一出口是关掉应用。
         let child_pid = reaper.child_mut().id();
-        let (outcome, status) = wait_for_child(
+        let (outcome, status) = wait_for_child_with_stall(
             reaper.child_mut(),
             PUNC_WAIT_BUDGET,
             WAIT_POLL_INTERVAL,
             || self.is_cancelled(),
+            Some(&last_activity),
         );
 
         let mut child = reaper.take();
@@ -582,6 +642,16 @@ impl PunctuationEngine {
             WaitOutcome::Cancelled => {
                 info!("CT-Punc 标点已取消，字幕保持未标点");
                 return Err(anyhow::Error::new(PuncStageError::Cancelled));
+            }
+            WaitOutcome::Stalled => {
+                // 卡死（连续无输出）与超时同性质：必须明确告警，而不是按退出码
+                // 归因成「依赖没装好」（误导）。
+                warn!(
+                    seconds = PUNC_STALL_BUDGET.as_secs(),
+                    stderr = %truncate_stderr(&stderr_raw, STDERR_LOG_MAX_CHARS),
+                    "CT-Punc 连续无输出达到停滞预算，已强杀；字幕保持未标点"
+                );
+                return Err(anyhow::Error::new(PuncStageError::Stalled));
             }
             WaitOutcome::TimedOut => {
                 // 带上 runner 最后的 stderr（截断展示）：排查时能看出它卡在哪一步——
@@ -695,6 +765,7 @@ impl PunctuationEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::whisper::take_live_pids;
     #[cfg(target_os = "windows")]
     use std::time::{Duration, Instant};
 
@@ -907,9 +978,18 @@ mod tests {
             "cancel() 必须强杀在册子进程，而不是等它自己跑完"
         );
         assert!(engine.is_cancelled());
+        // cancel() 取的是**快照**而不是 drain：登记表里的行**不会**被取走。
+        //
+        // 这正是「终止可重复」的关键：drain 语义下用户连点两次「终止转写」，第二次
+        // 拿到空名单——如果第一次的 taskkill 因为竞态/权限没杀掉子进程，用户就再没有
+        // 第二次机会，界面表现是「点了终止，转写照跑」。
+        //
+        // 行本身由 `ChildPidGuard` 在 `child.wait()` 返回处（以及守卫 Drop 时）摘掉，
+        // 所以「已回收的进程不会被重复强杀」这条保证并没有削弱——快照里不会出现
+        // 「PID 已归还系统、可能被复用给无关进程」的条目。
         assert!(
-            take_live_pids(&engine.active_children).is_empty(),
-            "cancel() 取走名单后登记表必须为空，避免重复强杀同一个 PID"
+            !take_live_pids(&engine.active_children).is_empty(),
+            "cancel() 只取快照、不清表：登记表里的行留给 ChildPidGuard 摘除"
         );
     }
 
@@ -995,19 +1075,22 @@ mod tests {
     #[test]
     fn taskkill_path_prefers_system32() {
         assert_eq!(
-            taskkill_program_from(Some("C:\\Windows")),
+            crate::engines::whisper::taskkill_program_from(Some("C:\\Windows")),
             "C:\\Windows\\System32\\taskkill.exe"
         );
         assert_eq!(
-            taskkill_program_from(Some("C:\\Windows\\")),
+            crate::engines::whisper::taskkill_program_from(Some("C:\\Windows\\")),
             "C:\\Windows\\System32\\taskkill.exe",
             "尾部反斜杠不得拼出双反斜杠"
         );
         assert_eq!(
-            taskkill_program_from(Some("  ")),
+            crate::engines::whisper::taskkill_program_from(Some("  ")),
             "taskkill",
             "SystemRoot 为空白时必须回退 PATH 查找"
         );
-        assert_eq!(taskkill_program_from(None), "taskkill");
+        assert_eq!(
+            crate::engines::whisper::taskkill_program_from(None),
+            "taskkill"
+        );
     }
 }

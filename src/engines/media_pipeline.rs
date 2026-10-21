@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tracing::{info, warn};
 
-use crate::engines::ffmpeg::{run_with_deadline, SUBPROCESS_LONG_TIMEOUT, SUBPROCESS_TIMEOUT};
+use crate::engines::ffmpeg::{run_with_deadline, SUBPROCESS_TIMEOUT};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderBackend {
@@ -441,6 +441,12 @@ pub struct ProxyManager {
     /// 一条刚转完的结果，不会再重复转一遍。
     in_flight: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     height_cache: Mutex<HashMap<PathBuf, (FileSignature, Option<u32>)>>,
+    /// 源素材时长缓存：路径 → (文件签名, 时长秒)。
+    ///
+    /// 只为**代理转码的预算缩放**服务：预算必须与素材时长成正比，否则长素材
+    /// 必然超时（见 `run_proxy`）。探测用 `ffmpeg -i`，有 120 秒截止期；
+    /// 按文件签名缓存，重复请求不会重复起进程。
+    duration_cache: Mutex<HashMap<PathBuf, (FileSignature, Option<f64>)>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,6 +498,7 @@ impl ProxyManager {
             hwaccel,
             in_flight: Mutex::new(HashMap::new()),
             height_cache: Mutex::new(HashMap::new()),
+            duration_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -678,6 +685,14 @@ impl ProxyManager {
     /// 后台线程抽干管道），本文件不再写第二套「轮询 + kill」：过去这里是裸的
     /// `cmd.status()`，没有任何上界，坏素材会让转码线程永远挂住、UI 一直转圈。
     /// 转码耗时与素材时长成正比，因此用长任务截止期（600 秒）而不是探测用的 120 秒。
+    ///
+    /// **但 600 秒是与素材时长无关的固定值**：2 小时 4K 素材转 720p 约需 20~40 分钟
+    /// （1200~2400 秒），必然被 kill；回退链再跑一次软解（同样超时），最终
+    /// `ensure_proxy` 报错、UI 回退播原片——也就是「长素材在无 GPU 机器上永远拿不到代理」。
+    ///
+    /// 现在按**源时长线性缩放**预算：实测 720p 编码速度约 3~6 倍实时，给足 3 倍余量，
+    /// 再加固定开销（进程启动 + 写盘）。短素材仍是原来的量级（不会因为缩放而变慢），
+    /// 长素材则能拿到与之匹配的预算。
     fn run_proxy(
         &self,
         source: &Path,
@@ -687,7 +702,8 @@ impl ProxyManager {
         threads: u32,
     ) -> Result<std::process::ExitStatus> {
         let mut cmd = self.proxy_cmd(source, out, height, hwaccel, threads);
-        let output = run_with_deadline(&mut cmd, SUBPROCESS_LONG_TIMEOUT)
+        let budget = proxy_timeout_for(self.source_duration_secs(source));
+        let output = run_with_deadline(&mut cmd, budget)
             .with_context(|| format!("启动代理生成失败: {:?}", self.ffmpeg_path))?;
         if !output.status.success() {
             // 旧写法让子进程继承控制台，错误信息由 FFmpeg 自己吐；换成截止期执行器
@@ -699,6 +715,44 @@ impl ProxyManager {
             );
         }
         Ok(output.status)
+    }
+
+    /// 源素材时长（秒）。探测失败返回 `None`（预算退回基准值）。
+    ///
+    /// 只为**代理转码的预算缩放**服务：预算必须与素材时长成正比，否则长素材
+    /// 必然被固定 600 秒的截止期杀掉（见 `run_proxy`）。
+    ///
+    /// 按文件签名缓存：素材变了签名就变，缓存自动失效。
+    fn source_duration_secs(&self, source: &Path) -> Option<f64> {
+        let signature = file_signature(source);
+        if let Some((cached_signature, dur)) = self
+            .duration_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(source)
+            .copied()
+        {
+            if cached_signature == signature {
+                return dur;
+            }
+        }
+
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        apply_no_window(&mut cmd);
+        cmd.arg("-i").arg(source);
+        // 与 `probe_height` 同一套截止期执行器：坏素材 / 网络盘可能长时间不返回。
+        let duration = run_with_deadline(&mut cmd, SUBPROCESS_TIMEOUT)
+            .ok()
+            .and_then(|out| {
+                super::ffmpeg::parse_ffmpeg_container_duration(&String::from_utf8_lossy(
+                    &out.stderr,
+                ))
+            });
+        self.duration_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(source.to_path_buf(), (signature, duration));
+        duration
     }
 
     fn probe_height(&self, source: &Path) -> Option<u32> {
@@ -733,6 +787,31 @@ impl ProxyManager {
     }
 }
 
+/// 代理转码的**基准**预算：与源时长无关的下限（短素材用这个）。
+///
+/// 原先这里是固定的 600 秒，对长素材来说远远不够（见 `run_proxy` 的说明）。
+const PROXY_BASE_BUDGET_SECS: u64 = 600;
+
+/// 代理转码的**硬上限**：无论素材多长都不超过这个值。
+///
+/// 没有上限的话，一份 24 小时的素材会把转码线程占住好几小时——
+/// 即便用户早就离开了。
+const PROXY_MAX_BUDGET_SECS: u64 = 4 * 3600;
+
+/// 代理转码预算 = 基准 + 源时长 × 倍率。
+///
+/// 倍率 3 的依据：720p / veryfast / CRF 28 的 libx264 编码速度实测约 3~6 倍实时
+/// （低端 CPU 偏低端、高端偏高端），再叠加一次软解回退（再乘 2），3 倍是
+/// 「够用且不太久」的折中。倍率**不随源时长变化**——素材越长，单位时间的编码
+/// 开销越接近稳态，按比例放大不会失真。
+pub fn proxy_timeout_for(duration_secs: Option<f64>) -> std::time::Duration {
+    let secs = duration_secs
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .map(|d| d as u64)
+        .unwrap_or(0);
+    let scaled = PROXY_BASE_BUDGET_SECS.saturating_add(secs.saturating_mul(3));
+    std::time::Duration::from_secs(scaled.min(PROXY_MAX_BUDGET_SECS))
+}
 pub fn parse_ffmpeg_height(ffmpeg_stderr: &str) -> Option<u32> {
     for token in ffmpeg_stderr.split_whitespace() {
         let token = token.trim_end_matches(',');
@@ -1546,6 +1625,35 @@ pub fn convert_nv12_frame(
 
 #[cfg(test)]
 mod tests {
+    use super::proxy_timeout_for;
+    use super::PROXY_BASE_BUDGET_SECS;
+    use super::PROXY_MAX_BUDGET_SECS;
+
+    /// 代理转码预算必须随源时长放大。
+    ///
+    /// 固定 600 秒的截止期对长素材是**必然失败**：2 小时 4K 转 720p 约需
+    /// 20~40 分钟（1200~2400 秒），必然被 kill，回退链再跑一次软解（同样超时），
+    /// 最终「长素材在无 GPU 机器上永远拿不到代理」。
+    #[test]
+    fn proxy_timeout_scales_with_source_duration() {
+        let short = proxy_timeout_for(Some(60.0));
+        let long = proxy_timeout_for(Some(7200.0));
+        assert!(
+            long > short,
+            "长素材的转码预算必须大于短素材（否则必然被固定截止期杀掉）"
+        );
+        // 2 小时素材：600 + 7200*3 = 22200 秒 ≈ 6.2 小时，远大于实测所需的 ~40 分钟。
+        assert!(long.as_secs() >= 60 * 60, "2 小时素材的预算至少要 1 小时");
+        // 未知时长 → 退回基准预算。
+        let unknown = proxy_timeout_for(None);
+        assert_eq!(unknown.as_secs(), PROXY_BASE_BUDGET_SECS);
+        // 非有限时长（ffprobe 字段损坏）不得把预算算成天文数字。
+        let nan = proxy_timeout_for(Some(f64::NAN));
+        assert_eq!(nan.as_secs(), PROXY_BASE_BUDGET_SECS);
+        // 硬上限：再长的素材也不超过 4 小时，否则转码线程会占住机器好几小时。
+        let huge = proxy_timeout_for(Some(100_000.0));
+        assert!(huge.as_secs() <= PROXY_MAX_BUDGET_SECS);
+    }
     use super::*;
 
     use std::time::{Duration, Instant};

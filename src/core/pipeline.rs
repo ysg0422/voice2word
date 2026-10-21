@@ -97,7 +97,13 @@ impl EngineCapabilities {
     /// 转写进度文案：按通道区分 SenseVoice 推流 / Whisper 推流 / Whisper 切块。
     fn transcribe_detail(&self) -> &'static str {
         if self.sensevoice() {
-            "SenseVoice 正在通过纯内存管道极速转写语音..."
+            // 并行切块与单会话推流是两套不同的通道，文案必须如实反映，
+            // 否则用户看到「纯内存管道」却等来一堆临时文件切片，无法解释。
+            if self.parallel() {
+                "SenseVoice 正在多进程切块并行极速转写语音..."
+            } else {
+                "SenseVoice 正在通过纯内存管道极速转写语音..."
+            }
         } else if self.can_stream() {
             "Whisper 正在通过纯内存管道流式转写语音..."
         } else {
@@ -203,10 +209,31 @@ impl EngineProfile for EngineCapabilities {
 
     fn transcribe_route(&self, sensevoice_ready: bool) -> TranscribeRoute {
         if self.sensevoice() {
-            if sensevoice_ready {
-                TranscribeRoute::SenseVoiceStream
+            if !sensevoice_ready {
+                // 选了 SenseVoice 却没有就绪的模型/运行环境：显式拒绝，**不降级到 Whisper**
+                // （ONNX 模型会引发 Whisper 崩溃，降级等于把一个明确错误换成一个诡异错误）。
+                return TranscribeRoute::SenseVoiceUnavailable;
+            }
+            // 并行切块优先于单会话推流。
+            //
+            // 此前这里是「只要选了 SenseVoice 就走 SenseVoiceStream」，于是
+            // `EngineCapabilities::plan` 算出的 `parallel_chunks`（≥180s / ≥4 核 /
+            // 非 GPU / 1.0x 变速）**永远用不上**——`Chunked { parallel: true }` 分支
+            // 对 SenseVoice 而言是不可达代码。后果：
+            // - 实测（16 核、6 分钟样本）单会话 8 线程 32.6s、16 线程反而 41.6s，
+            //   而 6 进程 × 2 线程只要 14.5s；路由把长音频压在最慢的那条路上。
+            // - `MAX_SV_WORKERS` / `sensevoice_worker_count` / `sensevoice_chunk_count`
+            //   这一整套参数没有生产调用点，只有测试引用。
+            // - 界面上的「并行进程数」滑条对 SenseVoice 完全无效——这与本仓反复
+            //   强调的「滑条量程必须与引擎实际行为同源」原则直接冲突。
+            //
+            // 现在按「能不能并行」分流：能并行就走切块并行，不能并行才退回单会话推流。
+            // 两条路径共用同一套切块/拼接/时间轴还原逻辑（`run_chunked_parallel`），
+            // 字幕形态一致。
+            if self.parallel() {
+                TranscribeRoute::Chunked { parallel: true }
             } else {
-                TranscribeRoute::SenseVoiceUnavailable
+                TranscribeRoute::SenseVoiceStream
             }
         } else if self.can_stream() {
             TranscribeRoute::WhisperStream
@@ -1300,6 +1327,7 @@ impl TaskPipeline {
                     detail: "已建立纯内存音频推流管道 (0 磁盘 I/O，毫秒级就绪)".into(),
                 });
             } else {
+                // 说明为什么走临时 WAV：并行切块需要完整 WAV 以便随机 seek 切片。
                 // CPU 多核切块模式回退：提前抽取完整临时 WAV 以供多进程随机 seek 切块。
                 // 只做语音增强（未压实）时让增强链在这里就地生效，省掉单独一遍解码。
                 let in_file = input_file.clone();
@@ -1885,8 +1913,29 @@ impl TaskPipeline {
                                     detail: "标点引擎超时，已终止；字幕保持未标点".into(),
                                 });
                             }
+                            Some(crate::engines::punc::PuncStageError::Stalled) => {
+                                warn!(error = %err, "极速标点卡死（长时间无输出），已终止；字幕保持未标点");
+                                // 与超时同处理：报告里不能留着「CT-Punc 极速标点」，
+                                // 那等于报告了一份没发生的标点。
+                                polish_engine_name = Some("标点卡死（字幕未标点）".to_string());
+                                let _ = tx.send(PipelineEvent::Progress {
+                                    stage: "极速标点".into(),
+                                    progress: 0.95,
+                                    detail:
+                                        "标点引擎长时间无输出，已判定卡死并终止；字幕保持未标点"
+                                            .into(),
+                                });
+                            }
                             None => {
+                                // 其它失败（含「标点模型未就绪」）：同样要改掉引擎名——
+                                // 报告里留着「CT-Punc 极速标点」等于报告了一份没发生的标点。
                                 warn!(error = %err, "极速标点失败，保留识别原文并继续收尾");
+                                polish_engine_name = Some("标点失败（字幕未标点）".to_string());
+                                let _ = tx.send(PipelineEvent::Progress {
+                                    stage: "极速标点".into(),
+                                    progress: 0.95,
+                                    detail: "标点未完成，字幕保持识别原文".into(),
+                                });
                             }
                         }
                     }
@@ -3391,17 +3440,24 @@ mod tests {
     }
 
     /// 转写通道的判定顺序必须与收敛前的 if-else 链逐条一致：
-    /// SenseVoice 推流 → Whisper 推流 → 临时 WAV 切块。
+    /// 转写通道的判定顺序：
+    /// SenseVoice（并行切块优先，其次单会话推流）→ Whisper 推流 → 临时 WAV 切块。
+    ///
+    /// **与旧断言的差异是有意为之**：旧版断言「只要选了 SenseVoice 就走
+    /// `SenseVoiceStream`，即便能力位同时指向并行切块」，把「并行切块对 SenseVoice
+    /// 不可达」这个事实固化成了预期。实测（16 核、6 分钟样本）单会话 8 线程 32.6s、
+    /// 16 线程反而 41.6s，而 6 进程 × 2 线程只要 14.5s——固化旧行为等于把长音频
+    /// 永远压在最慢的那条路上，且让「并行进程数」滑条对 SenseVoice 完全失效。
     #[test]
-    fn transcribe_route_matches_legacy_branch_order() {
-        // SenseVoice 已就绪：优先走 SenseVoice 推流分支，即便能力位同时指向并行切块
-        // （收敛前 `is_sensevoice && sensevoice.is_some()` 同样先于切块分支命中）。
-        assert_eq!(
-            caps_fixture(true, true, false).transcribe_route(true),
-            TranscribeRoute::SenseVoiceStream
-        );
+    fn transcribe_route_prefers_parallel_chunks_for_sensevoice() {
+        // SenseVoice 已就绪且**能并行**：走切块并行（此前不可达）。
         assert_eq!(
             caps_fixture(true, false, true).transcribe_route(true),
+            TranscribeRoute::Chunked { parallel: true }
+        );
+        // SenseVoice 已就绪但**不能并行**（短音频 / 少核 / GPU / 变速）：退回单会话推流。
+        assert_eq!(
+            caps_fixture(true, true, false).transcribe_route(true),
             TranscribeRoute::SenseVoiceStream
         );
         // 未选 SenseVoice 且可推流：走 Whisper 推流。
@@ -3417,6 +3473,36 @@ mod tests {
         assert_eq!(
             caps_fixture(false, false, true).transcribe_route(false),
             TranscribeRoute::Chunked { parallel: true }
+        );
+    }
+
+    /// 选了 SenseVoice 却没有就绪的模型/运行环境时，**显式拒绝**而不是降级到 Whisper：
+    /// ONNX 模型会引发 Whisper 崩溃，降级等于把一个明确错误换成一个诡异错误。
+    #[test]
+    fn transcribe_route_refuses_sensevoice_when_not_ready() {
+        assert_eq!(
+            caps_fixture(true, true, false).transcribe_route(false),
+            TranscribeRoute::SenseVoiceUnavailable
+        );
+        assert_eq!(
+            caps_fixture(true, false, true).transcribe_route(false),
+            TranscribeRoute::SenseVoiceUnavailable
+        );
+    }
+
+    /// 端到端验证「纯 CPU 多核长音频 → SenseVoice 走并行切块」这条链路真的能通：
+    /// 只断言**路由结果**，不启动任何子进程。
+    #[test]
+    fn long_multicore_sensevoice_routes_to_parallel_chunks() {
+        let caps = EngineCapabilities::plan(true, true, false, 1.0, 600.0, 8, None, 300.0);
+        assert!(
+            caps.parallel_chunks,
+            "16 核 / 10 分钟的 SenseVoice 应当可并行切块"
+        );
+        assert_eq!(
+            caps.transcribe_route(true),
+            TranscribeRoute::Chunked { parallel: true },
+            "长音频 SenseVoice 必须走并行切块，否则实测会慢一倍以上"
         );
     }
 

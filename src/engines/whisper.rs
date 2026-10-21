@@ -159,6 +159,7 @@ static CHILD_REGISTRATION_SEQ: AtomicU64 = AtomicU64::new(0);
 ///
 /// 持锁范围只有 `drain` 这一次：`kill_process_tree` 在锁释放之后才逐个执行，
 /// 避免在持锁期间做可能阻塞的进程操作（否则会拖住同引擎的其它登记/注销）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn take_live_pids(registry: &Arc<Mutex<Vec<ChildEntry>>>) -> Vec<u32> {
     registry
         .lock()
@@ -182,9 +183,10 @@ pub(crate) fn take_live_pids(registry: &Arc<Mutex<Vec<ChildEntry>>>) -> Vec<u32>
 /// 给无关进程」的号码。Windows 上还有句柄这一层：PID 只在进程对象的最后一个句柄
 /// 关闭后才可能被复用，而句柄由 `Child` 持有到 `wait()` 之后才关闭。
 ///
-/// # 为什么不直接改 [`take_live_pids`]
-/// `punc` / `sensevoice` 两个引擎仍按 drain 语义调用它，本轮只允许改本文件，
-/// 保留原函数不动、另加一个快照函数是唯一不破坏它们的做法。
+/// # [`take_live_pids`] 为什么还在
+/// 它是 drain 语义的对照实现：保留下来既供本文件的单测做「取消一次性 vs 取消可重复」
+/// 的并排断言，也供 punc / sensevoice 的单测断言「登记行确实被摘掉」。
+/// 生产代码里三个引擎的 `cancel()` 现在**一律走快照**，drain 版只留在测试里当对照。
 pub(crate) fn live_child_pids(registry: &Arc<Mutex<Vec<ChildEntry>>>) -> Vec<u32> {
     registry
         .lock()
@@ -309,13 +311,24 @@ impl<'a> From<&'a PathBuf> for AudioInput<'a> {
 }
 
 impl WhisperEngine {
+    /// 便捷构造：**不指定** VAD 模型时按项目约定路径自动探测。
+    ///
+    /// 探测路径必须经 [`crate::utils::AppConfig::resolve_path`] 锚到**项目根**，
+    /// 不能直接用相对路径：相对路径是相对**进程当前工作目录**解析的，而 GUI 启动时
+    /// cwd 可能是 `C:\Windows\System32`、从别的目录启动时更是五花八门——于是
+    /// `default_vad.exists()` 为假、VAD 被**静默关闭**（`spawn` 时只看文件在不在，
+    /// 不在就不加 `--vad`，用户既没报错也没提示，只是「怎么变慢了」）。
+    ///
+    /// 这正是「本机好使、别人电脑不好使」的一类典型：开发机从项目根启动能命中，
+    /// 客户机从快捷方式/安装目录启动就命中不了。
     pub fn new<P1: AsRef<Path>, P2: AsRef<Path>>(
         cli_path: P1,
         model_path: P2,
         threads: u32,
         processors: u32,
     ) -> Self {
-        let default_vad = PathBuf::from("models/whisper/ggml-silero-v6.2.0.bin");
+        let default_vad =
+            crate::utils::AppConfig::resolve_path("models/whisper/ggml-silero-v6.2.0.bin");
         let vad = if default_vad.exists() {
             Some(default_vad)
         } else {
@@ -365,6 +378,18 @@ impl WhisperEngine {
             use_gpu,
             gpu_limit_percent: AtomicU32::new(gpu_limit_percent),
             no_fallback,
+            // `-mc` 的取值语义（whisper.cpp 的 `n_max_text_ctx`）：
+            //
+            // - `-1`   = 不裁剪（用满 n_text_ctx）；实测比 32 慢 13% 且 CER 差 0.37pp，
+            //           所以出厂默认是 32 而不是 -1；
+            // - `0`    = **不携带任何跨句上下文**（每句独立解码）。这是合法取值，
+            //           不是「关掉上下文上限」——两者语义相反，容易读错，故在此钉死；
+            // - `1..448` = 携带 N 个 token 的跨句上下文，上限 448 是 whisper.cpp
+            //           对 `n_text_ctx/2` 的硬约束，超过会被它自己截断。
+            //
+            // 用 `u32` 承载（配 `clamp(0,448)`）而不是 i32：配置里写负数没有意义
+            // （`-1` 只能通过默认值路径拿到），负数会被 clamp 成 0，即「不携带上下文」
+            // ——比静默传一个 `-mc -1` 去和「不裁剪」混淆更安全。
             max_context: max_context.clamp(0, 448),
             need_token_probs: AtomicBool::new(false),
             // 质检置信度默认开启：实测 -ojf 相对 -oj 的耗时差落在噪声内（见字段注释），
@@ -809,7 +834,10 @@ impl WhisperEngine {
         }
 
         let safe_model = crate::utils::to_cli_safe_path(&effective_model);
-        let safe_vad = self.vad_model_path.as_ref().map(|p| crate::utils::to_cli_safe_path(p));
+        let safe_vad = self
+            .vad_model_path
+            .as_ref()
+            .map(|p| crate::utils::to_cli_safe_path(p));
 
         let mut cmd = Command::new(&effective_cli);
         let work_dir = if let Some(parent) = effective_model.parent() {
@@ -853,6 +881,20 @@ impl WhisperEngine {
                     ))
                     .arg("-vsd")
                     .arg("250"); // 最小静音间隔 250ms，剥离无效停顿，全自动时间戳映射还原
+            } else {
+                // VAD 模型配了却找不到：**不静默降级**。
+                //
+                // 静默降级的后果是「本机好使、别人电脑不好使」的典型形态：开发机上
+                // `models/whisper/ggml-silero-v6.2.0.bin` 在（仓库里跑过），客户机上
+                // 缺了 → VAD 被悄悄关掉 → 用户看到的是「怎么变慢了 / 静音段也出了字幕」，
+                // 却没有任何报错、没有提示，日志里也只有一行 info。
+                //
+                // 这里明确告警并说明影响：VAD 关掉后 whisper-cli 会对整段音频连续解码，
+                // 静音段容易出幻读、时长也明显变长。
+                warn!(
+                    path = %vad_path.display(),
+                    "Silero VAD 模型已配置但文件不存在，Whisper 将不带 VAD 运行（静音段容易幻读、转写明显变慢）。"
+                );
             }
         }
 
@@ -1100,7 +1142,9 @@ impl WhisperEngine {
                                 let ss = (cur_sec % 60.0) as u32;
                                 let tot_mm = (dur_stderr / 60.0) as u32;
                                 let tot_ss = (dur_stderr % 60.0) as u32;
-                                format!("已处理至 {mm:02}:{ss:02} / {tot_mm:02}:{tot_ss:02} ({pct}%)")
+                                format!(
+                                    "已处理至 {mm:02}:{ss:02} / {tot_mm:02}:{tot_ss:02} ({pct}%)"
+                                )
                             } else {
                                 format!("正在进行声学神经网络推理 ({pct}%)")
                             };
@@ -1125,11 +1169,7 @@ impl WhisperEngine {
             let stderr_text = if head.is_empty() {
                 tail_text
             } else {
-                format!(
-                    "{}\n…（中间省略）…\n{}",
-                    head.join("\n"),
-                    tail_text
-                )
+                format!("{}\n…（中间省略）…\n{}", head.join("\n"), tail_text)
             };
             (vad_ms / 1000.0, stderr_text)
         });
@@ -1544,7 +1584,8 @@ impl WhisperEngine {
         // 成功退出（退出码 0）却拿不到任何文本来源：必须报错，不能静默返回 Ok(空)。
         // 触发路径与文案见 [`empty_result_error`]。
         if segments.is_empty() {
-            if let Some(msg) = empty_result_error(lang, json_outcome, &stderr_str, &effective_model) {
+            if let Some(msg) = empty_result_error(lang, json_outcome, &stderr_str, &effective_model)
+            {
                 anyhow::bail!(msg);
             }
         }
@@ -1995,8 +2036,12 @@ fn kill_process_tree(pid: u32) {
 /// 排在系统目录之前，于是应用目录里被塞一个同名 `taskkill.exe`，就会在用户点「终止转写」
 /// 时被执行。这里优先用 `%SystemRoot%\System32\taskkill.exe`，只有它确实不存在时才
 /// 回退到 PATH 查找（保持原来的可用性）。
+///
+/// `pub(crate)`：punc / sensevoice 两个引擎此前各自抄了一份，其中 sensevoice 那份
+/// **漏掉了这道加固**（裸 `Command::new("taskkill")`）——三处口径不一致等于加固等于
+/// 没有。现在统一从本文件取，消除「同一仓库三份同名实现、其中一份是旧的」这种漂移。
 #[cfg(windows)]
-fn taskkill_program() -> String {
+pub(crate) fn taskkill_program() -> String {
     let candidate = taskkill_program_from(std::env::var("SystemRoot").ok().as_deref());
     if Path::new(&candidate).is_file() {
         candidate
@@ -2007,7 +2052,7 @@ fn taskkill_program() -> String {
 
 /// [`taskkill_program`] 的纯函数部分：只做路径拼装，便于单测（不读环境变量、不碰文件系统）。
 #[cfg(windows)]
-fn taskkill_program_from(system_root: Option<&str>) -> String {
+pub(crate) fn taskkill_program_from(system_root: Option<&str>) -> String {
     match system_root.map(str::trim).filter(|s| !s.is_empty()) {
         Some(root) => format!(
             "{}\\System32\\taskkill.exe",
@@ -2543,15 +2588,21 @@ mod tests {
     #[test]
     fn parse_whisper_progress_pct_tests() {
         assert_eq!(
-            WhisperEngine::parse_whisper_progress_pct("whisper_print_progress_callback: progress =   0%"),
+            WhisperEngine::parse_whisper_progress_pct(
+                "whisper_print_progress_callback: progress =   0%"
+            ),
             Some(0)
         );
         assert_eq!(
-            WhisperEngine::parse_whisper_progress_pct("whisper_print_progress_callback: progress =  15%"),
+            WhisperEngine::parse_whisper_progress_pct(
+                "whisper_print_progress_callback: progress =  15%"
+            ),
             Some(15)
         );
         assert_eq!(
-            WhisperEngine::parse_whisper_progress_pct("whisper_print_progress_callback: progress = 100%"),
+            WhisperEngine::parse_whisper_progress_pct(
+                "whisper_print_progress_callback: progress = 100%"
+            ),
             Some(100)
         );
         assert_eq!(
@@ -3701,12 +3752,18 @@ mod argv_and_result_guard_tests {
     #[test]
     fn empty_result_error_attributes_by_json_outcome() {
         assert!(
-            empty_result_error("zh", JsonOutcome::Parsed, "", std::path::Path::new("m.bin")).is_none(),
+            empty_result_error("zh", JsonOutcome::Parsed, "", std::path::Path::new("m.bin"))
+                .is_none(),
             "json 已产出就证明空结果是素材事实，不得报错"
         );
 
-        let missing =
-            empty_result_error("zh-CN", JsonOutcome::Missing, "", std::path::Path::new("m.bin")).expect("没有任何文本来源必须报错");
+        let missing = empty_result_error(
+            "zh-CN",
+            JsonOutcome::Missing,
+            "",
+            std::path::Path::new("m.bin"),
+        )
+        .expect("没有任何文本来源必须报错");
         assert!(
             missing.contains("zh-CN"),
             "报错要带上实际传入的 -l 值: {missing}"
@@ -3716,8 +3773,13 @@ mod argv_and_result_guard_tests {
             "报错要给出可操作的下一步（改用 auto 或有效代码）: {missing}"
         );
 
-        let parse_failed =
-            empty_result_error("zh", JsonOutcome::ParseFailed, "", std::path::Path::new("m.bin")).expect("解析失败必须报错");
+        let parse_failed = empty_result_error(
+            "zh",
+            JsonOutcome::ParseFailed,
+            "",
+            std::path::Path::new("m.bin"),
+        )
+        .expect("解析失败必须报错");
         assert!(
             !parse_failed.contains("语言码") && !parse_failed.contains("-l "),
             "解析失败与语言码无关，不得把用户引向改语言设置: {parse_failed}"

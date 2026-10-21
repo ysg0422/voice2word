@@ -173,15 +173,51 @@ fn main() -> Result<()> {
     // 无写权限而失败——`Database::open` 返回 Err，`main` 直接 `?` 退出，
     // **用户连界面都看不到**（实测报错：`unable to open database file`）。
     // 库仍然留在项目根（与旧行为一致），只是不再随 cwd 漂移。
-    let db_path = AppConfig::resolve_path("voice2word.db");
+    // 项目根不可写时的回退：数据库退到 %LOCALAPPDATA%\Voice2Word（每用户可写）。
+    //
+    // 此前这里只有「项目根」一个位置，于是装在只读目录（Program Files、企业策略、
+    // 只读 U 盘、拷贝自别的用户）时 SQLite 报 `unable to open database file`，
+    // 程序**直接退出、连界面都看不到**，而错误文案只说「打开 SQLite 数据库失败」，
+    // 完全指向不了真正的原因（目录只读）。这正是「本机好使、别人电脑不好使」
+    // 的一类：开发机的项目根可写，客户机的安装目录不一定可写。
+    let mut db_path = AppConfig::resolve_path("voice2word.db");
     let db = match Database::open(&db_path) {
         Ok(db) => db,
         Err(err) => {
-            report_startup_failure(
-                "打开 SQLite 数据库",
-                &format!("路径：{}\n{err:#}", db_path.display()),
-            );
-            return Err(err);
+            // 第一次失败：换到可写目录再试一次。
+            let fallback_root = AppConfig::writable_data_dir();
+            let fallback_path = fallback_root.join("voice2word.db");
+            if fallback_path != db_path {
+                match Database::open(&fallback_path) {
+                    Ok(db) => {
+                        warn!(
+                            original = %db_path.display(),
+                            fallback = %fallback_path.display(),
+                            error = %format!("{err:#}"),
+                            "项目根不可写，数据库已退到可写目录"
+                        );
+                        db_path = fallback_path;
+                        db
+                    }
+                    Err(fallback_err) => {
+                        report_startup_failure(
+                            "打开 SQLite 数据库",
+                            &format!(
+                                "原路径：{}\n回退路径：{}\n原始错误：{err:#}\n回退错误：{fallback_err:#}",
+                                db_path.display(),
+                                fallback_path.display()
+                            ),
+                        );
+                        return Err(fallback_err);
+                    }
+                }
+            } else {
+                report_startup_failure(
+                    "打开 SQLite 数据库",
+                    &format!("路径：{}\n{err:#}", db_path.display()),
+                );
+                return Err(err);
+            }
         }
     };
     info!(db = %db_path.display(), "SQLite 数据库已连接");
@@ -569,6 +605,8 @@ fn check_external_dependencies(config: &AppConfig) {
     // 且无任何 stderr 输出——用户看到的是「转写失败：」空串，无从排查。
     // 这里在启动时就把这类「就位但不可运行」的坑提前点破。
     check_whisper_cli_runtime_deps(config);
+    // llama.cpp 同理：入口 exe 只有几 KB，缺同目录 DLL 会静默以 0xC0000139 退出。
+    check_llama_runtime_deps(config);
 
     // 模型属于「用到才需要」：缺失不报缺失，交由对应引擎在启用时报错
     let optional: [(&str, Option<&str>); 5] = [
@@ -643,6 +681,42 @@ fn check_external_dependencies(config: &AppConfig) {
 ///
 /// # 为什么不能只查一组写死的 DLL 名
 ///
+/// 启动时核对 **llama.cpp** 推理后端的运行时依赖（同目录 DLL 是否齐全）。
+///
+/// 为什么必须查：llama.cpp 的 `llama-completion.exe` 只有 ~9 KB，真正的代码在
+/// 同目录的 `llama-common.dll` / `llama-server-impl.dll` / `ggml-*.dll` 里。
+/// 缺一个时进程会立刻以 `0xC0000139`（STATUS_ENTRYPOINT_NOT_FOUND）退出，
+/// **且没有任何 stderr**——用户看到的是「点了离线翻译没反应」，日志里也只有
+/// 「转写失败」这种笼统信息，根本指向不了真正的原因。
+///
+/// 这是「本机好使、别人电脑不好使」的典型形态：开发机上 DLL 就在仓库 `tools/`
+/// 下（本机跑过），客户机上是安装包没带过去。
+///
+/// 与 whisper 那边（[`check_whisper_cli_runtime_deps`]）同一套机制：解析 PE 导入表，
+/// 只对「这份二进制真正需要、却找不到」的 DLL 报警。
+fn check_llama_runtime_deps(config: &AppConfig) {
+    // llama-cli 与 llama-completion 都查：前者是常驻服务、后者是命令行回退，
+    // 两条路径都要能用。
+    for raw in [&config.paths.llama_cli] {
+        let exe = AppConfig::resolve_path(raw);
+        if !exe.exists() {
+            continue; // exe 缺失已由 optional 检查报告，这里不重复
+        }
+        let missing = voice2word::utils::pe_imports::missing_imports(&exe);
+        if missing.is_empty() {
+            continue;
+        }
+        let hint =
+            "离线翻译 / 润色会直接失败。修复：把缺失的 DLL 与 llama-completion.exe 放到同一目录，"
+                .to_string()
+                + "或在「性能设置 → 模型与组件」里重新下载 llama.cpp 组件。";
+        warn!(
+            exe = %exe.display(),
+            dlls = ?missing,
+            "llama.cpp 运行库缺失：exe 存在但启动会立即退出（0xC0000139），且无任何报错。{hint}"
+        );
+    }
+}
 /// 早期版本无条件去查 MinGW 三件套。把 whisper-cli 换成**官方 MSVC 构建**后，
 /// 它根本不导入 libgcc/libstdc++，于是每次启动都误报「运行库缺失」，把用户往
 /// 错误的修复方向带。正确做法是**解析 PE 导入表**，只对「这份二进制真正需要、

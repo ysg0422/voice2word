@@ -22,7 +22,22 @@ from pathlib import Path
 SERVER_NAME = "voice2word-mcp"
 SERVER_VERSION = "0.1.0"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
-SUPPORTED_FORMATS = ("srt", "ass", "vtt", "json", "txt", "ttml", "ttal")
+# 与 CLI 的 SUPPORTED_FORMATS（src/cli.rs）保持一致：10 种。
+#
+# 此前这里只列 7 种（漏了 sbv / lrc / txt-ts），于是通过 MCP 无法请求这三种格式——
+# CLI 能做的 MCP 做不了，是纯粹的接口漂移。
+SUPPORTED_FORMATS = (
+    "srt",
+    "ass",
+    "vtt",
+    "json",
+    "txt",
+    "ttml",
+    "ttal",
+    "sbv",
+    "lrc",
+    "txt-ts",
+)
 
 # JSON-RPC 2.0 错误码
 PARSE_ERROR = -32700
@@ -83,10 +98,24 @@ def _explicit_candidates(explicit):
 
 
 def _auto_candidates():
-    """仓库内自动探测的候选（约定顺序）。"""
+    # 仓库内自动探测的候选（约定顺序）。
+    #
+    # 优先 voice2word-cli.exe（控制台子系统），再退回 voice2word.exe。
+    #
+    # 为什么不直接用 voice2word.exe：它是 Windows GUI 子系统程序
+    # (windows_subsystem = "windows")，PowerShell 不等待它，重定向会拿到空文件
+    # 并报 os error 232。MCP 把 stdout 整条读回来解析——用 GUI 构建时读到的就是空串，
+    # MCP 客户端拿到的是一段没有内容的空结果。
+    #
+    # 这正是「本机好使、别人电脑不好使」的一类：开发机在仓库根用 cargo run 起的是
+    # 控制台构建，客户机装的是 GUI 构建。voice2word-cli.exe 行为完全一致、
+    # 只是不起 GUI，是脚本与 MCP 场景的正确入口。
     return [
+        REPO_ROOT / "target" / "release" / "voice2word-cli.exe",
+        REPO_ROOT / "target" / "debug" / "voice2word-cli.exe",
         REPO_ROOT / "target" / "release" / "voice2word.exe",
         REPO_ROOT / "target" / "debug" / "voice2word.exe",
+        REPO_ROOT / "voice2word-cli.exe",
         REPO_ROOT / "voice2word.exe",
     ]
 
@@ -137,9 +166,12 @@ def resolve_exe(explicit=None):
                 existing.append(str(candidate))
         except OSError:
             continue
-    found = shutil.which("voice2word") or shutil.which("voice2word.exe")
-    if found:
-        existing.append(found)
+    # PATH 查找同理：控制台子系统优先（GUI 构建在重定向场景下读不到 stdout）。
+    for name in ("voice2word-cli", "voice2word-cli.exe", "voice2word", "voice2word.exe"):
+        found = shutil.which(name)
+        if found:
+            existing.append(found)
+            break
 
     chosen = None
     for path in existing:

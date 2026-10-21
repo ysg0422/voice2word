@@ -1,4 +1,4 @@
-# 构建内置便携 Python 运行时
+﻿# 构建内置便携 Python 运行时
 #
 # 目的：客户机上「系统 Python 残缺 / 没有 Python」是 SenseVoice、CT-Punc 最高频的
 #      环境故障（`Failed to import encodings module`、`No module named 'sherpa_onnx'`）。
@@ -51,8 +51,21 @@ $getpip = Join-Path $env:TEMP "get-pip.py"
 Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile $getpip -UseBasicParsing -TimeoutSec 300
 & $pythonExe $getpip --no-warn-script-location
 
-# 运行器实际需要的两个包（CT-Punc 与 SenseVoice 都走 sherpa-onnx）。
-& $pythonExe -m pip install --no-warn-script-location --disable-pip-version-check numpy sherpa-onnx
+# 运行器实际需要的包（CT-Punc 与 SenseVoice 都走 sherpa-onnx）。
+#
+# **锁版本**：不锁的话，不同时间构建出的包内容不同（今天 numpy 2.4.6 / sherpa 1.13.8，
+# 明天可能就变了），客户机上出现的问题在开发机上无法复现。
+#
+# `onnxruntime-directml` 是给 Windows 的 **DirectML** 后端：内置 Python 里装的是
+# `sherpa-onnx` 官方 wheel，它绑的是 **CPU-only 的 onnxruntime**——于是配置里选
+# "DirectML" 时 sherpa 找不到后端，**静默回落 CPU**，而界面仍显示「GPU 加速已开启」。
+# 显式装上 directml 运行时，这条静默降级才会真的变成 GPU 加速。
+$pinnedPackages = @(
+    "numpy==2.4.6",
+    "sherpa-onnx==1.13.8",
+    "onnxruntime-directml==1.23.0"
+)
+& $pythonExe -m pip install --no-warn-script-location --disable-pip-version-check @pinnedPackages
 
 # 自检：两个运行器都要能起来（--help 会在 import 阶段加载 numpy/sherpa_onnx）。
 & $pythonExe -c "import numpy, sherpa_onnx; print('bundled python ok')"
