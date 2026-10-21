@@ -871,7 +871,7 @@ pub fn scan_presence(cfg: &AppConfig) -> (HashMap<String, bool>, HashMap<String,
 /// 同一个逻辑模型在本项目里存在多种合法形态，只比体积会把完好的文件
 /// 误判为缺失（界面于是永远显示「缺失」，用户反复下载同一个文件）：
 /// - **路径可能被改**：`config.local.toml` 可以把 `ffmpeg` 指到任意位置
-///   （例如 `A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe`）。只看 `item.dest`
+///   （例如 `<某个非默认位置>\ffmpeg.exe`）。只看 `item.dest`
 ///   会把这种「已配好但不在默认路径」的情况误报为缺失。
 /// - **格式可能不同**：标点模型上游是 fp32（294 MB），本项目默认用本地
 ///   量化的 int8（75 MB）；Whisper Small 上游 q5_1（181 MB）与本地的
@@ -2712,7 +2712,7 @@ mod tests {
     /// 配置里把组件指到**非默认路径**时，判定必须跟着走。
     ///
     /// 这是之前的一个真实缺陷：判定只看 `item.dest`（默认路径），
-    /// 于是「ffmpeg 装在 A:\cppsoft\...」的用户会看到界面一直报 ffmpeg 缺失，
+    /// 于是「ffmpeg 装在 <某个非默认位置>」的用户会看到界面一直报 ffmpeg 缺失，
     /// 反复下载同一个文件。这里构造一份指向临时文件的配置来锁住行为。
     #[test]
     fn configured_path_overrides_default_dest() {

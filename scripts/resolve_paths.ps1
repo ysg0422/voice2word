@@ -3,7 +3,7 @@
   Bench 脚本共用的路径解析：优先读 config.local.toml，其次 config.toml，最后回退内置默认。
 
 .DESCRIPTION
-  这些基准脚本原先各自硬编码 `A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe`，于是仓库里
+  这些基准脚本原先各自硬编码 `<某台机器的 abs 路径>\ffmpeg.exe`，于是仓库里
   有 9 份「只对某台机器成立」的绝对路径——换台机器 clone 下来全部报「缺少测试文件」。
 
   改为统一走配置解析，与本程序的加载顺序保持一致：

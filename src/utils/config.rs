@@ -1802,8 +1802,8 @@ impl Default for AppConfig {
 ///
 /// ```toml
 /// [paths]
-/// ffmpeg    = 'A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe'
-/// llama_cli = 'A:\cppsoft\llama.cpp\build\bin\Release\llama-completion.exe'
+/// ffmpeg    = 'C:\tools\ffmpeg.exe'
+/// llama_cli = 'C:\tools\llama-completion.exe'
 /// ```
 ///
 /// 设计上只承载「换台机器就不成立」的三类东西：路径、GPU 策略、在线翻译接口。
@@ -2012,7 +2012,7 @@ impl AppConfig {
     ///
     /// `config.toml` 是**被 git 跟踪**的共享配置，但它里面混着两类东西：
     /// 1. 所有人都一样的调参（线程数、VAD 阈值、字幕样式、润色模式…）；
-    /// 2. **只对本机成立**的绝对路径，例如 `A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe`。
+    /// 2. **只对本机成立**的绝对路径，例如 `C:\tools\ffmpeg.exe`。
     ///
     /// 第 2 类一旦提交，别人 clone 下来直接就是「你的机器」——路径不存在，
     /// 启动即报错，且每个人都要先把这几行改掉才能跑，改完又会把改动推回去。
@@ -3090,9 +3090,8 @@ mod tests {
     fn machine_absolute_paths_are_split_out_of_shared_config() {
         let mut cfg = super::AppConfig::default();
         // 三个必填项各来一个绝对路径 + 一个相对路径
-        cfg.paths.ffmpeg = r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe".to_string();
-        cfg.paths.llama_cli =
-            r"A:\cppsoft\llama.cpp\build\bin\Release\llama-completion.exe".to_string();
+        cfg.paths.ffmpeg = r"C:\tools\ffmpeg.exe".to_string();
+        cfg.paths.llama_cli = r"C:\tools\llama-completion.exe".to_string();
         cfg.paths.whisper_cli = "tools/whisper-vulkan/whisper.exe".to_string();
         // Option 项同样要有覆盖
         cfg.paths.punc_model = Some(r"D:\models\punc\model.int8.onnx".to_string());
@@ -3112,10 +3111,7 @@ mod tests {
         );
 
         // 机器路径原样记录在本地覆盖里
-        assert_eq!(
-            local.ffmpeg.as_deref(),
-            Some(r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe")
-        );
+        assert_eq!(local.ffmpeg.as_deref(), Some(r"C:\tools\ffmpeg.exe"));
         assert_eq!(
             local.punc_model.as_deref(),
             Some(r"D:\models\punc\model.int8.onnx")
@@ -3169,8 +3165,8 @@ mod tests {
         let main_path = dir.join("config.toml");
 
         let mut cfg = super::AppConfig::default();
-        cfg.paths.ffmpeg = r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe".to_string();
-        cfg.paths.llama_cli = r"A:\cppsoft\llama.cpp\llama-completion.exe".to_string();
+        cfg.paths.ffmpeg = r"C:\tools\ffmpeg.exe".to_string();
+        cfg.paths.llama_cli = r"C:\tools\llama-completion.exe".to_string();
         cfg.pipeline.whisper_threads = 12;
         cfg.ui.theme = "light".to_string();
 
@@ -3180,21 +3176,18 @@ mod tests {
         // 共享配置里不能出现机器路径
         let shared_text = std::fs::read_to_string(&main_path).expect("read shared");
         assert!(
-            !shared_text.contains(r"A:\cppsoft"),
+            !shared_text.contains(r"C:\tools"),
             "机器路径不应写进 config.toml:\n{shared_text}"
         );
         // 覆盖文件里必须有
         let local_path = dir.join(super::AppConfig::LOCAL_OVERRIDE);
         let local_text = std::fs::read_to_string(&local_path).expect("read local");
-        assert!(local_text.contains(r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe"));
+        assert!(local_text.contains(r"C:\tools\ffmpeg.exe"));
 
         // 读回来：机器路径复原，共享调参也保留
         let back = super::AppConfig::load_from_file(&main_path).expect("load");
-        assert_eq!(back.paths.ffmpeg, r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe");
-        assert_eq!(
-            back.paths.llama_cli,
-            r"A:\cppsoft\llama.cpp\llama-completion.exe"
-        );
+        assert_eq!(back.paths.ffmpeg, r"C:\tools\ffmpeg.exe");
+        assert_eq!(back.paths.llama_cli, r"C:\tools\llama-completion.exe");
         assert_eq!(back.pipeline.whisper_threads, 12);
         assert_eq!(back.ui.theme, "light");
 
@@ -3241,7 +3234,7 @@ mod tests {
         let local_path = dir.join(super::AppConfig::LOCAL_OVERRIDE);
 
         let mut cfg = super::AppConfig::default();
-        cfg.paths.ffmpeg = r"A:\cppsoft\ffmpeg-6.9\bin\ffmpeg.exe".to_string();
+        cfg.paths.ffmpeg = r"C:\tools\ffmpeg.exe".to_string();
         cfg.save_to_file(&main_path)
             .expect("save with absolute path");
         assert!(local_path.exists(), "绝对路径应产生本机覆盖文件");
@@ -3383,7 +3376,7 @@ gpu_limit_percent = 60
         std::fs::write(
             &local_path,
             r#"[paths]
-ffmpeg = 'A:\cppsoft\ffmpeg.exe'
+ffmpeg = 'C:\tools\ffmpeg.exe'
 [gpu]
 gpu_limit_percent = 60
 "#,
