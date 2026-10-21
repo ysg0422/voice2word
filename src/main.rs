@@ -427,7 +427,16 @@ fn main() -> Result<()> {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(1080.0), px(720.0))),
+                // 最小尺寸要留得比「常见小屏的逻辑分辨率」还小，否则窗口根本放不下。
+                //
+                // 1080p 笔记本在 **150% 缩放**下逻辑分辨率只有 1280×720，减去任务栏后
+                // 工作区约 1280×680：原来的下限 1080×720 比工作区还高，用户既不能把窗口
+                // 缩到屏幕内、又不会自动最大化，底部的时间轴/状态栏永远在屏幕外。
+                // 这是很常见的一档（Win10/11 对 1080p 的推荐缩放就是 125%~150%）。
+                //
+                // 960×600 仍高于布局的实际需求（左侧栏可折叠成 38px，剪辑台在 <820 宽时
+                // 自动改成上下堆叠），但足够小，任何常见屏幕都能容纳。
+                window_min_size: Some(size(px(960.0), px(600.0))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Voice2Word — 音视频智能字幕生成器".into()),
                     appears_transparent: true,

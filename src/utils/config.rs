@@ -2026,8 +2026,17 @@ impl AppConfig {
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let full_path = Self::resolve_path(path.as_ref().to_str().unwrap_or("config.toml"));
         let mut cfg = if full_path.exists() {
-            let content = std::fs::read_to_string(&full_path)
+            // 按字节读、再做 UTF-8 → GBK 兜底：中文 Windows 上有些编辑器保存 .toml
+            // 用的是 GBK，而 `read_to_string` 要求严格 UTF-8，一遇到就报
+            // 「读取配置文件失败」并让**程序拒绝启动**——用户只是改了行配置。
+            let raw = std::fs::read(&full_path)
                 .with_context(|| format!("读取配置文件失败: {:?}", full_path))?;
+            let (content, non_utf8) = crate::utils::decode_text_bytes(&raw);
+            if non_utf8 {
+                let hint = "配置文件不是 UTF-8 编码（已按 GBK 兼容读取）：".to_string()
+                    + "建议用「另存为 UTF-8」重存，否则含中文的取值在别的工具里可能显示成乱码";
+                tracing::warn!(file = %full_path.display(), "{hint}");
+            }
             let parsed: Self =
                 toml::from_str(&content).with_context(|| "反序列化 config.toml 失败")?;
             // 不认识的顶层段不阻断启动（向前/向后兼容），但不能静默：段名写错
@@ -2073,8 +2082,9 @@ impl AppConfig {
         // 会把覆盖文件错认到项目根下，于是「自定义路径的配置」永远读不到自己的覆盖。
         let local_path = Self::local_override_path(&full_path);
         if local_path.exists() {
-            match std::fs::read_to_string(&local_path)
+            match std::fs::read(&local_path)
                 .map_err(anyhow::Error::from)
+                .map(|raw| crate::utils::decode_text_bytes(&raw).0)
                 .and_then(|c| {
                     toml::from_str::<LocalOverride>(&c)
                         .map_err(anyhow::Error::from)
@@ -3522,7 +3532,45 @@ gpu_limit_percent = 60
             .unwrap_or_else(|| panic!("候选里应含 {}: {candidates:?}", needle.display()))
     }
 
-    /// `dir_is_writable` 必须**真的落一个探针文件**再删掉，不能只看权限位：
+    /// `decode_text_bytes`：UTF-8 原样、GBK 兜底、乱码 lossy。
+    #[test]
+    fn decode_text_bytes_handles_utf8_and_gbk() {
+        let utf8 = "中文配置".as_bytes();
+        assert_eq!(
+            crate::utils::decode_text_bytes(utf8),
+            ("中文配置".to_string(), false)
+        );
+
+        // 「中文配置」的 GBK 编码
+        let gbk: &[u8] = &[0xD6, 0xD0, 0xCE, 0xC4, 0xC5, 0xE4, 0xD6, 0xC3];
+        let (text, fallback) = crate::utils::decode_text_bytes(gbk);
+        assert_eq!(text, "中文配置", "GBK 必须能正确解出中文");
+        assert!(fallback, "走了非 UTF-8 兜底要能报告出来");
+    }
+
+    /// 配置文件被按 GBK 保存时，**必须仍能启动**（以前会因严格 UTF-8 解码失败而拒绝启动）。
+    #[test]
+    fn gbk_encoded_config_still_loads() {
+        let dir = plain_dir("cfg_gbk");
+        let path = dir.join("config.toml");
+        // 用**完整默认配置**做基底（纯 ASCII），末尾再加一段 GBK 中文注释——
+        // 这正是「中文 Windows 上某个编辑器保存了一次」之后的样子。
+        let base = toml::to_string_pretty(&super::AppConfig::default()).expect("序列化默认配置");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(base.as_bytes());
+        bytes.extend_from_slice(&[0x23, 0x20]); // "# "
+        bytes.extend_from_slice(&[0xD6, 0xD0, 0xCE, 0xC4]); // 中文（GBK）
+        bytes.extend_from_slice(b"\n");
+        std::fs::write(&path, &bytes).expect("写入 GBK 配置");
+
+        let cfg = super::AppConfig::load_from_file(&path)
+            .expect("GBK 编码的配置必须能加载，否则用户改行配置就打不开程序");
+        assert_eq!(cfg.pipeline.language, "zh");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `dir_is_writable` 必须**真的落一个探针文件**再删掉，不能只看权限位：    /// `dir_is_writable` 必须**真的落一个探针文件**再删掉，不能只看权限位：
     /// Windows 上 ACL 才是准的，只看只读属性位会误判。
     #[test]
     fn dir_is_writable_probes_the_filesystem() {

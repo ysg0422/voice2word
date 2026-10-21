@@ -1710,7 +1710,13 @@ impl AppState {
     /// 从 `glossary.txt` 读回术语表（跳过自动写入的注释头），落盘并返回生效条数。
     pub fn reload_glossary_from_temp_file(&mut self) -> std::io::Result<usize> {
         let path = crate::utils::AppConfig::resolve_path("glossary.txt");
-        let text = std::fs::read_to_string(&path)?;
+        // 这个文件是**让用户用记事本改的**：中文 Windows 上记事本/编辑器的默认保存
+        // 编码常常是 GBK，严格 UTF-8 读取会直接失败，界面只能报一句看不懂的 io 错误。
+        let raw = std::fs::read(&path)?;
+        let (text, non_utf8) = crate::utils::decode_text_bytes(&raw);
+        if non_utf8 {
+            tracing::warn!("glossary.txt 不是 UTF-8（已按 GBK 兼容读取）：建议另存为 UTF-8");
+        }
         self.config.translate.glossary = text;
         self.save_translate_config();
         Ok(self.config.translate.glossary_entries().len())
@@ -1742,7 +1748,17 @@ impl AppState {
         path: &std::path::Path,
         config_path: impl AsRef<std::path::Path>,
     ) -> std::io::Result<(usize, usize, usize)> {
-        let text = std::fs::read_to_string(path)?;
+        // 导入的文件多半来自 Excel 的「另存为 CSV」——中文 Windows 上 Excel 默认写
+        // **GBK/ANSI**，严格 UTF-8 读取必然失败，用户只会看到一条 io 错误，
+        // 完全想不到「用记事本另存为 UTF-8」这一步。
+        let raw = std::fs::read(path)?;
+        let (text, non_utf8) = crate::utils::decode_text_bytes(&raw);
+        if non_utf8 {
+            tracing::warn!(
+                path = %path.display(),
+                "术语表文件不是 UTF-8（已按 GBK 兼容读取）：建议在 Excel 里选「CSV UTF-8」导出"
+            );
+        }
         // 表格软件「另存为 UTF-8」几乎都会带 BOM；这里统一吃掉，`from_csv` 自己也认。
         let body = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
         let is_csv = path

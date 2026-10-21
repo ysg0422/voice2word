@@ -51,8 +51,14 @@ pub fn to_cli_safe_path(path: &Path) -> PathBuf {
         //   卷的大小（与 E: 一样大），极具迷惑性。
         // - 不再在驱动器根目录建 `.v2w_alias` 硬链接：删除源文件后空间不回收，
         //   盘根还会多出隐藏目录。
-        // 大文件（视频 / 模型）直接用原路径：ffmpeg、whisper 都是从 argv 取
-        // UTF-8 路径，不需要 ASCII 别名；GB 级复制只会拖慢起播并吃满磁盘。
+        // 大文件（视频 / 模型）直接用原路径：**外部 CLI 的 argv 能正确接收 UTF-8**，
+        // 不需要 ASCII 别名；GB 级复制只会拖慢起播并吃满磁盘。
+        //
+        // 这条结论是**实测**过的，记在这里免得以后又有人来加「盘符映射 / 硬链接别名」：
+        // 把中文路径传给 whisper-cli，报错信息里看起来是 `�����ڵ�����.wav`，很像 argv
+        // 被按 ANSI 解码了；但把它的 stderr 按 **GBK(936)** 解码后是正确中文——那是它
+        // **输出编码**的问题（写 ANSI 码页），不是输入的问题。程序侧已有
+        // `decode_cli_bytes`（UTF-8 → GBK → lossy）兜住输出，路径本身无需别名。
         const MAX_SAFE_COPY_BYTES: u64 = 64 * 1024 * 1024;
         if normalized.is_file() {
             let small = normalized

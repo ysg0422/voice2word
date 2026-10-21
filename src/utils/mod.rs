@@ -50,6 +50,33 @@ pub use path_safety::{normalize_path_slashes, safe_temp_dir, to_cli_safe_path};
 static OTHER_INSTANCE_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// 解码一段**用户可编辑**的文本文件字节（配置、术语表等）。
+///
+/// 顺序：严格 UTF-8 → GBK（`had_errors` 为假才算命中）→ lossy 兜底。
+///
+/// 为什么必须有这一步：中文 Windows 上不少编辑器（老版记事本、Notepad++ 的默认设置、
+/// 部分 IDE 插件）保存 .toml/.txt 时用的是 **GBK**。而 `fs::read_to_string` 要求严格
+/// UTF-8，一遇到 GBK 就返回 `InvalidData`——程序把它当成「配置文件损坏」，
+/// **直接拒绝启动**，只抛一条看不懂的 io 错误。用户只是改了行配置而已。
+///
+/// 返回 `(文本, 是否用了非 UTF-8 兜底)`：第二项供调用方记一条提示，
+/// 让用户知道「建议另存为 UTF-8」，而不是让编码问题永久潜伏。
+pub fn decode_text_bytes(raw: &[u8]) -> (String, bool) {
+    match std::str::from_utf8(raw) {
+        Ok(s) => (s.to_string(), false),
+        Err(_) => {
+            let (decoded, _, had_errors) = encoding_rs::GBK.decode(raw);
+            if !had_errors {
+                (decoded.into_owned(), true)
+            } else {
+                // 既不是 UTF-8 也不是干净 GBK：按 lossy 保留可读部分，绝不因为
+                // 「有几个字节不认识」就把整份配置丢弃。
+                (String::from_utf8_lossy(raw).into_owned(), true)
+            }
+        }
+    }
+}
+
 /// 记录「启动时检测到另一个实例在运行」。
 pub fn set_other_instance_running(value: bool) {
     OTHER_INSTANCE_RUNNING.store(value, std::sync::atomic::Ordering::SeqCst);
