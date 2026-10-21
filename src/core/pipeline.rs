@@ -124,7 +124,12 @@ impl EngineCapabilities {
 
     /// VAD 展示名。
     fn vad_engine_name(&self, vad_sec: f64) -> &'static str {
-        if self.sensevoice() {
+        // 并行切块时每个进程内部各自跑 VAD，与识别**并发**发生、无法单独计时，
+        // 报告里该行的耗时常年为 0；此时再写「流式 VAD」会让人以为漏统计了。
+        // 说清楚「未单独计时，已并入识别」比给一个 0 秒更可信。
+        if self.sensevoice() && self.parallel_chunks {
+            "SenseVoice 内嵌 VAD（多进程并行，耗时并入识别）"
+        } else if self.sensevoice() {
             "SenseVoice 融合流式 VAD"
         } else if vad_sec > 0.0 {
             "Silero VAD 毫秒级语音切片压实"
@@ -1576,7 +1581,8 @@ impl TaskPipeline {
                         })
                         .await??;
                     let total_elapsed = transcription_started.elapsed().as_secs_f64();
-                    let pure_sec = (total_elapsed - v_sec).max(0.0);
+                    // VAD 是串行的真实占用，可以扣，但必须钳在墙钟内。
+                    let (v_sec, pure_sec) = split_vad_and_asr(total_elapsed, v_sec, false);
                     (segs, v_sec, pure_sec)
                 }
                 TranscribeRoute::Chunked { parallel } => {
@@ -1638,7 +1644,8 @@ impl TaskPipeline {
                     })
                     .await??;
                     let total_elapsed = transcription_started.elapsed().as_secs_f64();
-                    let pure_sec = (total_elapsed - v_sec).max(0.0);
+                    // 并行切块：各 worker 的 VAD 是并发发生的，相加没有意义。
+                    let (v_sec, pure_sec) = split_vad_and_asr(total_elapsed, v_sec, parallel);
                     (segs, v_sec, pure_sec)
                 }
                 TranscribeRoute::SenseVoiceUnavailable => {
@@ -2382,6 +2389,35 @@ fn restore_final_timeline(
     restorer.restore_all(segments);
 }
 
+/// 把「识别阶段的总墙钟」拆成 (VAD, 纯推理) 两项。
+///
+/// **并行切块**时每个 worker 各自跑 VAD、各自计时，把它们相加得到的是
+/// 「各进程累计」而不是任何真实等待时长——实测 6 个 worker 相加 605 秒，
+/// 而整条链路墙钟只有 118 秒。旧代码直接拿这个和去减墙钟，于是同一次运行里
+/// 同时出现两种错：ASR 被压成 `0 ms`、VAD 显示 605 秒（比总耗时还大）。
+///
+/// 因此：
+/// - `parallel = true`：VAD 与 ASR 在多个进程里**并发**发生，无法从墙钟里分离，
+///   VAD 记 0，整段墙钟归给 ASR（与 SenseVoice 单进程流式路径同一口径）；
+/// - 串行路径：VAD 是真实占用，可以直接扣，但**钳到墙钟以内**，
+///   防止引擎回报一个比总耗时还大的数把 ASR 压成 0。
+fn split_vad_and_asr(total_elapsed: f64, reported_vad: f64, parallel: bool) -> (f64, f64) {
+    let total = if total_elapsed.is_finite() {
+        total_elapsed.max(0.0)
+    } else {
+        0.0
+    };
+    if parallel {
+        return (0.0, total);
+    }
+    let vad = if reported_vad.is_finite() {
+        reported_vad.clamp(0.0, total)
+    } else {
+        0.0
+    };
+    (vad, (total - vad).max(0.0))
+}
+
 /// 记录「引擎吐出第一段输出」的时刻（只记第一次）。
 ///
 /// 用途：把**子进程启动 + 模型加载**从「阶段 3」的总时长里单独量出来。
@@ -2706,6 +2742,39 @@ fn ensure_exportable_segments(segments: &[Segment]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 并行切块时，每个 worker 各自计的 VAD 不能相加后再去减墙钟。
+    ///
+    /// 现场数据：6 个 worker 相加 605 秒、墙钟只有 118.8 秒 → 旧实现让 ASR 显示
+    /// `0 ms`、VAD 显示 605 秒（比总耗时还大）。
+    #[test]
+    fn parallel_chunks_attribute_all_wall_time_to_asr() {
+        let (vad, asr) = super::split_vad_and_asr(118.8, 605.0, true);
+        assert_eq!(
+            vad, 0.0,
+            "并行切块的 VAD 不可分离，不能报一个比墙钟还大的数"
+        );
+        assert!((asr - 118.8).abs() < 1e-9, "整段墙钟应归给 ASR，实得 {asr}");
+    }
+
+    /// 串行路径：VAD 是真实占用，可以扣；但引擎若回报超过墙钟的值，必须钳住。
+    #[test]
+    fn serial_vad_is_subtracted_but_clamped_to_wall_time() {
+        let (vad, asr) = super::split_vad_and_asr(100.0, 12.0, false);
+        assert!((vad - 12.0).abs() < 1e-9);
+        assert!((asr - 88.0).abs() < 1e-9);
+
+        // 越界的回报（比墙钟还大）：VAD 吃满、ASR 归零，但**不许出现负数**
+        let (vad, asr) = super::split_vad_and_asr(30.0, 250.0, false);
+        assert!((vad - 30.0).abs() < 1e-9);
+        assert_eq!(asr, 0.0);
+
+        // 负值 / NaN / 非有限墙钟：一律当 0 处理，不产生 NaN 传播到界面
+        assert_eq!(super::split_vad_and_asr(10.0, -5.0, false).0, 0.0);
+        assert_eq!(super::split_vad_and_asr(10.0, f64::NAN, false).0, 0.0);
+        assert_eq!(super::split_vad_and_asr(f64::NAN, 3.0, false), (0.0, 0.0));
+    }
+
     use super::*;
     use crate::subtitle::segment::WordTiming;
     use crate::subtitle::Segment;
