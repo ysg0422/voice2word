@@ -31,6 +31,7 @@ Voice2Word 是一款**完全本地运行**的音视频字幕工作台，覆盖�
   - [下载安装包](#下载安装包)
   - [从源码构建](#从源码构建)
   - [模型与组件](#模型与组件)
+    - [本地识别引擎](#本地识别引擎)
   - [运行测试](#运行测试)
   - [装好后自检](#装好后自检)
 - [快速上手](#快速上手)
@@ -185,6 +186,9 @@ models/
     silero_vad.onnx
   llm/
     qwen2.5-0.5b-instruct-q4_k_m.gguf         # 本地润色 / 翻译用的 Qwen 模型
+  dolphin/                                    # 本地识别引擎（按需下载，可只用其中一个）
+    model.int8.onnx
+    tokens.txt
 ```
 
 - **FFmpeg**：三种来源都行，按顺序取第一个可用的——① 上面 `tools/ffmpeg.exe`；② **系统 PATH 上的 `ffmpeg`**（自己装过或 scoop/winget 装的都能直接用）；③ 都没有时，程序启动后会自动把它下载到 `tools/ffmpeg.exe`。手动下载见 [ffmpeg.org](https://ffmpeg.org/download.html)。
@@ -193,6 +197,25 @@ models/
 - **模型**：Whisper 系列取自 [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp)，Qwen 取自 [Qwen2.5 GGUF](https://huggingface.co/Qwen)，SenseVoice / CT-Punc 的 ONNX 模型可从 ModelScope 获取（`tools/download_sensevoice.py` 提供 SenseVoice 下载脚本）。
 
 > 只使用某一种引擎时，其余模型可以不放：对应功能在界面上不可用，但程序可正常启动。
+
+#### 本地识别引擎
+
+除 Whisper 之外，程序还能直接调用一套基于 sherpa-onnx 的本地识别引擎。它们和 Whisper 是**两套运行时**：Whisper 读 `ggml-*.bin`，这些模型读 `*.onnx`。
+
+| 模型 | 语言 | 体积 | 特点 |
+| --- | --- | --- | --- |
+| SenseVoice | 中/英/日/韩/粤 | 228 MB | 非自回归，速度最快，自带标点与数字规范化 |
+| Paraformer | 中 | 997 MB | 同样非自回归，长句与数字更稳 |
+| FireRedASR Large | 中/英 | 1.47 GB | 中文准确率最高档，编码器-解码器结构，明显更慢 |
+| Dolphin Base | 东亚/东南亚约 40 种 | 80 MB | 小语种覆盖广，体积几乎可以忽略 |
+| Canary 180M Flash | 英/西/德/法 | 147 MB | NVIDIA 多语种小模型 |
+| Parakeet TDT 0.6B | 英 | 482 MB | 英文准确率第一梯队 |
+| Parakeet CTC 110M | 英 | 414 MB | 英文轻量档 |
+| Moonshine Base | 英 | 250 MB | 低延迟，适合短句与实时场景 |
+
+下载后在该条目上点「设为当前」，程序会把模型路径写进 `config.toml` 并提示重启生效。切换只影响识别引擎，标点、润色与翻译模型不受影响。
+
+> 这些模型以 `.tar.bz2` 发布，解压由内置便携 Python 完成；压缩包内的顶层版本目录会自动剥离，落地路径稳定为 `models/<引擎名>/`。
 
 ### 运行测试
 
