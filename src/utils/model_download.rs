@@ -1704,7 +1704,12 @@ pub fn delete_item_file(item_id: &str, cfg: &AppConfig) -> Result<Option<PathBuf
     // 就是 tools/ 本身，更不能碰。让用户手动整体删除。
     if item.is_archive {
         let entry = AppConfig::resolve_path(item.dest);
-        let dir = entry.parent().unwrap_or(entry.as_path());
+        let dir = entry.parent().unwrap_or(entry.as_path()).to_path_buf();
+        let exclusive = archive_dir_is_deletable(&entry);
+        if exclusive && dir.is_dir() {
+            fs::remove_dir_all(&dir).with_context(|| format!("删除目录失败: {}", dir.display()))?;
+            return Ok(Some(dir));
+        }
         bail!(
             "{}（{}）是自包含/压缩包组件：入口文件只是几 KB 的启动桩，\
              真正的程序在同目录的 DLL 里，单独删一个文件会留下残缺的半包。\
@@ -1757,11 +1762,39 @@ pub fn delete_item_file(item_id: &str, cfg: &AppConfig) -> Result<Option<PathBuf
 ///
 /// 未知 id 返回 `false`：界面拿到的可能是过期的 id（条目已改名/下线），
 /// 此时宁可不出按钮，也不要渲染一个点了就报错的按钮。
-pub fn item_is_deletable(id: &str) -> bool {
-    match item_by_id(id) {
-        Some(item) => !item.is_archive,
-        None => false,
+/// 解压目录是否"可整体删除"：独占 **且** 位于 `models/` 下。
+///
+/// 为什么还要求 ModelSS 下：`tools/` 里放的是**程序**（whisper / llama / ffmpeg），
+/// 其中 whisper 可能是用户自己用脚本编译的 Vulkan 版。程序目录交给用户自己管理，
+/// 界面上不给「删除」按钮，避免一键把手工编译的产物删掉。
+fn archive_dir_is_deletable(dest: &Path) -> bool {
+    let Some(dir) = dest.parent() else {
+        return false;
+    };
+    let models_root = AppConfig::resolve_path("models");
+    if !dir.starts_with(&models_root) {
+        return false;
     }
+    archive_root_is_exclusive(
+        dest,
+        ITEMS
+            .iter()
+            .map(|other| AppConfig::resolve_path(other.dest))
+            .filter(|other| other.parent() != Some(dir)),
+    )
+}
+
+pub fn item_is_deletable(id: &str) -> bool {
+    let Some(item) = item_by_id(id) else {
+        return false;
+    };
+    if !item.is_archive {
+        return true;
+    }
+    // 压缩包条目：只有 models/ 下的**独占**目录才给删除按钮。
+    // llama / sherpa 平铺解到 tools/（与 ffmpeg 共用），整目录删会误伤；
+    // whisper 可能是用户自编译的，程序目录一律不给删。
+    archive_dir_is_deletable(&AppConfig::resolve_path(item.dest))
 }
 
 /// 缺少的**必需**条目数（用于启动提示与界面告警）。
@@ -2799,6 +2832,27 @@ mod tests {
     /// 测试里泄漏几个短字符串无所谓，换来的是测试不再向仓库树写东西。
     fn leak_str(s: String) -> &'static str {
         Box::leak(s.into_boxed_str())
+    }
+
+    /// 压缩包条目能否删除，取决于它的解压目录是否**独占**。
+    ///
+    /// llama / sherpa 平铺解到 tools/（与 ffmpeg 等共用），整目录删会误伤；
+    /// models/dolphin 这类独占目录则可以整体删除，否则用户下完就没地方删了。
+    #[test]
+    fn archive_deletability_requires_exclusive_dir() {
+        use super::item_is_deletable;
+        // 独占目录：可删
+        assert!(
+            item_is_deletable("asr-dolphin"),
+            "models/dolphin/ 只归 Dolphin，应当可以删除"
+        );
+        // 平铺解到 tools/：不可删
+        assert!(
+            !item_is_deletable("llama-cpp"),
+            "llama 解到共享的 tools/，整目录删会带走 ffmpeg"
+        );
+        // 未知 id
+        assert!(!item_is_deletable("no-such-item"));
     }
 
     /// 同目录词表的相对路径必须是正斜杠且与其它配置项同口径。
