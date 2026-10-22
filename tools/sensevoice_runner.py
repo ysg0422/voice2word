@@ -261,6 +261,44 @@ SUPPORTED_MODEL_TYPES = (
 NEEDS_DECODER = ("fire-red-asr", "fireredasr", "canary", "nemo-canary")
 
 
+def discover_sibling(path, *names):
+    """在 `path` 同目录里按 `names` 顺序找第一个存在的文件。
+
+    为什么要自动发现而不是让调用方逐个填：sherpa-onnx 的发布包一律把
+    `model.int8.onnx` / `tokens.txt`（多文件族的 `decoder*.onnx`）平铺在同一目录。
+    让 Rust 侧为每个族硬编码文件名，等于把上游的命名方式抄进源码——上游改名就失败，
+    而失败发生在「用户已经下了 1.5 GB」之后。留空即自动查找，找不到再报错。
+    """
+    base = os.path.dirname(os.path.abspath(path)) if path else ""
+    if not base:
+        return ""
+    for name in names:
+        candidate = os.path.join(base, name)
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+def resolve_optional_paths(args):
+    """补全 tokens / decoder：留空就按模型目录自动查找。返回错误消息或 None。"""
+    if not args.tokens:
+        args.tokens = discover_sibling(args.model, "tokens.txt")
+    if not args.tokens:
+        return "词表未找到：请在 --tokens 指定，或把 tokens.txt 放在模型同目录"
+    if not args.decoder:
+        kind = (args.model_type or "").strip().lower().replace("_", "-")
+        if kind in NEEDS_DECODER:
+            args.decoder = discover_sibling(
+                args.model, "decoder.int8.onnx", "decoder.onnx", "decoder.fp16.onnx"
+            )
+            if not args.decoder:
+                return (
+                    "decoder 未找到：请在 --decoder 指定，"
+                    "或把 decoder*.onnx 放在模型同目录"
+                )
+    return None
+
+
 def validate_model_type(args):
     """在**接管 fd 2 之前**校验模型族与必需文件。
 
@@ -275,8 +313,10 @@ def validate_model_type(args):
             file=sys.stderr,
         )
         sys.exit(1)
-    if kind in NEEDS_DECODER and not args.decoder:
-        print(f"{args.model_type} 需要 --decoder（encoder/decoder 两个 onnx）", file=sys.stderr)
+    # tokens / decoder 留空时先尝试自动发现，再判定是否真的缺。
+    missing = resolve_optional_paths(args)
+    if missing:
+        print(missing, file=sys.stderr)
         sys.exit(1)
 
 
@@ -364,7 +404,8 @@ def main():
         sys.stderr.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Voice2Word SenseVoice Runner")
     parser.add_argument("--model", required=True, help="Path to SenseVoice model.int8.onnx")
-    parser.add_argument("--tokens", required=True, help="Path to tokens.txt")
+    # 可选：留空时自动在同目录找 tokens.txt（sherpa-onnx 的模型包都是平铺同名文件）。
+    parser.add_argument("--tokens", default="", help="Path to tokens.txt（留空则按模型目录自动查找）")
     parser.add_argument("--vad-model", required=True, help="Path to silero_vad.onnx")
     parser.add_argument("--input", required=True, help="Path to input .wav or '-' for stdin")
     parser.add_argument("--output", help="Optional output JSON path")
