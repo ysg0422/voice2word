@@ -5266,6 +5266,28 @@ impl MainWindow {
             cx.notify();
             return;
         }
+        // VAD 是**必需依赖**：启动时引擎装配要求 model + tokens + vad 三者都在，
+        // 少了 vad 会静默回落到 Whisper——用户以为切换成功了，其实没生效。
+        // 这里提前拦住并说清楚要下哪个，比让它悄悄不生效好。
+        let vad_path = self
+            .state
+            .config
+            .paths
+            .sensevoice_vad
+            .as_ref()
+            .map(|p| crate::utils::AppConfig::resolve_path(p))
+            .unwrap_or_else(|| {
+                crate::utils::AppConfig::resolve_path("models/sensevoice/silero_vad.onnx")
+            });
+        if !vad_path.is_file() {
+            self.notice = Some(
+                "还缺「Silero VAD（静音检测）」——本地识别引擎靠它切分语音段，缺了引擎\
+                 装不起来。它在「SenseVoice」分区的组件里，只有 0.6 MB，下载后再点「设为当前」。"
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         self.state.config.paths.sensevoice_model = Some(item.dest.to_string());
         self.state.config.paths.sensevoice_tokens = Some(tokens_rel);
         self.state.persist_config();

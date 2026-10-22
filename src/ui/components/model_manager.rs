@@ -229,8 +229,29 @@ pub(crate) fn is_item_needed_for_tab(
 ///
 /// 只有 `required: true` 的条目才可能计入（当前是 whisper-small 与 ffmpeg/ffplay），
 /// 外加「当前选中档位对应的那个模型」——用户主动选了某一档却没下，那才算缺。
+/// 当前配置里选中的是不是「非 SenseVoice 的本地引擎」（Dolphin / Paraformer / …）。
+///
+/// 判据看模型路径而不是另立一个配置项：切换动作本身就只写路径（见
+/// [`MainWindow::use_local_asr_model`]），多一个开关反而会出现两者不一致的状态。
+pub(crate) fn local_engine_selected(state: &crate::app::AppState) -> bool {
+    engine_path_is_local(&state.config.paths.sensevoice_model)
+}
+
+/// 判定内核（纯函数，便于单测）：给定 config 里的模型路径，判断是否选中了非 SenseVoice 族。
+///
+/// `None` = 用默认路径（`models/sensevoice/model.int8.onnx`），也就是 SenseVoice。
+pub fn engine_path_is_local(model: &Option<String>) -> bool {
+    let model = model
+        .clone()
+        .unwrap_or_else(|| "models/sensevoice/model.int8.onnx".to_string());
+    crate::engines::sensevoice::model_family_from_path(&crate::utils::AppConfig::resolve_path(
+        &model,
+    )) != crate::engines::sensevoice::ModelFamily::SenseVoice
+}
+
 pub fn is_item_required_now(item_id: &str, state: &crate::app::AppState) -> bool {
     let is_sv = state.whisper_model_tier == crate::app::WhisperModelTier::SenseVoice;
+    let local = local_engine_selected(state);
 
     match item_id {
         // 抽音解码：任何模式都需要
@@ -243,8 +264,11 @@ pub fn is_item_required_now(item_id: &str, state: &crate::app::AppState) -> bool
             !is_sv && !has_cli
         }
 
-        // SenseVoice 套件：选它时三个文件齐了才跑得起来
-        "sensevoice-model" | "sensevoice-tokens" | "sensevoice-vad" => is_sv,
+        // SenseVoice 套件：**真的在用 SenseVoice** 时才算必需。
+        // 用户已经切到 Dolphin/Paraformer 之后，再提示「SenseVoice 模型缺失」纯属噪音。
+        "sensevoice-model" | "sensevoice-tokens" => is_sv && !local,
+        // VAD 是两条链路都要的公共依赖，切到本地引擎后依然必需。
+        "sensevoice-vad" => is_sv || local,
 
         // Whisper 各档模型：**只认当前选中的那一档**。没选中的档位是「可选商品」，
         // 缺与不缺都不该报警——用户下不下由他自己决定。
@@ -1283,11 +1307,27 @@ mod tests {
     use super::{model_disk_snapshot_stale, ModelDiskKey};
     use std::path::PathBuf;
 
-    /// 分块表必须自洽：引用的条目 id 都真实存在，且**同一 id 只出现在一个块里**。
+    /// 切到本地引擎之后，SenseVoice 的模型/词表不该再被当成「缺失」催下载；
+    /// 但 VAD 是两条链路共用，必须仍然算必需。
     ///
-    /// 后者是「一页三块」特有的风险。早先按专区切换时，同一个 id 登记在两个专区
-    /// 是无害的（一次只渲染一个）；现在三块同时渲染，重复登记会让同一个模型在页面上
-    /// 出现两次，块头「已就位 N / M」的分母也会被算重。
+    /// 这里只测判定内核（纯函数）：构造完整 AppState 需要数据库与管线，
+    /// 与这条规则本身无关。
+    #[test]
+    fn engine_path_is_local_follows_config_path() {
+        // 未配置 / 默认路径 → 不是本地引擎（仍是 SenseVoice）
+        assert!(!super::engine_path_is_local(&None));
+        assert!(!super::engine_path_is_local(&Some(
+            "models/sensevoice/model.int8.onnx".to_string()
+        )));
+        // 指向别的族 → 是本地引擎
+        assert!(super::engine_path_is_local(&Some(
+            "models/dolphin/model.int8.onnx".to_string()
+        )));
+        assert!(super::engine_path_is_local(&Some(
+            "models/paraformer/model.int8.onnx".to_string()
+        )));
+    }
+
     #[test]
     fn block_table_references_real_items_without_duplicates() {
         use super::MODEL_BLOCKS;
