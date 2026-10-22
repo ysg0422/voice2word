@@ -1137,13 +1137,36 @@ impl MainWindow {
             // 只有「本地识别引擎」族的条目才有「设为当前」这件事：
             // 它们是同一套运行时的不同模型，切换靠改 config 的两个路径。
             if crate::engines::sensevoice::model_family_for_item(item.id).is_some() {
-                actions = actions.child(
-                    primitives::mini_btn("设为当前", !is_downloading)
-                        .id(("model-use-asr", row_idx))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.use_local_asr_model(row_id, cx);
-                        })),
-                );
+                // 已经是当前引擎时不再给一个点了没反应的按钮，直接显示状态：
+                // 用户点完「设为当前」需要看到**确认**，否则会怀疑没生效而反复点。
+                let is_current_engine = self
+                    .state
+                    .config
+                    .paths
+                    .sensevoice_model
+                    .as_deref()
+                    .map(|p| p == item.dest)
+                    .unwrap_or(false);
+                if is_current_engine {
+                    actions = actions.child(
+                        div()
+                            .px(px(Theme::SPACE_2))
+                            .py(px(2.0))
+                            .rounded(px(Theme::RADIUS_SM))
+                            .bg(Theme::tint_mint_soft())
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::accent_mint())
+                            .child("当前引擎"),
+                    );
+                } else {
+                    actions = actions.child(
+                        primitives::mini_btn("设为当前", !is_downloading)
+                            .id(("model-use-asr", row_idx))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.use_local_asr_model(row_id, cx);
+                            })),
+                    );
+                }
             }
             actions = actions.child(
                 primitives::mini_btn("定位", true)
