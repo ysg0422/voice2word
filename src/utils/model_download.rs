@@ -99,6 +99,16 @@ fn is_allowed_source(url: &str) -> bool {
     .any(|b| url.starts_with(b))
 }
 
+/// 压缩包条目「已就位」判据的下限（针对**解压后的入口文件**）。
+///
+/// 为什么不按压缩包大小推：`item.size` 是**下载包**的大小，而判据看的是解压后的单个
+/// 文件（FireRedASR 的 encoder 只是包里两三个文件之一）。按 95% 推会得出「永远缺失」，
+/// 用户就会反复重下 1.5 GB —— 这正是 min_size 这个字段存在的理由。
+///
+/// 为什么可以取这么低：包完整性由**解压本身**保证（tarfile 解不完整会直接抛错，
+/// 之后还会校验入口文件是否存在）。这里的下限只用来区分「文件在」和「文件是 0 字节的残渣」。
+const ARCHIVE_ENTRY_MIN_SIZE: u64 = 10_000_000;
+
 /// 单个可下载项。
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadItem {
@@ -362,7 +372,7 @@ pub const ITEMS: &[DownloadItem] = &[
         ],
         size: 80_671_385, // 实测 Content-Length（压缩包）
         // 判定的是**解压后**的 model.int8.onnx，比压缩包小得多；给一个宽松下限即可。
-        min_size: 60_000_000,
+        min_size: ARCHIVE_ENTRY_MIN_SIZE,
         required: false,
         group: ItemGroup::Asr,
         is_archive: true,
@@ -380,7 +390,7 @@ pub const ITEMS: &[DownloadItem] = &[
             "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-2024-03-09.tar.bz2",
         ],
         size: 996_591_364, // 实测 Content-Length（压缩包）
-        min_size: 200_000_000, // 解压后的 model.int8.onnx
+        min_size: ARCHIVE_ENTRY_MIN_SIZE,
         required: false,
         group: ItemGroup::Asr,
         is_archive: true,
@@ -399,7 +409,7 @@ pub const ITEMS: &[DownloadItem] = &[
             "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-fire-red-asr-large-zh_en-2025-02-16.tar.bz2",
         ],
         size: 1_469_513_701,
-        min_size: 300_000_000,
+        min_size: ARCHIVE_ENTRY_MIN_SIZE,
         required: false,
         group: ItemGroup::Asr,
         is_archive: true,
@@ -416,7 +426,7 @@ pub const ITEMS: &[DownloadItem] = &[
             "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8.tar.bz2",
         ],
         size: 153_692_328,
-        min_size: 50_000_000,
+        min_size: ARCHIVE_ENTRY_MIN_SIZE,
         required: false,
         group: ItemGroup::Asr,
         is_archive: true,
@@ -433,7 +443,7 @@ pub const ITEMS: &[DownloadItem] = &[
             "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000.tar.bz2",
         ],
         size: 434_206_949,
-        min_size: 100_000_000,
+        min_size: ARCHIVE_ENTRY_MIN_SIZE,
         required: false,
         group: ItemGroup::Asr,
         is_archive: true,
@@ -452,7 +462,7 @@ pub const ITEMS: &[DownloadItem] = &[
             "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2",
         ],
         size: 250_807_309,
-        min_size: 60_000_000,
+        min_size: ARCHIVE_ENTRY_MIN_SIZE,
         required: false,
         group: ItemGroup::Asr,
         is_archive: true,
@@ -470,7 +480,7 @@ pub const ITEMS: &[DownloadItem] = &[
             "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
         ],
         size: 482_468_385,
-        min_size: 100_000_000,
+        min_size: ARCHIVE_ENTRY_MIN_SIZE,
         required: false,
         group: ItemGroup::Asr,
         is_archive: true,
