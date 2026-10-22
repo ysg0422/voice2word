@@ -1972,7 +1972,7 @@ pub fn download_one(
                     if let Some(cb) = progress {
                         cb(PROGRESS_UNPACKING, 0, item.id);
                     }
-                    match unpack_archive(item, &part, &dest, url) {
+                    match unpack_archive(item, &part, &dest, url, cancel) {
                         Ok(()) => {
                             let dir = dest.parent().unwrap_or(dest.as_path());
                             info!(item = item.id, dir = %dir.display(), "下载并解压完成");
@@ -2107,7 +2107,7 @@ print(count)
 "#;
 
 /// 用内置便携 Python 解压 `.tar.bz2`，返回解出的普通文件数。
-fn extract_tar_bz2(part: &Path, dir: &Path) -> Result<usize> {
+fn extract_tar_bz2(part: &Path, dir: &Path, cancel: &Arc<AtomicBool>) -> Result<usize> {
     // 与 SenseVoice 运行器同一套解释器解析规则：优先内置便携 Python，
     // 别指望客户机 PATH 上有 python。
     let python = crate::utils::AppConfig::resolve_command("python");
@@ -2116,25 +2116,74 @@ fn extract_tar_bz2(part: &Path, dir: &Path) -> Result<usize> {
         .arg(TAR_BZ2_SCRIPT)
         .arg(part)
         .arg(dir)
-        .stdin(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null())
+        // 必须显式 pipe：改用 spawn 之后不再有 run_with_deadline 帮忙设管道，
+        // 不 pipe 的话 stdout 是继承的，读回来永远是空串（计数会变成 0）。
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     // 去掉用户环境里残留的 PYTHONHOME/PYTHONPATH 并固定 UTF-8 输出：
     // 否则某些机器上解释器会去找另一份（残缺的）标准库。
     crate::engines::media_pipeline::apply_python_env(&mut cmd);
-    // 1.5 GB 的 bz2 在慢 CPU 上解压要几分钟；给足预算，但不能无限等。
-    let out = crate::engines::ffmpeg::run_with_deadline(&mut cmd, Duration::from_secs(1800))
+    // 不用 run_with_deadline：它一次性等到进程结束，期间**按取消没反应**。
+    // 1.5 GB 的 bz2 要解几分钟，用户点了「取消」却只能强杀进程——这里改成
+    // spawn + 每 200ms 轮询一次取消标志，命中就 kill 子进程。
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("启动解压进程失败: {}", python.display()))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    let deadline = std::time::Instant::now() + Duration::from_secs(1800);
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    // 子进程要写 stdout/stderr；不读会把它堵死（管道缓冲区满即阻塞），
+    // 因此起两个线程把输出读空。
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stdout_pipe.take() {
+            use std::io::Read;
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stderr_pipe.take() {
+            use std::io::Read;
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    });
+
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("已取消"));
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("解压超时（30 分钟），已终止");
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("等待解压进程失败: {err}");
+            }
+        }
+    };
+
+    let stdout = out_thread.join().unwrap_or_default();
+    let stderr = err_thread.join().unwrap_or_default();
+    if !status.success() {
         bail!(
             "解压 .tar.bz2 失败（退出码 {:?}）：{}",
-            out.status.code(),
+            status.code(),
             stderr.trim().chars().take(400).collect::<String>()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<usize>()
-        .unwrap_or(0))
+    Ok(stdout.trim().parse::<usize>().unwrap_or(0))
 }
 
 /// 把已下载到 `part` 的 zip 解压到 `dest` 的父目录，并校验关键文件都落盘。
@@ -2144,15 +2193,20 @@ fn extract_tar_bz2(part: &Path, dir: &Path) -> Result<usize> {
 /// 2. 校验入口文件（`dest`）与伴生文件（`companion`）确实存在；
 /// 3. 全部校验通过后才删除 `.part`。中途失败则保留 `.part`，
 ///    既不会留下半成品目录，也能被 `sweep_parts_for` 在下次启动时清掉。
-fn unpack_archive(item: &DownloadItem, part: &Path, dest: &Path, url: &str) -> Result<()> {
+fn unpack_archive(
+    item: &DownloadItem,
+    part: &Path,
+    dest: &Path,
+    url: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<()> {
     let dir = dest
         .parent()
         .ok_or_else(|| anyhow!("目标路径没有父目录: {}", dest.display()))?;
     // 按 URL 的扩展名选解压器：.tar.bz2 走便携 Python，其余沿用内置 zip 解析器。
     let n = match archive_kind_from_url(url) {
-        ArchiveKind::TarBz2 => {
-            extract_tar_bz2(part, dir).with_context(|| format!("解压失败: {}", part.display()))?
-        }
+        ArchiveKind::TarBz2 => extract_tar_bz2(part, dir, cancel)
+            .with_context(|| format!("解压失败: {}", part.display()))?,
         ArchiveKind::Zip => {
             let bytes =
                 fs::read(part).with_context(|| format!("读取压缩包失败: {}", part.display()))?;
@@ -2938,7 +2992,12 @@ with tarfile.open(out, "w:bz2") as tf:
 
         let out_dir = dir.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
-        let n = super::extract_tar_bz2(&archive, &out_dir).expect("解压应成功");
+        let n = super::extract_tar_bz2(
+            &archive,
+            &out_dir,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .expect("解压应成功");
         assert_eq!(n, 2);
         assert!(
             out_dir.join("model.int8.onnx").exists(),
@@ -2986,7 +3045,12 @@ with tarfile.open(out, "w:bz2") as tf:
 
         let out_dir = dir.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
-        let n = super::extract_tar_bz2(&archive, &out_dir).expect("解压应成功");
+        let n = super::extract_tar_bz2(
+            &archive,
+            &out_dir,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .expect("解压应成功");
         assert_eq!(n, 1, "只应解出一个正常文件");
         assert!(out_dir.join("ok.txt").exists(), "正常文件必须解出");
         assert!(
@@ -3512,7 +3576,14 @@ with tarfile.open(out, "w:bz2") as tf:
         .unwrap();
         let dest = dir.join("tool.exe");
 
-        unpack_archive(&item, &part, &dest, "https://example.invalid/x.zip").unwrap();
+        unpack_archive(
+            &item,
+            &part,
+            &dest,
+            "https://example.invalid/x.zip",
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
         assert!(dest.exists(), "入口文件应已解压落盘");
         assert!(dir.join("tool-server.exe").exists(), "伴生文件应已解压落盘");
         assert!(!part.exists(), "成功后 .part 必须被删除");
@@ -3547,7 +3618,14 @@ with tarfile.open(out, "w:bz2") as tf:
         let dest = dir.join("tool.exe");
 
         assert!(
-            unpack_archive(&item, &part, &dest, "https://example.invalid/x.zip").is_err(),
+            unpack_archive(
+                &item,
+                &part,
+                &dest,
+                "https://example.invalid/x.zip",
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+            )
+            .is_err(),
             "缺伴生文件应报错"
         );
         assert!(part.exists(), "失败时 .part 应保留以便清理");
