@@ -1897,7 +1897,16 @@ pub fn download_one(
     }
     // 空间预检放在「目录已建好」之后、「开始下载」之前：
     // 这样路径解析与可写性已经过，剩下的失败几乎只可能是空间不足。
-    ensure_free_space(&dest, item.size)?;
+    // 预检要按**峰值**算，不是按下载包大小：
+    // 压缩包条目下载完还要解压，峰值 = 压缩包 + 解压产物 ≈ 3 倍包体
+    // （FireRedASR 1.47 GB → 峰值约 4.5 GB）。只按 1.5 GB 预检，
+    // 下载会在解压到一半时磁盘写满，那时 .part 已经删了、目录是半成品。
+    let needed = if item.is_archive {
+        item.size.saturating_mul(3)
+    } else {
+        item.size
+    };
+    ensure_free_space(&dest, needed)?;
     // 已经存在**自编译的自包含构建**时拒绝覆盖：官方包是「启动桩 + DLL」，
     // 直接下载会把用户的单文件构建换成启动桩（尤其是手编的 Vulkan 版，
     // GPU 支持会凭空消失且毫无提示）。让他先自行处理，或把 config 指向别处。
