@@ -143,7 +143,7 @@ const MODEL_BLOCKS: [ModelBlock; 4] = [
             },
             ModelCategory {
                 title: "英文专用",
-                item_ids: &["asr-parakeet"],
+                item_ids: &["asr-parakeet-tdt", "asr-parakeet", "asr-moonshine"],
             },
         ],
     },
@@ -966,6 +966,8 @@ impl MainWindow {
             "asr-firered" => "内存 8 GB · 纯 CPU 很慢，建议独显 · 解压后约 3 GB",
             "asr-canary" => "内存 4 GB · 纯 CPU 可跑 · 解压后约 200 MB（仅英西德法）",
             "asr-parakeet" => "内存 4 GB · 纯 CPU 可跑 · 解压后约 450 MB（仅英文）",
+            "asr-parakeet-tdt" => "内存 6 GB · 纯 CPU 可跑 · 解压后约 600 MB（仅英文）",
+            "asr-moonshine" => "内存 2 GB · 纯 CPU 可跑，延迟极低 · 解压后约 260 MB（仅英文）",
             _ => "纯 CPU 即可 · 具体占用见左侧大小",
         }
     }

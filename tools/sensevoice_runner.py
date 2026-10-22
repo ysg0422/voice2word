@@ -7,6 +7,7 @@ Voice2Word SenseVoice-Small 极速非自回归语音识别执行器
 
 import sys
 import os
+import glob as _glob
 import re
 import json
 import time
@@ -257,8 +258,10 @@ SUPPORTED_MODEL_TYPES = (
     "nemo",
     "canary",
     "nemo-canary",
+    "moonshine",
+    "transducer",
 )
-NEEDS_DECODER = ("fire-red-asr", "fireredasr", "canary", "nemo-canary")
+NEEDS_DECODER = ("fire-red-asr", "fireredasr", "canary", "nemo-canary", "transducer")
 
 
 def discover_sibling(path, *names):
@@ -276,6 +279,22 @@ def discover_sibling(path, *names):
         candidate = os.path.join(base, name)
         if os.path.exists(candidate):
             return candidate
+    return ""
+
+
+def discover_by_pattern(path, *patterns):
+    """在同目录按**通配**找文件（多文件族的文件名带 int8/fp16 后缀，写死会失效）。
+
+    例：Moonshine 的编码器叫 `encode.int8.onnx`，全精度版叫 `encode.onnx`。
+    用 `encode*.onnx` 一次覆盖两种，不必为每个量化档写一份配置。
+    """
+    base = os.path.dirname(os.path.abspath(path)) if path else ""
+    if not base:
+        return ""
+    for pattern in patterns:
+        hits = sorted(_glob.glob(os.path.join(base, pattern)))
+        if hits:
+            return hits[0]
     return ""
 
 
@@ -371,6 +390,54 @@ def build_recognizer(sherpa_onnx, args, provider, language):
     if kind in ("nemo-ctc", "nemo"):
         return sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
             model=args.model,
+            tokens=args.tokens,
+            num_threads=args.threads,
+            provider=provider,
+        )
+
+    if kind == "moonshine":
+        # Moonshine 是四件套：preprocessor + encoder + 两个 decoder，文件名必须成组出现。
+        # 逐项按通配找，缺哪个就点名说哪个——比一句「加载失败」有用得多。
+        pre = discover_by_pattern(args.model, "preprocess*.onnx")
+        enc = discover_by_pattern(args.model, "encode*.onnx") or args.model
+        uncached = discover_by_pattern(args.model, "uncached_decode*.onnx")
+        cached = discover_by_pattern(args.model, "cached_decode*.onnx")
+        missing = [
+            name
+            for name, value in (
+                ("preprocess*.onnx", pre),
+                ("encode*.onnx", enc),
+                ("uncached_decode*.onnx", uncached),
+                ("cached_decode*.onnx", cached),
+            )
+            if not value
+        ]
+        if missing:
+            print(f"Moonshine 缺少文件：{'、'.join(missing)}", file=sys.stderr)
+            sys.exit(1)
+        return sherpa_onnx.OfflineRecognizer.from_moonshine(
+            preprocessor=pre,
+            encoder=enc,
+            uncached_decoder=uncached,
+            cached_decoder=cached,
+            tokens=args.tokens,
+            num_threads=args.threads,
+            provider=provider,
+        )
+
+    if kind == "transducer":
+        # Parakeet TDT 这类 transducer：encoder + decoder + joiner 三件套。
+        joiner = discover_by_pattern(args.model, "joiner*.onnx")
+        if not joiner:
+            print("transducer 缺少 joiner*.onnx（与 encoder/decoder 同目录）", file=sys.stderr)
+            sys.exit(1)
+        if not args.decoder:
+            print("transducer 缺少 decoder*.onnx", file=sys.stderr)
+            sys.exit(1)
+        return sherpa_onnx.OfflineRecognizer.from_transducer(
+            encoder=args.model,
+            decoder=args.decoder,
+            joiner=joiner,
             tokens=args.tokens,
             num_threads=args.threads,
             provider=provider,

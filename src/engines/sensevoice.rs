@@ -396,9 +396,9 @@ pub fn model_family_from_path(model_path: &Path) -> ModelFamily {
     } else if p.contains("firered") || p.contains("fire-red") {
         ModelFamily::FireRedAsr
     } else if p.contains("moonshine") {
-        // Moonshine 是 encoder+decoder+preprocessor 四文件，runner 尚未接入；
-        // 这里仍归到 NeMo CTC 之外的族，避免被当成 SenseVoice 静默跑错。
-        ModelFamily::NemoCtc
+        ModelFamily::Moonshine
+    } else if p.contains("parakeet-tdt") || p.contains("tdt") {
+        ModelFamily::Transducer
     } else {
         ModelFamily::SenseVoice
     }
@@ -420,6 +420,10 @@ pub fn model_family_for_item(item_id: &str) -> Option<ModelFamily> {
         "asr-canary" => ModelFamily::NemoCanary,
         // Parakeet CTC：NVIDIA 英文，单 onnx。
         "asr-parakeet" => ModelFamily::NemoCtc,
+        // Moonshine：四件套小模型，英文专用、低延迟。
+        "asr-moonshine" => ModelFamily::Moonshine,
+        // Parakeet TDT：transducer 三件套，英文准确率更高（但比 CTC 版大）。
+        "asr-parakeet-tdt" => ModelFamily::Transducer,
         _ => return None,
     })
 }
@@ -445,6 +449,10 @@ pub enum ModelFamily {
     NemoCtc,
     /// NVIDIA NeMo Canary（encoder + decoder 两个 onnx）
     NemoCanary,
+    /// Useful Sensors Moonshine（preprocessor + encoder + 两个 decoder，四件套）
+    Moonshine,
+    /// transducer 结构（encoder + decoder + joiner 三件套，如 Parakeet TDT）
+    Transducer,
 }
 
 impl ModelFamily {
@@ -457,12 +465,14 @@ impl ModelFamily {
             Self::DolphinCtc => "dolphin-ctc",
             Self::NemoCtc => "nemo-ctc",
             Self::NemoCanary => "nemo-canary",
+            Self::Moonshine => "moonshine",
+            Self::Transducer => "transducer",
         }
     }
 
     /// 该族是否必须额外给一个 decoder 文件。
     pub fn needs_decoder(self) -> bool {
-        matches!(self, Self::FireRedAsr | Self::NemoCanary)
+        matches!(self, Self::FireRedAsr | Self::NemoCanary | Self::Transducer)
     }
 
     /// 追加到 runner 命令行的额外参数。
@@ -1612,6 +1622,20 @@ mod tests {
         assert!(ModelFamily::FireRedAsr.needs_decoder());
         assert!(ModelFamily::NemoCanary.needs_decoder());
         assert!(!ModelFamily::NemoCtc.needs_decoder());
+
+        // 四件套 / 三件套族：runner 的 --model-type 必须与 Python 侧支持的取值完全一致，
+        // 写错一个字母会在用户下完几百 MB 之后才炸。
+        assert_eq!(
+            ModelFamily::Moonshine.runner_extra_args(None),
+            vec!["--model-type", "moonshine"]
+        );
+        assert_eq!(
+            ModelFamily::Transducer.runner_extra_args(None),
+            vec!["--model-type", "transducer"]
+        );
+        // transducer 需要 decoder（三件套之一），缺了必须判为「需要」
+        assert!(ModelFamily::Transducer.needs_decoder());
+        assert!(!ModelFamily::Moonshine.needs_decoder());
     }
 
     use super::*;

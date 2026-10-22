@@ -441,6 +441,43 @@ pub const ITEMS: &[DownloadItem] = &[
         sha256: None,
     },
     DownloadItem {
+        id: "asr-moonshine",
+        label: "Moonshine Base（英文·低延迟）",
+        note: "Useful Sensors 出品，MIT 许可；短句/实时场景延迟很低，250MB",
+        // 四件套：preprocess / encode / uncached_decode / cached_decode（+ tokens）。
+        // 入口登记 encoder，其余由运行器在模型同目录按通配自动找。
+        dest: "models/moonshine/encode.int8.onnx",
+        urls: &[
+            "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2",
+            "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2",
+        ],
+        size: 250_807_309,
+        min_size: 60_000_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: true,
+        companion: Some("tokens.txt"),
+        sha256: None,
+    },
+    DownloadItem {
+        id: "asr-parakeet-tdt",
+        label: "Parakeet TDT 0.6B v2（英文·最高精度）",
+        note: "NVIDIA transducer 结构，英文准确率在开源模型里属于第一梯队；482MB，比 CTC 版更大也更准",
+        // 三件套：encoder / decoder / joiner（+ tokens）。入口登记 encoder。
+        dest: "models/parakeet-tdt/encoder.int8.onnx",
+        urls: &[
+            "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+            "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+        ],
+        size: 482_468_385,
+        min_size: 100_000_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: true,
+        companion: Some("tokens.txt"),
+        sha256: None,
+    },
+    DownloadItem {
         id: "whisper-tiny",
         label: "Whisper Tiny（轻量尝鲜）",
         note: "75MB 超轻模型，低内存占用与秒级测试",
