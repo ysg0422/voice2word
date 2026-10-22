@@ -5513,6 +5513,18 @@ impl MainWindow {
         cx.spawn(async move |this, cx| {
             while let Some((done, total_b, id)) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
+                    // 哨兵：下载已完成，正在解压（大包要几分钟，必须给提示）。
+                    if done == crate::utils::model_download::PROGRESS_UNPACKING {
+                        if let Some(item) = crate::utils::ITEMS.iter().find(|i| i.id == id) {
+                            this.state.download_status_msg = format!("正在解压 {}…", item.label);
+                        }
+                        this.state.download_item_progress.insert(
+                            id.clone(),
+                            (crate::utils::model_download::PROGRESS_UNPACKING, 0),
+                        );
+                        cx.notify();
+                        return;
+                    }
                     // 哨兵：这一条结束了（成功或失败），把它的进度摘掉。
                     // 用 `u64::MAX` 而不是新开一种消息，是为了让通道类型保持简单。
                     if done == u64::MAX {

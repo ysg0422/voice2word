@@ -99,6 +99,13 @@ fn is_allowed_source(url: &str) -> bool {
     .any(|b| url.starts_with(b))
 }
 
+/// 进度回调里表示「下载已完成、正在解压」的哨兵值。
+///
+/// 为什么需要：1.5 GB 的 `.tar.bz2` 在普通机器上解压要一两分钟，而下载进度条此时
+/// 已经走到 100%——如果什么都不说，界面看起来就是卡死了。用 sentinel 而不是改
+/// 回调签名：`ProgressFn` 是既有约定，加参数会波及所有调用点。
+pub const PROGRESS_UNPACKING: u64 = u64::MAX - 1;
+
 /// 压缩包条目「已就位」判据的下限（针对**解压后的入口文件**）。
 ///
 /// 为什么不按压缩包大小推：`item.size` 是**下载包**的大小，而判据看的是解压后的单个
@@ -1961,6 +1968,10 @@ pub fn download_one(
                 // 压缩包类组件（如 llama.cpp）：下载物是 zip，真正的程序在包内。
                 // 必须解压到 dest 的父目录并校验关键文件都在，才算成功。
                 if item.is_archive {
+                    // 先告诉界面「进入解压阶段」，避免几分钟的静默被当成卡死。
+                    if let Some(cb) = progress {
+                        cb(PROGRESS_UNPACKING, 0, item.id);
+                    }
                     match unpack_archive(item, &part, &dest, url) {
                         Ok(()) => {
                             let dir = dest.parent().unwrap_or(dest.as_path());

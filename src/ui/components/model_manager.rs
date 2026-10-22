@@ -1273,7 +1273,13 @@ impl MainWindow {
                             // 下载中：进度直接长在**这一条自己**的下面。
                             // 同时下几条时各看各的，不用去顶部找「现在是谁在跑」。
                             .children(row_progress.map(|(done, total)| {
-                                let ratio = if total > 0 {
+                                // 解压阶段没有字节进度可言：显示满条 + 「解压中」，
+                                // 否则会把哨兵值当字节数渲染成 16 EB。
+                                let unpacking =
+                                    done == crate::utils::model_download::PROGRESS_UNPACKING;
+                                let ratio = if unpacking {
+                                    1.0
+                                } else if total > 0 {
                                     (done as f32 / total as f32).clamp(0.0, 1.0)
                                 } else {
                                     0.0
@@ -1289,7 +1295,9 @@ impl MainWindow {
                                         div()
                                             .text_size(px(Theme::TEXT_CAPTION))
                                             .text_color(Theme::text_muted())
-                                            .child(if total > 0 {
+                                            .child(if unpacking {
+                                                "解压中…（大包需要一两分钟）".to_string()
+                                            } else if total > 0 {
                                                 format!(
                                                     "{} / {}",
                                                     human_size(done),
