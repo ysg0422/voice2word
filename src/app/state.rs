@@ -1039,6 +1039,12 @@ pub struct AppState {
     /// 「进度显示在条目自己那一行」并允许并发——那就必须按 id 分开记。
     /// 空表示该条目当前没在下（下载完成 / 失败后立刻移除）。
     pub download_item_progress: std::collections::HashMap<String, (u64, u64)>,
+
+    /// 鼠标当前悬停的模型条目 id（`None` = 没悬停）。用来渲染「配置要求」悬浮卡。
+    ///
+    /// 放在状态里而不是行内部：卡片要浮在**行之外**（否则会被行高裁掉），
+    /// 只有把「谁被悬停」提到列表层才能定位。
+    pub hovered_model_id: Option<&'static str>,
     /// 最近一次下载的结果提示（成功或失败原因）
     pub download_status_msg: String,
     /// 最近一次字幕写库失败的原因（`None` = 一切正常）。
@@ -1370,6 +1376,7 @@ impl AppState {
             download_done_bytes: 0,
             download_total_bytes: 0,
             download_item_progress: std::collections::HashMap::new(),
+            hovered_model_id: None,
             download_status_msg: String::new(),
             // 首次扫描放在 `with_hardware` 收尾处（那里能拿到 &mut self）
             cached_transcription: Arc::new(std::sync::Mutex::new(None)),

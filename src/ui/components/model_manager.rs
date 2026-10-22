@@ -925,6 +925,70 @@ impl MainWindow {
         card.into_any_element()
     }
 
+    /// 「跑这个模型需要什么样的机器」——悬浮卡片的内容来源。
+    ///
+    /// 为什么单独一张表而不是塞进 DownloadItem：那个结构是下载/校验用的数据结构，
+    /// 硬件建议属于**展示**，改文案不该动下载逻辑，也不该让 30+ 个字面量再长一截。
+    pub(crate) fn hardware_hint(item_id: &str) -> &'static str {
+        match item_id {
+            "whisper-tiny" => "内存 2 GB · 纯 CPU 可跑（最快）· 磁盘 75 MB",
+            "whisper-base" => "内存 2 GB · 纯 CPU 可跑 · 磁盘 141 MB",
+            "whisper-small" => "内存 4 GB · 纯 CPU 可跑 · 磁盘 173 MB",
+            "whisper-small-en" => "内存 4 GB · 纯 CPU 可跑 · 磁盘 465 MB（仅英文）",
+            "whisper-medium" => "内存 8 GB · 纯 CPU 可跑但偏慢 · 磁盘 1.5 GB",
+            "whisper-medium-q8" => "内存 6 GB · 纯 CPU 可跑 · 磁盘 785 MB",
+            "whisper-medium-en" => "内存 8 GB · 纯 CPU 偏慢 · 磁盘 1.5 GB（仅英文）",
+            "whisper-turbo-q5" => "内存 6 GB · 建议 4 核以上 · 磁盘 547 MB",
+            "whisper-turbo-q8" => "内存 8 GB · 建议 4 核以上 · 磁盘 834 MB",
+            "whisper-large-v3-turbo-f16" => "内存 12 GB · 建议独显 · 磁盘 1.6 GB",
+            "whisper-large-v3" => "内存 16 GB · 建议 6 GB 以上显存 · 磁盘 3.0 GB",
+            "whisper-large-v3-q5_0" => "内存 10 GB · 建议独显 · 磁盘 1.1 GB",
+            "whisper-large-v2" => "内存 16 GB · 建议 6 GB 以上显存 · 磁盘 3.0 GB",
+            "whisper-cublas" => "需要 NVIDIA 显卡 + CUDA 运行库 · 磁盘 436 MB",
+            "whisper-cli" => "纯 CPU 即可（CPU 版推理程序）· 磁盘 4 MB",
+            "sensevoice-model" => "内存 4 GB · 纯 CPU 即可，速度最快（非自回归）· 磁盘 228 MB",
+            "punc-model" => "内存 2 GB · 纯 CPU · 磁盘 72 MB",
+            "silero-vad" => "内存 <1 GB · 纯 CPU · 磁盘 1 MB",
+            "asr-dolphin" => "内存 4 GB · 纯 CPU 可跑 · 解压后约 80 MB",
+            _ => "纯 CPU 即可 · 具体占用见左侧大小",
+        }
+    }
+
+    /// 悬浮卡片：悬停某行时浮在行右侧，显示「需要什么配置」。
+    ///
+    /// 用绝对定位而不是插入一行：卡片一插进去就会把整张列表顶开，鼠标一动布局就跳，
+    /// 反而看不清。这里只浮不改布局。
+    fn render_model_hover_card(item: &'static crate::utils::DownloadItem) -> AnyElement {
+        div()
+            .absolute()
+            .top(px(0.0))
+            .right(px(0.0))
+            .w(px(300.0))
+            .p(px(Theme::SPACE_2_5))
+            .rounded(px(Theme::RADIUS_SM))
+            .bg(Theme::bg_raised())
+            .border_1()
+            .border_color(Theme::border())
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_1))
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(Theme::text_primary())
+                    .child("配置要求"),
+            )
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(Theme::text_muted())
+                    .child(Self::hardware_hint(item.id)),
+            )
+            .into_any_element()
+    }
+
     /// 单个条目行：名称 + 用途说明 + 体积 + 状态徽标 + 操作区。
     fn render_model_row(
         &mut self,
@@ -945,6 +1009,8 @@ impl MainWindow {
         let row_idx = ITEMS.iter().position(|i| i.id == item.id).unwrap_or(0);
         // 这一条自己的下载进度（没有 = 没在下）。
         let row_progress = self.state.download_item_progress.get(item.id).copied();
+        // 悬停回调拿到的只有 &mut App，所以要提前把实体句柄降级保存一份。
+        let hover_entity = cx.entity().downgrade();
         // 当前配置下是否**真的需要**它（只认真必需的，见 [`is_item_required_now`]）。
         // 未就位不再一律染红：模型列表是一份可选清单，没下过的档位是「还没装」
         // 而不是「出错了」。
@@ -1165,6 +1231,23 @@ impl MainWindow {
                     ),
             )
             .child(right_actions)
+            // 交互元素必须先有稳定 id，GPUI 才把 on_hover 挂得上（Div 只有在
+            // 实现 StatefulInteractiveElement 之后才提供 on_hover）。
+            .id(("model-row", row_idx))
+            // 悬停：只写「谁被悬停」，卡片浮在行右侧，不改变任何一行的高度。
+            .on_hover(move |hovered: &bool, _window, app| {
+                let on = *hovered;
+                let _ = hover_entity.update(app, |this, cx| {
+                    let next = if on { Some(row_id) } else { None };
+                    if this.state.hovered_model_id != next {
+                        this.state.hovered_model_id = next;
+                        cx.notify();
+                    }
+                });
+            })
+            .when(self.state.hovered_model_id == Some(item.id), |d| {
+                d.child(Self::render_model_hover_card(item))
+            })
             .into_any_element()
     }
 }
