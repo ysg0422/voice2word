@@ -353,13 +353,16 @@ fn main() -> Result<()> {
             Some(Arc::new(
                 engines::SenseVoiceEngine::with_python_and_provider(
                     runner,
-                    model,
+                    model.clone(),
                     tokens,
                     vad,
                     config.pipeline.whisper_threads,
                     python_path.clone(),
                     provider,
-                ),
+                )
+                // 族由模型路径决定：指向 models/dolphin/ 就是 Dolphin，指向 SenseVoice 目录
+                // 就是原样（认不出也收敛到 SenseVoice，行为不变）。
+                .with_family(engines::sensevoice::model_family_from_path(&model), None),
             ))
         } else {
             warn!(

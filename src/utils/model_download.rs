@@ -1452,6 +1452,29 @@ fn archive_root_is_exclusive(
     !other_dests.any(|other| other.parent() == Some(root))
 }
 
+/// 与 `dest` 同目录的词表**相对路径**（写进 config 用，必须与其它配置项同口径）。
+///
+/// `config.toml` 里的路径一律是相对项目根、且用正斜杠；直接 `PathBuf` 拼出来在
+/// Windows 上会带反斜杠，虽然能读，但与本文件其它条目的写法不一致，容易在比对/测试里
+/// 出现「看起来一样却不相等」。
+pub fn sibling_tokens_rel(dest: &str) -> String {
+    Path::new(dest)
+        .with_file_name("tokens.txt")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// 同目录下的词表路径（sherpa-onnx 的模型包一律是 `model.int8.onnx` + `tokens.txt`
+/// 平铺在同一目录）。
+///
+/// 抽成函数是为了让「设为当前识别模型」与下载完成后的路径推断用同一份规则，
+/// 避免一边写 `tokens.txt`、另一边写 `tokens.json` 这种不一致。
+pub fn sibling_tokens_path(dest: &Path) -> PathBuf {
+    dest.parent()
+        .map(|d| d.join("tokens.txt"))
+        .unwrap_or_else(|| PathBuf::from("tokens.txt"))
+}
+
 /// 某个条目在磁盘上的**实际占用**（`None` = 未就位）。
 ///
 /// # 为什么不能只看 `dest`
@@ -2659,6 +2682,18 @@ mod tests {
     /// 测试里泄漏几个短字符串无所谓，换来的是测试不再向仓库树写东西。
     fn leak_str(s: String) -> &'static str {
         Box::leak(s.into_boxed_str())
+    }
+
+    /// 同目录词表的相对路径必须是正斜杠且与其它配置项同口径。
+    #[test]
+    fn sibling_tokens_rel_uses_forward_slashes() {
+        use super::sibling_tokens_rel;
+        assert_eq!(
+            sibling_tokens_rel("models/dolphin/model.int8.onnx"),
+            "models/dolphin/tokens.txt"
+        );
+        // 只给文件名时落在根目录
+        assert_eq!(sibling_tokens_rel("model.onnx"), "tokens.txt");
     }
 
     /// 压缩包类型从 URL 推断：sherpa-onnx 的发布包一律 .tar.bz2，其余按 zip。

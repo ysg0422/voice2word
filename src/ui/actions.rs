@@ -5240,6 +5240,42 @@ impl MainWindow {
     /// 在**后台线程**执行：最大 833 MB 的文件在慢网下要几十分钟，绝不能在
     /// UI 线程上跑。进度通过 `mpsc` 回传，取消用一个 `AtomicBool`
     /// （与翻译链路同一套模式）。
+    /// 把某个「本地识别引擎」条目设为**当前 ASR 模型**。
+    ///
+    /// 实现方式：只写 `config.toml` 里既有的 `sensevoice_model` / `sensevoice_tokens`
+    /// 两个字段（启动时引擎就是按它们装配的）。不为「选模型」新增配置项——配置是
+    /// 用户手改的文件，字段越少越不容易配错。
+    ///
+    /// 为什么提示「重启后生效」：引擎在启动时装配一次，运行中换模型需要重建整条管线，
+    /// 贸然热切换会在转写中途换掉正在用的会话。说清楚比假装能热切更负责。
+    pub(crate) fn use_local_asr_model(&mut self, item_id: &'static str, cx: &mut Context<Self>) {
+        if crate::engines::sensevoice::model_family_for_item(item_id).is_none() {
+            return;
+        }
+        let Some(item) = crate::utils::ITEMS.iter().find(|i| i.id == item_id) else {
+            return;
+        };
+        let tokens_rel = crate::utils::model_download::sibling_tokens_rel(item.dest);
+        let model_ok = crate::utils::AppConfig::resolve_path(item.dest).is_file();
+        let tokens_ok = crate::utils::AppConfig::resolve_path(&tokens_rel).is_file();
+        if !model_ok || !tokens_ok {
+            self.notice = Some(format!(
+                "「{}」还没下载完整（缺模型或词表），先下载再切换",
+                item.label
+            ));
+            cx.notify();
+            return;
+        }
+        self.state.config.paths.sensevoice_model = Some(item.dest.to_string());
+        self.state.config.paths.sensevoice_tokens = Some(tokens_rel);
+        self.state.persist_config();
+        self.notice = Some(format!(
+            "已把「{}」设为当前识别模型；重启应用后生效。",
+            item.label
+        ));
+        cx.notify();
+    }
+
     pub(crate) fn start_model_download(&mut self, item_id: &'static str, cx: &mut Context<Self>) {
         if self.state.is_downloading {
             return;

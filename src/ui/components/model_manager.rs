@@ -1026,6 +1026,17 @@ impl MainWindow {
                 .items_center()
                 .flex_shrink_0()
                 .gap(px(Theme::SPACE_1_5));
+            // 只有「本地识别引擎」族的条目才有「设为当前」这件事：
+            // 它们是同一套运行时的不同模型，切换靠改 config 的两个路径。
+            if crate::engines::sensevoice::model_family_for_item(item.id).is_some() {
+                actions = actions.child(
+                    primitives::mini_btn("设为当前", !is_downloading)
+                        .id(("model-use-asr", row_idx))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.use_local_asr_model(row_id, cx);
+                        })),
+                );
+            }
             actions = actions.child(
                 primitives::mini_btn("定位", true)
                     .id(("model-reveal", row_idx))
