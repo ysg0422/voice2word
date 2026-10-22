@@ -132,10 +132,20 @@ const MODEL_BLOCKS: [ModelBlock; 4] = [
         tab: ModelManagerTab::LocalAsr,
         title: "本地识别引擎",
         subtitle: "同一套 sherpa-onnx 运行时承载的其它模型族；体积小、语种多，按需下载",
-        categories: &[ModelCategory {
-            title: "多语种（东亚 / 东南亚，约 40 种语言）",
-            item_ids: &["asr-dolphin"],
-        }],
+        categories: &[
+            ModelCategory {
+                title: "中文高精度（比 SenseVoice 更准，慢一些）",
+                item_ids: &["asr-firered", "asr-paraformer"],
+            },
+            ModelCategory {
+                title: "多语种（东亚 / 东南亚 / 欧洲）",
+                item_ids: &["asr-dolphin", "asr-canary"],
+            },
+            ModelCategory {
+                title: "英文专用",
+                item_ids: &["asr-parakeet"],
+            },
+        ],
     },
     ModelBlock {
         tab: ModelManagerTab::Common,
@@ -194,7 +204,9 @@ pub(crate) fn is_item_needed_for_tab(
         }
         ModelManagerTab::LocalAsr => {
             // 本地识别引擎（非 Whisper、非 SenseVoice）：模型 + 词表 + FFmpeg 抽音。
-            matches!(item_id, "ffmpeg" | "asr-dolphin")
+            // 用族映射判断，而不是再抄一份 id 列表：加模型只改一处。
+            matches!(item_id, "ffmpeg")
+                || crate::engines::sensevoice::model_family_for_item(item_id).is_some()
         }
         ModelManagerTab::Common => {
             // 公用组件：FFmpeg 媒体流提取、FFplay 伴音播放、llama.cpp 推理程序，
@@ -950,6 +962,10 @@ impl MainWindow {
             "punc-model" => "内存 2 GB · 纯 CPU · 磁盘 72 MB",
             "silero-vad" => "内存 <1 GB · 纯 CPU · 磁盘 1 MB",
             "asr-dolphin" => "内存 4 GB · 纯 CPU 可跑 · 解压后约 80 MB",
+            "asr-paraformer" => "内存 4 GB · 纯 CPU 可跑（非自回归，快）· 解压后约 220 MB",
+            "asr-firered" => "内存 8 GB · 纯 CPU 很慢，建议独显 · 解压后约 3 GB",
+            "asr-canary" => "内存 4 GB · 纯 CPU 可跑 · 解压后约 200 MB（仅英西德法）",
+            "asr-parakeet" => "内存 4 GB · 纯 CPU 可跑 · 解压后约 450 MB（仅英文）",
             _ => "纯 CPU 即可 · 具体占用见左侧大小",
         }
     }
@@ -1183,6 +1199,15 @@ impl MainWindow {
                                         Theme::text_primary()
                                     })
                                     .child(item.label),
+                            )
+                            // 一句话说明「它是干什么的」：模型名本身（如 whisper-turbo-q8）
+                            // 对不熟的用户等于没有信息，而这一行是他们挑模型的主要依据。
+                            .child(
+                                div()
+                                    .mt(px(Theme::SPACE_0_5))
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_muted())
+                                    .child(item.note),
                             )
                             .child(
                                 div()

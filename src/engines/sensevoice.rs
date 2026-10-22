@@ -412,6 +412,14 @@ pub fn model_family_for_item(item_id: &str) -> Option<ModelFamily> {
     Some(match item_id {
         // Dolphin：DataoceanAI 的多语种 CTC 模型，单 onnx + tokens。
         "asr-dolphin" => ModelFamily::DolphinCtc,
+        // Paraformer：阿里达摩院中文工业档，单 onnx，非自回归（快）。
+        "asr-paraformer" => ModelFamily::Paraformer,
+        // FireRedASR：小红书中英高精度，encoder + decoder 两个 onnx。
+        "asr-firered" => ModelFamily::FireRedAsr,
+        // Canary：NVIDIA 多语种小模型，encoder + decoder。
+        "asr-canary" => ModelFamily::NemoCanary,
+        // Parakeet CTC：NVIDIA 英文，单 onnx。
+        "asr-parakeet" => ModelFamily::NemoCtc,
         _ => return None,
     })
 }
