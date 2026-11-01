@@ -4,7 +4,7 @@
 
 #define MyAppName "Voice2Word"
 #ifndef MyAppVersion
-#define MyAppVersion "0.2.27"
+#define MyAppVersion "0.2.28"
 #endif
 #define MyAppPublisher "Voice2Word"
 #define MyAppURL "https://github.com/ysg0422/voice2word"
