@@ -73,16 +73,25 @@ impl AppState {
             if seg.locked {
                 continue;
             }
+            let before_source = seg.display_text().to_string();
+            let before_text = seg.text.clone();
+            let before_polished = seg.polished.clone();
             if let Some(fixed) = memory.apply(&seg.text) {
                 if fixed != seg.text {
                     seg.text = fixed;
-                    changed += 1;
                 }
             }
             if !seg.polished.is_empty() {
                 if let Some(fixed) = memory.apply(&seg.polished) {
                     seg.polished = fixed;
                 }
+            }
+            if seg.display_text() != before_source {
+                seg.invalidate_translations();
+                seg.words.clear();
+            }
+            if seg.text != before_text || seg.polished != before_polished {
+                changed += 1;
             }
         }
         if changed > 0 {
@@ -93,15 +102,28 @@ impl AppState {
         changed
     }
 
-    /// 清掉某个语言的全部译文（语言包 + 当前展示），用于「重译全部」。
+    /// 清掉未锁定句子的指定语言译文（语言包 + 当前展示），支持撤销，用于「重译全部」。
     ///
     /// 引擎的增量语义是「`!translation_matches(target)` 才重译」，所以只要译文带对
     /// 语言标记就永远跳过——换了引擎/模型想重新出一遍时，此前没有任何入口。
     /// 返回被清理的句数。
     pub fn clear_translations_for_lang(&mut self, lang: &str) -> usize {
+        if !self.segments.iter().any(|seg| {
+            !seg.locked
+                && (seg.translations.contains_key(lang)
+                    || seg.translation_lang.as_deref() == Some(lang)
+                    || seg.stale_translation_langs.contains(lang))
+        }) {
+            return 0;
+        }
+        self.snapshot_for_undo();
         let mut touched = 0usize;
         for seg in self.segments.iter_mut() {
+            if seg.locked {
+                continue;
+            }
             let mut hit = seg.translations.remove(lang).is_some();
+            hit |= seg.stale_translation_langs.remove(lang);
             if seg.translation_lang.as_deref() == Some(lang) {
                 seg.translation = None;
                 seg.translation_lang = None;
@@ -255,10 +277,7 @@ impl AppState {
             before_text,
             new_text.clone(),
         );
-        // P0-2：改原文必须让**旧译文失效**。`translation_matches` 只看「译文非空 +
-        // 语言标记匹配」，而 `Segment` 里没有源文本哈希，所以只改原文不动标记时，
-        // 这条会一直算「已完成」：表格里长期并列显示「新原文 + 旧译文」，点「开始翻译」
-        // 还回一句「已全部翻译」——译文与原文已经对不上，却没有任何机制纠正。
+        // 改原文必须让所有旧语言包失效，保留文本与语言供参考和配音选声使用。
         if let Some(seg) = self.segments.iter_mut().find(|s| s.index == idx) {
             // 只有原文**真的变了**才动标记。本函数逐键触发，若「点进来又点出去」
             // 这种没改字的调用也清标记，用户会莫名其妙丢掉完成状态。
@@ -269,15 +288,10 @@ impl AppState {
             if !seg.polished.is_empty() {
                 seg.polished = new_text;
             }
-            // 方案 A（最小侵入）：只清语言标记、**保留译文文本**——用户仍能看到旧译文
-            // 作参考（界面不显示「—」），但 `translation_matches` 立刻失效，
-            // 下一次翻译会把这一句重译。没有译文（含只有空白）时不动标记：
-            // 没有「陈旧译文」可言，也就无需失效。
-            // 残留风险：`has_translation()` 仍为 true，双语导出仍会带出这条陈旧译文；
-            // 彻底解决需要给 `Segment` 加「译文是否对应当前原文」的标记或源文本哈希，
-            // 但 `src/subtitle/segment.rs` 不在本次可改清单内。
-            if text_changed && seg.has_translation() {
-                seg.translation_lang = None;
+            // 旧文本仍供参考，失效状态随语言包保存，切换语言不能恢复完成标记。
+            if text_changed {
+                seg.invalidate_translations();
+                seg.words.clear();
             }
         }
         // 去抖：编辑逐键触发，若每次都全量序列化全部片段写 SQLite，长视频输入时是隐形 I/O 热点。
@@ -297,6 +311,14 @@ impl AppState {
         let Some(idx) = self.selected_segment_index else {
             return;
         };
+        self.set_segment_translation(idx, text);
+    }
+
+    /// 指定句的译文编辑入口，供表格就地编辑与选句编辑共用。
+    pub fn set_segment_translation(&mut self, idx: usize, text: &str) {
+        if !self.segments.iter().any(|seg| seg.index == idx) {
+            return;
+        }
         self.snapshot_for_undo();
         let cleaned = text.trim().to_string();
         let before_translation = self
@@ -331,7 +353,12 @@ impl AppState {
             self.translate_target_lang.clone()
         };
         if let Some(seg) = self.segments.iter_mut().find(|s| s.index == idx) {
+            seg.cache_visible_translation();
             if cleaned.is_empty() {
+                // 清除的是当前显示的那份；不让切换语言包时把旧译文恢复出来。
+                let cleared_lang = seg.translation_lang.as_deref().unwrap_or(&target_lang);
+                seg.translations.remove(cleared_lang);
+                seg.stale_translation_langs.remove(cleared_lang);
                 seg.translation = None;
                 seg.translation_lang = None;
             } else {
@@ -341,6 +368,10 @@ impl AppState {
                 // 于是「已有别的语言标记」的句子改完仍带着旧标记，下次翻译必然重译并覆盖。
                 if !target_lang.trim().is_empty() {
                     seg.translation_lang = Some(target_lang.clone());
+                }
+                seg.cache_visible_translation();
+                if !target_lang.trim().is_empty() {
+                    seg.stale_translation_langs.remove(&target_lang);
                 }
             }
         }
@@ -629,6 +660,7 @@ impl AppState {
             translation: trans_right,
             translation_lang: trans_lang,
             translations: right_packs,
+            stale_translation_langs: orig.stale_translation_langs.clone(),
             polished: if !orig.polished.is_empty() {
                 part2
             } else {
@@ -676,7 +708,9 @@ impl AppState {
             before_merge,
             String::new(),
         );
-        let next = self.segments.remove(pos + 1);
+        let mut next = self.segments.remove(pos + 1);
+        next.cache_visible_translation();
+        self.segments[pos].cache_visible_translation();
         // P0-4：译文不能丢。`next` 被 remove 之后它的译文就没了，而原文是「拼接」的，
         // 合并后的 cue 理应对应两段译文的拼接。修前这里完全没碰译文：首句无译文、
         // 次句有译文时，合并后译文直接消失（双语导出少一行），且立刻落库。
@@ -687,8 +721,24 @@ impl AppState {
             next.translation.as_deref(),
             next.translation_lang.as_deref(),
         );
+        let left = &self.segments[pos];
+        let incomplete_langs: std::collections::BTreeSet<_> = left
+            .translations
+            .keys()
+            .chain(next.translations.keys())
+            .filter(|lang| {
+                (!left.translate_source().trim().is_empty()
+                    && left.translation_pack(lang).is_none())
+                    || (!next.translate_source().trim().is_empty()
+                        && next.translation_pack(lang).is_none())
+            })
+            .cloned()
+            .collect();
         let cur = &mut self.segments[pos];
-        cur.end = next.end;
+        cur.stale_translation_langs.extend(incomplete_langs);
+        cur.stale_translation_langs
+            .extend(next.stale_translation_langs.iter().cloned());
+        cur.end = cur.end.max(next.end);
         // F11：西文之间补一个空格，否则 "Hello"+"world" 会粘成 "Helloworld"。
         let joined_text = join_segment_text(cur.display_text(), next.display_text());
         if !cur.polished.is_empty() || !next.polished.is_empty() {
@@ -707,12 +757,20 @@ impl AppState {
             cur.translations
                 .entry(lang.clone())
                 .and_modify(|existing| {
-                    if needs_join_space(existing, text) {
-                        existing.push(' ');
+                    if !existing.trim().is_empty() {
+                        existing.push('\n');
                     }
                     existing.push_str(text);
                 })
                 .or_insert_with(|| text.clone());
+        }
+        // 当前语言可能只在另一句的语言包中有译文，投影完整合并结果，避免显示半句。
+        if let Some(text) = cur
+            .translation_lang
+            .as_deref()
+            .and_then(|lang| cur.translation_pack(lang))
+        {
+            cur.translation = Some(text.to_string());
         }
 
         self.reindex_segments();
@@ -810,6 +868,8 @@ impl AppState {
         seg.text = text;
         // 旧润色稿是按旧原文生成的，留着会让显示文本还是错的。
         seg.polished.clear();
+        seg.invalidate_translations();
+        seg.words.clear();
         self.segments_dirty = true;
         self.bump_segments_revision();
         true

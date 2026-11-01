@@ -283,19 +283,6 @@ impl TranslateEngine {
                     .llm_engine
                     .as_ref()
                     .ok_or_else(|| anyhow!("离线翻译引擎未初始化"))?;
-                // P0-A（离线侧）：源为中文且目标是中文变体时同样短路
-                if crate::subtitle::is_source_chinese(&segments) {
-                    if let Some(variant) = chinese_variant_target(target_lang) {
-                        self.store_rewrite_stats(RewriteStats::default());
-                        return convert_chinese_variant(
-                            segments,
-                            target_lang,
-                            variant,
-                            progress_cb,
-                            &cancel,
-                        );
-                    }
-                }
                 // 取消标志下沉到引擎：润色/翻译都是分批长循环，取消必须能在批次之间生效
                 engine.install_cancel_flag(cancel);
                 // 离线链路同样要能「翻译一会落盘一点」+ 失败时保住已译部分（S2/S3）：
@@ -555,7 +542,9 @@ fn translate_via_online_api_with_stats(
         .iter()
         .enumerate()
         .filter(|(_, seg)| {
-            !seg.translate_source().trim().is_empty() && !seg.translation_matches(target_lang)
+            !seg.locked
+                && !seg.translate_source().trim().is_empty()
+                && !seg.translation_matches(target_lang)
         })
         .map(|(pos, _)| pos)
         .collect();
@@ -739,8 +728,7 @@ fn translate_via_online_api_with_stats(
                 // 绝不允许把可疑译文静默写进用户字幕。
                 match validate_translation(&segments[pos].translate_source(), text) {
                     RewriteVerdict::Ok => {
-                        segments[pos].translation = Some(text.clone());
-                        segments[pos].translation_lang = Some(target_lang.to_string());
+                        segments[pos].set_translation(target_lang, text.clone());
                         matched += 1;
                     }
                     RewriteVerdict::Echo => {
@@ -786,8 +774,7 @@ fn translate_via_online_api_with_stats(
                             Some(text)
                                 if validate_translation(&source, text) == RewriteVerdict::Ok =>
                             {
-                                segments[pos].translation = Some(text.clone());
-                                segments[pos].translation_lang = Some(target_lang.to_string());
+                                segments[pos].set_translation(target_lang, text.clone());
                                 matched += 1;
                             }
                             _ => heal.fallback += 1,
@@ -978,8 +965,7 @@ fn retry_missing_online(
                             if validate_translation(&segments[pos].translate_source(), text)
                                 == RewriteVerdict::Ok
                             {
-                                segments[pos].translation = Some(text.clone());
-                                segments[pos].translation_lang = Some(target_lang.to_string());
+                                segments[pos].set_translation(target_lang, text.clone());
                                 recovered += 1;
                             } else {
                                 debug!(
@@ -1036,8 +1022,7 @@ fn retry_missing_online(
                 if validate_translation(&segments[pos].translate_source(), &text)
                     == RewriteVerdict::Ok
                 {
-                    segments[pos].translation = Some(text);
-                    segments[pos].translation_lang = Some(target_lang.to_string());
+                    segments[pos].set_translation(target_lang, text);
                     recovered += 1;
                 } else {
                     debug!(
@@ -2072,6 +2057,12 @@ pub(crate) fn post_chat_completions(
         // 而不与 401/403/404 这类明确的业务错误混在一起。
         Ok(resp) => read_response_body(resp).and_then(|body| parse_response_json(&body)),
         Err(ureq::Error::Status(code, resp)) => {
+            // Retry-After 是响应头，不能只在错误 body 里查找，否则限流重试会忽略服务端等待时间。
+            let retry_after = resp
+                .header("Retry-After")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(|seconds| format!("; retry-after: {}", seconds.clamp(1, 60)))
+                .unwrap_or_default();
             // 4xx/5xx 的响应体通常带服务端的错误说明，原样透出便于排查。
             // 同样带字节上限：错误页也可能是超大响应。
             //
@@ -2087,7 +2078,7 @@ pub(crate) fn post_chat_completions(
                 _ => "",
             };
             Err(anyhow!(
-                "在线接口返回 HTTP {code}{hint}: {snippet}{truncated}"
+                "在线接口返回 HTTP {code}{hint}{retry_after}: {snippet}{truncated}"
             ))
         }
         Err(e) => Err(anyhow!("无法连接在线翻译接口 {}: {e}", cfg.endpoint)),
@@ -2568,6 +2559,17 @@ mod tests {
     fn spawn_mock_server_status(
         replies: Vec<(u16, String)>,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        spawn_mock_server_headers(
+            replies
+                .into_iter()
+                .map(|(status, body)| (status, body, String::new()))
+                .collect(),
+        )
+    }
+
+    fn spawn_mock_server_headers(
+        replies: Vec<(u16, String, String)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -2609,10 +2611,10 @@ mod tests {
                     let body = String::from_utf8_lossy(&buf[pos + 4..]).to_string();
                     seen_clone.lock().unwrap().push(body);
                 }
-                let (status, body) = reply;
+                let (status, body, headers) = reply;
                 let reason = if status == 200 { "OK" } else { "Error" };
                 let resp = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status} {reason}\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -2633,6 +2635,65 @@ mod tests {
             timeout_secs: 10,
             glossary_hint: String::new(),
         }
+    }
+
+    #[test]
+    fn rate_limit_reads_retry_after_response_header() {
+        let (addr, _) = spawn_mock_server_headers(vec![(
+            429,
+            r#"{"error":"rate limited"}"#.into(),
+            "Retry-After: 7\r\n".into(),
+        )]);
+        let error = post_chat_completions(&online_cfg_for(&addr), &serde_json::json!({}))
+            .expect_err("限流应返回可重试错误");
+        assert!(is_retryable(&error));
+        assert_eq!(retry_after_hint(&error), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn audit_online_translation_never_requests_locked_caption() {
+        let reply =
+            serde_json::json!({"choices": [{"message": {"content": "[1] Approved.\n[2] World."}}]})
+                .to_string();
+        let (addr, seen) = spawn_mock_server(vec![reply]);
+        let mut locked = Segment::new(1, 0.0, 1.0, "不要发送的定稿内容");
+        locked.locked = true;
+        let out = translate_via_online_api(
+            &online_cfg_for(&addr),
+            vec![locked, Segment::new(2, 1.0, 2.0, "世界")],
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(out[0].translation.is_none());
+        assert!(out[1].translation_matches("English"));
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|body| !body.contains("不要发送的定稿内容")));
+    }
+
+    #[test]
+    fn audit_chinese_conversion_preserves_locked_translation() {
+        let mut s = Segment::new(1, 0.0, 1.0, "这是中文原文。");
+        s.set_translation("English", "Manually approved".into());
+        s.locked = true;
+        let out = TranslateEngine::offline(LLMEngine::new("missing-cli", "missing.gguf", 4096, 4))
+            .translate_subtitles(vec![s], "繁体中文", None, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        assert_eq!(out[0].translation.as_deref(), Some("Manually approved"));
+    }
+
+    #[test]
+    fn audit_offline_locked_only_document_does_not_require_model() {
+        let mut s = Segment::new(1, 0.0, 1.0, "定稿内容");
+        s.locked = true;
+        let out = TranslateEngine::offline(LLMEngine::new("missing-cli", "missing.gguf", 4096, 4))
+            .translate_subtitles(vec![s], "English", None, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        assert!(out[0].translation.is_none());
     }
 
     /// 完整走一遍在线翻译：请求发出、响应解析、译文回填、语言标记写入。
@@ -2664,6 +2725,29 @@ mod tests {
         assert_eq!(out[0].translation_lang.as_deref(), Some("English"));
         assert_eq!(out[1].translation_lang.as_deref(), Some("English"));
         assert_eq!(seen.lock().unwrap().len(), 1, "只应发一次请求");
+    }
+
+    #[test]
+    fn online_retranslation_refreshes_stale_pack() {
+        let reply =
+            serde_json::json!({"choices": [{"message": {"content": "[1] Hello."}}]}).to_string();
+        let (addr, seen) = spawn_mock_server(vec![reply]);
+        let mut seg = Segment::new(1, 0.0, 1.0, "你好");
+        seg.set_translation("English", "Old translation".into());
+        seg.invalidate_translations();
+        seg.show_translation_pack("English");
+        assert!(!seg.translation_matches("English"));
+        let out = translate_via_online_api(
+            &online_cfg_for(&addr),
+            vec![seg],
+            "English",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(out[0].translation_matches("English"));
+        assert_eq!(out[0].translation_pack("English"), Some("Hello."));
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     /// 输出校验自愈（在线链路）：译文「改动过大」（把一句扩写成一整段）时，先做
@@ -3314,6 +3398,25 @@ mod tests {
             t0.contains('學') || t0.contains('會') || t0.contains('這'),
             "应含繁体字: {t0}"
         );
+    }
+
+    #[test]
+    fn offline_mixed_source_requires_real_translation_in_both_entry_points() {
+        let segments = vec![
+            Segment::new(1, 0.0, 2.0, "这是一段很长的中文讲解，用来确保整篇被检测为以中文为主，接下来还有一句需要真正翻译的英文。"),
+            Segment::new(2, 2.0, 3.0, "Hello, world."),
+        ];
+        assert!(crate::subtitle::is_source_chinese(&segments));
+        let engine = LLMEngine::new("missing-test-cli.exe", "missing-test-model.gguf", 4096, 4);
+        assert!(
+            engine
+                .translate(segments.clone(), "简体中文", None)
+                .is_err(),
+            "混排需要真实引擎，不能按整篇中文直接返回"
+        );
+        assert!(TranslateEngine::offline(engine)
+            .translate_subtitles(segments, "简体中文", None, Arc::new(AtomicBool::new(false)),)
+            .is_err());
     }
 
     /// 例外：目标「简体中文」而源本来就是简体时，转换结果 == 原文。这是**正确行为**，

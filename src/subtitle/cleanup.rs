@@ -289,7 +289,10 @@ pub fn apply(segments: &mut [Segment], rules: CleanupRules) -> CleanupPlan {
         if let Some(p) = src {
             // 写回 display_text 真正读的那个字段：润色文本非空时界面与导出都看
             // `polished`，改 `text` 等于改了个看不见的地方。
-            if seg.polished.trim().is_empty() {
+            if p.final_text.trim().is_empty() {
+                seg.text.clear();
+                seg.polished.clear();
+            } else if seg.polished.trim().is_empty() {
                 seg.text = p.final_text.clone();
             } else {
                 seg.polished = p.final_text.clone();
@@ -298,10 +301,11 @@ pub fn apply(segments: &mut [Segment], rules: CleanupRules) -> CleanupPlan {
             // 回落到整句高亮，而不是显示一段对不上号的假高亮（与拆分/合并同一
             // 处理方式：宁可没有，不要错的）。
             seg.words.clear();
+            seg.invalidate_translations();
             out.hits.extend(p.hits);
         }
         if let Some(p) = trans {
-            seg.translation = Some(p.final_text.clone());
+            seg.update_visible_translation_text(p.final_text.clone());
             out.hits.extend(p.hits);
         }
     }
@@ -822,13 +826,15 @@ pub fn fold_duplicates(segments: &mut Vec<Segment>) -> DuplicateFoldReport {
     }
     let mut out: Vec<Segment> = Vec::with_capacity(segments.len());
     let mut removed = 0;
-    for seg in segments.drain(..) {
+    for mut seg in segments.drain(..) {
         let duplicate = out.last().is_some_and(|prev| is_duplicate_pair(prev, &seg));
         if !duplicate {
             out.push(seg);
             continue;
         }
         let kept = out.last_mut().expect("上一句刚刚判定存在");
+        kept.cache_visible_translation();
+        seg.cache_visible_translation();
         kept.end = kept.end.max(seg.end);
         let kept_translation_missing = kept
             .translation
@@ -836,9 +842,28 @@ pub fn fold_duplicates(segments: &mut Vec<Segment>) -> DuplicateFoldReport {
             .map(|t| t.trim().is_empty())
             .unwrap_or(true);
         if kept_translation_missing && seg.translation.is_some() {
-            kept.translation = seg.translation;
-            kept.translation_lang = seg.translation_lang;
+            kept.translation = seg.translation.clone();
+            kept.translation_lang = seg.translation_lang.clone();
+            kept.cache_visible_translation();
+            if let Some(lang) = seg.translation_lang.as_ref() {
+                if seg.stale_translation_langs.contains(lang) {
+                    kept.stale_translation_langs.insert(lang.clone());
+                } else {
+                    kept.stale_translation_langs.remove(lang);
+                }
+            }
         }
+        for (lang, text) in seg.translations {
+            if kept.translation_pack(&lang).is_none() && !text.trim().is_empty() {
+                if seg.stale_translation_langs.contains(&lang) {
+                    kept.stale_translation_langs.insert(lang.clone());
+                } else {
+                    kept.stale_translation_langs.remove(&lang);
+                }
+                kept.translations.insert(lang, text);
+            }
+        }
+        kept.locked |= seg.locked;
         removed += 1;
     }
     *segments = out;
@@ -880,6 +905,47 @@ mod tests {
 
     fn all() -> CleanupRules {
         CleanupRules::recommended()
+    }
+
+    #[test]
+    fn audit_cleanup_invalidates_source_and_updates_translation_pack() {
+        let mut s = seg(1, 0.0, 1.0, "嗯，我来了。");
+        s.set_translation("English", "I  arrived.".into());
+        let mut segments = vec![s];
+        apply(&mut segments, all());
+        assert_eq!(segments[0].display_text(), "我来了。");
+        assert!(!segments[0].translation_matches("English"));
+        segments[0].show_source_only();
+        segments[0].show_translation_pack("English");
+        assert_eq!(segments[0].translation.as_deref(), Some("I arrived."));
+        assert!(!segments[0].translation_matches("English"));
+    }
+
+    #[test]
+    fn audit_cleaning_polished_markers_does_not_restore_raw_asr() {
+        let mut s = seg(1, 0.0, 1.0, "旧识别文本");
+        s.polished = "[music]".into();
+        let mut segments = vec![s];
+        apply(&mut segments, all());
+        assert!(segments[0].display_text().is_empty());
+    }
+
+    #[test]
+    fn audit_duplicate_fold_keeps_hidden_packs_and_locked_state() {
+        let mut first = seg(1, 0.0, 1.0, "这是一句重复字幕");
+        first.set_translation("English", "Repeated subtitle".into());
+        let mut second = seg(2, 1.0, 2.0, "这是一句重复字幕");
+        second.set_translation_pack("日本語", "繰り返しの字幕");
+        second.stale_translation_langs.insert("日本語".into());
+        second.locked = true;
+        let mut segments = vec![first, second];
+        assert_eq!(fold_duplicates(&mut segments).removed, 1);
+        assert_eq!(
+            segments[0].translation_pack("日本語"),
+            Some("繰り返しの字幕")
+        );
+        assert!(segments[0].stale_translation_langs.contains("日本語"));
+        assert!(segments[0].locked);
     }
 
     /// 语气词只在句首/标点之后删：句尾的「呀」「啊」是语气助词，删了会改语气。

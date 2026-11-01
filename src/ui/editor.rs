@@ -1015,6 +1015,7 @@ impl MainWindow {
                                 translation: None,
                                 translation_lang: None,
                                 translations: Default::default(),
+                                stale_translation_langs: Default::default(),
                                 speaker: None,
                                 speaker_name: None,
                                 words: Vec::new(),
@@ -2328,7 +2329,7 @@ impl MainWindow {
                                                                     .children(speaker.map(|s| {
                                                                         let label = speaker_label
                                                                             .clone()
-                                                                            .unwrap_or_else(|| format!("说话人 {}", s + 1));
+                                                                            .unwrap_or_else(|| format!("说话人 {}", u64::from(s) + 1));
                                                                         div()
                                                                             .id(("badge-speaker", seg_idx))
                                                                             .cursor_pointer()
@@ -8519,15 +8520,7 @@ impl MainWindow {
         };
         let new_text = self.inline_edit_buffer.trim().to_string();
         if is_trans {
-            if let Some(seg) = self.state.segments.iter_mut().find(|s| s.index == seg_idx) {
-                if new_text.is_empty() {
-                    seg.translation = None;
-                    seg.translation_lang = None;
-                } else {
-                    seg.translation = Some(new_text);
-                    seg.translation_lang = Some(self.state.translate_target_lang.clone());
-                }
-            }
+            self.state.set_segment_translation(seg_idx, &new_text);
         } else {
             // 错别字记忆库的学习入口：必须在覆盖之前拿到旧文本。
             // 此前 `learn_typo_from_edit` 没有任何调用者，等于「记忆库永远学不到东西」。
@@ -8539,10 +8532,16 @@ impl MainWindow {
                 .map(|s| s.text.clone())
                 .unwrap_or_default();
             if !new_text.is_empty() {
+                self.state.snapshot_for_undo();
                 if let Some(seg) = self.state.segments.iter_mut().find(|s| s.index == seg_idx) {
+                    let changed = seg.display_text() != new_text;
                     seg.text = new_text.clone();
                     if !seg.polished.is_empty() {
                         seg.polished = new_text.clone();
+                    }
+                    if changed {
+                        seg.invalidate_translations();
+                        seg.words.clear();
                     }
                 }
                 if self.state.selected_segment_index == Some(seg_idx) {

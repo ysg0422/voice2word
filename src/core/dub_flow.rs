@@ -101,17 +101,32 @@ pub struct DubReport {
 
 /// 配音音色：按句子语言 + 说话人选择（`voice_zh/en` 为空时按预设轮换）。
 fn voice_for(seg: &Segment, target_lang: &str, opts: &DubOptions) -> String {
-    let lang = seg
-        .language
-        .as_deref()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .unwrap_or(target_lang);
+    // 读译文时按译文语言选声音，回退原文时才用源语言。
+    let use_translation = opts.source == DubSource::Translation && seg.has_translation();
+    let lang = if use_translation {
+        seg.translation_lang.as_deref().unwrap_or(target_lang)
+    } else {
+        seg.language.as_deref().unwrap_or(target_lang)
+    };
+    let lang = lang.trim();
+    let lang = if lang.is_empty() {
+        target_lang.trim()
+    } else {
+        lang
+    };
     let lang = lang.split(['-', '_']).next().unwrap_or(lang);
+    let lang = match lang {
+        "English" | "english" | "英语" | "英文" => "en",
+        "日本語" | "日语" | "Japanese" | "japanese" => "ja",
+        "简体中文" | "繁体中文" | "中文" | "Chinese" | "chinese" => "zh",
+        other => other,
+    };
     let override_voice = if lang.eq_ignore_ascii_case("en") {
         Some(opts.voice_en.as_str())
-    } else {
+    } else if lang.eq_ignore_ascii_case("zh") {
         Some(opts.voice_zh.as_str())
+    } else {
+        None
     }
     .filter(|v| !v.trim().is_empty());
     crate::engines::tts::voice_for_speaker(lang, seg.speaker, override_voice)
@@ -562,5 +577,25 @@ mod tests {
         opts.voice_zh = "custom-zh".to_string();
         s.language = Some("zh".to_string());
         assert_eq!(voice_for(&s, "zh", &opts), "custom-zh");
+    }
+
+    #[test]
+    fn dubbed_translation_uses_its_language_and_matching_override() {
+        let mut s = seg(1, 0.0, 1.0, "你好");
+        s.language = Some("zh".into());
+        s.translation = Some("Hello".into());
+        s.translation_lang = Some("English".into());
+        let mut opts = DubOptions::from_config(&DubConfig::default());
+        opts.voice_zh = "custom-zh".into();
+        assert!(voice_for(&s, "English", &opts).starts_with("en-US-"));
+        opts.voice_en = "custom-en".into();
+        assert_eq!(voice_for(&s, "English", &opts), "custom-en");
+        s.translation_lang = Some("日本語".into());
+        assert!(voice_for(&s, "日本語", &opts).starts_with("ja-JP-"));
+        opts.source = DubSource::Text;
+        assert_eq!(voice_for(&s, "English", &opts), "custom-zh");
+        opts.source = DubSource::Translation;
+        s.translation = Some(" ".into());
+        assert_eq!(voice_for(&s, "English", &opts), "custom-zh");
     }
 }

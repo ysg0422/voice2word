@@ -1920,6 +1920,150 @@ fn translation_packs_survive_relanguage_and_can_be_switched_back() {
     assert_eq!(state.translation_packs().len(), 2, "语言包一份都不该丢");
 }
 
+#[test]
+fn manual_translation_survives_pack_switch_and_clear() {
+    let mut seg = Segment::new(1, 0.0, 2.0, "你好");
+    seg.translation = Some("old".into());
+    seg.translation_lang = Some("English".into());
+    seg.set_translation_pack("English", "old");
+    let mut state = test_state(vec![seg]);
+    state.translate_target_lang = "English".into();
+    state.select_segment(1);
+    state.set_selected_translation("corrected");
+    state.apply_translation_pack(None);
+    state.apply_translation_pack(Some("English"));
+    assert_eq!(state.segments[0].translation.as_deref(), Some("corrected"));
+    state.set_selected_translation("");
+    state.apply_translation_pack(Some("English"));
+    assert!(
+        state.segments[0].translation.is_none(),
+        "清除后旧语言包不得复活"
+    );
+}
+
+#[test]
+fn legacy_visible_translation_survives_source_only_and_relanguage() {
+    let mut seg = Segment::new(1, 0.0, 2.0, "你好");
+    seg.translation = Some("legacy English".into());
+    seg.translation_lang = Some("English".into());
+    let mut state = test_state(vec![seg]);
+    state.apply_translation_pack(None);
+    state.apply_translation_pack(Some("English"));
+    assert_eq!(
+        state.segments[0].translation.as_deref(),
+        Some("legacy English")
+    );
+    let mut incoming = state.segments.clone();
+    incoming[0].translation = Some("こんにちは".into());
+    incoming[0].translation_lang = Some("日本語".into());
+    state.merge_translations(incoming);
+    state.apply_translation_pack(Some("English"));
+    assert_eq!(
+        state.segments[0].translation.as_deref(),
+        Some("legacy English")
+    );
+}
+
+#[test]
+fn replacing_translation_pack_keeps_new_explicit_value() {
+    let mut seg = Segment::new(1, 0.0, 2.0, "你好");
+    seg.translation = Some("old visible".into());
+    seg.translation_lang = Some("English".into());
+    seg.set_translation_pack("English", "new pack");
+    assert!(seg.show_translation_pack("English"));
+    assert_eq!(seg.translation.as_deref(), Some("new pack"));
+}
+
+#[test]
+fn merge_protects_manual_language_change_even_when_text_is_identical() {
+    let mut seg = Segment::new(1, 0.0, 2.0, "测试");
+    seg.translation = Some("OK".into());
+    seg.translation_lang = Some("English".into());
+    let mut state = test_state(vec![seg]);
+    let baseline = super::TranslationBaseline::capture(&state.segments);
+    let mut incoming = state.segments.clone();
+    incoming[0].translation = Some("machine".into());
+    state.segments[0].translation_lang = Some("日本語".into());
+    assert_eq!(
+        state.merge_translations_checked(incoming, Some(&baseline)),
+        1
+    );
+    assert_eq!(state.segments[0].translation.as_deref(), Some("OK"));
+    assert_eq!(
+        state.segments[0].translation_lang.as_deref(),
+        Some("日本語")
+    );
+}
+
+#[test]
+fn merge_ignores_unchanged_snapshot_translation() {
+    let mut seg = Segment::new(1, 0.0, 2.0, "你好");
+    seg.translation = Some("Hello".into());
+    seg.translation_lang = Some("English".into());
+    let mut state = test_state(vec![seg]);
+    let baseline = super::TranslationBaseline::capture(&state.segments);
+    let unchanged = state.segments.clone();
+    state.apply_translation_pack(None);
+    assert_eq!(
+        state.merge_translations_checked(unchanged, Some(&baseline)),
+        0
+    );
+    assert!(
+        state.segments[0].translation.is_none(),
+        "旧快照不是本轮新译文"
+    );
+}
+
+#[test]
+fn merge_segments_keeps_latest_visible_text_in_language_pack() {
+    let mut a = Segment::new(1, 0.0, 2.0, "你好");
+    a.translation = Some("Hello".into());
+    a.translation_lang = Some("English".into());
+    a.set_translation_pack("English", "stale");
+    let mut b = Segment::new(2, 2.0, 4.0, "世界");
+    b.translation = Some("world".into());
+    b.translation_lang = Some("English".into());
+    let mut state = test_state(vec![a, b]);
+    state.select_segment(1);
+    state.merge_selected_with_next();
+    assert_eq!(
+        state.segments[0].translation.as_deref(),
+        Some("Hello\nworld")
+    );
+    state.apply_translation_pack(Some("English"));
+    assert_eq!(
+        state.segments[0].translation.as_deref(),
+        Some("Hello\nworld")
+    );
+}
+
+#[test]
+fn merging_nested_time_ranges_preserves_full_end() {
+    let mut state = test_state(vec![
+        Segment::new(1, 0.0, 10.0, "长句"),
+        Segment::new(2, 2.0, 3.0, "短句"),
+    ]);
+    state.select_segment(1);
+    state.merge_selected_with_next();
+    assert_eq!(state.segments[0].end, 10.0, "合并不能缩短已覆盖的时间");
+}
+
+#[test]
+fn merging_half_translated_segments_still_requires_translation() {
+    let mut left = Segment::new(1, 0.0, 1.0, "你好");
+    left.set_translation("English", "Hello".into());
+    let mut state = test_state(vec![left, Segment::new(2, 1.0, 2.0, "世界")]);
+    state.select_segment(1);
+    state.merge_selected_with_next();
+    assert_eq!(state.segments[0].translation.as_deref(), Some("Hello"));
+    assert!(
+        !state.segments[0].translation_matches("English"),
+        "不能把半句译文当成合并后的完整译文"
+    );
+    state.apply_translation_pack(Some("English"));
+    assert!(!state.segments[0].translation_matches("English"));
+}
+
 /// 翻译在后台跑几分钟，期间用户仍可编辑字幕。修前收尾是
 /// `self.segments = translated`（开始时的快照），会把用户这几分钟的编辑
 /// 静默回滚。这里模拟「翻译期间用户改了原文」，断言：原文改动保留，
@@ -2158,6 +2302,105 @@ fn clearing_manual_translation_nulls_both_fields() {
 
 // ───────────── P0-2：改原文必须让旧译文失效 ─────────────
 
+#[test]
+fn source_edit_keeps_old_packs_but_they_stay_pending_after_switch_and_reload() {
+    let mut seg = Segment::new(1, 0.0, 2.0, "旧原文");
+    seg.set_translation("English", "Old translation".into());
+    seg.set_translation_pack("日本語", "古い翻訳");
+    let mut state = test_state(vec![seg]);
+    state.select_segment(1);
+    state.editing_text = "新原文".into();
+    state.save_selected_text();
+    let json = serde_json::to_string(&state.segments).unwrap();
+    state.segments = serde_json::from_str(&json).unwrap();
+    for lang in ["English", "日本語"] {
+        state.apply_translation_pack(Some(lang));
+        assert!(state.segments[0].has_translation(), "旧文本保留供参考");
+        assert!(!state.segments[0].translation_matches(lang));
+    }
+    state.apply_translation_pack(Some("English"));
+    let baseline = super::TranslationBaseline::capture(&state.segments);
+    let mut incoming = state.segments.clone();
+    // 重译结果即使恰好与旧译文一样，也必须更新失效状态。
+    incoming[0].set_translation("English", "Old translation".into());
+    assert_eq!(
+        state.merge_translations_checked(incoming, Some(&baseline)),
+        0
+    );
+    assert!(state.segments[0].translation_matches("English"));
+    state.apply_translation_pack(Some("日本語"));
+    assert!(!state.segments[0].translation_matches("日本語"));
+    state.translate_target_lang = "日本語".into();
+    state.set_segment_translation(1, "手動修正");
+    assert!(state.segments[0].translation_matches("日本語"));
+}
+
+#[test]
+fn local_retranscription_invalidates_translation_and_undo_restores_it() {
+    let mut seg = Segment::new(1, 0.0, 2.0, "旧原文");
+    seg.set_translation("English", "Old translation".into());
+    let mut state = test_state(vec![seg]);
+    assert!(state.replace_segment_text(1, "重新识别的原文".into()));
+    state.apply_translation_pack(Some("English"));
+    assert!(!state.segments[0].translation_matches("English"));
+    state.undo();
+    assert_eq!(state.segments[0].text, "旧原文");
+    assert!(state.segments[0].translation_matches("English"));
+}
+
+#[test]
+fn typo_memory_counts_and_saves_polished_only_edits() {
+    let mut seg = Segment::new(1, 0.0, 2.0, "这是正确句子");
+    seg.polished = "这是错别字句子".into();
+    seg.set_translation("English", "Old translation".into());
+    let mut state = test_state(vec![seg]);
+    let revision = state.segments_revision;
+    let mut memory = crate::utils::typo_memory::TypoMemory::default();
+    assert_eq!(memory.learn_from_edit("这是错别字句子", "这是正确句子"), 1);
+    assert_eq!(state.apply_typo_memory_with(&memory), 1);
+    assert_eq!(state.segments[0].polished, "这是正确句子");
+    assert!(state.segments_dirty);
+    assert!(state.segments_revision > revision);
+    state.apply_translation_pack(Some("English"));
+    assert!(!state.segments[0].translation_matches("English"));
+}
+
+#[test]
+fn editing_unselected_translation_uses_shared_pack_and_undo_path() {
+    let mut state = test_state(vec![
+        Segment::new(1, 0.0, 1.0, "一"),
+        Segment::new(2, 1.0, 2.0, "二"),
+    ]);
+    state.select_segment(1);
+    state.translate_target_lang = "English".into();
+    state.set_segment_translation(2, "two");
+    assert_eq!(state.selected_segment_index, Some(1));
+    assert_eq!(state.segments[1].translation_pack("English"), Some("two"));
+    state.set_segment_translation(2, "");
+    state.apply_translation_pack(Some("English"));
+    assert!(!state.segments[1].has_translation());
+    state.undo();
+    assert_eq!(state.segments[1].translation.as_deref(), Some("two"));
+}
+
+#[test]
+fn force_retranslation_preserves_locked_captions_and_supports_undo() {
+    let mut locked = Segment::new(1, 0.0, 1.0, "定稿");
+    locked.set_translation("English", "Final".into());
+    locked.locked = true;
+    let mut editable = Segment::new(2, 1.0, 2.0, "可修改");
+    editable.set_translation("English", "Editable".into());
+    editable.set_translation_pack("日本語", "編集可");
+    let mut state = test_state(vec![locked, editable]);
+    assert_eq!(state.clear_translations_for_lang("English"), 1);
+    state.apply_translation_pack(Some("English"));
+    assert!(state.segments[0].translation_matches("English"));
+    assert!(!state.segments[1].has_translation());
+    assert_eq!(state.segments[1].translation_pack("日本語"), Some("編集可"));
+    assert!(state.undo());
+    assert!(state.segments[1].translation_matches("English"));
+}
+
 /// 有译文的句子改原文 → `translation_matches(原目标语言)` 变 false，译文文本仍在。
 #[test]
 fn editing_source_invalidates_stale_translation() {
@@ -2177,9 +2420,9 @@ fn editing_source_invalidates_stale_translation() {
     assert_eq!(
         state.segments[0].translation.as_deref(),
         Some("Old translation"),
-        "只清语言标记、保留译文文本，用户仍能看到旧译文作参考"
+        "保留旧译文文本供参考，完成状态由失效标记保护"
     );
-    // 残留风险（已知）：has_translation() 仍为 true，双语导出仍会带出这条陈旧译文。
+    // 旧文本保留供参考，导出前可通过失效标记提示复核；has_translation 只表达非空。
     assert!(state.segments[0].has_translation());
 }
 

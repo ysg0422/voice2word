@@ -798,7 +798,9 @@ pub(crate) fn convert_chinese_variant(
         .iter()
         .enumerate()
         .filter(|(_, seg)| {
-            !seg.translate_source().trim().is_empty() && !seg.translation_matches(target_lang)
+            !seg.locked
+                && !seg.translate_source().trim().is_empty()
+                && !seg.translation_matches(target_lang)
         })
         .map(|(pos, _)| pos)
         .collect();
@@ -823,8 +825,7 @@ pub(crate) fn convert_chinese_variant(
             continue;
         }
         let converted = zhconv::zhconv(&segments[pos].translate_source(), variant);
-        segments[pos].translation = Some(converted);
-        segments[pos].translation_lang = Some(target_lang.to_string());
+        segments[pos].set_translation(target_lang, converted);
         completed += 1;
         // 每 32 句回报一次：太长片的进度条不至于长时间不动。
         if completed.is_multiple_of(32) {
@@ -1795,7 +1796,11 @@ impl LLMEngine {
         // 这里也做一次判定（不只是引擎构造处的 `TranslateEngine`），因为
         // `LLMEngine::translate` 是公开入口：短路判定必须落在最终执行的地方。
         // 必须源语言也是中文时才短路；外语目标为中文时必须调用 LLM 翻译。
-        if crate::subtitle::is_source_chinese(&segments) {
+        let all_sentences_chinese = segments.iter().all(|seg| {
+            seg.translate_source().trim().is_empty()
+                || crate::subtitle::is_source_chinese(std::slice::from_ref(seg))
+        });
+        if all_sentences_chinese && crate::subtitle::is_source_chinese(&segments) {
             if let Some(variant) = chinese_variant_target(target_lang) {
                 return convert_chinese_variant(
                     segments,
@@ -1806,20 +1811,6 @@ impl LLMEngine {
                 );
             }
         }
-        // 同 polish：模型/程序缺失时 fail-fast，避免「翻译完成 0 句」的假成功。
-        self.ensure_ready()?;
-        self.store_rewrite_stats(RewriteStats::default());
-        info!("LLM 开始将 {} 个字幕片段翻译为 {}", total, target_lang);
-        if let Some(ref cb) = progress_cb {
-            cb(0.0, "正在加载 Qwen 翻译模型，首次启动需要几秒...");
-        }
-        let mut server = self.start_server();
-        if server.is_some() {
-            info!("Qwen 常驻服务已就绪，复用模型进行批量字幕翻译");
-        } else {
-            warn!("Qwen 常驻服务不可用，回退到命令行批量翻译");
-        }
-
         // 增量：只译「还没有目标语言译文」的句子。
         //
         // 翻译是可以重入的——中途取消、换目标语言、或补译后来新增的句子，
@@ -1830,7 +1821,9 @@ impl LLMEngine {
             .iter()
             .enumerate()
             .filter(|(_, seg)| {
-                !seg.translate_source().trim().is_empty() && !seg.translation_matches(target_lang)
+                !seg.locked
+                    && !seg.translate_source().trim().is_empty()
+                    && !seg.translation_matches(target_lang)
             })
             .map(|(pos, _)| pos)
             .collect();
@@ -1845,6 +1838,20 @@ impl LLMEngine {
         }
         if pending_total < total {
             info!("增量翻译：{total} 句中有 {pending_total} 句需要翻译为 {target_lang}");
+        }
+
+        // 同 polish：模型/程序缺失时 fail-fast，避免「翻译完成 0 句」的假成功。
+        self.ensure_ready()?;
+        self.store_rewrite_stats(RewriteStats::default());
+        info!("LLM 开始将 {} 个字幕片段翻译为 {}", total, target_lang);
+        if let Some(ref cb) = progress_cb {
+            cb(0.0, "正在加载 Qwen 翻译模型，首次启动需要几秒...");
+        }
+        let mut server = self.start_server();
+        if server.is_some() {
+            info!("Qwen 常驻服务已就绪，复用模型进行批量字幕翻译");
+        } else {
+            warn!("Qwen 常驻服务不可用，回退到命令行批量翻译");
         }
 
         // 术语表 + 源语言线索是**每批重复注入**的固定开销：预算必须显式扣掉它们的
@@ -1949,8 +1956,7 @@ impl LLMEngine {
                                 missed.push(pos);
                             }
                             RewriteVerdict::Ok => {
-                                segments[pos].translation = Some(trans.clone());
-                                segments[pos].translation_lang = Some(target_lang.to_string());
+                                segments[pos].set_translation(target_lang, trans.clone());
                             }
                         }
                     }
@@ -2002,8 +2008,7 @@ impl LLMEngine {
                     let source = segments[pos].translate_source();
                     match healed.get(&segments[pos].index) {
                         Some(text) if validate_translation(&source, text) == RewriteVerdict::Ok => {
-                            segments[pos].translation = Some(text.clone());
-                            segments[pos].translation_lang = Some(target_lang.to_string());
+                            segments[pos].set_translation(target_lang, text.clone());
                         }
                         _ => heal.fallback += 1,
                     }
@@ -2128,8 +2133,7 @@ impl LLMEngine {
                         Some(trans) => {
                             match classify_retry_outcome(&segments[pos].translate_source(), trans) {
                                 RetryVerdict::Accept => {
-                                    segments[pos].translation = Some(trans.clone());
-                                    segments[pos].translation_lang = Some(target_lang.to_string());
+                                    segments[pos].set_translation(target_lang, trans.clone());
                                 }
                                 RetryVerdict::RejectCopy => {
                                     // 近似复制：保持未译，并把下标交回上层计入复制率。

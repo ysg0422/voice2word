@@ -53,6 +53,7 @@ impl JsonSubtitleExporter {
                     "polished": seg.polished,
                     "locked": seg.locked,
                     "translations": seg.translations,
+                    "stale_translation_langs": seg.stale_translation_langs,
                     "speaker_name": seg.speaker_name,
                     "translation": seg.translation,
                     "translation_lang": seg.translation_lang,
@@ -102,6 +103,20 @@ mod tests {
 
     fn tmp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("v2w_json_{}_{}.json", name, std::process::id()))
+    }
+
+    #[test]
+    fn audit_json_roundtrip_keeps_translation_stale_flags() {
+        let mut s = Segment::new(1, 0.0, 1.0, "原文");
+        s.set_translation("English", "Old translation".into());
+        s.invalidate_translations();
+        let p = tmp("stale_roundtrip");
+        JsonSubtitleExporter::write_to_file(&[s], &p, None, ExportMode::Bilingual, Some("English"))
+            .unwrap();
+        let back = crate::subtitle::reader::read_subtitle_file(&p).unwrap();
+        assert!(!back[0].translation_matches("English"));
+        assert_eq!(back[0].translation.as_deref(), Some("Old translation"));
+        let _ = std::fs::remove_file(p);
     }
 
     #[test]

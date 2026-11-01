@@ -69,7 +69,7 @@ impl TtmlProfile {
 /// 与 [`super::segment::Segment::speaker_label`]（`说话人 N`，N 从 1 起）保持同一编号，
 /// 界面里看到的「说话人 2」在文档里就是 `spk2`，便于对稿。
 fn speaker_agent_id(speaker: u32) -> String {
-    format!("spk{}", speaker + 1)
+    format!("spk{}", u64::from(speaker) + 1)
 }
 
 pub struct TtmlExporter;
@@ -230,6 +230,27 @@ mod tests {
 
     fn tmp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("v2w_ttml_{}_{}.xml", name, std::process::id()))
+    }
+
+    #[test]
+    fn audit_ttml_preserves_maximum_imported_speaker_id() {
+        let mut s = seg(1, 0.0, 1.0, "字幕");
+        s.speaker = Some(u32::MAX);
+        let p = tmp("max_speaker").with_extension("ttml");
+        TtmlExporter::write_to_file(
+            &[s],
+            &p,
+            "zh",
+            None,
+            ExportMode::RawOnly,
+            TtmlProfile::EbuTtD,
+        )
+        .unwrap();
+        let xml = std::fs::read_to_string(&p).unwrap();
+        assert!(xml.contains("spk4294967296"));
+        let back = crate::subtitle::reader::read_subtitle_file(&p).unwrap();
+        assert_eq!(back[0].speaker, Some(u32::MAX));
+        let _ = std::fs::remove_file(p);
     }
 
     #[test]

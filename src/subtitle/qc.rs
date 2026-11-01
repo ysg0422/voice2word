@@ -784,6 +784,7 @@ pub fn apply_repairs(segments: &mut [Segment], plan: &RepairPlan) -> usize {
             seg.translation = None;
             seg.translation_lang = None;
             seg.translations.clear();
+            seg.stale_translation_langs.clear();
         }
 
         let changed = seg.start != before_start

@@ -251,9 +251,57 @@ pub(crate) fn translated_out_count(segments: &[Segment], target: &str) -> usize 
 /// 翻译收尾的统计口径（纯函数，便于单测）：`(实际译出句数, 应有译文句数)`。
 ///
 /// 分子只认**目标语言 + 非空译文**（空串/纯空白不算），分母只算源文非空的句子。
+#[cfg(test)]
 pub(crate) fn translation_coverage(segments: &[Segment], target: &str) -> (usize, usize) {
     let done = translated_out_count(segments, target);
     (done, expected_translation_count(segments))
+}
+
+/// 只统计本轮字幕在当前文档中真正保留的译文；后台快照成功不代表回填成功。
+fn translation_coverage_in_current(
+    current: &[Segment],
+    requested: &[Segment],
+    target: &str,
+) -> (usize, usize) {
+    let mut by_start: std::collections::HashMap<u64, Vec<&Segment>> =
+        std::collections::HashMap::new();
+    for seg in current {
+        if seg.start.is_finite() {
+            let key = if seg.start == 0.0 {
+                0
+            } else {
+                seg.start.to_bits()
+            };
+            by_start.entry(key).or_default().push(seg);
+        }
+    }
+    let mut counted = std::collections::HashSet::new();
+    let done = requested
+        .iter()
+        .filter(|src| {
+            if !src.start.is_finite() || src.translate_source().trim().is_empty() {
+                return false;
+            }
+            let key = if src.start == 0.0 {
+                0
+            } else {
+                src.start.to_bits()
+            };
+            let Some(candidates) = by_start.get(&key) else {
+                return false;
+            };
+            let mut matches = candidates
+                .iter()
+                .filter(|seg| seg.translate_source() == src.translate_source());
+            let Some(seg) = matches.next() else {
+                return false;
+            };
+            matches.next().is_none()
+                && seg.translation_matches(target)
+                && counted.insert((key, src.translate_source()))
+        })
+        .count();
+    (done, expected_translation_count(requested))
 }
 
 /// 把导入的字幕灌进工作台（同步、不 spawn），返回给用户看的提示文案；`segs`
@@ -382,7 +430,7 @@ fn clear_translations_with_undo(state: &mut AppState) -> bool {
     let cleared = state
         .segments
         .iter()
-        .filter(|s| s.translation.is_some())
+        .filter(|s| s.translation.is_some() || !s.translations.is_empty())
         .count();
     if cleared == 0 {
         return false;
@@ -391,6 +439,8 @@ fn clear_translations_with_undo(state: &mut AppState) -> bool {
     for seg in &mut state.segments {
         seg.translation = None;
         seg.translation_lang = None;
+        seg.translations.clear();
+        seg.stale_translation_langs.clear();
     }
     // 修订号必须在这里递增：清译文改掉了「是否还有双语行 / 译出句数 / 质检的未翻译」
     // 这些一律按 `segments_revision` 失效的派生量。修前本函数不递增，靠调用点
@@ -4811,7 +4861,7 @@ impl MainWindow {
         }
         // 本轮参与翻译的句子：选句模式只取勾选的，否则整篇。
         // 引擎按 `index` 回填、收尾按 `start` 合并，因此传子集是安全的。
-        let work_segments: Vec<crate::subtitle::Segment> = match picked.as_ref() {
+        let mut work_segments: Vec<crate::subtitle::Segment> = match picked.as_ref() {
             Some(ids) => self
                 .state
                 .segments
@@ -4821,6 +4871,8 @@ impl MainWindow {
                 .collect(),
             None => self.state.segments.clone(),
         };
+        // 锁定句不参与本轮请求和完成率，否则会永远显示部分完成。
+        work_segments.retain(|seg| !seg.locked);
         // 「已完成」必须按**当前目标语言**判定。用不分语言的 `translated_count()`
         // 会踩到这个坑：用户把目标语言从 English 改成 日本語 后，旧英文译文仍算
         // 「已完成」，于是 100% 时这里直接 return——点「开始翻译」毫无反应，
@@ -4832,7 +4884,7 @@ impl MainWindow {
         let done_now = translated_out_count(&work_segments, &target_now);
         let expected_now = expected_translation_count(&work_segments);
         if expected_now == 0 {
-            self.state.translate_status_msg = "没有可翻译的文本（所有字幕行都是空的）".to_string();
+            self.state.translate_status_msg = "没有可翻译的文本（字幕为空或已锁定）".to_string();
             cx.notify();
             return;
         }
@@ -4990,13 +5042,20 @@ impl MainWindow {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(translated_segs) => {
-                        // 收尾统计用「实际译出」口径，而不是「引擎有没有给语言标签」：
-                        // 引擎解析失败时可能写下空串/纯空白译文（照样带 translation_lang），
-                        // 只按标签计数就会把一片空白显示成「翻译完成」。
-                        // `translation_coverage` 的分子只认 `has_translation()`（忽略空串/纯空白），
-                        // 分母只算源文非空的句子。
+                        if this.state.doc_epoch != epoch_at_start {
+                            this.state.translate_status_msg =
+                                "翻译结果已丢弃：期间切换了工程或重新导入了字幕".to_string();
+                            return;
+                        }
+                        // 收尾先回填再统计：冲突拒收、锁定或删改不能被快照的 100% 掩盖。
+                        let skipped = this.state.merge_translations_checked(
+                            translated_segs.clone(), Some(baseline.as_ref()),
+                        );
+                        // 只统计当前文档真正保留的目标语言译文；被修改或删除的句子不算完成。
                         let (done, expected) =
-                            translation_coverage(&translated_segs, &target_lang_for_msg);
+                            translation_coverage_in_current(&this.state.segments, &translated_segs, &target_lang_for_msg);
+                        this.state.translate_progress =
+                            if expected == 0 { 1.0 } else { done as f32 / expected as f32 };
                         // 引擎在取消时返回**已完成的偏序结果**而非错误，所以这里必须
                         // 显式区分「跑完了」与「被取消了」。不区分的话，用户点了取消
                         // 却看到「翻译完成（N 句）」，会以为取消没生效。
@@ -5009,6 +5068,10 @@ impl MainWindow {
                             info!("字幕多语言翻译完成（{}/{} 句带译文）", done, expected);
                             this.state.translate_progress = 1.0;
                             this.state.translate_status_msg = format!("翻译完成（{} 句）", done);
+                        } else if skipped > 0 {
+                            this.state.translate_status_msg = format!(
+                                "翻译已返回，当前保留 {done} / {expected} 句目标语言译文；{skipped} 句因编辑、锁定或匹配冲突未覆盖，请核对后补译"
+                            );
                         } else if done == 0 {
                             // 一句都没译出：引擎本该返 Err（见 engines 的 fail-fast），
                             // 这里再兜一层——只要没有任何实际译文就绝不能显示「完成」，
@@ -5033,30 +5096,6 @@ impl MainWindow {
                                 "翻译部分完成：{done} / {expected} 句已译出，剩余 {missing} 句未译出（可再次点击「开始翻译」补齐）"
                             );
                         }
-                        // 译文**按句合并**回当前字幕表，而不是整表覆盖。
-                        //
-                        // 翻译要跑几分钟，而这段时间里用户仍能在剪辑台编辑字幕
-                        // （改错别字、调时间、拆合句）。引擎拿的是开始时的快照，
-                        // 若在这里 `= translated_segs` 直接覆盖，用户这几分钟的
-                        // 编辑会被静默回滚——改了半天，翻译一结束全没了。
-                        // `merge_translations` 只把译文按 index 并回去，原文/时间
-                        // 等用户改动原样保留。
-                        // S1：收尾前先确认还停在同一个文档上。期间用户导入字幕、
-                        // 又跑了一单转写或打开别的工程，这份结果属于上一个文档，
-                        // 合并进来就是「译文写进别的工程」的静默数据污染。
-                        if this.state.doc_epoch != epoch_at_start {
-                            tracing::warn!(
-                                "翻译完成时文档已切换，结果已丢弃（不合并、不落库）"
-                            );
-                            this.state.translate_status_msg =
-                                "翻译结果已丢弃：期间切换了工程或重新导入了字幕".to_string();
-                            return;
-                        }
-                        // S4：带冲突判定的合并——期间被改过原文的句子、以及用户手写
-                        // 的译文都不覆盖，只并「原文没变且译文没动过」的那些。
-                        let skipped = this
-                            .state
-                            .merge_translations_checked(translated_segs, Some(baseline.as_ref()));
                         if skipped > 0 {
                             tracing::info!("翻译收尾跳过 {skipped} 句：期间原文或译文被编辑过");
                         }
@@ -5169,7 +5208,7 @@ impl MainWindow {
     /// - 判据复用管线那份（见 [`is_copied_translation`]）：短句 / 纯拉丁术语放行；
     /// - 走撤销栈：先 `snapshot_for_undo`，`Ctrl+Z` 能把译文原样换回来；
     /// - **无命中时不压撤销点**：否则按一次 `Ctrl+Z` 只会退掉一次什么都没做的操作；
-    /// - 只动 `translation` / `translation_lang`，**不碰 `words`**：词级时间戳属于
+    /// - 同步清掉当前语言包，**不碰 `words`**：词级时间戳属于
     ///   原文字幕（卡拉 OK 高亮按它切分），清译文与它无关；既有的「清空全部译文」
     ///   路径同样不动它，两处口径保持一致；
     /// - 审计归到「改译文」（`EditKind::Translation`），与整批清空同一口径。
@@ -5191,6 +5230,10 @@ impl MainWindow {
             let Some(seg) = self.state.segments.get_mut(pos) else {
                 continue;
             };
+            if let Some(lang) = seg.translation_lang.as_deref() {
+                seg.translations.remove(lang);
+                seg.stale_translation_langs.remove(lang);
+            }
             seg.translation = None;
             seg.translation_lang = None;
             cleared += 1;
@@ -5220,7 +5263,7 @@ impl MainWindow {
         };
         self.state.snapshot_for_undo();
         let next_spk = match self.state.segments[pos].speaker {
-            Some(s) => (s + 1) % 4,
+            Some(s) => (s % 4 + 1) % 4,
             None => 0,
         };
         self.state.segments[pos].speaker = Some(next_spk);
@@ -5251,7 +5294,7 @@ impl MainWindow {
         self.state.flush_segments_if_dirty();
         self.notice = Some(format!(
             "已为说话人 {} 批量更新角色名称（涉及 {count} 个片段）",
-            speaker_id + 1
+            u64::from(speaker_id) + 1
         ));
         cx.notify();
     }
@@ -6790,6 +6833,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn translation_completion_counts_only_current_retained_results() {
+        let mut requested = vec![
+            Segment::new(1, 0.0, 1.0, "你好"),
+            Segment::new(2, 1.0, 2.0, "世界"),
+        ];
+        for seg in &mut requested {
+            seg.translation = Some("translated".into());
+            seg.translation_lang = Some("English".into());
+        }
+        let mut current = requested.clone();
+        current[0].text = "改过的源文".into();
+        current[0].translation = None;
+        current[1].index = 1; // 删句重排不影响本轮范围识别。
+        let mut unrelated = Segment::new(3, 4.0, 5.0, "未选中");
+        unrelated.translation = Some("another".into());
+        unrelated.translation_lang = Some("English".into());
+        current.push(unrelated);
+        assert_eq!(
+            super::translation_coverage_in_current(&current, &requested, "English"),
+            (1, 2)
+        );
+        current.remove(1);
+        assert_eq!(
+            super::translation_coverage_in_current(&current, &requested, "English"),
+            (0, 2)
+        );
+    }
+
     /// 回归（P2）：收尾统计必须用「实际译出」口径——
     /// 引擎可能给空串/纯空白译文打上 `translation_lang`，只数标签就会把
     /// 空白显示成「翻译完成」；分母还必须排除空源句，否则会永远「部分完成」。
@@ -7072,6 +7144,25 @@ mod tests {
         let revision_after_clear = state.segments_revision;
         assert!(!clear_translations_with_undo(&mut state));
         assert_eq!(state.segments_revision, revision_after_clear);
+    }
+
+    #[test]
+    fn clearing_all_translations_removes_hidden_packs_and_can_be_undone() {
+        let mut seg = Segment::new(1, 0.0, 1.0, "你好");
+        seg.set_translation("English", "Hello".into());
+        seg.set_translation_pack("日本語", "こんにちは");
+        seg.show_source_only();
+        let mut state = copied_state(vec![seg]);
+        assert!(
+            clear_translations_with_undo(&mut state),
+            "仅有隐藏语言包也需要清理"
+        );
+        state.apply_translation_pack(Some("English"));
+        assert!(!state.segments[0].has_translation());
+        assert!(state.translation_packs().is_empty());
+        assert!(state.undo());
+        state.apply_translation_pack(Some("日本語"));
+        assert_eq!(state.segments[0].translation.as_deref(), Some("こんにちは"));
     }
 
     /// 「译文与原文一字不差」的判定必须与翻译管线那份判据同口径（同一份实现），

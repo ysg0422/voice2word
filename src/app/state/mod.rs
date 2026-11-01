@@ -881,12 +881,17 @@ pub struct TranslationBaseline {
     pub source: std::collections::HashMap<i64, String>,
     /// `Segment::index` -> 开工时的译文（空串视为 `None`）
     pub translation: std::collections::HashMap<i64, Option<String>>,
+    /// 译文语言也属于编辑身份；同样文本被改为另一语言时仍须保护。
+    pub translation_lang: std::collections::HashMap<i64, Option<String>>,
+    pub translation_stale: std::collections::HashMap<i64, bool>,
 }
 
 impl TranslationBaseline {
     pub fn capture(segments: &[Segment]) -> Self {
         let mut source = std::collections::HashMap::with_capacity(segments.len());
         let mut translation = std::collections::HashMap::with_capacity(segments.len());
+        let mut translation_lang = std::collections::HashMap::with_capacity(segments.len());
+        let mut translation_stale = std::collections::HashMap::with_capacity(segments.len());
         for seg in segments {
             let idx = seg.index as i64;
             source.insert(idx, seg.translate_source());
@@ -894,10 +899,14 @@ impl TranslationBaseline {
                 idx,
                 seg.translation.clone().filter(|t| !t.trim().is_empty()),
             );
+            translation_lang.insert(idx, seg.translation_lang.clone());
+            translation_stale.insert(idx, seg.visible_translation_is_stale());
         }
         Self {
             source,
             translation,
+            translation_lang,
+            translation_stale,
         }
     }
 }

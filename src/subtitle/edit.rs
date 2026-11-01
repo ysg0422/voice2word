@@ -209,7 +209,14 @@ pub fn replace_all(
         let outcome = replace_one(target, find, replace, options, regex.as_ref(), &mut budget);
         report.matched_hits += outcome.matched;
         if outcome.replaced > 0 {
+            let source_cleared = outcome.text.trim().is_empty();
             *target = outcome.text;
+            if source_cleared {
+                seg.text.clear();
+                seg.polished.clear();
+            }
+            seg.invalidate_translations();
+            seg.words.clear();
             report.text_hits += outcome.replaced;
             changed = true;
         }
@@ -229,7 +236,7 @@ pub fn replace_all(
                 );
                 report.matched_hits += outcome.matched;
                 if outcome.replaced > 0 {
-                    seg.translation = Some(outcome.text);
+                    seg.update_visible_translation_text(outcome.text);
                     report.translation_hits += outcome.replaced;
                     changed = true;
                 }
@@ -424,6 +431,47 @@ mod tests {
     /// 构造一个只有主文本的片段，省掉每个测试里的样板字段。
     fn seg(index: usize, text: &str) -> Segment {
         Segment::new(index, 0.0, 1.0, text)
+    }
+
+    #[test]
+    fn audit_source_replacement_invalidates_translation_and_word_timings() {
+        let mut s = seg(1, "旧原文");
+        s.set_translation("English", "Old source".into());
+        s.words.push(crate::subtitle::segment::WordTiming {
+            word: "旧原文".into(),
+            start: 0.0,
+            end: 1.0,
+        });
+        let mut segments = vec![s];
+        replace_all(&mut segments, "旧", "新", &ReplaceOptions::default());
+        assert!(!segments[0].translation_matches("English"));
+        assert!(segments[0].words.is_empty());
+    }
+
+    #[test]
+    fn audit_translation_replacement_updates_pack_and_removes_empty_pack() {
+        let mut s = seg(1, "原文");
+        s.set_translation("English", "hello earth".into());
+        let mut segments = vec![s];
+        let options = ReplaceOptions {
+            include_translation: true,
+            ..Default::default()
+        };
+        replace_all(&mut segments, "earth", "world", &options);
+        segments[0].show_source_only();
+        assert!(segments[0].show_translation_pack("English"));
+        assert_eq!(segments[0].translation.as_deref(), Some("hello world"));
+        replace_all(&mut segments, "hello world", "", &options);
+        assert!(!segments[0].show_translation_pack("English"));
+    }
+
+    #[test]
+    fn audit_clearing_polished_source_does_not_restore_raw_asr() {
+        let mut s = seg(1, "旧识别文本");
+        s.polished = "待删除".into();
+        let mut segments = vec![s];
+        replace_all(&mut segments, "待删除", "", &ReplaceOptions::default());
+        assert!(segments[0].display_text().is_empty());
     }
 
     /// 默认值本身就是产品决策，单独钉住：不区分大小写、不动译文，且新开关

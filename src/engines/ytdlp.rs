@@ -55,14 +55,22 @@ impl YtDlpEngine {
 
     /// 下载 `url` 到 `out_dir`，返回**最终文件路径**。
     pub fn download(&self, url: &str, out_dir: &Path) -> Result<PathBuf> {
+        let url = url.trim();
+        let authority = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .and_then(|rest| rest.split(['/', '?', '#']).next());
+        if authority.is_none_or(str::is_empty) || url.chars().any(char::is_whitespace) {
+            anyhow::bail!("只支持有效的 http(s) 链接: {url}");
+        }
+        if self.cancel.load(Ordering::SeqCst) {
+            anyhow::bail!("链接下载已取消");
+        }
         if !self.is_available() {
             anyhow::bail!(
                 "缺少 yt-dlp（{}）：请在「模型与组件」里下载，或放到该路径",
                 self.exe.display()
             );
-        }
-        if !url.trim().starts_with("http") {
-            anyhow::bail!("只支持 http(s) 链接: {url}");
         }
         std::fs::create_dir_all(out_dir)
             .with_context(|| format!("创建下载目录失败: {}", out_dir.display()))?;
@@ -198,9 +206,9 @@ pub fn parse_final_path(stdout: &str) -> Option<PathBuf> {
 fn tail_line(stderr: &str, stdout: &str) -> String {
     stderr
         .lines()
-        .chain(stdout.lines())
         .map(str::trim)
         .rfind(|l| !l.is_empty())
+        .or_else(|| stdout.lines().map(str::trim).rfind(|l| !l.is_empty()))
         .unwrap_or("未知错误")
         .to_string()
 }
@@ -256,6 +264,41 @@ mod tests {
             .download("https://example.com/v", Path::new("D:/tmp"))
             .unwrap_err();
         assert!(format!("{err:#}").contains("缺少 yt-dlp"), "{err:#}");
+    }
+
+    #[test]
+    fn download_error_keeps_stderr_even_when_stdout_has_progress() {
+        assert_eq!(
+            tail_line("ERROR: authentication failed\n", "[download] 25%\n"),
+            "ERROR: authentication failed"
+        );
+        assert_eq!(tail_line(" \n", "fallback\n"), "fallback");
+    }
+
+    #[test]
+    fn download_validates_url_and_cancel_before_starting_process() {
+        let engine = YtDlpEngine {
+            exe: PathBuf::from("missing-yt-dlp.exe"),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        for url in [
+            "httpjunk",
+            "http://",
+            "https:///missing-host",
+            "https://host with spaces/v",
+        ] {
+            let error = engine
+                .download(url, Path::new("unused"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("有效"), "{url}: {error}");
+        }
+        engine.cancel();
+        let error = engine
+            .download("https://example.com/v", Path::new("unused"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("已取消"), "{error}");
     }
 
     #[test]

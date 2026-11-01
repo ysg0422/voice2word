@@ -50,6 +50,9 @@ pub struct Segment {
     /// 用户再也切不回去，也看不出这部片子到底译过哪几种语言。
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub translations: std::collections::BTreeMap<String, String>,
+    /// 原文改动后失效的语言包；保留旧文本供参考，但不能算作翻译完成。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub stale_translation_langs: std::collections::BTreeSet<String>,
     /// 已锁定（人工校对完成）：重新翻译 / 润色**不得覆盖**这一句。
     ///
     /// 与 `merge_translations_checked` 里的 baseline 保护是两回事：那个只在**同一次
@@ -119,6 +122,7 @@ impl Segment {
             translation: None,
             translation_lang: None,
             translations: std::collections::BTreeMap::new(),
+            stale_translation_langs: std::collections::BTreeSet::new(),
             polished: String::new(),
             language: None,
             confidence: None,
@@ -156,6 +160,9 @@ impl Segment {
     /// 不做模糊匹配——把 "English" 与 "英语" 视作同一语言的猜测一旦猜错，
     /// 就会静默跳过本该重译的句子。
     pub fn translation_matches(&self, target_lang: &str) -> bool {
+        if self.stale_translation_langs.contains(target_lang) {
+            return false;
+        }
         match (
             self.translation.as_deref(),
             self.translation_lang.as_deref(),
@@ -190,6 +197,13 @@ impl Segment {
             .unwrap_or(false)
     }
 
+    /// 当前显示的语言包是否已经因原文改动而失效。
+    pub fn visible_translation_is_stale(&self) -> bool {
+        self.translation_lang
+            .as_ref()
+            .is_some_and(|lang| self.stale_translation_langs.contains(lang))
+    }
+
     /// 取某个语言包里的译文（空串 / 纯空白视为没有这一份）。
     pub fn translation_pack(&self, lang: &str) -> Option<&str> {
         self.translations
@@ -206,6 +220,50 @@ impl Segment {
             return;
         }
         self.translations.insert(lang.to_string(), text.to_string());
+        self.stale_translation_langs.remove(lang);
+    }
+
+    /// 安装一份对应当前原文的新译文，同时同步语言包与完成状态。
+    pub fn set_translation(&mut self, lang: &str, text: String) {
+        self.cache_visible_translation();
+        self.set_translation_pack(lang, &text);
+        self.translation = Some(text);
+        self.translation_lang = Some(lang.to_string());
+    }
+
+    /// 批量文本操作同步展示译文与语言包；不会自动确认已失效的旧译文。
+    pub fn update_visible_translation_text(&mut self, text: String) {
+        if text.trim().is_empty() {
+            if let Some(lang) = self.translation_lang.as_deref() {
+                self.translations.remove(lang);
+                self.stale_translation_langs.remove(lang);
+            }
+            self.translation = None;
+            self.translation_lang = None;
+        } else {
+            self.translation = Some(text);
+            self.cache_visible_translation();
+        }
+    }
+
+    /// 保留旧译文，但让所有旧语言包等待重译或人工确认。
+    pub fn invalidate_translations(&mut self) {
+        self.cache_visible_translation();
+        self.stale_translation_langs
+            .extend(self.translations.keys().cloned());
+    }
+
+    /// 当前展示可能来自旧工程或手工编辑，切换前把最新值同步进语言包。
+    pub fn cache_visible_translation(&mut self) {
+        if let (Some(lang), Some(text)) = (
+            self.translation_lang.as_deref(),
+            self.translation.as_deref(),
+        ) {
+            if !lang.trim().is_empty() && !text.trim().is_empty() {
+                self.translations
+                    .insert(lang.trim().to_string(), text.to_string());
+            }
+        }
     }
 
     /// 把某个语言包切换成「当前展示 / 导出用的那一份」。
@@ -225,6 +283,7 @@ impl Segment {
 
     /// 回到「只显示原文」：清掉当前展示的译文，但**语言包保留**（还能切回来）。
     pub fn show_source_only(&mut self) {
+        self.cache_visible_translation();
         self.translation = None;
         self.translation_lang = None;
     }
@@ -242,10 +301,8 @@ impl Segment {
                 return Some(trimmed.to_string());
             }
         }
-        // 用饱和加法：序号是外部数据，理论上可到 u32::MAX，`s + 1` 在 debug 构建
-        // 会直接 panic（release 回绕成 0），而这里只想渲染一个标签。
-        self.speaker
-            .map(|s| format!("说话人 {}", s.saturating_add(1)))
+        // 先扩宽再加一，保证导入的 u32::MAX 也有唯一且不溢出的展示编号。
+        self.speaker.map(|s| format!("说话人 {}", u64::from(s) + 1))
     }
 
     /// 带说话人前缀的文本（仅在该段有说话人标签时加前缀）
@@ -1322,6 +1379,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         translation: left_trans,
         translation_lang: seg.translation_lang.clone(),
         translations: left_packs,
+        stale_translation_langs: seg.stale_translation_langs.clone(),
         polished: left_polished,
         language: seg.language.clone(),
         confidence: seg.confidence,
@@ -1338,6 +1396,7 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         translation: right_trans,
         translation_lang: seg.translation_lang.clone(),
         translations: right_packs,
+        stale_translation_langs: seg.stale_translation_langs.clone(),
         polished: right_polished,
         language: seg.language,
         confidence: seg.confidence,
@@ -2294,16 +2353,18 @@ mod tests {
         assert_eq!(dominant_language(segs.iter().rev()).as_deref(), Some("en"));
     }
 
-    /// 极端序号（u32::MAX）下渲染说话人标签不得 panic 或回绕成 0。
+    /// 极端序号不得 panic、回绕或与前一个说话人的标签重号。
     #[test]
-    fn speaker_label_saturates_instead_of_overflowing() {
+    fn speaker_label_widens_without_overflow_or_collision() {
         let mut seg = Segment::new(1, 0.0, 1.0, "文本");
         seg.speaker = Some(u32::MAX);
         assert_eq!(
             seg.speaker_label().as_deref(),
-            Some("说话人 4294967295"),
-            "饱和加法不该回绕"
+            Some("说话人 4294967296"),
+            "展示编号必须与 TTML 的一基编号一致"
         );
+        seg.speaker = Some(u32::MAX - 1);
+        assert_eq!(seg.speaker_label().as_deref(), Some("说话人 4294967295"));
     }
 
     #[test]

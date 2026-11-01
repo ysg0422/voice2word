@@ -73,6 +73,18 @@ impl AppState {
         };
         let mut by_start: HashMap<u64, Vec<Segment>> = HashMap::with_capacity(translated.len());
         for seg in translated {
+            if let Some(base) = baseline {
+                let idx = seg.index as i64;
+                let text = seg.translation.clone().filter(|t| !t.trim().is_empty());
+                if base.translation.get(&idx) == Some(&text)
+                    && base.translation_lang.get(&idx) == Some(&seg.translation_lang)
+                    && base.translation_stale.get(&idx).copied().unwrap_or(false)
+                        == seg.visible_translation_is_stale()
+                {
+                    // 未译出或开工前已译好，不能把旧快照当成本轮新产物回填。
+                    continue;
+                }
+            }
             if seg.has_translation() {
                 if let Some(start) = key(seg.start) {
                     by_start.entry(start).or_default().push(seg);
@@ -126,13 +138,22 @@ impl AppState {
                 let now = seg.translation.clone().filter(|t| !t.trim().is_empty());
                 let then = base.translation.get(&idx).cloned().flatten();
                 let incoming = src.translation.clone().filter(|t| !t.trim().is_empty());
+                let then_lang = base.translation_lang.get(&idx).cloned().flatten();
                 // `now == incoming` 是本函数上一次写下的值（增量落盘会反复合并同一份
                 // 快照），不能误判成「人手改过」而跳过，否则第二次合并就全部失效。
-                if now != then && now != incoming {
+                let unchanged = now == then
+                    && seg.translation_lang == then_lang
+                    && seg.visible_translation_is_stale()
+                        == base.translation_stale.get(&idx).copied().unwrap_or(false);
+                let already_applied = now == incoming
+                    && seg.translation_lang == src.translation_lang
+                    && seg.visible_translation_is_stale() == src.visible_translation_is_stale();
+                if !unchanged && !already_applied {
                     skipped += 1;
                     continue;
                 }
             }
+            seg.cache_visible_translation();
             // 先进语言包，再投影成「当前展示」：换目标语言重译时，旧语言的
             // 那一份留在 `translations` 里，用户随时能在「字幕语言包」切回去。
             if let (Some(lang), Some(text)) =
@@ -211,6 +232,7 @@ impl AppState {
     /// 字段，所以切语言包不用改下游一行；语言包本身一份都不会丢。
     pub fn apply_translation_pack(&mut self, lang: Option<&str>) {
         for seg in self.segments.iter_mut() {
+            seg.cache_visible_translation();
             match lang {
                 Some(l) => {
                     // 这一句没有该语言的包：清掉展示，避免留下上一门语言的残余。

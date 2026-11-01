@@ -567,6 +567,11 @@ pub fn parse_json(content: &str) -> Result<Vec<Segment>> {
             })
             .unwrap_or_default();
         seg.speaker_name = opt_body(input.speaker_name.as_ref());
+        seg.stale_translation_langs = input
+            .stale_translation_langs
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
         seg.translation = opt_body(input.translation.as_ref());
         seg.translation_lang = opt_identifier(input.translation_lang.as_ref());
         seg.language = opt_identifier(input.language.as_ref());
@@ -608,6 +613,7 @@ struct JsonSegmentIn {
     polished: Option<serde_json::Value>,
     locked: Option<serde_json::Value>,
     translations: Option<serde_json::Value>,
+    stale_translation_langs: Option<serde_json::Value>,
     speaker_name: Option<serde_json::Value>,
     translation: Option<serde_json::Value>,
     translation_lang: Option<serde_json::Value>,
@@ -1314,7 +1320,7 @@ fn parse_ttml_speaker(id: &str) -> Option<u32> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    digits.parse::<u32>().ok()?.checked_sub(1)
+    u32::try_from(digits.parse::<u64>().ok()?.checked_sub(1)?).ok()
 }
 
 /// 拆出 `<p>` 正文里的语言 span 与裸文本，返回 `(spans, bare)`。
