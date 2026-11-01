@@ -1,4 +1,4 @@
-# 不下载模型或启动外部程序，验证发布预取的目录布局与重名保护。
+﻿# 不下载模型或启动外部程序，验证发布预取的目录布局与重名保护。
 $ErrorActionPreference = 'Stop'
 $tokens = $null
 $parseErrors = $null
