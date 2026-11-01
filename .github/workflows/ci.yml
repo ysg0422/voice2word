@@ -318,6 +318,10 @@ jobs:
         with:
           shared-key: v2w-windows
 
+      - name: Prepare model directory for source-root resolution
+        shell: pwsh
+        run: New-Item -ItemType Directory -Path models -Force | Out-Null
+
       - name: cargo test --lib -- --test-threads=1
         # --test-threads=1 是**规避**已知偶发 STATUS_HEAP_CORRUPTION 的绕过手段，
         # 不是修复：默认并行时约 25 次跑崩 1 次，崩掉的正是两个 wgpu 用例。
@@ -349,6 +353,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: v2w-windows
+
+      - name: Prepare model directory for source-root resolution
+        shell: pwsh
+        run: New-Item -ItemType Directory -Path models -Force | Out-Null
 
       - name: cargo test --lib (default parallel — flake telemetry)
         # 目的单一：暴露 STATUS_HEAP_CORRUPTION 的复现率。
@@ -393,6 +401,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: v2w-windows
+
+      - name: Prepare model directory for source-root resolution
+        shell: pwsh
+        run: New-Item -ItemType Directory -Path models -Force | Out-Null
 
       - name: cargo test --all-targets --no-fail-fast
         run: cargo test --all-targets --no-fail-fast

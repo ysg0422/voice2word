@@ -16,30 +16,39 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已存在的发行标签，例如 v0.2.27'
+        required: true
+        type: string
   push:
     tags:
       - 'v*'
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: write   # 创建 Release + 上传资产
 
 env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
 
 jobs:
   release:
-    name: build & publish (${{ github.ref_name }})
+    name: build & publish (${{ inputs.tag || github.ref_name }})
     runs-on: windows-latest
     timeout-minutes: 120
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -60,11 +69,13 @@ jobs:
         with:
           shared-key: v2w-windows
           key: release
+          cache-on-failure: true
 
       - name: Verify Tag against Cargo.toml
         shell: pwsh
         run: |
-          $tag = '${{ github.ref_name }}'
+          $tag = $env:RELEASE_TAG
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw '发行标签格式无效' }
           $tagVersion = $tag -replace '^v', ''
           $cargoVersion = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
           Write-Host "Tag Version: $tagVersion, Cargo.toml Version: $cargoVersion"
@@ -75,6 +86,11 @@ jobs:
       - name: Packaging archive regression tests
         shell: pwsh
         run: pwsh -NoProfile -File scripts/test_release_packaging.ps1
+
+      - name: Prepare model directory for source-root resolution
+        shell: pwsh
+        # 路径定位把 models/ 当根目录标记；空目录不含模型，不绕过外部资产检查。
+        run: New-Item -ItemType Directory -Path models -Force | Out-Null
 
       # ---------------------------------------------------------------
       # 发布前最低验证：lib 单测（单线程，规避已知 wgpu 偶发崩溃）。
@@ -153,7 +169,7 @@ jobs:
       - name: Build Installer and Assemble Release Assets
         shell: pwsh
         run: |
-          $tag = '${{ github.ref_name }}'
+          $tag = $env:RELEASE_TAG
           $version = $tag -replace '^v', ''
           New-Item -ItemType Directory -Path dist -Force | Out-Null
 
@@ -214,9 +230,10 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: Voice2Word ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Voice2Word ${{ env.RELEASE_TAG }}
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           make_latest: true
           generate_release_notes: true
           files: |
@@ -232,8 +249,8 @@ jobs:
             - 修复人声分离开关与断点缓存参数校验，补齐发布包的运行脚本。
 
             ### 📦 发行文件说明
-            • Voice2Word-${{ github.ref_name }}-Setup.exe：标准向导安装包（推荐），支持自定义安装目录与创建桌面快捷方式
-            • voice2word-${{ github.ref_name }}-win64-lite.zip：便携版，含启动运行库、CLI 与运行脚本，解压到可写目录后运行；模型和外部工具在应用内补齐
+            • Voice2Word-${{ env.RELEASE_TAG }}-Setup.exe：标准向导安装包（推荐），支持自定义安装目录与创建桌面快捷方式
+            • voice2word-${{ env.RELEASE_TAG }}-win64-lite.zip：便携版，含启动运行库、CLI 与运行脚本，解压到可写目录后运行；模型和外部工具在应用内补齐
             • voice2word.exe：已有便携目录升级用，替换前退出程序，新用户请下载安装包或 ZIP
             • voice2word-cli.exe：后台命令行无头程序，供脚本与自动化批处理调用
             • SHA256SUMS.txt：发行文件 SHA-256 校验值
