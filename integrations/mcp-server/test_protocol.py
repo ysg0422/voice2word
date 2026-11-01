@@ -181,7 +181,8 @@ class McpProtocolTests(unittest.TestCase):
             self.assertIn(key, props)
         self.assertEqual(transcribe["inputSchema"].get("required"), ["input"])
         self.assertEqual(
-            props["format"]["enum"], ["srt", "ass", "vtt", "json", "txt", "ttml", "ttal"]
+            props["format"]["enum"],
+            ["srt", "ass", "vtt", "json", "txt", "ttml", "ttal", "sbv", "lrc", "txt-ts"],
         )
 
     # --- 3. ping ---------------------------------------------------------

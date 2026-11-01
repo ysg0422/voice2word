@@ -20,8 +20,9 @@
 //!
 //! 目标是「够用且不会错」，不是通用 ZIP 库。
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -157,18 +158,61 @@ const MAX_TOTAL_UNCOMPRESSED: u64 = 2 * 1024 * 1024 * 1024;
 /// 否则任何带目录层级的条目一律跳过（不碰）。即便剥前缀后，最终文件名仍必须通过
 /// `is_safe_name`——绝不允许写到 `dest_dir` 之外。
 pub fn extract_zip(bytes: &[u8], dest_dir: &Path) -> Result<usize> {
+    extract_zip_with_cancel(bytes, dest_dir, None)
+}
+
+/// 与 [`extract_zip`] 相同，但支持取消：置位后在下一条目开始前中止。
+pub fn extract_zip_with_cancel(
+    bytes: &[u8],
+    dest_dir: &Path,
+    cancel: Option<&AtomicBool>,
+) -> Result<usize> {
     let entries = parse_central_directory(bytes)?;
+    extract_entries(&entries, dest_dir, cancel, |e| read_entry_data(bytes, e))
+}
+
+/// 从磁盘上的 zip 文件解压：**按条目读取**，不再把整包读进内存。
+///
+/// 大组件包（几百 MB）用 [`extract_zip`] 会先 `fs::read` 整包，峰值内存翻倍；
+/// 这里只读中央目录与每个条目的压缩数据。
+pub fn extract_zip_file(
+    path: &Path,
+    dest_dir: &Path,
+    cancel: Option<&AtomicBool>,
+) -> Result<usize> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("打开压缩包失败: {}", path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("读取压缩包大小失败: {}", path.display()))?
+        .len();
+    let entries = parse_central_directory_from_file(&mut file, len)?;
+    extract_entries(&entries, dest_dir, cancel, |e| {
+        read_file_entry_data(&mut file, e)
+    })
+}
+
+fn extract_entries<F, D>(
+    entries: &[ZipEntry],
+    dest_dir: &Path,
+    cancel: Option<&AtomicBool>,
+    mut data_for: F,
+) -> Result<usize>
+where
+    F: FnMut(&ZipEntry) -> Result<D>,
+    D: AsRef<[u8]>,
+{
     if entries.is_empty() {
         bail!("压缩包里没有任何条目");
     }
-    let strip = common_prefix(&entries);
+    let strip = common_prefix(entries);
 
     std::fs::create_dir_all(dest_dir)
         .with_context(|| format!("创建目录失败: {}", dest_dir.display()))?;
 
     let mut written = 0usize;
     let mut total_out: u64 = 0;
-    for e in &entries {
+    for e in entries {
         let name = strip
             .as_deref()
             .and_then(|p| e.name.strip_prefix(p))
@@ -176,7 +220,11 @@ pub fn extract_zip(bytes: &[u8], dest_dir: &Path) -> Result<usize> {
         if !is_safe_name(name) {
             continue;
         }
-        let data = read_entry_data(bytes, e)?;
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            bail!("解压已取消");
+        }
+        let data = data_for(e)?;
+        let data = data.as_ref();
         // 声明值不可信，只用来给 `Vec` 预留容量（并设上限，避免预留本身就把内存打满）。
         let per_entry_cap = entry_size_cap(e.uncomp_size)?;
         let mut out = Vec::with_capacity((e.uncomp_size as usize).min(1 << 20));
@@ -283,12 +331,7 @@ struct ZipEntry {
 /// 「是否都在同一个顶层目录下」，进而决定要不要剥前缀。
 fn parse_central_directory(bytes: &[u8]) -> Result<Vec<ZipEntry>> {
     let eocd = find_eocd(bytes)?;
-    let total = read_u16(bytes, eocd + 10)? as usize;
-    let cd_off = read_u32(bytes, eocd + 16)? as usize;
-    let cd_size = read_u32(bytes, eocd + 12)? as usize;
-    if cd_off == 0xffff_ffff || cd_size == 0xffff_ffff || total == 0xffff {
-        bail!("不支持 Zip64 格式的压缩包");
-    }
+    let (total, cd_off, cd_size) = central_directory_header(bytes, eocd)?;
     if cd_off
         .checked_add(cd_size)
         .map(|end| end > bytes.len())
@@ -296,24 +339,41 @@ fn parse_central_directory(bytes: &[u8]) -> Result<Vec<ZipEntry>> {
     {
         bail!("zip 中央目录越界（文件截断）");
     }
+    let cd = bytes
+        .get(cd_off..cd_off + cd_size)
+        .ok_or_else(|| anyhow!("zip 中央目录越界（文件截断）"))?;
+    parse_entries(cd, total)
+}
 
+/// 从 EOCD 读出 (条目数, 中央目录偏移, 中央目录长度)，并拒绝 Zip64。
+fn central_directory_header(bytes: &[u8], eocd: usize) -> Result<(usize, usize, usize)> {
+    let total = read_u16(bytes, eocd + 10)? as usize;
+    let cd_off = read_u32(bytes, eocd + 16)? as usize;
+    let cd_size = read_u32(bytes, eocd + 12)? as usize;
+    if cd_off == 0xffff_ffff || cd_size == 0xffff_ffff || total == 0xffff {
+        bail!("不支持 Zip64 格式的压缩包");
+    }
+    Ok((total, cd_off, cd_size))
+}
+
+/// 解析中央目录切片（偏移量相对切片起点）。条目数据在解压时再按 `local_off` 读取。
+fn parse_entries(cd: &[u8], total: usize) -> Result<Vec<ZipEntry>> {
     let mut entries = Vec::with_capacity(total);
-    let mut p = cd_off;
+    let mut p = 0usize;
     for _ in 0..total {
-        if read_u32(bytes, p)? != SIG_CENTRAL {
+        if read_u32(cd, p)? != SIG_CENTRAL {
             bail!("中央目录条目签名不正确（偏移 {p}）");
         }
-        let method = read_u16(bytes, p + 10)?;
-        let crc32 = read_u32(bytes, p + 16)?;
-        let comp_size = read_u32(bytes, p + 20)?;
-        let uncomp_size = read_u32(bytes, p + 24)?;
-        let name_len = read_u16(bytes, p + 28)? as usize;
-        let extra_len = read_u16(bytes, p + 30)? as usize;
-        let comment_len = read_u16(bytes, p + 32)? as usize;
-        let local_off = read_u32(bytes, p + 42)?;
+        let method = read_u16(cd, p + 10)?;
+        let crc32 = read_u32(cd, p + 16)?;
+        let comp_size = read_u32(cd, p + 20)?;
+        let uncomp_size = read_u32(cd, p + 24)?;
+        let name_len = read_u16(cd, p + 28)? as usize;
+        let extra_len = read_u16(cd, p + 30)? as usize;
+        let comment_len = read_u16(cd, p + 32)? as usize;
+        let local_off = read_u32(cd, p + 42)?;
         let name = String::from_utf8_lossy(
-            bytes
-                .get(p + 46..p + 46 + name_len)
+            cd.get(p + 46..p + 46 + name_len)
                 .ok_or_else(|| anyhow!("条目名越界"))?,
         )
         .into_owned();
@@ -332,6 +392,31 @@ fn parse_central_directory(bytes: &[u8]) -> Result<Vec<ZipEntry>> {
         });
     }
     Ok(entries)
+}
+
+/// 从磁盘文件解析中央目录：只读文件尾部的 EOCD 与中央目录本身。
+fn parse_central_directory_from_file(file: &mut std::fs::File, len: u64) -> Result<Vec<ZipEntry>> {
+    if len < 22 {
+        bail!("不是合法的 zip（长度不足 EOCD）");
+    }
+    let tail_len = (len as usize).min(22 + 0xffff);
+    let tail_start = len - tail_len as u64;
+    file.seek(SeekFrom::Start(tail_start))?;
+    let mut tail = vec![0u8; tail_len];
+    file.read_exact(&mut tail)?;
+    let rel = find_eocd(&tail)?;
+    let (total, cd_off, cd_size) = central_directory_header(&tail, rel)?;
+    if cd_off
+        .checked_add(cd_size)
+        .map(|end| end as u64 > len)
+        .unwrap_or(true)
+    {
+        bail!("zip 中央目录越界（文件截断）");
+    }
+    file.seek(SeekFrom::Start(cd_off as u64))?;
+    let mut cd = vec![0u8; cd_size];
+    file.read_exact(&mut cd)?;
+    parse_entries(&cd, total)
 }
 
 /// 若全部非目录条目共用同一个顶层目录前缀，返回该前缀（带尾部 `/`）。
@@ -407,6 +492,30 @@ fn read_entry_data<'a>(bytes: &'a [u8], e: &ZipEntry) -> Result<&'a [u8]> {
     bytes
         .get(data_start..data_start + e.comp_size as usize)
         .ok_or_else(|| anyhow!("条目数据越界: {}", e.name))
+}
+
+/// 从文件读取单个条目的压缩数据（按本地头定位，只读这一段）。
+fn read_file_entry_data(file: &mut std::fs::File, e: &ZipEntry) -> Result<Vec<u8>> {
+    // 压缩长度同样来自中央目录、不可信：先按全局上限拦住畸形声明，
+    // 避免一次 `vec![0; 4GB]` 把内存打满（字节版是切片，没有这个问题）。
+    if u64::from(e.comp_size) > MAX_ENTRY_UNCOMPRESSED {
+        bail!("条目声明的压缩体积过大: {}（{} 字节）", e.name, e.comp_size);
+    }
+    file.seek(SeekFrom::Start(u64::from(e.local_off)))?;
+    let mut header = [0u8; 30];
+    file.read_exact(&mut header)
+        .with_context(|| format!("读取本地文件头失败: {}", e.name))?;
+    if u32::from_le_bytes([header[0], header[1], header[2], header[3]]) != SIG_LOCAL {
+        bail!("本地文件头签名不正确: {}", e.name);
+    }
+    let name_len = u64::from(u16::from_le_bytes([header[26], header[27]]));
+    let extra_len = u64::from(u16::from_le_bytes([header[28], header[29]]));
+    let data_start = u64::from(e.local_off) + 30 + name_len + extra_len;
+    file.seek(SeekFrom::Start(data_start))?;
+    let mut data = vec![0u8; e.comp_size as usize];
+    file.read_exact(&mut data)
+        .with_context(|| format!("读取条目数据失败: {}", e.name))?;
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -639,6 +748,44 @@ mod tests {
         assert_eq!(extract_zip(&zip, &dir).unwrap(), 1);
         assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), raw);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件版解压与字节版结果一致：只读中央目录与条目数据，不整包载入内存。
+    #[test]
+    fn extracts_from_file_like_bytes() {
+        let zip = build_stored_zip(&[("a.exe", b"hello"), ("b.dll", b"world!")]);
+        let dir = tmp_dir("file");
+        let zip_path = dir.join("pkg.zip");
+        std::fs::write(&zip_path, &zip).unwrap();
+        let out = tmp_dir("file_out");
+        assert_eq!(extract_zip_file(&zip_path, &out, None).unwrap(), 2);
+        assert_eq!(std::fs::read(out.join("a.exe")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(out.join("b.dll")).unwrap(), b"world!");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// 取消位在解压开始前就置位时：一个文件都不写，直接报「已取消」。
+    #[test]
+    fn file_extraction_honours_cancel_flag() {
+        let zip = build_stored_zip(&[("a.exe", b"hello"), ("b.dll", b"world!")]);
+        let dir = tmp_dir("file_cancel");
+        let zip_path = dir.join("pkg.zip");
+        std::fs::write(&zip_path, &zip).unwrap();
+        let out = tmp_dir("file_cancel_out");
+        let cancel = AtomicBool::new(true);
+        let err = extract_zip_file(&zip_path, &out, Some(&cancel)).unwrap_err();
+        assert!(
+            format!("{err}").contains("取消"),
+            "错误信息应说明是取消: {err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().count(),
+            0,
+            "取消后不应写出任何文件"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]

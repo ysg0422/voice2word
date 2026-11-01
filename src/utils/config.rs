@@ -28,6 +28,128 @@ pub struct AppConfig {
     /// 沿用内置默认键位，因此老配置读取行为逐字节不变。
     #[serde(default, skip_serializing_if = "ShortcutsConfig::is_empty")]
     pub shortcuts: ShortcutsConfig,
+    /// 配音闭环（TTS 配音 + 时间轴对齐 + 音轨替换/混音）参数。
+    #[serde(default)]
+    pub dub: DubConfig,
+    /// 文件夹监听（新素材自动入批量队列）。
+    #[serde(default)]
+    pub watch: WatchConfig,
+}
+
+/// 文件夹监听配置段 `[watch]`。
+///
+/// ```toml
+/// [watch]
+/// enabled = false
+/// dir = "D:/recordings"
+/// recursive = false
+/// interval_secs = 3
+/// settle_secs = 5
+/// ```
+///
+/// 默认关闭：监听会在后台常驻轮询目录，不该在用户没要求时动他的文件系统。
+/// `settle_secs` 是「文件落定窗口」——小于它的文件视为仍在复制/下载中。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WatchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 监听目录（空串 = 未配置，开关打开也不扫描）。
+    #[serde(default)]
+    pub dir: String,
+    /// 是否递归子目录。
+    #[serde(default)]
+    pub recursive: bool,
+    /// 扫描间隔（秒），下限 1。
+    #[serde(default = "default_watch_interval")]
+    pub interval_secs: u64,
+    /// 落定窗口（秒）：mtime 距今不足该值的文件不入队。
+    #[serde(default = "default_watch_settle")]
+    pub settle_secs: u64,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: String::new(),
+            recursive: false,
+            interval_secs: default_watch_interval(),
+            settle_secs: default_watch_settle(),
+        }
+    }
+}
+
+fn default_watch_interval() -> u64 {
+    3
+}
+
+fn default_watch_settle() -> u64 {
+    5
+}
+
+/// 配音闭环配置段 `[dub]`。
+///
+/// ```toml
+/// [dub]
+/// mode = "mix"            # mix | replace
+/// bgm_volume = 0.25
+/// max_rate_percent = 35
+/// source = "translation"  # translation | text
+/// voice_zh = "zh-CN-XiaoxiaoNeural"
+/// voice_en = "en-US-JennyNeural"
+/// ```
+///
+/// 默认**不自动配音**（要联网合成、耗时随句数增长），必须由用户显式触发；
+/// 这一段只描述「触发之后怎么配」。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DubConfig {
+    /// `mix` = 保留原声（按 `bgm_volume` 压低）与配音混音；`replace` = 整条替换。
+    #[serde(default = "default_dub_mode")]
+    pub mode: String,
+    /// `mix` 模式下原声保留比例（0~1）。0 等价于 replace。
+    #[serde(default = "default_dub_bgm_volume")]
+    pub bgm_volume: f32,
+    /// 语速上限（百分数）。再快就听不清了，宁可让这一句轻微溢出到句间空隙。
+    #[serde(default = "default_dub_max_rate")]
+    pub max_rate_percent: u32,
+    /// 配音文本来源：`translation`（译文；为空时回退原文）| `text`（原文）。
+    #[serde(default = "default_dub_source")]
+    pub source: String,
+    /// 中文首选音色（留空 = 按说话人在预设里轮换）。
+    #[serde(default)]
+    pub voice_zh: String,
+    /// 英文首选音色（同上）。
+    #[serde(default)]
+    pub voice_en: String,
+}
+
+impl Default for DubConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_dub_mode(),
+            bgm_volume: default_dub_bgm_volume(),
+            max_rate_percent: default_dub_max_rate(),
+            source: default_dub_source(),
+            voice_zh: String::new(),
+            voice_en: String::new(),
+        }
+    }
+}
+
+fn default_dub_mode() -> String {
+    "mix".to_string()
+}
+
+fn default_dub_bgm_volume() -> f32 {
+    0.25
+}
+
+fn default_dub_max_rate() -> u32 {
+    35
+}
+
+fn default_dub_source() -> String {
+    "translation".to_string()
 }
 
 /// 快捷键自定义配置段 `[shortcuts]`。
@@ -1506,7 +1628,7 @@ impl GpuConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathsConfig {
     pub ffmpeg: String,
     pub whisper_cli: String,
@@ -1515,6 +1637,10 @@ pub struct PathsConfig {
     pub vad_model: Option<String>,
     #[serde(default = "default_punc_model")]
     pub punc_model: Option<String>,
+    /// 人声分离模型（UVR MDX-Net 类 ONNX）。只在 `preprocess_vocal_sep` 开启时使用；
+    /// 缺失时管线显式告警并回退原始音频，不静默吞掉。
+    #[serde(default = "default_vocal_model")]
+    pub vocal_model: Option<String>,
     #[serde(default = "default_sensevoice_model")]
     pub sensevoice_model: Option<String>,
     #[serde(default = "default_sensevoice_tokens")]
@@ -1541,6 +1667,7 @@ impl Default for PathsConfig {
             whisper_model: "models/whisper/ggml-small-q5_0.bin".to_string(),
             vad_model: Some("models/whisper/ggml-silero-v6.2.0.bin".to_string()),
             punc_model: Some("models/punc/model.int8.onnx".to_string()),
+            vocal_model: Some("models/vocal_sep/UVR-MDX-NET-Inst_HQ_3.onnx".to_string()),
             sensevoice_model: Some("models/sensevoice/model.int8.onnx".to_string()),
             sensevoice_tokens: Some("models/sensevoice/tokens.txt".to_string()),
             sensevoice_vad: Some("models/sensevoice/silero_vad.onnx".to_string()),
@@ -1565,6 +1692,10 @@ fn default_vad_model() -> Option<String> {
 
 fn default_punc_model() -> Option<String> {
     Some("models/punc/model.int8.onnx".to_string())
+}
+
+fn default_vocal_model() -> Option<String> {
+    Some("models/vocal_sep/UVR-MDX-NET-Inst_HQ_3.onnx".to_string())
 }
 
 fn default_sensevoice_model() -> Option<String> {
@@ -1695,6 +1826,12 @@ pub struct PipelineConfig {
     /// 压实要多写一个临时 WAV，收益太小时不划算。
     #[serde(default = "default_min_saving")]
     pub preprocess_min_saving: f64,
+    /// 人声分离前置（UVR MDX-Net，模型见 `paths.vocal_model`）：把「人声 + BGM」
+    /// 拆成人声轨再喂识别。**默认关闭**：多付一遍全轨分离（约 0.5~2× 实时），
+    /// 只在 BGM/背景人声重的素材上有明显收益；模型缺失或分离失败时管线
+    /// **显式告警并回退原始音频**，绝不静默吞掉（对齐「静默降级看得见」原则）。
+    #[serde(default)]
+    pub preprocess_vocal_sep: bool,
     pub llm_threads: u32,
     pub llm_ctx: u32,
     /// 并行进程数：`0` = 自动（按 CPU 核数推导引擎内实测调优值）；`>0` = 显式指定。
@@ -1743,6 +1880,7 @@ impl Default for AppConfig {
                 whisper_model: "models/whisper/ggml-small-q5_0.bin".to_string(),
                 vad_model: Some("models/whisper/ggml-silero-v6.2.0.bin".to_string()),
                 punc_model: Some("models/punc/model.int8.onnx".to_string()),
+                vocal_model: Some("models/vocal_sep/UVR-MDX-NET-Inst_HQ_3.onnx".to_string()),
                 sensevoice_model: Some("models/sensevoice/model.int8.onnx".to_string()),
                 sensevoice_tokens: Some("models/sensevoice/tokens.txt".to_string()),
                 sensevoice_vad: Some("models/sensevoice/silero_vad.onnx".to_string()),
@@ -1779,6 +1917,7 @@ impl Default for AppConfig {
                 preprocess_highpass_hz: 70.0,
                 preprocess_compact: false,
                 preprocess_min_saving: 0.10,
+                preprocess_vocal_sep: false,
                 llm_threads: 8,
                 llm_ctx: 4096,
                 parallel_workers: 0,
@@ -1791,6 +1930,8 @@ impl Default for AppConfig {
             translate: TranslateConfig::default(),
             ui: UiConfig::default(),
             shortcuts: ShortcutsConfig::default(),
+            dub: DubConfig::default(),
+            watch: WatchConfig::default(),
         }
     }
 }
@@ -1826,6 +1967,7 @@ pub struct LocalPathsOverride {
     pub whisper_model: Option<String>,
     pub vad_model: Option<String>,
     pub punc_model: Option<String>,
+    pub vocal_model: Option<String>,
     pub sensevoice_model: Option<String>,
     pub sensevoice_tokens: Option<String>,
     pub sensevoice_vad: Option<String>,
@@ -1842,6 +1984,7 @@ impl LocalPathsOverride {
             || self.whisper_model.is_some()
             || self.vad_model.is_some()
             || self.punc_model.is_some()
+            || self.vocal_model.is_some()
             || self.sensevoice_model.is_some()
             || self.sensevoice_tokens.is_some()
             || self.sensevoice_vad.is_some()
@@ -1930,6 +2073,7 @@ impl LocalOverride {
             apply_path!(
                 vad_model,
                 punc_model,
+                vocal_model,
                 sensevoice_model,
                 sensevoice_tokens,
                 sensevoice_vad
@@ -2116,14 +2260,17 @@ impl AppConfig {
         Ok(cfg)
     }
 
-    /// 配置路径参数的规范化：把机器专属的绝对路径拆到 `config.local.toml`，
-    /// `config.toml` 只保留可提交的相对路径。
+    /// 配置路径参数的规范化：把机器/个人专属的路径拆到 `config.local.toml`，
+    /// `config.toml` 只保留可提交的**便携默认值**。
     ///
-    /// 判定规则只有一条、且是客观的：**绝对路径即机器专属**。
-    /// 相对路径（如 `models/whisper/ggml-small-q5_0.bin`）随项目根走，人人可共享。
+    /// 判定规则有两条、都是客观的：
+    /// 1. **绝对路径**必然是机器专属；
+    /// 2. **与默认值不同的路径**也是个人选择（例如把 `whisper_model` 指到
+    ///    SenseVoice 的 onnx 来切换默认引擎）——它不是共享默认值，留在
+    ///    `config.toml` 里会让源码运行 / 文档 / 新克隆的行为被某个人的机器带偏。
     ///
-    /// 这样即使 UI 触发的保存把完整配置序列化一遍，写进 `config.toml` 的
-    /// 也永远是可提交的值——机器路径不会随一次「改主题」被悄悄提交回去。
+    /// 两条都搬进本机覆盖后，写进 `config.toml` 的 `[paths]` 恒等于内置默认值：
+    /// 版本库里的这份文件不会随一次「改设置」被悄悄改回个人配置。
     fn split_machine_paths(&self) -> (PathsConfig, LocalPathsOverride) {
         let portable = PathsConfig::default();
         let mut shared = self.paths.clone();
@@ -2134,7 +2281,7 @@ impl AppConfig {
         macro_rules! strip_required {
             ($($f:ident),* $(,)?) => {
                 $(
-                    if Path::new(&self.paths.$f).is_absolute() {
+                    if Path::new(&self.paths.$f).is_absolute() || self.paths.$f != portable.$f {
                         local.$f = Some(self.paths.$f.clone());
                         shared.$f = portable.$f.clone();
                     }
@@ -2145,7 +2292,7 @@ impl AppConfig {
             ($($f:ident),* $(,)?) => {
                 $(
                     if let Some(v) = self.paths.$f.as_ref() {
-                        if Path::new(v).is_absolute() {
+                        if Path::new(v).is_absolute() || self.paths.$f != portable.$f {
                             local.$f = Some(v.clone());
                             shared.$f = portable.$f.clone();
                         }
@@ -2165,6 +2312,7 @@ impl AppConfig {
         strip_optional!(
             vad_model,
             punc_model,
+            vocal_model,
             sensevoice_model,
             sensevoice_tokens,
             sensevoice_vad
@@ -2223,8 +2371,8 @@ impl AppConfig {
         // 一旦覆盖文件写失败，用户的可用路径就丢了。
         let local_file = Self::local_override_path(&full_path);
 
-        // 磁盘上已有的 `[gpu]` 段必须原样保留：`split_machine_paths` 只认绝对路径，
-        // 看不到用户手写的 `[gpu]` 覆盖。若不先读出来，下面「没有绝对路径可写」的
+        // 磁盘上已有的 `[gpu]` 段必须原样保留：`split_machine_paths` 只处理路径，
+        // 看不到用户手写的 `[gpu]` 覆盖。若不先读出来，下面「没有路径可写」的
         // 分支会把整个覆盖文件删掉，用户的 GPU 策略会在下次启动时静默丢失。
         let existing_gpu = std::fs::read_to_string(&local_file)
             .ok()
@@ -3085,7 +3233,8 @@ mod tests {
         assert_eq!(cfg.paths.ffmpeg, before);
     }
 
-    /// 绝对路径必须被剥离到本地覆盖，共享配置只留可提交的相对路径。
+    /// 非默认路径（绝对路径或与默认值不同的相对路径）必须被剥离到本地覆盖，
+    /// 共享配置只留可提交的便携默认值。
     #[test]
     fn machine_absolute_paths_are_split_out_of_shared_config() {
         let mut cfg = super::AppConfig::default();
@@ -3103,20 +3252,27 @@ mod tests {
         assert_eq!(shared.ffmpeg, super::PathsConfig::default().ffmpeg);
         assert_eq!(shared.llama_cli, super::PathsConfig::default().llama_cli);
         assert_eq!(shared.punc_model, super::PathsConfig::default().punc_model);
-        // 本来就是相对路径的不动
-        assert_eq!(shared.whisper_cli, "tools/whisper-vulkan/whisper.exe");
+        // 与默认值不同的相对路径同样视为个人选择：共享配置回到默认值
+        assert_eq!(
+            shared.whisper_cli,
+            super::PathsConfig::default().whisper_cli
+        );
         assert_eq!(
             shared.sensevoice_model.as_deref(),
-            Some("models/sensevoice/model.int8.onnx")
+            super::PathsConfig::default().sensevoice_model.as_deref()
         );
 
-        // 机器路径原样记录在本地覆盖里
+        // 机器/个人路径原样记录在本地覆盖里
         assert_eq!(local.ffmpeg.as_deref(), Some(r"C:\tools\ffmpeg.exe"));
         assert_eq!(
             local.punc_model.as_deref(),
             Some(r"D:\models\punc\model.int8.onnx")
         );
-        assert!(local.whisper_cli.is_none(), "相对路径不应进入本地覆盖");
+        assert_eq!(
+            local.whisper_cli.as_deref(),
+            Some("tools/whisper-vulkan/whisper.exe"),
+            "非默认相对路径也应进本地覆盖"
+        );
         assert!(local.has_any());
     }
 
@@ -3252,6 +3408,33 @@ mod tests {
         assert_eq!(back.paths.ffmpeg, super::AppConfig::default().paths.ffmpeg);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 版本库里的 `config.toml` 必须保持「可提交」：能解析，且 `[paths]` 恒为
+    /// 内置默认值、`[translate]` 不含具体网关。
+    ///
+    /// 这条钉的是「作者的开发机配置被提交进了版本库」：此前它把 `whisper_model`
+    /// 指到 SenseVoice 的 onnx（个人切换引擎的选择）、并预置了在线翻译地址。
+    /// 新克隆的人会莫名其妙地默认走 SenseVoice，文档与源码运行也对不上。
+    ///
+    /// 个人/机器路径请放 `config.local.toml`（不进版本库）。
+    #[test]
+    fn repo_config_is_portable_and_neutral() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", path.display()));
+        let cfg: super::AppConfig =
+            toml::from_str(&text).unwrap_or_else(|e| panic!("config.toml 必须可解析: {e}"));
+
+        assert_eq!(
+            cfg.paths,
+            super::PathsConfig::default(),
+            "config.toml 的 [paths] 应保持内置默认值；个人路径放 config.local.toml"
+        );
+        assert!(
+            cfg.translate.api_base.is_empty() && cfg.translate.api_key.is_empty(),
+            "在线翻译接口地址/密钥属于本机配置，不能进 config.toml"
+        );
     }
 
     /// 在线翻译接口必须走本机覆盖：`config.toml` 里的 `[translate]` 恒为空，

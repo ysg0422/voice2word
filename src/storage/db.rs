@@ -28,6 +28,58 @@ fn is_busy(err: &rusqlite::Error) -> bool {
     )
 }
 
+/// 是否是「文件确实不是一个完好的数据库」这类完整性错误。
+///
+/// 只有这两类可以在启动时触发「改名留底 + 新建空库」。把 BUSY / IO 错误也算进来，
+/// 就会在一次瞬时抖动里把用户完好的历史库改名，界面表现为「记录全没了」。
+fn is_integrity_error(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+    )
+}
+
+/// `PRAGMA quick_check` 的三种结局。
+#[derive(Debug, PartialEq, Eq)]
+enum Integrity {
+    /// `ok`。
+    Healthy,
+    /// 完整性检查明确失败（返回了问题行，或报 SQLITE_CORRUPT / SQLITE_NOTADB）。
+    Corrupt(String),
+    /// 检查本身没跑完（锁、IO 等）——**不能**据此判定库损坏。
+    Inconclusive(String),
+}
+
+/// 把一次 `quick_check` 的结果分类。抽成纯函数以便单测三种分支。
+fn classify_quick_check(result: rusqlite::Result<String>) -> Integrity {
+    match result {
+        Ok(msg) if msg.eq_ignore_ascii_case("ok") => Integrity::Healthy,
+        // 完整性检查发现问题时，SQLite 会**正常返回**一行问题描述（如
+        // "row 3 missing from index ..."），而不是报错。
+        Ok(msg) => Integrity::Corrupt(msg),
+        Err(err) if is_integrity_error(&err) => Integrity::Corrupt(err.to_string()),
+        Err(err) => Integrity::Inconclusive(err.to_string()),
+    }
+}
+
+/// 跑一次 `quick_check`；瞬时错误重试一次再分类。
+fn probe_integrity(conn: &Connection) -> Integrity {
+    let mut last_inconclusive = None;
+    for attempt in 0..2 {
+        let result = conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0));
+        match classify_quick_check(result) {
+            Integrity::Inconclusive(reason) => {
+                last_inconclusive = Some(reason);
+                if attempt == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+            verdict => return verdict,
+        }
+    }
+    Integrity::Inconclusive(last_inconclusive.unwrap_or_default())
+}
+
 /// 对可重试的「库被占用」错误做有限次重试，其余错误原样返回。
 fn with_busy_retry<T, F>(mut op: F) -> rusqlite::Result<T>
 where
@@ -102,14 +154,27 @@ fn normalize_segment_blanks(segments: &mut [Segment]) {
 /// 开销全在 UI 线程上。写入侧本来就拿着 `&[Segment]`，顺手算出来是零成本。
 ///
 /// 口径必须与旧的 SQL 实现一致（那段 SQL 现在只保留在 v3→v4 的回填里）：
-/// - `sample_text`：首句 `polished` 去掉 **ASCII 空白**后非空则取 trim 结果，
-///   否则取首句 `text`；没有句子则为空串。不能图省事用 `display_text()`：
-///   它返回未 trim 的 `polished`，而旧 SQL 返回 trim 后的值，两端会漂移。
+/// - `sample_text`：见 [`sample_text_of`]——全仓唯一的摘录口径。
 /// - `has_translation`：复用 [`Segment::has_translation`]（全项目唯一的判定
 ///   口径，与 `hydrate_task` 装载后的重算完全一致；纯空白译文不算）。
 /// - `segment_count`：句数。
 fn summarize_segments(segments: &[Segment]) -> (usize, String, bool) {
-    let sample_text = segments
+    let sample_text = sample_text_of(segments);
+    let has_translation = segments.iter().any(Segment::has_translation);
+    (segments.len(), sample_text, has_translation)
+}
+
+/// 摘录文本（`sample_text` 列）的唯一口径：首句 `polished` 去掉 **ASCII 空白**
+/// 后非空则取 trim 结果，否则取首句 `text`；没有句子则为空串。
+///
+/// # 为什么抽成独立函数（本轮修的漂移）
+///
+/// 写入侧（[`summarize_segments`]）与读取侧（`row_to_task`）此前各写一份：读侧
+/// 用 `display_text()`（返回**未 trim** 的 polished），写侧 trim 后再判空。同一行
+/// 数据两条路径给出不同的摘录，列表页与缓存命中的文本对不上；中间空白还会让
+/// 「polished 全空白」在读侧被当成有摘录、写侧当成无摘录。收敛到这一份。
+fn sample_text_of(segments: &[Segment]) -> String {
+    segments
         .first()
         .map(|seg| {
             let polished = seg.polished.trim_matches(|c: char| c.is_ascii_whitespace());
@@ -119,9 +184,7 @@ fn summarize_segments(segments: &[Segment]) -> (usize, String, bool) {
                 polished.to_string()
             }
         })
-        .unwrap_or_default();
-    let has_translation = segments.iter().any(Segment::has_translation);
-    (segments.len(), sample_text, has_translation)
+        .unwrap_or_default()
 }
 
 /// 迁移回填 `sample_text` 时 `TRIM(X, …)` 用的字符集：**ASCII 空白**。
@@ -275,6 +338,11 @@ fn decode_segments_json(
 #[derive(Clone, Debug)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
+    /// 启动时若因损坏做了「改名留底 + 新建空库」，记下备份路径。
+    ///
+    /// 只写日志不够：用户不会去翻 logs/，而「历史库看起来空了」是必须当面告知的
+    /// 一次性的确凿事实。`AppState::with_hardware` 启动时取走它并挂到顶部提示条。
+    heal_notice: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl Database {
@@ -344,44 +412,62 @@ impl Database {
         // 语句都会直接报错，`Database::open` 于是返回 Err，**整个程序启动失败**——
         // 用户连界面都进不去，历史库里的其它完好工程也一并不可达。
         //
-        // 这里先用 `quick_check` 探一次：损坏则把原库改名留底（`.corrupt-<时间戳>`，
+        // 这里先用 `quick_check` 探一次：确认损坏才把原库改名留底（`.corrupt-<时间戳>`，
         // 绝不删除，用户可能还想用 sqlite3 .recover 抢救），再建一个空库继续启动。
         // 代价是「历史列表暂时空了」，收益是「程序能开、能继续干活、能导出」。
         // quick_check 在 512 KB 的库上实测约 7 ms，对启动无感。
-        let db = match Self::heal_if_corrupt(conn) {
-            Ok(conn) => Self {
-                conn: Arc::new(Mutex::new(conn)),
-            },
-            Err(heal_err) => {
-                // 自愈本身失败（例如目录只读、改名被拒）——退回原库错误，不掩盖根因。
-                return Err(heal_err);
-            }
+        //
+        // **只有确认损坏才隔离**：BUSY / IO 错误与「完整性检查失败」必须分开——
+        // 前者是一过性的，把它当损坏会把完好的历史库改名、让用户以为数据没了。
+        let (conn, heal_notice) = Self::heal_if_corrupt(conn)?;
+        let db = Self {
+            conn: Arc::new(Mutex::new(conn)),
+            heal_notice: Arc::new(Mutex::new(heal_notice)),
         };
         db.init_tables()?;
         db.apply_migrations()?;
         Ok(db)
     }
 
-    /// 检查连接并返回**可用**的连接：完好则原样返回；损坏则改名留底并新建空库。
+    /// 取走「本次启动做过损坏隔离」的提示（`Some` = 备份文件路径）。
     ///
-    /// 传入的是已经设过 WAL/busy_timeout 的连接（这些 PRAGMA 对损坏库也能设置成功，
-    /// 所以能走到这里）。
-    fn heal_if_corrupt(conn: Connection) -> Result<Connection> {
-        let healthy = conn
-            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
-            .map(|s| s == "ok")
-            .unwrap_or(false);
-        if healthy {
-            return Ok(conn);
+    /// 取走而不是只读：这是**一次性**事件，提示条只需出现一次；重复展示会让
+    /// 用户以为每次启动都在丢库。没有发生隔离时返回 `None`。
+    pub fn take_heal_notice(&self) -> Option<std::path::PathBuf> {
+        self.heal_notice
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    /// 检查连接并返回**可用**的连接：确认损坏才改名留底并新建空库；其余情况原样返回。
+    ///
+    /// 返回 `(连接, 备份路径)`：第二项只在真的做了隔离时是 `Some`，供界面提示。
+    fn heal_if_corrupt(conn: Connection) -> Result<(Connection, Option<std::path::PathBuf>)> {
+        match probe_integrity(&conn) {
+            Integrity::Healthy => return Ok((conn, None)),
+            Integrity::Inconclusive(reason) => {
+                // `quick_check` 没跑完不等于库坏了：读锁、杀毒软件临时占用、U 盘瞬时
+                // IO 错误都会走到这里。此时隔离数据库是**破坏性**的——完好的历史库被
+                // 改名，用户看到的是「记录全没了」。放行，让 `init_tables` 去暴露
+                // 真正的问题；它失败时 main 还会回退到可写目录再试一次。
+                warn!(
+                    error = %reason,
+                    "quick_check 未能完成（疑似瞬时锁或 I/O 错误），不隔离数据库，继续启动"
+                );
+                return Ok((conn, None));
+            }
+            Integrity::Corrupt(reason) => {
+                warn!(reason = %reason, "数据库 quick_check 确认损坏，准备改名留底并新建空库");
+            }
         }
 
         // 取原库路径用于改名与新建。`Connection::path()` 对内存库返回 None，
         // 内存库不可能「损坏到要备份」，直接放行。
         let path = match conn.path() {
             Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
-            _ => return Ok(conn),
+            _ => return Ok((conn, None)),
         };
-        warn!(path = %path.display(), "数据库 quick_check 未通过，尝试自愈：改名留底并新建空库");
         // 关掉 WAL，确保 -wal / -shm 在改名时一并处理干净（否则残留副产物会
         // 让新建的空库读到旧的未 checkpoint 事务）。
         let _ = conn.pragma_update(None, "journal_mode", "DELETE");
@@ -414,7 +500,7 @@ impl Database {
         let _ = fresh.busy_timeout(std::time::Duration::from_secs(5));
         let _ = fresh.pragma_update(None, "journal_mode", "WAL");
         let _ = fresh.pragma_update(None, "synchronous", "NORMAL");
-        Ok(fresh)
+        Ok((fresh, Some(backup)))
     }
 
     fn init_tables(&self) -> Result<()> {
@@ -842,7 +928,9 @@ impl Database {
     pub fn update_task_segments(&self, id: i64, segments: &[Segment]) -> Result<()> {
         let conn = self.lock_conn();
         let segments_json = serde_json::to_string(segments).context("序列化 segments 失败")?;
-        let total_dur = segments.last().map(|s| s.end).unwrap_or(0.0);
+        // 段末时间取 max(end)：乱序表（手动编辑 / 导入外部字幕）下 `last().end`
+        // 会偏短，`duration` 也就跟着虚低（见 `subtitle::timeline_end`）。
+        let total_dur = crate::subtitle::timeline_end(segments);
         // 摘要列与 `segments_json` 在同一条 UPDATE 里刷新，理由同 `insert_task`：
         // 两处一旦分开写，中途失败就会留下与正文不一致的摘要素材。
         let (segment_count, sample_text, has_translation) = summarize_segments(segments);
@@ -882,7 +970,8 @@ impl Database {
         let segments: Vec<Segment> = serde_json::from_str(segments_json)
             .with_context(|| format!("待写库的 segments_json 无法解析（task_id={id}）"))?;
         let conn = self.lock_conn();
-        let total_dur = segments.last().map(|s| s.end).unwrap_or(0.0);
+        // 同 `update_task_segments`：段末时间取 max(end)，乱序表不虚低。
+        let total_dur = crate::subtitle::timeline_end(&segments);
         let (segment_count, sample_text, has_translation) = summarize_segments(&segments);
         with_busy_retry(|| {
             conn.execute(
@@ -983,10 +1072,7 @@ impl Database {
         let metrics: Option<crate::core::PipelinePerformanceMetrics> = metrics_json
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
-        let sample_text = segments
-            .first()
-            .map(|s| s.display_text().to_string())
-            .unwrap_or_default();
+        let sample_text = sample_text_of(&segments);
         // 与 `list_recent_tasks` 第 11 列同一口径：任一句带非空译文即 true。
         // 必须在 `segments` 被 move 进结构体之前算好。
         let has_translation = segments.iter().any(|s| s.has_translation());
@@ -1092,8 +1178,86 @@ mod tests {
             "按 id 更新不应波及同路径的另一条记录"
         );
     }
-    /// 译文与**目标语言**都必须能穿过 SQLite 往返存活。
-    ///
+    /// 回归：读侧 `row_to_task` 的 `sample_text` 必须与写侧 `summarize_segments`
+    /// 同口径（polished 去 ASCII 空白后取 trim，空则回退 text）。此前读侧用
+    /// `display_text()`（未 trim 的 polished），同一条记录在列表页与缓存命中两条
+    /// 路径上摘录不一致。
+    #[test]
+    fn row_to_task_sample_text_matches_write_side() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        // polished 两端留白：写侧 trim，读侧旧实现不 trim——口径漂移的复现素材。
+        let mut segs = seg("原文兜底");
+        segs[0].polished = "  修剪过的首句  ".to_string();
+        let id = db
+            .insert_task("D:/s.mp4", "s.mp4", 1.0, "completed", &segs, None)
+            .unwrap();
+
+        let hit = db
+            .find_cached_task("D:/s.mp4")
+            .unwrap()
+            .expect("应命中缓存");
+        assert_eq!(
+            hit.sample_text, "修剪过的首句",
+            "读侧摘录必须与写侧同口径（trim 后的 polished）"
+        );
+
+        // polished 全空白 → 两侧都应退回 text（读侧旧实现会当成有摘录）。
+        let mut segs = seg("原文兜底二");
+        segs[0].polished = "   ".to_string();
+        let id2 = db
+            .insert_task("D:/s2.mp4", "s2.mp4", 1.0, "completed", &segs, None)
+            .unwrap();
+        let hit2 = db
+            .find_cached_task("D:/s2.mp4")
+            .unwrap()
+            .expect("应命中缓存");
+        assert_eq!(
+            hit2.sample_text, "原文兜底二",
+            "全空白 polished 应回退 text"
+        );
+        let _ = id;
+        let _ = id2;
+    }
+
+    /// 回归：`update_task_segments(_json)` 的 duration 口径是 max(end) 而非
+    /// 「最后一句的 end」——乱序表（手动编辑/导入外部字幕）下旧实现写入虚低的时长。
+    #[test]
+    fn update_task_segments_duration_uses_max_end_not_last() {
+        let db = Database::open(":memory:").expect("内存数据库应能打开");
+        let id = db
+            .insert_task("D:/u2.mp4", "u2.mp4", 1.0, "completed", &seg("x"), None)
+            .unwrap();
+        // 乱序：最大 end 的段不在末位。
+        let unordered = vec![
+            Segment::new(1, 9.0, 12.5, "最长尾巴（首位）"),
+            Segment::new(2, 0.0, 2.0, "末位短句"),
+        ];
+        db.update_task_segments(id, &unordered).unwrap();
+        let d: f64 = db
+            .lock_conn()
+            .query_row(
+                "SELECT duration FROM tasks WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(d, 12.5, "duration 应取 max(end)=12.5，而非末位的 2.0");
+
+        // _json 变体同口径。
+        let json = serde_json::to_string(&unordered).unwrap();
+        db.update_task_segments_json(id, &json).unwrap();
+        let d: f64 = db
+            .lock_conn()
+            .query_row(
+                "SELECT duration FROM tasks WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(d, 12.5, "_json 变体口径必须与逐字段变体一致");
+    }
+
+    /// 译文与**目标语言**都必须能穿过 SQLite 往返存活。    ///
     /// 这是本次翻译改造的关键依赖：`translation_lang` 一旦在落库/装载时丢失，
     /// 重启后所有句子都会被判为「非当前目标语言」，触发整篇重译（在线接口直接烧钱），
     /// 而且用户会看到「明明译过却又要重译」。
@@ -1270,12 +1434,61 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0);
         // 原损坏文件被改名留底（目录里应存在一个 .corrupt- 备份）
-        let has_backup = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
-        assert!(has_backup, "损坏库应被改名留底，而不是删除");
+        let backup = db
+            .take_heal_notice()
+            .expect("隔离后必须留下一次性提示，界面才能告知用户");
+        assert!(
+            backup
+                .file_name()
+                .map(|n| n.to_string_lossy().contains(".corrupt-"))
+                .unwrap_or(false),
+            "提示里应带备份路径: {}",
+            backup.display()
+        );
+        assert!(backup.exists(), "备份文件应真实存在: {}", backup.display());
+        // 一次性语义：取走后再取为 None（避免每次启动都弹）
+        assert!(db.take_heal_notice().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `quick_check` 的三类结果必须分开：只有确认损坏才允许隔离数据库。
+    ///
+    /// 这条钉的是「启动时遇到一次瞬时锁，把完好的历史库改名」那个数据事故：
+    /// 此前 `unwrap_or(false)` 把 BUSY / IO 错误一并当成损坏。
+    #[test]
+    fn quick_check_classification_separates_corruption_from_transient_errors() {
+        assert_eq!(classify_quick_check(Ok("ok".into())), Integrity::Healthy);
+        assert!(matches!(
+            classify_quick_check(Ok("row 3 missing from index sqlite_autoindex".into())),
+            Integrity::Corrupt(_)
+        ));
+
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".into()),
+        );
+        assert!(
+            matches!(classify_quick_check(Err(busy)), Integrity::Inconclusive(_)),
+            "瞬时锁不能被当成库损坏"
+        );
+
+        let io = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+            Some("disk I/O error".into()),
+        );
+        assert!(
+            matches!(classify_quick_check(Err(io)), Integrity::Inconclusive(_)),
+            "I/O 错误不能被当成库损坏"
+        );
+
+        let corrupt = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some("database disk image is malformed".into()),
+        );
+        assert!(matches!(
+            classify_quick_check(Err(corrupt)),
+            Integrity::Corrupt(_)
+        ));
     }
 
     /// 迁移必须整体成对完成：迁移后版本号推进，**且**新旧字段都能正常读写。

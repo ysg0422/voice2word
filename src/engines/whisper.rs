@@ -720,24 +720,47 @@ impl WhisperEngine {
             None => self.model_path.clone(),
         };
 
-        // 预检：模型必须存在、且必须是 Whisper 的 GGML 权重。
-        // 客户机上真实踩过：引擎选成 Whisper，但 `paths.whisper_model` 还指着
-        // SenseVoice 的 `model.int8.onnx`——whisper-cli 加载失败后**以退出码 0 结束、
-        // 不产出 JSON**，上层只能报「未产出任何识别结果」，把人引去改语言码。
+        // 预检：模型必须存在、且必须是 Whisper 认识的 GGML/GGUF 权重。
+        //
+        // 三起真实事故都从这一道挡：
+        // ① 引擎选 Whisper、`paths.whisper_model` 却指着 SenseVoice 的 `.onnx`——
+        //    whisper-cli 加载失败后**以退出码 0 结束、不产出 JSON**，上层只能报
+        //    「未产出任何识别结果」，把人引去改语言码；
+        // ② SenseVoice 档位不可用时上游回退到 Whisper 路由、仍传 `.onnx` 路径——
+        //    whisper-cli 在加载函数里直接崩溃，弹系统级「whisper-cli.exe 已崩溃」；
+        // ③ 模型文件不存在（换机器 / 挪目录后档位指向失效）。
+        //
+        // 这里曾经有**两遍** `exists` 与**两层** `.onnx` 守卫（文案各说各话，见 git
+        // 历史），收敛为一次判定：存在性 → 扩展名分诊（`.onnx` 与其它非法扩展分开报，
+        // 各自给对症的可操作指引）。
         if !effective_model.exists() {
             anyhow::bail!(
                 "Whisper 模型文件不存在：{}\n请在「性能设置 → Whisper 模型档位」选择已下载的模型，或到「模型与组件」下载。",
                 effective_model.display()
             );
         }
-        if effective_model
+        let whisper_model_ext = effective_model
             .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
-        {
-            anyhow::bail!(
-                "当前识别模型是 SenseVoice 的 .onnx（{}），但引擎按 Whisper 在跑。\n请在「性能设置 → Whisper 模型档位」重新选一个 ggml-*.bin 模型，或把识别引擎切回 SenseVoice。",
-                effective_model.display()
-            );
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        match whisper_model_ext.as_deref() {
+            Some("bin") | Some("gguf") => {}
+            // ONNX 单独给对症文案：这是「引擎/档位不配套」，不是「模型坏了」。
+            Some("onnx") => {
+                anyhow::bail!(
+                    "当前识别模型是 SenseVoice 的 .onnx（{}），但引擎按 Whisper 在跑。\n请在「性能设置 → Whisper 模型档位」重新选一个 ggml-*.bin 模型，或把识别引擎切回 SenseVoice。",
+                    effective_model.display()
+                );
+            }
+            _ => {
+                anyhow::bail!(
+                    "Whisper 引擎收到了非 Whisper 模型：{:?}（whisper.cpp 只认 .bin / .gguf；.onnx 是 SenseVoice 的模型）。\
+                     这通常意味着「选中的 SenseVoice 档位不可用、程序回退到了 Whisper」：\
+                     请到「性能设置 → 模型与组件 → SenseVoice」补齐组件（含 tools/sensevoice_runner.py），\
+                     或改选一个已下载的 Whisper 档位。",
+                    effective_model
+                );
+            }
         }
 
         let is_stream = matches!(audio_input, AudioInput::Stream(_));
@@ -746,35 +769,6 @@ impl WhisperEngine {
             if is_stream { "纯内存管道推流 (0 磁盘 I/O)" } else { "本地文件" },
             lang, th, effective_th, processors, effective_model, self.vad_model_path
         );
-
-        if !effective_model.exists() {
-            anyhow::bail!(
-                "Whisper 模型未就位：{:?}。请到「性能设置 → 模型与组件」下载，或在 config.toml 的 paths.whisper_model 指向实际模型文件。",
-                effective_model
-            );
-        }
-
-        // 模型**类型**也要拦：whisper.cpp 只认 ggml/GGUF（`.bin` / `.gguf`）。
-        //
-        // 真实事故：用户的档位是 SenseVoice（模型是 `.onnx`），但 SenseVoice 引擎因为
-        // 缺胶水脚本 / 词表 / VAD 而建不起来，上游于是**回退到 Whisper 路由**，却仍把
-        // SenseVoice 的 `.onnx` 路径当 whisper 模型传进来 —— whisper-cli 在
-        // `whisper_init_from_file_with_params_no_state` 里直接崩溃，用户看到的是一个
-        // 系统级「whisper-cli.exe 已崩溃」弹窗，完全不知道跟档位有关。
-        // 这里提前 bail 成可读原因，把崩溃挡在进程创建之前。
-        let whisper_model_ext = effective_model
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        if !matches!(whisper_model_ext.as_deref(), Some("bin") | Some("gguf")) {
-            anyhow::bail!(
-                "Whisper 引擎收到了非 Whisper 模型：{:?}（whisper.cpp 只认 .bin / .gguf；.onnx 是 SenseVoice 的模型）。\
-                 这通常意味着「选中的 SenseVoice 档位不可用、程序回退到了 Whisper」：\
-                 请到「性能设置 → 模型与组件 → SenseVoice」补齐组件（含 tools/sensevoice_runner.py），\
-                 或改选一个已下载的 Whisper 档位。",
-                effective_model
-            );
-        }
 
         // 魔数校验：下载中断留下的半截文件扩展名仍是 .bin，但内容不是模型。
         // 客户机上实测过这种「whisper-cli 静默退出（退出码 0、不写 JSON）」，
@@ -788,7 +782,12 @@ impl WhisperEngine {
                     effective_model
                 );
             }
-            if !matches!(&magic, b"ggml" | b"ggmf" | b"ggjt" | b"ggla" | b"gguf") {
+            // whisper.cpp 把数值魔数 0x67676d6c 按小端写盘，字节是 lmgg。
+            // 只比较字符串 ggml 会把正常下载的 Whisper 权重误报为损坏。
+            if !matches!(
+                &magic,
+                b"lmgg" | b"ggml" | b"ggmf" | b"ggjt" | b"ggla" | b"gguf"
+            ) {
                 anyhow::bail!(
                     "Whisper 模型文件损坏或不是 GGML 模型：{:?}（文件头不是 ggml/gguf）。\
                      最常见原因是下载中断留下了半截文件——请在「模型与组件」里删除该模型后重新下载。",
@@ -1258,8 +1257,13 @@ impl WhisperEngine {
                             // `streaming_segments` 会让界面显示「一句几秒钟说不完的话」，而它
                             // 结束后才会被 `optimize_segments` 按标点拆开。这里在推流出口先按同一
                             // 规则拆短，让实时字幕流与最终字幕表逐条对齐。
-                            let preview_segs =
-                                opt_seg.map(|seg| crate::subtitle::split_long_segments(vec![seg]));
+                            let preview_segs = opt_seg.map(|seg| {
+                                let base = seg.index;
+                                crate::subtitle::reindex_split_pieces(
+                                    crate::subtitle::split_long_segments(vec![seg]),
+                                    base,
+                                )
+                            });
 
                             let display_sec = if proc_count > 1 && dur > 0.0 {
                                 ratio * dur
@@ -3004,7 +3008,8 @@ mod tests {
         // 必须是**合法 GGML 文件头**：`transcribe` 会做魔数校验（下载中断留下的
         // 半截 .bin 会让 whisper-cli 静默退出），写 "stub" 会先被这条预检拦下，
         // 于是「取消早退 / spawn 失败」这两条测试测的就不再是它们本来要测的东西。
-        std::fs::write(&p, b"ggml\0\0\0\0").expect("写临时模型文件应成功");
+        // whisper.cpp 的 0x67676d6c 按小端写盘，实际字节为 lmgg。
+        std::fs::write(&p, b"lmgg\0\0\0\0").expect("写临时模型文件应成功");
         p
     }
 
@@ -3077,6 +3082,42 @@ mod tests {
             msg.contains("Whisper 推理程序未就位"),
             "错误应来自 spawn 失败这条路径，实际: {msg}"
         );
+    }
+
+    #[test]
+    fn model_header_guard_rejects_truncated_and_download_error_files() {
+        let engine = engine_with_missing_cli();
+        let audio = std::env::temp_dir().join("v2w_probe_dummy_audio.wav");
+        let cases: &[(&[u8], &str)] = &[
+            (b"", "不足 4 字节"),
+            (b"lmg", "不足 4 字节"),
+            (
+                b"<!DOCTYPE html><html>download error</html>",
+                "模型文件损坏",
+            ),
+            (
+                b"version https://git-lfs.github.com/spec/v1\n",
+                "模型文件损坏",
+            ),
+        ];
+        for (bytes, expected) in cases {
+            let model = TempPathGuard::file(temp_model_file("invalid_header"));
+            std::fs::write(model.path(), bytes).unwrap();
+            let err = engine
+                .transcribe_input_with_processors(
+                    AudioInput::Path(audio.as_path()),
+                    None,
+                    None,
+                    None,
+                    Some(model.path()),
+                    false,
+                    None,
+                    None,
+                )
+                .expect_err("无效文件必须在启动推理程序前被拦截");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(expected), "错误归因不符：{msg}");
+        }
     }
 
     // ---- 缺陷 1 回归：多处理器并行时的线程配额 ----

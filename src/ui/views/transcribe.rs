@@ -157,7 +157,7 @@ impl MainWindow {
                     .items_center()
                     .justify_center()
                     .gap(px(Theme::SPACE_4))
-                    // 1. 转写步骤看板：七步列全，每步自己的进度条 + 耗时
+                    // 1. 转写步骤看板：全部阶段列全，每步自己的进度条 + 耗时
                     .child(self.render_stage_board(
                         is_sensevoice,
                         total_dur,
@@ -1598,6 +1598,75 @@ impl MainWindow {
                             })),
                     ),
             )
+            // ── 文件夹监听：新素材自动入队 ──
+            .child({
+                let watch = self.state.config.watch.clone();
+                let enabled = watch.enabled;
+                let dir_label = if watch.dir.trim().is_empty() {
+                    "未选择目录（点击「选择目录」开始监听）".to_string()
+                } else {
+                    watch.dir.clone()
+                };
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Theme::SPACE_1))
+                    .p(px(Theme::SPACE_2))
+                    .rounded_sm()
+                    .bg(Theme::bg_card_hover())
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(Theme::SPACE_2))
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_muted())
+                                    .child(format!(
+                                        "文件夹监听 · {}",
+                                        if enabled { "已开启" } else { "已关闭" }
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(Theme::SPACE_1_5))
+                                    .child(
+                                        primitives::btn(
+                                            "选择目录",
+                                            primitives::BtnSize::Xs,
+                                            primitives::BtnVariant::Ghost,
+                                        )
+                                        .id("watch-pick-dir-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.choose_watch_dir(cx);
+                                        })),
+                                    )
+                                    .child(
+                                        primitives::btn(
+                                            if enabled { "关闭" } else { "开启" },
+                                            primitives::BtnSize::Xs,
+                                            primitives::BtnVariant::Secondary,
+                                        )
+                                        .id("watch-toggle-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_watch_folder(cx);
+                                        })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child(dir_label),
+                    )
+            })
             // ── 工具条：添加文件、添加文件夹、清空 ──
             .child(
                 div()

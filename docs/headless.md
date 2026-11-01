@@ -29,6 +29,8 @@ $exe = if (Test-Path .\target\release\voice2word.exe) { '.\target\release\voice2
 | `run <输入>` | 一次调用完成一次转写（面向机器） | **一行 JSON**（默认开启，等价于 `transcribe --json`） |
 | `tools` | 列出可被外部调用的工具与参数 schema | 工具一览（`--json` 时是一行 JSON 清单） |
 | `doctor` | 本机自检（只读）：配置、依赖、硬件、日志与数据库 | 每项一行 `OK/WARN/ERROR 名称 - 说明` + 末行汇总（`--json` 时是一行 JSON 报告） |
+| `dub -i <音视频> -s <字幕>` | 给**已有字幕**配音出片（不重新识别）：逐句 TTS + 时间轴对齐 + 混音/替换 | 末行 `配音完成: <路径>（N 句，…）`，过程进度写 stderr |
+| `download -u <链接>` | 用 yt-dlp 把视频链接下载到本地（YouTube / B站 等） | **只打印最终文件路径**（一行），进度写 stderr |
 | `--help` / `-h` | 顶层帮助 | 帮助文本 |
 | `--version` / `-V` | 版本号 | `voice2word <版本>` |
 | `--gui` | 启动图形界面（无参数时也是它） | — |
@@ -178,6 +180,10 @@ fix: 检查文件权限与磁盘状态；被其它进程独占时稍后重试。
 | `--translate-mode online\|offline` | 翻译链路：在线接口 / 本地模型 | 取 `[translate].mode` |
 | `--glossary "甲=乙,丙=丁"` | 术语表覆盖（`原文=译文`） | 取 `[translate].glossary` |
 | `--polish` | 强制开启润色/标点 | 取 `pipeline.enable_polish` |
+| `--vocal-sep` | 强制开启人声分离前置（BGM 重的素材先拆人声再识别） | 取 `pipeline.preprocess_vocal_sep` |
+| `--dub` | 生成配音视频（字幕旁同名 `.mp4`）；需要 `edge-tts` | 关闭 |
+| `--dub-mode mix\|replace` | 配音音轨：保留背景音混音 / 纯替换 | 取 `[dub].mode` |
+| `--dub-bgm 0-100` | `mix` 模式下原声保留百分比 | 取 `[dub].bgm_volume` |
 | `--diarize` / `--speakers 2-4` | 说话人分离与人数 | 取 `pipeline.enable_diarization` |
 | `--threads <数量>` | 推理线程数（超过本机逻辑核数自动收敛） | 取 `pipeline.whisper_threads` |
 | `--model <路径>` | 覆盖识别模型文件（路径里含 `sensevoice` 即走 SenseVoice 引擎） | 取 `paths.whisper_model` |
@@ -208,7 +214,7 @@ fix: 检查文件权限与磁盘状态；被其它进程独占时稍后重试。
 {
   "schema": "voice2word.tools.v1",
   "program": "voice2word",
-  "version": "0.2.0",
+  "version": "0.2.26",
   "summary": "本机音视频转字幕工具：一次调用把一个音视频文件或整个目录转成字幕文件，可选翻译与润色。",
   "exit_codes": { "0": "成功", "1": "运行失败", "2": "参数错误" },
   "output_streams": { "stdout": "结果（--json 时为一行 JSON）", "stderr": "进度与诊断" },
@@ -271,7 +277,7 @@ fix: 检查文件权限与磁盘状态；被其它进程独占时稍后重试。
 
 ## 10. 一次函数调用触发转写：`run --tool-call`
 
-`--tool-call` 把「一句自然语言需求」交给**在线接口**，由模型选择并填写 `transcribe` 工具参数，本程序随即在本机执行，全程只做一次调用：
+`--tool-call` 把「一句自然语言需求」交给**在线接口**，由模型选择并填写 `transcribe` 工具参数，本程序随即在本机执行：本地工具执行只做一次，执行完成后另有一次面向模型的总结请求（把结果回传模型换一句说明，见流程 3；端点同样由 `--api-*` / `config.toml` 的 `[translate]` 指定）：
 
 ```powershell
 & $exe run --json --tool-call "把 D:\media\talk.mp4 转成 srt 字幕，热词：张三" --input D:\media\talk.mp4

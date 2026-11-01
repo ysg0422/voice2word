@@ -223,6 +223,55 @@ fn reap_locked(list: &mut Vec<Child>) {
     });
 }
 
+/// 「本来就要 `wait()`、但中途可能提前退出」的子进程的 RAII 回收守卫。
+///
+/// # 为什么需要它
+///
+/// 调用子进程的代码里到处是提前退出路径——`stdin.write_all(...)?`、
+/// `spawn(...)?`、调用方传入的 `progress_cb`（UI 层代码，panic 会直接展开栈）。
+/// 任意一条触发时 `Child` 句柄被丢弃，但进程仍在运行：轻则占着解释器/模型内存，
+/// 重则（ffmpeg 流）占着管道让整条流水线挂住。把回收绑到栈变量生命周期上，
+/// 所有退出方式（提前返回、panic 展开）都覆盖，以后新增分支也不必再记着补 kill。
+///
+/// # 与本模块登记表（[`register`]）的分工
+///
+/// 那边收容「发起后**没人** `wait()`」的辅助进程（ffplay 预览等）；这边管的是
+/// 「有人 `wait()`、但可能等不到」的工作进程，所以不进全局登记表。
+///
+/// # 历史
+///
+/// 这份实现此前在仓库里有**四份副本**：`engines/punc.rs` 一份完整的，
+/// `core/pipeline.rs` 里还有三份内联在函数体中的迷你版（只包 `Child`、Drop 里
+/// kill+wait）。四份语义一致却各写各的，改一处漏三处；收敛到此，一处维护。
+pub struct ChildReaper(Option<Child>);
+
+impl ChildReaper {
+    pub fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    /// 借用内部子进程（写 stdin、取 stdout 等）；句柄被 [`Self::take`] 取走前必然存在。
+    pub fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("子进程句柄在 take() 之前必然存在")
+    }
+
+    /// 交出句柄，改由调用方接管（`wait()` / `wait_with_output()`）；守卫此后不再干预。
+    pub fn take(&mut self) -> Child {
+        self.0.take().expect("子进程句柄只能被取走一次")
+    }
+}
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            // 进程可能已自行退出，kill 失败不算错误
+            let _ = child.kill();
+            // kill 之后必须 wait，否则句柄不释放
+            let _ = child.wait();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

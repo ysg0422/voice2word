@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     Transcribes an audio/video file into subtitles (srt / ass / vtt / json / txt /
-    ttml / ttal) by wrapping the voice2word CLI.
+    ttml / ttal / sbv / lrc / txt-ts) by wrapping the voice2word CLI.
 
     Stream contract:
       - progress and diagnostics from the CLI go to stderr and are passed through
@@ -28,7 +28,8 @@
     and base name as the input, with the extension of the chosen format).
 
 .PARAMETER Format
-    Optional. One of srt / ass / vtt / json / txt / ttml / ttal (default srt).
+    Optional. One of srt / ass / vtt / json / txt / ttml / ttal / sbv / lrc /
+    txt-ts (default srt).
 
 .PARAMETER Language
     Optional. Source language code, e.g. zh / en / ja / auto.
@@ -38,8 +39,10 @@
     Useful when config.toml points at a model the CLI cannot load.
 
 .PARAMETER Translate
-    Optional. Target language for translation. Note: the CLI currently only
-    records this value; the translation stage is not wired up yet.
+    Optional. Target language for translation (CLI --translate). The CLI really
+    translates: offline Qwen or online API, chosen by --translate-mode /
+    config.toml [translate].mode; --glossary adds a term glossary. This script
+    only forwards --translate; set mode and glossary in config.toml when needed.
 
 .PARAMETER Threads
     Optional. Inference thread count; must be a positive integer.
@@ -57,7 +60,9 @@
     Also accepted on its own to pin the directory without -Resume.
 
 .PARAMETER Exe
-    Optional. Explicit path to voice2word.exe; highest priority.
+    Optional. Explicit path to the voice2word executable; highest priority.
+    Prefer the console-subsystem build voice2word-cli.exe over the GUI build
+    voice2word.exe (the GUI build yields empty redirected output).
 
 .EXAMPLE
     .\transcribe.ps1 -Input talk.mp4 -Format vtt -Language zh -Threads 8
@@ -72,7 +77,7 @@
     .\transcribe.ps1 -Input talk.mp4 -Resume -ArtifactDir .\.voice2word-stages\talk
 
 .EXAMPLE
-    .\transcribe.ps1 -Input talk.mp4 -Exe ..\..\..\target\release\voice2word.exe
+    .\transcribe.ps1 -Input talk.mp4 -Exe ..\..\..\target\release\voice2word-cli.exe
 #>
 [CmdletBinding()]
 param(
@@ -103,7 +108,7 @@ if (Get-Variable -Name 'PSNativeCommandUseErrorActionPreference' -ErrorAction Si
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 try { $OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
-$SupportedFormats = @('srt', 'ass', 'vtt', 'json', 'txt', 'ttml', 'ttal')
+$SupportedFormats = @('srt', 'ass', 'vtt', 'json', 'txt', 'ttml', 'ttal', 'sbv', 'lrc', 'txt-ts')
 
 # `$Input` is a PowerShell automatic variable (the pipeline input enumerator), and
 # the engine overwrites it once the script body starts. Read the bound value from
@@ -149,31 +154,40 @@ function Resolve-Voice2WordExe {
         Write-Warning ("VOICE2WORD_EXE points to a missing file, ignoring it: " + $envExe)
     }
 
-    # 3) build artifacts inside the repository (this script lives in
-    #    integrations\voice2word-skill\scripts\, so the root is three levels up)
-    if (-not [string]::IsNullOrWhiteSpace($RepoRoot)) {
-        $candidates = @(
-            (Join-Path $RepoRoot 'target\release\voice2word.exe'),
-            (Join-Path $RepoRoot 'target\debug\voice2word.exe'),
-            (Join-Path $RepoRoot 'voice2word.exe')
-        )
+    # 3) Prefer the console-subsystem build voice2word-cli.exe over the GUI build
+    #    voice2word.exe. The GUI build is a windows_subsystem = "windows" program:
+    #    PowerShell does not wait for it and redirected output comes back empty
+    #    (os error 232). The commands are identical, so try every location with
+    #    voice2word-cli.exe first, then fall back to voice2word.exe in the same
+    #    order: script directory -> target\release -> target\debug -> PATH.
+    foreach ($name in @('voice2word-cli.exe', 'voice2word.exe')) {
+        # build artifacts inside the repository (this script lives in
+        # integrations\voice2word-skill\scripts\, so the root is three levels up)
+        $candidates = @()
+        if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+            $candidates += (Join-Path $PSScriptRoot $name)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RepoRoot)) {
+            $candidates += (Join-Path $RepoRoot ('target\release\' + $name))
+            $candidates += (Join-Path $RepoRoot ('target\debug\' + $name))
+        }
         foreach ($candidate in $candidates) {
             if (Test-Path -LiteralPath $candidate -PathType Leaf) {
                 return (Resolve-Path -LiteralPath $candidate).ProviderPath
             }
         }
+
+        # 4) this build name on PATH
+        $onPath = Get-Command -Name $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($onPath) { return $onPath.Source }
     }
 
-    # 4) voice2word on PATH
-    $onPath = Get-Command -Name 'voice2word' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($onPath) { return $onPath.Source }
-
     $hint = @(
-        'Cannot find voice2word.exe. Looked at: -Exe, VOICE2WORD_EXE, target\release, target\debug, repo root, PATH.',
+        'Cannot find voice2word-cli.exe or voice2word.exe. Looked at: -Exe, VOICE2WORD_EXE, script directory, target\release, target\debug, PATH (voice2word-cli.exe first, then voice2word.exe).',
         'Provide the executable in one of these ways:',
-        '  1) -Exe <path>              e.g. -Exe .\target\release\voice2word.exe',
-        '  2) VOICE2WORD_EXE env var   e.g. $env:VOICE2WORD_EXE = "C:\tools\voice2word.exe"',
-        '  3) build it in the repo     cargo build --release  ->  target\release\voice2word.exe',
+        '  1) -Exe <path>              e.g. -Exe .\target\release\voice2word-cli.exe',
+        '  2) VOICE2WORD_EXE env var   e.g. $env:VOICE2WORD_EXE = "C:\tools\voice2word-cli.exe"',
+        '  3) build it in the repo     cargo build --release  ->  target\release\voice2word-cli.exe',
         '  4) put the build output directory on PATH'
     ) -join [Environment]::NewLine
     Stop-WithError -Message $hint
@@ -298,7 +312,7 @@ if ($null -eq $resultPath) {
     # Exit code 0 without the success line means no subtitle file was confirmed.
     # The usual cause is a stale executable that predates the CLI subcommand and
     # therefore just opened its GUI window.
-    Stop-WithError -Code 1 -Message ('The CLI exited 0 but never printed the expected "subtitle written" line, so no subtitle file could be confirmed. If the executable is an old build it may have opened a GUI window instead: rebuild with "cargo build --release", or pass -Exe target\debug\voice2word.exe.')
+    Stop-WithError -Code 1 -Message ('The CLI exited 0 but never printed the expected "subtitle written" line, so no subtitle file could be confirmed. If the executable is an old build it may have opened a GUI window instead: rebuild with "cargo build --release", or pass -Exe target\debug\voice2word-cli.exe.')
 }
 Write-Output ("Result path: " + $resultPath)
 exit 0

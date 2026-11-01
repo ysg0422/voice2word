@@ -38,11 +38,12 @@
 #    持续采集该崩溃的复现率，一旦长期为 0 就可以删掉单线程绕过。
 #
 # 3) 为什么 clippy 是 -D warnings：
-#    当前基线 `cargo clippy --all-targets` 是 0 error / 约 34 warning。
-#    按任务要求把 clippy 做成**硬门禁**。注意：这意味着在 warning 清零之前，
-#    clippy job 一定会红。若需要"先红后绿"的过渡期，临时把
-#    `-D warnings` 换成 `-D warnings -A clippy::all` 之类的白名单，
-#    或把该 job 加 `continue-on-error: true`；warning 清零后请还原成严格门禁。
+#    clippy 做成**硬门禁**：warning 即 error。基线已于 2026-10-22 清零
+#    （`cargo clippy --all-targets` 0 error / 0 warning，仅剩第三方
+#    proc-macro-error2 的 future-incompat 通告，见第 4 条），门禁保持严格。
+#    历史备注：曾有一段「约 34 warning、job 会红」的过渡期，当时的绕法是临时把
+#    `-D warnings` 换成 `-D warnings -A clippy::all` 白名单、或给 job 加
+#    `continue-on-error: true`；仅在确需过渡时使用，事后还原严格门禁。
 #
 # 4) 第三方依赖的 future-incompat 通告不判红：
 #    `proc-macro-error2 v2.0.1`（经依赖树传入）会打印 future-incompat 通告，

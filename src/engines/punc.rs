@@ -278,45 +278,9 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
-/// RAII 守卫：持有「已 `spawn()` 但尚未 `wait()`」的子进程，守卫离开作用域时若句柄仍在，
-/// 就 `kill()` + `wait()` 回收它。
-///
-/// 为什么不能只在错误分支里补一行 kill：`spawn()` 与 `wait_with_output()` 之间夹着三条
-/// 提前退出路径——`stdin.write_all(...)?`、`stdin.flush()?`，以及调用方传入的 `progress_cb`
-/// 回调（UI 层代码，panic 会直接展开栈）。任意一条触发时，`Child` 句柄被丢弃但 Python
-/// runner 仍在运行，占着解释器与模型内存，成为没人回收的孤儿进程。
-/// 把回收绑到栈变量生命周期上，所有退出方式（提前返回、panic 展开）都覆盖，
-/// 以后新增分支也不必再记着补 kill。
-/// （与 `src/utils/child_registry.rs` 的分工：那边收容「发起后没人 `wait()`」的进程；
-/// 这边管的是「本来就要 `wait()`、但中途可能提前退出」的进程，所以不进全局登记表。）
-struct ChildReaper(Option<Child>);
-
-impl ChildReaper {
-    fn new(child: Child) -> Self {
-        Self(Some(child))
-    }
-
-    /// 借用内部子进程，用于在交出句柄前写 stdin。
-    fn child_mut(&mut self) -> &mut Child {
-        self.0.as_mut().expect("子进程句柄在 take() 之前必然存在")
-    }
-
-    /// 交出句柄，改由调用方 `wait_with_output()` 接管；守卫此后不再干预。
-    fn take(&mut self) -> Child {
-        self.0.take().expect("子进程句柄只能被取走一次")
-    }
-}
-
-impl Drop for ChildReaper {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            // 进程可能已自行退出，kill 失败不算错误
-            let _ = child.kill();
-            // kill 之后必须 wait，否则句柄不释放
-            let _ = child.wait();
-        }
-    }
-}
+/// RAII 子进程回收守卫：实现已收敛到 [`crate::utils::child_registry::ChildReaper`]
+/// （此前本文件与 `core/pipeline.rs` 各持一份副本，共四份；语义与分工说明见那边）。
+use crate::utils::child_registry::ChildReaper;
 
 #[derive(Clone)]
 pub struct PunctuationEngine {
@@ -706,8 +670,14 @@ impl PunctuationEngine {
 
         #[derive(serde::Deserialize)]
         struct OutputPayload {
+            // 元信息字段缺省容忍：`count` / `elapsed_sec` 只用于日志展示，但此前
+            // 任何一个键缺失（runner 升级、协议加字段后的老脚本）都会让**整批**
+            // 「解析标点输出 JSON 失败」，全部句子退回无标点原文。`results` 才是
+            // 有效载荷，缺它才该报错。
+            #[serde(default)]
             #[allow(dead_code)]
             count: usize,
+            #[serde(default)]
             #[allow(dead_code)]
             elapsed_sec: f64,
             #[serde(default)]

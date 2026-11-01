@@ -15,6 +15,7 @@ tools/*
 !tools/sensevoice_runner.py
 !tools/download_sensevoice.py
 !tools/edge_tts_runner.py
+!tools/vocal_sep_runner.py
 *.bin
 *.gguf
 *.onnx

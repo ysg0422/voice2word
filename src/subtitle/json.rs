@@ -46,6 +46,14 @@ impl JsonSubtitleExporter {
                     "duration": seg.duration(),
                     "text": super::segment::export_text_for(seg, mode, with_speaker),
                     "raw_text": seg.display_text(),
+                    // 以下是「编辑状态」字段：导出给下游之外，也用于本程序再次导入时
+                    // 还原工程。`text` / `raw_text` 是渲染结果，无法反推原始识别文本与
+                    // 润色结果，因此两者必须各自显式导出。
+                    "source_text": seg.text,
+                    "polished": seg.polished,
+                    "locked": seg.locked,
+                    "translations": seg.translations,
+                    "speaker_name": seg.speaker_name,
                     "translation": seg.translation,
                     "translation_lang": seg.translation_lang,
                     "language": seg.language,
@@ -57,7 +65,7 @@ impl JsonSubtitleExporter {
             })
             .collect();
 
-        let total = segments.last().map(|s| s.end).unwrap_or(0.0);
+        let total = crate::subtitle::timeline_end(segments);
         let doc = serde_json::json!({
             "format": "voice2word-json",
             "version": 1,

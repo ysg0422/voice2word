@@ -47,6 +47,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
@@ -153,10 +154,12 @@ pub fn parse_latest_release(body: &str) -> Result<LatestRelease> {
     // 2. voice2word.exe（主程序便携版，单文件直接运行）
     // 3. 其他非 cli 的 .exe
     // 4. .zip 压缩包
-    // 5. voice2word-cli.exe（纯无头后台命令行工具，仅在别无选择时作为最后备选）
+    // CLI 附件不属于图形程序升级目标，始终排除。
     let asset_rank = |name: &str| -> i32 {
         let lower = name.to_ascii_lowercase();
-        if lower.contains("setup") && lower.ends_with(".exe") {
+        if lower.contains("cli") {
+            0
+        } else if is_installer_asset(name) {
             100
         } else if (lower == "voice2word.exe" || lower.starts_with("voice2word-"))
             && lower.ends_with(".exe")
@@ -167,8 +170,6 @@ pub fn parse_latest_release(body: &str) -> Result<LatestRelease> {
             50
         } else if lower.ends_with(".zip") {
             30
-        } else if lower.ends_with(".exe") {
-            10
         } else {
             0
         }
@@ -211,14 +212,6 @@ pub fn parse_latest_release(body: &str) -> Result<LatestRelease> {
                 }
             }
         }
-    }
-
-    if download_url.is_empty() {
-        asset_name = "voice2word.exe".to_string();
-        download_url = format!(
-            "https://github.com/ysg0422/voice2word/releases/download/{}/voice2word.exe",
-            tag
-        );
     }
 
     Ok(LatestRelease {
@@ -455,7 +448,13 @@ pub fn describe(current: &str, latest: &str, newer: bool) -> String {
 /// 会被当成成功落盘，用户点更新后拿到的是打不开的文件。未给长度（chunked 传输）
 /// 时无从校验，只能放行。
 fn download_is_complete(written: u64, total_size: u64) -> bool {
-    total_size == 0 || written >= total_size
+    total_size == 0 || written == total_size
+}
+
+/// 便携 EXE / ZIP 不能作为安装器启动，否则旧程序并没有被升级。
+pub fn is_installer_asset(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.ends_with("-setup.exe") || name.ends_with("_setup.exe") || name == "setup.exe"
 }
 
 /// 下载内容的最小可信字节数：比它小的一律当成下载源返回的错误页 / 空响应丢弃。
@@ -540,11 +539,8 @@ static ADVERTISED_DIGESTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new())
 /// 最多记住多少条已声明的摘要。
 const MAX_ADVERTISED_DIGESTS: usize = 8;
 
-/// 登记一条「官方 API 为这个下载链接声明的内容摘要」；`sha256` 为 `None` 时不登记。
+/// 登记最新摘要；官方撤回摘要时也清除旧值，不能沿用另一次响应的声明。
 fn record_advertised_digest(url: &str, sha256: Option<&str>) {
-    let Some(digest) = sha256 else {
-        return;
-    };
     if url.trim().is_empty() {
         return;
     }
@@ -553,7 +549,9 @@ fn record_advertised_digest(url: &str, sha256: Option<&str>) {
         return;
     };
     list.retain(|(u, _)| u != url);
-    list.insert(0, (url.to_string(), digest.to_string()));
+    if let Some(digest) = sha256 {
+        list.insert(0, (url.to_string(), digest.to_string()));
+    }
     list.truncate(MAX_ADVERTISED_DIGESTS);
 }
 
@@ -563,51 +561,57 @@ fn advertised_digest(url: &str) -> Option<String> {
     list.iter().find(|(u, _)| u == url).map(|(_, d)| d.clone())
 }
 
-/// 边写盘边算 sha256 —— 校验不必为了拿摘要再把几十 MB 的文件整份读一遍。
-///
-/// `new(false)` 时所有 `update` 都是空操作、`finish_hex` 返回 `None`：上游没给摘要
-/// 时不做无谓的哈希计算。
-struct StreamingHasher(Option<Sha256>);
-
-impl StreamingHasher {
-    fn new(enabled: bool) -> Self {
-        Self(enabled.then(Sha256::new))
-    }
-
-    fn update(&mut self, buf: &[u8]) {
-        if let Some(hasher) = self.0.as_mut() {
-            hasher.update(buf);
-        }
-    }
-
-    fn finish_hex(self) -> Option<String> {
-        self.0.map(|hasher| format!("{:x}", hasher.finalize()))
-    }
-}
-
-/// 下载更新文件到 updates/ 目录，支持镜像加速与断点/临时文件保护。
 pub fn download_update_file(
     download_url: &str,
     asset_name: &str,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    progress: impl Fn(f32, u64, u64) + Send + 'static,
+    progress: impl Fn(f32, u64, u64) + Send + Sync + 'static,
 ) -> Result<std::path::PathBuf> {
+    download_update_file_with_size(download_url, asset_name, 0, cancel, progress)
+}
+
+/// 官方附件大小与镜像的 Content-Length 必须同时满足。
+pub fn download_update_file_with_size(
+    download_url: &str,
+    asset_name: &str,
+    expected_size: u64,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    progress: impl Fn(f32, u64, u64) + Send + Sync + 'static,
+) -> Result<std::path::PathBuf> {
+    download_update_into(
+        &crate::utils::AppConfig::resolve_path("updates"),
+        download_url,
+        asset_name,
+        expected_size,
+        advertised_digest(download_url).as_deref(),
+        cancel,
+        progress,
+    )
+}
+
+fn download_update_into(
+    updates_dir: &std::path::Path,
+    download_url: &str,
+    asset_name: &str,
+    expected_size: u64,
+    expected_digest: Option<&str>,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    progress: impl Fn(f32, u64, u64) + Send + Sync + 'static,
+) -> Result<std::path::PathBuf> {
+    use super::model_download;
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::sync::atomic::Ordering;
-
-    let updates_dir = crate::utils::AppConfig::resolve_path("updates");
-    fs::create_dir_all(&updates_dir).map_err(|e| anyhow!("创建 updates 目录失败：{e}"))?;
-
+    if cancel.load(Ordering::Relaxed) {
+        return Err(anyhow!("用户已取消下载"));
+    }
+    if download_url.trim().is_empty() {
+        return Err(anyhow!("发行版没有可下载的安装包，请打开发行页面查看"));
+    }
+    fs::create_dir_all(updates_dir).map_err(|e| anyhow!("创建 updates 目录失败：{e}"))?;
     let final_name = safe_file_name(asset_name);
     let dest = updates_dir.join(&final_name);
     let part = updates_dir.join(format!("{final_name}.part"));
-    // 本次下载要校验的内容摘要：只有官方 API 为**这个** URL 声明过才有值。
-    // 有值时「镜像返回的字节」必须与官方发布的一致，否则换下一个源。
-    let expected_digest = advertised_digest(download_url);
-
-    // 候选下载镜像（国内加速镜像优先，最后兜底 GitHub 直链）
-    // 候选下载镜像（国内加速镜像优先，最后兜底 GitHub 直链）
     let mut candidate_urls = Vec::new();
     if download_url.starts_with("https://github.com/") {
         candidate_urls.push(format!("https://ghfast.top/{download_url}"));
@@ -616,151 +620,197 @@ pub fn download_update_file(
         candidate_urls.push(format!("https://ghproxy.net/{download_url}"));
     }
     candidate_urls.push(download_url.to_string());
-
+    let cb: model_download::ProgressFn = Box::new(move |done, total, _| {
+        let frac = if total > 0 {
+            (done as f32 / total as f32).clamp(0.0, 0.99)
+        } else {
+            0.0
+        };
+        progress(frac, done, total);
+    });
     let mut last_err = None;
+    let mut net_bytes = 0;
     for url in candidate_urls {
         if cancel.load(Ordering::Relaxed) {
-            let _ = fs::remove_file(&part);
             return Err(anyhow!("用户已取消下载"));
         }
-
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(6))
-            .timeout_read(Duration::from_secs(60))
-            .try_proxy_from_env(true)
-            .build();
-
-        let resp = match agent
-            .get(&url)
-            .set(
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            )
-            .call()
-        {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = Some(anyhow!("连接下载源失败：{e}"));
-                continue;
-            }
-        };
-
-        if resp.status() < 200 || resp.status() >= 300 {
-            last_err = Some(anyhow!("下载源返回 HTTP {}", resp.status()));
-            continue;
-        }
-
-        let total_size = resp
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-
-        let mut reader = resp.into_reader();
-        let mut file = match fs::File::create(&part) {
-            Ok(f) => f,
-            Err(e) => return Err(anyhow!("创建临时文件失败：{e}")),
-        };
-
-        let mut buf = vec![0u8; 128 * 1024];
-        let mut written: u64 = 0;
-        let mut download_ok = true;
-        // 落盘前要做魔数校验，但那时文件已经写到磁盘上了；顺手在下载过程中记住开头
-        // 几个字节，省得再把文件打开一次。
-        let mut head = [0u8; 4];
-        let mut head_len = 0usize;
-        // 摘要随写盘一起算：下完再整份读一遍是另一笔几十 MB 的 IO。
-        let mut hasher = StreamingHasher::new(expected_digest.is_some());
-
-        loop {
+        if let Err(err) = model_download::fetch_to_file(
+            &url,
+            &part,
+            expected_size,
+            "app-update",
+            cancel,
+            Some(&cb),
+            &mut net_bytes,
+        ) {
             if cancel.load(Ordering::Relaxed) {
-                drop(file);
-                let _ = fs::remove_file(&part);
                 return Err(anyhow!("用户已取消下载"));
             }
-
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if head_len < head.len() {
-                        let take = (head.len() - head_len).min(n);
-                        head[head_len..head_len + take].copy_from_slice(&buf[..take]);
-                        head_len += take;
-                    }
-                    if let Err(e) = file.write_all(&buf[..n]) {
-                        last_err = Some(anyhow!("写入磁盘失败：{e}"));
-                        download_ok = false;
-                        break;
-                    }
-                    written += n as u64;
-                    hasher.update(&buf[..n]);
-                    let frac = if total_size > 0 {
-                        (written as f32 / total_size as f32).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    progress(frac, written, total_size);
-                }
-                Err(e) => {
-                    last_err = Some(anyhow!("网络读取中断：{e}"));
-                    download_ok = false;
-                    break;
-                }
+            last_err = Some(err);
+            continue;
+        }
+        let verified: Result<()> = (|| {
+            let written = fs::metadata(&part)?.len();
+            verify_download(written, expected_size).map_err(anyhow::Error::msg)?;
+            let mut head = [0u8; 4];
+            let n = fs::File::open(&part)?.read(&mut head)?;
+            if !magic_matches(&final_name, &head[..n]) {
+                return Err(anyhow!("下载内容不是有效的更新包，下载源可能返回了错误页"));
             }
-        }
-
-        drop(file);
-
-        // 落盘前校验：长度（截断 / 过小，见 `verify_download`）与内容类型
-        // （魔数，见 `magic_matches`）。任何一种不过都当成该镜像不可用，换下一个。
-        if download_ok {
-            if let Err(reason) = verify_download(written, total_size) {
-                last_err = Some(anyhow!("{}", reason));
-                download_ok = false;
-            }
-        }
-        if download_ok && !magic_matches(&final_name, &head[..head_len]) {
-            last_err = Some(anyhow!(
-                "下载内容不是有效的安装包（{final_name} 的文件头不匹配），疑似下载源返回了错误页"
-            ));
-            download_ok = false;
-        }
-        // 内容摘要校验：只有官方 API 给过摘要时才做（没摘要 = 无从校验，不能因此
-        // 把文件判成坏的）。不匹配说明**镜像返回的字节不是官方发布的那一份**——
-        // 这正是「换包」的形态，必须换下一个下载源，绝不能让陌生内容落盘。
-        if download_ok {
-            if let (Some(expected), Some(actual)) =
-                (expected_digest.as_deref(), hasher.finish_hex())
-            {
+            if let Some(expected) = expected_digest {
+                let actual = model_download::sha256_file(&part)?;
                 if !digests_match(expected, &actual) {
-                    last_err = Some(anyhow!(
-                        "下载内容与官方声明的 sha256 不一致（疑似下载源替换了安装包）：\
-                         期望 {expected}，实际 {actual}"
-                    ));
-                    download_ok = false;
+                    return Err(anyhow!("更新包 sha256 与官方声明不一致，已拒绝安装"));
                 }
             }
+            Ok(())
+        })();
+        if let Err(err) = verified {
+            model_download::discard_partial(&part);
+            last_err = Some(err);
+            continue;
         }
-
-        if download_ok {
-            if let Err(e) = fs::rename(&part, &dest) {
-                let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
-                let alt_dest = updates_dir.join(format!("voice2word_{timestamp}.exe"));
-                if let Err(e2) = fs::rename(&part, &alt_dest) {
-                    return Err(anyhow!("落盘失败：{e} / {e2}"));
-                }
-                return Ok(alt_dest);
-            }
-            return Ok(dest);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!("用户已取消下载"));
+        }
+        // 同名包可能仍在运行；新名字保留原扩展名与 Setup 标识。
+        let dest = if dest.exists() {
+            updates_dir.join(format!("{}-{final_name}", uuid::Uuid::new_v4()))
         } else {
-            let _ = fs::remove_file(&part);
-        }
+            dest.clone()
+        };
+        fs::rename(&part, &dest).map_err(|e| anyhow!("保存更新包失败：{e}"))?;
+        let _ = fs::remove_file(model_download::resume_metadata_path(&part));
+        return Ok(dest);
     }
-
     Err(last_err.unwrap_or_else(|| anyhow!("所有下载镜像均不可用，请稍后重试")))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::model_download::download_regression_tests::{response, server, workspace};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn update_payload() -> Vec<u8> {
+        let mut bytes = vec![7; 4096];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes
+    }
+
+    #[test]
+    fn update_rejects_a_mirror_that_declares_a_shorter_complete_file() {
+        let dir = workspace();
+        let body = update_payload();
+        let (url, served) = server(vec![response(
+            "200 OK",
+            "Content-Length: 4000\r\n",
+            &body[..4000],
+        )]);
+        assert!(download_update_into(
+            dir.path(),
+            &url,
+            "Voice2Word-Setup.exe",
+            4096,
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _, _| {}
+        )
+        .is_err());
+        assert!(!dir.path().join("Voice2Word-Setup.exe").exists());
+        served.join().unwrap();
+    }
+
+    #[test]
+    fn update_sha_mismatch_preserves_existing_package() {
+        let dir = workspace();
+        let name = "Voice2Word-Setup.exe";
+        std::fs::write(dir.path().join(name), b"old installer").unwrap();
+        let (url, served) = server(vec![response(
+            "200 OK",
+            "Content-Length: 4096\r\n",
+            &update_payload(),
+        )]);
+        assert!(download_update_into(
+            dir.path(),
+            &url,
+            name,
+            4096,
+            Some(&"0".repeat(64)),
+            &Arc::new(AtomicBool::new(false)),
+            |_, _, _| {}
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join(name)).unwrap(),
+            b"old installer"
+        );
+        served.join().unwrap();
+    }
+
+    #[test]
+    fn cancelling_after_last_bytes_never_returns_an_installable_package() {
+        let dir = workspace();
+        let (url, served) = server(vec![response(
+            "200 OK",
+            "Content-Length: 4096\r\n",
+            &update_payload(),
+        )]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let result = download_update_into(
+            dir.path(),
+            &url,
+            "Voice2Word-Setup.exe",
+            4096,
+            None,
+            &cancel,
+            move |_, done, total| {
+                if done > 0 && done == total {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("已取消"));
+        assert!(!dir.path().join("Voice2Word-Setup.exe").exists());
+        served.join().unwrap();
+    }
+
+    #[test]
+    fn verified_update_keeps_its_zip_extension_when_same_name_already_exists() {
+        let dir = workspace();
+        let name = "voice2word.zip";
+        std::fs::write(dir.path().join(name), b"old zip").unwrap();
+        let mut body = update_payload();
+        body[..4].copy_from_slice(b"PK\x03\x04");
+        let digest = format!("{:x}", Sha256::digest(&body));
+        let (url, served) = server(vec![response("200 OK", "Content-Length: 4096\r\n", &body)]);
+        let path = download_update_into(
+            dir.path(),
+            &url,
+            name,
+            4096,
+            Some(&digest),
+            &Arc::new(AtomicBool::new(false)),
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(path.extension().unwrap(), "zip");
+        assert_eq!(std::fs::read(path).unwrap(), body);
+        assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), b"old zip");
+        served.join().unwrap();
+    }
+
+    #[test]
+    fn updater_never_selects_the_cli_as_a_gui_upgrade() {
+        let release = parse_latest_release(r#"{
+            "tag_name": "v9.0.0", "assets": [{"name":"voice2word-cli.exe", "browser_download_url":"https://example.invalid/cli.exe"}]
+        }"#).unwrap();
+        assert!(release.download_url.is_empty());
+        assert!(!is_installer_asset("voice2word.exe"));
+        assert!(!is_installer_asset("voice2word.zip"));
+        assert!(is_installer_asset("Voice2Word-v1.0.0-Setup.exe"));
+    }
 
     /// 基本大小关系：`0.2.0` 比 `0.1.0` 新，反向与相等都不成立。
     #[test]
@@ -960,9 +1010,9 @@ mod tests {
         // 未给 Content-Length（chunked）：无从校验，放行。
         assert!(download_is_complete(0, 0));
         assert!(download_is_complete(123, 0));
-        // 给足或超出：算完整。
+        // 必须精确匹配：多一字节或少一字节均不通过。
         assert!(download_is_complete(1000, 1000));
-        assert!(download_is_complete(1001, 1000));
+        assert!(!download_is_complete(1001, 1000));
         // 少一个字节都不算完整。
         assert!(!download_is_complete(999, 1000));
         assert!(!download_is_complete(0, 1000));
@@ -992,17 +1042,14 @@ mod tests {
         assert_eq!(r.asset_size, 25000000);
     }
 
-    /// 所有附件都没有直链时，才回退到按 tag 拼出的硬编码 URL。
+    /// 没有可下载附件时不编造地址，界面应引导用户打开发行页面。
     #[test]
-    fn parse_latest_release_falls_back_when_no_asset_has_url() {
+    fn parse_latest_release_has_no_download_when_no_asset_has_url() {
         let body =
             r#"{ "tag_name": "v0.4.0", "assets": [ { "name": "voice2word.exe", "size": 1 } ] }"#;
         let r = parse_latest_release(body).unwrap();
-        assert_eq!(r.asset_name, "voice2word.exe");
-        assert_eq!(
-            r.download_url,
-            "https://github.com/ysg0422/voice2word/releases/download/v0.4.0/voice2word.exe"
-        );
+        assert!(r.asset_name.is_empty());
+        assert!(r.download_url.is_empty());
     }
 
     /// 附件名来自服务端，落盘前必须取 basename：绝对路径 / `..` 会逃出 `updates/`。
@@ -1094,22 +1141,6 @@ mod tests {
     /// 流式摘要必须与「一次算完整内容」一致，否则校验会误报/漏报。
     /// 用 sha256("abc") 的已知向量钉住。
     #[test]
-    fn streaming_hasher_matches_known_vector() {
-        let mut hasher = StreamingHasher::new(true);
-        hasher.update(b"a");
-        hasher.update(b"bc");
-        assert_eq!(
-            hasher.finish_hex(),
-            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string())
-        );
-        // 未启用时不计算（上游没给摘要就不做无谓开销）
-        let mut off = StreamingHasher::new(false);
-        off.update(b"abc");
-        assert_eq!(off.finish_hex(), None);
-    }
-
-    /// 附件元数据里的 `digest` 要被解析进 `asset_sha256`，供落盘前校验使用。
-    #[test]
     fn parse_latest_release_extracts_asset_digest() {
         let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let body = format!(
@@ -1135,7 +1166,7 @@ mod tests {
         let r2 = parse_latest_release(no_digest).expect("应解析成功");
         assert_eq!(r2.asset_sha256, None);
 
-        // 完全没有 assets → 回退 URL，同样没有摘要
+        // 完全没有 assets → 不提供下载目标，同样没有摘要
         let r3 = parse_latest_release(r#"{ "tag_name": "v0.3.0" }"#).expect("应解析成功");
         assert_eq!(r3.asset_sha256, None);
     }
@@ -1160,5 +1191,7 @@ mod tests {
         let other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         record_advertised_digest(url, Some(other));
         assert_eq!(advertised_digest(url).as_deref(), Some(other));
+        record_advertised_digest(url, None);
+        assert_eq!(advertised_digest(url), None);
     }
 }

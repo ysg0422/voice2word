@@ -7,25 +7,29 @@
 ### 1.1 定位可执行文件
 
 Windows 下有两个可执行文件，**行为与命令完全一致，区别只在 Windows 子系统**：`voice2word.exe`（GUI 子系统，带图形界面）与 `voice2word-cli.exe`（控制台子系统，无图形界面）。**脚本与 CI 请用 `voice2word-cli.exe`**：PowerShell 不会等待 GUI 子系统的进程，`voice2word.exe ... > out.json` 会在子进程写出之前拆掉重定向（文件为空，并伴随 `failed printing to stdout: 管道正在被关闭`）；控制台子系统的进程由 shell 同步等待，重定向、管道与 `` 都正常。
-按以下顺序定位 `voice2word.exe`（要无头入口就把文件名换成 `voice2word-cli`）：
+按以下顺序定位可执行文件（脚本与 CI 先找 `voice2word-cli.exe`，全部落空后按同样顺序回退 `voice2word.exe`）：
 
 1. 显式指定（MCP / 脚本参数、环境变量 `VOICE2WORD_EXE`）；
-2. 仓库内 `target\release\voice2word.exe`；
-3. 仓库内 `target\debug\voice2word.exe` 或仓库根 `voice2word.exe`；
-4. `PATH` 中的 `voice2word`。
+2. 仓库内 `target\release\voice2word-cli.exe`；
+3. 仓库内 `target\debug\voice2word-cli.exe` 或仓库根 `voice2word-cli.exe`；
+4. `PATH` 中的 `voice2word-cli`。
 
 ```powershell
 # 优先 release 构建，其次 PATH
-$exe = if (Test-Path .\target\release\voice2word.exe) { '.\target\release\voice2word.exe' } else { 'voice2word' }
+$exe = if (Test-Path .\target\release\voice2word-cli.exe) { '.\target\release\voice2word-cli.exe' } else { 'voice2word-cli' }
 ```
 
 ### 1.2 用法
 
 ```
 voice2word [--gui]
-voice2word transcribe <输入文件> [-o <输出>] [--format srt|ass|vtt|json|txt|ttml|ttal]
+voice2word transcribe <输入文件或目录> [-o <输出>] [--format srt|ass|vtt|json|txt|ttml|ttal|sbv|lrc|txt-ts]
                           [--lang <代码>] [--translate <语言>] [--model <路径>]
                           [--threads N] [--polish] [--resume] [--artifact-dir <路径>]
+voice2word run <输入文件或目录> [选项]
+voice2word tools [--json]
+voice2word dub -i <音视频> -s <字幕> [选项]
+voice2word download -u <链接> [-o <目录>]
 voice2word doctor [--json]
 voice2word --help | -h
 voice2word --version | -V
@@ -34,20 +38,25 @@ voice2word --version | -V
 - 无参数或 `--gui`：启动图形界面（与加入 CLI 之前行为一致）。
 - `transcribe`：无头转写并导出字幕。
 - `doctor`：本机自检（只读），逐项检查依赖、硬件、日志与数据库。
+- `run`：机器用入口，默认 `--json`，stdout 只输出一行结果 JSON。
+- `tools`：列出可被外部程序调用的工具与参数 schema。
+- `dub`：给已有字幕配音出片（需要 edge-tts）。
+- `download`：把视频链接下载到本地（需要 yt-dlp）。
 
 ### 1.3 参数表
 
 | 参数 | 取值 | 说明 | 默认 |
 | --- | --- | --- | --- |
-| `transcribe` | — | 无头转写子命令，后接输入文件 | — |
-| `<输入文件>` | 路径 | 待转写的音视频文件（必填） | — |
+| `transcribe` | — | 无头转写子命令，后接输入文件或目录 | — |
+| `<输入文件或目录>` | 路径 | 待转写的音视频文件或目录（必填；目录会批量转写，可加 `--recursive` 递归子目录） | — |
 | `-o`, `--output` | 路径 | 输出字幕路径 | 与输入同目录、同名的 `.<格式>` |
-| `--format` | `srt`/`ass`/`vtt`/`json`/`txt`/`ttml`/`ttal` | 输出格式（不区分大小写，内部转小写） | `srt` |
+| `--format` | `srt`/`ass`/`vtt`/`json`/`txt`/`ttml`/`ttal`/`sbv`/`lrc`/`txt-ts` | 输出格式（不区分大小写，内部转小写） | `srt` |
 | `--lang`, `--language` | 语言代码，如 `zh`/`en`/`ja`/`auto` | 源语言 | 取 `config.toml` 的 `pipeline.language` |
 | `--translate` | 目标语言 | 目标语言（离线 Qwen / 在线 API 均已接线） | 目标语言 |
 | `--model` | 路径 | 覆盖 Whisper 模型文件 | 取 `config.toml` |
 | `--threads` | 正整数 | 推理线程数 | 取 `config.toml` |
 | `--polish` | 布尔（不接受取值） | 强制开启润色/标点 | 取 `config.toml` |
+| `--vocal-sep` | 布尔（不接受取值） | 强制开启人声分离前置 | 取 `config.toml` |
 | `--resume` | 布尔（不接受取值） | 复用阶段产物目录中已有的识别结果（断点续跑） | 关闭 |
 | `--artifact-dir` | 路径 | 指定阶段产物目录 | 仅 `--resume` 时回落 `<输入目录>/.voice2word-stages/<文件名>`；否则不落盘 |
 | `-h`, `--help` | — | 显示帮助 | — |
@@ -76,7 +85,7 @@ voice2word --version | -V
 | --- | --- |
 | `0` | 成功（含 `--help` / `--version`） |
 | `1` | 转写运行期失败（输入文件不存在、管线报错、写盘失败、未产生字幕片段等） |
-| `2` | 参数错误（缺少输入文件、未知子命令/选项、非法 `--format`、`--threads` 非正整数或为 0、选项缺少取值等） |
+| `2` | 参数错误（缺少输入、未知子命令/选项、非法 `--format`、`--threads` 非正整数或为 0、选项缺少取值等） |
 
 `doctor` 的退出码另有细分：没有 ERROR 就是 `0`（只有 WARN 也算 `0`），存在 ERROR 是 `1`，参数错误同样是 `2`。
 
@@ -133,7 +142,7 @@ integrations/voice2word-skill/
   scripts/transcribe.ps1    # PowerShell 包装脚本（参数校验 + 友好报错）
 ```
 
-`SKILL.md` 包含：何时使用、如何定位 `voice2word.exe`、常用命令示例、参数说明、退出码语义、stdout 结果约定、常见错误排查。
+`SKILL.md` 包含：何时使用、如何定位可执行文件（`voice2word-cli.exe` 优先）、常用命令示例、参数说明、退出码语义、stdout 结果约定、常见错误排查。
 
 ### 2.1 安装方式
 
@@ -156,7 +165,7 @@ Copy-Item -Recurse -Force .\integrations\voice2word-skill\* $dst
 .\integrations\voice2word-skill\scripts\transcribe.ps1 -Input talk.mp4 -Resume -ArtifactDir .\.voice2word-stages\talk
 ```
 
-脚本会校验输入文件、格式与线程数，自动定位 `voice2word.exe`，把进度（stderr）透传，并打印结果路径；退出码与 CLI 一致（0/1/2）。
+脚本会校验输入文件、格式与线程数，自动定位可执行文件（`voice2word-cli.exe` 优先，回退 `voice2word.exe`），把进度（stderr）透传，并打印结果路径；退出码与 CLI 一致（0/1/2）。
 
 ## 3. MCP 服务器
 
@@ -189,7 +198,7 @@ integrations/mcp-server/
     "voice2word": {
       "command": "python",
       "args": ["<仓库路径>\\integrations\\mcp-server\\voice2word_mcp.py"],
-      "env": { "VOICE2WORD_EXE": "<仓库路径>\\target\\release\\voice2word.exe" }
+      "env": { "VOICE2WORD_EXE": "<仓库路径>\\target\\release\\voice2word-cli.exe" }
     }
   }
 }

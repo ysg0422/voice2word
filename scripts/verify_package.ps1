@@ -14,7 +14,7 @@
 #   4. 随包 config.toml 是**干净的默认配置**（不含绝对路径、不含密钥、
 #      whisper_model 不得指向 .onnx）；
 #   5. 便携 Python 能 import numpy / sherpa_onnx（SenseVoice 与标点的前提）；
-#   6. 胶水脚本（punc / sensevoice / edge_tts）在 tools/ 下。
+#   6. 胶水脚本（punc / sensevoice / edge_tts / vocal_sep）在 tools/ 下。
 #
 # 用法：
 #   pwsh -File scripts/verify_package.ps1            # 校验仓库里将要打包的输入
@@ -180,7 +180,7 @@ if (Test-Path $pyExe) {
 }
 
 # ── 6. 胶水脚本 ─────────────────────────────────────────────────────
-foreach ($py in @('punc_runner.py', 'sensevoice_runner.py', 'edge_tts_runner.py')) {
+foreach ($py in @('punc_runner.py', 'sensevoice_runner.py', 'edge_tts_runner.py', 'vocal_sep_runner.py')) {
     if (Test-Path (Join-Path $tools $py)) {
         Add-Pass "$py 已随包"
     } else {

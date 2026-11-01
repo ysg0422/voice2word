@@ -9,21 +9,22 @@ Voice2Word 是一个 Rust + GPUI 桌面字幕工具，同时提供无头（headl
 
 ## 1. 何时使用
 
-- 需要把音视频转写成字幕（srt/ass/vtt/json/txt/ttml/ttal）。
+- 需要把音视频转写成字幕（srt/ass/vtt/json/txt/ttml/ttal/sbv/lrc/txt-ts）。
 - 需要在脚本、CI 或其它自动化流程中调用 voice2word CLI。
 - 需要无头转写（不开 GUI、不依赖交互界面）。
 - 需要批量转写、指定语言、指定线程数或开启润色（--polish）。
 
-## 2. 如何定位 voice2word.exe
+## 2. 如何定位 voice2word 可执行文件
 
 按以下优先级顺序查找：
 
 1. 显式指定：命令行参数 `-Exe <路径>`，或环境变量 `VOICE2WORD_EXE`。
-2. 仓库内构建产物：`target\release\voice2word.exe`（相对仓库根）。
-3. 仓库内调试产物或根目录副本：`target\debug\voice2word.exe`、`.\voice2word.exe`。
-4. PATH 上的 `voice2word`（Get-Command voice2word）。
+2. 控制台构建 `voice2word-cli.exe`：脚本同目录（`$PSScriptRoot`）→ 仓库内 `target\release\voice2word-cli.exe` → `target\debug\voice2word-cli.exe` → PATH 上的 `voice2word-cli`。
+3. 最后才回退 GUI 构建 `voice2word.exe`，顺序同上（同目录 → `target\release` → `target\debug` → PATH）。
 
-> 注意：若 `target\release\voice2word.exe` 是**加入 CLI 子命令之前**构建的旧产物，它不认 `transcribe`，被调用时会直接打开图形界面并长时间不返回。遇到这种情况请用 `-Exe` 显式指向 `target\debug\voice2word.exe`（当前支持 CLI 的构建），或重新执行 `cargo build --release`。封装脚本与 MCP 服务器会用「CLI 标记」筛选跳过这类旧构建。
+> 为什么先找 `voice2word-cli.exe`：`voice2word.exe` 是 **GUI 子系统**程序，PowerShell 不等待它、输出重定向会拿到空文件（os error 232），封装脚本会误判为失败；`voice2word-cli.exe` 是控制台子系统构建，命令完全一致。
+>
+> 注意：若找到的 exe 是**加入 CLI 子命令之前**构建的旧产物，它不认 `transcribe`，被调用时会直接打开图形界面并长时间不返回。遇到这种情况请用 `-Exe` 显式指向当前构建（如 `target\debug\voice2word-cli.exe`），或重新执行 `cargo build --release`。封装脚本与 MCP 服务器会用「CLI 标记」筛选跳过这类旧构建。
 
 PowerShell 定位片段（不写死绝对路径）：
 
@@ -39,21 +40,21 @@ function Find-Voice2WordExe {
         return (Resolve-Path -LiteralPath $env:VOICE2WORD_EXE).Path
     }
 
-    # 2/3) 仓库内相对路径（相对于当前工作目录 = 仓库根）
-    $candidates = @(
-        'target\release\voice2word.exe',
-        'target\debug\voice2word.exe',
-        '.\voice2word.exe'
-    )
-    foreach ($c in $candidates) {
-        if (Test-Path -LiteralPath $c) { return (Resolve-Path -LiteralPath $c).Path }
+    # 2/3) 控制台构建 voice2word-cli.exe 优先，GUI 构建 voice2word.exe 兜底；
+    #      每种名字都按「脚本同目录 → target\release → target\debug → PATH」找一遍
+    foreach ($name in @('voice2word-cli.exe', 'voice2word.exe')) {
+        $candidates = @()
+        if ($PSScriptRoot) { $candidates += (Join-Path $PSScriptRoot $name) }
+        $candidates += "target\release\$name"
+        $candidates += "target\debug\$name"
+        foreach ($c in $candidates) {
+            if (Test-Path -LiteralPath $c) { return (Resolve-Path -LiteralPath $c).Path }
+        }
+        $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
     }
 
-    # 4) PATH
-    $cmd = Get-Command voice2word -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-
-    throw '未找到 voice2word.exe：请用 -Exe 指定，或设置 VOICE2WORD_EXE，或先 cargo build --release。'
+    throw '未找到 voice2word-cli.exe / voice2word.exe：请用 -Exe 指定，或设置 VOICE2WORD_EXE，或先 cargo build --release。'
 }
 
 $exe = Find-Voice2WordExe
@@ -98,15 +99,15 @@ voice2word --version
 
 | 参数 | 取值 | 说明 | 默认 |
 | --- | --- | --- | --- |
-| `transcribe` | 子命令 | 无头转写入口，后接输入文件 | — |
-| `<输入文件>` | 路径 | 待转写的音频/视频文件；必填 | — |
+| `transcribe` | 子命令 | 无头转写入口，后接输入文件或目录 | — |
+| `<输入文件或目录>` | 路径 | 待转写的音频/视频文件或目录；目录会批量转写（可加 `--recursive` 递归子目录），必填 | — |
 | `-o` / `--output` | 路径 | 输出字幕文件路径 | 与输入同目录同名，扩展名随格式 |
-| `--format` | `srt`/`ass`/`vtt`/`json`/`txt`/`ttml`/`ttal` | 输出字幕格式，输入大小写不敏感 | `srt` |
+| `--format` | `srt`/`ass`/`vtt`/`json`/`txt`/`ttml`/`ttal`/`sbv`/`lrc`/`txt-ts` | 输出字幕格式，输入大小写不敏感 | `srt` |
 | `--lang` / `--language` | 语言代码，如 `zh`、`en` | 指定识别语言 | 取 `config.toml` 的 `pipeline.language`（示例配置为 `zh`） |
 | `--translate` | 目标语言，如 `en` | 翻译目标语言（离线 Qwen / 在线 API 均已接线） | 不翻译 |
 | `--model` | 模型文件路径 | 覆盖默认 Whisper 模型文件 | 配置文件中的默认模型 |
 | `--threads` | 正整数 | 推理线程数 | 取 `config.toml` 的 `pipeline.whisper_threads` |
-| `--polish` | 布尔标志，不取值 | 强制开启润色/标点 | 取 `config.toml` 的 `pipeline.enable_polish`（示例配置为 `false`） |
+| `--polish` | 布尔标志，不取值 | 强制开启润色/标点 | 取 `config.toml` 的 `pipeline.enable_polish`（默认 `true`，以你的配置为准） |
 | `--resume` | 布尔标志，不取值 | 复用阶段产物目录中已有的识别结果（断点续跑） | 关闭 |
 | `--artifact-dir` | 路径 | 指定阶段产物目录 | 仅 `--resume` 时回落 `<输入目录>/.voice2word-stages/<文件名>`；否则不落盘 |
 | `--gui` | 布尔标志 | 启动图形界面 | 关闭 |
@@ -119,7 +120,7 @@ voice2word --version
 | --- | --- | --- |
 | 0 | 成功 | 正常完成转写；`--help`、`--version` 也返回 0 |
 | 1 | 转写运行期失败 | 输入文件不存在、磁盘写入失败、转写流水线错误 |
-| 2 | 参数错误 | 缺少输入文件、未知选项/子命令、非法 `--format`、`--threads` 非正整数或 0、选项缺少取值 |
+| 2 | 参数错误 | 缺少输入、未知选项/子命令、非法 `--format`、`--threads` 非正整数或 0、选项缺少取值 |
 
 ## 6. 结果在 stdout 的约定
 
@@ -149,19 +150,19 @@ if ($LASTEXITCODE -eq 0) { Write-Host "OK: $last" } else { Write-Host "失败，
 
 | 现象 | 可能原因 | 处理 |
 | --- | --- | --- |
-| 退出码 2，stderr 含 `参数错误: 缺少输入文件` | 未提供输入文件 | 补上输入文件路径；`transcribe` 后必须跟文件 |
+| 退出码 2，stderr 含 `参数错误: 缺少输入` | 未提供输入 | 补上输入路径（文件或目录）；`transcribe` 后必须跟一个输入 |
 | 退出码 2，stderr 含 `参数错误: 未知选项: ...` | 未知选项或子命令 | 检查拼写；用 `--help` 查看支持项 |
-| 退出码 2，stderr 含 `不支持的输出格式` | `--format` 非法 | 只能取 srt/ass/vtt/json/txt/ttml/ttal |
+| 退出码 2，stderr 含 `不支持的输出格式` | `--format` 非法 | 只能取 srt/ass/vtt/json/txt/ttml/ttal/sbv/lrc/txt-ts |
 | 退出码 2，stderr 含 `需要正整数` / `需要大于 0 的整数` | `--threads` 非正整数或 0 | 传正整数，如 `--threads 4` |
 | 退出码 2，stderr 含 `缺少取值` | 选项后没跟值 | 如 `-o`、`--format` 后补值 |
-| 退出码 2，stderr 含 `多余的参数` | 位置参数过多 | 只保留一个输入文件 |
+| 退出码 2，stderr 含 `多余的参数` | 位置参数过多 | 只保留一个输入（文件或目录） |
 | 退出码 1，提示输入文件不存在 | 路径错误或文件缺失 | 用 `Test-Path` 确认路径，注意相对路径基于当前工作目录 |
 | 退出码 1，提示写盘失败 | 输出目录不存在或无权限 | 先创建输出目录；检查权限与磁盘空间 |
 | 启动即报 config.toml 缺失 | 配置文件缺失 | 在仓库/工作目录下恢复 `config.toml`（含模型路径等配置） |
 | 报模型未下载 / 找不到模型文件 | 默认 Whisper 模型未下载 | 下载模型，或用 `--model <路径>` 指定已有模型文件 |
 | 报 ffmpeg 缺失 / 无法解码 | 系统没有 ffmpeg 或不在 PATH | 安装 ffmpeg 并加入 PATH；确认 `Get-Command ffmpeg` 可用 |
 | stdout 被进度信息污染 | 未分离 stderr/stdout | 用 `2> progress.log` 重定向，或改用 `scripts/transcribe.ps1`；只取 stdout 最后一行作为结果路径 |
-| 进程长时间不返回、弹出 GUI 窗口、stdout 无任何输出、退出码却是 0 | 定位到的 exe 是**旧构建**：它早于 CLI 子命令，会忽略全部参数直接开 GUI | 重新构建（`cargo build --release`），或显式传 `-Exe .\target\debug\voice2word.exe`。封装脚本遇到"退出码 0 但没有成功行"会以退出码 1 报错，不会静默假成功 |
+| 进程长时间不返回、弹出 GUI 窗口、stdout 无任何输出、退出码却是 0 | 定位到的 exe 是**旧构建**：它早于 CLI 子命令，会忽略全部参数直接开 GUI | 重新构建（`cargo build --release`），或显式传 `-Exe .\target\debug\voice2word-cli.exe`。封装脚本遇到"退出码 0 但没有成功行"会以退出码 1 报错，不会静默假成功 |
 | 报 `invalid model data (bad magic)` / 加载模型失败 | `config.toml` 里的 `whisper_model` 指向了非 Whisper 的模型文件（例如 SenseVoice 的 `.onnx`） | 用 `--model <Whisper ggml 模型>` 或封装脚本的 `-Model` 覆盖，例如 `models\whisper\ggml-base.bin` |
 
 ## 8. 封装脚本与安装位置
@@ -172,8 +173,8 @@ if ($LASTEXITCODE -eq 0) { Write-Host "OK: $last" } else { Write-Host "失败，
 # 在仓库根执行
 .\integrations\voice2word-skill\scripts\transcribe.ps1 -Input .\samples\meeting.mp4 -Format srt -Language zh
 
-# 也可显式指定 exe
-.\integrations\voice2word-skill\scripts\transcribe.ps1 -Input .\samples\meeting.mp4 -Exe .\target\release\voice2word.exe
+# 也可显式指定 exe（优先控制台构建 voice2word-cli.exe）
+.\integrations\voice2word-skill\scripts\transcribe.ps1 -Input .\samples\meeting.mp4 -Exe .\target\release\voice2word-cli.exe
 
 # 覆盖模型文件（config.toml 的 whisper_model 不可用时）
 .\integrations\voice2word-skill\scripts\transcribe.ps1 -Input .\samples\meeting.mp4 -Format vtt -Model .\models\whisper\ggml-base.bin

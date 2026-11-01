@@ -409,10 +409,47 @@ fn main() -> Result<()> {
         }
     };
 
+    // 人声分离（可选增强）：runner + 模型都就位才装配；没装配只是「该阶段降级」，
+    // 不阻断启动。开启分离却缺件时由 run_vocal_sep_stage 发可见提示回退原始音频。
+    let vocal_sep = {
+        let runner = AppConfig::resolve_path("tools/vocal_sep_runner.py");
+        let model = config
+            .paths
+            .vocal_model
+            .as_ref()
+            .map(|p| AppConfig::resolve_path(p))
+            .unwrap_or_else(|| {
+                AppConfig::resolve_path("models/vocal_sep/UVR-MDX-NET-Inst_HQ_3.onnx")
+            });
+        if runner.exists() && model.exists() {
+            let provider = config.gpu.resolve_onnx_provider();
+            info!("人声分离引擎已就绪: {:?} (provider={provider})", model);
+            Some(Arc::new(engines::VocalSepEngine::new(
+                provider.to_string(),
+                model,
+            )))
+        } else {
+            if config.pipeline.preprocess_vocal_sep {
+                warn!(
+                    "人声分离已开启但未就绪 (runner={}, model={})，将回退原始音频",
+                    runner.exists(),
+                    model.exists()
+                );
+            }
+            None
+        }
+    };
+
     startup.mark("engine_init");
 
     // 5. 编排流水线管线（此时硬件档案已落定）
-    let pipeline = Arc::new(TaskPipeline::new(ffmpeg, whisper, sensevoice, llm, punc));
+    let pipeline = {
+        let base = TaskPipeline::new(ffmpeg, whisper, sensevoice, llm, punc);
+        Arc::new(match vocal_sep {
+            Some(engine) => base.with_vocal_sep(engine),
+            None => base,
+        })
+    };
 
     // 6. 初始化全局应用状态
     let state = AppState::with_hardware(config, db, pipeline, hardware);

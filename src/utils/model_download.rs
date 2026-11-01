@@ -26,7 +26,8 @@
 //!
 //! 校验分两层，都是**按条目可选**的：
 //!
-//! - **大小**：始终执行，下限为 `size * 0.95`（或条目显式给出的 `min_size`）。
+//! - **文件格式**：落盘前与就位检测均核对 GGML/GGUF/PE/压缩包文件头，拒绝错误页与 LFS 指针。
+//! - **大小**：HTTP 提供精确长度时必须完整接收；登记体积是近似值，下限为 `size * 0.95`。
 //!   这拦住最常见的失败模式——**截断文件**，而截断恰恰是「模型加载失败」里
 //!   最难排查的一种损坏。
 //! - **sha256**：仅当条目声明了 `sha256` 时才执行。上游会重新导出 / 重新量化
@@ -40,11 +41,10 @@
 //!
 //! # 断点续传
 //!
-//! `.part` 不只是「半成品隔离」：若它已存在且大小介于 `(0, size)` 之间，
-//! 下次下载会带 `Range: bytes=<已有字节数>-` 续传。服务端返回 `206` 时以追加
-//! 方式写入；返回 `200`（不支持 Range）或异常状态码时**优雅回退**到从头下载
-//! （截断重写），不会因此把该源判死。若 `.part` 已不小于期望大小（上次下完但
-//! 没来得及 rename），则跳过网络直接进入校验。
+//! `.part.meta` 保存源 URL、ETag/Last-Modified、完整长度与正常结束标记。只有同源、
+//! 同版本的残留才带 `Range` + `If-Range` 续传；206 的完整范围与版本必须匹配。
+//! 换源或版本改变时从头下载，防止拼接两份权重。只有记录过正常 EOF 的完整残留可
+//! 跳过网络进入内容校验；旧版仅有 `.part` 的残留会安全地重新下载。
 //!
 //! 注意：启动时的 `sweep_stale_parts` 只清理**过期**（默认 7 天未更新）的
 //! `.part`；近期残留会保留，因此断点续传在**跨进程**（崩溃 / 强杀后重启）场景
@@ -105,6 +105,8 @@ fn is_allowed_source(url: &str) -> bool {
 /// 已经走到 100%——如果什么都不说，界面看起来就是卡死了。用 sentinel 而不是改
 /// 回调签名：`ProgressFn` 是既有约定，加参数会波及所有调用点。
 pub const PROGRESS_UNPACKING: u64 = u64::MAX - 1;
+/// 网络传输结束，正在校验文件，尚未交付。
+pub const PROGRESS_VALIDATING: u64 = u64::MAX - 2;
 
 /// 压缩包条目「已就位」判据的下限（针对**解压后的入口文件**）。
 ///
@@ -573,10 +575,7 @@ pub const ITEMS: &[DownloadItem] = &[
         note: "大模型量化版，速度与精度兼得（547MB）",
         dest: "models/whisper/ggml-large-v3-turbo-q5_0.bin",
         urls: &[
-            // 注：本模型国内 ModelScope 暂无 ggml 镜像（上游只提供 safetensors/pt）。
-            // 两条源都留着：国内用户可能命中，挂梯子的用户则靠 hf-mirror。
-            // 排序在运行时由 `order_sources` 决定（国内优先、失败沉底）。
-            "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3-turbo-q5_0.bin",
+            // 客户机日志已确认原 ModelScope 地址返回 404，不能继续作为首选源。
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
         ],
         size: 574_041_195, // 实测 ggml-large-v3-turbo-q5_0.bin（547.4 MiB）
@@ -593,7 +592,7 @@ pub const ITEMS: &[DownloadItem] = &[
         note: "旗舰精度量化版，抗口音吞音（833MB）",
         dest: "models/whisper/ggml-large-v3-turbo-q8_0.bin",
         urls: &[
-            // 同 Turbo Q5：国内暂无 ggml 镜像，双源都留（见该条目的说明）。
+            // 若该 ModelScope 镜像缺文件，下载器会自动尝试下一个源。
             "https://www.modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3-turbo-q8_0.bin",
             "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin",
         ],
@@ -741,6 +740,25 @@ pub const ITEMS: &[DownloadItem] = &[
         ],
         size: 885_098,
         min_size: 500_000,
+        required: false,
+        group: ItemGroup::Asr,
+        is_archive: false,
+        companion: None,
+        sha256: None,
+    },
+    // ── 音频预处理（可选）──
+    DownloadItem {
+        id: "vocal-sep-mdx",
+        label: "UVR-MDX-NET 人声分离模型",
+        note: "BGM/背景人声重的素材先拆出人声再识别（可选）",
+        dest: "models/vocal_sep/UVR-MDX-NET-Inst_HQ_3.onnx",
+        urls: &[
+            // 仓库门禁（`items_are_well_formed`）要求每条 URL 都走免梯子镜像/代理，
+            // GitHub 直链不允许登记——那等于给国内用户登记一个下载不了的源。
+            "https://gh-proxy.com/https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-MDX-NET-Inst_HQ_3.onnx",
+        ],
+        size: 66_400_000,
+        min_size: 20_000_000,
         required: false,
         group: ItemGroup::Asr,
         is_archive: false,
@@ -947,6 +965,24 @@ pub const ITEMS: &[DownloadItem] = &[
         group: ItemGroup::Binary,
         is_archive: true,
         companion: Some("onnxruntime.dll"),
+        sha256: None,
+    },
+    DownloadItem {
+        id: "yt-dlp",
+        label: "yt-dlp（链接导入：YouTube / B站 等）",
+        note: "下载视频链接到本地后再转写；官方单文件构建，无需 Python",
+        dest: "tools/yt-dlp.exe",
+        urls: &[
+            "https://gh-proxy.com/https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+            "https://ghproxy.net/https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+        ],
+        // 上游每晚发版、体积会漂移：只给出典型值，就位判定按 min_size。
+        size: 17_880_000,
+        min_size: 5_000_000,
+        required: false,
+        group: ItemGroup::Binary,
+        is_archive: false,
+        companion: None,
         sha256: None,
     },
 ];
@@ -1165,6 +1201,9 @@ fn is_present_with_opt(item: &DownloadItem, cfg: Option<&AppConfig>) -> bool {
     if companion_missing(&path, item, meta.len()) {
         return false;
     }
+    if validate_payload(&path, item.dest).is_err() {
+        return false;
+    }
     // 压缩包类条目的 `sha256` 是**下载物（zip）**的哈希，而不是解压后入口
     // 文件的哈希；对 `dest`（解压出来的 exe）重算必然不匹配。这类条目的
     // 完整性由 `companion` 把关，哈希只在下载 `.part` 时校验一次。
@@ -1241,6 +1280,10 @@ fn companion_missing(path: &Path, item: &DownloadItem, entry_len: u64) -> bool {
     let Some(companion) = item.companion else {
         return false;
     };
+    // ONNX 模型再大也不能代替词表；只有可执行文件才存在静态自包含构建。
+    if item.group != ItemGroup::Binary {
+        return !path.parent().is_some_and(|d| d.join(companion).is_file());
+    }
     // 非默认路径：用户自己配的，交给用户负责
     if path != AppConfig::resolve_path(item.dest) {
         return false;
@@ -1271,6 +1314,9 @@ fn companion_missing(path: &Path, item: &DownloadItem, entry_len: u64) -> bool {
 /// **悄悄覆盖**（体积骤减、GPU 支持凭空消失，而且没有任何提示）。
 /// 命中时由 [`download_one`] 拒绝覆盖并给出可操作提示。
 fn looks_like_custom_build(item: &DownloadItem, dest: &Path) -> bool {
+    if item.group != ItemGroup::Binary || validate_payload(dest, item.dest).is_err() {
+        return false;
+    }
     let Some(companion) = item.companion else {
         return false;
     };
@@ -1883,6 +1929,9 @@ pub fn download_one(
     cancel: &Arc<AtomicBool>,
     progress: Option<&ProgressFn>,
 ) -> Result<PathBuf> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("已取消");
+    }
     let dest = AppConfig::resolve_path(item.dest);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -1941,6 +1990,9 @@ pub fn download_one(
         if cancel.load(Ordering::Relaxed) {
             return Err(anyhow!("已取消"));
         }
+        if retry_budget_exhausted(net_bytes, item.size) {
+            bail!("累计传输已超过登记大小的 3 倍，停止重试；请检查下载源后重试");
+        }
         match fetch_to_file(
             url,
             &part,
@@ -1951,28 +2003,51 @@ pub fn download_one(
             &mut net_bytes,
         ) {
             Ok(()) => {
+                if cancel.load(Ordering::Relaxed) {
+                    bail!("已取消");
+                }
+                if let Some(cb) = progress {
+                    cb(PROGRESS_VALIDATING, 0, item.id);
+                }
+                let payload_name = if item.is_archive {
+                    match archive_kind_from_url(url) {
+                        ArchiveKind::Zip => "download.zip",
+                        ArchiveKind::TarBz2 => "download.tar.bz2",
+                    }
+                } else {
+                    item.dest
+                };
+                if let Err(err) = validate_payload(&part, payload_name) {
+                    discard_partial(&part);
+                    last_err = Some(err);
+                    continue;
+                }
                 // 内容哈希强校验（仅当条目声明了 sha256）。不符时删 `.part` 换源，
                 // 绝不 rename —— 把损坏文件落到正式名比下载失败更难排查。
                 if let Some(expected) = item.sha256 {
                     match sha256_file(&part) {
-                        Ok(actual) if actual == expected => {}
+                        Ok(actual) if actual.eq_ignore_ascii_case(expected) => {}
                         Ok(actual) => {
                             warn!(
                                 item = item.id,
                                 url, expected, actual, "sha256 校验失败，尝试下一个下载源"
                             );
-                            let _ = fs::remove_file(&part);
+                            discard_partial(&part);
                             last_err =
                                 Some(anyhow!("sha256 校验失败：期望 {expected}，实际 {actual}"));
                             continue;
                         }
                         Err(err) => {
                             warn!(item = item.id, url, error = %err, "计算 sha256 失败，尝试下一个下载源");
-                            let _ = fs::remove_file(&part);
+                            discard_partial(&part);
                             last_err = Some(err);
                             continue;
                         }
                     }
+                }
+
+                if cancel.load(Ordering::Relaxed) {
+                    bail!("已取消");
                 }
                 // 压缩包类组件（如 llama.cpp）：下载物是 zip，真正的程序在包内。
                 // 必须解压到 dest 的父目录并校验关键文件都在，才算成功。
@@ -1991,7 +2066,10 @@ pub fn download_one(
                             // 结构与登记不符（比如镜像换了打包方式）：当成该源失败，
                             // 删掉 .part 换下一个源，而不是留下半成品目录。
                             warn!(item = item.id, url, error = %err, "解压失败，尝试下一个下载源");
-                            let _ = fs::remove_file(&part);
+                            if cancel.load(Ordering::Relaxed) {
+                                bail!("已取消");
+                            }
+                            discard_partial(&part);
                             last_err = Some(err);
                             continue;
                         }
@@ -2001,10 +2079,14 @@ pub fn download_one(
                 fs::rename(&part, &dest).with_context(|| {
                     format!("重命名失败: {} → {}", part.display(), dest.display())
                 })?;
+                let _ = fs::remove_file(resume_metadata_path(&part));
                 info!(item = item.id, path = %dest.display(), "下载完成");
                 return Ok(dest);
             }
             Err(err) => {
+                if cancel.load(Ordering::Relaxed) {
+                    bail!("已取消");
+                }
                 warn!(item = item.id, url, error = %err, "该下载源失败，尝试下一个");
                 // 换源前先算账：累计传输已经超过登记大小的 3 倍还在失败，说明所有源
                 // 都在反复给错误内容，继续换下去只是继续烧用户的流量。
@@ -2213,31 +2295,106 @@ fn unpack_archive(
         .parent()
         .ok_or_else(|| anyhow!("目标路径没有父目录: {}", dest.display()))?;
     // 按 URL 的扩展名选解压器：.tar.bz2 走便携 Python，其余沿用内置 zip 解析器。
+    let staging =
+        crate::utils::TempPathGuard::dir(dir.join(format!(".v2w-unpack-{}", uuid::Uuid::new_v4())));
+    let contents = staging.path().join("contents");
+    fs::create_dir_all(&contents)?;
     let n = match archive_kind_from_url(url) {
-        ArchiveKind::TarBz2 => extract_tar_bz2(part, dir, cancel)
+        ArchiveKind::TarBz2 => extract_tar_bz2(part, &contents, cancel)
             .with_context(|| format!("解压失败: {}", part.display()))?,
-        ArchiveKind::Zip => {
-            let bytes =
-                fs::read(part).with_context(|| format!("读取压缩包失败: {}", part.display()))?;
-            super::zip_extract::extract_zip(&bytes, dir)
-                .with_context(|| format!("解压失败: {}", part.display()))?
-        }
+        ArchiveKind::Zip => super::zip_extract::extract_zip_file(part, &contents, Some(cancel))
+            .with_context(|| format!("解压失败: {}", part.display()))?,
     };
     if n == 0 {
         bail!("压缩包里没有可用的文件: {}", part.display());
     }
-    if !dest.exists() {
+    let entry = contents.join(dest.file_name().context("目标文件名为空")?);
+    if !entry.is_file() {
         bail!(
             "解压完成但缺少入口文件 {}（压缩包内容与登记不符）",
             dest.display()
         );
     }
+    validate_payload(&entry, item.dest)?;
     if let Some(companion) = item.companion {
-        if !dir.join(companion).exists() {
+        if !contents.join(companion).is_file() || fs::metadata(contents.join(companion))?.len() == 0
+        {
             bail!("解压完成但缺少伴生文件 {companion}（可能压缩包不完整）");
         }
     }
+    if let Err(err) = publish_archive(&contents, &staging.path().join("backup"), dir, cancel) {
+        let retained = staging.path().display().to_string();
+        staging.disarm();
+        return Err(err).with_context(|| format!("安装组件失败，恢复文件保留在 {retained}"));
+    }
     fs::remove_file(part).with_context(|| format!("清理中间文件失败: {}", part.display()))?;
+    let _ = fs::remove_file(resume_metadata_path(part));
+    Ok(())
+}
+
+/// 安装前完整解压校验；安装中途失败或取消时恢复旧文件。
+fn publish_archive(contents: &Path, backup: &Path, dest: &Path, cancel: &AtomicBool) -> Result<()> {
+    let mut pending = vec![contents.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                pending.push(entry.path());
+            } else if entry.file_type()?.is_file() {
+                files.push(entry.path().strip_prefix(contents)?.to_path_buf());
+            } else {
+                bail!("组件包包含不支持的文件类型");
+            }
+        }
+    }
+    files.sort();
+    let mut installed: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    let result: Result<()> = (|| {
+        for relative in files {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("已取消");
+            }
+            let target = dest.join(&relative);
+            fs::create_dir_all(target.parent().context("目标目录为空")?)?;
+            let old = if target.exists() {
+                if !target.is_file() {
+                    bail!("目标位置不是普通文件，拒绝覆盖：{}", target.display());
+                }
+                let saved = backup.join(&relative);
+                fs::create_dir_all(saved.parent().context("备份目录为空")?)?;
+                fs::rename(&target, &saved)
+                    .with_context(|| format!("组件可能正在使用，无法替换 {}", target.display()))?;
+                Some(saved)
+            } else {
+                None
+            };
+            installed.push((target.clone(), old));
+            fs::rename(contents.join(relative), &target)
+                .with_context(|| format!("安装组件文件失败：{}", target.display()))?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = result {
+        let mut recovery_errors = Vec::new();
+        for (target, old) in installed.into_iter().rev() {
+            if target.is_file() {
+                if let Err(e) = fs::remove_file(&target) {
+                    recovery_errors.push(e.to_string());
+                    continue;
+                }
+            }
+            if let Some(old) = old {
+                if let Err(e) = fs::rename(old, target) {
+                    recovery_errors.push(e.to_string());
+                }
+            }
+        }
+        if recovery_errors.is_empty() {
+            return Err(err);
+        }
+        bail!("{err:#}；恢复旧组件失败：{}", recovery_errors.join("；"));
+    }
     Ok(())
 }
 
@@ -2321,6 +2478,7 @@ fn sweep_parts_for_at(dests: &[PathBuf], now: SystemTime) -> usize {
         }
         match fs::remove_file(&part) {
             Ok(()) => {
+                let _ = fs::remove_file(resume_metadata_path(&part));
                 info!(path = %part.display(), "已清理过期残留的下载中间文件");
                 removed += 1;
             }
@@ -2351,6 +2509,90 @@ fn part_path_for(dest: &Path) -> Option<PathBuf> {
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)";
 
+pub(super) fn validate_payload(path: &Path, name: &str) -> Result<()> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("无法读取下载文件：{}", path.display()))?;
+    let mut head = [0u8; 512];
+    let n = file.read(&mut head).context("读取下载文件头失败")?;
+    let bytes = &head[..n];
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim_start_matches('\u{feff}').trim_start();
+    let lower = text.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    if bytes.is_empty()
+        || lower.starts_with("<!doctype")
+        || lower.starts_with("<html")
+        || lower.starts_with("<head")
+        || lower.starts_with("<body")
+        || (!name.ends_with(".txt") && lower.starts_with('{'))
+        || lower.starts_with("version https://git-lfs.github.com/spec/")
+    {
+        bail!("下载内容为空、错误页或 Git LFS 指针，不是有效的组件文件");
+    }
+    let expected: Option<&[u8]> = if name.ends_with(".bin") {
+        Some(b"lmgg")
+    } else if name.ends_with(".gguf") {
+        Some(b"GGUF")
+    } else if name.ends_with(".exe") {
+        Some(b"MZ")
+    } else if name.ends_with(".zip") {
+        Some(b"PK\x03\x04")
+    } else if name.ends_with(".tar.bz2") {
+        Some(b"BZh")
+    } else {
+        None
+    };
+    if let Some(expected) = expected {
+        if !bytes.starts_with(expected) {
+            bail!("下载文件格式不匹配（{name}），已拒绝保存；请重试或切换下载源");
+        }
+    }
+    Ok(())
+}
+
+/// 续传必须属于同一源、同一版本；完整性由 HTTP 长度及下载后的内容校验共同确认。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ResumeMetadata {
+    url: String,
+    validator: Option<String>,
+    total: u64,
+    complete: bool,
+}
+
+pub(super) fn resume_metadata_path(part: &Path) -> PathBuf {
+    let mut name = part.as_os_str().to_os_string();
+    name.push(".meta");
+    PathBuf::from(name)
+}
+
+fn read_resume_metadata(part: &Path) -> Option<ResumeMetadata> {
+    let path = resume_metadata_path(part);
+    if fs::metadata(&path).ok()?.len() > 64 * 1024 {
+        return None;
+    }
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn write_resume_metadata(part: &Path, metadata: &ResumeMetadata) -> Result<()> {
+    let path = resume_metadata_path(part);
+    let tmp = path.with_extension("meta.tmp");
+    fs::write(&tmp, serde_json::to_vec(metadata)?).context("写入续传信息失败")?;
+    fs::rename(&tmp, &path).context("保存续传信息失败")
+}
+
+pub(super) fn discard_partial(part: &Path) {
+    let _ = fs::remove_file(part);
+    let _ = fs::remove_file(resume_metadata_path(part));
+}
+
+fn response_validator(response: &ureq::Response) -> Option<String> {
+    response
+        .header("ETag")
+        .filter(|v| !v.starts_with("W/"))
+        .or_else(|| response.header("Last-Modified"))
+        .map(str::to_owned)
+}
+
 /// 断点续传的起点判定：返回需要续传的字节偏移量。
 ///
 /// 只有「`.part` 已有内容」且「尚未达到期望大小」时才续传；其余情况一律返回
@@ -2371,18 +2613,26 @@ fn range_header(offset: u64) -> String {
 
 /// 从 `Content-Range` 响应头里解析本次响应的**起始字节偏移**。
 ///
-/// 形如 `bytes 500-999/1000` 或 `bytes 500-/1000`，返回 `Some(500)`；
-/// 格式不认识时返回 `None`。抽成纯函数便于单测（真正的 206 响应要联网才有）。
+/// 只接受起止位置与总长完整、范围合法的响应。
+#[cfg(test)]
 fn content_range_start(value: &str) -> Option<u64> {
-    let rest = value.trim().strip_prefix("bytes")?.trim_start();
-    let start = rest.split('/').next()?.split('-').next()?;
-    start.trim().parse::<u64>().ok()
+    parse_content_range(value).map(|(start, _, _)| start)
+}
+
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?;
+    let end = end.trim().parse::<u64>().ok()?;
+    let total = total.trim().parse::<u64>().ok()?;
+    (start <= end && end < total).then_some((start, end, total))
 }
 
 /// 计算文件的 sha256，返回 64 位十六进制小写字符串。
 ///
 /// 独立成函数便于单测：喂固定内容即可验证，不需要联网。
-fn sha256_file(path: &Path) -> Result<String> {
+pub(super) fn sha256_file(path: &Path) -> Result<String> {
     let mut file =
         fs::File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -2410,9 +2660,9 @@ fn send_get(
     agent: &ureq::Agent,
     url: &str,
     item_id: &str,
-    resume: Option<u64>,
+    resume: Option<(u64, &str)>,
 ) -> Result<ureq::Response> {
-    let Some(offset) = resume else {
+    let Some((offset, validator)) = resume else {
         // 不带 Range：整文件下载。
         return agent
             .get(url)
@@ -2424,6 +2674,7 @@ fn send_get(
         .get(url)
         .set("User-Agent", USER_AGENT)
         .set("Range", &range_header(offset))
+        .set("If-Range", validator)
         .call()
     {
         Ok(resp) => Ok(resp),
@@ -2486,7 +2737,7 @@ fn retry_budget_exhausted(transferred: u64, expected: u64) -> bool {
     expected > 0 && transferred > expected.saturating_mul(3)
 }
 
-fn fetch_to_file(
+pub(super) fn fetch_to_file(
     url: &str,
     part: &Path,
     expected_size: u64,
@@ -2495,166 +2746,149 @@ fn fetch_to_file(
     progress: Option<&ProgressFn>,
     net_bytes: &mut u64,
 ) -> Result<()> {
-    // 大文件（最大 833 MB）在慢网下需要足够长的**总**上限；但只有总上限是不够的：
-    // 连接建好之后对端不再发数据时，总超时会把界面卡在「下载中 … 0 B」上整整两小时，
-    // 既不报错也不换源，用户只能手动点取消（镜像端不响应时实测就是这样）。所以除总
-    // 上限外还有一条连接超时与一条**空闲**超时（见各自的常量文档）。
+    if cancel.load(Ordering::Relaxed) {
+        bail!("已取消");
+    }
     let agent = build_download_agent(
         DOWNLOAD_IDLE_TIMEOUT,
         DOWNLOAD_CONNECT_TIMEOUT,
         DOWNLOAD_TOTAL_TIMEOUT,
     );
-
-    // `.part` 的现有大小：用于判断能否续传。
     let existing = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
-
-    // 已不小于期望大小：多半是上次下完但没来得及 rename（进程被杀）。
-    // 直接跳过网络、交给上层做大小 / 哈希校验，省下一次几百 MB 的重下。
-    if expected_size > 0 && existing >= expected_size {
-        // 超过登记大小说明这份 `.part` 根本不是我们要的东西（错误页 / 别的资产 /
-        // 代理把两段拼在了一起）。这里必须删掉重下——否则上层会把它 rename 成正式
-        // 文件名，用户拿到一个「大小不对但没人报错」的模型。
-        if exceeds_expected(existing, expected_size) {
-            warn!(
-                item = item_id,
-                bytes = existing,
-                expected = expected_size,
-                "临时文件大于登记大小，判为损坏并丢弃"
-            );
-            let _ = fs::remove_file(part);
-        } else {
-            info!(
-                item = item_id,
-                bytes = existing,
-                "已有完整的临时文件，跳过下载直接校验"
-            );
-            if let Some(cb) = progress {
-                cb(existing, existing, item_id);
-            }
-            return Ok(());
+    let metadata = read_resume_metadata(part).filter(|m| m.url == url);
+    // 只有已记录正常 EOF 的同源文件才能跳过网络；单看大小不能证明完整。
+    if metadata
+        .as_ref()
+        .is_some_and(|m| m.complete && m.total > 0 && existing == m.total)
+    {
+        if let Some(cb) = progress {
+            cb(existing, existing, item_id);
         }
+        return Ok(());
     }
-
-    let requested_resume = resume_offset(existing, expected_size);
-
-    // 发请求；若 Range 被服务端拒绝，`send_get` 内部已回退为整文件请求。
+    let requested_resume = metadata
+        .as_ref()
+        .and_then(|m| Some((resume_offset(existing, m.total)?, m.validator.as_deref()?)));
     let mut resp = send_get(&agent, url, item_id, requested_resume)?;
     let mut resume = requested_resume;
-
-    // 服务端回 206 只说明「我按 Range 给了部分内容」，并不保证起点就是我们要的
-    // 偏移——有的镜像 / 代理会忽略或错解 `Range`，若直接把 body 追加进 `.part`，
-    // 会把两段错位的字节拼成一个「大小对、内容错」的文件（哈希校验才拦得住，
-    // 未登记哈希的条目则会被静默损坏）。这里核对 `Content-Range` 的起点：
-    // 对不上（或拿不到该头）就丢弃这个响应，改发一次**不带 Range** 的整文件请求。
-    if resp.status() == 206 {
-        match resp.header("Content-Range").and_then(content_range_start) {
-            Some(start) if Some(start) == resume => {}
-            got => {
-                warn!(
-                    item = item_id,
-                    url,
-                    got = ?got,
-                    requested = ?resume,
-                    "206 响应的 Content-Range 起点与续传偏移不符，放弃续传、改为整文件重下"
-                );
-                resp = send_get(&agent, url, item_id, None)?;
-                resume = None;
+    if resp.status() == 206 || resp.header("Content-Range").is_some() {
+        let range = resp.header("Content-Range").and_then(parse_content_range);
+        let valid = match (resp.status(), range, resume, metadata.as_ref()) {
+            (206, Some((start, end, total)), Some((offset, validator)), Some(m)) => {
+                start == offset
+                    && end + 1 == total
+                    && total == m.total
+                    && response_validator(&resp).as_deref() == Some(validator)
             }
+            (200, Some((0, end, total)), _, _) => end + 1 == total,
+            _ => false,
+        };
+        if !valid {
+            warn!(
+                item = item_id,
+                url, "续传响应的版本或范围不符，改为整文件下载"
+            );
+            drop(resp);
+            resp = send_get(&agent, url, item_id, None)?;
+            resume = None;
         }
     }
-
     let status = resp.status();
-    // 只有「发了 Range 且服务端明确回 206」才续写；其余（含 200）一律截断重下，
-    // 保证不会把两段不同来源的字节拼在一起。
+    if status != 200 && !(status == 206 && resume.is_some()) {
+        bail!("下载源返回了无效的 HTTP {status} 响应，未保存为完整文件");
+    }
+    if resp.header("Content-Type").is_some_and(|v| {
+        let v = v.to_ascii_lowercase();
+        v.contains("text/html") || v.contains("application/json")
+    }) {
+        bail!("下载源返回了错误页，未下载到组件文件");
+    }
+    if cancel.load(Ordering::Relaxed) {
+        bail!("已取消");
+    }
     let appending = status == 206 && resume.is_some();
-
+    let remaining = resp
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let response_total = if appending || resp.header("Content-Range").is_some() {
+        let (start, end, total) = resp
+            .header("Content-Range")
+            .and_then(parse_content_range)
+            .context("续传响应缺少合法的 Content-Range")?;
+        if (!appending && start != 0) || end + 1 != total {
+            bail!("下载源把部分内容当作完整响应返回，已拒绝保存");
+        }
+        if remaining > 0 && remaining != end - start + 1 {
+            bail!("续传响应的 Content-Length 与 Content-Range 不一致");
+        }
+        total
+    } else {
+        remaining
+    };
+    let mut receipt = ResumeMetadata {
+        url: url.to_string(),
+        validator: response_validator(&resp),
+        total: response_total,
+        complete: false,
+    };
     let (mut file, mut written) = if appending {
         let f = fs::OpenOptions::new()
-            .create(true)
             .append(true)
             .open(part)
             .with_context(|| format!("打开临时文件失败: {}", part.display()))?;
-        // 以文件**真实长度**为续写起点，而不是 metadata 快照——两者之间文件若被
-        // 截断，用旧快照会让进度与实际字节数对不上。
-        let base = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let base = f.metadata()?.len();
+        if Some(base) != resume.map(|(offset, _)| offset) {
+            bail!("临时文件在续传前发生变化，请重新下载");
+        }
         (f, base)
     } else {
         let f = fs::File::create(part)
             .with_context(|| format!("创建临时文件失败: {}", part.display()))?;
         (f, 0)
     };
-
-    // 进度条的总字节数一律用**登记大小**：206 响应里 `Content-Length` 只是剩余
-    // 长度，直接当总数会让进度从 0 跳变甚至倒退。
-    let remaining = resp
-        .header("Content-Length")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    // 服务端声明的**整文件**大小只在 200（整文件响应）时可推：206 的 Content-Length
-    // 只是剩余部分。续传时 written 里已含前缀，两者相加才是完整大小。
-    let server_declared = if status == 200 && remaining > 0 {
-        written.saturating_add(remaining)
-    } else {
-        0
-    };
-    // 上限以登记大小为准，但**登记值过期时以服务端为准**（见 `resolve_size_bound`）——
-    // 否则上游换了更大的量化版本之后，正常下载会被自己的上限拦死。
-    let (bound, registry_stale) = resolve_size_bound(expected_size, server_declared);
+    write_resume_metadata(part, &receipt)?;
+    let (bound, registry_stale) = resolve_size_bound(expected_size, response_total);
     if registry_stale {
         warn!(
             item = item_id,
             registry = expected_size,
-            server = server_declared,
-            "登记大小与服务端不一致（多半是上游换了文件），本次按服务端大小放行"
+            server = response_total,
+            "登记大小与服务端不一致，本次以服务端完整长度为准"
         );
     }
-    let total = if bound > 0 {
-        bound
+    let total = if response_total > 0 {
+        response_total
     } else {
-        written + remaining
+        bound
     };
-    // 本次实际下载的字节数（用于测速）；`written` 里含续传前已有的部分。
     let base_bytes = written;
-
     let mut reader = resp.into_reader();
-
     let mut buf = vec![0u8; 256 * 1024];
     let started = Instant::now();
     let mut last_report = Instant::now();
-
+    if let Some(cb) = progress {
+        cb(written, total, item_id);
+    }
     loop {
         if cancel.load(Ordering::Relaxed) {
-            drop(file);
-            // 保留 `.part`：用户重新点下载时可以接着下，不必从头再来。
-            return Err(anyhow!("已取消"));
+            bail!("已取消");
         }
-        // 文案里点出「对端长时间没有数据」：这正是空闲超时最常见的原因，
-        // 比一句干巴巴的「读取失败」更能让用户知道该换源还是查网络。
         let n = reader
             .read(&mut buf)
             .context("下载中断：读取响应流失败（网络中断，或对端长时间没有数据）")?;
         if n == 0 {
             break;
         }
-        // 先算「写完会有多少」，超限就**不写**：宁可少写一次，也不要为了报错先把
-        // 几百 MB 的错误内容落到盘上。
         let prospective = written.saturating_add(n as u64);
+        *net_bytes = net_bytes.saturating_add(n as u64);
         if exceeds_expected(prospective, bound) {
             drop(file);
-            let _ = fs::remove_file(part);
-            return Err(anyhow!(
-                "下载内容超出登记大小：已收到 {:.1} MB，登记 {:.1} MB（疑似镜像返回了错误内容）",
-                prospective as f64 / MB as f64,
-                bound as f64 / MB as f64
-            ));
+            discard_partial(part);
+            bail!("下载内容超出预期大小，疑似镜像返回了错误内容");
         }
         file.write_all(&buf[..n]).context("写入文件失败")?;
-        written += n as u64;
-        // 累计**网络**字节（跨重试 / 换源），用来判断「是不是所有源都在反复给错东西」。
-        *net_bytes = net_bytes.saturating_add(n as u64);
-
-        // 限流上报：进度条不需要每 256KB 刷一次，100ms 一次足够顺滑，
-        // 也能让 UI 线程少做无谓的重绘。
+        written = prospective;
         if last_report.elapsed() >= Duration::from_millis(100) {
             last_report = Instant::now();
             if let Some(cb) = progress {
@@ -2663,37 +2897,37 @@ fn fetch_to_file(
         }
     }
     file.flush().context("刷盘失败")?;
+    file.sync_all().context("保存下载文件失败")?;
     drop(file);
-
+    if cancel.load(Ordering::Relaxed) {
+        bail!("已取消");
+    }
+    if response_total > 0 && written != response_total {
+        bail!("下载不完整：收到 {written} 字节，服务端声明 {response_total} 字节");
+    }
+    // 登记体积是近似值，只有它没有精确长度；不能替代 HTTP 的完整长度校验。
+    if expected_size > 0 && (written as f64) < expected_size as f64 * 0.95 {
+        bail!("下载不完整：收到 {written} 字节，登记大小约 {expected_size} 字节");
+    }
+    receipt.total = written;
+    receipt.complete = true;
+    write_resume_metadata(part, &receipt)?;
     if let Some(cb) = progress {
         cb(written, total.max(written), item_id);
     }
-
-    // 大小校验：截断的下载是「模型加载失败」最常见也最难查的根因
-    if expected_size > 0 {
-        let expected = expected_size as f64;
-        let actual = written as f64;
-        if actual < expected * 0.95 {
-            return Err(anyhow!(
-                "下载不完整：收到 {:.1} MB，期望至少 {:.1} MB",
-                actual / MB as f64,
-                expected * 0.95 / MB as f64
-            ));
-        }
-    }
-
-    // 测速只算本次真正下载的字节数（续传时不含此前已有的部分）。
     let fetched = written.saturating_sub(base_bytes);
-    let secs = started.elapsed().as_secs_f64().max(0.001);
     info!(
         item = item_id,
         mb = fetched / MB,
-        secs = secs,
-        speed_mbps = (fetched as f64 / MB as f64) / secs,
-        "下载完成"
+        secs = started.elapsed().as_secs_f64(),
+        "下载传输完成，等待内容校验"
     );
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "model_download_tests.rs"]
+pub(super) mod download_regression_tests;
 
 #[cfg(test)]
 mod disk_space_tests {
@@ -2798,6 +3032,18 @@ mod item_and_presence_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_stub(path: impl AsRef<Path>, size: usize) -> std::io::Result<()> {
+        let path = path.as_ref();
+        let mut data = vec![0u8; size];
+        let magic: &[u8] = match path.extension().and_then(|v| v.to_str()) {
+            Some("bin") => b"lmgg",
+            Some("exe") => b"MZ",
+            _ => b"",
+        };
+        data[..magic.len()].copy_from_slice(magic);
+        fs::write(path, data)
+    }
 
     /// 源排序：国内源优先、失败的沉底，且**任何一条都不被丢弃**。
     ///
@@ -3116,9 +3362,9 @@ with tarfile.open(out, "w:bz2") as tf:
         let base = std::env::temp_dir().join(format!("v2w_dirsize_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("sub/deep")).unwrap();
-        std::fs::write(base.join("a.bin"), vec![0u8; 100]).unwrap();
-        std::fs::write(base.join("sub/b.bin"), vec![0u8; 200]).unwrap();
-        std::fs::write(base.join("sub/deep/c.bin"), vec![0u8; 300]).unwrap();
+        write_stub(base.join("a.bin"), 100).unwrap();
+        write_stub(base.join("sub/b.bin"), 200).unwrap();
+        write_stub(base.join("sub/deep/c.bin"), 300).unwrap();
         assert_eq!(super::dir_size(&base), 600, "必须把子目录里的文件都算上");
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -3285,15 +3531,15 @@ with tarfile.open(out, "w:bz2") as tf:
 
         // 造一个明显截断的文件（10% 大小）→ 仍应判为缺失
         fs::create_dir_all(real.parent().unwrap()).unwrap();
-        fs::write(&real, vec![0u8; 100]).unwrap();
+        write_stub(&real, 100).unwrap();
         assert!(!is_present(&item), "截断文件应判为缺失");
 
         // 写足大小 → 判为已就位
-        fs::write(&real, vec![0u8; 1000]).unwrap();
+        write_stub(&real, 1000).unwrap();
         assert!(is_present(&item), "大小达标应判为已就位");
 
         // 稍小但在 5% 容差内 → 仍算就位（上游重新导出会有微小出入）
-        fs::write(&real, vec![0u8; 970]).unwrap();
+        write_stub(&real, 970).unwrap();
         assert!(is_present(&item), "5% 容差内的差异应算就位");
 
         let _ = fs::remove_file(&real);
@@ -3357,11 +3603,11 @@ with tarfile.open(out, "w:bz2") as tf:
         };
 
         // 只有入口文件 → 仍判为缺失（伴生文件不在）
-        fs::write(&real, vec![0u8; 10]).unwrap();
+        write_stub(&real, 10).unwrap();
         assert!(!is_present(&item), "缺少伴生文件时必须判为缺失");
 
         // 补上伴生文件 → 判为已就位
-        fs::write(dir.join("tool-server.exe"), vec![0u8; 10]).unwrap();
+        write_stub(dir.join("tool-server.exe"), 10).unwrap();
         assert!(is_present(&item), "入口与伴生文件都在时应判为已就位");
 
         let _ = fs::remove_dir_all(&dir);
@@ -3392,7 +3638,7 @@ with tarfile.open(out, "w:bz2") as tf:
             sha256: None,
         };
         // 入口 5 MB（> 2 MB 阈值）且没有 tool.dll → 应判为已就位
-        fs::write(&real, vec![0u8; 5_000_000]).unwrap();
+        write_stub(&real, 5_000_000).unwrap();
         assert!(is_present(&item), "静态自包含构建不应因缺 DLL 被判为缺失");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3424,14 +3670,14 @@ with tarfile.open(out, "w:bz2") as tf:
         };
 
         // 1) 大单文件、无 DLL → 判定为自编译构建
-        fs::write(&entry, vec![0u8; 5_000_000]).unwrap();
+        write_stub(&entry, 5_000_000).unwrap();
         assert!(
             looks_like_custom_build(&item, &entry),
             "60MB 级单文件应被识别为自编译构建"
         );
 
         // 2) 补上随附 DLL（本项目自己下载展开的形态）→ 不再视为自编译，允许升级覆盖
-        fs::write(dir.join("tool.dll"), vec![0u8; 10]).unwrap();
+        write_stub(dir.join("tool.dll"), 10).unwrap();
         assert!(
             !looks_like_custom_build(&item, &entry),
             "有随附 DLL 时不应视为自编译构建"
@@ -3439,7 +3685,7 @@ with tarfile.open(out, "w:bz2") as tf:
 
         // 3) 小体积启动桩（官方形态）→ 不是自编译构建
         let _ = fs::remove_file(dir.join("tool.dll"));
-        fs::write(&entry, vec![0u8; 300_000]).unwrap();
+        write_stub(&entry, 300_000).unwrap();
         assert!(
             !looks_like_custom_build(&item, &entry),
             "几百 KB 的官方启动桩不应被判为自编译构建"
@@ -3462,7 +3708,7 @@ with tarfile.open(out, "w:bz2") as tf:
         let entry = dir.join("whisper-cli.exe");
         // 入口是几百 KB 的官方形态桩（低于 SELF_CONTAINED_ENTRY_FLOOR），
         // 因此只能靠 ggml-vulkan.dll 这条证据识别。
-        fs::write(&entry, vec![0u8; 485_888]).unwrap();
+        write_stub(&entry, 485_888).unwrap();
         let item = DownloadItem {
             id: "whisper-cli",
             label: "t",
@@ -3479,14 +3725,14 @@ with tarfile.open(out, "w:bz2") as tf:
         };
 
         // 1) 纯 CPU 形态：有 companion、无 vulkan DLL → 不算自定义构建
-        fs::write(dir.join("whisper.dll"), vec![0u8; 483_840]).unwrap();
+        write_stub(dir.join("whisper.dll"), 483_840).unwrap();
         assert!(
             !looks_like_custom_build(&item, &entry),
             "官方 CPU 形态（桩 + companion，无 vulkan）不应被判为自定义构建"
         );
 
         // 2) 加上 ggml-vulkan.dll → 判为 GPU 自定义构建
-        fs::write(dir.join("ggml-vulkan.dll"), vec![0u8; 1024]).unwrap();
+        write_stub(dir.join("ggml-vulkan.dll"), 1024).unwrap();
         assert!(
             looks_like_custom_build(&item, &entry),
             "带 ggml-vulkan.dll 的构建应被判为自定义，避免被 CPU 包覆盖"
@@ -3494,7 +3740,7 @@ with tarfile.open(out, "w:bz2") as tf:
 
         // 3) 测试 CUDA / cuBLAS DLL 同样能被正确识别为 GPU 构建
         fs::remove_file(dir.join("ggml-vulkan.dll")).unwrap();
-        fs::write(dir.join("cublas64_12.dll"), vec![0u8; 1024]).unwrap();
+        write_stub(dir.join("cublas64_12.dll"), 1024).unwrap();
         assert!(
             looks_like_custom_build(&item, &entry),
             "带 cublas64_12.dll 的构建应被判为 GPU 自定义构建"
@@ -3504,7 +3750,7 @@ with tarfile.open(out, "w:bz2") as tf:
     }
 
     /// 构造一个最小 zip（全部「存储」条目），供解压测试使用。
-    fn tiny_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(super) fn tiny_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut central = Vec::new();
         for (name, data) in files {
@@ -3580,7 +3826,7 @@ with tarfile.open(out, "w:bz2") as tf:
         let part = dir.join("tool.exe.part");
         fs::write(
             &part,
-            tiny_zip(&[("tool.exe", b"exe"), ("tool-server.exe", b"server")]),
+            tiny_zip(&[("tool.exe", b"MZexe"), ("tool-server.exe", b"MZserver")]),
         )
         .unwrap();
         let dest = dir.join("tool.exe");
@@ -3623,7 +3869,7 @@ with tarfile.open(out, "w:bz2") as tf:
         };
         let part = dir.join("tool.exe.part");
         // 只有入口，缺伴生文件
-        fs::write(&part, tiny_zip(&[("tool.exe", b"exe")])).unwrap();
+        fs::write(&part, tiny_zip(&[("tool.exe", b"MZexe")])).unwrap();
         let dest = dir.join("tool.exe");
 
         assert!(
@@ -3672,7 +3918,7 @@ with tarfile.open(out, "w:bz2") as tf:
         fs::create_dir_all(&dir).unwrap();
         let fake_ffmpeg = dir.join("my-ffmpeg.exe");
         // 造一个「像样的可执行文件」（大小超过 ffmpeg 的 min_size）
-        fs::write(&fake_ffmpeg, vec![0u8; 300_000]).unwrap();
+        write_stub(&fake_ffmpeg, 300_000).unwrap();
 
         let mut cfg = AppConfig::default();
         cfg.paths.ffmpeg = fake_ffmpeg.to_string_lossy().to_string();
@@ -3702,7 +3948,7 @@ with tarfile.open(out, "w:bz2") as tf:
         // 只有一个 exe，没有 llama-server.exe / DLL（模拟静态构建）
         let custom = dir.join("llama-completion.exe");
         // 3 MB >= `SELF_CONTAINED_ENTRY_FLOOR`（2 MB）：这才算「静态自包含单文件」形态
-        fs::write(&custom, vec![0u8; 3_000_000]).unwrap();
+        write_stub(&custom, 3_000_000).unwrap();
 
         let mut cfg = AppConfig::default();
         cfg.paths.llama_cli = custom.to_string_lossy().to_string();
@@ -3803,7 +4049,7 @@ with tarfile.open(out, "w:bz2") as tf:
         fs::create_dir_all(&dir).unwrap();
 
         let file = dir.join("my-ffmpeg.exe");
-        fs::write(&file, vec![0u8; 4096]).unwrap();
+        write_stub(&file, 4096).unwrap();
 
         let mut cfg = AppConfig::default();
         // 绝对路径会被 `resolve_path` 原样保留，且 `resolve_existing_path`
@@ -3894,8 +4140,8 @@ with tarfile.open(out, "w:bz2") as tf:
 
         let exe = dir.join("ffmpeg.exe");
         // >= 2 MB 的大单文件 + 官方 CPU 包从不提供的 GPU 后端 DLL。
-        fs::write(&exe, vec![0u8; 3_000_000]).unwrap();
-        fs::write(dir.join("ggml-vulkan.dll"), vec![0u8; 1024]).unwrap();
+        write_stub(&exe, 3_000_000).unwrap();
+        write_stub(dir.join("ggml-vulkan.dll"), 1024).unwrap();
 
         let mut cfg = AppConfig::default();
         cfg.paths.ffmpeg = exe.to_string_lossy().to_string();
@@ -4154,10 +4400,7 @@ with tarfile.open(out, "w:bz2") as tf:
     fn content_range_start_parses_offset() {
         assert_eq!(content_range_start("bytes 500-999/1000"), Some(500));
         assert_eq!(content_range_start("bytes 0-99/100"), Some(0));
-        assert_eq!(
-            content_range_start("bytes 4078768-/4078768"),
-            Some(4_078_768)
-        );
+        assert_eq!(content_range_start("bytes 4078768-/4078768"), None);
         assert_eq!(content_range_start("  bytes 1-2/3  "), Some(1));
         assert_eq!(content_range_start("items 500-999/1000"), None);
         assert_eq!(content_range_start("bytes abc-1/2"), None);
@@ -4244,7 +4487,7 @@ with tarfile.open(out, "w:bz2") as tf:
         fs::create_dir_all(&dir).unwrap();
         // 造一个「够大」的假 ffmpeg（`is_present` 对它有条体积下限）
         let fake_ffmpeg = dir.join("my-ffmpeg.exe");
-        fs::write(&fake_ffmpeg, vec![0u8; 300_000]).unwrap();
+        write_stub(&fake_ffmpeg, 300_000).unwrap();
 
         let mut cfg = AppConfig::default();
         cfg.paths.ffmpeg = fake_ffmpeg.to_string_lossy().to_string();
@@ -4305,7 +4548,7 @@ with tarfile.open(out, "w:bz2") as tf:
         fs::create_dir_all(&dir).unwrap();
         let custom = dir.join("llama-completion.exe");
         // 3 MB >= `SELF_CONTAINED_ENTRY_FLOOR`（2 MB）：这才算「静态自包含单文件」形态
-        fs::write(&custom, vec![0u8; 3_000_000]).unwrap();
+        write_stub(&custom, 3_000_000).unwrap();
 
         let mut cfg = AppConfig::default();
         cfg.paths.llama_cli = custom.to_string_lossy().to_string();

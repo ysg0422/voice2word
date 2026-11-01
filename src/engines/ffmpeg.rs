@@ -210,13 +210,108 @@ pub(crate) fn run_with_deadline(cmd: &mut Command, timeout: Duration) -> Result<
 /// 目录，否则 Windows 绝对路径的盘符冒号会被滤镜解析器当成选项分隔符。
 /// 抽成纯函数是为了让滤镜串可被单测直接断言，不必真的起 FFmpeg。
 fn subtitle_burn_filter(subtitle_file_name: &str) -> String {
-    // 文件名包在单引号里，自带单引号或反斜杠时会被滤镜解析器提前截断：
-    // 单引号按滤镜语法转义成 '\''，反斜杠翻倍。
-    // 顺序不能颠倒：反斜杠先翻倍，再转义单引号，否则会二次转义反斜杠。
-    let escaped = subtitle_file_name
-        .replace('\\', "\\\\")
-        .replace('\'', r"'\''");
-    format!("subtitles=filename='{escaped}',scale=trunc(iw/2)*2:trunc(ih/2)*2")
+    format!(
+        "subtitles=filename='{}',scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        escape_subtitle_name(subtitle_file_name)
+    )
+}
+
+/// 滤镜串里字幕文件名的转义。
+///
+/// 文件名包在单引号里，自带单引号或反斜杠时会被滤镜解析器提前截断：单引号按滤镜
+/// 语法转义成 `'\''`，反斜杠翻倍。顺序不能颠倒——先翻倍反斜杠再转义单引号，否则
+/// 会二次转义。
+fn escape_subtitle_name(name: &str) -> String {
+    name.replace('\\', "\\\\").replace('\'', r"'\''")
+}
+
+/// 竖屏切片导出参数（1080×1920 默认）。
+#[derive(Debug, Clone)]
+pub struct VerticalClipOptions {
+    pub width: u32,
+    pub height: u32,
+    pub crf: u32,
+    pub preset: String,
+}
+
+impl Default for VerticalClipOptions {
+    fn default() -> Self {
+        Self {
+            width: 1080,
+            height: 1920,
+            crf: 20,
+            preset: "veryfast".to_string(),
+        }
+    }
+}
+
+/// 组装竖屏切片导出的命令行参数（**纯函数**，便于脱离子进程测试）。
+///
+/// 画面处理只有一条：`scale=…:force_original_aspect_ratio=increase` 放大到覆盖
+/// 画布，再 `crop` 居中裁切——这是竖屏二创的通行做法（人脸跟随需要检测模型，
+/// 不在本轮范围）。字幕作为同一条滤镜链的下一环烧上去，因此字幕是在**竖屏画布
+/// 坐标**里渲染的，不会先按横屏排版再被裁掉。
+///
+/// `-ss` 放在 `-i` 之前是输入侧定位（关键帧跳跃，长素材上快一个量级）；配合
+/// `-t` 而不是 `-to`，避免「输入侧 `-ss` + 输出侧 `-to`」的基准混淆。
+pub fn build_vertical_clip_args(
+    input: &Path,
+    output: &Path,
+    start: f64,
+    duration: f64,
+    subtitle_name: Option<&str>,
+    opts: &VerticalClipOptions,
+) -> Vec<std::ffi::OsString> {
+    let start = if start.is_finite() {
+        start.max(0.0)
+    } else {
+        0.0
+    };
+    let duration = if duration.is_finite() {
+        duration.max(MIN_EDIT_DUR)
+    } else {
+        MIN_EDIT_DUR
+    };
+    let (w, h) = (opts.width.max(2), opts.height.max(2));
+    let mut filter = format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}");
+    if let Some(name) = subtitle_name {
+        filter.push_str(&format!(
+            ",subtitles=filename='{}'",
+            escape_subtitle_name(name)
+        ));
+    }
+
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-y".into(),
+        "-ss".into(),
+        format!("{start:.3}").into(),
+        "-t".into(),
+        format!("{duration:.3}").into(),
+        "-i".into(),
+        input.as_os_str().to_os_string(),
+        "-vf".into(),
+        filter.into(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        opts.preset.clone().into(),
+        "-crf".into(),
+        opts.crf.to_string().into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        "192k".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        output.as_os_str().to_os_string(),
+    ];
+    args.shrink_to_fit();
+    args
 }
 /// 字幕烧录（硬字幕合成）的编码参数。
 ///
@@ -611,6 +706,40 @@ impl FFmpegEngine {
         Ok(target_wav)
     }
 
+    /// 按指定采样率/声道数抽取整轨 WAV（pcm_s16le），给人声分离的输入端用。
+    ///
+    /// 与 [`Self::extract_audio_filtered`] 的区别只有输出规格：UVR MDX-Net 类模型
+    /// 训练在 44.1kHz 立体声上，喂 16k 单声道会直接退化分离质量；分离产物再走
+    /// 现有的 16k 抽取/推流链路即可，下游不需要感知这件事。
+    pub fn extract_wav_at<P1: AsRef<Path>, P2: AsRef<Path>>(
+        &self,
+        input_path: P1,
+        output_wav: P2,
+        rate: u32,
+        channels: u32,
+    ) -> Result<PathBuf> {
+        let input_path = input_path.as_ref();
+        let target_wav = output_wav.as_ref();
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(input_path)
+            .args(["-map", "0:a:0?", "-vn", "-sn", "-dn"])
+            .args(["-acodec", "pcm_s16le", "-ar"])
+            .arg(rate.to_string())
+            .arg("-ac")
+            .arg(channels.to_string())
+            .args(["-threads", "0"])
+            .arg(target_wav);
+        let status = run_with_deadline(&mut cmd, SUBPROCESS_LONG_TIMEOUT)
+            .with_context(|| format!("执行 FFmpeg 失败: {:?}", self.ffmpeg_path))?
+            .status;
+        if !status.success() {
+            anyhow::bail!("FFmpeg 音频提取返回非零退出码");
+        }
+        Ok(target_wav.to_path_buf())
+    }
+
     /// 抽取指定时间窗的音频为 16kHz 单声道 PCM WAV 文件。
     ///
     /// 与 [`Self::extract_audio`] 的区别：`-ss`/`-t` 放在 `-i` 之前做输入侧快速
@@ -703,6 +832,57 @@ impl FFmpegEngine {
             anyhow::bail!("FFmpeg 切片导出返回非零退出码：{detail}");
         }
         Ok(out_path)
+    }
+
+    /// 竖屏切片导出（9:16 居中裁切 + 可选烧录字幕）。
+    ///
+    /// `subtitle` 必须是**已经按切片相对时间轴写好**的 ASS：这里只负责把它烧到
+    /// 竖屏画布上，不做时间平移（平移属于字幕准备阶段，见 `ui::actions::export_clips_vertical`）。
+    pub fn export_vertical_clip(
+        &self,
+        input: &Path,
+        output: &Path,
+        start_sec: f64,
+        end_sec: f64,
+        subtitle: Option<&Path>,
+        opts: &VerticalClipOptions,
+    ) -> Result<PathBuf> {
+        if let Some(parent) = output.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("创建输出目录失败: {:?}", parent))?;
+            }
+        }
+        let duration = (end_sec - start_sec).max(MIN_EDIT_DUR);
+        let sub_name = match subtitle {
+            Some(path) => Some(
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .context("竖屏字幕文件名不是合法 UTF-8，无法构造烧录滤镜")?,
+            ),
+            None => None,
+        };
+
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
+        // 字幕按纯文件名引用，工作目录切到字幕所在目录（盘符冒号会被滤镜解析器
+        // 当成选项分隔符，与 `burn_subtitles` 同一口径）。
+        if let Some(dir) = subtitle
+            .and_then(|p| p.parent())
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            cmd.current_dir(dir);
+        }
+        cmd.args(build_vertical_clip_args(
+            input, output, start_sec, duration, sub_name, opts,
+        ));
+        let result = run_with_deadline(&mut cmd, SUBPROCESS_LONG_TIMEOUT)
+            .with_context(|| format!("执行 FFmpeg 竖屏切片导出失败: {:?}", self.ffmpeg_path))?;
+        if !result.status.success() {
+            let detail = format_stderr_tail(&result.stderr, STDERR_MESSAGE_CAP);
+            anyhow::bail!("FFmpeg 竖屏切片导出返回非零退出码：{detail}");
+        }
+        Ok(output.to_path_buf())
     }
 
     /// 纯内存管道推流：以 16kHz 单声道 s16le PCM WAV 格式将音频输出到 stdout 匿名管道 (0 磁盘 I/O)
@@ -1126,6 +1306,70 @@ impl FFmpegEngine {
         None
     }
 
+    /// 探测工程导出需要的画布与帧率（取首个视频流）。
+    ///
+    /// 解析 `ffmpeg -i` 的 stderr：尺寸取 `1920x1080`，帧率取 `29.97 fps` 或
+    /// `30000/1001 fps`。纯音频 / 损坏文件返回 `None`，调用方回落到
+    /// [`crate::subtitle::ProjectFormat::default`]。
+    pub fn get_format<P: AsRef<Path>>(
+        &self,
+        input_path: P,
+    ) -> Option<crate::subtitle::ProjectFormat> {
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        super::media_pipeline::apply_default_child_flags(&mut cmd);
+        cmd.arg("-i").arg(input_path.as_ref());
+        let output = run_with_deadline(&mut cmd, SUBPROCESS_TIMEOUT).ok()?;
+        Self::parse_project_format(&String::from_utf8_lossy(&output.stderr))
+    }
+
+    /// 从 `ffmpeg -i` 输出解析画布与帧率。抽成纯函数便于单测。
+    fn parse_project_format(stderr: &str) -> Option<crate::subtitle::ProjectFormat> {
+        let line = stderr.lines().find(|l| l.contains("Video:"))?;
+        let mut dims = None;
+        for token in line.split([',', ' ', '(', ')']) {
+            let Some((w, h)) = token.split_once('x') else {
+                continue;
+            };
+            let (Ok(w), Ok(h)) = (w.trim().parse::<u32>(), h.trim().parse::<u32>()) else {
+                continue;
+            };
+            // 过滤 0x001B 之类的十六进制杂讯与异常值
+            if (16..=16384).contains(&w) && (16..=16384).contains(&h) {
+                dims = Some((w, h));
+                break;
+            }
+        }
+        let (w, h) = dims?;
+        let fps = Self::parse_fps_from_line(line).unwrap_or(30.0);
+        Some(crate::subtitle::ProjectFormat::new(fps, w, h))
+    }
+
+    /// 在视频行里找 `X fps` 的 X（也接受 `30000/1001` 这种分数形式）。
+    fn parse_fps_from_line(line: &str) -> Option<f64> {
+        let tokens: Vec<&str> = line
+            .split([',', ' ', '(', ')'])
+            .filter(|t| !t.is_empty())
+            .collect();
+        for pair in tokens.windows(2) {
+            if pair[1] == "fps" {
+                if let Some(fps) = Self::parse_fps_token(pair[0]) {
+                    return Some(fps);
+                }
+            }
+        }
+        None
+    }
+
+    fn parse_fps_token(token: &str) -> Option<f64> {
+        if let Some((num, den)) = token.split_once('/') {
+            let n: f64 = num.parse().ok()?;
+            let d: f64 = den.parse().ok()?;
+            (d > 0.0).then_some(n / d)
+        } else {
+            token.parse().ok()
+        }
+    }
+
     /// 根据时间点快速抽取视频某一帧画面 (用于视频编辑监视器预览)
     pub fn extract_frame<P1: AsRef<Path>, P2: AsRef<Path>>(
         &self,
@@ -1484,6 +1728,27 @@ impl FFmpegEngine {
 #[cfg(test)]
 mod mux_tests {
     use super::*;
+
+    /// 帧率/画布解析：常见 30fps、29.97、竖屏与分数帧率都要认。
+    #[test]
+    fn parses_project_format_from_ffmpeg_stderr() {
+        let stderr = "Stream #0:0: Video: h264 (High), yuv420p, 1920x1080 [SAR 1:1 DAR 16:9], 29.97 fps, 29.97 tbr, 90k tbn\n";
+        let f = FFmpegEngine::parse_project_format(stderr).expect("应解析出格式");
+        assert_eq!((f.width, f.height), (1920, 1080));
+        assert!((f.fps - 29.97).abs() < 0.01);
+
+        let vertical = "Stream #0:0: Video: h264, yuv420p, 1080x1920, 60 fps, 60 tbr, 90k tbn";
+        let f = FFmpegEngine::parse_project_format(vertical).unwrap();
+        assert_eq!((f.width, f.height), (1080, 1920));
+        assert_eq!(f.fps, 60.0);
+
+        let fractional = "Stream #0:0: Video: h264, 1280x720, 30000/1001 fps, 29.97 tbr";
+        let f = FFmpegEngine::parse_project_format(fractional).unwrap();
+        assert!((f.fps - 29.97).abs() < 0.01);
+
+        // 无视频流 → None（调用方回落到默认 30/1920×1080）
+        assert!(FFmpegEngine::parse_project_format("Stream #0:0: Audio: aac, 44100 Hz").is_none());
+    }
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -1905,7 +2170,8 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'video.mp4':
 #[cfg(test)]
 mod clip_tests {
     use crate::engines::ffmpeg::{
-        build_replace_audio_args, plan_segment_clip, ClipKind, DEFAULT_CLIP_PAD,
+        build_replace_audio_args, build_vertical_clip_args, plan_segment_clip, ClipKind,
+        VerticalClipOptions, DEFAULT_CLIP_PAD,
     };
     use crate::subtitle::{Segment, MIN_EDIT_DUR};
     use std::path::Path;
@@ -2062,5 +2328,80 @@ mod clip_tests {
             .collect();
         assert!(duck_args.iter().any(|s| s.contains("volume=0.30")));
         assert!(duck_args.iter().any(|s| s.contains("amix=inputs=2")));
+    }
+
+    /// 竖屏切片参数：输入侧定位（`-ss` 在 `-i` 之前）+ 9:16 覆盖裁切 + 音频参数。
+    #[test]
+    fn vertical_clip_args_use_input_seek_and_cover_crop() {
+        let args = build_vertical_clip_args(
+            Path::new("in.mp4"),
+            Path::new("out.mp4"),
+            12.5,
+            8.25,
+            None,
+            &VerticalClipOptions::default(),
+        );
+        let text: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let joined = text.join(" ");
+        assert!(joined.contains("-ss 12.500"), "{joined}");
+        assert!(joined.contains("-t 8.250"), "{joined}");
+        assert!(
+            joined.contains("scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"),
+            "{joined}"
+        );
+        assert!(!joined.contains("subtitles="), "未给字幕时不应出现字幕滤镜");
+        let ss = text.iter().position(|s| s == "-ss").expect("缺 -ss");
+        let input = text.iter().position(|s| s == "-i").expect("缺 -i");
+        assert!(ss < input, "-ss 必须在 -i 之前（输入侧定位）");
+        assert!(text.contains(&"libx264".to_string()));
+        assert!(text.contains(&"yuv420p".to_string()));
+    }
+
+    /// 竖屏切片烧字幕：滤镜里带转义后的纯文件名（单引号按滤镜语法转义）。
+    #[test]
+    fn vertical_clip_args_escape_subtitle_name() {
+        let args = build_vertical_clip_args(
+            Path::new("in.mp4"),
+            Path::new("out.mp4"),
+            0.0,
+            3.0,
+            Some("it's.ass"),
+            &VerticalClipOptions::default(),
+        );
+        let joined = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains(r"subtitles=filename='it'\''s.ass'"),
+            "{joined}"
+        );
+    }
+
+    /// 竖屏切片参数对退化时间做兜底：负起点归零、非有限时长回到最短时长。
+    #[test]
+    fn vertical_clip_args_sanitize_degenerate_times() {
+        let args = build_vertical_clip_args(
+            Path::new("i.mp4"),
+            Path::new("o.mp4"),
+            -5.0,
+            f64::NAN,
+            None,
+            &VerticalClipOptions::default(),
+        );
+        let text: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            text.contains(&"0.000".to_string()),
+            "负起点应归零: {text:?}"
+        );
+        let t = text.iter().position(|s| s == "-t").expect("缺 -t");
+        assert_eq!(text[t + 1], format!("{MIN_EDIT_DUR:.3}"));
     }
 }

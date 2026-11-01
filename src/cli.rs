@@ -40,7 +40,8 @@ use crate::core::{PipelineEvent, TaskPipeline};
 use crate::engines::translate::{extract_message_content, post_chat_completions};
 use crate::engines::{
     self, FFmpegEngine, HardwareProfile, LLMEngine, OnlineApiConfig, PunctuationEngine,
-    SenseVoiceEngine, TextProgressCb, TranslateEngine, TranslateMode, WhisperEngine,
+    SenseVoiceEngine, TTSEngine, TextProgressCb, TranslateEngine, TranslateMode, VocalSepEngine,
+    WhisperEngine,
 };
 use crate::subtitle::{Segment, SubtitleWriter};
 use crate::utils::diagnostics::{self, CheckItem, CheckStatus};
@@ -116,6 +117,38 @@ pub enum HelpTopic {
     Tools,
     /// `doctor` 子命令（本机自检）。
     Doctor,
+    /// `dub` 子命令（给已有字幕配音出片）。
+    Dub,
+    /// `download` 子命令（把视频链接落到本地）。
+    Download,
+}
+
+/// `download` 子命令解析后的参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadArgs {
+    /// 视频页面链接（YouTube / B站 等，由 yt-dlp 支持）。
+    pub url: String,
+    /// 落盘目录；`None` = 系统临时目录下的 `voice2word-downloads`。
+    pub out_dir: Option<PathBuf>,
+}
+
+/// `dub` 子命令解析后的参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DubArgs {
+    /// 原始音视频。
+    pub input: PathBuf,
+    /// 已有字幕文件（SRT/VTT/ASS/JSON 等，按扩展名解析）。
+    pub subtitle: PathBuf,
+    /// 输出视频；`None` = 与输入同名 `.mp4`。
+    pub output: Option<PathBuf>,
+    /// `mix` / `replace`；`None` = 沿用 `[dub].mode`。
+    pub mode: Option<String>,
+    /// `mix` 模式原声保留百分比（0~100）。
+    pub bgm_percent: Option<u8>,
+    /// `translation` / `text`。
+    pub source: Option<String>,
+    /// 目标语言（决定音色分组）；`None` = 沿用 `[translate].target_lang`。
+    pub lang: Option<String>,
 }
 
 /// 转写子命令解析后的参数。
@@ -147,6 +180,17 @@ pub struct TranscribeArgs {
     pub threads: Option<u32>,
     /// 强制开启润色/标点阶段。
     pub polish: bool,
+    /// 强制开启人声分离前置（OR 语义：配置里已开时不必重复）。
+    pub vocal_sep: bool,
+    /// 转写/翻译完成后，按字幕时间轴生成配音视频（需要 `edge-tts`）。
+    pub dub: bool,
+    /// 配音音轨模式：`mix` / `replace`；`None` = 沿用 `config.toml` 的 `[dub].mode`。
+    pub dub_mode: Option<String>,
+    /// `mix` 模式下原声保留比例（百分比 0~100）；`None` = 沿用配置。
+    ///
+    /// 存整数百分比而不是 `f32`：`TranscribeArgs` 需要 `Eq`（`CliAction` 也依赖它），
+    /// 浮点没有全序；换算在使用处做 `/ 100`。
+    pub dub_bgm_percent: Option<u8>,
     /// 开启说话人分离。
     pub diarize: bool,
     /// 说话人数（2~4）；给出即隐含开启说话人分离。
@@ -214,6 +258,10 @@ pub enum CliAction {
     Tools(Box<ToolsArgs>),
     /// 本机自检并打印结论（`doctor`）。
     Doctor(Box<DoctorArgs>),
+    /// 给已有字幕配音出片（`dub`）。
+    Dub(Box<DubArgs>),
+    /// 下载视频链接到本地（`download`）。
+    Download(Box<DownloadArgs>),
 }
 
 /// 命令行解析错误（面向用户的一段中文说明）。
@@ -284,6 +332,10 @@ const COMMON_OPTIONS_HELP: &str = "\
                             auto 在 whisper 模型不可用而 SenseVoice 就位时自动选后者
       --threads <数量>      推理线程数（正整数，覆盖 config.toml；超过本机逻辑核数自动收敛）
       --polish              强制开启润色/标点（默认沿用 config.toml）
+      --vocal-sep           强制开启人声分离前置（默认沿用 config.toml 的 preprocess_vocal_sep）
+      --dub                 完成后生成配音视频（需要 edge-tts：pip install edge-tts）
+      --dub-mode <模式>     配音音轨：mix（默认，保留背景音）/ replace（纯替换）
+      --dub-bgm <0~100>     mix 模式下原声保留百分比，默认 25
       --diarize             开启说话人分离
       --speakers <2-4>      说话人数（隐含 --diarize）
       --recursive           输入是目录时递归子目录（默认只处理该目录一层）
@@ -339,6 +391,8 @@ pub fn usage() -> String {
   voice2word run <输入文件或目录> [选项]           机器用：单次调用，stdout 输出一行 JSON
   voice2word tools [--json]                       列出可被外部程序调用的工具与参数 schema
   voice2word doctor [--json]                      本机自检：依赖、硬件、日志与数据库
+  voice2word dub -i <音视频> -s <字幕> [选项]      给已有字幕配音出片（不重新识别）
+  voice2word download -u <链接> [-o <目录>]        把视频链接下载到本地（需要 yt-dlp）
   voice2word --help | -h                          显示本帮助
   voice2word --version | -V                       显示版本号
 
@@ -465,6 +519,61 @@ pub fn usage_tools() -> String {
     )
 }
 
+/// `dub` 子命令帮助。
+pub fn usage_dub() -> String {
+    format!(
+        r#"voice2word dub — 给已有字幕生成配音视频（逐句 TTS + 时间轴对齐 + 混音/替换）
+
+用法:
+  voice2word dub -i <音视频> -s <字幕> [-o <输出.mp4>] [选项]
+
+  -i, --input <路径>         原始音视频
+  -s, --subtitle <路径>      已有字幕（SRT/VTT/ASS/JSON/TXT 等，按扩展名解析）
+  -o, --output <路径>        输出视频；默认与输入同名 .mp4
+      --mode <mix|replace>   混音（保留背景音）/ 纯替换；默认取 [dub].mode
+      --bgm <0~100>          mix 模式原声保留百分比；默认取 [dub].bgm_volume
+      --source <translation|text>
+                             配音文本取译文还是原文；默认取 [dub].source
+      --lang <语言>          音色分组（zh / en / ja）；默认取 [translate].target_lang
+  -h, --help                 显示本帮助
+
+说明:
+  逐句按字幕时间窗合成；超窗句子自动提速（上限 [dub].max_rate_percent），仍超则
+  允许溢出到句间空隙，只在会压到下一句时留 30ms 余量截断。
+  需要 edge-tts：pip install edge-tts。
+  产物默认与字幕同名 .mp4；`--mode replace` 不重编码视频流，出片最快。
+
+示例:
+  voice2word dub -i talk.mp4 -s talk.srt
+  voice2word dub -i talk.mp4 -s talk.srt -o talk_ja.mp4 --mode mix --bgm 15 --lang ja
+{exit}"#,
+        exit = EXIT_CODE_HELP,
+    )
+}
+
+/// `download` 子命令帮助。
+pub fn usage_download() -> String {
+    format!(
+        r#"voice2word download — 把视频链接下载到本地（YouTube / B站 等，由 yt-dlp 支持）
+
+用法:
+  voice2word download -u <链接> [-o <目录>]
+
+  -u, --url <链接>     视频页面链接（http/https）
+  -o, --output <目录>  落盘目录；默认是系统临时目录下的 voice2word-downloads
+  -h, --help           显示本帮助
+
+说明:
+  stdout **只打印最终文件路径**（一行），进度写 stderr，便于脚本接：
+      $p = voice2word download -u "https://..."
+      voice2word transcribe $p
+  需要 yt-dlp：在「模型与组件」里下载，或放到 tools/yt-dlp.exe。
+  音视频分流需要合并，程序会把 --ffmpeg-location 指向本项目的 tools 目录。
+{exit}"#,
+        exit = EXIT_CODE_HELP,
+    )
+}
+
 /// `doctor` 子命令帮助。
 pub fn usage_doctor() -> String {
     format!(
@@ -523,6 +632,8 @@ pub fn usage_for(topic: HelpTopic) -> String {
         HelpTopic::Run => usage_run(),
         HelpTopic::Tools => usage_tools(),
         HelpTopic::Doctor => usage_doctor(),
+        HelpTopic::Dub => usage_dub(),
+        HelpTopic::Download => usage_download(),
     }
 }
 
@@ -548,9 +659,11 @@ where
         "run" => parse_run_like(&rest[1..], OutputMode::Json),
         "tools" => parse_tools(&rest[1..]),
         "doctor" => parse_doctor(&rest[1..]),
+        "dub" => parse_dub(&rest[1..]),
+        "download" => parse_download(&rest[1..]),
         other if other.starts_with('-') => Err(CliError::new(format!("未知选项: {other}"))),
         other => Err(CliError::new(format!(
-            "未知子命令: {other}（可用: transcribe | run | tools | doctor | --help | --version）"
+            "未知子命令: {other}（可用: transcribe | run | tools | doctor | dub | download | --help | --version）"
         ))),
     }
 }
@@ -573,6 +686,10 @@ fn parse_run_like(args: &[String], mode: OutputMode) -> std::result::Result<CliA
     let mut engine: Option<String> = None;
     let mut threads: Option<u32> = None;
     let mut polish = false;
+    let mut vocal_sep = false;
+    let mut dub = false;
+    let mut dub_mode: Option<String> = None;
+    let mut dub_bgm_percent: Option<u8> = None;
     let mut diarize = false;
     let mut speakers: Option<u32> = None;
     let mut recursive = false;
@@ -664,6 +781,25 @@ fn parse_run_like(args: &[String], mode: OutputMode) -> std::result::Result<CliA
                 }
                 engine = Some(value);
             }
+            "--dub-mode" => {
+                let value = take_value(flag, inline, args, &mut i)?;
+                if !matches!(value.as_str(), "mix" | "replace") {
+                    return Err(CliError::new(format!(
+                        "--dub-mode 只接受 mix / replace，收到: {value}"
+                    )));
+                }
+                dub_mode = Some(value);
+            }
+            "--dub-bgm" => {
+                let value = take_value(flag, inline, args, &mut i)?;
+                let parsed: u8 = value.parse().map_err(|_| {
+                    CliError::new(format!("--dub-bgm 需要 0~100 的整数，收到: {value}"))
+                })?;
+                if parsed > 100 {
+                    return Err(CliError::new("--dub-bgm 需要 0~100 的整数"));
+                }
+                dub_bgm_percent = Some(parsed);
+            }
             "--threads" => {
                 let value = take_value(flag, inline, args, &mut i)?;
                 let parsed: u32 = value
@@ -689,13 +825,15 @@ fn parse_run_like(args: &[String], mode: OutputMode) -> std::result::Result<CliA
             "--artifact-dir" => {
                 artifact_dir = Some(PathBuf::from(take_value(flag, inline, args, &mut i)?));
             }
-            "--polish" | "--diarize" | "--recursive" | "--resume" | "--json" | "--dry-run"
-            | "--yes" => {
+            "--polish" | "--vocal-sep" | "--dub" | "--diarize" | "--recursive" | "--resume"
+            | "--json" | "--dry-run" | "--yes" => {
                 if inline.is_some() {
                     return Err(CliError::new(format!("{flag} 不接受取值")));
                 }
                 match flag {
                     "--polish" => polish = true,
+                    "--vocal-sep" => vocal_sep = true,
+                    "--dub" => dub = true,
                     "--diarize" => diarize = true,
                     "--recursive" => recursive = true,
                     "--resume" => resume = true,
@@ -764,6 +902,10 @@ fn parse_run_like(args: &[String], mode: OutputMode) -> std::result::Result<CliA
         engine,
         threads,
         polish,
+        vocal_sep,
+        dub,
+        dub_mode,
+        dub_bgm_percent,
         diarize,
         speakers,
         recursive,
@@ -838,6 +980,127 @@ fn parse_doctor(args: &[String]) -> std::result::Result<CliAction, CliError> {
         }
     }
     Ok(CliAction::Doctor(Box::new(DoctorArgs { json })))
+}
+
+/// 解析 `dub` 子命令：给已有字幕配一条音轨并出片。
+///
+/// 与 `transcribe --dub` 的区别：这条链路**不重新识别**，直接把现成字幕按时间轴
+/// 配音，适合「字幕已经校对完，只想出配音版」，也方便脚本化与回归验证。
+fn parse_dub(args: &[String]) -> std::result::Result<CliAction, CliError> {
+    let mut input: Option<PathBuf> = None;
+    let mut subtitle: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut mode: Option<String> = None;
+    let mut bgm_percent: Option<u8> = None;
+    let mut source: Option<String> = None;
+    let mut lang: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline) = split_flag(arg);
+        match flag {
+            "-h" | "--help" => return Ok(CliAction::Help(HelpTopic::Dub)),
+            "-i" | "--input" => {
+                input = Some(PathBuf::from(take_value(flag, inline, args, &mut i)?));
+            }
+            "-s" | "--subtitle" => {
+                subtitle = Some(PathBuf::from(take_value(flag, inline, args, &mut i)?));
+            }
+            "-o" | "--output" => {
+                output = Some(PathBuf::from(take_value(flag, inline, args, &mut i)?));
+            }
+            "--mode" => {
+                let value = take_value(flag, inline, args, &mut i)?;
+                if !matches!(value.as_str(), "mix" | "replace") {
+                    return Err(CliError::new(format!(
+                        "--mode 只接受 mix / replace，收到: {value}"
+                    )));
+                }
+                mode = Some(value);
+            }
+            "--bgm" => {
+                let value = take_value(flag, inline, args, &mut i)?;
+                let parsed: u8 = value.parse().map_err(|_| {
+                    CliError::new(format!("--bgm 需要 0~100 的整数，收到: {value}"))
+                })?;
+                if parsed > 100 {
+                    return Err(CliError::new("--bgm 需要 0~100 的整数"));
+                }
+                bgm_percent = Some(parsed);
+            }
+            "--source" => {
+                let value = take_value(flag, inline, args, &mut i)?;
+                if !matches!(value.as_str(), "translation" | "text") {
+                    return Err(CliError::new(format!(
+                        "--source 只接受 translation / text，收到: {value}"
+                    )));
+                }
+                source = Some(value);
+            }
+            "--lang" => {
+                lang = Some(take_value(flag, inline, args, &mut i)?);
+            }
+            other if other.starts_with('-') && other != "-" => {
+                return Err(CliError::new(format!("未知选项: {other}")));
+            }
+            _ => return Err(CliError::new(format!("多余的参数: {arg}"))),
+        }
+        i += 1;
+    }
+
+    let Some(input) = input else {
+        return Err(CliError::new("dub 需要 --input <音视频>"));
+    };
+    let Some(subtitle) = subtitle else {
+        return Err(CliError::new("dub 需要 --subtitle <字幕文件>"));
+    };
+    Ok(CliAction::Dub(Box::new(DubArgs {
+        input,
+        subtitle,
+        output,
+        mode,
+        bgm_percent,
+        source,
+        lang,
+    })))
+}
+
+/// 解析 `download` 子命令：把视频链接落到本地，stdout 打印最终文件路径。
+///
+/// 只做下载、不做转写：这样脚本可以 `$p = voice2word download -u URL` 再决定
+/// 用哪些参数转写；也避免把「网络下载」与「识别」两段失败的退出码混在一起。
+fn parse_download(args: &[String]) -> std::result::Result<CliAction, CliError> {
+    let mut url: Option<String> = None;
+    let mut out_dir: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline) = split_flag(arg);
+        match flag {
+            "-h" | "--help" => return Ok(CliAction::Help(HelpTopic::Download)),
+            "-u" | "--url" => {
+                url = Some(take_value(flag, inline, args, &mut i)?);
+            }
+            "-o" | "--output" => {
+                out_dir = Some(PathBuf::from(take_value(flag, inline, args, &mut i)?));
+            }
+            other if other.starts_with('-') && other != "-" => {
+                return Err(CliError::new(format!("未知选项: {other}")));
+            }
+            _ => return Err(CliError::new(format!("多余的参数: {arg}"))),
+        }
+        i += 1;
+    }
+    let Some(url) = url else {
+        return Err(CliError::new("download 需要 --url <链接>"));
+    };
+    if !url.trim().starts_with("http") {
+        return Err(CliError::new(format!(
+            "--url 需要 http(s) 链接，收到: {url}"
+        )));
+    }
+    Ok(CliAction::Download(Box::new(DownloadArgs { url, out_dir })))
 }
 
 /// 拆出 `--opt=value` 形式里的取值；无 `=` 时取值为 `None`。
@@ -1055,6 +1318,8 @@ where
         Ok(CliAction::Transcribe(args)) => Some(run_transcribe(&args)),
         Ok(CliAction::Tools(args)) => Some(run_tools(&args)),
         Ok(CliAction::Doctor(args)) => Some(run_doctor(&args)),
+        Ok(CliAction::Dub(args)) => Some(run_dub_command(&args)),
+        Ok(CliAction::Download(args)) => Some(run_download_command(&args)),
         Err(err) => {
             eprintln!("参数错误: {}", err.message());
             eprintln!();
@@ -1138,6 +1403,118 @@ fn run_transcribe(args: &TranscribeArgs) -> i32 {
             EXIT_FAILURE
         }
     }
+}
+
+/// `download` 子命令入口。
+fn run_download_command(args: &DownloadArgs) -> i32 {
+    let out_dir = args
+        .out_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("voice2word-downloads"));
+    let engine = crate::engines::YtDlpEngine::new();
+    if !engine.is_available() {
+        eprintln!(
+            "缺少 yt-dlp：请在「模型与组件」里下载，或放到 {}",
+            crate::utils::AppConfig::resolve_path(crate::engines::YTDLP_REL).display()
+        );
+        return EXIT_FAILURE;
+    }
+    match engine.download(&args.url, &out_dir) {
+        Ok(path) => {
+            // stdout 只放路径：脚本靠它取结果，任何提示都走 stderr。
+            println!("{}", path.display());
+            EXIT_OK
+        }
+        Err(err) => {
+            eprintln!("下载失败: {err:#}");
+            EXIT_FAILURE
+        }
+    }
+}
+
+/// `dub` 子命令入口：失败只打 stderr 并返回非零退出码。
+fn run_dub_command(args: &DubArgs) -> i32 {
+    match dub_command_inner(args) {
+        Ok(()) => EXIT_OK,
+        Err(err) => {
+            eprintln!("配音失败: {err:#}");
+            EXIT_FAILURE
+        }
+    }
+}
+
+/// `dub` 子命令实现：不重新识别，直接把现成字幕按时间轴配音出片。
+fn dub_command_inner(args: &DubArgs) -> Result<()> {
+    let config = AppConfig::load_from_file("config.toml").context("加载 config.toml 失败")?;
+    if !args.input.is_file() {
+        bail!("输入文件不存在: {}", args.input.display());
+    }
+    if !args.subtitle.is_file() {
+        bail!("字幕文件不存在: {}", args.subtitle.display());
+    }
+    let segments = crate::subtitle::reader::read_subtitle_file(&args.subtitle)
+        .with_context(|| format!("读取字幕失败: {}", args.subtitle.display()))?;
+    if segments.is_empty() {
+        bail!("字幕没有有效句子: {}", args.subtitle.display());
+    }
+    let output = args
+        .output
+        .clone()
+        .unwrap_or_else(|| args.input.with_extension("mp4"));
+    if output == args.input {
+        bail!("输出不能覆盖输入文件: {}", output.display());
+    }
+
+    let ffmpeg = FFmpegEngine::new(AppConfig::resolve_path(&config.paths.ffmpeg));
+    // 音轨长度用媒体真实时长：配音轨短于视频时 `-shortest` 会把视频截断。
+    let probe = ffmpeg.get_audio_duration(&args.input);
+    let total = if probe > 0.0 {
+        probe
+    } else {
+        crate::subtitle::timeline_end(&segments)
+    };
+    let mut dub_cfg = config.dub.clone();
+    if let Some(mode) = &args.mode {
+        dub_cfg.mode = mode.clone();
+    }
+    if let Some(percent) = args.bgm_percent {
+        dub_cfg.bgm_volume = percent as f32 / 100.0;
+    }
+    if let Some(source) = &args.source {
+        dub_cfg.source = source.clone();
+    }
+    let opts = crate::core::dub_flow::DubOptions::from_config(&dub_cfg);
+    let lang = args
+        .lang
+        .clone()
+        .unwrap_or_else(|| config.translate.target_lang.clone());
+    let tts = TTSEngine::new();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress: crate::core::dub_flow::ProgressFn = std::sync::Arc::new(|msg, frac| {
+        eprintln!("[配音] {msg}（{:.0}%）", frac * 100.0);
+    });
+    let report = crate::core::dub_flow::run_dub(
+        &ffmpeg,
+        &tts,
+        &args.input,
+        &segments,
+        total,
+        &lang,
+        &output,
+        &opts,
+        progress,
+        &cancel,
+    )?;
+    println!(
+        "配音完成: {}（{} 句，{} 句提速，{} 句截断，{} 句失败，耗时 {:.0}s）",
+        report.output.display(),
+        report.synthesized,
+        report.sped_up,
+        report.trimmed,
+        report.failed.len(),
+        report.elapsed_sec
+    );
+    Ok(())
 }
 
 /// 打印 `tools` 子命令的结果。
@@ -2440,6 +2817,60 @@ fn execute_job(config: &AppConfig, args: &TranscribeArgs, job: &Job) -> Result<R
         .with_context(|| format!("写入字幕失败: {}", job.output.display()))?;
     report.segments = segments.len();
     report.duration_sec = finite(covered_duration(&segments));
+
+    // 配音是**附加产物**：字幕已经成功落盘，配音失败不改退出码（批处理里把整次
+    // 转写判失败会让调用方以为连字幕都没有），错误只打 stderr。
+    if args.dub {
+        let ffmpeg =
+            crate::engines::FFmpegEngine::new(AppConfig::resolve_path(&config.paths.ffmpeg));
+        // 音轨长度必须用**媒体真实时长**：配音轨短于视频时 `-shortest` 会把视频截断。
+        let probe = ffmpeg.get_audio_duration(&job.input);
+        let total = if probe > 0.0 {
+            probe
+        } else {
+            crate::subtitle::timeline_end(&segments)
+        };
+        let mut dub_cfg = config.dub.clone();
+        if let Some(mode) = &args.dub_mode {
+            dub_cfg.mode = mode.clone();
+        }
+        if let Some(percent) = args.dub_bgm_percent {
+            dub_cfg.bgm_volume = percent as f32 / 100.0;
+        }
+        let opts = crate::core::dub_flow::DubOptions::from_config(&dub_cfg);
+        let target_lang = args
+            .translate
+            .clone()
+            .unwrap_or_else(|| config.translate.target_lang.clone());
+        let out_video = job.output.with_extension("mp4");
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let progress: crate::core::dub_flow::ProgressFn = std::sync::Arc::new(|msg, frac| {
+            eprintln!("[配音] {msg}（{:.0}%）", frac * 100.0);
+        });
+        let tts = crate::engines::TTSEngine::new();
+        match crate::core::dub_flow::run_dub(
+            &ffmpeg,
+            &tts,
+            &job.input,
+            &segments,
+            total,
+            &target_lang,
+            &out_video,
+            &opts,
+            progress,
+            &cancel,
+        ) {
+            Ok(result) => eprintln!(
+                "配音完成: {}（{} 句，{} 句提速，耗时 {:.0}s）",
+                result.output.display(),
+                result.synthesized,
+                result.sped_up,
+                result.elapsed_sec
+            ),
+            Err(err) => eprintln!("配音失败（字幕已正常输出）: {err:#}"),
+        }
+    }
+
     report.elapsed_sec = finite(started.elapsed().as_secs_f64());
     Ok(report)
 }
@@ -2459,7 +2890,12 @@ fn run_pipeline(
 
     let enable_polish = args.polish || config.pipeline.enable_polish;
     let polish_mode = enable_polish.then(|| config.pipeline.polish_mode.clone());
-    let whisper_options = build_runtime_options(config);
+    let mut whisper_options = build_runtime_options(config);
+    // `--vocal-sep` 与 `--polish` 同为 OR 语义：命令行只负责「打开」，
+    // 配置里已开时不需重复传。
+    if args.vocal_sep {
+        whisper_options.preprocess.vocal_sep = true;
+    }
     let speakers = resolve_speakers(config, args);
     let diarization = DiarizationOptions {
         enabled: speakers.is_some(),
@@ -2741,6 +3177,7 @@ fn build_runtime_options(config: &AppConfig) -> WhisperRuntimeOptions {
         compaction: engines::CompactionConfig::default(),
         compact: config.pipeline.preprocess_compact,
         min_saving: config.pipeline.preprocess_min_saving,
+        vocal_sep: config.pipeline.preprocess_vocal_sep,
     };
     WhisperRuntimeOptions {
         audio_speed: config.pipeline.whisper_audio_speed,
@@ -2875,8 +3312,32 @@ fn build_pipeline(config: &AppConfig, args: &TranscribeArgs) -> Arc<TaskPipeline
 
     let sensevoice = build_sensevoice(config, &python_path);
     let punc = build_punc(config, &python_path);
+    let vocal_sep = build_vocal_sep(config);
 
-    Arc::new(TaskPipeline::new(ffmpeg, whisper, sensevoice, llm, punc))
+    let base = TaskPipeline::new(ffmpeg, whisper, sensevoice, llm, punc);
+    Arc::new(match vocal_sep {
+        Some(engine) => base.with_vocal_sep(engine),
+        None => base,
+    })
+}
+
+/// 可选人声分离引擎：runner + 模型都就位才装配（缺件只是该阶段降级，见
+/// `run_vocal_sep_stage` 的降级语义）。python 解释器由引擎内部解析，
+/// 与 SenseVoice / CT-Punc 同一套口径。
+fn build_vocal_sep(config: &AppConfig) -> Option<Arc<VocalSepEngine>> {
+    let runner = AppConfig::resolve_path("tools/vocal_sep_runner.py");
+    let model = config
+        .paths
+        .vocal_model
+        .as_ref()
+        .map(|p| AppConfig::resolve_path(p))
+        .unwrap_or_else(|| AppConfig::resolve_path("models/vocal_sep/UVR-MDX-NET-Inst_HQ_3.onnx"));
+    if runner.exists() && model.exists() {
+        let provider = config.gpu.resolve_onnx_provider();
+        Some(Arc::new(VocalSepEngine::new(provider.to_string(), model)))
+    } else {
+        None
+    }
 }
 
 /// 可选 SenseVoice 引擎：runner / 模型 / tokens / VAD 四项齐全才装配。
@@ -2903,15 +3364,19 @@ fn build_sensevoice(config: &AppConfig, python_path: &Path) -> Option<Arc<SenseV
 
     if runner.exists() && model.exists() && tokens.exists() && vad.exists() {
         let provider = config.gpu.resolve_onnx_provider();
-        Some(Arc::new(SenseVoiceEngine::with_python_and_provider(
-            runner,
-            model,
-            tokens,
-            vad,
-            config.pipeline.whisper_threads,
-            python_path,
-            provider,
-        )))
+        let family = engines::sensevoice::model_family_from_path(&model);
+        Some(Arc::new(
+            SenseVoiceEngine::with_python_and_provider(
+                runner,
+                model,
+                tokens,
+                vad,
+                config.pipeline.whisper_threads,
+                python_path,
+                provider,
+            )
+            .with_family(family, None),
+        ))
     } else {
         eprintln!("提示: SenseVoice 引擎未就绪，转写回退到 Whisper");
         None
@@ -3627,6 +4092,83 @@ mod tests {
         assert_eq!(usage_for(HelpTopic::Run), usage_run());
     }
 
+    /// `--dub*` 三个参数的解析与校验：默认全关、模式白名单、百分比范围。
+    #[test]
+    fn dub_flags_parse_and_validate() {
+        let args = transcribe_args(&["voice2word", "transcribe", "talk.mp4", "--dub"]);
+        assert!(args.dub);
+        assert_eq!(args.dub_mode, None);
+        assert_eq!(args.dub_bgm_percent, None);
+
+        let args = transcribe_args(&[
+            "voice2word",
+            "transcribe",
+            "talk.mp4",
+            "--dub",
+            "--dub-mode",
+            "replace",
+            "--dub-bgm",
+            "40",
+        ]);
+        assert_eq!(args.dub_mode.as_deref(), Some("replace"));
+        assert_eq!(args.dub_bgm_percent, Some(40));
+
+        // 模式白名单
+        assert!(
+            parse_error(&["voice2word", "transcribe", "a.mp4", "--dub-mode", "duck"])
+                .contains("mix / replace")
+        );
+        // 百分比范围（0~100 的整数）
+        assert!(
+            parse_error(&["voice2word", "transcribe", "a.mp4", "--dub-bgm", "101"])
+                .contains("0~100")
+        );
+        assert!(
+            parse_error(&["voice2word", "transcribe", "a.mp4", "--dub-bgm", "0.3"])
+                .contains("0~100")
+        );
+        // 布尔开关不接受取值
+        assert!(
+            parse_error(&["voice2word", "transcribe", "a.mp4", "--dub=1"]).contains("不接受取值")
+        );
+    }
+
+    /// `download` 子命令：必须给 http(s) 链接，`-o` 可省略。
+    #[test]
+    fn download_flags_parse_and_validate() {
+        let action =
+            parse(["voice2word", "download", "-u", "https://ex.com/v"]).expect("应解析成功");
+        match action {
+            CliAction::Download(args) => {
+                assert_eq!(args.url, "https://ex.com/v");
+                assert_eq!(args.out_dir, None);
+            }
+            other => panic!("期望 Download，得到 {other:?}"),
+        }
+
+        let action = parse([
+            "voice2word",
+            "download",
+            "--url",
+            "https://ex.com/v",
+            "-o",
+            "D:/videos",
+        ])
+        .expect("应解析成功");
+        match action {
+            CliAction::Download(args) => {
+                assert_eq!(
+                    args.out_dir.as_deref(),
+                    Some(std::path::Path::new("D:/videos"))
+                );
+            }
+            other => panic!("期望 Download，得到 {other:?}"),
+        }
+
+        assert!(parse_error(&["voice2word", "download"]).contains("--url"));
+        assert!(parse_error(&["voice2word", "download", "-u", "ftp://ex.com/v"]).contains("http"));
+    }
+
     #[test]
     fn transcribe_uses_documented_defaults() {
         let args = transcribe_args(&["voice2word", "transcribe", "talk.mp4"]);
@@ -3677,6 +4219,7 @@ mod tests {
             "--threads",
             "8",
             "--polish",
+            "--vocal-sep",
             "--diarize",
             "--speakers",
             "3",
@@ -3706,7 +4249,7 @@ mod tests {
         assert_eq!(args.threads, Some(8));
         assert_eq!(args.speakers, Some(3));
         assert_eq!(args.artifact_dir, Some(PathBuf::from("stages")));
-        assert!(args.polish && args.diarize && args.recursive && args.resume);
+        assert!(args.polish && args.vocal_sep && args.diarize && args.recursive && args.resume);
         assert!(args.json && args.dry_run);
         assert!(args.yes, "--yes 必须被解析出来");
         assert_eq!(
@@ -4927,6 +5470,32 @@ mod tests {
             ),
             "whisper"
         );
+    }
+
+    #[test]
+    fn cli_onnx_assembly_preserves_configured_model_family() {
+        use crate::engines::sensevoice::ModelFamily;
+        let dir = temp_dir("onnx_family");
+        let tokens = dir.join("tokens.txt");
+        let vad = dir.join("vad.onnx");
+        std::fs::write(&tokens, b"<unk> 0").unwrap();
+        std::fs::write(&vad, b"vad fixture").unwrap();
+        let mut config = AppConfig::default();
+        config.paths.sensevoice_tokens = Some(tokens.display().to_string());
+        config.paths.sensevoice_vad = Some(vad.display().to_string());
+        for (name, family) in [
+            ("sensevoice", ModelFamily::SenseVoice),
+            ("paraformer", ModelFamily::Paraformer),
+            ("dolphin", ModelFamily::DolphinCtc),
+        ] {
+            let model = dir.join(format!("{name}.onnx"));
+            std::fs::write(&model, b"model fixture").unwrap();
+            config.paths.sensevoice_model = Some(model.display().to_string());
+            let engine = build_sensevoice(&config, Path::new("python"))
+                .expect("仓库 runner 和测试模型齐全时应能装配");
+            assert_eq!(engine.family(), family, "CLI 不应把 {name} 当作 SenseVoice");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
     fn double_dash_terminates_option_parsing() {

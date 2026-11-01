@@ -500,7 +500,15 @@ fn is_private_ipv4(ip: &str) -> bool {
 /// 传入非默认值会直接报 HTTP 400 Bad Request。
 fn supports_temperature(model: &str) -> bool {
     let m = model.to_lowercase();
-    !(m.starts_with("o1") || m.starts_with("o3") || m.contains("-o1") || m.contains("-o3"))
+    // `o1` / `o3` 必须是**完整标识段**（两侧到非字母数字为止）：OpenAI 命名是
+    // `o1` / `o1-mini` / `o3-mini`，也可能是 `openai/o3-mini`、`azure-o1-preview`
+    // 这类带前缀的部署名。按段匹配两种误判都覆盖：
+    // - `o1x-custom`（段是 `o1x`）不再被 `starts_with("o1")` 误伤成禁 temperature；
+    // - `openai/o3-mini`（段是 `o3`）不再因 `contains("-o1")` 只认 `-` 分隔符而漏判。
+    // 漏判的代价是服务端 400 整批失败，误伤只是少了 temperature 微调——边界拿捏
+    // 偏向「宁可少传 temperature」，但不把无关模型名整类误伤。
+    !m.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|seg| seg == "o1" || seg == "o3")
 }
 
 fn translate_via_online_api_with_stats(
@@ -2186,6 +2194,35 @@ fn content_to_text(c: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// `o1` / `o3` 必须按**完整标识段**匹配：
+    /// - `o1x-custom` 这类第三方模型名不能被 `starts_with("o1")` 误伤成禁 temperature
+    ///   （误伤只是少传一个参数，但会平白丢掉温度微调）；
+    /// - `openai/o3-mini`、`azure-o1-preview` 这类带前缀的部署名不能漏判
+    ///   （漏判的代价是服务端 400、整批请求失败）。
+    #[test]
+    fn temperature_support_matches_model_segments_not_prefixes() {
+        // 禁 temperature 的推理模型：应判为 false
+        for m in [
+            "o1",
+            "o1-mini",
+            "O3-MINI",
+            "openai/o3-mini",
+            "azure-o1-preview",
+        ] {
+            assert!(!supports_temperature(m), "{m} 不该携带 temperature");
+        }
+        // 普通模型（含以 o1/o3 开头的第三方命名）：应判为 true
+        for m in [
+            "gpt-4o-mini",
+            "deepseek-chat",
+            "o1x-custom",
+            "o3foo",
+            "qwen2.5-0.5b",
+        ] {
+            assert!(supports_temperature(m), "{m} 应允许 temperature");
+        }
+    }
+
     /// 本地端点判定必须按 **host** 精确判断，不能拿整串做子串匹配。
     ///
     /// 旧实现用 `contains("10.")`，于是 `https://api.10.example.com/v1` 被判成

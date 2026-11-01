@@ -53,7 +53,7 @@ impl PlaybackWindow {
         ffmpeg: PathBuf,
         cx: &mut Context<Self>,
     ) -> Self {
-        let total_duration = segments.last().map(|s| s.end).unwrap_or(0.0);
+        let total_duration = crate::subtitle::timeline_end(&segments);
         let mut this = Self {
             player: Arc::new(VideoPlayerEngine::new(ffmpeg)),
             media,

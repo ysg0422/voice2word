@@ -516,6 +516,49 @@ fn shift_segment(seg: &mut Segment, offset_secs: f64) {
 pub type ChunkTranscriber<'a> =
     dyn Fn(&Path, f64, u32) -> Result<(Vec<Segment>, f64)> + Send + Sync + 'a;
 
+/// 跨块上下文：取末尾若干句的文本，压成一行并限长。
+///
+/// 给「下一块」当 initial prompt 用。设计取舍与测量方案见
+/// `docs/切块跨块上下文-设计与测量.md`——注意本仓库有一条**实测反向证据**：
+/// whisper 的 `--carry-initial-prompt`（段内跨窗口携带）曾因中文 CER 净亏被移除，
+/// 所以跨块提示必须先测量再默认开启。
+///
+/// 三条规则：
+/// - 从后往前累加到 `max_chars` 为止（保留**末尾**——它衔接的是下一块开头）；
+/// - 空白（含换行）折叠成单空格，避免 prompt 里出现换行被当成段落边界；
+/// - 按 `char` 边界截断，绝不切出半个 UTF-8 字符。
+pub fn context_tail(segments: &[Segment], max_chars: usize) -> String {
+    if max_chars == 0 || segments.is_empty() {
+        return String::new();
+    }
+    let mut picked: Vec<&str> = Vec::new();
+    let mut total = 0usize;
+    for seg in segments.iter().rev() {
+        let text = seg.display_text().trim();
+        if text.is_empty() {
+            continue;
+        }
+        let chars = text.chars().count();
+        picked.push(text);
+        total += chars + 1;
+        if total >= max_chars {
+            break;
+        }
+    }
+    picked.reverse();
+    let joined = picked
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if joined.chars().count() <= max_chars {
+        return joined;
+    }
+    // 超长时**保留尾部**：衔接点在下一块开头，丢掉开头比丢掉结尾更安全。
+    let skip = joined.chars().count() - max_chars;
+    joined.chars().skip(skip).collect()
+}
+
 /// 单块转写结果：(块下标, 块起始秒, 块内片段, 该块 VAD 耗时秒)。
 type ChunkResult = (usize, f64, Vec<Segment>, f64);
 
@@ -947,6 +990,40 @@ fn rayon_pool(workers: usize) -> Result<rayon::ThreadPool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 跨块上下文只取**末尾**若干句：衔接点是下一块开头，取开头等于把无关内容
+    /// 塞进 prompt。
+    #[test]
+    fn context_tail_takes_the_end_not_the_start() {
+        let segs = vec![
+            Segment::new(1, 0.0, 1.0, "第一句"),
+            Segment::new(2, 1.0, 2.0, "第二句"),
+            Segment::new(3, 2.0, 3.0, "第三句"),
+        ];
+        assert_eq!(context_tail(&segs, 4), "第三句");
+        assert_eq!(context_tail(&segs, 100), "第一句 第二句 第三句");
+    }
+
+    /// 空白/换行折叠成单空格：prompt 里的换行会被 whisper 当段落边界。
+    #[test]
+    fn context_tail_collapses_whitespace_and_skips_blank() {
+        let mut segs = vec![
+            Segment::new(1, 0.0, 1.0, "  前面  "),
+            Segment::new(2, 1.0, 2.0, ""),
+            Segment::new(3, 2.0, 3.0, "多\n行\t文本 "),
+        ];
+        assert_eq!(context_tail(&segs, 100), "前面 多 行 文本");
+        segs.clear();
+        assert_eq!(context_tail(&segs, 100), "");
+        assert_eq!(context_tail(&segs, 0), "");
+    }
+
+    /// 超过上限时保留尾部，且按 char 边界截断（中文不会被切坏）。
+    #[test]
+    fn context_tail_truncates_at_char_boundary_keeping_the_tail() {
+        let segs = vec![Segment::new(1, 0.0, 1.0, "一二三四五六七八九十")];
+        assert_eq!(context_tail(&segs, 4), "七八九十");
+    }
 
     #[test]
     fn short_audio_is_single_chunk() {

@@ -26,24 +26,30 @@ use std::sync::Arc;
 
 /// 替换面板里「正则 / 整词 / 范围」三项选择的会话态。
 ///
-/// 为什么不挂在 `MainWindow` 上：这三项只被本模块使用，而窗口结构体定义在
-/// `ui/mod.rs`，本模块不便向外扩字段。GPUI 的渲染与事件都在主线程执行，线程局部
-/// 变量的可见性与窗口字段一致；面板收起再展开会保留上次选择，与「区分大小写 /
-/// 含译文」两个既有开关的行为对齐。
-struct ReplacePanelToggles {
-    regex: std::cell::Cell<bool>,
-    whole_word: std::cell::Cell<bool>,
-    scope_selected: std::cell::Cell<bool>,
+/// 挂在 `MainWindow` 的字段 [`MainWindow::replace_toggles`] 上（本轮结构治理从
+/// thread_local 收敛而来）。字段继续用 `Cell`：渲染路径是 `&self`，而开关的点击
+/// 处理器要在渲染树里改这三项，`Cell` 让「&self 读、事件里写」都不用动签名。
+/// 面板收起再展开会保留上次选择，与「区分大小写 / 含译文」两个既有开关的行为对齐。
+pub(crate) struct ReplacePanelToggles {
+    pub(crate) regex: std::cell::Cell<bool>,
+    pub(crate) whole_word: std::cell::Cell<bool>,
+    pub(crate) scope_selected: std::cell::Cell<bool>,
 }
 
-thread_local! {
-    static REPLACE_PANEL_TOGGLES: ReplacePanelToggles = const {
-        ReplacePanelToggles {
+impl ReplacePanelToggles {
+    pub(crate) const fn new() -> Self {
+        Self {
             regex: std::cell::Cell::new(false),
             whole_word: std::cell::Cell::new(false),
             scope_selected: std::cell::Cell::new(false),
         }
-    };
+    }
+}
+
+impl Default for ReplacePanelToggles {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// 字幕配置 → 预览配色 `(文字色, 底色, 描边色)`。
@@ -1718,69 +1724,7 @@ impl MainWindow {
             .flex()
             .flex_col()
             .overflow_hidden()
-            // ── 顶部标头栏 ──
-            .child(
-                div()
-                    .h(px(Theme::HEADER_H))
-                    .px(px(Theme::PAGE_PAD))
-                    .bg(Theme::bg_sidebar())
-                    .border_b_1()
-                    .border_color(Theme::border())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        primitives::panel_title("字幕面板"),
-                    )
-                    .child(
-                        // 两张面板互斥切换：顶部一对分段选项代替原先的「展开 / 收起」开关。
-                        // 面板高度有限，样式卡与翻译卡纵向堆叠时必须滚动才能看到下面那张，
-                        // 拆成互斥视图后一次只占一份版面。
-                        primitives::segmented_cluster()
-                            // 样式面板：全局字幕样式与排版
-                            .child(
-                                primitives::segmented(
-                                    "字幕样式",
-                                    panel == EditorSubtitlePanel::Style,
-                                    false,
-                                )
-                                .id("btn-panel-subtitle-style")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.subtitle_panel = EditorSubtitlePanel::Style;
-                                    cx.notify();
-                                })),
-                            )
-                            // 翻译面板：多语言翻译与进度
-                            .child(
-                                primitives::segmented(
-                                    "字幕翻译",
-                                    panel == EditorSubtitlePanel::Translate,
-                                    false,
-                                )
-                                .id("btn-panel-subtitle-translate")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.subtitle_panel = EditorSubtitlePanel::Translate;
-                                    cx.notify();
-                                })),
-                            )
-                            // 统计与导出面板：整篇的时长 / 字数 / 语速 / 过长句，
-                            // 以及导出内容 / 文件名模板 / 格式选择。这些数字此前无处可看
-                            // （只能自己数），而 CPS 与「过长句」正是字幕交付会被打回的硬指标；
-                            // 导出又正是这份字幕最后的交付动作，两者合并同屏最贴合。
-                            .child(
-                                primitives::segmented(
-                                    "统计与导出",
-                                    panel == EditorSubtitlePanel::Stats,
-                                    false,
-                                )
-                                .id("btn-panel-subtitle-stats")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.subtitle_panel = EditorSubtitlePanel::Stats;
-                                    cx.notify();
-                                })),
-                            ),
-                    ),
-            )
+            .child(Self::render_inspector_header(panel, cx))
             // ── 属性面板主体 ──
             .child(
                 div()
@@ -1798,68 +1742,852 @@ impl MainWindow {
                     .flex()
                     .flex_col()
                     .gap(px(Theme::CARD_GAP))
-                    // 1. 全局字幕样式与排版配置卡片（仅「字幕样式」面板可见）
+                    .child(if panel == EditorSubtitlePanel::Style {
+                        self.render_subtitle_style_card(cx)
+                    } else {
+                        div().into_any_element()
+                    })
                     .child(
-                        if panel == EditorSubtitlePanel::Style {
-                            let cur_style = self.state.config.subtitle_style.clone();
+                        if let Some(seg) = cur_seg
+                            .as_ref()
+                            .filter(|_| panel == EditorSubtitlePanel::Style)
+                        {
+                            self.render_selected_segment_card(seg, &cur_text, cx)
+                        } else {
+                            div().into_any_element()
+                        },
+                    )
+                    // 2.4 整轨时间轴调整（仅「字幕样式」面板可见）
+                    //
+                    // 与样式卡并列、而不是塞进样式卡内部：它是**整轨级**操作（平移 /
+                    // 缩放 / 铺满），与「观感」是两件事；放在同一页是因为两者都属于
+                    // 「我要调整这一整份字幕」的心智模型。
+                    .child(if panel == EditorSubtitlePanel::Style {
+                        self.render_retime_card(cx).into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+                    // 2.5 字幕多语言翻译面板（仅「字幕翻译」面板可见；后端链路早已就绪）
+                    .child(if panel == EditorSubtitlePanel::Translate {
+                        self.render_translate_card(cx).into_any_element()
+                    } else if panel == EditorSubtitlePanel::Stats {
+                        // 统计与导出同屏：两张卡都是「对整份字幕做事」的收尾动作，
+                        // 一起竖排在同一个面板里。
+                        div()
+                            .w_full()
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .gap(px(Theme::CARD_GAP))
+                            .child(self.render_subtitle_stats_card(cx))
+                            .child(self.render_export_card(cx))
+                            .child(self.render_clips_card(cx))
+                            .child(self.render_dub_card(cx))
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+                    // 3. 多语言字幕配置与对照大表格 (仅在「字幕翻译」面板可见；「字幕样式」与「统计与导出」不展示此卡)
+                    .child(if panel == EditorSubtitlePanel::Translate {
+                        primitives::card_sm()
+                            .flex_1()
+                            .min_h(px(Theme::TABLE_MIN_H))
+                            .gap(px(0.0))
+                            // 上下堆叠时面板整体已可纵向滚动，这里不能再吃 flex_1
+                            // （自动高度的滚动容器里会塌成 0 高），改为固定高度。
+                            .when(stacked, |d| d.flex_none().h(px(Theme::TABLE_STACK_H)))
+                            .overflow_hidden()
+                            .child(self.render_subtitle_search_row(cx))
+                            .children(self.render_replace_bar(cx))
+                            .child(self.render_subtitle_list_subheader())
+                            .child(self.render_subtitle_list_rows(sel_idx, cx))
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    }),
+            )
+    }
 
-                            if self.subtitle_style_collapsed {
-                                div()
-                                    .id("bar-subtitle-style-collapsed")
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_lg()
-                                    .bg(Theme::bg_sidebar())
-                                    .border_1()
-                                    .border_color(Theme::border())
-                                    .hover(|s| s.bg(Theme::bg_hover()))
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.subtitle_style_collapsed = false;
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.0))
-                                                    .text_color(Theme::accent_mint())
-                                                    .child("▶")
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(Theme::TEXT_BODY))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(Theme::text_primary())
-                                                    .child("全局字幕样式与排版"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(Theme::TEXT_CAPTION))
-                                                    .px_2()
-                                                    .py_0p5()
-                                                    .rounded_md()
-                                                    .bg(Theme::bg_inset())
-                                                    .text_color(Theme::text_muted())
-                                                    .child(format!("{}px · {} · {}", cur_style.font_size, if cur_style.is_bold { "加粗" } else { "常规" }, match cur_style.alignment.as_str() { "left" => "靠左", "right" => "靠右", _ => "居中" })),
-                                            )
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(Theme::TEXT_SMALL))
-                                            .text_color(Theme::accent_mint())
-                                            .child("展开 ⚙"),
-                                    )
-                                    .into_any_element()
-                            } else {
-                                primitives::card_sm()
+    /// 字幕清单顶部的过滤 / 搜索行：搜索框、清除按钮、命中计数与「查找替换」开关。
+    ///
+    /// 搜索只过滤显示、替换会真改字幕，所以「查找替换」是独立开关（见原处注释）；
+    /// 命中条数实时回显，避免用户以为「搜了没结果」是卡住了。
+    fn render_subtitle_search_row(&mut self, cx: &mut Context<Self>) -> Div {
+        // 搜索栏：按关键字过滤清单（原文与译文都参与匹配），
+        // 命中条数实时回显，避免用户以为「搜了没结果」是卡住了
+        let total = self.state.segments.len();
+        let visible = self.subtitle_filter.len();
+        let searching = !self.subtitle_search.trim().is_empty();
+        div()
+            .w_full()
+            .h(px(Theme::TABLE_HEADER_H))
+            .px(px(Theme::SPACE_3))
+            .bg(Theme::bg_sidebar())
+            .border_b_1()
+            .border_color(Theme::border())
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_muted())
+                    .child("搜索"),
+            )
+            .child(self.render_search_input(cx))
+            .child(if searching {
+                div()
+                    .id("subtitle-search-clear")
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(Theme::bg_raised())
+                    .border_1()
+                    .border_color(Theme::border_mid())
+                    .cursor_pointer()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(Theme::text_secondary())
+                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.subtitle_search.clear();
+                        this.subtitle_search_cursor = 0;
+                        cx.notify();
+                    }))
+                    .child("清除")
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_family("Consolas")
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(if searching && visible == 0 {
+                        Theme::accent_red()
+                    } else {
+                        Theme::text_muted()
+                    })
+                    .child(if searching {
+                        format!("命中 {}/{}", visible, total)
+                    } else {
+                        format!("共 {} 句", total)
+                    }),
+            )
+            .child(
+                // 查找替换开关：与「搜索」分开成独立面板，因为
+                // 搜索只过滤显示、替换会真改字幕，混在一起极易误操作。
+                primitives::mini_btn("查找替换", true)
+                    .id("replace-panel-toggle")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.replace_panel_open = !this.replace_panel_open;
+                        if !this.replace_panel_open {
+                            this.replace_status = None;
+                        }
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// 字幕清单的子标头：左侧清单标题、右侧「双语 / 单语」显示状态。
+    fn render_subtitle_list_subheader(&mut self) -> Div {
+        // 列表信息子标头
+        // 双语判定与「有没有译文」都取自派生快照：以前这两条与下面
+        // 的行高计算、翻译卡里的同名判定各算一遍（同一件事每帧
+        // 三遍 O(n)），现在一次算完、按 revision 缓存。
+        let snapshot = self.derived_snapshot();
+        let has_any_trans = snapshot.has_any_translation;
+        let has_distinct_trans = snapshot.has_distinct_translation;
+        div()
+            .w_full()
+            .h(px(26.0))
+            .px(px(Theme::SPACE_3))
+            .bg(Theme::bg_sidebar())
+            .border_b_1()
+            .border_color(Theme::border())
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(Theme::text_muted())
+                    .child(if has_distinct_trans {
+                        "字幕清单（上下并列显示）"
+                    } else {
+                        "字幕清单"
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_SMALL))
+                    .text_color(if has_distinct_trans {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::text_muted()
+                    })
+                    .child(if has_distinct_trans {
+                        "双语显示"
+                    } else if has_any_trans {
+                        "单语显示（译文同原文）"
+                    } else {
+                        "单语显示"
+                    }),
+            )
+    }
+
+    /// 字幕清单主体：选中行跟随滚动 + uniform_list 虚拟化列表 + 嵌套滚轮拦截。
+    fn render_subtitle_list_rows(
+        &mut self,
+        sel_idx: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // 表格行内容：uniform_list 虚拟化渲染，上下并列布局
+        // 选中行变化时自动滚动跟随（时间轴点击 / 上下句跳转 / 播放联动）
+        if self.subtitle_list_followed_sel != sel_idx {
+            if let Some(idx) = sel_idx {
+                // 滚动位置按「过滤后列表里的行号」计算，否则搜索态下会滚错行
+                let pos = self
+                    .subtitle_filter
+                    .iter()
+                    .position(|&p| self.state.segments.get(p).map(|s| s.index) == Some(idx));
+                if let Some(pos) = pos {
+                    self.subtitle_list_scroll
+                        .scroll_to_item(pos, ScrollStrategy::Top);
+                }
+            }
+            self.subtitle_list_followed_sel = sel_idx;
+        }
+
+        let row_count = self.subtitle_filter.len();
+        // 行高与上面子标头必须用同一个布尔，否则会出现
+        // 「标题写双语、行高是单语」。都取快照。
+        let has_distinct_trans = self.derived_snapshot().has_distinct_translation;
+        let row_h = if has_distinct_trans {
+            SUBTITLE_ROW_H_BILINGUAL
+        } else {
+            SUBTITLE_ROW_H_MONO
+        };
+
+        // 术语表合规：疑似未按术语表译出的句子下标集合。每帧只算一次
+        let glossary_bad: std::collections::HashSet<usize> =
+            self.cached_glossary_violations().into_iter().collect();
+        // 低置信句集合：同样每帧只算一次
+        let low_conf: std::collections::HashSet<usize> =
+            self.cached_low_confidence().into_iter().collect();
+        uniform_list(
+            "inspector-segments-virtual",
+            row_count,
+            cx.processor(
+                move |this, visible_range: std::ops::Range<usize>, _window, cx| {
+                    let sel = this.state.selected_segment_index;
+                    // 选中区间（含 Shift 扩选）：行高亮与「重转 N 句」都读它。
+                    let span = this.state.selected_span();
+                    let cur_time = this.state.current_time;
+                    let glossary_bad = glossary_bad.clone();
+                    let low_conf = low_conf.clone();
+                    let inline_target = this.inline_edit_target;
+                    let inline_buf = this.inline_edit_buffer.clone();
+                    let inline_focus = this.inline_edit_focus.clone();
+                    visible_range
+                        .map(|i| {
+                            this.render_subtitle_list_item(
+                                i,
+                                row_h,
+                                sel,
+                                span,
+                                cur_time,
+                                &glossary_bad,
+                                &low_conf,
+                                inline_target,
+                                &inline_buf,
+                                &inline_focus,
+                                cx,
+                            )
+                        })
+                        .collect()
+                },
+            ),
+        )
+        .track_scroll(self.subtitle_list_scroll.clone())
+        .flex_1()
+        .w_full()
+        // 内嵌清单自己吃掉滚轮：清单还有余量时不让事件继续冒泡到
+        // 外层可滚动面板，避免「清单与外层面板一起滚」（见
+        // `should_consume_scroll` 的说明）。到边界时放行，外层接管。
+        .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+            let delta_y = match event.delta {
+                ScrollDelta::Lines(p) => p.y,
+                ScrollDelta::Pixels(p) => f32::from(p.y),
+            };
+            let state = this.subtitle_list_scroll.0.borrow();
+            let offset_y = f32::from(state.base_handle.offset().y);
+            let max_h = f32::from(state.base_handle.max_offset().height);
+            drop(state);
+            if primitives::should_consume_scroll(delta_y, offset_y, max_h) {
+                cx.stop_propagation();
+            }
+        }))
+    }
+
+    /// 字幕清单行内的就地编辑框（原文 / 译文共用同一棵元素树）。
+    ///
+    /// 两处编辑框原先各有一份复制粘贴，只差 id 后缀（raw / trans）与字号（原文用
+    /// 正文、译文小一号）；这里按 `is_trans` 参数化，id 字符串与字号逐一对齐原实现。
+    /// 保存 / 取消直接落到 `commit_inline_edit` / `cancel_inline_edit`，与双击进入
+    /// 编辑那条路径共用同一套提交语义。
+    fn render_inline_edit_box(
+        &self,
+        seg_idx: usize,
+        is_trans: bool,
+        inline_buf: &str,
+        inline_focus: &FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id((
+                if is_trans {
+                    "inline-edit-trans"
+                } else {
+                    "inline-edit-raw"
+                },
+                seg_idx,
+            ))
+            .w_full()
+            .h(px(24.0))
+            .track_focus(inline_focus)
+            .px_1p5()
+            .py_0p5()
+            .rounded_sm()
+            .bg(Theme::bg_sidebar())
+            .border_1()
+            .border_color(Theme::accent_mint())
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.inline_edit_focus);
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                this.handle_inline_edit_keydown(event, cx);
+            }))
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(if is_trans {
+                        Theme::TEXT_SMALL
+                    } else {
+                        Theme::TEXT_BODY
+                    }))
+                    .text_color(Theme::accent_mint())
+                    .truncate()
+                    .child(format!("{}▌", inline_buf)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .child(
+                        div()
+                            .id((
+                                if is_trans {
+                                    "inline-save-trans"
+                                } else {
+                                    "inline-save-raw"
+                                },
+                                seg_idx,
+                            ))
+                            .px_1()
+                            .py_0p5()
+                            .rounded_sm()
+                            .bg(Theme::accent_mint())
+                            .text_size(px(10.0))
+                            .text_color(Theme::text_on_accent())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.commit_inline_edit(cx);
+                            }))
+                            .child("保存"),
+                    )
+                    .child(
+                        div()
+                            .id((
+                                if is_trans {
+                                    "inline-cancel-trans"
+                                } else {
+                                    "inline-cancel-raw"
+                                },
+                                seg_idx,
+                            ))
+                            .px_1()
+                            .py_0p5()
+                            .rounded_sm()
+                            .bg(Theme::bg_hover())
+                            .text_size(px(10.0))
+                            .text_color(Theme::text_muted())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_inline_edit(cx);
+                            }))
+                            .child("取消"),
+                    ),
+            )
+    }
+
+    /// uniform_list 虚拟列表的单行 item 渲染（原闭包体；参数即闭包当时捕获的那些量）。
+    ///
+    /// 一行分四段：行容器与整行点击（跳播 / Shift 扩选 / 选句翻译勾选）、左缘选中
+    /// 指示线、第一行时间与元数据、第二行原文与第三行译文（双击进入就地编辑）。
+    /// 行底色优先级：选句勾选 > 扩选区间 > 术语警示 > 播放中。
+    // 参数多是提取重构的直接结果：这 12 个量就是原 uniform_list item 闭包的捕获清单，
+    // 一一对应便于对照审阅；打包成结构体只会在每行渲染热路径上多一层间接，
+    // 并让「少传一个捕获」这类错误变得难发现。故显式豁免。
+    #[allow(clippy::too_many_arguments)]
+    fn render_subtitle_list_item(
+        &self,
+        i: usize,
+        row_h: f32,
+        sel: Option<usize>,
+        span: Option<(usize, usize)>,
+        cur_time: f64,
+        glossary_bad: &std::collections::HashSet<usize>,
+        low_conf: &std::collections::HashSet<usize>,
+        inline_target: Option<(usize, bool)>,
+        inline_buf: &str,
+        inline_focus: &FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pos = self.subtitle_filter.get(i).copied().unwrap_or(i);
+        let Some(seg) = self.state.segments.get(pos) else {
+            return div()
+                .id(("table-row-placeholder", i))
+                .w_full()
+                .h(px(row_h))
+                .border_b_1()
+                .border_color(Theme::border_subtle())
+                .into_any_element();
+        };
+        let seg_idx = seg.index;
+        let is_selected = sel == Some(seg_idx);
+        // 范围高亮：Shift 连点选中的整段都要变底色，
+        // 否则用户看不出「这一下会重转多少句」。
+        let in_span = span
+            .map(|(lo, hi)| seg_idx >= lo && seg_idx <= hi)
+            .unwrap_or(false);
+        let is_playing_here = is_playing_at(seg.start, seg.end, cur_time);
+        let start_ts = seconds_to_timestamp_short(seg.start);
+        let end_ts = seconds_to_timestamp_short(seg.end);
+        let dur = seg.duration();
+        let raw_text = seg.display_text().to_string();
+        let has_trans = seg.has_translation();
+        let trans_text = seg.translation.clone().unwrap_or_default();
+        let speaker = seg.speaker;
+        let speaker_label = seg.speaker_label();
+        let glossary_flagged = glossary_bad.contains(&seg_idx);
+        let low_conf_flagged = low_conf.contains(&seg_idx);
+        // 选句翻译模式：整行点击 = 勾选/取消勾选，
+        // 不再走「选中 + 跳播」那条路径。
+        let picked = self.state.is_translate_picked(seg_idx as i64);
+
+        div()
+                                                    .id(("table-row-seg", seg_idx))
+                                                    .w_full()
+                                                    .h(px(row_h))
+                                                    .px(px(Theme::SPACE_3))
+                                                    .py(px(4.0))
+                                                    .border_b_1()
+                                                    .border_color(Theme::border_subtle())
+                                                    .cursor_pointer()
+                                                    .relative()
+                                                    .bg(if picked {
+                                                        Theme::tint_mint_badge()
+                                                    } else if in_span {
+                                                        Theme::tint_mint_soft()
+                                                    } else if glossary_flagged {
+                                                        Theme::tint_warn_soft()
+                                                    } else if is_playing_here {
+                                                        Theme::tint_primary_soft()
+                                                    } else {
+                                                        Theme::transparent()
+                                                    })
+                                                    .hover(|s| s.bg(if picked || is_selected { Theme::tint_mint_badge() } else { Theme::bg_hover() }))
+                                                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                                        // Shift 连点 = 从锚点扩选到这一句（范围重转用）。
+                                                        let extend = matches!(
+                                                            event,
+                                                            ClickEvent::Mouse(m) if m.down.modifiers.shift
+                                                        );
+                                                        // 选句模式：只切换勾选，不动播放位置。
+                                                        if this.state.is_picking_translate() {
+                                                            this.state
+                                                                .toggle_translate_pick_one(seg_idx as i64);
+                                                            cx.notify();
+                                                            return;
+                                                        }
+                                                        // 点击某行 = 跳播到该句起点。先停掉正在进行的实时播放：
+                                                        // 否则播放时钟会在下一帧把 current_time 拉回旧位置、音频也
+                                                        // 继续从旧处播放，点击等于没生效（与键盘「上/下句」
+                                                        // `jump_prev/next_segment` 同一套「先停再选」语义）。
+                                                        this.halt_preview_playback();
+                                                        this.state.select_segment_with(seg_idx, extend);
+                                                        // 选中即把播放位置归位到该句起点；再显式 seek 一次做边界钳制，
+                                                        // 随后 `trigger_extract_frame` 抽帧，画面即落到这一句。
+                                                        if let Some(target) =
+                                                            click_seek_target(&this.state.segments, seg_idx)
+                                                        {
+                                                            this.state.seek_to(target);
+                                                        }
+                                                        this.trigger_extract_frame(cx);
+                                                        cx.notify();
+                                                    }))
+                                                    .flex()
+                                                    .flex_col()
+                                                    .justify_start()
+                                                    .gap(px(3.0))
+                                                    // 选中指示线（左缘 3px 竖条）
+                                                    .child(if is_selected {
+                                                        div()
+                                                            .absolute()
+                                                            .left(px(0.0))
+                                                            .top(px(2.0))
+                                                            .bottom(px(2.0))
+                                                            .w(px(3.0))
+                                                            .rounded_r_full()
+                                                            .bg(Theme::accent_mint())
+                                                            .into_any_element()
+                                                    } else {
+                                                        div().into_any_element()
+                                                    })
+                                                    // 第一行：时间与元数据（序号、起止时间、时长、说话人、标记）
+                                                    .child(
+                                                        div()
+                                                            .w_full()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .child(
+                                                                div()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .gap_1p5()
+                                                                    .children(low_conf_flagged.then(|| {
+                                                                        primitives::stat_dot_sm(Theme::accent_red())
+                                                                    }))
+                                                                    .child(
+                                                                        div()
+                                                                            .px_1()
+                                                                            .py_0p5()
+                                                                            .rounded_sm()
+                                                                            .bg(if is_selected {
+                                                                                Theme::tint_mint_badge()
+                                                                            } else {
+                                                                                Theme::bg_raised()
+                                                                            })
+                                                                            .text_size(px(Theme::TEXT_CAPTION))
+                                                                            .font_weight(FontWeight::BOLD)
+                                                                            .text_color(if is_selected {
+                                                                                Theme::accent_mint()
+                                                                            } else {
+                                                                                Theme::text_muted()
+                                                                            })
+                                                                            .child(format!("#{:03}", seg_idx)),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .font_family("Consolas")
+                                                                            .text_size(px(Theme::TEXT_SMALL))
+                                                                            .text_color(if is_selected {
+                                                                                Theme::accent_mint()
+                                                                            } else {
+                                                                                Theme::text_secondary()
+                                                                            })
+                                                                            .child(format!("{} - {}", start_ts, end_ts)),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(Theme::TEXT_CAPTION))
+                                                                            .text_color(Theme::text_muted())
+                                                                            .child(format!("({:.1}s)", dur)),
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .gap_1()
+                                                                    .children(speaker.map(|s| {
+                                                                        let label = speaker_label
+                                                                            .clone()
+                                                                            .unwrap_or_else(|| format!("说话人 {}", s + 1));
+                                                                        div()
+                                                                            .id(("badge-speaker", seg_idx))
+                                                                            .cursor_pointer()
+                                                                            .px_1p5()
+                                                                            .py_0p5()
+                                                                            .rounded_sm()
+                                                                            .border_1()
+                                                                            .border_color(speaker_border(s))
+                                                                            .bg(speaker_tint(s))
+                                                                            .text_size(px(Theme::TEXT_CAPTION))
+                                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                                            .text_color(speaker_color(s))
+                                                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                                                cx.stop_propagation();
+                                                                                this.cycle_segment_speaker(seg_idx, cx);
+                                                                            }))
+                                                                            .child(label)
+                                                                    }))
+                                                                    .children(glossary_flagged.then(|| {
+                                                                        div()
+                                                                            .px_1()
+                                                                            .py_0p5()
+                                                                            .rounded_sm()
+                                                                            .bg(Theme::tint_warn_soft())
+                                                                            .text_size(px(Theme::TEXT_CAPTION))
+                                                                            .text_color(Theme::accent_orange())
+                                                                            .child("术语")
+                                                                    })),
+                                                            ),
+                                                    )
+                                                    // 第二行：字幕内容 (原文，点击直接就地编辑)
+                                                    .child({
+                                                        let is_editing_raw = inline_target == Some((seg_idx, false));
+                                                        if is_editing_raw {
+self.render_inline_edit_box(seg_idx, false, inline_buf, inline_focus, cx)
+                                                        } else {
+                                                            div()
+                                                                .id(("table-row-raw", seg_idx))
+                                                                .w_full()
+                                                                .text_size(px(Theme::TEXT_BODY))
+                                                                .font_weight(if is_selected {
+                                                                    FontWeight::SEMIBOLD
+                                                                } else {
+                                                                    FontWeight::NORMAL
+                                                                })
+                                                                .text_color(Theme::text_primary())
+                                                                .truncate()
+                                                                .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                .cursor_pointer()
+                                                                .on_click(cx.listener({
+                                                                    let raw_for_click = raw_text.clone();
+                                                                    move |this, _, window, cx| {
+                                                                        this.state.select_segment(seg_idx);
+                                                                        this.trigger_extract_frame(cx);
+                                                                        let now = std::time::Instant::now();
+                                                                        let is_double = matches!(
+                                                                            this.last_subtitle_click,
+                                                                            Some((last_idx, false, last_t))
+                                                                                if last_idx == seg_idx && now.duration_since(last_t).as_millis() < 350
+                                                                        );
+                                                                        if is_double {
+                                                                            this.last_subtitle_click = None;
+                                                                            this.start_inline_edit(seg_idx, false, &raw_for_click, window, cx);
+                                                                        } else {
+                                                                            this.last_subtitle_click = Some((seg_idx, false, now));
+                                                                            cx.notify();
+                                                                        }
+                                                                    }
+                                                                }))
+                                                                .child(raw_text.clone())
+                                                        }
+                                                    })
+                                                    // 第三行：翻译字幕 (点击直接就地编辑；无翻译且非编辑态时不显示)
+                                                    .children({
+                                                        let is_editing_trans = inline_target == Some((seg_idx, true));
+                                                        let show_trans = is_editing_trans || (has_trans && !trans_text.trim().is_empty() && trans_text.trim() != raw_text.trim());
+                                                        if show_trans {
+                                                            Some(if is_editing_trans {
+self.render_inline_edit_box(seg_idx, true, inline_buf, inline_focus, cx)
+                                                            } else {
+                                                                div()
+                                                                    .id(("table-row-trans", seg_idx))
+                                                                    .w_full()
+                                                                    .text_size(px(Theme::TEXT_SMALL))
+                                                                    .text_color(if is_selected {
+                                                                        Theme::accent_mint()
+                                                                    } else {
+                                                                        Theme::text_secondary()
+                                                                    })
+                                                                    .truncate()
+                                                                    .hover(|s| s.text_color(Theme::accent_mint()))
+                                                                    .cursor_pointer()
+                                                                    .on_click(cx.listener({
+                                                                        let trans_for_click = trans_text.clone();
+                                                                        move |this, _, window, cx| {
+                                                                            this.state.select_segment(seg_idx);
+                                                                            this.trigger_extract_frame(cx);
+                                                                            let now = std::time::Instant::now();
+                                                                            let is_double = matches!(
+                                                                                this.last_subtitle_click,
+                                                                                Some((last_idx, true, last_t))
+                                                                                    if last_idx == seg_idx && now.duration_since(last_t).as_millis() < 350
+                                                                            );
+                                                                            if is_double {
+                                                                                this.last_subtitle_click = None;
+                                                                                this.start_inline_edit(seg_idx, true, &trans_for_click, window, cx);
+                                                                            } else {
+                                                                                this.last_subtitle_click = Some((seg_idx, true, now));
+                                                                                cx.notify();
+                                                                            }
+                                                                        }
+                                                                    }))
+                                                                    .child(trans_text)
+                                                            })
+                                                        } else {
+                                                            None
+                                                        }
+                                                    })
+                                                    .into_any_element()
+    }
+
+    /// 字幕面板顶部标头栏：面板标题 + 「样式 / 翻译 / 统计与导出」互斥分段切换。
+    fn render_inspector_header(panel: EditorSubtitlePanel, cx: &mut Context<Self>) -> Div {
+        // ── 顶部标头栏 ──
+        div()
+            .h(px(Theme::HEADER_H))
+            .px(px(Theme::PAGE_PAD))
+            .bg(Theme::bg_sidebar())
+            .border_b_1()
+            .border_color(Theme::border())
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(primitives::panel_title("字幕面板"))
+            .child(
+                // 两张面板互斥切换：顶部一对分段选项代替原先的「展开 / 收起」开关。
+                // 面板高度有限，样式卡与翻译卡纵向堆叠时必须滚动才能看到下面那张，
+                // 拆成互斥视图后一次只占一份版面。
+                primitives::segmented_cluster()
+                    // 样式面板：全局字幕样式与排版
+                    .child(
+                        primitives::segmented(
+                            "字幕样式",
+                            panel == EditorSubtitlePanel::Style,
+                            false,
+                        )
+                        .id("btn-panel-subtitle-style")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.subtitle_panel = EditorSubtitlePanel::Style;
+                            cx.notify();
+                        })),
+                    )
+                    // 翻译面板：多语言翻译与进度
+                    .child(
+                        primitives::segmented(
+                            "字幕翻译",
+                            panel == EditorSubtitlePanel::Translate,
+                            false,
+                        )
+                        .id("btn-panel-subtitle-translate")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.subtitle_panel = EditorSubtitlePanel::Translate;
+                            cx.notify();
+                        })),
+                    )
+                    // 统计与导出面板：整篇的时长 / 字数 / 语速 / 过长句，
+                    // 以及导出内容 / 文件名模板 / 格式选择。这些数字此前无处可看
+                    // （只能自己数），而 CPS 与「过长句」正是字幕交付会被打回的硬指标；
+                    // 导出又正是这份字幕最后的交付动作，两者合并同屏最贴合。
+                    .child(
+                        primitives::segmented(
+                            "统计与导出",
+                            panel == EditorSubtitlePanel::Stats,
+                            false,
+                        )
+                        .id("btn-panel-subtitle-stats")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.subtitle_panel = EditorSubtitlePanel::Stats;
+                            cx.notify();
+                        })),
+                    ),
+            )
+    }
+
+    /// 全局字幕样式与排版配置卡：收起态摘要条，或展开后的样式工具条 / 描边底框 / 排版参数。
+    fn render_subtitle_style_card(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // 1. 全局字幕样式与排版配置卡片（仅「字幕样式」面板可见）
+        let cur_style = self.state.config.subtitle_style.clone();
+
+        if self.subtitle_style_collapsed {
+            div()
+                .id("bar-subtitle-style-collapsed")
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .bg(Theme::bg_sidebar())
+                .border_1()
+                .border_color(Theme::border())
+                .hover(|s| s.bg(Theme::bg_hover()))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.subtitle_style_collapsed = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(Theme::accent_mint())
+                                .child("▶"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_BODY))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(Theme::text_primary())
+                                .child("全局字幕样式与排版"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .bg(Theme::bg_inset())
+                                .text_color(Theme::text_muted())
+                                .child(format!(
+                                    "{}px · {} · {}",
+                                    cur_style.font_size,
+                                    if cur_style.is_bold {
+                                        "加粗"
+                                    } else {
+                                        "常规"
+                                    },
+                                    match cur_style.alignment.as_str() {
+                                        "left" => "靠左",
+                                        "right" => "靠右",
+                                        _ => "居中",
+                                    }
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_SMALL))
+                        .text_color(Theme::accent_mint())
+                        .child("展开 ⚙"),
+                )
+                .into_any_element()
+        } else {
+            primitives::card_sm()
                                     .flex_none()
                                     .gap(px(Theme::SPACE_2))
                                     // 卡片标题与恢复默认（带收起按钮）
@@ -2489,1378 +3217,743 @@ impl MainWindow {
                                         )
                                 )
                                 .into_any_element()
-                            }
-                        } else {
-                            div().into_any_element()
-                        }
-                    )
-                    // 2. 单句快速编辑卡（仅「字幕样式」面板）。
-                    //
-                    // 这张卡自带「实时预览条」，预览的就是卡里正在编辑的这一句——编辑与
-                    // 预览在同一张卡上，改字 / 调字号都是即时的。翻译面板不重复放编辑卡：
-                    // 面板标头已能切回样式面板，两处各放一份只会让人分不清哪份生效。
+        }
+    }
+
+    /// 单句快速编辑卡：编号 / 时间、保存删除、剪辑文本导出工具条、原文与译文编辑、
+    /// 画面效果预览、时间微调与快捷标点注入。
+    fn render_selected_segment_card(
+        &mut self,
+        seg: &Segment,
+        cur_text: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // 2. 单句快速编辑卡（仅「字幕样式」面板）。
+        //
+        // 这张卡自带「实时预览条」，预览的就是卡里正在编辑的这一句——编辑与
+        // 预览在同一张卡上，改字 / 调字号都是即时的。翻译面板不重复放编辑卡：
+        // 面板标头已能切回样式面板，两处各放一份只会让人分不清哪份生效。
+        let seg_idx = seg.index;
+        let start_ts = seconds_to_timestamp_short(seg.start);
+        let end_ts = seconds_to_timestamp_short(seg.end);
+        let dur = seg.duration();
+        // 单字无法拆分；最后一句没有下一句可合并，按钮置灰而不是点了没反应
+        let can_split = seg.display_text().chars().count() > 1;
+        let can_merge = seg_idx < self.state.segments.len();
+        // 正在导出片段时把两个导出按钮一并置灰：导出是后台任务，
+        // 重复点击会被忽略，显式不可点比「点了没反应」更清楚。
+        let clip_idle =
+            !super::actions::CLIP_EXPORT_BUSY.load(std::sync::atomic::Ordering::Relaxed);
+
+        primitives::card_sm()
+            .flex_none()
+            .gap(px(Theme::SPACE_2))
+            // 第一行：文段编号与主要操作 (保存修改、删除)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
                     .child(
-                        if let Some(seg) = cur_seg.as_ref().filter(|_| panel == EditorSubtitlePanel::Style) {
-                            let seg_idx = seg.index;
-                            let start_ts = seconds_to_timestamp_short(seg.start);
-                            let end_ts = seconds_to_timestamp_short(seg.end);
-                            let dur = seg.duration();
-                            // 单字无法拆分；最后一句没有下一句可合并，按钮置灰而不是点了没反应
-                            let can_split = seg.display_text().chars().count() > 1;
-                            let can_merge = seg_idx < self.state.segments.len();
-                            // 正在导出片段时把两个导出按钮一并置灰：导出是后台任务，
-                            // 重复点击会被忽略，显式不可点比「点了没反应」更清楚。
-                            let clip_idle = !super::actions::CLIP_EXPORT_BUSY
-                                .load(std::sync::atomic::Ordering::Relaxed);
-
-                            primitives::card_sm()
-                                .flex_none()
-                                .gap(px(Theme::SPACE_2))
-                                // 第一行：文段编号与主要操作 (保存修改、删除)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .child(
-                                                    div()
-                                                        .px_2()
-                                                        .py_0p5()
-                                                        .rounded_md()
-                                                        .bg(Theme::tint_mint_badge())
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .text_color(Theme::accent_mint())
-                                                        .child(format!("#{:03}", seg_idx)),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .font_family("Consolas")
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .text_color(Theme::text_secondary())
-                                                        .child(format!("{} - {} ({:.1}s)", start_ts, end_ts, dur)),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .flex_shrink_0()
-                                                .child(
-                                                    div()
-                                                        .id("btn-save-text-top")
-                                                        .px_3()
-                                                        .py_1()
-                                                        .rounded_md()
-                                                        .bg(Theme::accent_mint())
-                                                        .cursor_pointer()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .text_color(Theme::text_on_accent())
-                                                        .hover(|s| s.opacity(0.9))
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.save_selected_text();
-                                                            cx.notify();
-                                                        }))
-                                                        .child("保存修改"),
-                                                )
-                                                // 「重转此句」：只解目标窗口那几秒音频，
-                                                // 长视频改一句不用整片重跑。锁定的句子不参与，
-                                                // 免得把用户定稿的文本又覆盖掉。
-                                                .child({
-                                                    // 没有媒体文件就置灰：此时点了只会弹一句
-                                                    // 「找不到媒体」，属于假按钮。
-                                                    let has_media = self.state.selected_file.is_some()
-                                                        || self.state.transcribe_file.is_some();
-                                                    let can_respan = self.state.selected_segment_index.is_some()
-                                                        && has_media;
-                                                    let span_len = self
-                                                        .state
-                                                        .selected_span()
-                                                        .map(|(lo, hi)| hi.saturating_sub(lo) + 1)
-                                                        .unwrap_or(0);
-                                                    let label = if span_len > 1 {
-                                                        format!("重转 {span_len} 句")
-                                                    } else {
-                                                        "重转此句".to_string()
-                                                    };
-                                                    primitives::mini_btn(label, can_respan)
-                                                        .id("btn-retranscribe-seg")
-                                                        .when(can_respan, |d| {
-                                                            d.on_click(cx.listener(|this, _, _, cx| {
-                                                                this.retranscribe_selected_segment(cx);
-                                                            }))
-                                                        })
-                                                })
-                                                // 「已校对」开关：锁定后重新翻译/润色不会覆盖这一句。
-                                                // 放在「保存修改」旁边：用户点完保存顺手就能锁上，
-                                                // 不用再去别处找。
-                                                .child({
-                                                    let locked = self
-                                                        .state
-                                                        .selected_segment_index
-                                                        .and_then(|idx| {
-                                                            self.state
-                                                                .segments
-                                                                .iter()
-                                                                .find(|s| s.index == idx)
-                                                        })
-                                                        .map(|s| s.locked)
-                                                        .unwrap_or(false);
-                                                    primitives::mini_btn(
-                                                        if locked { "已校对 ✓" } else { "标记已校对" },
-                                                        self.state.selected_segment_index.is_some(),
-                                                    )
-                                                    .id("btn-toggle-seg-lock")
-                                                    .when(self.state.selected_segment_index.is_some(), |d| {
-                                                        d.on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.toggle_selected_lock();
-                                                            this.state.flush_segments_if_dirty();
-                                                            cx.notify();
-                                                        }))
-                                                    })
-                                                })
-                                                .child(
-                                                    primitives::btn_danger("删除", primitives::BtnSize::Sm)
-                                                        .id("btn-del-seg")
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.state.delete_selected_segment();
-                                                            this.trigger_extract_frame(cx);
-                                                            cx.notify();
-                                                        })),
-                                                ),
-                                        ),
-                                )
-                                // 第一行半：次级操作工具条（语义化三组分立：剪辑、文本、导出）
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap_2()
-                                        // 组 1：剪辑动作（拆分 / 合并下句）
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(Self::render_mini_btn(
-                                                    "btn-split-seg",
-                                                    "✂ 拆分",
-                                                    can_split,
-                                                    cx,
-                                                    |this, cx| {
-                                                        let len = this.state.editing_text.chars().count();
-                                                        let at = if this.text_cursor_pos > 0
-                                                            && this.text_cursor_pos < len
-                                                        {
-                                                            Some(this.text_cursor_pos)
-                                                        } else {
-                                                            None
-                                                        };
-                                                        this.state.split_selected_segment(at);
-                                                        this.trigger_extract_frame(cx);
-                                                    },
-                                                ))
-                                                .child(Self::render_mini_btn(
-                                                    "btn-merge-seg",
-                                                    "🔗 合并下句",
-                                                    can_merge,
-                                                    cx,
-                                                    |this, cx| {
-                                                        this.state.merge_selected_with_next();
-                                                        this.trigger_extract_frame(cx);
-                                                    },
-                                                ))
-                                        )
-                                        // 组 2：文本辅助（弹窗大图编辑 / 改译文 / 清译文）
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .id("btn-open-prompt-edit")
-                                                        .px_2p5()
-                                                        .py_1()
-                                                        .rounded_md()
-                                                        .bg(Theme::bg_inset())
-                                                        .border_1()
-                                                        .border_color(Theme::border_mid())
-                                                        .cursor_pointer()
-                                                        .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.prompt_edit_text(cx);
-                                                        }))
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(Theme::TEXT_SMALL))
-                                                                .text_color(Theme::text_secondary())
-                                                                .child("弹窗编辑"),
-                                                        ),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("btn-open-translation-edit")
-                                                        .px_2p5()
-                                                        .py_1()
-                                                        .rounded_md()
-                                                        .bg(Theme::bg_inset())
-                                                        .border_1()
-                                                        .border_color(Theme::border_mid())
-                                                        .cursor_pointer()
-                                                        .hover(|s| s.bg(Theme::bg_hover()))
-                                                        .on_click(cx.listener(|this, _, window, cx| {
-                                                            if let Some(idx) = this.state.selected_segment_index {
-                                                                let trans = this.state.segments.iter().find(|s| s.index == idx)
-                                                                    .and_then(|s| s.translation.clone())
-                                                                    .unwrap_or_default();
-                                                                this.start_inline_edit(idx, true, &trans, window, cx);
-                                                            }
-                                                        }))
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(Theme::TEXT_SMALL))
-                                                                .text_color(Theme::text_secondary())
-                                                                .child("改译文"),
-                                                        ),
-                                                )
-                                                .child(
-                                                    if seg.has_translation() {
-                                                        div()
-                                                            .id("btn-clear-translation")
-                                                            .px_2()
-                                                            .py_1()
-                                                            .rounded_md()
-                                                            .bg(Theme::bg_inset())
-                                                            .border_1()
-                                                            .border_color(Theme::border_mid())
-                                                            .cursor_pointer()
-                                                            .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::accent_red()))
-                                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                                this.state.set_selected_translation("");
-                                                                cx.notify();
-                                                            }))
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(Theme::TEXT_SMALL))
-                                                                    .text_color(Theme::text_muted())
-                                                                    .child("清除译文"),
-                                                            )
-                                                            .into_any_element()
-                                                    } else {
-                                                        div().into_any_element()
-                                                    },
-                                                )
-                                        )
-                                        // 组 3：音视频导出
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(Self::render_mini_btn(
-                                                    "btn-export-clip",
-                                                    "导出片段",
-                                                    clip_idle,
-                                                    cx,
-                                                    |this, cx| {
-                                                        this.export_selected_clip(cx);
-                                                    },
-                                                ))
-                                                .child(Self::render_mini_btn(
-                                                    "btn-export-clip-audio",
-                                                    "导出音频",
-                                                    clip_idle,
-                                                    cx,
-                                                    |this, cx| {
-                                                        this.export_selected_clip_audio(cx);
-                                                    },
-                                                ))
-                                        ),
-                                )
-                                // 第二行：原文输入框（带清晰标题）
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .child(
-                                                    div()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(Theme::text_muted())
-                                                        .child("原文编辑"),
-                                                ),
-                                        )
-                                        .child({
-                                            let is_focused = self.is_text_focused;
-                                            let total_chars = cur_text.chars().count();
-                                            let cursor_pos = self.text_cursor_pos.min(total_chars);
-
-                                            div()
-                                                .id("subtitle-text-editor-box")
-                                                .w_full()
-                                                .track_focus(&self.text_focus)
-                                                .min_h(px(Theme::TABLE_HEADER_H))
-                                                .px(px(Theme::SPACE_3))
-                                                .py(px(Theme::SPACE_1))
-                                                .rounded(px(Theme::RADIUS_LG))
-                                                .bg(Theme::bg_sidebar())
-                                                .border_1()
-                                                .border_color(if is_focused { Theme::accent_mint() } else { Theme::border() })
-                                                .cursor_text()
-                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                                    window.focus(&this.text_focus);
-                                                    this.is_text_focused = true;
-                                                    cx.notify();
-                                                }))
-                                                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                                                    let key = &event.keystroke.key;
-                                                    let total_chars = this.state.editing_text.chars().count();
-                                                    let cursor = this.text_cursor_pos.min(total_chars);
-
-                                                    if event.keystroke.modifiers.control {
-                                                        if key == "v" {
-                                                            if let Some(item) = cx.read_from_clipboard() {
-                                                                if let Some(text) = item.text() {
-                                                                    let mut chars: Vec<char> = this.state.editing_text.chars().collect();
-                                                                    let insert_chars: Vec<char> = text.chars().collect();
-                                                                    let ins_len = insert_chars.len();
-                                                                    chars.splice(cursor..cursor, insert_chars);
-                                                                    this.state.editing_text = chars.into_iter().collect();
-                                                                    this.text_cursor_pos = cursor + ins_len;
-                                                                    this.state.save_selected_text();
-                                                                    cx.notify();
-                                                                }
-                                                            }
-                                                        } else if key == "c" {
-                                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(this.state.editing_text.clone()));
-                                                            return;
-                                                        } else if key == "a" {
-                                                            this.text_cursor_pos = total_chars;
-                                                            cx.notify();
-                                                            return;
-                                                        }
-                                                        return;
-                                                    }
-
-                                                    if key == "backspace" {
-                                                        if cursor > 0 && total_chars > 0 {
-                                                            let mut chars: Vec<char> = this.state.editing_text.chars().collect();
-                                                            chars.remove(cursor - 1);
-                                                            this.state.editing_text = chars.into_iter().collect();
-                                                            this.text_cursor_pos = cursor - 1;
-                                                            this.state.save_selected_text();
-                                                            cx.notify();
-                                                        }
-                                                    } else if key == "delete" {
-                                                        if cursor < total_chars {
-                                                            let mut chars: Vec<char> = this.state.editing_text.chars().collect();
-                                                            chars.remove(cursor);
-                                                            this.state.editing_text = chars.into_iter().collect();
-                                                            this.state.save_selected_text();
-                                                            cx.notify();
-                                                        }
-                                                    } else if key == "left" {
-                                                        if cursor > 0 {
-                                                            this.text_cursor_pos = cursor - 1;
-                                                            cx.notify();
-                                                        }
-                                                    } else if key == "right" {
-                                                        if cursor < total_chars {
-                                                            this.text_cursor_pos = cursor + 1;
-                                                            cx.notify();
-                                                        }
-                                                    } else if key == "home" {
-                                                        this.text_cursor_pos = 0;
-                                                        cx.notify();
-                                                    } else if key == "end" {
-                                                        this.text_cursor_pos = total_chars;
-                                                        cx.notify();
-                                                    } else if key == "enter" {
-                                                        this.state.save_selected_text();
-                                                        cx.notify();
-                                                    } else if key.chars().count() == 1 {
-                                                        let ch = key.chars().next().unwrap();
-                                                        if !ch.is_control() {
-                                                            let mut chars: Vec<char> = this.state.editing_text.chars().collect();
-                                                            chars.insert(cursor, ch);
-                                                            this.state.editing_text = chars.into_iter().collect();
-                                                            this.text_cursor_pos = cursor + 1;
-                                                            this.state.save_selected_text();
-                                                            cx.notify();
-                                                        }
-                                                    }
-                                                }))
-                                                .flex()
-                                                .flex_wrap()
-                                                .items_center()
-                                                .text_size(px(Theme::TEXT_BODY_LG))
-                                                .text_color(Theme::text_primary())
-                                                .child(if cur_text.is_empty() {
-                                                    div().child(if is_focused { "▌".to_string() } else { "点击直接输入字幕...".to_string() })
-                                                } else {
-                                                    div()
-                                                        .flex()
-                                                        .flex_wrap()
-                                                        .items_center()
-                                                        .children(cur_text.chars().enumerate().map(|(idx, ch)| {
-                                                            let show_cursor = is_focused && cursor_pos == idx;
-                                                            let ch_str = ch.to_string();
-                                                            div()
-                                                                .id(("text-char", idx))
-                                                                .cursor_text()
-                                                                .flex()
-                                                                .items_center()
-                                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                                                                    window.focus(&this.text_focus);
-                                                                    this.is_text_focused = true;
-                                                                    this.text_cursor_pos = idx;
-                                                                    cx.notify();
-                                                                }))
-                                                                .child(if show_cursor {
-                                                                    div()
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .child(
-                                                                            div()
-                                                                                .text_color(Theme::accent_mint())
-                                                                                .font_weight(FontWeight::BOLD)
-                                                                                .child("▌"),
-                                                                        )
-                                                                        .child(ch_str)
-                                                                    } else {
-                                                                        div().child(ch_str)
-                                                                    })
-                                                        }))
-                                                        .child(if is_focused && cursor_pos == total_chars {
-                                                            div()
-                                                                .cursor_text()
-                                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                                                                    window.focus(&this.text_focus);
-                                                                    this.is_text_focused = true;
-                                                                    this.text_cursor_pos = total_chars;
-                                                                    cx.notify();
-                                                                }))
-                                                                .text_color(Theme::accent_mint())
-                                                                .font_weight(FontWeight::BOLD)
-                                                                .child("▌")
-                                                        } else {
-                                                            div()
-                                                        })
-                                                })
-                                        }),
-                                )
-                                // 第二行半：译文内容展示（若已翻译）
-                                .children(seg.translation.as_ref().filter(|t| !t.trim().is_empty()).map(|trans_str| {
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .child(
-                                                    div()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(Theme::accent_mint())
-                                                        .child("译文内容"),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("subtitle-trans-editor-box")
-                                                .w_full()
-                                                .min_h(px(Theme::TABLE_HEADER_H))
-                                                .px(px(Theme::SPACE_3))
-                                                .py(px(Theme::SPACE_1))
-                                                .rounded(px(Theme::RADIUS_LG))
-                                                .bg(Theme::bg_sidebar())
-                                                .border_1()
-                                                .border_color(Theme::border())
-                                                .cursor_pointer()
-                                                .hover(|s| s.border_color(Theme::accent_mint()))
-                                                .text_size(px(Theme::TEXT_BODY_LG))
-                                                .text_color(Theme::accent_mint())
-                                                .on_click(cx.listener({
-                                                    let trans_clone = trans_str.clone();
-                                                    let idx = seg.index;
-                                                    move |this, _, window, cx| {
-                                                        this.start_inline_edit(idx, true, &trans_clone, window, cx);
-                                                    }
-                                                }))
-                                                .child(trans_str.clone()),
-                                        )
-                                }))
-                                // 第二行四分之三：实时排版效果预览（带明确标题与双语联动）
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .pt_1()
-                                                .child(
-                                                    div()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(Theme::text_muted())
-                                                        .child("画面效果预览"),
-                                                ),
-                                        )
-                                        .child({
-                                            let preview_str = if let Some(t) = &seg.translation {
-                                                if !t.trim().is_empty() && t.trim() != cur_text.trim() {
-                                                    format!("{}\n{}", t.trim(), cur_text.trim())
-                                                } else {
-                                                    cur_text.clone()
-                                                }
-                                            } else {
-                                                cur_text.clone()
-                                            };
-                                            self.render_subtitle_preview_box(&preview_str, cx)
-                                        }),
-                                )
-                                // 第三行：时间微调与快捷标点注入 (规整两行，干净不拥挤)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(Theme::SPACE_2))
-                                        // 第一行：时间微调（对称连体胶囊：起点 + 终点，告别杂乱按键）
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
-                                                // 起点微调连体胶囊
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .bg(Theme::bg_inset())
-                                                        .border_1()
-                                                        .border_color(Theme::border())
-                                                        .rounded_md()
-                                                        .p_0p5()
-                                                        .child(Self::render_mini_btn(
-                                                            "fine-tune-start-minus-500",
-                                                            "-0.5s",
-                                                            true,
-                                                            cx,
-                                                            |this, _| this.state.adjust_selected_times(-0.5, 0.0),
-                                                        ))
-                                                        .child(Self::render_mini_btn(
-                                                            "fine-tune-start-minus-100",
-                                                            "-0.1s",
-                                                            true,
-                                                            cx,
-                                                            |this, _| this.state.adjust_selected_times(-0.1, 0.0),
-                                                        ))
-                                                        .child(
-                                                            div()
-                                                                .px_1()
-                                                                .text_size(px(Theme::TEXT_SMALL))
-                                                                .font_weight(FontWeight::BOLD)
-                                                                .text_color(Theme::text_secondary())
-                                                                .child("起点"),
-                                                        )
-                                                        .child(Self::render_mini_btn(
-                                                            "fine-tune-start-plus-100",
-                                                            "+0.1s",
-                                                            true,
-                                                            cx,
-                                                            |this, _| this.state.adjust_selected_times(0.1, 0.0),
-                                                        ))
-                                                        .child(Self::render_mini_btn(
-                                                            "fine-tune-start-plus-500",
-                                                            "+0.5s",
-                                                            true,
-                                                            cx,
-                                                            |this, _| this.state.adjust_selected_times(0.5, 0.0),
-                                                        )),
-                                                )
-                                                // 终点微调连体胶囊
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .bg(Theme::bg_inset())
-                                                        .border_1()
-                                                        .border_color(Theme::border())
-                                                        .rounded_md()
-                                                        .p_0p5()
-                                                        .child(Self::render_mini_btn(
-                                                            "fine-tune-end-minus-500",
-                                                            "-0.5s",
-                                                            true,
-                                                            cx,
-                                                            |this, _| this.state.adjust_selected_times(0.0, -0.5),
-                                                        ))
-                                                        .child(Self::render_mini_btn(
-                                                            "fine-tune-end-minus-100",
-                                                            "-0.1s",
-                                                            true,
-                                                            cx,
-                                                            |this, _| this.state.adjust_selected_times(0.0, -0.1),
-                                                        ))
-                                                        .child(
-                                                            div()
-                                                                .px_1()
-                                                                .text_size(px(Theme::TEXT_SMALL))
-                                                                .font_weight(FontWeight::BOLD)
-                                                                .text_color(Theme::text_secondary())
-                                                                .child("终点"),
-                                                        )
-                                                        .child(Self::render_mini_btn(
-                                                            "fine-tune-end-plus-100",
-                                                            "+0.1s",
-                                                            true,
-                                                            cx,
-                                                            |this, _| this.state.adjust_selected_times(0.0, 0.1),
-                                                        ))
-                                                        .child(Self::render_mini_btn(
-                                                            "fine-tune-end-plus-500",
-                                                            "+0.5s",
-                                                            true,
-                                                            cx,
-                                                            |this, _| this.state.adjust_selected_times(0.0, 0.5),
-                                                        )),
-                                                ),
-                                        )
-                                        // 第二行：快捷标点注入
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .bg(Theme::bg_inset())
-                                                .border_1()
-                                                .border_color(Theme::border_subtle())
-                                                .rounded_md()
-                                                .px_2p5()
-                                                .py_1()
-                                                .child(
-                                                    div()
-                                                        .text_size(px(Theme::TEXT_SMALL))
-                                                        .text_color(Theme::text_secondary())
-                                                        .child("快捷标点注入："),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap_2()
-                                                        .child(self.render_punct_btn("，", cx))
-                                                        .child(self.render_punct_btn("。", cx))
-                                                        .child(self.render_punct_btn("？", cx))
-                                                        .child(self.render_punct_btn("！", cx))
-                                                        .child(self.render_punct_btn("、", cx)),
-                                                ),
-                                        ),
-                                )
-                                .into_any_element()
-                        } else {
-                            div().into_any_element()
-                        }
-                    )
-                    // 2.4 整轨时间轴调整（仅「字幕样式」面板可见）
-                    //
-                    // 与样式卡并列、而不是塞进样式卡内部：它是**整轨级**操作（平移 /
-                    // 缩放 / 铺满），与「观感」是两件事；放在同一页是因为两者都属于
-                    // 「我要调整这一整份字幕」的心智模型。
-                    .child(if panel == EditorSubtitlePanel::Style {
-                        self.render_retime_card(cx).into_any_element()
-                    } else {
-                        div().into_any_element()
-                    })
-                    // 2.5 字幕多语言翻译面板（仅「字幕翻译」面板可见；后端链路早已就绪）
-                    .child(
-                        if panel == EditorSubtitlePanel::Translate {
-                            self.render_translate_card(cx).into_any_element()
-                        } else if panel == EditorSubtitlePanel::Stats {
-                            // 统计与导出同屏：两张卡都是「对整份字幕做事」的收尾动作，
-                            // 一起竖排在同一个面板里。
-                            div()
-                                .w_full()
-                                .flex_none()
-                                .flex()
-                                .flex_col()
-                                .gap(px(Theme::CARD_GAP))
-                                .child(self.render_subtitle_stats_card(cx))
-                                .child(self.render_export_card(cx))
-                                .into_any_element()
-                        } else {
-                            div().into_any_element()
-                        },
-                    )
-                    // 3. 多语言字幕配置与对照大表格 (仅在「字幕翻译」面板可见；「字幕样式」与「统计与导出」不展示此卡)
-                    .child(if panel == EditorSubtitlePanel::Translate {
-                        primitives::card_sm()
-                            .flex_1()
-                            .min_h(px(Theme::TABLE_MIN_H))
-                            .gap(px(0.0))
-                            // 上下堆叠时面板整体已可纵向滚动，这里不能再吃 flex_1
-                            // （自动高度的滚动容器里会塌成 0 高），改为固定高度。
-                            .when(stacked, |d| d.flex_none().h(px(Theme::TABLE_STACK_H)))
-                            .overflow_hidden()
-                            // 搜索栏：按关键字过滤清单（原文与译文都参与匹配），
-                            // 命中条数实时回显，避免用户以为「搜了没结果」是卡住了
-                            .child({
-                                let total = self.state.segments.len();
-                                let visible = self.subtitle_filter.len();
-                                let searching = !self.subtitle_search.trim().is_empty();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
                                 div()
-                                    .w_full()
-                                    .h(px(Theme::TABLE_HEADER_H))
-                                    .px(px(Theme::SPACE_3))
-                                    .bg(Theme::bg_sidebar())
-                                    .border_b_1()
-                                    .border_color(Theme::border())
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .bg(Theme::tint_mint_badge())
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(Theme::accent_mint())
+                                    .child(format!("#{:03}", seg_idx)),
+                            )
+                            .child(
+                                div()
+                                    .font_family("Consolas")
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .text_color(Theme::text_secondary())
+                                    .child(format!("{} - {} ({:.1}s)", start_ts, end_ts, dur)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .flex_shrink_0()
+                            .child(
+                                div()
+                                    .id("btn-save-text-top")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(Theme::accent_mint())
+                                    .cursor_pointer()
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(Theme::text_on_accent())
+                                    .hover(|s| s.opacity(0.9))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.save_selected_text();
+                                        cx.notify();
+                                    }))
+                                    .child("保存修改"),
+                            )
+                            // 「重转此句」：只解目标窗口那几秒音频，
+                            // 长视频改一句不用整片重跑。锁定的句子不参与，
+                            // 免得把用户定稿的文本又覆盖掉。
+                            .child({
+                                // 没有媒体文件就置灰：此时点了只会弹一句
+                                // 「找不到媒体」，属于假按钮。
+                                let has_media = self.state.selected_file.is_some()
+                                    || self.state.transcribe_file.is_some();
+                                let can_respan =
+                                    self.state.selected_segment_index.is_some() && has_media;
+                                let span_len = self
+                                    .state
+                                    .selected_span()
+                                    .map(|(lo, hi)| hi.saturating_sub(lo) + 1)
+                                    .unwrap_or(0);
+                                let label = if span_len > 1 {
+                                    format!("重转 {span_len} 句")
+                                } else {
+                                    "重转此句".to_string()
+                                };
+                                primitives::mini_btn(label, can_respan)
+                                    .id("btn-retranscribe-seg")
+                                    .when(can_respan, |d| {
+                                        d.on_click(cx.listener(|this, _, _, cx| {
+                                            this.retranscribe_selected_segment(cx);
+                                        }))
+                                    })
+                            })
+                            // 「已校对」开关：锁定后重新翻译/润色不会覆盖这一句。
+                            // 放在「保存修改」旁边：用户点完保存顺手就能锁上，
+                            // 不用再去别处找。
+                            .child({
+                                let locked = self
+                                    .state
+                                    .selected_segment_index
+                                    .and_then(|idx| {
+                                        self.state.segments.iter().find(|s| s.index == idx)
+                                    })
+                                    .map(|s| s.locked)
+                                    .unwrap_or(false);
+                                primitives::mini_btn(
+                                    if locked {
+                                        "已校对 ✓"
+                                    } else {
+                                        "标记已校对"
+                                    },
+                                    self.state.selected_segment_index.is_some(),
+                                )
+                                .id("btn-toggle-seg-lock")
+                                .when(
+                                    self.state.selected_segment_index.is_some(),
+                                    |d| {
+                                        d.on_click(cx.listener(|this, _, _, cx| {
+                                            this.state.toggle_selected_lock();
+                                            this.state.flush_segments_if_dirty();
+                                            cx.notify();
+                                        }))
+                                    },
+                                )
+                            })
+                            .child(
+                                primitives::btn_danger("删除", primitives::BtnSize::Sm)
+                                    .id("btn-del-seg")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.delete_selected_segment();
+                                        this.trigger_extract_frame(cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            // 第一行半：次级操作工具条（语义化三组分立：剪辑、文本、导出）
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    // 组 1：剪辑动作（拆分 / 合并下句）
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(Self::render_mini_btn(
+                                "btn-split-seg",
+                                "✂ 拆分",
+                                can_split,
+                                cx,
+                                |this, cx| {
+                                    let len = this.state.editing_text.chars().count();
+                                    let at =
+                                        if this.text_cursor_pos > 0 && this.text_cursor_pos < len {
+                                            Some(this.text_cursor_pos)
+                                        } else {
+                                            None
+                                        };
+                                    this.state.split_selected_segment(at);
+                                    this.trigger_extract_frame(cx);
+                                },
+                            ))
+                            .child(Self::render_mini_btn(
+                                "btn-merge-seg",
+                                "🔗 合并下句",
+                                can_merge,
+                                cx,
+                                |this, cx| {
+                                    this.state.merge_selected_with_next();
+                                    this.trigger_extract_frame(cx);
+                                },
+                            )),
+                    )
+                    // 组 2：文本辅助（弹窗大图编辑 / 改译文 / 清译文）
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("btn-open-prompt-edit")
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(Theme::bg_inset())
+                                    .border_1()
+                                    .border_color(Theme::border_mid())
+                                    .cursor_pointer()
+                                    .hover(|s| {
+                                        s.bg(Theme::bg_hover()).text_color(Theme::text_primary())
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.prompt_edit_text(cx);
+                                    }))
                                     .child(
                                         div()
-                                            .flex_shrink_0()
-                                            .text_size(px(Theme::TEXT_SMALL))
-                                            .text_color(Theme::text_muted())
-                                            .child("搜索"),
-                                    )
-                                    .child(self.render_search_input(cx))
-                                    .child(if searching {
-                                        div()
-                                            .id("subtitle-search-clear")
-                                            .flex_shrink_0()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_md()
-                                            .bg(Theme::bg_raised())
-                                            .border_1()
-                                            .border_color(Theme::border_mid())
-                                            .cursor_pointer()
                                             .text_size(px(Theme::TEXT_SMALL))
                                             .text_color(Theme::text_secondary())
-                                            .hover(|s| {
-                                                s.bg(Theme::bg_hover())
-                                                    .text_color(Theme::text_primary())
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.subtitle_search.clear();
-                                                this.subtitle_search_cursor = 0;
-                                                cx.notify();
-                                            }))
-                                            .child("清除")
-                                            .into_any_element()
-                                    } else {
-                                        div().into_any_element()
-                                    })
+                                            .child("弹窗编辑"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-open-translation-edit")
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(Theme::bg_inset())
+                                    .border_1()
+                                    .border_color(Theme::border_mid())
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if let Some(idx) = this.state.selected_segment_index {
+                                            let trans = this
+                                                .state
+                                                .segments
+                                                .iter()
+                                                .find(|s| s.index == idx)
+                                                .and_then(|s| s.translation.clone())
+                                                .unwrap_or_default();
+                                            this.start_inline_edit(idx, true, &trans, window, cx);
+                                        }
+                                    }))
                                     .child(
                                         div()
-                                            .flex_shrink_0()
-                                            .font_family("Consolas")
-                                            .text_size(px(Theme::TEXT_CAPTION))
-                                            .text_color(if searching && visible == 0 {
-                                                Theme::accent_red()
-                                            } else {
-                                                Theme::text_muted()
-                                            })
-                                            .child(if searching {
-                                                format!("命中 {}/{}", visible, total)
-                                            } else {
-                                                format!("共 {} 句", total)
-                                            }),
-                                    )
-                                    .child(
-                                        // 查找替换开关：与「搜索」分开成独立面板，因为
-                                        // 搜索只过滤显示、替换会真改字幕，混在一起极易误操作。
-                                        primitives::mini_btn("查找替换", true)
-                                            .id("replace-panel-toggle")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.replace_panel_open = !this.replace_panel_open;
-                                                if !this.replace_panel_open {
-                                                    this.replace_status = None;
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                            })
-                            .children(self.render_replace_bar(cx))
-                            // 列表信息子标头
-                            .child({
-                                // 双语判定与「有没有译文」都取自派生快照：以前这两条与下面
-                                // 的行高计算、翻译卡里的同名判定各算一遍（同一件事每帧
-                                // 三遍 O(n)），现在一次算完、按 revision 缓存。
-                                let snapshot = self.derived_snapshot();
-                                let has_any_trans = snapshot.has_any_translation;
-                                let has_distinct_trans = snapshot.has_distinct_translation;
+                                            .text_size(px(Theme::TEXT_SMALL))
+                                            .text_color(Theme::text_secondary())
+                                            .child("改译文"),
+                                    ),
+                            )
+                            .child(if seg.has_translation() {
                                 div()
+                                    .id("btn-clear-translation")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(Theme::bg_inset())
+                                    .border_1()
+                                    .border_color(Theme::border_mid())
+                                    .cursor_pointer()
+                                    .hover(|s| {
+                                        s.bg(Theme::bg_hover()).text_color(Theme::accent_red())
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.set_selected_translation("");
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_size(px(Theme::TEXT_SMALL))
+                                            .text_color(Theme::text_muted())
+                                            .child("清除译文"),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                div().into_any_element()
+                            }),
+                    )
+                    // 组 3：音视频导出
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(Self::render_mini_btn(
+                                "btn-export-clip",
+                                "导出片段",
+                                clip_idle,
+                                cx,
+                                |this, cx| {
+                                    this.export_selected_clip(cx);
+                                },
+                            ))
+                            .child(Self::render_mini_btn(
+                                "btn-export-clip-audio",
+                                "导出音频",
+                                clip_idle,
+                                cx,
+                                |this, cx| {
+                                    this.export_selected_clip_audio(cx);
+                                },
+                            )),
+                    ),
+            )
+            // 第二行：原文输入框（带清晰标题）
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div().flex().items_center().justify_between().child(
+                            div()
+                                .text_size(px(Theme::TEXT_SMALL))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(Theme::text_muted())
+                                .child("原文编辑"),
+                        ),
+                    )
+                    .child({
+                        let is_focused = self.is_text_focused;
+                        let total_chars = cur_text.chars().count();
+                        let cursor_pos = self.text_cursor_pos.min(total_chars);
+
+                        div()
+                            .id("subtitle-text-editor-box")
+                            .w_full()
+                            .track_focus(&self.text_focus)
+                            .min_h(px(Theme::TABLE_HEADER_H))
+                            .px(px(Theme::SPACE_3))
+                            .py(px(Theme::SPACE_1))
+                            .rounded(px(Theme::RADIUS_LG))
+                            .bg(Theme::bg_sidebar())
+                            .border_1()
+                            .border_color(if is_focused {
+                                Theme::accent_mint()
+                            } else {
+                                Theme::border()
+                            })
+                            .cursor_text()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    window.focus(&this.text_focus);
+                                    this.is_text_focused = true;
+                                    cx.notify();
+                                }),
+                            )
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                let key = &event.keystroke.key;
+                                let total_chars = this.state.editing_text.chars().count();
+                                let cursor = this.text_cursor_pos.min(total_chars);
+
+                                if event.keystroke.modifiers.control {
+                                    if key == "v" {
+                                        if let Some(item) = cx.read_from_clipboard() {
+                                            if let Some(text) = item.text() {
+                                                let mut chars: Vec<char> =
+                                                    this.state.editing_text.chars().collect();
+                                                let insert_chars: Vec<char> =
+                                                    text.chars().collect();
+                                                let ins_len = insert_chars.len();
+                                                chars.splice(cursor..cursor, insert_chars);
+                                                this.state.editing_text =
+                                                    chars.into_iter().collect();
+                                                this.text_cursor_pos = cursor + ins_len;
+                                                this.state.save_selected_text();
+                                                cx.notify();
+                                            }
+                                        }
+                                    } else if key == "c" {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            this.state.editing_text.clone(),
+                                        ));
+                                        return;
+                                    } else if key == "a" {
+                                        this.text_cursor_pos = total_chars;
+                                        cx.notify();
+                                        return;
+                                    }
+                                    return;
+                                }
+
+                                if key == "backspace" {
+                                    if cursor > 0 && total_chars > 0 {
+                                        let mut chars: Vec<char> =
+                                            this.state.editing_text.chars().collect();
+                                        chars.remove(cursor - 1);
+                                        this.state.editing_text = chars.into_iter().collect();
+                                        this.text_cursor_pos = cursor - 1;
+                                        this.state.save_selected_text();
+                                        cx.notify();
+                                    }
+                                } else if key == "delete" {
+                                    if cursor < total_chars {
+                                        let mut chars: Vec<char> =
+                                            this.state.editing_text.chars().collect();
+                                        chars.remove(cursor);
+                                        this.state.editing_text = chars.into_iter().collect();
+                                        this.state.save_selected_text();
+                                        cx.notify();
+                                    }
+                                } else if key == "left" {
+                                    if cursor > 0 {
+                                        this.text_cursor_pos = cursor - 1;
+                                        cx.notify();
+                                    }
+                                } else if key == "right" {
+                                    if cursor < total_chars {
+                                        this.text_cursor_pos = cursor + 1;
+                                        cx.notify();
+                                    }
+                                } else if key == "home" {
+                                    this.text_cursor_pos = 0;
+                                    cx.notify();
+                                } else if key == "end" {
+                                    this.text_cursor_pos = total_chars;
+                                    cx.notify();
+                                } else if key == "enter" {
+                                    this.state.save_selected_text();
+                                    cx.notify();
+                                } else if key.chars().count() == 1 {
+                                    let ch = key.chars().next().unwrap();
+                                    if !ch.is_control() {
+                                        let mut chars: Vec<char> =
+                                            this.state.editing_text.chars().collect();
+                                        chars.insert(cursor, ch);
+                                        this.state.editing_text = chars.into_iter().collect();
+                                        this.text_cursor_pos = cursor + 1;
+                                        this.state.save_selected_text();
+                                        cx.notify();
+                                    }
+                                }
+                            }))
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .text_size(px(Theme::TEXT_BODY_LG))
+                            .text_color(Theme::text_primary())
+                            .child(if cur_text.is_empty() {
+                                div().child(if is_focused {
+                                    "▌".to_string()
+                                } else {
+                                    "点击直接输入字幕...".to_string()
+                                })
+                            } else {
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .children(cur_text.chars().enumerate().map(|(idx, ch)| {
+                                        let show_cursor = is_focused && cursor_pos == idx;
+                                        let ch_str = ch.to_string();
+                                        div()
+                                            .id(("text-char", idx))
+                                            .cursor_text()
+                                            .flex()
+                                            .items_center()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, window, cx| {
+                                                    window.focus(&this.text_focus);
+                                                    this.is_text_focused = true;
+                                                    this.text_cursor_pos = idx;
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(if show_cursor {
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .child(
+                                                        div()
+                                                            .text_color(Theme::accent_mint())
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .child("▌"),
+                                                    )
+                                                    .child(ch_str)
+                                            } else {
+                                                div().child(ch_str)
+                                            })
+                                    }))
+                                    .child(if is_focused && cursor_pos == total_chars {
+                                        div()
+                                            .cursor_text()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, window, cx| {
+                                                    window.focus(&this.text_focus);
+                                                    this.is_text_focused = true;
+                                                    this.text_cursor_pos = total_chars;
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .text_color(Theme::accent_mint())
+                                            .font_weight(FontWeight::BOLD)
+                                            .child("▌")
+                                    } else {
+                                        div()
+                                    })
+                            })
+                    }),
+            )
+            // 第二行半：译文内容展示（若已翻译）
+            .children(
+                seg.translation
+                    .as_ref()
+                    .filter(|t| !t.trim().is_empty())
+                    .map(|trans_str| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div().flex().items_center().justify_between().child(
+                                    div()
+                                        .text_size(px(Theme::TEXT_SMALL))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(Theme::accent_mint())
+                                        .child("译文内容"),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .id("subtitle-trans-editor-box")
                                     .w_full()
-                                    .h(px(26.0))
+                                    .min_h(px(Theme::TABLE_HEADER_H))
                                     .px(px(Theme::SPACE_3))
+                                    .py(px(Theme::SPACE_1))
+                                    .rounded(px(Theme::RADIUS_LG))
                                     .bg(Theme::bg_sidebar())
-                                    .border_b_1()
+                                    .border_1()
                                     .border_color(Theme::border())
+                                    .cursor_pointer()
+                                    .hover(|s| s.border_color(Theme::accent_mint()))
+                                    .text_size(px(Theme::TEXT_BODY_LG))
+                                    .text_color(Theme::accent_mint())
+                                    .on_click(cx.listener({
+                                        let trans_clone = trans_str.clone();
+                                        let idx = seg.index;
+                                        move |this, _, window, cx| {
+                                            this.start_inline_edit(
+                                                idx,
+                                                true,
+                                                &trans_clone,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }))
+                                    .child(trans_str.clone()),
+                            )
+                    }),
+            )
+            // 第二行四分之三：实时排版效果预览（带明确标题与双语联动）
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div().flex().items_center().justify_between().pt_1().child(
+                            div()
+                                .text_size(px(Theme::TEXT_SMALL))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(Theme::text_muted())
+                                .child("画面效果预览"),
+                        ),
+                    )
+                    .child({
+                        let preview_str = if let Some(t) = &seg.translation {
+                            if !t.trim().is_empty() && t.trim() != cur_text.trim() {
+                                format!("{}\n{}", t.trim(), cur_text.trim())
+                            } else {
+                                cur_text.to_string()
+                            }
+                        } else {
+                            cur_text.to_string()
+                        };
+                        self.render_subtitle_preview_box(&preview_str, cx)
+                    }),
+            )
+            // 第三行：时间微调与快捷标点注入 (规整两行，干净不拥挤)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Theme::SPACE_2))
+                    // 第一行：时间微调（对称连体胶囊：起点 + 终点，告别杂乱按键）
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            // 起点微调连体胶囊
+                            .child(
+                                div()
+                                    .flex_1()
                                     .flex()
                                     .items_center()
                                     .justify_between()
+                                    .bg(Theme::bg_inset())
+                                    .border_1()
+                                    .border_color(Theme::border())
+                                    .rounded_md()
+                                    .p_0p5()
+                                    .child(Self::render_mini_btn(
+                                        "fine-tune-start-minus-500",
+                                        "-0.5s",
+                                        true,
+                                        cx,
+                                        |this, _| this.state.adjust_selected_times(-0.5, 0.0),
+                                    ))
+                                    .child(Self::render_mini_btn(
+                                        "fine-tune-start-minus-100",
+                                        "-0.1s",
+                                        true,
+                                        cx,
+                                        |this, _| this.state.adjust_selected_times(-0.1, 0.0),
+                                    ))
                                     .child(
                                         div()
+                                            .px_1()
                                             .text_size(px(Theme::TEXT_SMALL))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(Theme::text_muted())
-                                            .child(if has_distinct_trans {
-                                                "字幕清单（上下并列显示）"
-                                            } else {
-                                                "字幕清单"
-                                            }),
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::text_secondary())
+                                            .child("起点"),
                                     )
+                                    .child(Self::render_mini_btn(
+                                        "fine-tune-start-plus-100",
+                                        "+0.1s",
+                                        true,
+                                        cx,
+                                        |this, _| this.state.adjust_selected_times(0.1, 0.0),
+                                    ))
+                                    .child(Self::render_mini_btn(
+                                        "fine-tune-start-plus-500",
+                                        "+0.5s",
+                                        true,
+                                        cx,
+                                        |this, _| this.state.adjust_selected_times(0.5, 0.0),
+                                    )),
+                            )
+                            // 终点微调连体胶囊
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .bg(Theme::bg_inset())
+                                    .border_1()
+                                    .border_color(Theme::border())
+                                    .rounded_md()
+                                    .p_0p5()
+                                    .child(Self::render_mini_btn(
+                                        "fine-tune-end-minus-500",
+                                        "-0.5s",
+                                        true,
+                                        cx,
+                                        |this, _| this.state.adjust_selected_times(0.0, -0.5),
+                                    ))
+                                    .child(Self::render_mini_btn(
+                                        "fine-tune-end-minus-100",
+                                        "-0.1s",
+                                        true,
+                                        cx,
+                                        |this, _| this.state.adjust_selected_times(0.0, -0.1),
+                                    ))
                                     .child(
                                         div()
+                                            .px_1()
                                             .text_size(px(Theme::TEXT_SMALL))
-                                            .text_color(if has_distinct_trans {
-                                                Theme::accent_mint()
-                                            } else {
-                                                Theme::text_muted()
-                                            })
-                                            .child(if has_distinct_trans {
-                                                "双语显示"
-                                            } else if has_any_trans {
-                                                "单语显示（译文同原文）"
-                                            } else {
-                                                "单语显示"
-                                            }),
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(Theme::text_secondary())
+                                            .child("终点"),
                                     )
-                            })
-                            // 表格行内容：uniform_list 虚拟化渲染，上下并列布局
-                            .child({
-                                // 选中行变化时自动滚动跟随（时间轴点击 / 上下句跳转 / 播放联动）
-                                if self.subtitle_list_followed_sel != sel_idx {
-                                    if let Some(idx) = sel_idx {
-                                        // 滚动位置按「过滤后列表里的行号」计算，否则搜索态下会滚错行
-                                        let pos = self.subtitle_filter.iter().position(|&p| {
-                                            self.state.segments.get(p).map(|s| s.index) == Some(idx)
-                                        });
-                                        if let Some(pos) = pos {
-                                            self.subtitle_list_scroll
-                                                .scroll_to_item(pos, ScrollStrategy::Top);
-                                        }
-                                    }
-                                    self.subtitle_list_followed_sel = sel_idx;
-                                }
-
-                                let row_count = self.subtitle_filter.len();
-                                // 行高与上面子标头必须用同一个布尔，否则会出现
-                                // 「标题写双语、行高是单语」。都取快照。
-                                let has_distinct_trans =
-                                    self.derived_snapshot().has_distinct_translation;
-                                let row_h = if has_distinct_trans {
-                                    SUBTITLE_ROW_H_BILINGUAL
-                                } else {
-                                    SUBTITLE_ROW_H_MONO
-                                };
-
-                                // 术语表合规：疑似未按术语表译出的句子下标集合。每帧只算一次
-                                let glossary_bad: std::collections::HashSet<usize> = self
-                                    .cached_glossary_violations()
-                                    .into_iter()
-                                    .collect();
-                                // 低置信句集合：同样每帧只算一次
-                                let low_conf: std::collections::HashSet<usize> = self
-                                    .cached_low_confidence()
-                                    .into_iter()
-                                    .collect();
-                                uniform_list(
-                                    "inspector-segments-virtual",
-                                    row_count,
-                                    cx.processor(move |this, visible_range: std::ops::Range<usize>, _window, cx| {
-                                        let sel = this.state.selected_segment_index;
-                                        // 选中区间（含 Shift 扩选）：行高亮与「重转 N 句」都读它。
-                                        let span = this.state.selected_span();
-                                        let cur_time = this.state.current_time;
-                                        let glossary_bad = glossary_bad.clone();
-                                        let low_conf = low_conf.clone();
-                                        let inline_target = this.inline_edit_target;
-                                        let inline_buf = this.inline_edit_buffer.clone();
-                                        let inline_focus = this.inline_edit_focus.clone();
-                                        visible_range
-                                            .map(|i| {
-                                                let pos = this.subtitle_filter.get(i).copied().unwrap_or(i);
-                                                let Some(seg) = this.state.segments.get(pos) else {
-                                                    return div()
-                                                        .id(("table-row-placeholder", i))
-                                                        .w_full()
-                                                        .h(px(row_h))
-                                                        .border_b_1()
-                                                        .border_color(Theme::border_subtle())
-                                                        .into_any_element();
-                                                };
-                                                let seg_idx = seg.index;
-                                                let is_selected = sel == Some(seg_idx);
-                                                // 范围高亮：Shift 连点选中的整段都要变底色，
-                                                // 否则用户看不出「这一下会重转多少句」。
-                                                let in_span = span
-                                                    .map(|(lo, hi)| seg_idx >= lo && seg_idx <= hi)
-                                                    .unwrap_or(false);
-                                                let is_playing_here = is_playing_at(seg.start, seg.end, cur_time);
-                                                let start_ts = seconds_to_timestamp_short(seg.start);
-                                                let end_ts = seconds_to_timestamp_short(seg.end);
-                                                let dur = seg.duration();
-                                                let raw_text = seg.display_text().to_string();
-                                                let has_trans = seg.has_translation();
-                                                let trans_text = seg.translation.clone().unwrap_or_default();
-                                                let speaker = seg.speaker;
-                                                let speaker_label = seg.speaker_label();
-                                                let glossary_flagged = glossary_bad.contains(&seg_idx);
-                                                let low_conf_flagged = low_conf.contains(&seg_idx);
-                                                // 选句翻译模式：整行点击 = 勾选/取消勾选，
-                                                // 不再走「选中 + 跳播」那条路径。
-                                                let picked =
-                                                    this.state.is_translate_picked(seg_idx as i64);
-
-                                                div()
-                                                    .id(("table-row-seg", seg_idx))
-                                                    .w_full()
-                                                    .h(px(row_h))
-                                                    .px(px(Theme::SPACE_3))
-                                                    .py(px(4.0))
-                                                    .border_b_1()
-                                                    .border_color(Theme::border_subtle())
-                                                    .cursor_pointer()
-                                                    .relative()
-                                                    .bg(if picked {
-                                                        Theme::tint_mint_badge()
-                                                    } else if in_span {
-                                                        Theme::tint_mint_soft()
-                                                    } else if glossary_flagged {
-                                                        Theme::tint_warn_soft()
-                                                    } else if is_playing_here {
-                                                        Theme::tint_primary_soft()
-                                                    } else {
-                                                        Theme::transparent()
-                                                    })
-                                                    .hover(|s| s.bg(if picked || is_selected { Theme::tint_mint_badge() } else { Theme::bg_hover() }))
-                                                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                                        // Shift 连点 = 从锚点扩选到这一句（范围重转用）。
-                                                        let extend = matches!(
-                                                            event,
-                                                            ClickEvent::Mouse(m) if m.down.modifiers.shift
-                                                        );
-                                                        // 选句模式：只切换勾选，不动播放位置。
-                                                        if this.state.is_picking_translate() {
-                                                            this.state
-                                                                .toggle_translate_pick_one(seg_idx as i64);
-                                                            cx.notify();
-                                                            return;
-                                                        }
-                                                        // 点击某行 = 跳播到该句起点。先停掉正在进行的实时播放：
-                                                        // 否则播放时钟会在下一帧把 current_time 拉回旧位置、音频也
-                                                        // 继续从旧处播放，点击等于没生效（与键盘「上/下句」
-                                                        // `jump_prev/next_segment` 同一套「先停再选」语义）。
-                                                        this.halt_preview_playback();
-                                                        this.state.select_segment_with(seg_idx, extend);
-                                                        // 选中即把播放位置归位到该句起点；再显式 seek 一次做边界钳制，
-                                                        // 随后 `trigger_extract_frame` 抽帧，画面即落到这一句。
-                                                        if let Some(target) =
-                                                            click_seek_target(&this.state.segments, seg_idx)
-                                                        {
-                                                            this.state.seek_to(target);
-                                                        }
-                                                        this.trigger_extract_frame(cx);
-                                                        cx.notify();
-                                                    }))
-                                                    .flex()
-                                                    .flex_col()
-                                                    .justify_start()
-                                                    .gap(px(3.0))
-                                                    // 选中指示线（左缘 3px 竖条）
-                                                    .child(if is_selected {
-                                                        div()
-                                                            .absolute()
-                                                            .left(px(0.0))
-                                                            .top(px(2.0))
-                                                            .bottom(px(2.0))
-                                                            .w(px(3.0))
-                                                            .rounded_r_full()
-                                                            .bg(Theme::accent_mint())
-                                                            .into_any_element()
-                                                    } else {
-                                                        div().into_any_element()
-                                                    })
-                                                    // 第一行：时间与元数据（序号、起止时间、时长、说话人、标记）
-                                                    .child(
-                                                        div()
-                                                            .w_full()
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_between()
-                                                            .child(
-                                                                div()
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .gap_1p5()
-                                                                    .children(low_conf_flagged.then(|| {
-                                                                        primitives::stat_dot_sm(Theme::accent_red())
-                                                                    }))
-                                                                    .child(
-                                                                        div()
-                                                                            .px_1()
-                                                                            .py_0p5()
-                                                                            .rounded_sm()
-                                                                            .bg(if is_selected {
-                                                                                Theme::tint_mint_badge()
-                                                                            } else {
-                                                                                Theme::bg_raised()
-                                                                            })
-                                                                            .text_size(px(Theme::TEXT_CAPTION))
-                                                                            .font_weight(FontWeight::BOLD)
-                                                                            .text_color(if is_selected {
-                                                                                Theme::accent_mint()
-                                                                            } else {
-                                                                                Theme::text_muted()
-                                                                            })
-                                                                            .child(format!("#{:03}", seg_idx)),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .font_family("Consolas")
-                                                                            .text_size(px(Theme::TEXT_SMALL))
-                                                                            .text_color(if is_selected {
-                                                                                Theme::accent_mint()
-                                                                            } else {
-                                                                                Theme::text_secondary()
-                                                                            })
-                                                                            .child(format!("{} - {}", start_ts, end_ts)),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .text_size(px(Theme::TEXT_CAPTION))
-                                                                            .text_color(Theme::text_muted())
-                                                                            .child(format!("({:.1}s)", dur)),
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .gap_1()
-                                                                    .children(speaker.map(|s| {
-                                                                        let label = speaker_label
-                                                                            .clone()
-                                                                            .unwrap_or_else(|| format!("说话人 {}", s + 1));
-                                                                        div()
-                                                                            .id(("badge-speaker", seg_idx))
-                                                                            .cursor_pointer()
-                                                                            .px_1p5()
-                                                                            .py_0p5()
-                                                                            .rounded_sm()
-                                                                            .border_1()
-                                                                            .border_color(speaker_border(s))
-                                                                            .bg(speaker_tint(s))
-                                                                            .text_size(px(Theme::TEXT_CAPTION))
-                                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                                            .text_color(speaker_color(s))
-                                                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                                                cx.stop_propagation();
-                                                                                this.cycle_segment_speaker(seg_idx, cx);
-                                                                            }))
-                                                                            .child(label)
-                                                                    }))
-                                                                    .children(glossary_flagged.then(|| {
-                                                                        div()
-                                                                            .px_1()
-                                                                            .py_0p5()
-                                                                            .rounded_sm()
-                                                                            .bg(Theme::tint_warn_soft())
-                                                                            .text_size(px(Theme::TEXT_CAPTION))
-                                                                            .text_color(Theme::accent_orange())
-                                                                            .child("术语")
-                                                                    })),
-                                                            ),
-                                                    )
-                                                    // 第二行：字幕内容 (原文，点击直接就地编辑)
-                                                    .child({
-                                                        let is_editing_raw = inline_target == Some((seg_idx, false));
-                                                        if is_editing_raw {
-                                                            div()
-                                                                .id(("inline-edit-raw", seg_idx))
-                                                                .w_full()
-                                                                .h(px(24.0))
-                                                                .track_focus(&inline_focus)
-                                                                .px_1p5()
-                                                                .py_0p5()
-                                                                .rounded_sm()
-                                                                .bg(Theme::bg_sidebar())
-                                                                .border_1()
-                                                                .border_color(Theme::accent_mint())
-                                                                .cursor_text()
-                                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                                                    window.focus(&this.inline_edit_focus);
-                                                                    cx.notify();
-                                                                }))
-                                                                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                                                                    this.handle_inline_edit_keydown(event, cx);
-                                                                }))
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_between()
-                                                                .child(
-                                                                    div()
-                                                                        .flex_1()
-                                                                        .text_size(px(Theme::TEXT_BODY))
-                                                                        .text_color(Theme::accent_mint())
-                                                                        .truncate()
-                                                                        .child(format!("{}▌", inline_buf)),
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .gap_1()
-                                                                        .flex_shrink_0()
-                                                                        .child(
-                                                                            div()
-                                                                                .id(("inline-save-raw", seg_idx))
-                                                                                .px_1()
-                                                                                .py_0p5()
-                                                                                .rounded_sm()
-                                                                                .bg(Theme::accent_mint())
-                                                                                .text_size(px(10.0))
-                                                                                .text_color(Theme::text_on_accent())
-                                                                                .cursor_pointer()
-                                                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                                                    this.commit_inline_edit(cx);
-                                                                                }))
-                                                                                .child("保存"),
-                                                                        )
-                                                                        .child(
-                                                                            div()
-                                                                                .id(("inline-cancel-raw", seg_idx))
-                                                                                .px_1()
-                                                                                .py_0p5()
-                                                                                .rounded_sm()
-                                                                                .bg(Theme::bg_hover())
-                                                                                .text_size(px(10.0))
-                                                                                .text_color(Theme::text_muted())
-                                                                                .cursor_pointer()
-                                                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                                                    this.cancel_inline_edit(cx);
-                                                                                }))
-                                                                                .child("取消"),
-                                                                        ),
-                                                                )
-                                                        } else {
-                                                            div()
-                                                                .id(("table-row-raw", seg_idx))
-                                                                .w_full()
-                                                                .text_size(px(Theme::TEXT_BODY))
-                                                                .font_weight(if is_selected {
-                                                                    FontWeight::SEMIBOLD
-                                                                } else {
-                                                                    FontWeight::NORMAL
-                                                                })
-                                                                .text_color(Theme::text_primary())
-                                                                .truncate()
-                                                                .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                .cursor_pointer()
-                                                                .on_click(cx.listener({
-                                                                    let raw_for_click = raw_text.clone();
-                                                                    move |this, _, window, cx| {
-                                                                        this.state.select_segment(seg_idx);
-                                                                        this.trigger_extract_frame(cx);
-                                                                        let now = std::time::Instant::now();
-                                                                        let is_double = matches!(
-                                                                            this.last_subtitle_click,
-                                                                            Some((last_idx, false, last_t))
-                                                                                if last_idx == seg_idx && now.duration_since(last_t).as_millis() < 350
-                                                                        );
-                                                                        if is_double {
-                                                                            this.last_subtitle_click = None;
-                                                                            this.start_inline_edit(seg_idx, false, &raw_for_click, window, cx);
-                                                                        } else {
-                                                                            this.last_subtitle_click = Some((seg_idx, false, now));
-                                                                            cx.notify();
-                                                                        }
-                                                                    }
-                                                                }))
-                                                                .child(raw_text.clone())
-                                                        }
-                                                    })
-                                                    // 第三行：翻译字幕 (点击直接就地编辑；无翻译且非编辑态时不显示)
-                                                    .children({
-                                                        let is_editing_trans = inline_target == Some((seg_idx, true));
-                                                        let show_trans = is_editing_trans || (has_trans && !trans_text.trim().is_empty() && trans_text.trim() != raw_text.trim());
-                                                        if show_trans {
-                                                            Some(if is_editing_trans {
-                                                                div()
-                                                                    .id(("inline-edit-trans", seg_idx))
-                                                                    .w_full()
-                                                                    .h(px(24.0))
-                                                                    .track_focus(&inline_focus)
-                                                                    .px_1p5()
-                                                                    .py_0p5()
-                                                                    .rounded_sm()
-                                                                    .bg(Theme::bg_sidebar())
-                                                                    .border_1()
-                                                                    .border_color(Theme::accent_mint())
-                                                                    .cursor_text()
-                                                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                                                        window.focus(&this.inline_edit_focus);
-                                                                        cx.notify();
-                                                                    }))
-                                                                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                                                                        this.handle_inline_edit_keydown(event, cx);
-                                                                    }))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_between()
-                                                                    .child(
-                                                                        div()
-                                                                            .flex_1()
-                                                                            .text_size(px(Theme::TEXT_SMALL))
-                                                                            .text_color(Theme::accent_mint())
-                                                                            .truncate()
-                                                                            .child(format!("{}▌", inline_buf)),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .flex()
-                                                                            .items_center()
-                                                                            .gap_1()
-                                                                            .flex_shrink_0()
-                                                                            .child(
-                                                                                div()
-                                                                                    .id(("inline-save-trans", seg_idx))
-                                                                                    .px_1()
-                                                                                    .py_0p5()
-                                                                                    .rounded_sm()
-                                                                                    .bg(Theme::accent_mint())
-                                                                                    .text_size(px(10.0))
-                                                                                    .text_color(Theme::text_on_accent())
-                                                                                    .cursor_pointer()
-                                                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                                                        this.commit_inline_edit(cx);
-                                                                                    }))
-                                                                                    .child("保存"),
-                                                                            )
-                                                                            .child(
-                                                                                div()
-                                                                                    .id(("inline-cancel-trans", seg_idx))
-                                                                                    .px_1()
-                                                                                    .py_0p5()
-                                                                                    .rounded_sm()
-                                                                                    .bg(Theme::bg_hover())
-                                                                                    .text_size(px(10.0))
-                                                                                    .text_color(Theme::text_muted())
-                                                                                    .cursor_pointer()
-                                                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                                                        this.cancel_inline_edit(cx);
-                                                                                    }))
-                                                                                    .child("取消"),
-                                                                            ),
-                                                                    )
-                                                            } else {
-                                                                div()
-                                                                    .id(("table-row-trans", seg_idx))
-                                                                    .w_full()
-                                                                    .text_size(px(Theme::TEXT_SMALL))
-                                                                    .text_color(if is_selected {
-                                                                        Theme::accent_mint()
-                                                                    } else {
-                                                                        Theme::text_secondary()
-                                                                    })
-                                                                    .truncate()
-                                                                    .hover(|s| s.text_color(Theme::accent_mint()))
-                                                                    .cursor_pointer()
-                                                                    .on_click(cx.listener({
-                                                                        let trans_for_click = trans_text.clone();
-                                                                        move |this, _, window, cx| {
-                                                                            this.state.select_segment(seg_idx);
-                                                                            this.trigger_extract_frame(cx);
-                                                                            let now = std::time::Instant::now();
-                                                                            let is_double = matches!(
-                                                                                this.last_subtitle_click,
-                                                                                Some((last_idx, true, last_t))
-                                                                                    if last_idx == seg_idx && now.duration_since(last_t).as_millis() < 350
-                                                                            );
-                                                                            if is_double {
-                                                                                this.last_subtitle_click = None;
-                                                                                this.start_inline_edit(seg_idx, true, &trans_for_click, window, cx);
-                                                                            } else {
-                                                                                this.last_subtitle_click = Some((seg_idx, true, now));
-                                                                                cx.notify();
-                                                                            }
-                                                                        }
-                                                                    }))
-                                                                    .child(trans_text)
-                                                            })
-                                                        } else {
-                                                            None
-                                                        }
-                                                    })
-                                                    .into_any_element()
-                                            })
-                                            .collect()
-                                    }),
-                                )
-                                .track_scroll(self.subtitle_list_scroll.clone())
-                                .flex_1()
-                                .w_full()
-                                // 内嵌清单自己吃掉滚轮：清单还有余量时不让事件继续冒泡到
-                                // 外层可滚动面板，避免「清单与外层面板一起滚」（见
-                                // `should_consume_scroll` 的说明）。到边界时放行，外层接管。
-                                .on_scroll_wheel(cx.listener(
-                                    |this, event: &ScrollWheelEvent, _window, cx| {
-                                        let delta_y = match event.delta {
-                                            ScrollDelta::Lines(p) => p.y,
-                                            ScrollDelta::Pixels(p) => f32::from(p.y),
-                                        };
-                                        let state = this.subtitle_list_scroll.0.borrow();
-                                        let offset_y =
-                                            f32::from(state.base_handle.offset().y);
-                                        let max_h = f32::from(state.base_handle.max_offset().height);
-                                        drop(state);
-                                        if primitives::should_consume_scroll(delta_y, offset_y, max_h) {
-                                            cx.stop_propagation();
-                                        }
-                                    },
-                                ))
-                            })
-                            .into_any_element()
-                    } else {
-                        div().into_any_element()
-                    })
+                                    .child(Self::render_mini_btn(
+                                        "fine-tune-end-plus-100",
+                                        "+0.1s",
+                                        true,
+                                        cx,
+                                        |this, _| this.state.adjust_selected_times(0.0, 0.1),
+                                    ))
+                                    .child(Self::render_mini_btn(
+                                        "fine-tune-end-plus-500",
+                                        "+0.5s",
+                                        true,
+                                        cx,
+                                        |this, _| this.state.adjust_selected_times(0.0, 0.5),
+                                    )),
+                            ),
+                    )
+                    // 第二行：快捷标点注入
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .bg(Theme::bg_inset())
+                            .border_1()
+                            .border_color(Theme::border_subtle())
+                            .rounded_md()
+                            .px_2p5()
+                            .py_1()
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_SMALL))
+                                    .text_color(Theme::text_secondary())
+                                    .child("快捷标点注入："),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(self.render_punct_btn("，", cx))
+                                    .child(self.render_punct_btn("。", cx))
+                                    .child(self.render_punct_btn("？", cx))
+                                    .child(self.render_punct_btn("！", cx))
+                                    .child(self.render_punct_btn("、", cx)),
+                            ),
+                    ),
             )
+            .into_any_element()
     }
 
     /// 字幕预览框：显示当前编辑句的排版效果，两侧把手可拖拽调宽。
@@ -4757,6 +4850,295 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// 智能切片卡：自动选出「高光片段」候选，一键批量切成独立文件。
+    ///
+    /// 产品形态对标 OpusClip 一类工具，但**不替用户做创作决策**：只给「值得单独
+    /// 发出去」的候选清单（时间范围 + 兜底标题 + 入选理由 + 得分），点行跳到对应
+    /// 句子核对，确认后按视频 / 音频批量导出。候选由纯函数规划器打分
+    /// （见 [`crate::subtitle::clips`]），同输入必得同结果。
+    fn render_clips_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let busy = self.clips_generating;
+        let has_segments = !self.state.segments.is_empty();
+
+        let header = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Theme::SPACE_0_5))
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_BODY_LG))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(Theme::text_primary())
+                            .child("智能切片"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child("按疑问句密度 / 语速 / 置信度 / 章节边界挑高光片段"),
+                    ),
+            )
+            .child(
+                primitives::mini_btn(
+                    if busy { "生成中…" } else { "生成建议" },
+                    !busy && has_segments,
+                )
+                .id("clips-generate")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.generate_clips(cx);
+                })),
+            );
+
+        let mut card = primitives::card_sm()
+            .flex_none()
+            .gap(px(Theme::SPACE_2))
+            .child(header);
+
+        // 候选列表：点行跳到首句核对（与统计卡的「点击跳转」同一心智）。
+        if !self.clips.is_empty() {
+            let rows = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .children(self.clips.iter().enumerate().map(|(i, cand)| {
+                    let t0 = seconds_to_timestamp_short(cand.start);
+                    let t1 = seconds_to_timestamp_short(cand.end);
+                    let first_idx = cand.seg_indices.first().copied().unwrap_or(0);
+                    div()
+                        .id(("clip-row", i))
+                        .w_full()
+                        .px(px(Theme::SPACE_2))
+                        .py(px(Theme::SPACE_1))
+                        .rounded_sm()
+                        .bg(Theme::bg_card_hover())
+                        .cursor_pointer()
+                        .hover(|d| d.bg(Theme::bg_hover()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.jump_to_segment_for_stats(first_idx, cx);
+                        }))
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_SMALL))
+                                .text_color(Theme::text_primary())
+                                .child(format!(
+                                    "{} → {}  {}  ·  {}  ·  {:.0}分",
+                                    t0,
+                                    t1,
+                                    cand.title,
+                                    cand.reason,
+                                    cand.score * 100.0
+                                )),
+                        )
+                }))
+                .into_any_element();
+            card = card.child(rows);
+        }
+
+        // 导出按钮行 + 提示行：与导出卡同在「统计与导出」页，都是收尾动作。
+        let actions = div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                primitives::mini_btn("导出视频片段", !self.clips.is_empty())
+                    .id("clips-export-video")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.export_clips(cx, crate::engines::ffmpeg::ClipKind::Video);
+                    })),
+            )
+            .child(
+                primitives::mini_btn("导出音频片段", !self.clips.is_empty())
+                    .id("clips-export-audio")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.export_clips(cx, crate::engines::ffmpeg::ClipKind::Audio);
+                    })),
+            )
+            .child(
+                primitives::mini_btn("竖屏成片 9:16", !self.clips.is_empty())
+                    .id("clips-export-vertical")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.export_clips_vertical(cx);
+                    })),
+            );
+        card = card.child(actions);
+
+        if let Some((ok, text)) = self.clips_notice.clone() {
+            card = card.child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(if ok {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::accent_red()
+                    })
+                    .child(text),
+            );
+        }
+
+        card
+    }
+
+    /// 配音卡：多角色 TTS + 字幕时间轴对齐 + 音轨替换/混音。
+    ///
+    /// 放在「统计与导出」页与切片卡相邻：两者都是「字幕做完之后的收尾动作」。
+    /// 配音本身要联网合成、按句数耗时，所以默认不自动跑，必须显式点「开始配音」；
+    /// 进行中显示阶段文案 + 进度条 + 取消，完成后提示产物路径与统计。
+    fn render_dub_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let busy = self.dub_busy;
+        let has_segments = !self.state.segments.is_empty();
+        let replace = self
+            .state
+            .config
+            .dub
+            .mode
+            .trim()
+            .eq_ignore_ascii_case("replace");
+        let bgm_percent = (self.state.config.dub.bgm_volume * 100.0).round() as i32;
+
+        let header = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Theme::SPACE_0_5))
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_BODY_LG))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(Theme::text_primary())
+                            .child("配音"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(Theme::text_muted())
+                            .child("逐句合成译文并按字幕时间轴对齐，替换或混音原声出片"),
+                    ),
+            )
+            .child(
+                primitives::mini_btn(
+                    if busy { "配音中…" } else { "开始配音" },
+                    !busy && has_segments,
+                )
+                .id("dub-start")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.start_dubbing(cx);
+                })),
+            );
+
+        let mut card = primitives::card_sm()
+            .flex_none()
+            .gap(px(Theme::SPACE_2))
+            .child(header);
+
+        // 模式：两种输出语义写清楚，避免「以为替换了其实混音」的误判。
+        let modes = div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(Theme::SPACE_2))
+            .child(
+                primitives::chip_clickable(format!("保留背景音 {bgm_percent}%"), !replace, false)
+                    .id("dub-mode-mix")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.state.config.dub.mode = "mix".to_string();
+                        this.state.persist_config();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                primitives::chip_clickable("纯替换音轨", replace, false)
+                    .id("dub-mode-replace")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.state.config.dub.mode = "replace".to_string();
+                        this.state.persist_config();
+                        cx.notify();
+                    })),
+            );
+        card = card.child(modes);
+
+        // 进度：阶段文案 + 百分比 + 进度条 + 取消。
+        if let Some((msg, frac)) = self.dub_progress.clone() {
+            let frac = frac.clamp(0.0, 1.0);
+            card = card.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Theme::SPACE_1))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(Theme::SPACE_2))
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_muted())
+                                    .child(msg),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(Theme::text_primary())
+                                    .child(format!("{:.0}%", frac * 100.0)),
+                            ),
+                    )
+                    .child(primitives::progress_bar(frac))
+                    .child(
+                        primitives::mini_btn("取消配音", true)
+                            .id("dub-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_dubbing(cx);
+                            })),
+                    ),
+            );
+        }
+
+        if let Some((ok, text)) = self.dub_notice.clone() {
+            card = card.child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(if ok {
+                        Theme::accent_mint()
+                    } else {
+                        Theme::accent_red()
+                    })
+                    .child(text),
+            );
+        }
+
+        // 口径说明：音色来源与文本来源，避免用户以为「没配音」是漏了。
+        card.child(
+            div()
+                .text_size(px(Theme::TEXT_CAPTION))
+                .text_color(Theme::text_muted())
+                .child(if has_segments {
+                    "音色按说话人轮换；文本取译文（为空回退原文）；超窗句子自动提速，仍超则溢出到句间空隙"
+                } else {
+                    "先完成识别，再来配音"
+                }),
+        )
+    }
+
     /// 导出卡片：导出内容 / 文件名模板 / 编辑日志 / 格式选择 + 导出按钮。
     ///
     /// 它原本是**常驻在右侧面板最底部**的一条底栏（`render_editor_export_dock`），
@@ -5173,9 +5555,11 @@ impl MainWindow {
         let with = self.replace_with.clone();
         let case_sensitive = self.replace_case_sensitive;
         let include_translation = self.replace_include_translation;
-        // 本会话的正则 / 整词 / 范围选择（见 `REPLACE_PANEL_TOGGLES`）。
-        let (toggle_regex, toggle_whole_word, toggle_scope_selected) = REPLACE_PANEL_TOGGLES
-            .with(|t| (t.regex.get(), t.whole_word.get(), t.scope_selected.get()));
+        // 本会话的正则 / 整词 / 范围选择（见 `ReplacePanelToggles`）。
+        let (toggle_regex, toggle_whole_word, toggle_scope_selected) = {
+            let t = &self.replace_toggles;
+            (t.regex.get(), t.whole_word.get(), t.scope_selected.get())
+        };
         let status = self.replace_status.clone();
         let can_apply = !find.is_empty() && !self.state.segments.is_empty();
         // 规则集下拉要用的渲染数据：名字列表 + 当前选中项。只在面板展开时每帧克隆
@@ -5352,8 +5736,10 @@ impl MainWindow {
             .child(
                 primitives::mini_btn(if toggle_regex { "✓ 正则" } else { "正则" }, true)
                     .id("replace-toggle-regex")
-                    .on_click(cx.listener(|_this, _, _, cx| {
-                        REPLACE_PANEL_TOGGLES.with(|t| t.regex.set(!t.regex.get()));
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.replace_toggles
+                            .regex
+                            .set(!this.replace_toggles.regex.get());
                         cx.notify();
                     })),
             )
@@ -5367,8 +5753,10 @@ impl MainWindow {
                     true,
                 )
                 .id("replace-toggle-whole-word")
-                .on_click(cx.listener(|_this, _, _, cx| {
-                    REPLACE_PANEL_TOGGLES.with(|t| t.whole_word.set(!t.whole_word.get()));
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.replace_toggles
+                        .whole_word
+                        .set(!this.replace_toggles.whole_word.get());
                     cx.notify();
                 })),
             )
@@ -5382,8 +5770,8 @@ impl MainWindow {
                     true,
                 )
                 .id("replace-scope-all")
-                .on_click(cx.listener(|_this, _, _, cx| {
-                    REPLACE_PANEL_TOGGLES.with(|t| t.scope_selected.set(false));
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.replace_toggles.scope_selected.set(false);
                     cx.notify();
                 })),
             )
@@ -5398,8 +5786,8 @@ impl MainWindow {
                 )
                 .id("replace-scope-selected")
                 .when(has_selected_segment, |d| {
-                    d.on_click(cx.listener(|_this, _, _, cx| {
-                        REPLACE_PANEL_TOGGLES.with(|t| t.scope_selected.set(true));
+                    d.on_click(cx.listener(|this, _, _, cx| {
+                        this.replace_toggles.scope_selected.set(true);
                         cx.notify();
                     }))
                 }),
@@ -5411,8 +5799,7 @@ impl MainWindow {
                         d.on_click(cx.listener(move |this, _, _, cx| {
                             // 范围=仅当前句但此刻没有选中句时：只提示、绝不动全部——
                             // 否则「只想改一句」会变成整轨批量替换，方向正好反了。
-                            let scope_selected =
-                                REPLACE_PANEL_TOGGLES.with(|t| t.scope_selected.get());
+                            let scope_selected = this.replace_toggles.scope_selected.get();
                             let scope = match (scope_selected, this.state.selected_segment_index) {
                                 (true, Some(index)) => ReplaceScope::SelectedSentence(index),
                                 (true, None) => {
@@ -5427,8 +5814,8 @@ impl MainWindow {
                             let options = ReplaceOptions {
                                 case_sensitive: this.replace_case_sensitive,
                                 include_translation: this.replace_include_translation,
-                                regex: REPLACE_PANEL_TOGGLES.with(|t| t.regex.get()),
-                                whole_word: REPLACE_PANEL_TOGGLES.with(|t| t.whole_word.get()),
+                                regex: this.replace_toggles.regex.get(),
+                                whole_word: this.replace_toggles.whole_word.get(),
                                 scope,
                             };
                             let report = replace_all(
@@ -6453,22 +6840,49 @@ impl MainWindow {
     }
 }
 
-// 时间轴的水平平移量（可视窗口起点，秒）。
-//
-// 不挂在 `MainWindow` 上：窗口结构体定义在 `ui/mod.rs`，本模块不便向外扩字段
-// （同 `REPLACE_PANEL_TOGGLES`）。缩放复用已有字段 `state.timeline_zoom`，平移是纯
-// 视图态——不需要持久化，换了素材后 `clamp_window` 会把它夹回新素材范围内。
-thread_local! {
-    static TIMELINE_PAN_START: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+/// 时间轴拖拽 / 平移的交互会话（本轮结构治理从 thread_local 收敛而来，挂在
+/// `MainWindow::timeline_session` 上）。
+///
+/// 字段一律 `Cell`：渲染路径是 `&self`，而播放跟随的回写
+/// （[`MainWindow::timeline_window_followed`]）与点击处理器都要写它——`Cell` 让
+/// 所有签名原样不动、行为零变化；收益是「每窗口实例一份」：thread_local 是每**线程**
+/// 一份，同线程上的第二个窗口（如独立播放窗）与并行测试会读到别人的会话。
+pub(crate) struct TimelineInteraction {
+    /// 时间轴的水平平移量（可视窗口起点，秒）。
+    ///
+    /// 缩放复用已有字段 `state.timeline_zoom`，平移是纯视图态——不需要持久化，
+    /// 换了素材后 `clamp_window` 会把它夹回新素材范围内。
+    pub(crate) pan_start: std::cell::Cell<f64>,
+    /// 「用户手动调过视图」标记：记的是手动平移/缩放**那一刻的播放头时间**（秒）。
+    ///
+    /// 暂停时窗口不跟随播放头（用户手动平移的意图优先），但只有在用户没动过视图时才做
+    /// 「播放头离屏就拉回」的兜底；播放头一动（seek / 播放推进）该标记自动失效，跟随随之
+    /// 恢复——所以从清单点一句跳到窗口外的句子仍会把窗口带过去。
+    pub(crate) pan_anchor: std::cell::Cell<Option<f64>>,
+    /// 一轮拖拽编辑的会话（按下 → 移动 → 松手），见 [`TimelineTrimDrag`]。
+    pub(crate) trim_drag: std::cell::Cell<Option<TimelineTrimDrag>>,
+    /// 「刚拖过时间」标记：松手时 GPUI 仍会补一次 click（按下/松开都在片段内），那一次
+    /// 不该再顺手跳播。按下任何热区/片段时清零（见 [`MainWindow::begin_timeline_trim`]）。
+    pub(crate) trim_click_guard: std::cell::Cell<bool>,
 }
 
-// 「用户手动调过视图」标记：记的是手动平移/缩放**那一刻的播放头时间**（秒）。
-//
-// 暂停时窗口不跟随播放头（用户手动平移的意图优先），但只有在用户没动过视图时才做
-// 「播放头离屏就拉回」的兜底；播放头一动（seek / 播放推进）该标记自动失效，跟随随之
-// 恢复——所以从清单点一句跳到窗口外的句子仍会把窗口带过去。
-thread_local! {
-    static TIMELINE_PAN_ANCHOR: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+impl TimelineInteraction {
+    /// 记一笔「用户手动调过视图」：存下手动那一刻的播放头时间。
+    /// 播放头一动（seek / 播放推进）标记自动失效，跟随随之恢复（见 [`follow_playhead`]）。
+    pub(crate) fn mark_manual_view_change(&self, playhead: f64) {
+        self.pan_anchor.set(Some(playhead));
+    }
+}
+
+impl Default for TimelineInteraction {
+    fn default() -> Self {
+        Self {
+            pan_start: std::cell::Cell::new(0.0),
+            pan_anchor: std::cell::Cell::new(None),
+            trim_drag: std::cell::Cell::new(None),
+            trim_click_guard: std::cell::Cell::new(false),
+        }
+    }
 }
 
 /// 时间轴缩放上下限：1.0 = 整段（与改造前一致），20.0 = 一秒的素材也能占到 1/20 宽。
@@ -6697,10 +7111,10 @@ enum TimelineTrimMode {
 
 /// 一轮拖拽的会话（按下 → 移动 → 松手）。
 ///
-/// 与 [`TIMELINE_PAN_START`] 同一套 thread_local 范式：窗口结构体定义在 `ui/mod.rs`，
-/// 本模块不便向外扩字段（同 `REPLACE_PANEL_TOGGLES`）。
+/// 存放于 [`TimelineInteraction::trim_drag`]（本轮结构治理从 thread_local 收敛而来，
+/// 与 pan_* 两个字段同一套 Cell 范式）。
 #[derive(Clone, Copy)]
-struct TimelineTrimDrag {
+pub(crate) struct TimelineTrimDrag {
     /// 被拖拽片段的 `Segment::index`。不用下标：拖拽途中任何一次拆分/合并都会让下标
     /// 指向别的句子，`index` 才是清单与列表共用的稳定标识。
     index: usize,
@@ -6710,20 +7124,6 @@ struct TimelineTrimDrag {
     origin_end: f64,
     /// 按下时的鼠标横坐标：拖动量取「按下点 → 当前点」的时间差，热区抓偏一点也不会跳。
     press_x: Pixels,
-}
-
-thread_local! {
-    static TIMELINE_TRIM_DRAG: std::cell::Cell<Option<TimelineTrimDrag>> =
-        const { std::cell::Cell::new(None) };
-    /// 「刚拖过时间」标记：松手时 GPUI 仍会补一次 click（按下/松开都在片段内），那一次
-    /// 不该再顺手跳播。按下任何热区/片段时清零（见 `begin_timeline_trim`）。
-    static TIMELINE_TRIM_CLICK_GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// 记一笔「用户手动调过视图」：存下手动那一刻的播放头时间。
-/// 播放头一动（seek / 播放推进）标记自动失效，跟随随之恢复（见 [`follow_playhead`]）。
-fn mark_manual_view_change(playhead: f64) {
-    TIMELINE_PAN_ANCHOR.with(|a| a.set(Some(playhead)));
 }
 
 /// 最小时长的兜底：非有限或非正值一律退回常量，免得 NaN 渗进夹紧区间。
@@ -6989,7 +7389,7 @@ fn trim_handles(index: usize, selected: bool, cx: &Context<MainWindow>) -> [AnyE
                 MouseButton::Left,
                 cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
                     // 没拖动过的那次松手仍算「点选 + 跳播」；真拖了就只落这一次编辑
-                    if !TIMELINE_TRIM_CLICK_GUARD.with(|g| g.get()) {
+                    if !this.timeline_session.trim_click_guard.get() {
                         this.select_timeline_segment(index, cx);
                     }
                     this.commit_timeline_trim(cx);
@@ -7015,7 +7415,7 @@ impl MainWindow {
         window_width: Pixels,
     ) {
         // 新一轮按下先清零「刚拖过」标记（上一个会话可能没走到 click 就结束了）
-        TIMELINE_TRIM_CLICK_GUARD.with(|g| g.set(false));
+        self.timeline_session.trim_click_guard.set(false);
         let Some((origin_start, origin_end)) = self
             .state
             .segments
@@ -7023,23 +7423,21 @@ impl MainWindow {
             .find(|s| s.index == index)
             .map(|s| (s.start, s.end))
         else {
-            TIMELINE_TRIM_DRAG.with(|d| d.set(None));
+            self.timeline_session.trim_drag.set(None);
             return;
         };
         if timeline_time_at_x(press_x, window_width, self.timeline_window()).is_none() {
             // 轨道太窄，换算不出按下点：宁可不拖，也别产生半截编辑
-            TIMELINE_TRIM_DRAG.with(|d| d.set(None));
+            self.timeline_session.trim_drag.set(None);
             return;
         }
-        TIMELINE_TRIM_DRAG.with(|d| {
-            d.set(Some(TimelineTrimDrag {
-                index,
-                mode,
-                origin_start,
-                origin_end,
-                press_x,
-            }))
-        });
+        self.timeline_session.trim_drag.set(Some(TimelineTrimDrag {
+            index,
+            mode,
+            origin_start,
+            origin_end,
+            press_x,
+        }));
     }
 
     /// 拖拽中：把鼠标位置换算成新时间写进 `segments`（实时预览）。
@@ -7052,7 +7450,7 @@ impl MainWindow {
     /// 的；被拖的片段本来就在可视范围内（否则点不到），不会中途从轨道上消失，松手递增
     /// 修订号后索引立刻归位。
     fn update_timeline_trim(&mut self, mouse_x: Pixels, window_width: Pixels) -> bool {
-        let Some(drag) = TIMELINE_TRIM_DRAG.with(|d| d.get()) else {
+        let Some(drag) = self.timeline_session.trim_drag.get() else {
             return false;
         };
         // 手抖一两像素不算拖拽：否则每次点选都会顺手把时间挪走几十毫秒
@@ -7174,7 +7572,7 @@ impl MainWindow {
         }
         seg.start = start;
         seg.end = end;
-        TIMELINE_TRIM_CLICK_GUARD.with(|g| g.set(true));
+        self.timeline_session.trim_click_guard.set(true);
         true
     }
 
@@ -7184,7 +7582,7 @@ impl MainWindow {
     /// 关窗守卫读到的仍是 false，这次改动会被当成「无改动」丢掉）、
     /// `bump_segments_revision`（只失效清单缓存、不自己落库，见 `AppState` 上的同款注释）。
     fn commit_timeline_trim(&mut self, cx: &mut Context<Self>) {
-        let Some(drag) = TIMELINE_TRIM_DRAG.with(|d| d.take()) else {
+        let Some(drag) = self.timeline_session.trim_drag.take() else {
             return;
         };
         let Some(pos) = self
@@ -7235,7 +7633,7 @@ impl MainWindow {
     fn timeline_window(&self) -> TimelineWindow {
         timeline_window(
             self.state.timeline_zoom,
-            TIMELINE_PAN_START.with(|p| p.get()),
+            self.timeline_session.pan_start.get(),
             self.timeline_total_dur(),
         )
     }
@@ -7250,10 +7648,10 @@ impl MainWindow {
             self.timeline_total_dur(),
             self.state.is_playing,
             // 暂停时「手动调过视图」的标记：内容是手动那一刻的播放头时间（见 follow_playhead）
-            TIMELINE_PAN_ANCHOR.with(|a| a.get()),
+            self.timeline_session.pan_anchor.get(),
         );
         if followed.start != win.start {
-            TIMELINE_PAN_START.with(|p| p.set(followed.start));
+            self.timeline_session.pan_start.set(followed.start);
         }
         followed
     }
@@ -7265,11 +7663,12 @@ impl MainWindow {
     /// 下一帧渲染就被 [`follow_playhead`] 拉走，放大到哪都白给。
     fn zoom_timeline(&mut self, anchor_ratio: f64, factor: f64, cx: &mut Context<Self>) {
         let total = self.timeline_total_dur();
-        let start = TIMELINE_PAN_START.with(|p| p.get());
+        let start = self.timeline_session.pan_start.get();
         let (zoom, start) = zoom_at(anchor_ratio, start, total, self.state.timeline_zoom, factor);
         self.state.timeline_zoom = zoom;
-        TIMELINE_PAN_START.with(|p| p.set(start));
-        mark_manual_view_change(self.state.current_time);
+        self.timeline_session.pan_start.set(start);
+        self.timeline_session
+            .mark_manual_view_change(self.state.current_time);
         cx.notify();
     }
 
@@ -7283,15 +7682,16 @@ impl MainWindow {
         let span = win.span();
         let start = win.start + delta_spans * span;
         let (start, _) = clamp_window(start, start + span, total);
-        TIMELINE_PAN_START.with(|p| p.set(start));
-        mark_manual_view_change(self.state.current_time);
+        self.timeline_session.pan_start.set(start);
+        self.timeline_session
+            .mark_manual_view_change(self.state.current_time);
         cx.notify();
     }
 
     /// 复位到整段视图。
     fn reset_timeline_zoom(&mut self, cx: &mut Context<Self>) {
         self.state.timeline_zoom = TIMELINE_ZOOM_MIN;
-        TIMELINE_PAN_START.with(|p| p.set(0.0));
+        self.timeline_session.pan_start.set(0.0);
         cx.notify();
     }
 }
@@ -7448,7 +7848,7 @@ impl MainWindow {
 
         // 拖拽中的时间提示：显示正在编辑的那一端（右端热区 = 终点，其余 = 起点）。
         // 只给时间码，不加说明文字——拖动时眼睛在片段上，多一个字都是噪声。
-        let trim_hint: Option<String> = TIMELINE_TRIM_DRAG.with(|d| d.get()).and_then(|drag| {
+        let trim_hint: Option<String> = self.timeline_session.trim_drag.get().and_then(|drag| {
             self.state
                 .segments
                 .iter()
@@ -7794,7 +8194,7 @@ impl MainWindow {
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         // 刚拖过时间的那次松手，GPUI 仍会补一次 click：
                                                         // 这一下不该再跳播，否则改完时间画面又跳回去
-                                                        if TIMELINE_TRIM_CLICK_GUARD.with(|g| g.get()) {
+                                                        if this.timeline_session.trim_click_guard.get() {
                                                             return;
                                                         }
                                                         this.select_timeline_segment(seg_idx, cx);
@@ -7979,7 +8379,7 @@ impl MainWindow {
         // 拖拽改时间期间不再按鼠标位置挪播放头：轨道响应层比片段/热区后画（冒泡里必然
         // 先吃到事件，`stop_propagation` 拦不住它），不在这里拦的话，修右端时指针一路往右、
         // 播放头跟着跑，画面被拽得到处都是。
-        if TIMELINE_TRIM_DRAG.with(|d| d.get()).is_some() {
+        if self.timeline_session.trim_drag.get().is_some() {
             return;
         }
         self.halt_preview_playback();

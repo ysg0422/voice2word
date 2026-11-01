@@ -1070,6 +1070,72 @@ fn is_split_punct(c: char) -> bool {
     )
 }
 
+/// 标点作为切分点的强度：句末 > 分号/冒号 > 逗号。
+///
+/// 断句的本质是「语义单元」：距离目标位置差不多时，句号明显比逗号更适合当字幕行
+/// 边界（「他说，好的。」在逗号处断开会把引语劈成两半）。强度在
+/// [`split_index_at_ratio`] 里折算成距离折扣，让句末标点在稍远一点时也能胜出。
+fn split_punct_strength(c: char) -> i64 {
+    match c {
+        '。' | '！' | '？' | '…' | '.' | '!' | '?' => 3,
+        '；' | '：' | ';' | ':' => 2,
+        '，' | '、' | ',' => 1,
+        _ => 0,
+    }
+}
+
+/// 切点是否落在成对括号/中文引号内部：在里面切会把「（补充说明）」劈成两半。
+fn inside_pairs(chars: &[char], pos: usize) -> bool {
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    for &c in chars.iter().take(pos) {
+        match c {
+            '（' | '(' | '【' | '[' | '《' | '「' | '『' => depth += 1,
+            '）' | ')' | '】' | ']' | '》' | '」' | '』' => depth = (depth - 1).max(0),
+            '“' => in_quote = true,
+            '”' => in_quote = false,
+            _ => {}
+        }
+    }
+    depth > 0 || in_quote
+}
+
+/// 用词级时间戳把「按字数选出的切点」换算成**真实的切分时刻**。
+///
+/// 旧实现一律用 `start + 时长 * 字数比例` 插值：语速不均（强调、停顿、拖音）时切点
+/// 会落在词的中间，拆分后的逐词高亮与卡拉 OK 都会错位。有词级时间戳时改为取
+/// 「累计字数最接近切点」的那个词的结束时刻——那是真的测出来的边界。
+///
+/// 返回 `None` 的情形（调用方回退到比例插值）：词不足两个、切点在段首、所有词的
+/// 时间都非有限或贴着段边界。
+fn split_time_from_words(
+    words: &[WordTiming],
+    cut_chars: usize,
+    start: f64,
+    end: f64,
+) -> Option<f64> {
+    if words.len() < 2 || cut_chars == 0 {
+        return None;
+    }
+    let mut acc = 0usize;
+    let mut best: Option<(usize, f64)> = None;
+    for word in words {
+        let n = word.word.chars().filter(|c| !c.is_whitespace()).count();
+        if n == 0 {
+            continue;
+        }
+        acc += n;
+        if !word.end.is_finite() || word.end <= start || word.end >= end {
+            continue;
+        }
+        let dist = acc.abs_diff(cut_chars);
+        if best.is_none_or(|(best_dist, _)| dist < best_dist) {
+            best = Some((dist, word.end));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
 /// 在 text 中寻找最接近 ratio 位置的标点切点（切点标点归前段）。
 /// 切点强制落在 25%~75% 区间且两侧各保留至少 2 字符，避免切出头尾碎渣；无合理切点返回 None。
 fn split_index_at_ratio(text: &str, ratio: f64) -> Option<usize> {
@@ -1090,7 +1156,16 @@ fn split_index_at_ratio(text: &str, ratio: f64) -> Option<usize> {
         if left_len < 2 || n - left_len < 2 || left_len < lo || left_len > hi {
             continue;
         }
-        let dist = (left_len as i64 - target as i64).abs();
+        // 括号/引号内部不是语义边界：宁可切在更远的逗号上，也不把「（补充说明）」
+        // 或「“引语”」从中间劈开。
+        if inside_pairs(&chars, i) {
+            continue;
+        }
+        // 强度折算成距离折扣：句末标点（强度 3）相当于把距离减 4 字符，分号/冒号减 2。
+        // 否则「我们出发吧，天气不错。还要赶路」会为了 1 个字符的接近而切在逗号上，
+        // 把完整的一句话拆成两行。
+        let dist =
+            (left_len as i64 - target as i64).abs() - (split_punct_strength(c) - 1).max(0) * 2;
         if best.is_none_or(|(_, best_dist)| dist < best_dist) {
             best = Some((left_len, dist));
         }
@@ -1120,6 +1195,50 @@ pub(crate) fn split_following(text: &str, ratio: f64) -> (String, Option<String>
     (left, Some(right))
 }
 
+/// 把多语言包按同一 `ratio` 切成前后两份，供自动拆句与手动拆句**共用一份实现**
+/// （两处各自手写一份时，已经出过「左半整张包、右半空包」的错位）。
+///
+/// - 每个语言条目独立走 [`split_following`]：先标点就近、找不到再硬切，右半不落空；
+/// - 当前展示译文（`current_lang` / `current_trans`）通常比语言包里的条目**更新**
+///   （用户手改的是展示那份），切开后要覆盖同名条目，否则两半的语言包里存的是旧文；
+/// - 空白条目直接丢弃，与 [`Segment::set_translation_pack`] 的收入口径一致。
+pub(crate) fn split_translations_pack(
+    pack: &std::collections::BTreeMap<String, String>,
+    current_lang: Option<&str>,
+    current_trans: Option<&str>,
+    ratio: f64,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let mut left = std::collections::BTreeMap::new();
+    let mut right = std::collections::BTreeMap::new();
+    for (lang, text) in pack {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let (l, r) = split_following(text, ratio);
+        if !l.trim().is_empty() {
+            left.insert(lang.clone(), l);
+        }
+        if let Some(r) = r.filter(|s| !s.trim().is_empty()) {
+            right.insert(lang.clone(), r);
+        }
+    }
+    if let (Some(lang), Some(cur)) = (current_lang, current_trans) {
+        if !cur.trim().is_empty() {
+            let (l, r) = split_following(cur, ratio);
+            if !l.trim().is_empty() {
+                left.insert(lang.to_string(), l);
+            }
+            if let Some(r) = r.filter(|s| !s.trim().is_empty()) {
+                right.insert(lang.to_string(), r);
+            }
+        }
+    }
+    (left, right)
+}
+
 /// 按切点时间把词级时间戳分成前后两组：词中点落在切点之前的归左，其余归右。
 ///
 /// 拆分长句时若把 words 直接置空，Whisper 拿到的词级 offsets 会在这一步整体丢失，
@@ -1140,7 +1259,8 @@ fn split_words_at(words: &[WordTiming], split_t: f64) -> (Vec<WordTiming>, Vec<W
 }
 
 /// 递归拆分单条长句：按标点就近均分文本，时间按字数比例分配；
-/// 翻译与润色文本按同比例就近标点跟随拆分。无合理标点切点时保留原句。
+/// 翻译、多语言包与润色文本按同比例就近标点跟随拆分，`locked` 定稿锁两半继承。
+/// 无合理标点切点时保留原句。
 fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
     let char_count = seg.text.chars().count();
     if seg.duration() <= MAX_SEGMENT_DUR && char_count <= MAX_SEGMENT_CHARS {
@@ -1155,7 +1275,10 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
 
     let total = char_count as f64;
     let ratio = cut as f64 / total;
-    let split_t = seg.start + (seg.end - seg.start) * ratio;
+    // 时间轴的切点优先用**词级时间戳**换算：`start + 时长 * 字数比例` 只在语速均匀
+    // 时才准，遇到强调/停顿会把切点落在词中间，拆分后的逐词高亮随之错位。
+    let split_t = split_time_from_words(&seg.words, cut, seg.start, seg.end)
+        .unwrap_or(seg.start + (seg.end - seg.start) * ratio);
     let chars: Vec<char> = seg.text.chars().collect();
     let left_text: String = chars[..cut].iter().collect();
     let right_text: String = chars[cut..].iter().collect();
@@ -1175,17 +1298,30 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         (l, r.unwrap_or_default())
     };
 
+    // F11：多语言包与当前译文同规则切开，两半各拿自己那一份（共用
+    // [`split_translations_pack`]，与手动拆句 `split_selected_segment` 同一份实现）。
+    let (left_packs, right_packs) = split_translations_pack(
+        &seg.translations,
+        seg.translation_lang.as_deref(),
+        seg.translation.as_deref(),
+        ratio,
+    );
+
     let (left_words, right_words) = split_words_at(&seg.words, split_t);
 
+    // `locked` 是用户的定稿锁（随工程落库，挡重译覆盖与错别字记忆库自动改写），
+    // 两半都必须继承。此前这里写死 `false`：锁定的长句在下次载入被
+    // `optimize_segments` 自动拆开后**悄悄解锁**，再来一次「重译全部」就把用户
+    // 校对定稿的译文覆盖掉——自动拆句绝不能改变用户的锁定语义。
     let mut left = Segment {
-        locked: false,
+        locked: seg.locked,
         index: 0,
         start: seg.start,
         end: split_t,
         text: left_text,
         translation: left_trans,
         translation_lang: seg.translation_lang.clone(),
-        translations: Default::default(),
+        translations: left_packs,
         polished: left_polished,
         language: seg.language.clone(),
         confidence: seg.confidence,
@@ -1194,14 +1330,14 @@ fn split_segment_recursive(seg: Segment, out: &mut Vec<Segment>) {
         words: left_words,
     };
     let mut right = Segment {
-        locked: false,
+        locked: seg.locked,
         index: 0,
         start: split_t,
         end: seg.end,
         text: right_text,
         translation: right_trans,
         translation_lang: seg.translation_lang.clone(),
-        translations: Default::default(),
+        translations: right_packs,
         polished: right_polished,
         language: seg.language,
         confidence: seg.confidence,
@@ -1231,6 +1367,41 @@ pub fn split_long_segments(segments: Vec<Segment>) -> Vec<Segment> {
         split_segment_recursive(seg, &mut out);
     }
     out
+}
+
+/// 拆分后的分片编号：从 `base`（原句 `Segment::index`）起递增。
+///
+/// [`split_segment_recursive`] 产出的分片 `index` 全是 0（拆分时刻无从知道列表里
+/// 后续编号排到了几），基准只能由调用方显式给出。流式推流（whisper / sensevoice 的
+/// `SegmentStream`）把「一句拆多条」直接推给 UI 时，index 全 0 会让清单行标识、
+/// 选中跳转、翻译定位全部错乱；落在完整列表里的情形（`optimize_segments`）不受
+/// 影响——那边收尾本来就会整体 `reindex`。
+pub fn reindex_split_pieces(mut pieces: Vec<Segment>, base: usize) -> Vec<Segment> {
+    for (i, piece) in pieces.iter_mut().enumerate() {
+        piece.index = base + i;
+    }
+    pieces
+}
+
+/// 时间轴终点：所有片段 `end` 的**最大值**（不是「最后一个」），空表回 `fallback`。
+///
+/// 为什么要 Max 而不是 `.last().end`：segments 不保证按时间排序——手动编辑、导入
+/// 外部字幕、拆分/合并都可能留下乱序表，`.last().end` 会算出**过短**的总时长，
+/// 后果是 FCPXML / Premiere / 剪映工程里末尾那句被截掉、JSON 的 `total` 失真、
+/// 历史库的 `duration` 虚低。此前仓库里 15 处各自写 `.last().map(|s| s.end)`，
+/// 口径统一从这里出。非有限值（NaN/∞）不参与比较。
+pub fn timeline_end_or(segments: &[Segment], fallback: f64) -> f64 {
+    segments
+        .iter()
+        .map(|s| s.end)
+        .filter(|e| e.is_finite())
+        .fold(None::<f64>, |acc, e| Some(acc.map_or(e, |a: f64| a.max(e))))
+        .unwrap_or(fallback)
+}
+
+/// 时间轴终点（空表取 0.0）；见 [`timeline_end_or`]。
+pub fn timeline_end(segments: &[Segment]) -> f64 {
+    timeline_end_or(segments, 0.0)
 }
 
 /// 单条字幕的最短显示时长。微调与重叠修复都以此为准：压到 0 长度的字幕既看不见，
@@ -1380,8 +1551,16 @@ pub fn plan_time_edit(
         }
     }
 
-    // 兜底之后仍可能短于下限（后一句已经贴脸、前一句也退无可退）：把终点顶回下限，
-    // 绝不交出「下次载入会被鬼影判据删掉」的短片段——拒绝一次微调，比悄悄丢一句好。
+    // 兜底：仍短于下限（后句贴脸推不动、前句也退无可退）时把终点顶回下限。
+    //
+    // 这里**允许**与后句少量重叠，是刻意的取舍（三选一里最不坏的）：
+    // - 交短片段（< MIN_EDIT_DUR）→ 下次载入被鬼影判据删掉 = **丢句**，不可逆；
+    // - 拒绝微调（原样回传）→ 原句本身可能就短于下限，同样违反「输出不得短于
+    //   下限」这条被 [`test_plan_time_edit_never_outputs_degenerate_interval`]
+    //   钉死的不变式；
+    // - 保时长 + 允许越后句 → 重叠由 [`optimize_segments`] 的「消重叠保长句」
+    //   下次载入时收敛（保的正是本句这条较长的区间），不丢内容。
+    // 前一句一侧则**绝不**越界：那边由上面的 prev 钳制收口。
     if new_end - new_start < MIN_EDIT_DUR {
         new_end = new_start + MIN_EDIT_DUR;
     }
@@ -1846,6 +2025,165 @@ mod tests {
         );
     }
 
+    /// 断句优先句末标点：距离只差几个字时，句号比逗号更适合当行边界。
+    ///
+    /// 「我们出发吧，天气不错。还要赶路」目标位置 7：逗号在 6（距离 1），句号在 11
+    /// （距离 4，句末强度按 4 字符折扣后为 0）→ 应选句号。旧实现只看距离，会在逗号
+    /// 处把完整的一句话劈成两行。
+    #[test]
+    fn split_prefers_sentence_final_punctuation() {
+        let text = "我们出发吧，天气不错。还要赶路";
+        assert_eq!(text.chars().count(), 15);
+        assert_eq!(split_index_at_ratio(text, 0.5), Some(11));
+    }
+
+    /// 括号/引号内部不是语义边界：宁可切在更远的逗号上，也不把括号里的补充说明劈开。
+    #[test]
+    fn split_skips_punctuation_inside_brackets() {
+        // 括号内逗号在 6（距离 1，本会胜出），括号外逗号在 12（距离 5）。
+        let text = "他说（补充，很长）好的，结束吧";
+        assert_eq!(text.chars().count(), 15);
+        assert_eq!(split_index_at_ratio(text, 0.5), Some(12));
+    }
+
+    /// 拆句时刻优先取**真实词边界**，而不是按字数比例插值。
+    ///
+    /// 10 秒 11 个字、语速不均：按比例算切点是 5.45s，但词级时间戳显示该处边界在
+    /// 4.0s。取词边界后，两半的词时间与文本切点才真正对齐（卡拉 OK 不错位）。
+    #[test]
+    fn split_time_uses_measured_word_boundary() {
+        let mut seg = Segment::new(1, 0.0, 10.0, "一二三四五，六七八九十");
+        seg.words = vec![
+            WordTiming {
+                word: "一二".to_string(),
+                start: 0.0,
+                end: 1.2,
+            },
+            WordTiming {
+                word: "三四".to_string(),
+                start: 1.2,
+                end: 3.2,
+            },
+            WordTiming {
+                word: "五，".to_string(),
+                start: 3.2,
+                end: 4.0,
+            },
+            WordTiming {
+                word: "六七八九十".to_string(),
+                start: 4.0,
+                end: 10.0,
+            },
+        ];
+
+        let out = split_long_segments(vec![seg]);
+        assert!(out.len() >= 2, "前提：该段应被拆开");
+        assert!(
+            (out[0].end - 4.0).abs() < 1e-6,
+            "切点应取词边界 4.0s（字数插值会得到 5.45s），实际 {}",
+            out[0].end
+        );
+        assert_eq!(out[0].words.len(), 3, "左半应包含切点之前的三个词");
+        assert_eq!(out[1].words.len(), 1);
+    }
+
+    /// 没有词级时间戳时仍按字数比例插值（行为回退，不 panic）。
+    #[test]
+    fn split_time_falls_back_to_ratio_without_words() {
+        let seg = Segment::new(1, 0.0, 10.0, "一二三四五，六七八九十");
+        assert!(seg.words.is_empty());
+        let out = split_long_segments(vec![seg]);
+        assert!(out.len() >= 2);
+        assert!(
+            (out[0].end - 10.0 * 6.0 / 11.0).abs() < 1e-6,
+            "无词级信息时应回到字数比例，实际 {}",
+            out[0].end
+        );
+    }
+
+    /// 回归：自动拆句不得丢 `locked` 定稿锁与多语言包。
+    /// 修前两半 `locked: false`、`translations: Default::default()`——锁定的长句在
+    /// 载入时被 `optimize_segments` 拆开后悄悄解锁，「重译全部」即可覆盖用户定稿；
+    /// 语言包整张丢失后，切换「字幕语言包」再也找不回旧译文。
+    #[test]
+    fn split_long_segments_keeps_lock_and_translation_packs() {
+        let text = "前半句到标点为止。后半句继续往后写,再补一些字数凑到足够长,确保这里会被拆开。";
+        let mut seg = Segment::new(1, 0.0, 8.0, text);
+        seg.locked = true;
+        seg.translation =
+            Some("first half. second half, and more words to pad it out.".to_string());
+        seg.translation_lang = Some("English".to_string());
+        seg.translations.insert(
+            "English".to_string(),
+            "first half. second half, and more words to pad it out.".to_string(),
+        );
+        seg.translations.insert(
+            "日本語".to_string(),
+            "前半。後半、さらに語数を稼ぐために続ける。".to_string(),
+        );
+
+        let out = split_long_segments(vec![seg]);
+        assert!(out.len() >= 2, "前提：该段应被拆成多条，实际 {}", out.len());
+        assert!(
+            out.iter().all(|s| s.locked),
+            "自动拆句必须两半都继承 locked 定稿锁"
+        );
+        for (lang, expected) in [
+            (
+                "English",
+                "first half. second half, and more words to pad it out.",
+            ),
+            ("日本語", "前半。後半、さらに語数を稼ぐために続ける。"),
+        ] {
+            let pieces: Vec<&str> = out
+                .iter()
+                .filter_map(|s| s.translations.get(lang).map(|t| t.as_str()))
+                .collect();
+            assert!(
+                pieces.len() >= 2 && pieces.iter().all(|p| !p.trim().is_empty()),
+                "语言包 {lang} 应随拆分切开且两半都非空，实际 {pieces:?}"
+            );
+            // 拆分只切开、不改写：拼回必须逐字等于原文（与 text 拼接守恒同口径）
+            let joined: String = pieces.concat();
+            assert_eq!(joined, expected, "语言包 {lang} 拼接不守恒");
+        }
+    }
+
+    /// 回归：拆分后的分片编号必须从原句 index 起唯一递增。
+    /// `split_segment_recursive` 产出的 index 全 0，流式推流直接推给 UI 时会让
+    /// 清单行标识 / 选中跳转 / 翻译定位全部错乱。
+    #[test]
+    fn reindex_split_pieces_assigns_unique_incrementing_indices() {
+        let text = "前半句到标点为止。后半句继续往后写,再补一些字数凑到足够长,确保这里会被拆开。";
+        let seg = Segment::new(7, 0.0, 8.0, text);
+        let pieces = reindex_split_pieces(split_long_segments(vec![seg]), 7);
+        assert!(pieces.len() >= 2, "前提：该段应被拆成多条");
+        assert_eq!(
+            pieces.iter().map(|s| s.index).collect::<Vec<_>>(),
+            (7..7 + pieces.len()).collect::<Vec<_>>(),
+            "分片 index 应从原 index 起逐个递增"
+        );
+    }
+
+    /// 回归：时间轴终点取 max(end) 而不是「最后一句的 end」——segments 不保证
+    /// 按时间排序，乱序表会让 FCPXML/Premiere/剪映的工程时长算短、末句被裁。
+    /// 有效哨兵是「max(end) 的段**不在末位**」。
+    #[test]
+    fn timeline_end_takes_max_end_not_last() {
+        let unordered = vec![
+            Segment::new(1, 9.0, 12.5, "最长的尾巴（在首位）"),
+            Segment::new(2, 0.0, 2.0, "先出现的句子"),
+            Segment::new(3, 5.0, 8.0, "末位短句"),
+        ];
+        assert_eq!(timeline_end(&unordered), 12.5);
+        assert_eq!(timeline_end_or(&unordered, 42.0), 12.5);
+        assert_eq!(timeline_end(&[]), 0.0);
+        assert_eq!(timeline_end_or(&[], 42.0), 42.0, "空表回 fallback");
+        // 非有限值不参与比较
+        let nan_tail = vec![Segment::new(1, 0.0, f64::NAN, "坏数据")];
+        assert_eq!(timeline_end(&nan_tail), 0.0);
+    }
+
     /// 终点往右加：越界时把下一句的头往后挪。
     #[test]
     fn test_plan_time_edit_pushes_next_start() {
@@ -1903,6 +2241,43 @@ mod tests {
         assert!(
             edit.end - edit.start >= MIN_EDIT_DUR - 1e-9,
             "终点被后一句顶回时留下过短片段: {edit:?}"
+        );
+    }
+
+    /// 兜底取舍的回归护栏（三选一里「保时长、允许后句少量重叠」）：
+    /// - 前一句一侧**绝不**越界（prev 钳制收口）；
+    /// - 后句可推则推（`next_start` 跟随），推不动的死锁场景才容忍重叠——
+    ///   重叠由 `optimize_segments` 下次载入「消重叠保长句」收敛，不丢内容；
+    /// - 输出时长恒 ≥ [`MIN_EDIT_DUR`]（这条不变式被单独钉死，见
+    ///   `test_plan_time_edit_never_outputs_degenerate_interval`）。
+    #[test]
+    fn test_plan_time_edit_fallback_prefers_duration_over_zero_overlap() {
+        // 场景一（可推）：后句有余量，+0.5 应把后句头一起顶走，零交叉。
+        // 判据对照**调整后的**边界：next_start 跟随时，end 允许超过原 next.start。
+        let edit = plan_time_edit(1.0, 2.0, Some((0.0, 1.0)), Some((2.0, 4.0)), 0.0, 0.5);
+        let next_after = edit.next_start.unwrap_or(2.0);
+        assert!(
+            edit.end <= next_after + 1e-9,
+            "后句可推时零交叉（end 不得越过调整后的下一句起点）: {edit:?}"
+        );
+        assert!(
+            edit.start >= 1.0 - 1e-9,
+            "起点不回退（d_start=0 时不动）: {edit:?}"
+        );
+        assert!(edit.end - edit.start >= MIN_EDIT_DUR - 1e-9);
+
+        // 场景二（死锁）：后句贴脸且自身极短（推不动），强行把 start 右推会把
+        // 区间挤没。此时允许 end 越过 next.start，但前句侧要么零交叉、要么
+        // prev_end 合法收短跟随（判据对照调整后的边界），且时长达标。
+        let edit = plan_time_edit(1.0, 1.2, Some((0.5, 1.0)), Some((1.2, 1.3)), 0.5, 0.0);
+        let prev_after = edit.prev_end.unwrap_or(1.0);
+        assert!(
+            edit.start >= prev_after - 1e-9,
+            "前句侧不得留下交叉（prev_end 跟随收短即合法）: {edit:?}"
+        );
+        assert!(
+            edit.end - edit.start >= MIN_EDIT_DUR - 1e-9,
+            "死锁场景仍须保时长（丢句比少量重叠更糟）: {edit:?}"
         );
     }
 

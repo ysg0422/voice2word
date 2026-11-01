@@ -331,7 +331,13 @@ impl MainWindow {
                                                 .text_color(Theme::text_on_accent())
                                                 .cursor_pointer()
                                                 .hover(|s| s.bg(Theme::accent_mint_deep()))
-                                                .child("立即退出并安装升级")
+                                                .child(if crate::utils::update_check::is_installer_asset(
+                                                    &_path.file_name().unwrap_or_default().to_string_lossy(),
+                                                ) {
+                                                    "立即退出并安装升级"
+                                                } else {
+                                                    "查看替换说明"
+                                                })
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.install_downloaded_update(cx);
                                                 }))
@@ -392,9 +398,17 @@ impl MainWindow {
                                                 .text_color(Theme::text_on_accent())
                                                 .cursor_pointer()
                                                 .hover(|s| s.bg(Theme::accent_mint_deep()))
-                                                .child("立即下载更新")
+                                                .child(if target.is_some() {
+                                                    "立即下载更新"
+                                                } else {
+                                                    "打开发行页面"
+                                                })
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.download_app_update(cx);
+                                                    if this.state.update_download_target.is_some() {
+                                                        this.download_app_update(cx);
+                                                    } else {
+                                                        this.open_release_page(cx);
+                                                    }
                                                 }))
                                                 .into_any_element(),
                                         ]

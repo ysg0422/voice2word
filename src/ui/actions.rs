@@ -2,6 +2,7 @@
 
 use gpui::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -19,6 +20,15 @@ use crate::subtitle::writer::export_spec_for;
 use crate::subtitle::Segment;
 use crate::subtitle::SubtitleWriter;
 use crate::subtitle::{CpsFixPlan, DEFAULT_MAX_CPS, MIN_EDIT_DUR};
+
+/// 探测源媒体的画布与帧率，供工程文件导出使用；探测失败回落到 30fps / 1920×1080。
+///
+/// 只在导出动作里调用（此时已离开渲染帧）；不要放进 render 路径同步起 ffmpeg。
+fn probe_project_format(media: &Path, ffmpeg_path: &str) -> crate::subtitle::ProjectFormat {
+    let engine =
+        crate::engines::FFmpegEngine::new(crate::utils::AppConfig::resolve_path(ffmpeg_path));
+    engine.get_format(media).unwrap_or_default()
+}
 
 /// 导入字幕成功后的提示文案（**纯函数**，便于单测）。
 ///
@@ -105,6 +115,19 @@ fn burn_temp_seq() -> u64 {
 /// 置灰，不触碰既有状态机。
 pub(crate) static CLIP_EXPORT_BUSY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// 配音后台线程与 UI 协程之间的共享快照。
+///
+/// 为什么不让合成线程直接碰 GPUI：配音要跑几分钟（几百句逐个联网合成），
+/// 状态更新必须回到 UI 线程；这里只存「最新一条进度 + 最终结果」，UI 每 150ms
+/// 取一次快照，互不阻塞。
+#[derive(Default)]
+struct DubShared {
+    msg: String,
+    frac: f32,
+    done: bool,
+    result: Option<Result<crate::core::dub_flow::DubReport, String>>,
+}
 
 fn editor_export_format_string(fmt: EditorExportFormat) -> &'static str {
     match fmt {
@@ -454,7 +477,232 @@ static REQUIRED_AUTO_TRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::At
 /// 最多自动尝试几次（含首次）。到顶后只提示一次、转人工。
 const REQUIRED_AUTO_MAX_TRIES: u32 = 3;
 
+/// 系统对话框的种类：决定弹「打开文件 / 多选文件 / 选目录 / 另存为」中的哪一个，
+/// 也决定 [`DialogPick`] 的形状（单路径还是多路径清单）。
+enum DialogKind {
+    /// `pick_file()`：单选一个文件。
+    OpenFile,
+    /// `pick_files()`：多选文件。
+    OpenFiles,
+    /// `pick_folder()`：选一个目录。
+    PickFolder,
+    /// `save_file()`：另存为（目标已存在时的「是否覆盖」由原生对话框自己弹）。
+    SaveFile,
+}
+
+/// 系统对话框的产物。
+///
+/// `Clone` 是给 [`MainWindow::run_after_dialog`] 用的：后台闭包要路径、收尾也要
+/// 路径，骨架克隆一份发给双方（与改前各入口自己 `clone()` 进后台闭包同构）。
+#[derive(Clone)]
+enum DialogPick {
+    /// `pick_file` / `pick_folder` / `save_file` 的单个路径——三者在 rfd 里同形
+    /// （都是 `FileHandle::path().to_path_buf()`），不必分三档。
+    One(PathBuf),
+    /// `pick_files` 的多选清单。
+    Many(Vec<PathBuf>),
+}
+
+impl DialogPick {
+    /// 取单选路径。只有单选档该走到这里；真被接成多选也不 panic 掉异步任务，
+    /// 退回首项让调用点的校验去兜底（宁可少做一步，不要整条任务带崩没人收尾）。
+    fn into_path(self) -> PathBuf {
+        match self {
+            DialogPick::One(path) => path,
+            DialogPick::Many(paths) => paths.into_iter().next().unwrap_or_default(),
+        }
+    }
+
+    /// 展开成路径清单；单选折成一项列表，供「文件/文件夹通用」的收尾使用。
+    fn into_paths(self) -> Vec<PathBuf> {
+        match self {
+            DialogPick::One(path) => vec![path],
+            DialogPick::Many(paths) => paths,
+        }
+    }
+}
+
+/// 「弹哪个系统对话框」的纯数据描述（[`MainWindow::run_after_dialog`] 的对话框配置参数）。
+///
+/// 为什么是纯数据、而不是把 `rfd::AsyncFileDialog` 传进骨架：后者的构造器是按值
+/// 链式 builder，跨不过 `cx.spawn` 闭包的 `'static` 要求；而标题 / 默认文件名 /
+/// 过滤器这些**各入口的差异点**留在调用点拼成一份描述，骨架只负责把它翻译成一次
+/// rfd 调用——对话框长相在调用点一眼可见，「await 之后取路径」的样板也只剩一份。
+struct DialogSpec {
+    /// `set_title`。没有标题的入口（「选择音视频」「导出字幕」）留 `None`，与改前一致。
+    title: Option<String>,
+    /// `set_file_name`：另存为的默认文件名。
+    default_name: Option<String>,
+    /// `add_filter` 的（标签, 扩展名）清单，按压入顺序展开成同序的过滤器。
+    filters: Vec<(String, Vec<String>)>,
+    kind: DialogKind,
+}
+
+impl DialogSpec {
+    /// 打开单个文件（`pick_file`）。
+    fn open_file() -> Self {
+        Self {
+            title: None,
+            default_name: None,
+            filters: Vec::new(),
+            kind: DialogKind::OpenFile,
+        }
+    }
+
+    /// 多选文件（`pick_files`）。
+    fn open_files() -> Self {
+        Self {
+            title: None,
+            default_name: None,
+            filters: Vec::new(),
+            kind: DialogKind::OpenFiles,
+        }
+    }
+
+    /// 选一个目录（`pick_folder`）。
+    fn pick_folder() -> Self {
+        Self {
+            title: None,
+            default_name: None,
+            filters: Vec::new(),
+            kind: DialogKind::PickFolder,
+        }
+    }
+
+    /// 另存为（`save_file`）。
+    fn save_file() -> Self {
+        Self {
+            title: None,
+            default_name: None,
+            filters: Vec::new(),
+            kind: DialogKind::SaveFile,
+        }
+    }
+
+    fn titled(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    fn with_default_name(mut self, name: impl Into<String>) -> Self {
+        self.default_name = Some(name.into());
+        self
+    }
+
+    fn with_filter(
+        mut self,
+        label: impl Into<String>,
+        exts: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.filters
+            .push((label.into(), exts.into_iter().map(Into::into).collect()));
+        self
+    }
+
+    /// 把描述翻译成一次真实的 rfd 异步对话框调用；用户取消时返回 `None`。
+    ///
+    /// 构造顺序固定为「标题 → 默认文件名 → 过滤器 → 点选方式」：这几类 setter 互不
+    /// 相干，先后顺序不影响对话框长相，各调用点的标题 / 过滤器 / 默认文件名逐值不变。
+    async fn pick(self) -> Option<DialogPick> {
+        let mut dialog = rfd::AsyncFileDialog::new();
+        if let Some(title) = self.title {
+            dialog = dialog.set_title(title);
+        }
+        if let Some(name) = self.default_name {
+            dialog = dialog.set_file_name(name);
+        }
+        for (label, exts) in self.filters {
+            dialog = dialog.add_filter(label, &exts);
+        }
+        match self.kind {
+            DialogKind::OpenFile => dialog
+                .pick_file()
+                .await
+                .map(|handle| DialogPick::One(handle.path().to_path_buf())),
+            DialogKind::OpenFiles => dialog.pick_files().await.map(|handles| {
+                DialogPick::Many(handles.iter().map(|h| h.path().to_path_buf()).collect())
+            }),
+            DialogKind::PickFolder => dialog
+                .pick_folder()
+                .await
+                .map(|handle| DialogPick::One(handle.path().to_path_buf())),
+            DialogKind::SaveFile => dialog
+                .save_file()
+                .await
+                .map(|handle| DialogPick::One(handle.path().to_path_buf())),
+        }
+    }
+}
+
 impl MainWindow {
+    /// 「系统对话框 → （后台）干活 → 回 UI 写状态」三段式骨架的唯一出口。
+    ///
+    /// # 为什么要有它
+    ///
+    /// `rfd::AsyncFileDialog` + `cx.spawn` + `this.update` 这套骨架此前在本文件里
+    /// 复制了十几遍，每份都自带「取消分支怎么收、路径怎么取、结果怎么落状态」，
+    /// 改一处忘一处就会出现入口之间的行为漂移。现在差异只走三样参数：
+    /// `dialog`（弹什么，标题/过滤器/默认文件名逐值留在调用点）、`work`（选完之后
+    /// 干什么）、`done`（结果怎么写回界面）；`on_cancel` 只在取消有副作用时非空。
+    ///
+    /// # 几个刻意的约定（都是「行为零改动」的落点，不是可以随手「修」的瑕疵）
+    ///
+    /// - **`work` 跑在哪个线程由调用点自己决定**：重活（写盘/读库/转码）在 `work`
+    ///   里 `cx.background_executor().spawn(...)`，与各入口改前逐字一致；
+    ///   `export_with_save_dialog` 的写出闭包则刻意留在前台执行器的异步任务里
+    ///   （改前就跑在那里），骨架不代它挪线程。
+    /// - **取消分支无条件走一次 `this.update`**：没有取消副作用的入口给空闭包。
+    ///   gpui 的 `update` 不隐式 `notify`（notify 只由显式 `cx.notify()` 触发，
+    ///   见 `Context::notify`），空闭包因此与改前的「直接 return」逐帧等价；
+    ///   两个忙标志复位点把复位写进 `on_cancel`，顺序与改前一致（先复位、再 notify）。
+    /// - **`work` 与 `done` 各拿一份 `DialogPick`**：后台闭包要路径、收尾也要路径
+    ///   （比如打开资源管理器选中导出产物），骨架克隆一份给 `work`，与改前各入口
+    ///   自己 `clone()` 一份进后台闭包的做法同构。
+    fn run_after_dialog<R, Work, Done>(
+        &mut self,
+        cx: &mut Context<Self>,
+        dialog: DialogSpec,
+        on_cancel: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+        work: Work,
+        done: Done,
+    ) where
+        Work: AsyncFnOnce(DialogPick, &mut gpui::AsyncApp) -> R + 'static,
+        R: 'static,
+        Done: FnOnce(&mut Self, &mut Context<Self>, DialogPick, R) + 'static,
+    {
+        cx.spawn(async move |this, cx| {
+            let Some(pick) = dialog.pick().await else {
+                let _ = this.update(cx, |this, cx| on_cancel(this, cx));
+                return;
+            };
+            let result = work(pick.clone(), &mut *cx).await;
+            let _ = this.update(cx, |this, cx| done(this, cx, pick, result));
+        })
+        .detach();
+    }
+
+    /// 「（后台）干活 → 回 UI 写状态」的共用骨架——没有对话框的那一批入口
+    /// （备份、检查更新、读字幕文件……）用它。
+    ///
+    /// `work` 是一段纯同步计算，统一丢进 `background_executor`：与各入口改前
+    /// 「`cx.background_executor().spawn(async move { 计算 })`」逐字同构，于是
+    /// 「后台算什么、回 UI 写什么」在调用点只剩两个闭包，顺序（先算完、再回写）
+    /// 由骨架钉死。
+    fn spawn_background_work<R>(
+        &mut self,
+        cx: &mut Context<Self>,
+        work: impl FnOnce() -> R + Send + 'static,
+        done: impl FnOnce(&mut Self, &mut Context<Self>, R) + 'static,
+    ) where
+        R: Send + 'static,
+    {
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async move { work() }).await;
+            let _ = this.update(cx, |this, cx| done(this, cx, result));
+        })
+        .detach();
+    }
+
     /// 裁剪视频库的界面缓存，只保留仍存在于列表里的条目。
     ///
     /// `library_thumbs`（首帧缩略图路径）与 `library_sizes`（文件大小文本）
@@ -513,77 +761,72 @@ impl MainWindow {
         self.library_export_busy = true;
         cx.notify();
 
-        cx.spawn(async move |this, cx| {
-            let folder = rfd::AsyncFileDialog::new()
-                .set_title("选择批量导出目录")
-                .pick_folder()
-                .await;
-            let Some(folder_handle) = folder else {
-                // 用户取消：复位忙状态，不弹提示
-                let _ = this.update(cx, |this, cx| {
-                    this.library_export_busy = false;
-                    cx.notify();
-                });
-                return;
-            };
-            let dir = folder_handle.path().to_path_buf();
-            // 后台闭包与收尾提示都要用 dir：各持一份，避免 move 冲突
-            let dir_for_write = dir.clone();
-
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut ok = 0usize;
-                    let mut failed: Vec<String> = Vec::new();
-                    for (id, name) in &picked {
-                        let segs = match db.load_task_segments(*id) {
-                            Ok(s) if !s.is_empty() => s,
-                            Ok(_) => {
-                                failed.push(format!("{name}（无字幕内容）"));
-                                continue;
-                            }
-                            Err(e) => {
-                                failed.push(format!("{name}（读取失败：{e}）"));
-                                continue;
-                            }
-                        };
-                        // 文件名沿用工程名，剥掉原扩展名再补上所选格式的扩展名，
-                        // 避免「xx.mp4.srt」。此前扩展名与写出格式都硬编码为
-                        // "srt"，用户在配置里选了 JSON，批量导出却仍是 SRT 文件。
-                        let stem = std::path::Path::new(name)
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| format!("task_{id}"));
-                        // 文件名走统一模板：库批量导出与剪辑台单条导出必须给出
-                        // 同一套命名规则，否则同一个配置在两个入口行为不同。
-                        let fname = crate::subtitle::writer::export_file_name(
-                            &name_template,
-                            &stem,
-                            fmt_ext,
-                            &today,
-                        );
-                        let out = dir_for_write.join(&fname);
-                        // 走带样式的入口：srt / vtt / ass 按 `max_chars_per_line` 折行。
-                        // 其余格式（json / ttml / ttal / txt）在
-                        // `write_to_file_with_style` 内部**原样回落**到
-                        // `write_to_file_with_mode`，不会因为这次接线而报错或改变字节。
-                        match SubtitleWriter::write_to_file_with_style(
-                            &segs,
-                            &out,
-                            write_fmt,
-                            export_mode,
-                            &style,
-                        ) {
-                            Ok(()) => ok += 1,
-                            Err(e) => failed.push(format!("{name}（写出失败：{e}）")),
-                        }
-                    }
-                    (ok, failed)
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
+        self.run_after_dialog(
+            cx,
+            DialogSpec::pick_folder().titled("选择批量导出目录"),
+            // 用户取消：复位忙状态，不弹提示
+            |this, cx| {
                 this.library_export_busy = false;
+                cx.notify();
+            },
+            async move |pick, cx| {
+                // 后台闭包与收尾提示都要用 dir：`run_after_dialog` 给双方各发一份
+                // `DialogPick`，这里各自取出，天然避免 move 冲突
+                let dir = pick.into_path();
+                cx.background_executor()
+                    .spawn(async move {
+                        let mut ok = 0usize;
+                        let mut failed: Vec<String> = Vec::new();
+                        for (id, name) in &picked {
+                            let segs = match db.load_task_segments(*id) {
+                                Ok(s) if !s.is_empty() => s,
+                                Ok(_) => {
+                                    failed.push(format!("{name}（无字幕内容）"));
+                                    continue;
+                                }
+                                Err(e) => {
+                                    failed.push(format!("{name}（读取失败：{e}）"));
+                                    continue;
+                                }
+                            };
+                            // 文件名沿用工程名，剥掉原扩展名再补上所选格式的扩展名，
+                            // 避免「xx.mp4.srt」。此前扩展名与写出格式都硬编码为
+                            // "srt"，用户在配置里选了 JSON，批量导出却仍是 SRT 文件。
+                            let stem = std::path::Path::new(name)
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| format!("task_{id}"));
+                            // 文件名走统一模板：库批量导出与剪辑台单条导出必须给出
+                            // 同一套命名规则，否则同一个配置在两个入口行为不同。
+                            let fname = crate::subtitle::writer::export_file_name(
+                                &name_template,
+                                &stem,
+                                fmt_ext,
+                                &today,
+                            );
+                            let out = dir.join(&fname);
+                            // 走带样式的入口：srt / vtt / ass 按 `max_chars_per_line` 折行。
+                            // 其余格式（json / ttml / ttal / txt）在
+                            // `write_to_file_with_style` 内部**原样回落**到
+                            // `write_to_file_with_mode`，不会因为这次接线而报错或改变字节。
+                            match SubtitleWriter::write_to_file_with_style(
+                                &segs,
+                                &out,
+                                write_fmt,
+                                export_mode,
+                                &style,
+                            ) {
+                                Ok(()) => ok += 1,
+                                Err(e) => failed.push(format!("{name}（写出失败：{e}）")),
+                            }
+                        }
+                        (ok, failed)
+                    })
+                    .await
+            },
+            |this, cx, pick, result| {
+                this.library_export_busy = false;
+                let dir = pick.into_path();
                 let (ok, failed) = result;
                 if failed.is_empty() {
                     this.notice = Some(format!("已导出 {ok} 份字幕到 {}", dir.display()));
@@ -605,9 +848,8 @@ impl MainWindow {
                     ));
                 }
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// CPU 机器强制走 H.264 代理；有 GPU 默认原片，用户仍可手动打开。
@@ -668,26 +910,25 @@ impl MainWindow {
 
     /// 打开系统原生文件对话框选择音视频（支持单选与多选，异步非阻塞）
     pub(crate) fn choose_file(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let handles = rfd::AsyncFileDialog::new()
-                .add_filter(
-                    "音视频文件",
-                    &[
-                        "mp4", "mkv", "mov", "avi", "flv", "webm", "mp3", "wav", "flac", "m4a",
-                    ],
-                )
-                .pick_files()
-                .await;
-            let Some(handles) = handles else { return };
-            if handles.is_empty() {
-                return;
-            }
-            let files: Vec<PathBuf> = handles.iter().map(|h| h.path().to_path_buf()).collect();
-            let _ = this.update(cx, |this, cx| {
+        self.run_after_dialog(
+            cx,
+            DialogSpec::open_files().with_filter(
+                "音视频文件",
+                [
+                    "mp4", "mkv", "mov", "avi", "flv", "webm", "mp3", "wav", "flac", "m4a",
+                ],
+            ),
+            |_, _| {},
+            async move |pick, _cx| pick.into_paths(),
+            |this, cx, _pick, files| {
+                // 空清单在收尾闭包里提前返回且**不 notify**：与改前「直接 return」
+                // 逐帧等价（`this.update` 不隐式 notify，见 `run_after_dialog` 文档）。
+                if files.is_empty() {
+                    return;
+                }
                 this.handle_selected_media_files(files, cx);
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 处理用户通过文件对话框选择的音视频文件（支持单选与多选，平滑衔接单文件与批量队列）
@@ -806,14 +1047,10 @@ impl MainWindow {
         self.state.download_status_msg = "正在备份数据…".to_string();
         cx.notify();
 
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    crate::utils::backup::create_backup_with_db(&root, &db_path, &dest)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
+        self.spawn_background_work(
+            cx,
+            move || crate::utils::backup::create_backup_with_db(&root, &db_path, &dest),
+            |this, cx, result| {
                 match result {
                     Ok(outcome) => {
                         info!("数据备份完成: {}", outcome.archive.display());
@@ -832,9 +1069,8 @@ impl MainWindow {
                     }
                 }
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 选择一份备份归档并（在二次确认后）恢复。
@@ -844,15 +1080,14 @@ impl MainWindow {
     /// 本身拒绝覆盖已存在的文件——这是有意的双保险：即便用户误点确认，也不会
     /// 悄悄把当前工程库换掉；界面会把「哪些文件因为已存在而被保留」如实报出来。
     pub(crate) fn choose_backup_to_restore(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("选择要恢复的备份归档")
-                .add_filter("Voice2Word 备份", &["zip"])
-                .pick_file()
-                .await;
-            let Some(handle) = handle else { return };
-            let path = handle.path().to_path_buf();
-            let _ = this.update(cx, |this, cx| {
+        self.run_after_dialog(
+            cx,
+            DialogSpec::open_file()
+                .titled("选择要恢复的备份归档")
+                .with_filter("Voice2Word 备份", ["zip"]),
+            |_, _| {},
+            async move |pick, _cx| pick.into_path(),
+            |this, cx, _pick, path| {
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -868,9 +1103,8 @@ impl MainWindow {
                     action: crate::ui::types::ConfirmAction::RestoreBackup(path),
                 });
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 执行备份恢复（确认后调用）。结果同样落在 `download_status_msg`。
@@ -1045,23 +1279,31 @@ impl MainWindow {
     /// 的操作，那属于单独的、更高风险的一步（见 `utils::update_check` 的模块文档）。
     /// 检查是否有新版本（用户显式点击才发请求，不轮询）。
     pub(crate) fn check_for_update(&mut self, cx: &mut Context<Self>) {
-        if self.state.update_check_busy {
+        if self.state.update_check_busy || self.state.update_download_busy {
             return;
         }
         self.state.update_check_busy = true;
         self.state.download_status_msg = "正在检查更新…".to_string();
         self.state.update_download_status = Some("正在连接 GitHub 检查最新版本…".to_string());
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { crate::utils::update_check::fetch_latest_release(15) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
+        self.spawn_background_work(
+            cx,
+            move || crate::utils::update_check::fetch_latest_release(15),
+            |this, cx, result| {
                 use crate::utils::update_check::{current_version, describe, is_newer};
                 this.state.update_check_busy = false;
                 match result {
                     Ok(latest) => {
+                        let changed = this.state.update_release_info.as_ref().is_none_or(|old| {
+                            old.download_url != latest.download_url
+                                || old.asset_sha256 != latest.asset_sha256
+                                || old.asset_size != latest.asset_size
+                                || old.version != latest.version
+                        });
+                        if changed {
+                            this.state.update_downloaded_path = None;
+                            this.state.update_download_progress = 0.0;
+                        }
                         let current = current_version();
                         let newer = is_newer(&latest.version, current);
                         let text = describe(current, &latest.version, newer);
@@ -1069,8 +1311,8 @@ impl MainWindow {
                         this.state.update_release_info = Some(latest.clone());
                         this.state.update_check_result =
                             Some((newer, text.clone(), latest.page_url));
-                        this.state.update_download_target =
-                            Some((latest.download_url, latest.asset_name, latest.asset_size));
+                        this.state.update_download_target = (!latest.download_url.is_empty())
+                            .then_some((latest.download_url, latest.asset_name, latest.asset_size));
                         this.state.update_download_status = Some(text);
 
                         // 发现新版本时，自动弹出更新详情弹窗，便于用户查看改动并一键下载
@@ -1085,9 +1327,8 @@ impl MainWindow {
                     }
                 }
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 应用内直接下载最新版本（支持国内加速镜像，打通实时进度流）
@@ -1095,7 +1336,7 @@ impl MainWindow {
         if self.state.update_download_busy {
             return;
         }
-        let Some((url, name, _)) = self.state.update_download_target.clone() else {
+        let Some((url, name, expected_size)) = self.state.update_download_target.clone() else {
             return;
         };
         if url.trim().is_empty() {
@@ -1103,11 +1344,12 @@ impl MainWindow {
         }
 
         self.state.update_download_busy = true;
+        self.state.update_downloaded_path = None;
         self.state.update_download_progress = 0.01;
         self.state.update_download_status = Some("正在连接更新镜像…".to_string());
-        self.update_download_cancel
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.update_download_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel = self.update_download_cancel.clone();
+        let progress_cancel = cancel.clone();
         cx.notify();
 
         // 建立跨线程实时下载进度通信通道
@@ -1117,6 +1359,12 @@ impl MainWindow {
         cx.spawn(async move |this, cx| {
             while let Some((frac, written, total)) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
+                    if !this.state.update_download_busy
+                        || !Arc::ptr_eq(&this.update_download_cancel, &progress_cancel)
+                        || progress_cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return;
+                    }
                     this.state.update_download_progress = frac;
                     let mb_done = written as f64 / 1024.0 / 1024.0;
                     if total > 0 {
@@ -1141,9 +1389,10 @@ impl MainWindow {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    crate::utils::update_check::download_update_file(
+                    crate::utils::update_check::download_update_file_with_size(
                         &url,
                         &name,
+                        expected_size,
                         &cancel,
                         move |frac, written, total| {
                             let _ = tx.send((frac, written, total));
@@ -1162,7 +1411,7 @@ impl MainWindow {
                         this.state.update_downloaded_path = Some(path);
                     }
                     Err(e) => {
-                        this.state.update_download_status = Some(format!("下载失败：{e}"));
+                        this.state.update_download_status = Some(format!("下载失败：{e:#}"));
                     }
                 }
                 cx.notify();
@@ -1176,8 +1425,7 @@ impl MainWindow {
         if self.state.update_download_busy {
             self.update_download_cancel
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            self.state.update_download_busy = false;
-            self.state.update_download_status = Some("已取消下载".to_string());
+            self.state.update_download_status = Some("正在取消下载…".to_string());
             cx.notify();
         }
     }
@@ -1189,6 +1437,16 @@ impl MainWindow {
         };
         if !path.exists() {
             self.state.update_download_status = Some("更新文件不存在，请重新下载".to_string());
+            cx.notify();
+            return;
+        }
+        if !crate::utils::update_check::is_installer_asset(
+            &path.file_name().unwrap_or_default().to_string_lossy(),
+        ) {
+            self.open_downloaded_update(cx);
+            self.state.update_download_status = Some(
+                "已下载便携版：请退出程序后解压（如需要），再替换原目录中的程序文件。".to_string(),
+            );
             cx.notify();
             return;
         }
@@ -1311,25 +1569,26 @@ impl MainWindow {
         filter_label: &str,
     ) {
         let filter = filter_label.to_string();
-        cx.spawn(async move |this, cx| {
-            let ext = default_name.rsplit('.').next().unwrap_or("txt").to_string();
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("导出质检表")
-                .set_file_name(&default_name)
-                .add_filter(&filter, &[ext.as_str()])
-                .save_file()
-                .await;
-            let Some(handle) = handle else { return };
-            let path = handle.path().to_path_buf();
+        let ext = default_name.rsplit('.').next().unwrap_or("txt").to_string();
+        self.run_after_dialog(
+            cx,
+            DialogSpec::save_file()
+                .titled("导出质检表")
+                .with_default_name(default_name)
+                .with_filter(filter, [ext]),
+            |_, _| {},
             // 写盘本身是毫秒级小文件，但保持与其它导出一致的「后台执行」习惯，
-            // 免得将来内容变大时又要改一遍。路径 clone 一份进后台闭包：`path`
-            // 在收尾的成功分支里还要用（打开资源管理器选中它）。
-            let path_for_write = path.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { std::fs::write(&path_for_write, content.as_bytes()) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
+            // 免得将来内容变大时又要改一遍。路径要进后台闭包、收尾的成功分支
+            // 还要用它（打开资源管理器选中）：两份由 `run_after_dialog` 的
+            // `DialogPick` 各发一份，无需再手动 clone。
+            async move |pick, cx| {
+                let path = pick.into_path();
+                cx.background_executor()
+                    .spawn(async move { std::fs::write(&path, content.as_bytes()) })
+                    .await
+            },
+            |this, cx, pick, result| {
+                let path = pick.into_path();
                 match result {
                     Ok(()) => {
                         // 打开所在目录并选中文件：用户下一步多半就是把它发出去。
@@ -1342,9 +1601,8 @@ impl MainWindow {
                     }
                 }
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 在系统资源管理器中定位文件并选中；若为目录或文件不存在则打开所在目录。
@@ -1425,21 +1683,18 @@ impl MainWindow {
     /// 也容易抄错。过滤器给出 `.gguf`，但**不锁死**：llama.cpp 只吃 GGUF，
     /// 让用户先看到文件、再由校验给出可操作提示，比直接藏掉非 gguf 文件更好排错。
     pub(crate) fn choose_llm_model_file(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("选择本地大模型（GGUF）")
-                .add_filter("GGUF 模型", &["gguf"])
-                .add_filter("所有文件", &["*"])
-                .pick_file()
-                .await;
-            if let Some(file_handle) = handle {
-                let path = file_handle.path().to_path_buf();
-                let _ = this.update(cx, |this, cx| {
-                    this.set_local_model_path(path.to_string_lossy().to_string(), cx);
-                });
-            }
-        })
-        .detach();
+        self.run_after_dialog(
+            cx,
+            DialogSpec::open_file()
+                .titled("选择本地大模型（GGUF）")
+                .with_filter("GGUF 模型", ["gguf"])
+                .with_filter("所有文件", ["*"]),
+            |_, _| {},
+            async move |pick, _cx| pick.into_path(),
+            |this, cx, _pick, path| {
+                this.set_local_model_path(path.to_string_lossy().to_string(), cx);
+            },
+        );
     }
 
     /// 接纳一个刚导入的媒体文件：立刻发布选中状态，再在后台探测时长。
@@ -1473,20 +1728,21 @@ impl MainWindow {
         cx.notify();
 
         let duration_file = file.clone();
-        cx.spawn(async move |this, cx| {
-            let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
-            let duration = cx
-                .background_executor()
-                .spawn(async move { ffmpeg.get_duration(&duration_file) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
+        self.spawn_background_work(
+            cx,
+            move || {
+                let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
+                ffmpeg.get_duration(&duration_file)
+            },
+            move |this, cx, duration| {
+                // 仍是「路径对得上才回写」：探测期间用户可能已经换了文件，
+                // 拿旧探测结果覆盖新文件的时长就是张冠李戴。
                 if this.state.transcribe_file.as_ref() == Some(&file) {
                     this.state.transcribe_duration = duration;
                     cx.notify();
                 }
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 导入一个**已有的字幕文件**（SRT / WebVTT / LRC / ASS(SSA) / TTML(EBU-TT-D /
@@ -1510,20 +1766,20 @@ impl MainWindow {
     ///   用户要留存就自己导出（或后续接一个「另存为工程」）。
     #[allow(dead_code)]
     pub(crate) fn import_subtitle_file(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("导入字幕文件")
-                .add_filter("字幕文件", &IMPORT_SUBTITLE_EXTS)
-                .pick_file()
-                .await;
-            let Some(handle) = handle else { return };
-            let path = handle.path().to_path_buf();
+        self.run_after_dialog(
+            cx,
+            DialogSpec::open_file()
+                .titled("导入字幕文件")
+                .with_filter("字幕文件", IMPORT_SUBTITLE_EXTS),
+            |_, _| {},
+            async move |pick, _cx| pick.into_path(),
             // 落状态 / 清撤销栈 / 提示全部交给共用内核：这条路径与「把字幕拖进
             // 窗口」必须逐字一致，否则同一个文件两种入口会有两套收尾逻辑，
             // 迟早漂移（对话框多了个「重新编号」而拖拽少了，就是静默数据差异）。
-            let _ = this.update(cx, |this, cx| this.import_subtitle_path(path, cx));
-        })
-        .detach();
+            |this, cx, _pick, path| {
+                this.import_subtitle_path(path, cx);
+            },
+        );
     }
 
     /// 「给定一个路径，直接导入成当前工程」的内核——文件对话框与拖拽共用。
@@ -1542,13 +1798,11 @@ impl MainWindow {
         queue_note: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        cx.spawn(async move |this, cx| {
-            let read_path = path.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { crate::subtitle::reader::read_subtitle_file(&read_path) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
+        let read_path = path.clone();
+        self.spawn_background_work(
+            cx,
+            move || crate::subtitle::reader::read_subtitle_file(&read_path),
+            move |this, cx, result| {
                 match result {
                     Ok(segs) => match this.apply_imported_subtitle(&path, segs) {
                         // 成功：导入提示拼在队列摘要后面，两条信息都不丢
@@ -1567,9 +1821,8 @@ impl MainWindow {
                     }
                 }
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 把读好的字幕句灌进当前工程，返回给用户看的提示文案；`segs` 为空时置红色
@@ -1888,18 +2141,15 @@ impl MainWindow {
 
     /// 批量选择文件加入队列（转写页「批量导入」按钮）
     pub(crate) fn choose_batch_files(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let handles = rfd::AsyncFileDialog::new()
-                .add_filter("音视频文件", &MEDIA_EXTS)
-                .pick_files()
-                .await;
-            let Some(handles) = handles else { return };
-            let files: Vec<PathBuf> = handles.iter().map(|h| h.path().to_path_buf()).collect();
-            let _ = this.update(cx, |this, cx| {
+        self.run_after_dialog(
+            cx,
+            DialogSpec::open_files().with_filter("音视频文件", MEDIA_EXTS),
+            |_, _| {},
+            async move |pick, _cx| pick.into_paths(),
+            |this, cx, _pick, files| {
                 this.ingest_paths(files, cx);
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 选择一个**文件夹**，把里面（含子目录）的媒体文件全部加入队列。
@@ -1908,18 +2158,15 @@ impl MainWindow {
     /// 「选文件夹」二选一，混在一起会让用户点开发现选不了目录而困惑。拖拽那条路
     /// 则两者都收（见 `handle_dropped_files`）。
     pub(crate) fn choose_batch_folder(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("选择包含音视频的文件夹")
-                .pick_folder()
-                .await;
-            let Some(handle) = handle else { return };
-            let dir = handle.path().to_path_buf();
-            let _ = this.update(cx, |this, cx| {
+        self.run_after_dialog(
+            cx,
+            DialogSpec::pick_folder().titled("选择包含音视频的文件夹"),
+            |_, _| {},
+            async move |pick, _cx| pick.into_path(),
+            |this, cx, _pick, dir| {
                 this.ingest_paths(vec![dir], cx);
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 把一批「用户给的路径」（文件 / 目录混合）展开后入队，并给出有信息量的反馈。
@@ -2391,7 +2638,7 @@ impl MainWindow {
         // 又由函数开头的 `status != Processing` 守卫兜底，上一轮的取消不会误伤新任务。
         self.state.pipeline.begin_task();
         self.state.transcribe_started_at = Some(std::time::Instant::now());
-        // 步骤看板：点开始就把七步全部铺出来，第一步立刻标成进行中。
+        // 步骤看板：点开始就把全部阶段全部铺出来，第一步立刻标成进行中。
         self.state.reset_stage_rows();
         self.state.status = ProcessStatus::Processing {
             stage: "准备中...".to_string(),
@@ -2459,6 +2706,7 @@ impl MainWindow {
             compaction: crate::engines::CompactionConfig::default(),
             compact: self.state.config.pipeline.preprocess_compact,
             min_saving: self.state.config.pipeline.preprocess_min_saving,
+            vocal_sep: self.state.config.pipeline.preprocess_vocal_sep,
         };
         let whisper_options = crate::core::pipeline::WhisperRuntimeOptions {
             audio_speed: self.state.config.pipeline.whisper_audio_speed,
@@ -2579,7 +2827,16 @@ impl MainWindow {
                                 this.state.transcribe_started_at = None;
                                 // 收尾时把最后一行定住，否则它会永远停在「进行中」。
                                 this.state.finish_stage_rows();
-                                if this.state.cancel_requested {
+                                // 取消的判定要**连管线自己的取消位一起看**：
+                                // `cancel_requested` 只覆盖「用户点了终止」这一种来路，
+                                // 且会被先到的终态事件复位（终止引发的 Error 先到、
+                                // Finished 后到时它已经是 false）。只认它会把取消落进
+                                // 下面的空结果分支，报成「未能识别出任何有效字幕」并把
+                                // 队列项记失败——取消不是识别失败，不能吓用户也不能
+                                // 算进失败重排。与 Error 分支口径一致。
+                                let cancelled = this.state.cancel_requested
+                                    || this.state.pipeline.is_cancelled();
+                                if cancelled {
                                     // 用户主动终止：静默收尾，不弹完成框、不写历史库
                                     this.state.cancel_requested = false;
                                     this.state.status = ProcessStatus::Idle;
@@ -2613,7 +2870,7 @@ impl MainWindow {
                                     } else if this.state.total_duration > 0.0 {
                                         this.state.total_duration
                                     } else {
-                                        segments.last().map(|s| s.end).unwrap_or(0.0)
+                                        crate::subtitle::timeline_end(&segments)
                                     };
                                     let seg_count = segments.len();
                                     // 用 batch_running 而不是 batch_active 判断：用户删掉队列里
@@ -2819,8 +3076,11 @@ impl MainWindow {
                             }
                             PipelineEvent::Error(err) => {
                                 this.state.finish_stage_rows();
-                                if this.state.cancel_requested {
-                                    // 终止导致的子进程报错按取消处理，不显示为失败
+                                // 与 Finished 分支同口径：终止（含管线自身的取消位）
+                                // 导致的子进程报错按取消处理，不显示为失败。
+                                let cancelled = this.state.cancel_requested
+                                    || this.state.pipeline.is_cancelled();
+                                if cancelled {
                                     this.state.cancel_requested = false;
                                     this.state.status = ProcessStatus::Idle;
                                     this.state.transcribe_file = None;
@@ -2874,46 +3134,50 @@ impl MainWindow {
         self.state.flush_segments_if_dirty();
 
         let segments = self.state.segments.clone();
-        let filter_label = filter_label.to_string();
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_file_name(&default_name)
-                .add_filter(&filter_label, &[filter_ext.as_str()])
-                .save_file()
-                .await;
-            if let Some(save_handle) = handle {
-                let save_path = save_handle.path().to_path_buf();
+        self.run_after_dialog(
+            cx,
+            DialogSpec::save_file()
+                .with_default_name(default_name)
+                .with_filter(filter_label, [filter_ext]),
+            |_, _| {},
+            // 写盘刻意留在前台执行器的异步任务里（与改前逐字一致）：这里的
+            // `write_file` 是调用点给的写出闭包，把它挪进 `background_executor`
+            // 属于行为改动，骨架不代劳（见 `run_after_dialog` 文档）。
+            async move |pick, _cx| {
+                let save_path = pick.into_path();
                 let res = write_file(&segments, &save_path);
-                let _ = this.update(cx, |this, cx| {
-                    match res {
-                        Ok(()) => {
-                            info!("字幕成功导出至: {:?}", save_path);
-                            this.note_exported(&save_path);
-                            // 成功必须给出反馈：此前这里只有一行日志，界面上毫无动静。
-                            // 用户点了「导出」、选了路径、然后**什么都没有发生**——
-                            // 无法区分「成功」与「没点到」，只能去文件管理器里翻。
-                            // 走中性提示条（notice）而不是错误条：这是成功操作。
-                            this.notice = Some(format!(
-                                "已导出 {} 句字幕到 {}",
-                                segments.len(),
-                                save_path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| save_path.display().to_string())
-                            ));
-                        }
-                        Err(e) => {
-                            // 导出失败也要走跨页可见的提示：`ProcessStatus::Failed` 只有
-                            // 转写页的底部状态栏会渲染，而导出是在剪辑台做的。
-                            this.state.status = ProcessStatus::Failed(format!("导出失败：{}", e));
-                            this.notice = None;
-                        }
+                // 条数在这里算好带给收尾：`segments` 随本闭包走，收尾拿不到它
+                // （改前收尾直接读 `segments.len()`，值逐字一致）。
+                (res, save_path, segments.len())
+            },
+            |this, cx, _pick, (res, save_path, seg_count)| {
+                match res {
+                    Ok(()) => {
+                        info!("字幕成功导出至: {:?}", save_path);
+                        this.note_exported(&save_path);
+                        // 成功必须给出反馈：此前这里只有一行日志，界面上毫无动静。
+                        // 用户点了「导出」、选了路径、然后**什么都没有发生**——
+                        // 无法区分「成功」与「没点到」，只能去文件管理器里翻。
+                        // 走中性提示条（notice）而不是错误条：这是成功操作。
+                        this.notice = Some(format!(
+                            "已导出 {} 句字幕到 {}",
+                            seg_count,
+                            save_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| save_path.display().to_string())
+                        ));
                     }
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+                    Err(e) => {
+                        // 导出失败也要走跨页可见的提示：`ProcessStatus::Failed` 只有
+                        // 转写页的底部状态栏会渲染，而导出是在剪辑台做的。
+                        this.state.status = ProcessStatus::Failed(format!("导出失败：{}", e));
+                        this.notice = None;
+                    }
+                }
+                cx.notify();
+            },
+        );
     }
 
     /// 剪映专业版草稿一键直接注入（自动写入本机剪映草稿库，打开剪映即可见）
@@ -2941,21 +3205,24 @@ impl MainWindow {
         // 媒体时长：剪映草稿的视频轨必须用**真实媒体时长**，不能用最后一句字幕的
         // end（字幕只覆盖前 20 分钟时，草稿会把素材裁短）。
         let media_duration = self.state.total_duration;
-        cx.spawn(async move |this, cx| {
-            let res = cx
-                .background_executor()
-                .spawn(async move {
-                    let media = crate::subtitle::jianying::DraftMedia {
-                        path: video_path.clone(),
-                        duration_secs: (media_duration > 0.0).then_some(media_duration),
-                    };
-                    crate::subtitle::JianYingExporter::inject_to_local_jianying_with_media(
-                        &segments, &media, &stem, mode,
-                    )
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
+        let ffmpeg_path = self.state.config.paths.ffmpeg.clone();
+        self.spawn_background_work(
+            cx,
+            move || {
+                let format = video_path
+                    .as_deref()
+                    .map(|m| probe_project_format(m, &ffmpeg_path))
+                    .unwrap_or_default();
+                let media = crate::subtitle::jianying::DraftMedia {
+                    path: video_path.clone(),
+                    duration_secs: (media_duration > 0.0).then_some(media_duration),
+                    format,
+                };
+                crate::subtitle::JianYingExporter::inject_to_local_jianying_with_media(
+                    &segments, &media, &stem, mode,
+                )
+            },
+            move |this, cx, res| {
                 match res {
                     Ok(draft_path) => {
                         info!("成功注入剪映草稿: {:?}", draft_path);
@@ -2976,9 +3243,8 @@ impl MainWindow {
                     }
                 }
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 内嵌字幕导出：把「原文 + 各语言译文」作为**软字幕轨**封装进 mkv。
@@ -3075,16 +3341,14 @@ impl MainWindow {
             out.display()
         ));
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            let res = cx
-                .background_executor()
-                .spawn(async move {
-                    let engine = crate::engines::FFmpegEngine::new(ffmpeg_path);
-                    engine.mux_subtitles(&media, &tracks, &out)?;
-                    Ok::<std::path::PathBuf, anyhow::Error>(out)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
+        self.spawn_background_work(
+            cx,
+            move || {
+                let engine = crate::engines::FFmpegEngine::new(ffmpeg_path);
+                engine.mux_subtitles(&media, &tracks, &out)?;
+                Ok::<std::path::PathBuf, anyhow::Error>(out)
+            },
+            |this, cx, res| {
                 match res {
                     Ok(path) => {
                         info!("内嵌字幕视频已导出: {:?}", path);
@@ -3096,9 +3360,8 @@ impl MainWindow {
                     }
                 }
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 导出剪映草稿至指定独立文件夹
@@ -3121,20 +3384,23 @@ impl MainWindow {
         // 媒体时长在 `move` 闭包外取：闭包里拿不到 `self`，而草稿的视频轨必须用
         // 真实媒体时长（不能用最后一句字幕的 end，否则素材会被裁短）。
         let media_duration = self.state.total_duration;
+        let ffmpeg_path = self.state.config.paths.ffmpeg.clone();
 
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("选择剪映草稿保存目录")
-                .pick_folder()
-                .await;
-            if let Some(folder_handle) = handle {
-                let target_dir = folder_handle.path().join(&stem);
-                let res = cx
-                    .background_executor()
+        self.run_after_dialog(
+            cx,
+            DialogSpec::pick_folder().titled("选择剪映草稿保存目录"),
+            |_, _| {},
+            async move |pick, cx| {
+                let target_dir = pick.into_path().join(&stem);
+                cx.background_executor()
                     .spawn(async move {
                         let media = crate::subtitle::jianying::DraftMedia {
                             path: video_path.clone(),
                             duration_secs: (media_duration > 0.0).then_some(media_duration),
+                            format: video_path
+                                .as_deref()
+                                .map(|m| probe_project_format(m, &ffmpeg_path))
+                                .unwrap_or_default(),
                         };
                         crate::subtitle::JianYingExporter::export_to_folder_with_media(
                             &segments,
@@ -3144,30 +3410,28 @@ impl MainWindow {
                             mode,
                         )
                     })
-                    .await;
-
-                let _ = this.update(cx, |this, cx| {
-                    match res {
-                        Ok(p) => {
-                            info!("剪映草稿文件夹导出成功: {:?}", p);
-                            let _ = std::process::Command::new("explorer").arg(&p).spawn();
-                            this.notice = Some(format!(
-                                "已导出剪映草稿到 {}",
-                                p.file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| p.display().to_string())
-                            ));
-                        }
-                        Err(e) => {
-                            this.state.status =
-                                ProcessStatus::Failed(format!("剪映草稿导出失败：{}", e));
-                        }
+                    .await
+            },
+            |this, cx, _pick, res| {
+                match res {
+                    Ok(p) => {
+                        info!("剪映草稿文件夹导出成功: {:?}", p);
+                        let _ = std::process::Command::new("explorer").arg(&p).spawn();
+                        this.notice = Some(format!(
+                            "已导出剪映草稿到 {}",
+                            p.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| p.display().to_string())
+                        ));
                     }
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+                    Err(e) => {
+                        this.state.status =
+                            ProcessStatus::Failed(format!("剪映草稿导出失败：{}", e));
+                    }
+                }
+                cx.notify();
+            },
+        );
     }
 
     /// 导出 FCPXML (Final Cut Pro / 达芬奇) 工程文件
@@ -3185,6 +3449,9 @@ impl MainWindow {
             .to_string();
 
         let mode = self.editor_export_mode;
+        // 探测放在导出闭包里执行（真的要写文件时才起 ffmpeg）；先把参数捕获出来。
+        let media = self.state.preview_media().cloned();
+        let ffmpeg_path = self.state.config.paths.ffmpeg.clone();
         self.export_with_save_dialog(
             cx,
             crate::subtitle::writer::export_file_name(
@@ -3196,7 +3463,13 @@ impl MainWindow {
             "Final Cut Pro XML (*.fcpxml)",
             "fcpxml".to_string(),
             move |segs, path| {
-                crate::subtitle::FcpXmlExporter::write_to_file(segs, path, &stem, mode)
+                let format = media
+                    .as_deref()
+                    .map(|m| probe_project_format(m, &ffmpeg_path))
+                    .unwrap_or_default();
+                crate::subtitle::FcpXmlExporter::write_to_file_with_format(
+                    segs, path, &stem, mode, format,
+                )
             },
         );
     }
@@ -3216,6 +3489,8 @@ impl MainWindow {
             .to_string();
 
         let mode = self.editor_export_mode;
+        let media = self.state.preview_media().cloned();
+        let ffmpeg_path = self.state.config.paths.ffmpeg.clone();
         self.export_with_save_dialog(
             cx,
             crate::subtitle::writer::export_file_name(
@@ -3227,7 +3502,13 @@ impl MainWindow {
             "Premiere Pro XML (*.xml)",
             "xml".to_string(),
             move |segs, path| {
-                crate::subtitle::PremiereXmlExporter::write_to_file(segs, path, &stem, mode)
+                let format = media
+                    .as_deref()
+                    .map(|m| probe_project_format(m, &ffmpeg_path))
+                    .unwrap_or_default();
+                crate::subtitle::PremiereXmlExporter::write_to_file_with_format(
+                    segs, path, &stem, mode, format,
+                )
             },
         );
     }
@@ -3294,21 +3575,18 @@ impl MainWindow {
         self.state.dims_probed_for = Some(video.clone());
         let ffmpeg_path = crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
         let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { ffmpeg.get_resolution(&video) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
+        self.spawn_background_work(
+            cx,
+            move || ffmpeg.get_resolution(&video),
+            |this, cx, result| {
                 if let Some((w, h)) = result {
                     this.state.video_width = w;
                     this.state.video_height = h;
                     this.state.video_player.set_frame_dimensions(w, h);
                     cx.notify();
                 }
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 异步提取当前工程的音频波形包络，驱动时间轴波形轨。
@@ -3640,7 +3918,7 @@ impl MainWindow {
                         let max_dur = if this.state.total_duration > 0.0 {
                             this.state.total_duration
                         } else {
-                            this.state.segments.last().map(|s| s.end).unwrap_or(0.0)
+                            crate::subtitle::timeline_end(&this.state.segments)
                         };
 
                         if play_time >= max_dur && max_dur > 0.0 {
@@ -3723,47 +4001,43 @@ impl MainWindow {
             .to_string();
         let default_name = format!("{stem}_hardsub.mp4");
 
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("选择字幕烧录视频的保存位置")
-                .set_file_name(&default_name)
-                .add_filter("MP4 视频", &["mp4"])
-                .save_file()
-                .await;
-            let Some(save_handle) = handle else {
-                return;
-            };
-            let output = save_handle.path().to_path_buf();
-
-            let res = cx
-                .background_executor()
-                .spawn(async move {
-                    // 临时 ASS：把当前样式写进字幕头，FFmpeg 的 subtitles 滤镜会按
-                    // 内嵌样式渲染，实现「预览即所得」的硬字幕。
-                    let sub_path = std::env::temp_dir().join(format!(
-                        "voice2word_burn_{}_{}.ass",
-                        std::process::id(),
-                        burn_temp_seq()
-                    ));
-                    let _ = std::fs::remove_file(&sub_path);
-                    // 临时字幕交给 RAII 守卫：即便 write_ass_with_style 中途 `?`
-                    // 提前返回，守卫的 `Drop` 也会删掉半截 `.ass`，不在 %TEMP% 累积。
-                    let sub_guard = crate::utils::TempPathGuard::file(&sub_path);
-                    SubtitleWriter::write_ass_with_style(&segments, &sub_path, mode, &style)?;
-                    let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
-                    let result = ffmpeg.burn_subtitles(
-                        &input,
-                        &sub_path,
-                        &output,
-                        &crate::engines::ffmpeg::BurnOptions::default(),
-                    );
-                    // 无论成败都清掉临时字幕，避免在 %TEMP% 里累积
-                    drop(sub_guard);
-                    result
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
+        self.run_after_dialog(
+            cx,
+            DialogSpec::save_file()
+                .titled("选择字幕烧录视频的保存位置")
+                .with_default_name(default_name)
+                .with_filter("MP4 视频", ["mp4"]),
+            |_, _| {},
+            async move |pick, cx| {
+                let output = pick.into_path();
+                cx.background_executor()
+                    .spawn(async move {
+                        // 临时 ASS：把当前样式写进字幕头，FFmpeg 的 subtitles 滤镜会按
+                        // 内嵌样式渲染，实现「预览即所得」的硬字幕。
+                        let sub_path = std::env::temp_dir().join(format!(
+                            "voice2word_burn_{}_{}.ass",
+                            std::process::id(),
+                            burn_temp_seq()
+                        ));
+                        let _ = std::fs::remove_file(&sub_path);
+                        // 临时字幕交给 RAII 守卫：即便 write_ass_with_style 中途 `?`
+                        // 提前返回，守卫的 `Drop` 也会删掉半截 `.ass`，不在 %TEMP% 累积。
+                        let sub_guard = crate::utils::TempPathGuard::file(&sub_path);
+                        SubtitleWriter::write_ass_with_style(&segments, &sub_path, mode, &style)?;
+                        let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
+                        let result = ffmpeg.burn_subtitles(
+                            &input,
+                            &sub_path,
+                            &output,
+                            &crate::engines::ffmpeg::BurnOptions::default(),
+                        );
+                        // 无论成败都清掉临时字幕，避免在 %TEMP% 里累积
+                        drop(sub_guard);
+                        result
+                    })
+                    .await
+            },
+            |this, cx, _pick, res| {
                 match res {
                     Ok(path) => {
                         info!("字幕烧录视频导出成功: {:?}", path);
@@ -3786,9 +4060,8 @@ impl MainWindow {
                     }
                 }
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 「导出片段」：把当前选中句切成一段视频（`.mp4`）。
@@ -3866,32 +4139,27 @@ impl MainWindow {
         CLIP_EXPORT_BUSY.store(true, Ordering::Relaxed);
         cx.notify();
 
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("选择片段保存位置")
-                .set_file_name(&default_name)
-                .add_filter(if audio { "WAV 音频" } else { "MP4 视频" }, &[ext])
-                .save_file()
-                .await;
-            let Some(save_handle) = handle else {
-                // 用户取消：复位忙标志，不打扰。
-                let _ = this.update(cx, |_this, cx| {
-                    CLIP_EXPORT_BUSY.store(false, Ordering::Relaxed);
-                    cx.notify();
-                });
-                return;
-            };
-            let output = save_handle.path().to_path_buf();
-
-            let res = cx
-                .background_executor()
-                .spawn(async move {
-                    let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
-                    ffmpeg.export_clip(&input, &plan, &output)
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
+        self.run_after_dialog(
+            cx,
+            DialogSpec::save_file()
+                .titled("选择片段保存位置")
+                .with_default_name(default_name)
+                .with_filter(if audio { "WAV 音频" } else { "MP4 视频" }, [ext]),
+            // 用户取消：复位忙标志，不打扰。
+            |_this, cx| {
+                CLIP_EXPORT_BUSY.store(false, Ordering::Relaxed);
+                cx.notify();
+            },
+            async move |pick, cx| {
+                let output = pick.into_path();
+                cx.background_executor()
+                    .spawn(async move {
+                        let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
+                        ffmpeg.export_clip(&input, &plan, &output)
+                    })
+                    .await
+            },
+            move |this, cx, _pick, res| {
                 CLIP_EXPORT_BUSY.store(false, Ordering::Relaxed);
                 match res {
                     Ok(path) => {
@@ -3915,9 +4183,535 @@ impl MainWindow {
                     }
                 }
                 cx.notify();
+            },
+        );
+    }
+
+    /// 智能切片：从字幕里自动选出「高光片段」候选（纯 CPU 规划，秒级）。
+    ///
+    /// 规划器是纯函数（`subtitle::clips::plan_highlight_clips`）：按句界生成
+    /// [min,max] 时长窗，按疑问/感叹密度、语速甜区、置信度、章节边界、时长贴合度
+    /// 加权打分，去重后取前 N 条。这里只负责「取快照 → 后台算 → 回填列表」。
+    pub(crate) fn generate_clips(&mut self, cx: &mut Context<Self>) {
+        if self.clips_generating {
+            return;
+        }
+        self.state.flush_segments_if_dirty();
+        let segments = self.state.segments.clone();
+        self.clips_generating = true;
+        cx.notify();
+        self.spawn_background_work(
+            cx,
+            move || {
+                crate::subtitle::clips::plan_highlight_clips(
+                    &segments,
+                    &crate::subtitle::clips::ClipOptions::default(),
+                )
+            },
+            |this, cx, candidates| {
+                this.clips_generating = false;
+                this.clips_notice = Some(if candidates.is_empty() {
+                    (
+                        false,
+                        "没有找到合适的切片（字幕太短，或时长不满足 15~90 秒约束）".to_string(),
+                    )
+                } else {
+                    (
+                        true,
+                        format!("生成 {} 条切片建议，点行可跳转预览", candidates.len()),
+                    )
+                });
+                this.clips = candidates;
+                cx.notify();
+            },
+        );
+    }
+
+    /// 批量导出智能切片：把候选片段逐条切成独立文件（视频 mp4 / 音频 wav）。
+    ///
+    /// 与单句「导出片段」同源（`plan_segment_clip` + `export_clip`），差别只在：
+    /// ① 边界就是规划器给出的句界，padding 取 0（再留余量会把邻居的字带进切片）；
+    /// ② 目标是目录而非单文件，命名 `{片名}_clip{序号}_{起点秒}s.{ext}`；
+    /// ③ 一条失败不中断整批，收尾一次性汇总。
+    pub(crate) fn export_clips(
+        &mut self,
+        cx: &mut Context<Self>,
+        kind: crate::engines::ffmpeg::ClipKind,
+    ) {
+        use std::sync::atomic::Ordering;
+        if CLIP_EXPORT_BUSY.load(Ordering::Relaxed) {
+            return;
+        }
+        let candidates = self.clips.clone();
+        if candidates.is_empty() {
+            self.clips_notice = Some((false, "请先「生成建议」，再导出切片".to_string()));
+            cx.notify();
+            return;
+        }
+        let Some(input) = self.state.selected_file.clone() else {
+            self.clips_notice = Some((false, "请先打开一个媒体文件，再导出切片".to_string()));
+            cx.notify();
+            return;
+        };
+        self.state.flush_segments_if_dirty();
+        let ffmpeg_path = crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
+        let stem = input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("clip")
+            .to_string();
+        let ext = kind.extension();
+        let total = self.state.total_duration;
+
+        CLIP_EXPORT_BUSY.store(true, Ordering::Relaxed);
+        cx.notify();
+
+        self.run_after_dialog(
+            cx,
+            DialogSpec::pick_folder().titled("选择切片导出目录"),
+            // 用户取消：复位忙标志，不打扰。
+            |_this, cx| {
+                CLIP_EXPORT_BUSY.store(false, Ordering::Relaxed);
+                cx.notify();
+            },
+            async move |pick, cx| {
+                let out_dir = pick.into_path();
+                cx.background_executor()
+                    .spawn(async move {
+                        let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
+                        let mut ok = 0usize;
+                        let mut errs: Vec<String> = Vec::new();
+                        for (i, cand) in candidates.iter().enumerate() {
+                            let pseudo = crate::subtitle::Segment::new(0, cand.start, cand.end, "");
+                            let name = format!(
+                                "{stem}_clip{:02}_{secs}s.{ext}",
+                                i + 1,
+                                secs = cand.start.round().max(0.0) as i64
+                            );
+                            let output = out_dir.join(name);
+                            let res = crate::engines::ffmpeg::plan_segment_clip(
+                                &pseudo, total,
+                                // 边界即句界：留余量会把邻居的字带进切片
+                                0.0, kind,
+                            )
+                            .and_then(|plan| {
+                                ffmpeg
+                                    .export_clip(&input, &plan, &output)
+                                    .map_err(|e| anyhow::anyhow!("{e:#}"))
+                            });
+                            match res {
+                                Ok(_) => ok += 1,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "切片导出失败({}/{})：{e:#}",
+                                        i + 1,
+                                        candidates.len()
+                                    );
+                                    errs.push(format!("第 {} 条：{e:#}", i + 1));
+                                }
+                            }
+                        }
+                        (ok, errs, out_dir)
+                    })
+                    .await
+            },
+            move |this, cx, _pick, (ok, errs, out_dir)| {
+                CLIP_EXPORT_BUSY.store(false, Ordering::Relaxed);
+                this.clips_notice = Some(if errs.is_empty() {
+                    (true, format!("已导出 {ok} 条切片到 {}", out_dir.display()))
+                } else {
+                    (
+                        false,
+                        format!(
+                            "导出完成 {ok} 条、失败 {} 条：{}",
+                            errs.len(),
+                            errs.first().cloned().unwrap_or_default()
+                        ),
+                    )
+                });
+                if ok > 0 {
+                    // 打开产物目录便于逐条检查（与其它导出入口同口径）
+                    let _ = open::that(&out_dir);
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// 选择文件夹监听目录（选完自动开启监听）。
+    ///
+    /// 选目录即开启，是因为用户的意图已经很明确（他点了「选择目录」就是想让新素材
+    /// 自动进来）；再让他点一次开关属于多余的仪式。
+    pub(crate) fn choose_watch_dir(&mut self, cx: &mut Context<Self>) {
+        self.run_after_dialog(
+            cx,
+            DialogSpec::pick_folder().titled("选择要监听的文件夹"),
+            |_this, _cx| {},
+            async move |pick, _cx| pick.into_path(),
+            |this, cx, _pick, dir| {
+                this.state.config.watch.dir = dir.to_string_lossy().into_owned();
+                this.state.config.watch.enabled = true;
+                // 换目录后重新扫：新目录里既有文件也应入队；旧目录的记忆没用了。
+                this.state.watch_seen.clear();
+                this.state.persist_config();
+                this.notice = Some(format!(
+                    "已监听 {}，新素材会自动加入批量队列",
+                    dir.display()
+                ));
+                cx.notify();
+            },
+        );
+    }
+
+    /// 开/关文件夹监听。没选目录时直接跳到「选目录」。
+    pub(crate) fn toggle_watch_folder(&mut self, cx: &mut Context<Self>) {
+        let mut cfg = self.state.config.watch.clone();
+        if !cfg.enabled && cfg.dir.trim().is_empty() {
+            self.choose_watch_dir(cx);
+            return;
+        }
+        cfg.enabled = !cfg.enabled;
+        self.state.config.watch = cfg;
+        // 重开时清空去重集合：期间新增的文件应当被扫进来。
+        self.state.watch_seen.clear();
+        self.state.persist_config();
+        self.notice = Some(
+            if self.state.config.watch.enabled {
+                "文件夹监听已开启"
+            } else {
+                "文件夹监听已关闭"
+            }
+            .to_string(),
+        );
+        cx.notify();
+    }
+
+    /// 竖屏成片：把每条切片导出成 9:16（1080×1920）画面，并把该切片范围内的字幕
+    /// 烧进去。
+    ///
+    /// 与 [`Self::export_clips`] 的区别：那边是「原样剪出来」，这边是「能直接发」的
+    /// 成片——居中裁切 + 硬字幕。字幕按**切片相对时间轴**重写（每句平移 `-cand.start`），
+    /// 所以每条切片都要单独落一份临时 ASS。
+    pub(crate) fn export_clips_vertical(&mut self, cx: &mut Context<Self>) {
+        use std::sync::atomic::Ordering;
+        if CLIP_EXPORT_BUSY.load(Ordering::Relaxed) {
+            return;
+        }
+        let candidates = self.clips.clone();
+        if candidates.is_empty() {
+            self.clips_notice = Some((false, "请先「生成建议」，再导出竖屏成片".to_string()));
+            cx.notify();
+            return;
+        }
+        let Some(input) = self.state.selected_file.clone() else {
+            self.clips_notice = Some((false, "请先打开一个媒体文件，再导出竖屏成片".to_string()));
+            cx.notify();
+            return;
+        };
+        self.state.flush_segments_if_dirty();
+        let segments = self.state.segments.clone();
+        if segments.is_empty() {
+            self.clips_notice = Some((false, "没有字幕可烧录".to_string()));
+            cx.notify();
+            return;
+        }
+        let style = self.state.config.subtitle_style.clone();
+        let mode = self.editor_export_mode;
+        let ffmpeg_path = crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
+        let stem = input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("clip")
+            .to_string();
+
+        CLIP_EXPORT_BUSY.store(true, Ordering::Relaxed);
+        cx.notify();
+
+        self.run_after_dialog(
+            cx,
+            DialogSpec::pick_folder().titled("选择竖屏成片导出目录"),
+            |_this, cx| {
+                CLIP_EXPORT_BUSY.store(false, Ordering::Relaxed);
+                cx.notify();
+            },
+            async move |pick, cx| {
+                let out_dir = pick.into_path();
+                cx.background_executor()
+                    .spawn(async move {
+                        let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
+                        let opts = crate::engines::ffmpeg::VerticalClipOptions::default();
+                        let mut ok = 0usize;
+                        let mut errs: Vec<String> = Vec::new();
+                        for (i, cand) in candidates.iter().enumerate() {
+                            // 与切片有交集的句子，平移到切片相对时间轴。
+                            let span = (cand.end - cand.start).max(crate::subtitle::MIN_EDIT_DUR);
+                            let shifted: Vec<crate::subtitle::Segment> = segments
+                                .iter()
+                                .filter(|s| s.end > cand.start && s.start < cand.end)
+                                .map(|s| {
+                                    let mut c = s.clone();
+                                    c.start = (c.start - cand.start).clamp(0.0, span);
+                                    c.end = (c.end - cand.start)
+                                        .clamp(c.start + crate::subtitle::MIN_EDIT_DUR, span);
+                                    c
+                                })
+                                .collect();
+                            if shifted.is_empty() {
+                                errs.push(format!("第 {} 条：区间内没有字幕", i + 1));
+                                continue;
+                            }
+                            let ass_path = std::env::temp_dir()
+                                .join(format!("v2w_vertical_{}_{i}.ass", std::process::id()));
+                            let guard = crate::utils::TempPathGuard::file(ass_path.clone());
+                            let name = format!(
+                                "{stem}_vertical{:02}_{secs}s.mp4",
+                                i + 1,
+                                secs = cand.start.round().max(0.0) as i64
+                            );
+                            let output = out_dir.join(name);
+                            let res = crate::subtitle::SubtitleWriter::write_ass_with_style(
+                                &shifted,
+                                guard.path(),
+                                mode,
+                                &style,
+                            )
+                            .and_then(|_| {
+                                ffmpeg.export_vertical_clip(
+                                    &input,
+                                    &output,
+                                    cand.start,
+                                    cand.end,
+                                    Some(guard.path()),
+                                    &opts,
+                                )
+                            })
+                            .map_err(|e| anyhow::anyhow!("{e:#}"));
+                            match res {
+                                Ok(_) => ok += 1,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "竖屏成片导出失败({}/{})：{e:#}",
+                                        i + 1,
+                                        candidates.len()
+                                    );
+                                    errs.push(format!("第 {} 条：{e:#}", i + 1));
+                                }
+                            }
+                        }
+                        (ok, errs, out_dir)
+                    })
+                    .await
+            },
+            move |this, cx, _pick, (ok, errs, out_dir)| {
+                CLIP_EXPORT_BUSY.store(false, Ordering::Relaxed);
+                this.clips_notice = Some(if errs.is_empty() {
+                    (
+                        true,
+                        format!("已导出 {ok} 条竖屏成片到 {}", out_dir.display()),
+                    )
+                } else {
+                    (
+                        false,
+                        format!(
+                            "竖屏成片完成 {ok} 条、失败 {} 条：{}",
+                            errs.len(),
+                            errs.first().cloned().unwrap_or_default()
+                        ),
+                    )
+                });
+                if ok > 0 {
+                    let _ = open::that(&out_dir);
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// 配音：把译文（或原文）逐句 TTS 合成，按字幕时间轴对齐后替换/混音出片。
+    ///
+    /// 全流程在**独立线程**里跑（TTS 是联网合成，几百句要几分钟），进度用
+    /// [`DubShared`] 快照回传、UI 协程每 150ms 取一次。设计见
+    /// `docs/配音闭环-设计与实现.md`。
+    pub(crate) fn start_dubbing(&mut self, cx: &mut Context<Self>) {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        if self.dub_busy {
+            return;
+        }
+        let Some(media) = self
+            .state
+            .selected_file
+            .clone()
+            .or_else(|| self.state.preview_media().cloned())
+        else {
+            self.dub_notice = Some((false, "请先打开一个媒体文件".to_string()));
+            cx.notify();
+            return;
+        };
+        self.state.flush_segments_if_dirty();
+        if self.state.segments.is_empty() {
+            self.dub_notice = Some((false, "没有字幕可配音，请先完成识别".to_string()));
+            cx.notify();
+            return;
+        }
+        // 组件体检放在弹保存框之前：缺 edge-tts 时不该先让用户选一遍路径。
+        let tts_probe = crate::engines::TTSEngine::new();
+        if !tts_probe.is_available() {
+            self.dub_notice = Some((
+                false,
+                "配音组件缺失：缺少 tools/edge_tts_runner.py".to_string(),
+            ));
+            cx.notify();
+            return;
+        }
+
+        let opts = crate::core::dub_flow::DubOptions::from_config(&self.state.config.dub);
+        let segments = self.state.segments.clone();
+        let total = self
+            .state
+            .total_duration
+            .max(crate::subtitle::timeline_end(&segments));
+        let lang = self.state.config.translate.target_lang.clone();
+        let ffmpeg_path = crate::utils::AppConfig::resolve_path(&self.state.config.paths.ffmpeg);
+        let stem = media
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("dub")
+            .to_string();
+        let default_name = format!("{stem}_配音.mp4");
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        self.dub_busy = true;
+        self.dub_notice = None;
+        self.dub_progress = Some(("准备中".to_string(), 0.0));
+        self.dub_cancel = Some(Arc::clone(&cancel));
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            // 先让用户选输出位置；取消 = 什么都不做（与导出入口同语义）。
+            let picked = DialogSpec::save_file()
+                .titled("选择配音视频保存位置")
+                .with_default_name(default_name)
+                .with_filter("MP4 视频", ["mp4"])
+                .pick()
+                .await;
+            let Some(pick) = picked else {
+                let _ = this.update(cx, |this, cx| {
+                    this.dub_busy = false;
+                    this.dub_cancel = None;
+                    this.dub_progress = None;
+                    cx.notify();
+                    Ok::<(), ()>(())
+                });
+                return;
+            };
+            let output = pick.into_path();
+
+            let shared = Arc::new(Mutex::new(DubShared::default()));
+            let worker = Arc::clone(&shared);
+            let spawned = std::thread::Builder::new()
+                .name("voice2word-dub".to_string())
+                .spawn(move || {
+                    let ffmpeg = crate::engines::FFmpegEngine::new(ffmpeg_path);
+                    let tts = crate::engines::TTSEngine::new();
+                    // 音轨长度必须用媒体真实时长：配音轨短于视频时 `-shortest` 会截断画面。
+                    let probe = ffmpeg.get_audio_duration(&media);
+                    let total = if probe > 0.0 { probe } else { total };
+                    let cb_shared = Arc::clone(&worker);
+                    let cb: crate::core::dub_flow::ProgressFn =
+                        Arc::new(move |msg: &str, frac: f32| {
+                            if let Ok(mut g) = cb_shared.lock() {
+                                g.msg = msg.to_string();
+                                g.frac = frac;
+                            }
+                        });
+                    let result = crate::core::dub_flow::run_dub(
+                        &ffmpeg, &tts, &media, &segments, total, &lang, &output, &opts, cb, &cancel,
+                    )
+                    .map_err(|err| format!("{err:#}"));
+                    if let Ok(mut g) = worker.lock() {
+                        g.result = Some(result);
+                        g.done = true;
+                    }
+                });
+
+            if let Err(err) = spawned {
+                if let Ok(mut g) = shared.lock() {
+                    g.result = Some(Err(format!("启动配音线程失败：{err}")));
+                    g.done = true;
+                }
+            }
+
+            // 轮询进度：只在 UI 线程改状态；`dub_busy` 被外部复位（如关窗）时也退出。
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+                let (msg, frac, done) = {
+                    let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    (g.msg.clone(), g.frac, g.done)
+                };
+                let alive = this
+                    .update(cx, |this, cx| {
+                        this.dub_progress = Some((msg, frac));
+                        cx.notify();
+                        this.dub_busy
+                    })
+                    .unwrap_or(false);
+                if done || !alive {
+                    break;
+                }
+            }
+
+            let result = {
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                g.result.take()
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.dub_busy = false;
+                this.dub_cancel = None;
+                this.dub_progress = None;
+                match result {
+                    Some(Ok(report)) => {
+                        let mut note = format!(
+                            "配音完成：{}（{} 句，{} 句提速，{} 句截断，耗时 {:.0}s）",
+                            report.output.display(),
+                            report.synthesized,
+                            report.sped_up,
+                            report.trimmed,
+                            report.elapsed_sec
+                        );
+                        if !report.failed.is_empty() {
+                            note.push_str(&format!(
+                                "；{} 句合成失败已按静音处理",
+                                report.failed.len()
+                            ));
+                        }
+                        info!(output = %report.output.display(), "配音完成");
+                        this.dub_notice = Some((true, note));
+                    }
+                    Some(Err(err)) => {
+                        this.dub_notice = Some((false, format!("配音失败：{err}")));
+                    }
+                    None => {
+                        this.dub_notice = Some((false, "配音任务异常结束".to_string()));
+                    }
+                }
+                cx.notify();
+                Ok::<(), ()>(())
             });
         })
         .detach();
+    }
+
+    /// 请求取消正在跑的配音（幂等）。
+    pub(crate) fn cancel_dubbing(&mut self, cx: &mut Context<Self>) {
+        if let Some(flag) = self.dub_cancel.take() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.dub_progress = Some(("正在取消…".to_string(), 0.0));
+            cx.notify();
+        }
     }
 
     /// 根据当前剪辑工作台选中的格式执行统一导出
@@ -4698,33 +5492,30 @@ impl MainWindow {
     /// 渲染回调里正持有 RefCell 借用），读盘交给后台执行器（文件可能在网络盘上），
     /// 解析与合并回主线程做——那一步要改 `replace_rule_sets`。
     pub(crate) fn import_replace_rule_sets(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("导入替换规则集（JSON）")
-                .add_filter("规则集 JSON", &["json"])
-                .add_filter("所有文件", &["*"])
-                .pick_file()
-                .await;
-            let Some(file) = handle else {
-                return;
-            };
-            let path = file.path().to_path_buf();
-            let read = cx
-                .background_executor()
-                .spawn(async move {
-                    std::fs::read_to_string(&path)
-                        .map_err(|e| format!("规则集文件读取失败（{}）：{e}", path.display()))
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
+        self.run_after_dialog(
+            cx,
+            DialogSpec::open_file()
+                .titled("导入替换规则集（JSON）")
+                .with_filter("规则集 JSON", ["json"])
+                .with_filter("所有文件", ["*"]),
+            |_, _| {},
+            async move |pick, cx| {
+                let path = pick.into_path();
+                cx.background_executor()
+                    .spawn(async move {
+                        std::fs::read_to_string(&path)
+                            .map_err(|e| format!("规则集文件读取失败（{}）：{e}", path.display()))
+                    })
+                    .await
+            },
+            |this, cx, _pick, read| {
                 match read {
                     Ok(raw) => this.apply_imported_replace_rule_sets(&raw),
                     Err(err) => this.replace_rules_status = Some((false, err)),
                 }
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 解析一段导入的 JSON 并合并进规则集（同名覆盖），随后写回磁盘。
@@ -4781,33 +5572,30 @@ impl MainWindow {
         }
         let json = replace_rule_sets_to_json(&self.replace_rule_sets);
         let count = self.replace_rule_sets.len();
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("导出替换规则集（JSON）")
-                .set_file_name(REPLACE_RULES_FILE)
-                .add_filter("规则集 JSON", &["json"])
-                .save_file()
-                .await;
-            let Some(file) = handle else {
-                return;
-            };
-            let write_path = file.path().to_path_buf();
-            let write = cx
-                .background_executor()
-                .spawn(async move {
-                    std::fs::write(&write_path, json)
-                        .map_err(|e| format!("规则集写入失败（{}）：{e}", write_path.display()))
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
+        self.run_after_dialog(
+            cx,
+            DialogSpec::save_file()
+                .titled("导出替换规则集（JSON）")
+                .with_default_name(REPLACE_RULES_FILE)
+                .with_filter("规则集 JSON", ["json"]),
+            |_, _| {},
+            async move |pick, cx| {
+                let write_path = pick.into_path();
+                cx.background_executor()
+                    .spawn(async move {
+                        std::fs::write(&write_path, json)
+                            .map_err(|e| format!("规则集写入失败（{}）：{e}", write_path.display()))
+                    })
+                    .await
+            },
+            move |this, cx, _pick, write| {
                 this.replace_rules_status = Some(match write {
                     Ok(()) => (true, format!("已导出 {count} 个规则集")),
                     Err(err) => (false, err),
                 });
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 打开（或创建）术语表临时文件，供用户用记事本等编辑器编辑。
@@ -5081,16 +5869,15 @@ impl MainWindow {
     /// 路径与落一条中性提示；文件里没解析出条目时由 `glossary_import_notice` 给出
     /// 可操作的格式提示，不静默。
     pub(crate) fn import_glossary_dialog(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("导入术语表")
-                .add_filter("术语表", &["txt", "csv"])
-                .add_filter("所有文件", &["*"])
-                .pick_file()
-                .await;
-            let Some(handle) = handle else { return };
-            let path = handle.path().to_path_buf();
-            let _ = this.update(cx, |this, cx| {
+        self.run_after_dialog(
+            cx,
+            DialogSpec::open_file()
+                .titled("导入术语表")
+                .with_filter("术语表", ["txt", "csv"])
+                .with_filter("所有文件", ["*"]),
+            |_, _| {},
+            async move |pick, _cx| pick.into_path(),
+            |this, cx, _pick, path| {
                 match this.state.import_glossary_file(&path) {
                     Ok((added, overwritten, unchanged)) => {
                         this.notice = Some(glossary_import_notice(added, overwritten, unchanged));
@@ -5100,9 +5887,8 @@ impl MainWindow {
                     }
                 }
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// 把当前术语表导出成 CSV（默认名 `glossary.csv`）。
@@ -5170,21 +5956,18 @@ impl MainWindow {
         cx.notify();
 
         let cfg = self.state.online_translate_config();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { crate::engines::TranslateEngine::online(cfg).probe_online() })
-                .await;
-            let _ = this.update(cx, |this, cx| {
+        self.spawn_background_work(
+            cx,
+            move || crate::engines::TranslateEngine::online(cfg).probe_online(),
+            |this, cx, result| {
                 this.is_probing_translate = false;
                 this.translate_probe_msg = Some(match result {
                     Ok(reply) => (true, format!("连接成功，模型回显：{}", reply.trim())),
                     Err(e) => (false, format!("连接失败：{e}")),
                 });
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 }
 
@@ -5314,17 +6097,36 @@ impl MainWindow {
         self.state.download_total_bytes = 0;
         self.state.download_status_msg = format!("正在下载 {}...", item.label);
         self.state.download_item_progress.clear();
-        self.model_download_cancel
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.model_download_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         cx.notify();
 
         let cancel = self.model_download_cancel.clone();
+        let progress_cancel = cancel.clone();
         let (tx, mut rx) = mpsc::unbounded_channel::<(u64, u64, String)>();
 
         // 进度回传协程
         cx.spawn(async move |this, cx| {
             while let Some((done, total, id)) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
+                    if !this.state.is_downloading
+                        || !Arc::ptr_eq(&this.model_download_cancel, &progress_cancel)
+                        || progress_cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return;
+                    }
+                    if done == crate::utils::model_download::PROGRESS_VALIDATING
+                        || done == crate::utils::model_download::PROGRESS_UNPACKING
+                    {
+                        let phase = if done == crate::utils::model_download::PROGRESS_VALIDATING {
+                            "校验"
+                        } else {
+                            "解压"
+                        };
+                        this.state.download_status_msg = format!("正在{phase} {}…", item_id);
+                        this.state.download_item_progress.insert(id, (done, 0));
+                        cx.notify();
+                        return;
+                    }
                     this.state.download_done_bytes = done;
                     this.state.download_total_bytes = total;
                     // 单条下载也要喂行内进度，否则点单项时看不到任何进度条。
@@ -5383,7 +6185,7 @@ impl MainWindow {
                         this.ensure_required_components(cx);
                     }
                     Err(err) => {
-                        let msg = err.to_string();
+                        let msg = format!("{err:#}");
                         tracing::warn!(error = %err, item = item.id, "模型下载失败");
                         this.state.download_status_msg = if msg.contains("已取消") {
                             format!("{} 下载已取消", item.label)
@@ -5502,8 +6304,9 @@ impl MainWindow {
         // 条目总数在循环前取好：`pending` 会被 for 消费掉，
         // 收尾提示还要用它算「完成 N/M」。
         let total = pending.len();
+        self.model_download_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel = self.model_download_cancel.clone();
-        cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        let progress_cancel = cancel.clone();
         self.state.is_downloading = true;
         self.state.download_item_progress.clear();
         self.state.download_status_msg = format!("正在补齐 {total} 个缺失组件...");
@@ -5513,15 +6316,28 @@ impl MainWindow {
         cx.spawn(async move |this, cx| {
             while let Some((done, total_b, id)) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
+                    if !this.state.is_downloading
+                        || !Arc::ptr_eq(&this.model_download_cancel, &progress_cancel)
+                        || progress_cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return;
+                    }
                     // 哨兵：下载已完成，正在解压（大包要几分钟，必须给提示）。
-                    if done == crate::utils::model_download::PROGRESS_UNPACKING {
+                    if done == crate::utils::model_download::PROGRESS_UNPACKING
+                        || done == crate::utils::model_download::PROGRESS_VALIDATING
+                    {
                         if let Some(item) = crate::utils::ITEMS.iter().find(|i| i.id == id) {
-                            this.state.download_status_msg = format!("正在解压 {}…", item.label);
+                            let phase = if done == crate::utils::model_download::PROGRESS_VALIDATING
+                            {
+                                "校验"
+                            } else {
+                                "解压"
+                            };
+                            this.state.download_status_msg = format!("正在{phase} {}…", item.label);
                         }
-                        this.state.download_item_progress.insert(
-                            id.clone(),
-                            (crate::utils::model_download::PROGRESS_UNPACKING, 0),
-                        );
+                        this.state
+                            .download_item_progress
+                            .insert(id.clone(), (done, 0));
                         cx.notify();
                         return;
                     }
@@ -5602,6 +6418,7 @@ impl MainWindow {
                 this.state.download_current = None;
                 this.state.download_done_bytes = 0;
                 this.state.download_total_bytes = 0;
+                this.state.download_item_progress.clear();
                 // 与单条目下载完成同源：重扫（含 sha256 全文件读）走专用线程，
                 // 理由见 `refresh_model_presence_offloaded` 的文档注释。
                 this.refresh_model_presence_offloaded(cx);

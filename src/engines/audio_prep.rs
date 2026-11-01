@@ -225,7 +225,7 @@ impl SpeechFilterOptions {
 
 /// 停顿压实参数。默认值面向「课堂/讲座录音」：句间停顿通常 0.5~3 s，
 /// 而语流内部的换气停顿 < 0.3 s，两者用 300 ms 的合并阈值可以干净分开。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompactionConfig {
     /// 能量分析帧长（ms）
     pub frame_ms: u32,

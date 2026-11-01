@@ -4,7 +4,7 @@
 
 #define MyAppName "Voice2Word"
 #ifndef MyAppVersion
-#define MyAppVersion "0.2.26"
+#define MyAppVersion "0.2.27"
 #endif
 #define MyAppPublisher "Voice2Word"
 #define MyAppURL "https://github.com/ysg0422/voice2word"
@@ -106,6 +106,8 @@ Source: "..\tools\punc_runner.py"; DestDir: "{app}\tools"; Flags: ignoreversion 
 Source: "..\tools\sensevoice_runner.py"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 ; TTS 配音运行器（与前两个同样是随包分发的胶水脚本）
 Source: "..\tools\edge_tts_runner.py"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
+; 人声分离运行器：仓库脚本必须随安装包分发。
+Source: "..\tools\vocal_sep_runner.py"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "..\tools\ffmpeg.exe"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\tools\ffplay.exe"; DestDir: "{app}\tools"; Flags: ignoreversion skipifsourcedoesntexist
 ; ffplay 的共享库依赖（avcodec / avformat / avutil / avdevice / avfilter / swresample / swscale）。

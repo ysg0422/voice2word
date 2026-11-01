@@ -24,6 +24,7 @@ pub mod temp_guard;
 pub mod time;
 pub mod typo_memory;
 pub mod update_check;
+pub mod watch_folder;
 pub mod window_state;
 pub mod zip_extract;
 

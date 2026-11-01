@@ -351,7 +351,7 @@ TOOLS = [
         "name": "transcribe",
         "description": (
             "调用 voice2word transcribe 转写音视频并导出字幕。"
-            "支持 srt/ass/vtt/json/txt/ttml/ttal 格式，返回 CLI 的 stdout 与 stderr 摘要。"
+            "支持 srt/ass/vtt/json/txt/ttml/ttal/sbv/lrc/txt-ts 格式，返回 CLI 的 stdout 与 stderr 摘要。"
         ),
         "inputSchema": {
             "type": "object",

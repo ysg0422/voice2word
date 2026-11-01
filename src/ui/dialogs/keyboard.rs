@@ -28,10 +28,12 @@
 //!
 //! # 焦点句柄为什么放 `thread_local`
 //!
-//! `MainWindow` 的字段定义在 `ui/mod.rs`（本轮禁改），弹窗渲染路径又没有 `Window`，
+//! `MainWindow` 的字段定义在 `ui/mod.rs`，弹窗渲染路径又没有 `Window`，
 //! 而焦点句柄**必须跨帧复用同一个**（每帧新建一个，`window.focus()` 就指到一个已经不在
 //! 渲染树里的句柄上，键盘输入随即丢失）。`thread_local` 同时满足这两条，与同窗热词输入框
 //! （`HOTWORDS_INPUT`）是同一套做法。每个弹窗一个面板句柄 + 若干按钮句柄（按钮句柄是 Tab 停靠点）。
+//! （历史上唯一阻碍挂窗口字段的「不许扩 `MainWindow`」约束已随 thread_local 收敛解除，
+//! 但焦点句柄表是**跨帧身份缓存**而非会话状态，thread_local 仍是贴切表达，故保留。）
 
 use gpui::*;
 use std::cell::RefCell;
@@ -113,6 +115,85 @@ pub(crate) fn topmost_dialog(open: OpenDialogs) -> Option<DialogKind> {
         return Some(DialogKind::Completion);
     }
     None
+}
+
+/// Esc（`CancelOrClose`）这颗键打到哪儿。
+///
+/// 与 [`topmost_dialog`]（回车）同一套思路：把「谁在最上层」抽成纯函数，让优先级
+/// 可单测。此前它是 `ui/mod.rs` 里一串手写 if 链，与这里各写各的——弹窗层级一改
+/// 就要同步两处，漏一处就是「Esc 穿透误伤」（历史上修过：搜索框 Esc 清空被终止
+/// 转写截胡）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EscTarget {
+    /// 关闭确认框（最上层阻塞模态）
+    Confirm,
+    /// 硬件引导框按「稍后再说」收场（只标完成，不动硬件档位）
+    HardwareSetup,
+    /// 收起命令面板
+    CommandPalette,
+    /// 收起快捷键速查面板
+    ShortcutsHelp,
+    /// 关完成框 / 基准框
+    CompletionOrBenchmark,
+    /// 收起所有展开中的下拉
+    Dropdowns,
+    /// 清空字幕搜索过滤词
+    SearchClear,
+    /// 终止正在跑的转写（Esc 兜底语义）
+    CancelProcessing,
+}
+
+/// [`esc_target`] 的判定入参：纯数据快照，刻意不含 `MainWindow`，便于单测。
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct EscContext {
+    pub(crate) confirm: bool,
+    /// 硬件引导待完成（`!hardware_init_completed`）
+    pub(crate) hardware_setup: bool,
+    /// 焦点在任意文本输入框
+    pub(crate) input_focused: bool,
+    pub(crate) command_palette: bool,
+    pub(crate) shortcuts_help: bool,
+    pub(crate) completion: bool,
+    pub(crate) benchmark: bool,
+    /// 任一下拉展开中
+    pub(crate) dropdown_open: bool,
+    /// 字幕搜索框持有焦点
+    pub(crate) search_focused: bool,
+    /// 字幕搜索过滤词非空
+    pub(crate) search_has_text: bool,
+}
+
+/// Esc 的优先级判定。顺序即 `ui/mod.rs` `CancelOrClose` 分发的历史顺序，逐条有测试钉住：
+///
+/// 确认框 → 硬件引导 → 命令面板 → 速查面板 → 完成/基准框 → 下拉 → 搜索清空 → 终止任务。
+///
+/// 两处「与直觉/渲染层不完全一致」的点是**既有行为**，动之前先看测试注释：
+/// - 硬件引导只在输入框**未**聚焦时接管（输入框里 Esc 的语义是清空输入）；
+/// - 命令面板排在速查面板**之前**，与渲染层 z 序（速查在面板之上）相反——两浮层
+///   实际不会同时在场（见 `close_command_palette` 的注释），顺序沿用现状不翻转。
+pub(crate) fn esc_target(ctx: EscContext) -> EscTarget {
+    if ctx.confirm {
+        return EscTarget::Confirm;
+    }
+    if ctx.hardware_setup && !ctx.input_focused {
+        return EscTarget::HardwareSetup;
+    }
+    if ctx.command_palette {
+        return EscTarget::CommandPalette;
+    }
+    if ctx.shortcuts_help {
+        return EscTarget::ShortcutsHelp;
+    }
+    if ctx.completion || ctx.benchmark {
+        return EscTarget::CompletionOrBenchmark;
+    }
+    if ctx.dropdown_open {
+        return EscTarget::Dropdowns;
+    }
+    if ctx.search_focused && ctx.search_has_text {
+        return EscTarget::SearchClear;
+    }
+    EscTarget::CancelProcessing
 }
 
 /// 某框的**主操作**（焦点不在本框按钮上时，回车打到哪儿）。
@@ -317,12 +398,73 @@ impl MainWindow {
 #[cfg(test)]
 mod tests {
     // 刻意不 `use super::*`：把被测的名字逐个列出来，签名一改就立刻报错。
-    use super::{primary_action, topmost_dialog, DialogAction, DialogKind, OpenDialogs};
+    use super::{
+        esc_target, primary_action, topmost_dialog, DialogAction, DialogKind, EscContext,
+        EscTarget, OpenDialogs,
+    };
 
     fn opened(apply: impl FnOnce(&mut OpenDialogs)) -> OpenDialogs {
         let mut open = OpenDialogs::default();
         apply(&mut open);
         open
+    }
+
+    /// Esc 优先级逐层钉住：全开时按历史顺序出队，关掉一层出下一层；
+    /// 空场兜底是「终止任务」；输入框聚焦只跳过硬件引导，兜底照旧。
+    #[test]
+    fn esc_target_priority_matches_historical_order() {
+        use EscTarget::*;
+        let all = EscContext {
+            confirm: true,
+            hardware_setup: true,
+            input_focused: false,
+            command_palette: true,
+            shortcuts_help: true,
+            completion: true,
+            benchmark: true,
+            dropdown_open: true,
+            search_focused: true,
+            search_has_text: true,
+        };
+        assert_eq!(esc_target(all), Confirm);
+
+        let mut o = all;
+        o.confirm = false;
+        assert_eq!(esc_target(o), HardwareSetup);
+
+        // 输入框聚焦：硬件引导不接管（Esc 的语义是清空输入），落到下一层。
+        o.input_focused = true;
+        assert_eq!(esc_target(o), CommandPalette);
+
+        // 命令面板先于速查面板：与渲染 z 序相反，是沿用的既有行为（见 esc_target 文档）。
+        o.command_palette = false;
+        assert_eq!(esc_target(o), ShortcutsHelp);
+
+        o.shortcuts_help = false;
+        assert_eq!(esc_target(o), CompletionOrBenchmark);
+
+        o.completion = false;
+        o.benchmark = false;
+        assert_eq!(esc_target(o), Dropdowns);
+
+        o.dropdown_open = false;
+        assert_eq!(esc_target(o), SearchClear);
+
+        // 过滤词为空时搜索框不吃 Esc。
+        o.search_has_text = false;
+        assert_eq!(esc_target(o), CancelProcessing);
+
+        // 空场：Esc 兜底就是终止任务。
+        assert_eq!(esc_target(EscContext::default()), CancelProcessing);
+
+        // 硬件引导 + 输入框聚焦 + 空场：跳过引导后仍落到终止兜底（历史行为，不在
+        // 这里发明「输入框聚焦就不终止」的新语义）。
+        let hw = EscContext {
+            hardware_setup: true,
+            input_focused: true,
+            ..Default::default()
+        };
+        assert_eq!(esc_target(hw), CancelProcessing);
     }
 
     #[test]

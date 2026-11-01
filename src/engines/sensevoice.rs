@@ -1400,7 +1400,10 @@ fn apply_stream_event(
                 // 6s / 60 字（句内无可用切点），预览还得过一遍 Rust 拆分，否则界面实时流
                 // 会比最终字幕表粗一档（最终表由 `optimize_segments` 走同一个
                 // `split_long_segments`）。
-                for piece in crate::subtitle::split_long_segments(vec![seg]) {
+                for piece in crate::subtitle::reindex_split_pieces(
+                    crate::subtitle::split_long_segments(vec![seg]),
+                    parsed.index,
+                ) {
                     let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         cb(parsed.progress, &label, Some(piece));
                     }));

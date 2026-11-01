@@ -22,8 +22,10 @@ pub mod sensevoice;
 pub mod translate;
 pub mod tts;
 pub mod video_player;
+pub mod vocal_sep;
 pub mod waveform;
 pub mod whisper;
+pub mod ytdlp;
 
 pub use audio_prep::{
     plan_compaction, write_wav_mono16, CompactionConfig, CompactionPlan, SpeechFilterOptions,
@@ -43,13 +45,17 @@ pub use media_pipeline::{
 pub use punc::PunctuationEngine;
 pub use sensevoice::SenseVoiceEngine;
 pub use translate::{OnlineApiConfig, TranslateEngine, TranslateMode};
-pub use tts::{TTSEngine, PRESET_VOICES};
+pub use tts::{
+    format_rate, tts_batch_budget, voice_for_speaker, DubItem, TTSEngine, PRESET_VOICES,
+};
 pub use video_player::{PlayerFrame, VideoPlayerEngine, PLAYER_HEIGHT, PLAYER_WIDTH};
+pub use vocal_sep::{VocalSepEngine, VocalSepReport};
 pub use waveform::{
     find_magnetic_snap_point, WaveformColumn, WaveformData, DEFAULT_SILENCE_THRESHOLD,
     DEFAULT_SNAP_RADIUS_SECS, WAVEFORM_SAMPLE_RATE,
 };
 pub use whisper::WhisperEngine;
+pub use ytdlp::{YtDlpEngine, YTDLP_REL};
 
 /// 子进程 spawn 失败时的可操作报错。
 ///

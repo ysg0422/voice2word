@@ -8,9 +8,11 @@
 
   包内容：
     voice2word.exe        主程序（release）
+    voice2word-cli.exe    命令行入口（release）
+    *.dll                主程序所需 VC++ 运行库
     config.toml           可移植默认配置（路径全是相对路径）
     README-首次使用.txt    首次运行引导
-    tools/punc_runner.py  Python 标点/识别胶水（小文件，必须随包）
+    tools/*_runner.py     识别、标点、配音和人声分离运行器（必须随包）
 
   刻意**不含**：models/、tools/*.exe、tools/*.dll、testVideo/、voice2word.db、
   logs/、config.local.toml（本机专属）、target/、_whisper_build/
@@ -39,46 +41,71 @@ if (-not $OutputDir) { $OutputDir = Join-Path $repoRoot 'dist' }
 $cargoToml = Join-Path $repoRoot 'Cargo.toml'
 $version = (Select-String -LiteralPath $cargoToml -Pattern '^version\s*=\s*"([^"]+)"' |
     Select-Object -First 1).Matches[0].Groups[1].Value
-if (-not $version) { throw "无法从 Cargo.toml 读取 version" }
+if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Cargo.toml 版本号无效" }
 
 $exe = Join-Path $repoRoot 'target\release\voice2word.exe'
+$cli = Join-Path $repoRoot 'target\release\voice2word-cli.exe'
 
 if (-not $SkipBuild) {
     Write-Host "[1/4] cargo build --release ..." -ForegroundColor Cyan
     Push-Location $repoRoot
-    try { cargo build --release } finally { Pop-Location }
+    try {
+        & (Join-Path $PSScriptRoot 'build_release.ps1')
+        if ($LASTEXITCODE -ne 0) { throw "release 构建失败（exit=$LASTEXITCODE）" }
+    } finally { Pop-Location }
 }
 
 if (-not (Test-Path -LiteralPath $exe)) {
     throw "找不到 release 产物：$exe（请先 cargo build --release）"
 }
+if (-not (Test-Path -LiteralPath $cli)) { throw "缺少命令行入口：$cli" }
+$cliVersion = & $cli --version
+if ($LASTEXITCODE -ne 0 -or ($cliVersion -join ' ') -notmatch [regex]::Escape($version)) {
+    throw "release 产物版本与 Cargo.toml 不一致，请重新构建"
+}
 
 # ── 组装 staging 目录 ───────────────────────────────────────────────────────
 $pkgName = "voice2word-v$version-win64-lite"
-$stage = Join-Path $OutputDir $pkgName
+$OutputDir = [IO.Path]::GetFullPath($OutputDir)
+$stage = [IO.Path]::GetFullPath((Join-Path $OutputDir $pkgName))
+# 删除前确认 staging 是指定输出目录的直接子目录，拒绝符号链接。
+if ([IO.Path]::GetDirectoryName($stage).TrimEnd('\', '/') -ne $OutputDir.TrimEnd('\', '/')) {
+    throw "staging 路径超出输出目录：$stage"
+}
+if ((Test-Path -LiteralPath $stage) -and ((Get-Item -LiteralPath $stage).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw "staging 不得是符号链接：$stage"
+}
 if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
 Write-Host "[2/4] 复制程序本体 ..." -ForegroundColor Cyan
 Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'voice2word.exe') -Force
-
-# config.toml 是共享配置（可移植相对路径），随包分发
-$cfg = Join-Path $repoRoot 'config.toml'
-if (Test-Path -LiteralPath $cfg) {
-    Copy-Item -LiteralPath $cfg -Destination (Join-Path $stage 'config.toml') -Force
-} else {
-    Write-Warning "仓库根没有 config.toml；程序首次运行会自动生成默认配置"
+Copy-Item -LiteralPath $cli -Destination (Join-Path $stage 'voice2word-cli.exe') -Force
+foreach ($dll in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'vcomp140.dll')) {
+    $src = Join-Path $repoRoot "tools\$dll"
+    if (-not (Test-Path -LiteralPath $src)) { throw "缺少启动运行库：$src" }
+    Copy-Item -LiteralPath $src -Destination (Join-Path $stage $dll) -Force
 }
 
-# Python 胶水脚本是必需的小文件（SenseVoice / CT-Punc 走它们）
+# 从本次二进制生成默认值，避免把开发机配置或密钥带进便携包。
+$defaults = & $cli --print-default-config
+if ($LASTEXITCODE -ne 0) { throw "生成默认配置失败（exit=$LASTEXITCODE）" }
+$configText = $defaults -join "`n"
+if ($configText -notmatch '(?m)^whisper_model\s*=\s*"models/whisper/' -or
+    $configText -match '(?m)^\s*api_key\s*=\s*"[^"]+"') {
+    throw "生成的默认配置未通过便携性检查"
+}
+[IO.File]::WriteAllText((Join-Path $stage 'config.toml'), $configText, [Text.UTF8Encoding]::new($false))
+
+# Python 胶水脚本随包分发，缺少任一脚本就停止打包。
 $runnerDir = Join-Path $stage 'tools'
 New-Item -ItemType Directory -Path $runnerDir -Force | Out-Null
-foreach ($py in @('punc_runner.py', 'sensevoice_runner.py')) {
+foreach ($py in @('punc_runner.py', 'sensevoice_runner.py', 'edge_tts_runner.py', 'vocal_sep_runner.py')) {
     $src = Join-Path $repoRoot "tools\$py"
     if (Test-Path -LiteralPath $src) {
         Copy-Item -LiteralPath $src -Destination (Join-Path $runnerDir $py) -Force
     } else {
-        Write-Warning "缺少 $py（SenseVoice/标点功能会不可用，可在应用内一键下载）"
+        throw "缺少仓库脚本 tools/$py，无法生成完整发布包"
     }
 }
 
@@ -126,8 +153,9 @@ Voice2Word v$version — 首次使用说明
 # ── 打 zip ──────────────────────────────────────────────────────────────────
 Write-Host "[3/4] 压缩 ..." -ForegroundColor Cyan
 $zip = Join-Path $OutputDir "$pkgName.zip"
-if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal
+$zipPart = Join-Path $OutputDir (".$pkgName." + [guid]::NewGuid().ToString('N') + '.zip')
+Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPart -CompressionLevel Optimal
+Move-Item -LiteralPath $zipPart -Destination $zip -Force
 Remove-Item -LiteralPath $stage -Recurse -Force
 
 # ── 报告 ────────────────────────────────────────────────────────────────────

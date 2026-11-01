@@ -2108,6 +2108,7 @@ impl MainWindow {
         let denoise = p.preprocess_denoise;
         let normalize = p.preprocess_normalize;
         let compact = p.preprocess_compact;
+        let vocal_sep = p.preprocess_vocal_sep;
         let highpass = p.preprocess_highpass_hz;
         let speed = p.whisper_audio_speed;
         let vad = p.whisper_vad_threshold;
@@ -2226,6 +2227,16 @@ impl MainWindow {
                 compact,
                 cx,
                 |c, v| c.preprocess_compact = v,
+            ))
+            // 人声分离：BGM/背景人声重的素材先拆出人声再识别。多付一遍全轨分离
+            // （约 0.5~2× 实时），干净素材上没有收益，默认关。模型缺失/失败时
+            // 管线显式告警并回退原始音频。
+            .child(toggle(
+                "perf-pre-vocal-sep",
+                "人声分离",
+                vocal_sep,
+                cx,
+                |c, v| c.preprocess_vocal_sep = v,
             ))
             .into_any_element();
 

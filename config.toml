@@ -1,9 +1,18 @@
+# Voice2Word 共享配置（由 `voice2word-cli --print-default-config` 生成）
+#
+# 这里只放**便携默认值**：路径全部相对程序目录，换台机器即可用。
+# 机器专属的东西（绝对路径、GPU 策略、在线翻译接口与密钥）会由程序
+# 自动写进同目录的 config.local.toml，不会混进本文件。
+#
+# 一般来说不需要手改本文件——界面里的「性能设置」改的就是这些项。
+
 [paths]
 ffmpeg = "tools/ffmpeg.exe"
 whisper_cli = "tools/whisper-vulkan/whisper-1.8.4-windows-x64/whisper-cli.exe"
-whisper_model = "models/sensevoice/model.int8.onnx"
+whisper_model = "models/whisper/ggml-small-q5_0.bin"
 vad_model = "models/whisper/ggml-silero-v6.2.0.bin"
 punc_model = "models/punc/model.int8.onnx"
+vocal_model = "models/vocal_sep/UVR-MDX-NET-Inst_HQ_3.onnx"
 sensevoice_model = "models/sensevoice/model.int8.onnx"
 sensevoice_tokens = "models/sensevoice/tokens.txt"
 sensevoice_vad = "models/sensevoice/silero_vad.onnx"
@@ -31,6 +40,7 @@ preprocess_normalize = true
 preprocess_highpass_hz = 70.0
 preprocess_compact = false
 preprocess_min_saving = 0.1
+preprocess_vocal_sep = false
 llm_threads = 8
 llm_ctx = 4096
 parallel_workers = 0
@@ -39,7 +49,7 @@ speaker_count = 2
 asr_hotwords = ""
 
 [gpu]
-hardware_init_completed = true
+hardware_init_completed = false
 hardware_tier = "cpu"
 hwaccel_decode = false
 whisper_offload = false
@@ -48,20 +58,18 @@ yield_to_desktop = true
 gpu_limit_percent = 100
 
 [subtitle_style]
-font_size = 66
-letter_spacing = 9
-line_spacing = 2.1999998092651367
-max_chars_per_line = 20
-bottom_margin = 54
+font_size = 40
+letter_spacing = 1
+line_spacing = 1.2000000476837158
+max_chars_per_line = 16
+bottom_margin = 40
 margin_lr = 20
 preset_name = "白字黑影"
-preview_box_w = 642.6666870117188
 pos_x_percent = 50.0
-pos_y_percent = 95.0
-primary_color = "#FFD60A"
-outline_width = 0.0
+primary_color = "#FFFFFF"
+outline_width = 2.0
 outline_color = "#000000"
-bg_style = "none"
+bg_style = "shadow"
 bg_opacity = 0.6000000238418579
 is_bold = true
 alignment = "center"
@@ -75,12 +83,27 @@ api_key = ""
 api_model = ""
 batch_size = 20
 timeout_secs = 120
-target_lang = "日本語"
+target_lang = "简体中文"
 glossary = ""
 max_glossary_entries = 80
 
 [ui]
 theme = "dark"
-export_mode = "translation"
+export_mode = "bilingual"
 export_format = "jianying"
 export_name_template = "{name}.{ext}"
+
+[dub]
+mode = "mix"
+bgm_volume = 0.25
+max_rate_percent = 35
+source = "translation"
+voice_zh = ""
+voice_en = ""
+
+[watch]
+enabled = false
+dir = ""
+recursive = false
+interval_secs = 3
+settle_secs = 5

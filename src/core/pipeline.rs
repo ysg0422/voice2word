@@ -12,9 +12,10 @@ use crate::engines::sensevoice::ProviderStatus;
 use crate::engines::{
     plan_compaction, transcribe_chunked, transcribe_chunked_sensevoice, write_wav_mono16,
     CompactionConfig, CompactionPlan, FFmpegEngine, LLMEngine, PunctuationEngine, SenseVoiceEngine,
-    SpeechFilterOptions, WhisperEngine, ASR_SAMPLE_RATE,
+    SpeechFilterOptions, VocalSepEngine, WhisperEngine, ASR_SAMPLE_RATE,
 };
 use crate::subtitle::{ExportMode, Segment, SubtitleWriter};
+use crate::utils::child_registry::ChildReaper;
 use crate::utils::{SubtitleStyleConfig, TempPathGuard};
 
 #[derive(Debug, Clone)]
@@ -255,22 +256,28 @@ impl EngineProfile for EngineCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
     ExtractAudio,
+    /// 人声分离（可选增强）：在提取音频之后、预处理之前。
+    VocalSep,
     Preprocess,
     Transcribe,
     Rescue,
     Punctuate,
     Polish,
+    /// 说话人分离（可选增强）：在润色之后、写出之前。
+    Diarize,
     Write,
 }
 
 impl Stage {
-    pub const ALL: [Stage; 7] = [
+    pub const ALL: [Stage; 9] = [
         Stage::ExtractAudio,
+        Stage::VocalSep,
         Stage::Preprocess,
         Stage::Transcribe,
         Stage::Rescue,
         Stage::Punctuate,
         Stage::Polish,
+        Stage::Diarize,
         Stage::Write,
     ];
 
@@ -278,11 +285,13 @@ impl Stage {
     pub fn label(self) -> &'static str {
         match self {
             Stage::ExtractAudio => "提取音频",
+            Stage::VocalSep => "人声分离",
             Stage::Preprocess => "音频预处理",
             Stage::Transcribe => "语音识别",
             Stage::Rescue => "置信度救场",
             Stage::Punctuate => "极速标点",
             Stage::Polish => "智能润色",
+            Stage::Diarize => "说话人分离",
             Stage::Write => "生成字幕",
         }
     }
@@ -297,6 +306,9 @@ impl Stage {
     }
 
     /// 该阶段产物落盘的文件名（带序号，便于人工排查）。
+    ///
+    /// 序号是**历史编号**，不随看板顺序变化：断点续跑目录里的旧产物按文件名认领，
+    /// 重新编号会让升级前留下的产物全部失效。新增的可选阶段顺延到 08/09。
     pub fn artifact_file(self) -> &'static str {
         match self {
             Stage::ExtractAudio => "01_extract_audio.json",
@@ -306,6 +318,8 @@ impl Stage {
             Stage::Punctuate => "05_punctuate.json",
             Stage::Polish => "06_polish.json",
             Stage::Write => "07_write.json",
+            Stage::VocalSep => "08_vocal_sep.json",
+            Stage::Diarize => "09_diarize.json",
         }
     }
 }
@@ -348,6 +362,8 @@ pub struct StageArtifacts {
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ResumeFingerprint {
+    /// 指纹结构版本；旧产物缺失时为 0，防止复用缺少关键参数的历史指纹。
+    pub version: u32,
     /// 模型路径（`None` = 引擎默认模型，用空串表示）
     pub model: String,
     /// 识别语言（`None` = 自动检测，用空串表示）
@@ -361,6 +377,9 @@ pub struct ResumeFingerprint {
     /// 实际生效的高通截止频率（0 = 关闭；非有限值 / 负值同样记 0）
     pub preprocess_highpass_hz: u32,
     pub preprocess_compact: bool,
+    pub preprocess_vocal_sep: bool,
+    pub preprocess_min_saving: f64,
+    pub preprocess_compaction: CompactionConfig,
     /// 置信度救场阈值（<0 启用，0 关闭）
     pub rescue_logprob: f64,
     pub diarization_enabled: bool,
@@ -597,6 +616,9 @@ pub struct PreprocessOptions {
     pub compact: bool,
     /// 最小收益阈值：可切除静音占比低于该值时放弃压实（仍保留语音增强）
     pub min_saving: f64,
+    /// 人声分离前置（UVR MDX-Net，见 `PipelineConfig::preprocess_vocal_sep`）。
+    /// 开启时先拆出人声轨再走后续链路；模型缺失/失败显式告警并回退原始音频。
+    pub vocal_sep: bool,
 }
 
 impl Default for PreprocessOptions {
@@ -607,6 +629,7 @@ impl Default for PreprocessOptions {
             compaction: CompactionConfig::default(),
             compact: false,
             min_saving: 0.10,
+            vocal_sep: false,
         }
     }
 }
@@ -732,8 +755,15 @@ pub struct TaskPipeline {
     /// 时序说明）。它与 [`LLMEngine`] 通过 `install_cancel_flag` 共享同一个 `Arc`，
     /// 因此必须保持普通布尔量——不能升级成「代际比较」，否则润色阶段读到的语义就变了。
     cancelled: Arc<AtomicBool>,
+    /// 「杀进程动作在飞」去重位：`cancel_async` 每次都 spawn 一条杀进程线程，
+    /// 连点十几下就是十几条线程同时 `taskkill` 同一批 PID 还互相等对方 `wait`。
+    /// 同一时刻杀进程只需要一条线程；线程收尾时复位，保证下一单的取消照常能杀。
+    kill_in_flight: Arc<AtomicBool>,
     /// 并行进程数：0 = 自动（按 CPU 核数推导引擎内调优默认值）；>0 = 用户在设置页显式指定
     parallel_workers: AtomicUsize,
+    /// 人声分离引擎（可选装配）。未装配 / 分离失败时 [`Self::run_vocal_sep_stage`]
+    /// 显式降级回原始音频，绝不让可选增强挡转写的路。
+    vocal_sep: Option<Arc<VocalSepEngine>>,
     /// 自动导出用的字幕样式快照（字号 / 折行宽度等）。
     ///
     /// 由 `AppState` 在构造与每次样式变更（设置页 / 剪辑台滑条、预设切换）时写入，
@@ -834,6 +864,43 @@ pub(crate) fn respan_windows(start: f64, end: f64) -> Vec<(f64, f64)> {
     windows
 }
 
+/// 转写前的引擎装配产物（[`TaskPipeline::resolve_engine_setup`] 的输出契约）：
+/// 引擎句柄、设备选择、SenseVoice 热装配结果、能力快照与并行调参。打包成结构体
+/// 是为了让装配只求解一次，下游按字段取用，不再各自重算布尔量。
+struct EngineSetup {
+    whisper: Arc<WhisperEngine>,
+    ffmpeg: Arc<FFmpegEngine>,
+    use_gpu: bool,
+    dynamic_sensevoice: Option<Arc<SenseVoiceEngine>>,
+    sensevoice_available: bool,
+    caps: EngineCapabilities,
+    workers_override: Option<usize>,
+    cores: u32,
+}
+
+/// 阶段 1.5（音频前端预处理）的输出契约：实际生效的滤镜链、耗时与说明，
+/// 以及时间轴还原所需的压实计划与压实后时长。
+struct PreprocessOutcome {
+    preprocess_sec: f64,
+    preprocess_note: Option<String>,
+    compaction: Option<CompactionPlan>,
+    asr_duration: f64,
+    enhance_chain: Option<String>,
+}
+
+/// 阶段 2.5（置信度救场）的输出契约：实际重解码的窗口数与阶段耗时。
+struct RescueOutcome {
+    rescue_span_count: usize,
+    rescue_sec: f64,
+}
+
+/// 阶段 3（标点 / 润色）的输出契约：润色引擎耗时与实际生效的引擎展示名
+/// （超时 / 失败 / 取消时的名字必须如实反映「字幕未标点」）。
+struct PolishOutcome {
+    qwen_sec: f64,
+    polish_engine_name: Option<String>,
+}
+
 impl TaskPipeline {
     /// 本次装配是否带上了 SenseVoice 引擎（四项齐全才会装配，见 `cli::build_sensevoice`）。
     ///
@@ -858,10 +925,23 @@ impl TaskPipeline {
             llm,
             punc,
             cancelled: Arc::new(AtomicBool::new(false)),
+            kill_in_flight: Arc::new(AtomicBool::new(false)),
             parallel_workers: AtomicUsize::new(0),
+            vocal_sep: None,
             subtitle_style: Mutex::new(None),
             artifact_dir: Mutex::new(None),
         }
+    }
+
+    /// 装配人声分离引擎（构建期一次性）。未调用即「未装配」，该阶段显式降级。
+    pub fn with_vocal_sep(mut self, engine: Arc<VocalSepEngine>) -> Self {
+        self.vocal_sep = Some(engine);
+        self
+    }
+
+    /// 本次装配是否带有人声分离引擎（UI/CLI 提示用，与装配口径同源）。
+    pub fn has_vocal_sep(&self) -> bool {
+        self.vocal_sep.is_some()
     }
 
     /// 设置并行进程数（0 = 自动）。设置页滑条调用；对下一次启动的转写任务生效。
@@ -900,12 +980,17 @@ impl TaskPipeline {
 
     /// 指定阶段产物落盘目录（`None` = 关闭落盘 / 断点续跑，保持历史行为）。
     pub fn set_artifact_dir(&self, dir: Option<PathBuf>) {
-        *self.artifact_dir.lock().unwrap() = dir;
+        // 中毒容忍与全仓同一口径（`unwrap_or_else(into_inner)`）：一次持锁 panic
+        // 后 Mutex 会持续中毒，`.unwrap()` 会让此后每次打开/关闭断点续跑都连环 panic。
+        *self.artifact_dir.lock().unwrap_or_else(|e| e.into_inner()) = dir;
     }
 
     /// 当前阶段产物落盘目录；`None` = 未开启。
     pub fn artifact_dir(&self) -> Option<PathBuf> {
-        self.artifact_dir.lock().unwrap().clone()
+        self.artifact_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 设置润色（Qwen）推理线程数，对下一次润色生效
@@ -962,9 +1047,21 @@ impl TaskPipeline {
     /// 一定已经死透」的确定性，慢一点无所谓。
     pub fn cancel_async(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        // 连点去重：杀进程这活同一时刻只需要一条线程。此前每点一次就 spawn 一条，
+        // 连点十几下就是十几条线程同时 `taskkill` 同一批 PID、互相等对方 `wait`。
+        // 「杀进程在飞」期间的重复点击直接返回（取消标志已置位，语义不受影响）；
+        // 线程收尾时复位，保证下一单的取消照常能杀新进程。
+        if self
+            .kill_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
         let whisper = Arc::clone(&self.whisper);
         let sensevoice = self.sensevoice.clone();
         let punc = self.punc.clone();
+        let kill_in_flight = Arc::clone(&self.kill_in_flight);
         std::thread::spawn(move || {
             whisper.cancel();
             if let Some(sv) = sensevoice.as_ref() {
@@ -973,6 +1070,7 @@ impl TaskPipeline {
             if let Some(punc) = punc.as_ref() {
                 punc.cancel();
             }
+            kill_in_flight.store(false, Ordering::SeqCst);
         });
     }
 
@@ -1211,338 +1309,91 @@ impl TaskPipeline {
             let _ = tx.send(PipelineEvent::Finished(Vec::new(), Default::default()));
             return Ok(Vec::new());
         }
-        let _ = tx.send(PipelineEvent::StageChanged(
-            Stage::ExtractAudio.label().into(),
-        ));
-        let _ = tx.send(PipelineEvent::Progress {
-            stage: "提取音频".into(),
-            progress: 0.05,
-            detail: "正在探测媒体时长并准备音频通道...".into(),
-        });
-
-        // 断点续跑：阶段 1 的时长探测若已有落盘记录，直接复用并跳过 ffprobe。
-        let cached_duration = cached_extract_audio_duration(artifacts.as_ref(), &input_id);
-        let total_dur = if let Some(d) = cached_duration {
-            info!("断点续跑：复用已落盘的媒体时长（{:.1}s），跳过探测", d);
-            Some(d)
-        } else {
-            let ffmpeg_for_dur = self.ffmpeg.clone();
-            let in_file_for_dur = input_file.clone();
-            tokio::task::spawn_blocking(move || {
-                let d = ffmpeg_for_dur.get_duration(&in_file_for_dur);
-                if d > 0.0 {
-                    Some(d)
-                } else {
-                    None
-                }
-            })
-            .await
-            .unwrap_or(None)
-        };
+        let total_dur = self
+            .run_extract_audio_stage(&input_file, &input_id, artifacts.as_ref(), &tx)
+            .await;
 
         let duration_for_chunks = total_dur.unwrap_or(0.0);
-        if duration_for_chunks > 0.0 {
-            let _ = tx.send(PipelineEvent::Progress {
-                stage: "提取音频".into(),
-                progress: 0.08,
-                detail: format!(
-                    "媒体时长探测完成（{}），正在初始化音频通道...",
-                    crate::ui::format_mm_ss(duration_for_chunks)
-                ),
-            });
-        }
 
-        // best-effort 落盘阶段 1 产物（仅在未命中缓存时写；写失败只告警，不中断）。
-        if cached_duration.is_none() {
-            if let Some(a) = artifacts.as_ref() {
-                let record = ExtractAudioRecord {
-                    input: input_file.display().to_string(),
-                    duration_sec: duration_for_chunks,
-                };
-                if let Err(e) = a.write_json(Stage::ExtractAudio, &record) {
-                    warn!("提取音频产物落盘失败: {e:#}");
-                }
-            }
-        }
-        let whisper = self.whisper.clone();
-        let ffmpeg = self.ffmpeg.clone();
-        let use_gpu = whisper.uses_gpu();
-
-        // 引擎档位是否选中 SenseVoice：仅作为能力求解的输入，最终能力统一走
-        // [`EngineProfile`]，避免同一判断在求解前后各算一遍。
-        let sensevoice_selected = model_override
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_lowercase().contains("sensevoice"))
-            .unwrap_or(false);
-
-        // SenseVoice 在纯 CPU 多核机器上的长音频改走多进程切块并行：
-        // 实测单进程 16 线程 41.6s，而 4 进程 × 2~4 线程仅 18.6~20.2s（快约 2 倍）。
-        // 该路径需要完整临时 WAV 以便随机切块，因此不再走纯内存推流。
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4) as u32;
-        // 动态按需探测/热装配 SenseVoice 引擎：
-        // 若启动时尚未下载模型，但用户在运行期间完成了下载，在此处就地装配，
-        // 无需强制重启应用程序即可立即享受 SenseVoice 极速转写。
-        let dynamic_sensevoice = self.sensevoice.clone().or_else(|| {
-            let runner = crate::utils::AppConfig::resolve_path("tools/sensevoice_runner.py");
-            let model = crate::utils::AppConfig::resolve_path("models/sensevoice/model.int8.onnx");
-            let tokens = crate::utils::AppConfig::resolve_path("models/sensevoice/tokens.txt");
-            let vad = crate::utils::AppConfig::resolve_path("models/sensevoice/silero_vad.onnx");
-            if runner.is_file() && model.is_file() && tokens.is_file() && vad.is_file() {
-                let py = crate::utils::AppConfig::resolve_command("python");
-                let provider = if use_gpu { "dml" } else { "cpu" };
-                info!("动态热装配 SenseVoice 极速引擎 (provider={provider})");
-                Some(Arc::new(
-                    crate::engines::SenseVoiceEngine::with_python_and_provider(
-                        runner,
-                        model.clone(),
-                        tokens,
-                        vad,
-                        threads.unwrap_or(8),
-                        py,
-                        provider,
-                    )
-                    // 按模型路径自动识别族：路径认不出时仍是 SenseVoice，行为不变。
-                    .with_family(
-                        crate::engines::sensevoice::model_family_from_path(&model),
-                        None,
-                    ),
-                ))
-            } else {
-                None
-            }
-        });
-        let sensevoice_available = dynamic_sensevoice.is_some();
-
-        // 引擎能力一次性求解：并行切块 / 纯内存推流 / 单会话线程数的判定公式
-        // 集中在 [`EngineCapabilities::plan`]，此处只读结果，下游统一经 [`EngineProfile`] 取用。
-        let mut caps = EngineCapabilities::plan(
-            sensevoice_selected,
-            sensevoice_available,
+        let EngineSetup {
+            whisper,
+            ffmpeg,
             use_gpu,
+            dynamic_sensevoice,
+            sensevoice_available,
+            mut caps,
+            workers_override,
+            cores,
+        } = self.resolve_engine_setup(
+            model_override.as_deref(),
+            threads,
             audio_speed,
             duration_for_chunks,
-            cores,
-            threads,
-            crate::engines::chunk_threshold_secs(),
         );
-        // SenseVoice 单会话在 8 线程附近已饱和，继续加线程反而更慢
-        // （实测 16 线程 41.6s vs 8 线程 32.6s），故单会话线程数统一在
-        // [`EngineCapabilities::plan`] 内 clamp 到上限（`sensevoice_threads`）。
-        // 并行进程数：0 = 自动（沿用引擎内按核数推导的调优默认值）
-        let workers_override = match self.parallel_workers.load(Ordering::Relaxed) {
-            0 => None,
-            n => Some(n),
-        };
 
         // 是否启用纯内存管道推流 (In-Memory PCM Streaming Pipe) 由
         // [`EngineCapabilities::plan`] 统一求解；停顿压实后由下方 `caps.stream = false` 就地关断。
 
-        let mut ffmpeg_audio_sec = 0.0;
         // 临时 WAV 用守卫持有：本函数后续有多个 `?` / 取消提前返回点，
         // 只要守卫在作用域内，无论从哪条路径退出都会被删掉。
         let mut temp_wav_path: Option<TempPathGuard> = None;
 
-        // ── 阶段 1.5: 音频前端预处理（语音增强 + 可选停顿压实）──
+        // ── 阶段 1.2: 人声分离（可选）──
         //
-        // 语音增强的收益在精度侧：抑制静音处的幻觉 token 与 no_speech 误判，
-        // 从而减少碎段（每个碎段都要重付一轮 SOT 与时间戳解码）。
-        //
-        // 停顿压实默认关闭：whisper.cpp 自带的 Silero VAD 已经做了同一件事，
-        // 外置再压一遍不会减少编码窗口与解码 token，却要多付一次整轨解码、
-        // 多写一个临时 WAV，还会放弃 0 磁盘 I/O 的内存推流通道。
-        //
-        // 只做增强时不再单独跑一遍解码：增强链里已经含 `aresample` 到 16 kHz，
-        // 交给推流或临时 WAV 提取阶段就地生效即可。
-        let preprocess = options.preprocess;
-        let mut preprocess_sec = 0.0;
-        let mut preprocess_note: Option<String> = None;
-        let mut compaction: Option<CompactionPlan> = None;
-        let mut asr_duration = duration_for_chunks;
-        // 音频通道滤镜链：语音增强（若启用）+ 变速，留给推流 / 抽音阶段就地生效。
-        // 变速必须在这里兜底——关闭预处理时音频加速仍要生效。
-        let mut enhance_chain: Option<String> = if audio_speed > 1.0 {
-            Some(format!("atempo={audio_speed:.3}"))
-        } else {
-            None
+        // 成功后把后续所有「音频消费点」改读人声轨：`input_file` 在这里影子绑定。
+        // 时间轴与时长不变（分离不改时间轴），restorer / 断点续跑 / 导出都不感知；
+        // 人声临时 WAV 由守卫持有，与其它临时产物同一套清理口径。
+        let (vocal_wav, vocal_note) = self
+            .run_vocal_sep_stage(
+                &input_file,
+                duration_for_chunks,
+                options.preprocess.vocal_sep,
+                skip_post,
+                &tx,
+            )
+            .await;
+        let input_file = match &vocal_wav {
+            Some(guard) => guard.path().to_path_buf(),
+            None => input_file,
         };
 
-        if preprocess.enabled && !caps.sensevoice() && duration_for_chunks > 0.0 && !resumed {
-            let chain = preprocess.filters.chain_with_speed(audio_speed);
+        let PreprocessOutcome {
+            preprocess_sec,
+            preprocess_note,
+            compaction,
+            asr_duration,
+            enhance_chain,
+        } = self
+            .run_preprocess_stage(
+                &input_file,
+                options.preprocess,
+                audio_speed,
+                duration_for_chunks,
+                resumed,
+                &mut caps,
+                &mut temp_wav_path,
+                artifacts.as_ref(),
+                &tx,
+            )
+            .await;
 
-            if !preprocess.compact {
-                // 只做语音增强：不需要随机访问，保持纯内存推流通道
-                enhance_chain = chain;
-                // 增强链里含 atempo，切块规划与进度必须按变速后的时长算
-                asr_duration = if audio_speed > 1.0 {
-                    duration_for_chunks / audio_speed
-                } else {
-                    duration_for_chunks
-                };
-                preprocess_note = Some(if enhance_chain.is_some() {
-                    "语音增强（降噪 / 电平归一，在音频通道就地生效）".to_string()
-                } else {
-                    "音频预处理未产生有效滤镜".to_string()
-                });
-                info!("音频前端预处理：仅语音增强（停顿压实已关闭），保持纯内存推流通道");
-            } else {
-                let _ = tx.send(PipelineEvent::StageChanged(
-                    Stage::Preprocess.label().into(),
-                ));
-                let _ = tx.send(PipelineEvent::Progress {
-                    stage: "音频预处理".into(),
-                    progress: 0.12,
-                    detail: "正在做语音增强（降噪 / 电平归一）与停顿压实...".into(),
-                });
+        // 人声分离的「生效 / 降级」说明并入预处理备注，随性能报告与
+        // 「音频处理」指标名一起可见——降级绝不静默。
+        let preprocess_note = match (vocal_note, preprocess_note) {
+            (None, p) => p,
+            (Some(v), None) => Some(v),
+            (Some(v), Some(p)) => Some(format!("{v}；{p}")),
+        };
 
-                let started = Instant::now();
-                let ffmpeg_prep = ffmpeg.clone();
-                let in_file_prep = input_file.clone();
-                let chain_for_task = chain.clone();
-                let cfg = preprocess.compaction;
-                let min_saving = preprocess.min_saving;
-
-                let outcome = tokio::task::spawn_blocking(move || -> Result<PreparedAudio> {
-                    let pcm = ffmpeg_prep.decode_pcm_mono_filtered(
-                        &in_file_prep,
-                        ASR_SAMPLE_RATE,
-                        chain_for_task.as_deref(),
-                    )?;
-                    if pcm.is_empty() {
-                        anyhow::bail!("预处理解码得到空音频（该文件可能没有音轨）");
-                    }
-                    let decoded_sec = pcm.len() as f64 / ASR_SAMPLE_RATE as f64;
-                    let plan = plan_compaction(&pcm, ASR_SAMPLE_RATE, &cfg);
-                    // 收益太小就退回未压实音频：多写一个临时 WAV 却换不到多少模型工作量，
-                    // 不如把这一遍省下来的时间还给用户。
-                    let use_plan = !plan.is_identity() && plan.is_worthwhile(min_saving);
-                    let kept: Vec<i16> = if use_plan {
-                        plan.materialize(&pcm)
-                    } else {
-                        pcm
-                    };
-                    let wav_path = std::env::temp_dir().join(format!(
-                        "v2w_prep_{}_{}.wav",
-                        std::process::id(),
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis())
-                            .unwrap_or(0)
-                    ));
-                    // 先建守卫再落盘：write_wav_mono16 写一半失败时 `?` 直接返回，
-                    // 没有守卫就会留下一段截断的 WAV（正是实测到的 13.8 MB 残留）。
-                    let wav = TempPathGuard::file(wav_path);
-                    write_wav_mono16(wav.path(), &kept, ASR_SAMPLE_RATE)?;
-                    Ok(PreparedAudio {
-                        wav,
-                        plan: use_plan.then_some(plan),
-                        decoded_sec,
-                        asr_sec: kept.len() as f64 / ASR_SAMPLE_RATE as f64,
-                    })
-                })
-                .await;
-
-                match outcome {
-                    Ok(Ok(prep)) => {
-                        preprocess_sec = started.elapsed().as_secs_f64();
-                        asr_duration = prep.asr_sec;
-                        // 解构出来：wav 是守卫，plan 决定它该被保留还是随作用域销毁
-                        let PreparedAudio {
-                            wav,
-                            plan,
-                            decoded_sec,
-                            asr_sec,
-                        } = prep;
-                        match plan.as_ref() {
-                            Some(_) => {
-                                // 确实压实了：时间轴不再连续，必须走临时 WAV 随机访问通道
-                                caps.stream = false;
-                                preprocess_note = Some(format!(
-                                    "语音增强 + 停顿压实 ({:.1}s → {:.1}s，切除 {:.0}% 静音)",
-                                    decoded_sec,
-                                    asr_sec,
-                                    (1.0 - asr_sec / decoded_sec.max(0.001)) * 100.0
-                                ));
-                            }
-                            None => {
-                                // 压实收益不足：让守卫在本分支结束时删掉刚写的临时 WAV，
-                                // 增强改由音频通道就地生效，把 0 磁盘 I/O 的推流路径还回来。
-                                enhance_chain = chain;
-                                preprocess_note = Some(if enhance_chain.is_some() {
-                                    format!("语音增强（{:.1}s，静音占比不足未压实）", decoded_sec)
-                                } else {
-                                    format!("音频预处理无有效滤镜（{:.1}s）", decoded_sec)
-                                });
-                            }
-                        }
-                        info!(
-                            elapsed = ?started.elapsed(),
-                            decoded_sec,
-                            asr_sec,
-                            compacted = plan.is_some(),
-                            "音频前端预处理完成"
-                        );
-                        if let Some(p) = plan {
-                            compaction = Some(p);
-                            // 把守卫的所有权移交给 temp_wav_path：转写结束后由它负责删除
-                            temp_wav_path = Some(wav);
-                        }
-                    }
-                    Ok(Err(err)) => {
-                        warn!(error = %err, "音频预处理失败，回退到原始音频通道");
-                        enhance_chain = chain;
-                    }
-                    Err(err) => {
-                        warn!(error = %err, "音频预处理任务异常，回退到原始音频通道");
-                        enhance_chain = chain;
-                    }
-                }
-            }
-        }
-
-        // best-effort 留痕：记录预处理阶段实际生效的说明（信息型产物，不参与 resume）。
-        if let Some(a) = artifacts.as_ref() {
-            let record = StageRecord {
-                detail: preprocess_note.clone().unwrap_or_default(),
-            };
-            if let Err(e) = a.write_json(Stage::Preprocess, &record) {
-                warn!("预处理产物落盘失败: {e:#}");
-            }
-        }
-
-        if temp_wav_path.is_none() {
-            if caps.can_stream() {
-                info!(
-                    "音频通道就绪：启用纯内存管道推流 (In-Memory PCM Streaming Pipe，0 磁盘 I/O)"
-                );
-                let _ = tx.send(PipelineEvent::Progress {
-                    stage: "提取音频".into(),
-                    progress: 0.14,
-                    detail: "已建立纯内存音频推流管道 (0 磁盘 I/O，毫秒级就绪)".into(),
-                });
-            } else {
-                // 说明为什么走临时 WAV：并行切块需要完整 WAV 以便随机 seek 切片。
-                // CPU 多核切块模式回退：提前抽取完整临时 WAV 以供多进程随机 seek 切块。
-                // 只做语音增强（未压实）时让增强链在这里就地生效，省掉单独一遍解码。
-                let in_file = input_file.clone();
-                let ffmpeg_extract = ffmpeg.clone();
-                let chain_extract = enhance_chain.clone();
-                let extraction_started = Instant::now();
-                let wav_path = tokio::task::spawn_blocking(move || {
-                    ffmpeg_extract.extract_audio_filtered(&in_file, None, chain_extract.as_deref())
-                })
-                .await??;
-                ffmpeg_audio_sec = extraction_started.elapsed().as_secs_f64();
-                info!(elapsed = ?extraction_started.elapsed(), "FFmpeg 临时 WAV 提取完成 (CPU 切块模式)");
-                let _ = tx.send(PipelineEvent::Progress {
-                    stage: "提取音频".into(),
-                    progress: 0.14,
-                    detail: "音频提取成功".into(),
-                });
-                temp_wav_path = Some(TempPathGuard::file(wav_path));
-            }
-        }
+        let ffmpeg_audio_sec = self
+            .prepare_audio_channel(
+                &input_file,
+                &caps,
+                enhance_chain.as_deref(),
+                &mut temp_wav_path,
+                &tx,
+            )
+            .await?;
 
         // 预处理把音频改造成了「增强 + 变速 + 压实」后的新时间轴，
         // 后续所有时间戳都必须经它还原回原始媒体时间轴。
@@ -1617,14 +1468,7 @@ impl TaskPipeline {
                                 .take()
                                 .context("获取 FFmpeg 内存管道输出失败")?;
 
-                            struct ChildReaper(std::process::Child);
-                            impl Drop for ChildReaper {
-                                fn drop(&mut self) {
-                                    let _ = self.0.kill();
-                                    let _ = self.0.wait();
-                                }
-                            }
-                            let mut reaper = ChildReaper(ffmpeg_child);
+                            let mut reaper = ChildReaper::new(ffmpeg_child);
 
                             let tx_cb = tx_sv.clone();
                             let slot_a = asr_startup_slot_sv.clone();
@@ -1652,7 +1496,7 @@ impl TaskPipeline {
                                     });
                                 })),
                             );
-                            let _ = reaper.0.wait();
+                            let _ = reaper.take().wait();
                             res
                         })
                         .await??;
@@ -1685,14 +1529,7 @@ impl TaskPipeline {
                                 .take()
                                 .context("获取 FFmpeg 内存管道输出失败")?;
 
-                            struct ChildReaper(std::process::Child);
-                            impl Drop for ChildReaper {
-                                fn drop(&mut self) {
-                                    let _ = self.0.kill();
-                                    let _ = self.0.wait();
-                                }
-                            }
-                            let mut reaper = ChildReaper(ffmpeg_child);
+                            let mut reaper = ChildReaper::new(ffmpeg_child);
 
                             let tx_cb = tx_whisper.clone();
                             let res = whisper_engine.transcribe_stream(
@@ -1732,7 +1569,7 @@ impl TaskPipeline {
                                     });
                                 })),
                             );
-                            let _ = reaper.0.wait();
+                            let _ = reaper.take().wait();
                             let (segments, vad_sec) = res?;
                             // 返回的最终片段保持「变速后」时间轴，统一交给下方唯一入口还原。
                             // 这里若再自行 scale 一次，就会与统一还原叠加成二次缩放。
@@ -1868,6 +1705,638 @@ impl TaskPipeline {
             return Ok(segments);
         }
 
+        let RescueOutcome {
+            rescue_span_count,
+            rescue_sec,
+        } = self
+            .run_rescue_stage(
+                &mut segments,
+                rescue_logprob,
+                enable_polish,
+                &caps,
+                duration_for_chunks,
+                &input_file,
+                language.as_deref(),
+                model_override.as_deref(),
+                threads,
+                artifacts.as_ref(),
+                skip_post,
+                &tx,
+            )
+            .await;
+
+        let PolishOutcome {
+            qwen_sec,
+            polish_engine_name,
+        } = self
+            .apply_punctuate_polish(
+                &mut segments,
+                enable_polish,
+                polish_mode,
+                &caps,
+                skip_post,
+                artifacts.as_ref(),
+                &tx,
+            )
+            .await;
+
+        if self.is_cancelled() {
+            let _ = tx.send(PipelineEvent::Finished(
+                segments.clone(),
+                Default::default(),
+            ));
+            return Ok(segments);
+        }
+
+        let diarization_sec = self
+            .run_diarization_stage(&mut segments, diarization, &input_file, skip_post, &tx)
+            .await;
+
+        // ── 阶段 4 前的取消检查点 ──
+        // 说话人分离（上一阶段）在 spawn_blocking 里做整轨解码 + 聚类，是最后一个
+        // 「长阶段」，内部没有取消检查；再往下就直接落盘导出。缺了这道闸，用户在分离
+        // 期间点「终止」仍会拿到一份字幕文件——而「终止 ⇒ 不产出成品」是全链路的契约。
+        // 与转写后、润色后的两个检查点同一语义（`may_export`）。
+        if !may_export(self.is_cancelled()) {
+            warn!("任务已取消，跳过最终字幕导出");
+            let _ = tx.send(PipelineEvent::Finished(
+                segments.clone(),
+                Default::default(),
+            ));
+            return Ok(segments);
+        }
+
+        let writing_started = self.export_final_output(
+            &mut segments,
+            &out_path,
+            &output_format,
+            skip_post,
+            artifacts.as_ref(),
+            &tx,
+        )?;
+        // 首字延迟：三个转写分支都可能在首次回调时打点；断点续跑不会打点（就是 0）。
+        let asr_startup_sec = asr_startup_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or(0.0);
+        let srt_export_sec = writing_started.elapsed().as_secs_f64();
+        let total_elapsed_sec = pipeline_started.elapsed().as_secs_f64();
+
+        let metrics = report_stage_metrics(
+            StageMetricsInput {
+                ffmpeg_audio_sec,
+                preprocess_sec,
+                vad_sec,
+                pure_whisper_sec,
+                rescue_sec,
+                rescue_span_count,
+                qwen_sec,
+                polish_engine_name,
+                diarization_sec,
+                srt_export_sec,
+                asr_startup_sec,
+                total_elapsed_sec,
+                total_dur,
+                preprocess_note: preprocess_note.as_deref(),
+                model_override: model_override.as_deref(),
+                use_gpu,
+                cores,
+                threads,
+                output_format: output_format.as_str(),
+            },
+            &caps,
+            &segments,
+        );
+
+        let _ = tx.send(PipelineEvent::Finished(segments.clone(), metrics));
+        info!(elapsed = ?pipeline_started.elapsed(), "管线全部执行完成，输出文件: {:?}", out_path);
+        Ok(segments)
+    }
+
+    /// 阶段 1（ExtractAudio）：探测媒体时长并准备音频通道。
+    ///
+    /// 输入：媒体路径、本次输入标识与阶段产物句柄；输出：`Some(秒)` = 时长探测成功
+    /// （含断点续跑缓存命中），`None` = 无音轨 / 探测失败（下游按 0 秒处理）。
+    /// 本阶段自己的 `StageChanged` / 进度事件与 `ExtractAudioRecord` 落盘都在这里发出。
+    async fn run_extract_audio_stage(
+        &self,
+        input_file: &Path,
+        input_id: &str,
+        artifacts: Option<&StageArtifacts>,
+        tx: &UnboundedSender<PipelineEvent>,
+    ) -> Option<f64> {
+        let _ = tx.send(PipelineEvent::StageChanged(
+            Stage::ExtractAudio.label().into(),
+        ));
+        let _ = tx.send(PipelineEvent::Progress {
+            stage: "提取音频".into(),
+            progress: 0.05,
+            detail: "正在探测媒体时长并准备音频通道...".into(),
+        });
+
+        // 断点续跑：阶段 1 的时长探测若已有落盘记录，直接复用并跳过 ffprobe。
+        let cached_duration = cached_extract_audio_duration(artifacts, input_id);
+        let total_dur = if let Some(d) = cached_duration {
+            info!("断点续跑：复用已落盘的媒体时长（{:.1}s），跳过探测", d);
+            Some(d)
+        } else {
+            let ffmpeg_for_dur = self.ffmpeg.clone();
+            let in_file_for_dur = input_file.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let d = ffmpeg_for_dur.get_duration(&in_file_for_dur);
+                if d > 0.0 {
+                    Some(d)
+                } else {
+                    None
+                }
+            })
+            .await
+            .unwrap_or(None)
+        };
+
+        let duration_for_chunks = total_dur.unwrap_or(0.0);
+        if duration_for_chunks > 0.0 {
+            let _ = tx.send(PipelineEvent::Progress {
+                stage: "提取音频".into(),
+                progress: 0.08,
+                detail: format!(
+                    "媒体时长探测完成（{}），正在初始化音频通道...",
+                    crate::ui::format_mm_ss(duration_for_chunks)
+                ),
+            });
+        }
+
+        // best-effort 落盘阶段 1 产物（仅在未命中缓存时写；写失败只告警，不中断）。
+        if cached_duration.is_none() {
+            if let Some(a) = artifacts {
+                let record = ExtractAudioRecord {
+                    input: input_file.display().to_string(),
+                    duration_sec: duration_for_chunks,
+                };
+                if let Err(e) = a.write_json(Stage::ExtractAudio, &record) {
+                    warn!("提取音频产物落盘失败: {e:#}");
+                }
+            }
+        }
+        total_dur
+    }
+
+    /// 转写前的引擎装配：一次性求解引擎能力并按需热装配 SenseVoice。
+    ///
+    /// 输入：模型档位 / 线程数 / 音速 / 音频时长；输出：[`EngineSetup`]——引擎句柄、
+    /// 是否用 GPU、SenseVoice 引擎（含热装配结果）、[`EngineCapabilities`] 能力快照、
+    /// 并行进程数覆盖与 CPU 核数。纯求解 + 装配，不发事件、不落盘。
+    fn resolve_engine_setup(
+        &self,
+        model_override: Option<&Path>,
+        threads: Option<u32>,
+        audio_speed: f64,
+        duration_for_chunks: f64,
+    ) -> EngineSetup {
+        let whisper = self.whisper.clone();
+        let ffmpeg = self.ffmpeg.clone();
+        let use_gpu = whisper.uses_gpu();
+
+        // 引擎档位是否选中 SenseVoice：仅作为能力求解的输入，最终能力统一走
+        // [`EngineProfile`]，避免同一判断在求解前后各算一遍。
+        let sensevoice_selected = model_override
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_lowercase().contains("sensevoice"))
+            .unwrap_or(false);
+
+        // SenseVoice 在纯 CPU 多核机器上的长音频改走多进程切块并行：
+        // 实测单进程 16 线程 41.6s，而 4 进程 × 2~4 线程仅 18.6~20.2s（快约 2 倍）。
+        // 该路径需要完整临时 WAV 以便随机切块，因此不再走纯内存推流。
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4) as u32;
+        // 动态按需探测/热装配 SenseVoice 引擎：
+        // 若启动时尚未下载模型，但用户在运行期间完成了下载，在此处就地装配，
+        // 无需强制重启应用程序即可立即享受 SenseVoice 极速转写。
+        let dynamic_sensevoice = self.sensevoice.clone().or_else(|| {
+            let runner = crate::utils::AppConfig::resolve_path("tools/sensevoice_runner.py");
+            let model = crate::utils::AppConfig::resolve_path("models/sensevoice/model.int8.onnx");
+            let tokens = crate::utils::AppConfig::resolve_path("models/sensevoice/tokens.txt");
+            let vad = crate::utils::AppConfig::resolve_path("models/sensevoice/silero_vad.onnx");
+            if runner.is_file() && model.is_file() && tokens.is_file() && vad.is_file() {
+                let py = crate::utils::AppConfig::resolve_command("python");
+                let provider = if use_gpu { "dml" } else { "cpu" };
+                info!("动态热装配 SenseVoice 极速引擎 (provider={provider})");
+                Some(Arc::new(
+                    crate::engines::SenseVoiceEngine::with_python_and_provider(
+                        runner,
+                        model.clone(),
+                        tokens,
+                        vad,
+                        threads.unwrap_or(8),
+                        py,
+                        provider,
+                    )
+                    // 按模型路径自动识别族：路径认不出时仍是 SenseVoice，行为不变。
+                    .with_family(
+                        crate::engines::sensevoice::model_family_from_path(&model),
+                        None,
+                    ),
+                ))
+            } else {
+                None
+            }
+        });
+        let sensevoice_available = dynamic_sensevoice.is_some();
+
+        // 引擎能力一次性求解：并行切块 / 纯内存推流 / 单会话线程数的判定公式
+        // 集中在 [`EngineCapabilities::plan`]，此处只读结果，下游统一经 [`EngineProfile`] 取用。
+        let caps = EngineCapabilities::plan(
+            sensevoice_selected,
+            sensevoice_available,
+            use_gpu,
+            audio_speed,
+            duration_for_chunks,
+            cores,
+            threads,
+            crate::engines::chunk_threshold_secs(),
+        );
+        // SenseVoice 单会话在 8 线程附近已饱和，继续加线程反而更慢
+        // （实测 16 线程 41.6s vs 8 线程 32.6s），故单会话线程数统一在
+        // [`EngineCapabilities::plan`] 内 clamp 到上限（`sensevoice_threads`）。
+        // 并行进程数：0 = 自动（沿用引擎内按核数推导的调优默认值）
+        let workers_override = match self.parallel_workers.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        };
+
+        EngineSetup {
+            whisper,
+            ffmpeg,
+            use_gpu,
+            dynamic_sensevoice,
+            sensevoice_available,
+            caps,
+            workers_override,
+            cores,
+        }
+    }
+
+    /// 阶段 1.2（人声分离，可选）：UVR MDX-Net 把「人声 + BGM」拆成人声轨，
+    /// 返回人声 WAV（44.1kHz 立体声，后续链路照常按需降采样）与一条可见备注。
+    ///
+    /// # 降级语义（对齐「静默降级看得见」）
+    ///
+    /// 引擎未装配 / 组件缺失 / 分离失败——一律发可见进度说明并回退原始音频，
+    /// **绝不让可选增强挡转写的路**；备注随性能报告展示。取消不是失败：
+    /// 拆到一半被终止时静默返回，由阶段 2 入口的取消检查点统一收尾。
+    async fn run_vocal_sep_stage(
+        &self,
+        input_file: &Path,
+        duration: f64,
+        enabled: bool,
+        skip_post: bool,
+        tx: &UnboundedSender<PipelineEvent>,
+    ) -> (Option<TempPathGuard>, Option<String>) {
+        // 成品续跑无需音频；仅恢复 ASR 时，救场/说话人分离仍可能消费人声轨。
+        if !enabled || skip_post || self.is_cancelled() {
+            return (None, None);
+        }
+        let Some(engine) = self.vocal_sep.clone() else {
+            return (
+                None,
+                Some("人声分离未就位（未装配），已回退原始音频".to_string()),
+            );
+        };
+        if !engine.is_available() {
+            return (
+                None,
+                Some("人声分离未就位（缺 runner 或模型），已回退原始音频".to_string()),
+            );
+        }
+        let _ = tx.send(PipelineEvent::StageChanged(Stage::VocalSep.label().into()));
+        let _ = tx.send(PipelineEvent::Progress {
+            stage: Stage::VocalSep.label().into(),
+            progress: 0.10,
+            detail: "正在分离人声（UVR MDX-Net）...".into(),
+        });
+
+        let ffmpeg = self.ffmpeg.clone();
+        let input = input_file.to_path_buf();
+        let cancel = Arc::clone(&self.cancelled);
+        let outcome = tokio::task::spawn_blocking(move || -> Result<(TempPathGuard, f64)> {
+            // 模型训练在 44.1kHz 立体声上：先按模型规格抽轨，分离产物再由
+            // 后续的 16k 抽取/推流链路消费，下游不需要感知这件事。
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let in44 = TempPathGuard::file(
+                std::env::temp_dir().join(format!("v2w_vsep44_{}_{ms}.wav", std::process::id())),
+            );
+            ffmpeg.extract_wav_at(&input, in44.path(), 44_100, 2)?;
+            let out_wav = TempPathGuard::file(
+                std::env::temp_dir().join(format!("v2w_vsep_{}_{ms}.wav", std::process::id())),
+            );
+            let report = engine.separate(in44.path(), out_wav.path(), duration, &cancel)?;
+            Ok((out_wav, report.elapsed_sec))
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok((guard, engine_sec))) => {
+                let note = format!("人声分离（{engine_sec:.0}s）");
+                info!("人声分离完成，后续音频消费点改读人声轨");
+                let _ = tx.send(PipelineEvent::Progress {
+                    stage: "人声分离".into(),
+                    progress: 0.12,
+                    detail: "人声分离完成".into(),
+                });
+                (Some(guard), Some(note))
+            }
+            Ok(Err(err)) if self.is_cancelled() => {
+                // 拆到一半被终止：不是失败，静默返回（阶段 2 入口统一收尾）。
+                tracing::debug!(error = %err, "人声分离被取消");
+                (None, None)
+            }
+            Ok(Err(err)) => {
+                warn!(error = %err, "人声分离失败，回退原始音频");
+                let _ = tx.send(PipelineEvent::Progress {
+                    stage: "人声分离".into(),
+                    progress: 0.12,
+                    detail: format!("人声分离失败，已回退原始音频：{err:#}"),
+                });
+                (None, Some(format!("人声分离失败已回退（{err:#}）")))
+            }
+            Err(join_err) => {
+                warn!(error = %join_err, "人声分离任务异常，回退原始音频");
+                let _ = tx.send(PipelineEvent::Progress {
+                    stage: "人声分离".into(),
+                    progress: 0.12,
+                    detail: format!("人声分离任务异常，已回退原始音频：{join_err}"),
+                });
+                (None, Some("人声分离任务异常已回退".to_string()))
+            }
+        }
+    }
+
+    /// 阶段 1.5（音频前端预处理）：语音增强（降噪 / 电平归一）+ 可选停顿压实。
+    ///
+    /// 输入：媒体路径、预处理参数、音速、探测时长与断点续跑标志；输出：
+    /// [`PreprocessOutcome`]。可能写临时 WAV（压实路径，守卫移交给 `temp_wav_path`）
+    /// 并就地关断 `caps.stream`；压实计划留给时间轴还原使用。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_preprocess_stage(
+        &self,
+        input_file: &Path,
+        preprocess: PreprocessOptions,
+        audio_speed: f64,
+        duration_for_chunks: f64,
+        resumed: bool,
+        caps: &mut EngineCapabilities,
+        temp_wav_path: &mut Option<TempPathGuard>,
+        artifacts: Option<&StageArtifacts>,
+        tx: &UnboundedSender<PipelineEvent>,
+    ) -> PreprocessOutcome {
+        // ── 阶段 1.5: 音频前端预处理（语音增强 + 可选停顿压实）──
+        //
+        // 语音增强的收益在精度侧：抑制静音处的幻觉 token 与 no_speech 误判，
+        // 从而减少碎段（每个碎段都要重付一轮 SOT 与时间戳解码）。
+        //
+        // 停顿压实默认关闭：whisper.cpp 自带的 Silero VAD 已经做了同一件事，
+        // 外置再压一遍不会减少编码窗口与解码 token，却要多付一次整轨解码、
+        // 多写一个临时 WAV，还会放弃 0 磁盘 I/O 的内存推流通道。
+        //
+        // 只做增强时不再单独跑一遍解码：增强链里已经含 `aresample` 到 16 kHz，
+        // 交给推流或临时 WAV 提取阶段就地生效即可。
+        let mut preprocess_sec = 0.0;
+        let mut preprocess_note: Option<String> = None;
+        let mut compaction: Option<CompactionPlan> = None;
+        let mut asr_duration = duration_for_chunks;
+        // 音频通道滤镜链：语音增强（若启用）+ 变速，留给推流 / 抽音阶段就地生效。
+        // 变速必须在这里兜底——关闭预处理时音频加速仍要生效。
+        let mut enhance_chain: Option<String> = if audio_speed > 1.0 {
+            Some(format!("atempo={audio_speed:.3}"))
+        } else {
+            None
+        };
+
+        if preprocess.enabled && !caps.sensevoice() && duration_for_chunks > 0.0 && !resumed {
+            let chain = preprocess.filters.chain_with_speed(audio_speed);
+
+            if !preprocess.compact {
+                // 只做语音增强：不需要随机访问，保持纯内存推流通道
+                enhance_chain = chain;
+                // 增强链里含 atempo，切块规划与进度必须按变速后的时长算
+                asr_duration = if audio_speed > 1.0 {
+                    duration_for_chunks / audio_speed
+                } else {
+                    duration_for_chunks
+                };
+                preprocess_note = Some(if enhance_chain.is_some() {
+                    "语音增强（降噪 / 电平归一，在音频通道就地生效）".to_string()
+                } else {
+                    "音频预处理未产生有效滤镜".to_string()
+                });
+                info!("音频前端预处理：仅语音增强（停顿压实已关闭），保持纯内存推流通道");
+            } else {
+                let _ = tx.send(PipelineEvent::StageChanged(
+                    Stage::Preprocess.label().into(),
+                ));
+                let _ = tx.send(PipelineEvent::Progress {
+                    stage: "音频预处理".into(),
+                    progress: 0.12,
+                    detail: "正在做语音增强（降噪 / 电平归一）与停顿压实...".into(),
+                });
+
+                let started = Instant::now();
+                let ffmpeg_prep = self.ffmpeg.clone();
+                let in_file_prep = input_file.to_path_buf();
+                let chain_for_task = chain.clone();
+                let cfg = preprocess.compaction;
+                let min_saving = preprocess.min_saving;
+
+                let outcome = tokio::task::spawn_blocking(move || -> Result<PreparedAudio> {
+                    let pcm = ffmpeg_prep.decode_pcm_mono_filtered(
+                        &in_file_prep,
+                        ASR_SAMPLE_RATE,
+                        chain_for_task.as_deref(),
+                    )?;
+                    if pcm.is_empty() {
+                        anyhow::bail!("预处理解码得到空音频（该文件可能没有音轨）");
+                    }
+                    let decoded_sec = pcm.len() as f64 / ASR_SAMPLE_RATE as f64;
+                    let plan = plan_compaction(&pcm, ASR_SAMPLE_RATE, &cfg);
+                    // 收益太小就退回未压实音频：多写一个临时 WAV 却换不到多少模型工作量，
+                    // 不如把这一遍省下来的时间还给用户。
+                    let use_plan = !plan.is_identity() && plan.is_worthwhile(min_saving);
+                    let kept: Vec<i16> = if use_plan {
+                        plan.materialize(&pcm)
+                    } else {
+                        pcm
+                    };
+                    let wav_path = std::env::temp_dir().join(format!(
+                        "v2w_prep_{}_{}.wav",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0)
+                    ));
+                    // 先建守卫再落盘：write_wav_mono16 写一半失败时 `?` 直接返回，
+                    // 没有守卫就会留下一段截断的 WAV（正是实测到的 13.8 MB 残留）。
+                    let wav = TempPathGuard::file(wav_path);
+                    write_wav_mono16(wav.path(), &kept, ASR_SAMPLE_RATE)?;
+                    Ok(PreparedAudio {
+                        wav,
+                        plan: use_plan.then_some(plan),
+                        decoded_sec,
+                        asr_sec: kept.len() as f64 / ASR_SAMPLE_RATE as f64,
+                    })
+                })
+                .await;
+
+                match outcome {
+                    Ok(Ok(prep)) => {
+                        preprocess_sec = started.elapsed().as_secs_f64();
+                        asr_duration = prep.asr_sec;
+                        // 解构出来：wav 是守卫，plan 决定它该被保留还是随作用域销毁
+                        let PreparedAudio {
+                            wav,
+                            plan,
+                            decoded_sec,
+                            asr_sec,
+                        } = prep;
+                        match plan.as_ref() {
+                            Some(_) => {
+                                // 确实压实了：时间轴不再连续，必须走临时 WAV 随机访问通道
+                                caps.stream = false;
+                                preprocess_note = Some(format!(
+                                    "语音增强 + 停顿压实 ({:.1}s → {:.1}s，切除 {:.0}% 静音)",
+                                    decoded_sec,
+                                    asr_sec,
+                                    (1.0 - asr_sec / decoded_sec.max(0.001)) * 100.0
+                                ));
+                            }
+                            None => {
+                                // 压实收益不足：让守卫在本分支结束时删掉刚写的临时 WAV，
+                                // 增强改由音频通道就地生效，把 0 磁盘 I/O 的推流路径还回来。
+                                enhance_chain = chain;
+                                preprocess_note = Some(if enhance_chain.is_some() {
+                                    format!("语音增强（{:.1}s，静音占比不足未压实）", decoded_sec)
+                                } else {
+                                    format!("音频预处理无有效滤镜（{:.1}s）", decoded_sec)
+                                });
+                            }
+                        }
+                        info!(
+                            elapsed = ?started.elapsed(),
+                            decoded_sec,
+                            asr_sec,
+                            compacted = plan.is_some(),
+                            "音频前端预处理完成"
+                        );
+                        if let Some(p) = plan {
+                            compaction = Some(p);
+                            // 把守卫的所有权移交给 temp_wav_path：转写结束后由它负责删除
+                            *temp_wav_path = Some(wav);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        warn!(error = %err, "音频预处理失败，回退到原始音频通道");
+                        enhance_chain = chain;
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "音频预处理任务异常，回退到原始音频通道");
+                        enhance_chain = chain;
+                    }
+                }
+            }
+        }
+
+        // best-effort 留痕：记录预处理阶段实际生效的说明（信息型产物，不参与 resume）。
+        if let Some(a) = artifacts {
+            let record = StageRecord {
+                detail: preprocess_note.clone().unwrap_or_default(),
+            };
+            if let Err(e) = a.write_json(Stage::Preprocess, &record) {
+                warn!("预处理产物落盘失败: {e:#}");
+            }
+        }
+
+        PreprocessOutcome {
+            preprocess_sec,
+            preprocess_note,
+            compaction,
+            asr_duration,
+            enhance_chain,
+        }
+    }
+
+    /// 阶段 1 收尾：让音频通道就绪——纯内存推流直接放行，否则提前抽取完整临时 WAV
+    /// 供切块路径随机 seek。输入：媒体路径、能力快照、增强滤镜链与既有临时 WAV 守卫
+    /// （压实路径已有时不再抽取）；输出：FFmpeg 抽取耗时（秒，推流为 0）。
+    async fn prepare_audio_channel(
+        &self,
+        input_file: &Path,
+        caps: &EngineCapabilities,
+        enhance_chain: Option<&str>,
+        temp_wav_path: &mut Option<TempPathGuard>,
+        tx: &UnboundedSender<PipelineEvent>,
+    ) -> Result<f64> {
+        let mut ffmpeg_audio_sec = 0.0;
+        if temp_wav_path.is_none() {
+            if caps.can_stream() {
+                info!(
+                    "音频通道就绪：启用纯内存管道推流 (In-Memory PCM Streaming Pipe，0 磁盘 I/O)"
+                );
+                let _ = tx.send(PipelineEvent::Progress {
+                    stage: "提取音频".into(),
+                    progress: 0.14,
+                    detail: "已建立纯内存音频推流管道 (0 磁盘 I/O，毫秒级就绪)".into(),
+                });
+            } else {
+                // 说明为什么走临时 WAV：并行切块需要完整 WAV 以便随机 seek 切片。
+                // CPU 多核切块模式回退：提前抽取完整临时 WAV 以供多进程随机 seek 切块。
+                // 只做语音增强（未压实）时让增强链在这里就地生效，省掉单独一遍解码。
+                let in_file = input_file.to_path_buf();
+                let ffmpeg_extract = self.ffmpeg.clone();
+                let chain_extract = enhance_chain.map(str::to_owned);
+                let extraction_started = Instant::now();
+                let wav_path = tokio::task::spawn_blocking(move || {
+                    ffmpeg_extract.extract_audio_filtered(&in_file, None, chain_extract.as_deref())
+                })
+                .await??;
+                ffmpeg_audio_sec = extraction_started.elapsed().as_secs_f64();
+                info!(elapsed = ?extraction_started.elapsed(), "FFmpeg 临时 WAV 提取完成 (CPU 切块模式)");
+                let _ = tx.send(PipelineEvent::Progress {
+                    stage: "提取音频".into(),
+                    progress: 0.14,
+                    detail: "音频提取成功".into(),
+                });
+                *temp_wav_path = Some(TempPathGuard::file(wav_path));
+            }
+        }
+        Ok(ffmpeg_audio_sec)
+    }
+
+    /// 阶段 2.5（置信度救场）：对 avg_logprob 垫底的窗口从原始媒体切音频、
+    /// 带温度回退重新解码，并把结果回写进字幕列表。
+    ///
+    /// 输入：已还原到原始媒体时间轴的片段、阈值与引擎参数；输出：[`RescueOutcome`]，
+    /// `segments` 原地更新为救场后的结果。命中落盘产物时跳过重解码；空表 / 取消态
+    /// 不落盘。救场窗口与实时预览都经 `shift_window_to_media_timeline` 回到媒体时间轴。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_rescue_stage(
+        &self,
+        segments: &mut Vec<Segment>,
+        rescue_logprob: f64,
+        enable_polish: bool,
+        caps: &EngineCapabilities,
+        duration_for_chunks: f64,
+        input_file: &Path,
+        language: Option<&str>,
+        model_override: Option<&Path>,
+        threads: Option<u32>,
+        artifacts: Option<&StageArtifacts>,
+        skip_post: bool,
+        tx: &UnboundedSender<PipelineEvent>,
+    ) -> RescueOutcome {
         // ── 阶段 2.5: 置信度二段重解码（快速通场 -nf 的质量兜底）──
         // 快速通场全程禁用温度回退提速；这里只对 avg_logprob 垫底的少数窗口
         // 切出音频、带回退重新解码一次，用几个百分点的时间换回质量。
@@ -1878,15 +2347,15 @@ impl TaskPipeline {
             && segments.iter().any(|s| s.confidence.is_some());
 
         // Resume: read the persisted rescue artifact BEFORE computing; a hit skips the compute.
-        let rescue_resumed = resume_rescue_segments(artifacts.as_ref(), rescue_enabled, skip_post);
+        let rescue_resumed = resume_rescue_segments(artifacts, rescue_enabled, skip_post);
         let rescue_ran = rescue_enabled && !skip_post && rescue_resumed.is_none();
         if let Some(segs) = rescue_resumed {
             info!("断点续跑：复用已落盘的救场结果（{} 段）", segs.len());
-            segments = segs;
+            *segments = segs;
         }
 
         if rescue_ran {
-            let spans = plan_rescue_spans(&segments, rescue_logprob);
+            let spans = plan_rescue_spans(segments, rescue_logprob);
             let total_span_sec: f64 = spans.iter().map(|(s, e)| e - s).sum();
             let media_sec = if duration_for_chunks > 0.0 {
                 duration_for_chunks
@@ -1917,11 +2386,11 @@ impl TaskPipeline {
                     "快速通场存在低置信片段，启动置信度救场重解码"
                 );
 
-                let whisper_r = whisper.clone();
-                let ffmpeg_r = ffmpeg.clone();
-                let in_file_r = input_file.clone();
-                let lang_r = language.clone();
-                let model_r = model_override.clone();
+                let whisper_r = self.whisper.clone();
+                let ffmpeg_r = self.ffmpeg.clone();
+                let in_file_r = input_file.to_path_buf();
+                let lang_r = language.map(str::to_owned);
+                let model_r = model_override.map(Path::to_path_buf);
                 let cancel_r = self.cancelled.clone();
                 let tx_r = tx.clone();
                 let segs_snapshot = segments.clone();
@@ -1942,14 +2411,8 @@ impl TaskPipeline {
                             let mut child = ffmpeg_r.spawn_audio_stream_at(&in_file_r, Some(s0), Some(span_dur))?;
                             let stdout = child.stdout.take().context("获取救场窗口音频管道失败")?;
 
-                            struct ChildReaper(std::process::Child);
-                            impl Drop for ChildReaper {
-                                fn drop(&mut self) {
-                                    let _ = self.0.kill();
-                                    let _ = self.0.wait();
-                                }
-                            }
-                            let mut reaper = ChildReaper(child);
+
+                            let mut reaper = ChildReaper::new(child);
 
                             let res = whisper_r.transcribe_stream_with_fallback(
                                 Box::new(stdout),
@@ -1975,7 +2438,7 @@ impl TaskPipeline {
                                     });
                                 })),
                             )?;
-                            let _ = reaper.0.wait();
+                            let _ = reaper.take().wait();
                             Ok(res.0)
                         })();
 
@@ -2000,8 +2463,8 @@ impl TaskPipeline {
                 });
 
                 rescue_span_count = spans.len();
-                segments = rescued;
-                crate::subtitle::optimize_segments(&mut segments);
+                *segments = rescued;
+                crate::subtitle::optimize_segments(segments);
             }
         }
         let rescue_sec = rescue_started.elapsed().as_secs_f64();
@@ -2009,13 +2472,36 @@ impl TaskPipeline {
         // 空表 / 取消态都不落盘：救场产物会被下次续跑直接复用，写入半成品或空表
         // 等于把一次没完成的救场登记成成品（空表则让整段 ASR 被跳过）。
         if rescue_ran && !segments.is_empty() && !self.is_cancelled() {
-            if let Some(a) = artifacts.as_ref() {
-                if let Err(e) = a.write_segments(Stage::Rescue, &segments) {
+            if let Some(a) = artifacts {
+                if let Err(e) = a.write_segments(Stage::Rescue, segments) {
                     warn!("救场产物落盘失败: {e:#}");
                 }
             }
         }
 
+        RescueOutcome {
+            rescue_span_count,
+            rescue_sec,
+        }
+    }
+
+    /// 阶段 3（标点 / 语法润色）：按润色模式分发 SenseVoice 原生标点 /
+    /// CT-Punc 极速标点 / Qwen 润色，把结果写回 `segments`。
+    ///
+    /// 输入：识别片段、润色开关与模式、能力快照；输出：[`PolishOutcome`]。
+    /// 「结果真的写回了」与「这一跑跑过这个阶段」分开记录：超时 / 失败 / 取消时
+    /// 保留识别原文且不落盘润色产物，避免下次续跑把未标点文本当成成品。
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_punctuate_polish(
+        &self,
+        segments: &mut Vec<Segment>,
+        enable_polish: bool,
+        polish_mode: Option<String>,
+        caps: &EngineCapabilities,
+        skip_post: bool,
+        artifacts: Option<&StageArtifacts>,
+        tx: &UnboundedSender<PipelineEvent>,
+    ) -> PolishOutcome {
         // ── 阶段 3: 标点与语法润色（可跳过）──
         let mut qwen_sec = 0.0;
         let mut polish_engine_name = None;
@@ -2029,9 +2515,9 @@ impl TaskPipeline {
         // a disabled run keeps its fresh segments and ignores stale files.
         let mut polish_resumed = false;
         if enable_polish && !skip_post {
-            if let Some(segs) = resume_polish_segments(artifacts.as_ref()) {
+            if let Some(segs) = resume_polish_segments(artifacts) {
                 info!("断点续跑：复用已落盘的标点/润色结果（{} 段）", segs.len());
-                segments = segs;
+                *segments = segs;
                 polish_engine_name = Some("断点续跑：复用已落盘的标点/润色结果".to_string());
                 let _ = tx.send(PipelineEvent::Progress {
                     stage: "生成字幕".into(),
@@ -2099,13 +2585,13 @@ impl TaskPipeline {
                         if self.is_cancelled() {
                             info!("标点完成后检测到取消，丢弃本次标点结果");
                         } else {
-                            segments = polished;
+                            *segments = polished;
                             polish_applied = true;
                             qwen_sec = punc_started.elapsed().as_secs_f64();
                             info!(elapsed = ?punc_started.elapsed(), segments = segments.len(), "CT-Punc 极速标点完成");
                             if !skip_post {
-                                if let Some(a) = artifacts.as_ref() {
-                                    if let Err(e) = a.write_segments(Stage::Punctuate, &segments) {
+                                if let Some(a) = artifacts {
+                                    if let Err(e) = a.write_segments(Stage::Punctuate, segments) {
                                         warn!("标点产物落盘失败: {e:#}");
                                     }
                                 }
@@ -2199,7 +2685,7 @@ impl TaskPipeline {
                         if self.is_cancelled() {
                             info!("润色完成后检测到取消，丢弃本次润色结果");
                         } else {
-                            segments = polished;
+                            *segments = polished;
                             polish_applied = true;
                             qwen_sec = polishing_started.elapsed().as_secs_f64();
                             info!(elapsed = ?polishing_started.elapsed(), segments = segments.len(), "Qwen 润色完成");
@@ -2241,36 +2727,46 @@ impl TaskPipeline {
             !segments.is_empty(),
             skip_post,
         ) {
-            if let Some(a) = artifacts.as_ref() {
-                if let Err(e) = a.write_segments(Stage::Polish, &segments) {
+            if let Some(a) = artifacts {
+                if let Err(e) = a.write_segments(Stage::Polish, segments) {
                     warn!("润色产物落盘失败: {e:#}");
                 }
             }
         }
 
-        if self.is_cancelled() {
-            let _ = tx.send(PipelineEvent::Finished(
-                segments.clone(),
-                Default::default(),
-            ));
-            return Ok(segments);
+        PolishOutcome {
+            qwen_sec,
+            polish_engine_name,
         }
+    }
 
+    /// 阶段 3.5（说话人分离）：按基频 / 能量特征聚类出说话人标签并写回片段。
+    ///
+    /// 输入：润色后的片段、分离参数（期望人数）与媒体路径；输出：分离耗时（秒，
+    /// 未跑 / 失败为 0）。只读时间轴与音频、不改文本；失败时保留无标签结果。
+    async fn run_diarization_stage(
+        &self,
+        segments: &mut [Segment],
+        diarization: DiarizationOptions,
+        input_file: &Path,
+        skip_post: bool,
+        tx: &UnboundedSender<PipelineEvent>,
+    ) -> f64 {
         // ── 阶段 3.5: 说话人分离（F-015，可跳过）──
         // 放在润色之后：分离只读时间轴与音频、不改文本，最后一步做最省事，
         // 也让「导出带说话人前缀」与「界面标签」用的是同一份结果。
         let mut diarization_sec = 0.0;
         if diarization.enabled && !segments.is_empty() && !skip_post {
-            let _ = tx.send(PipelineEvent::StageChanged("说话人分离".into()));
+            let _ = tx.send(PipelineEvent::StageChanged(Stage::Diarize.label().into()));
             let _ = tx.send(PipelineEvent::Progress {
-                stage: "说话人分离".into(),
+                stage: Stage::Diarize.label().into(),
                 progress: 0.97,
                 detail: "正在提取基频/能量特征并聚类说话人...".into(),
             });
             let started = Instant::now();
             let ffmpeg_d = self.ffmpeg.clone();
-            let in_file_d = input_file.clone();
-            let snapshot = segments.clone();
+            let in_file_d = input_file.to_path_buf();
+            let snapshot = segments.to_vec();
             let k = diarization.speakers;
 
             let outcome = tokio::task::spawn_blocking(move || -> Result<Vec<Option<u32>>> {
@@ -2315,27 +2811,30 @@ impl TaskPipeline {
                 }
             }
         }
+        diarization_sec
+    }
 
-        // ── 阶段 4 前的取消检查点 ──
-        // 说话人分离（上一阶段）在 spawn_blocking 里做整轨解码 + 聚类，是最后一个
-        // 「长阶段」，内部没有取消检查；再往下就直接落盘导出。缺了这道闸，用户在分离
-        // 期间点「终止」仍会拿到一份字幕文件——而「终止 ⇒ 不产出成品」是全链路的契约。
-        // 与转写后、润色后的两个检查点同一语义（`may_export`）。
-        if !may_export(self.is_cancelled()) {
-            warn!("任务已取消，跳过最终字幕导出");
-            let _ = tx.send(PipelineEvent::Finished(
-                segments.clone(),
-                Default::default(),
-            ));
-            return Ok(segments);
-        }
-
+    /// 阶段 4（写出字幕文件）：优化段落、判空后把最终片段按格式 / 样式落盘。
+    ///
+    /// 输入：最终片段、输出路径与格式、续跑标志与产物句柄；输出：写盘起点时刻
+    /// （供调用方计算 `srt_export_sec`）。空结果拒绝写文件并返回明确错误（不覆盖
+    /// 已有成品）；写盘失败只告警并补一条进度，不阻塞 `Finished`。同时负责
+    /// `Stage::Write` 产物落盘与续跑补发进度。失败也不阻塞 Finished，避免界面一直转圈。
+    fn export_final_output(
+        &self,
+        segments: &mut Vec<Segment>,
+        out_path: &Path,
+        output_format: &str,
+        skip_post: bool,
+        artifacts: Option<&StageArtifacts>,
+        tx: &UnboundedSender<PipelineEvent>,
+    ) -> Result<Instant> {
         // ── 阶段 4: 输出字幕文件（失败也不阻塞 Finished，避免界面一直转圈）──
         let _ = tx.send(PipelineEvent::StageChanged(Stage::Write.label().into()));
-        crate::subtitle::optimize_segments(&mut segments);
+        crate::subtitle::optimize_segments(segments);
         // 空结果绝不写文件：历史上这里会把一份空字幕原子覆盖用户已有成品，还提示
         // 「未能识别出任何有效字幕」。改为返回明确错误，已有文件保持原样。
-        if let Err(err) = ensure_exportable_segments(&segments) {
+        if let Err(err) = ensure_exportable_segments(segments) {
             warn!(
                 path = %out_path.display(),
                 error = %err,
@@ -2354,8 +2853,8 @@ impl TaskPipeline {
         // best-effort 落盘最终产物：这是「走完全流程」的最终快照（含说话人标签），
         // 下次续跑命中它即可整段短路。写失败只告警。空表 / 取消态不写。
         if !skip_post && !segments.is_empty() && !self.is_cancelled() {
-            if let Some(a) = artifacts.as_ref() {
-                if let Err(e) = a.write_segments(Stage::Write, &segments) {
+            if let Some(a) = artifacts {
+                if let Err(e) = a.write_segments(Stage::Write, segments) {
                     warn!("最终字幕产物落盘失败: {e:#}");
                 }
             }
@@ -2367,7 +2866,7 @@ impl TaskPipeline {
         // 所以这里 `infer_export_mode` 一般得到 `RawOnly`——与旧 `write_to_file` 的
         // 内部推断完全一致，双语自动推断的行为没有丢。
         let export_style = self.subtitle_style();
-        match write_export_with_style(&segments, &out_path, &output_format, export_style.as_ref()) {
+        match write_export_with_style(segments, out_path, output_format, export_style.as_ref()) {
             Ok(()) => {
                 info!(elapsed = ?writing_started.elapsed(), "字幕文件写入完成");
                 let _ = tx.send(PipelineEvent::Progress {
@@ -2385,72 +2884,117 @@ impl TaskPipeline {
                 });
             }
         }
-        // 首字延迟：三个转写分支都可能在首次回调时打点；断点续跑不会打点（就是 0）。
-        let asr_startup_sec = asr_startup_slot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .unwrap_or(0.0);
-        let srt_export_sec = writing_started.elapsed().as_secs_f64();
-        let total_elapsed_sec = pipeline_started.elapsed().as_secs_f64();
-
-        // ── 阶段 5: 性能基准指标归档与打印 ──
-        let video_duration = if let Some(d) = total_dur {
-            d
-        } else {
-            segments.last().map(|s| s.end).unwrap_or(0.0)
-        };
-        // 由字幕时间区间求并集，得到有声覆盖时长；不能使用 vad_sec，后者只是 VAD 算法耗时。
-        let voiced_duration_sec =
-            clamp_voiced_to_media(covered_duration(&segments), video_duration);
-
-        let audio_process_name = caps.audio_process_name(preprocess_note.as_deref());
-
-        let vad_engine_name = caps.vad_engine_name(vad_sec);
-
-        let asr_detail_name =
-            caps.asr_detail_name(cores, model_override.as_deref(), use_gpu, threads);
-
-        let export_name = format!("{} 标准字幕格式写出", output_format.to_uppercase());
-
-        let metrics = crate::core::PipelinePerformanceMetrics {
-            video_duration,
-            voiced_duration_sec,
-            ffmpeg_audio_sec: ffmpeg_audio_sec + preprocess_sec,
-            audio_process_name: Some(audio_process_name),
-            vad_sec,
-            vad_engine_name: Some(vad_engine_name.to_string()),
-            whisper_sec: pure_whisper_sec,
-            rescue_sec,
-            rescue_span_count,
-            asr_engine_name: Some(asr_detail_name),
-            qwen_sec,
-            polish_engine_name,
-            diarization_sec,
-            srt_export_sec,
-            export_name: Some(export_name),
-            segment_count: segments.len(),
-            asr_startup_sec,
-            total_elapsed_sec,
-        };
-
-        let summary = metrics.format_summary_block();
-        // 同一份报告会被两条路径各写一次：`println!` 直接写 stdout，而 `trace_backend`
-        // 的日志 writer（`DualWriter`）把 `info!` 同时写进 stdout 与 logs/*.txt。
-        // 结果同一条多行统计在控制台出现两遍、日志文件里也占两份，批量转写时刷屏。
-        // 两条路径共用一次「打印名额」判定：先到的打印、后到的丢弃，始终只出现一份。
-        if metrics.take_print_slot() {
-            if summary_to_stderr() {
-                eprintln!("{summary}");
-            } else {
-                println!("{summary}");
-            }
-            info!("{}", summary);
-        }
-
-        let _ = tx.send(PipelineEvent::Finished(segments.clone(), metrics));
-        info!(elapsed = ?pipeline_started.elapsed(), "管线全部执行完成，输出文件: {:?}", out_path);
-        Ok(segments)
+        Ok(writing_started)
     }
+}
+
+/// 阶段 5（性能基准指标归档）的输入快照：各阶段收尾时测得的耗时与计数，
+/// 加只有收尾才知道的展示参数。字段名与 `run_with_options` 里的局部变量一一对应。
+struct StageMetricsInput<'a> {
+    ffmpeg_audio_sec: f64,
+    preprocess_sec: f64,
+    vad_sec: f64,
+    pure_whisper_sec: f64,
+    rescue_sec: f64,
+    rescue_span_count: usize,
+    qwen_sec: f64,
+    polish_engine_name: Option<String>,
+    diarization_sec: f64,
+    srt_export_sec: f64,
+    asr_startup_sec: f64,
+    total_elapsed_sec: f64,
+    total_dur: Option<f64>,
+    preprocess_note: Option<&'a str>,
+    model_override: Option<&'a Path>,
+    use_gpu: bool,
+    cores: u32,
+    threads: Option<u32>,
+    output_format: &'a str,
+}
+
+/// 阶段 5（性能基准指标归档与打印）：把各阶段计时归档成
+/// [`crate::core::PipelinePerformanceMetrics`]，并按「打印名额」打印一份统计块。
+///
+/// 输入：[`StageMetricsInput`] + 能力快照 + 最终片段；输出：指标本体（由调用方随
+/// `Finished` 事件送出）。纯归档 + 打印，不再发管线事件、不落盘。
+fn report_stage_metrics(
+    input: StageMetricsInput,
+    caps: &EngineCapabilities,
+    segments: &[Segment],
+) -> crate::core::PipelinePerformanceMetrics {
+    // ── 阶段 5: 性能基准指标归档与打印 ──
+    let StageMetricsInput {
+        ffmpeg_audio_sec,
+        preprocess_sec,
+        vad_sec,
+        pure_whisper_sec,
+        rescue_sec,
+        rescue_span_count,
+        qwen_sec,
+        polish_engine_name,
+        diarization_sec,
+        srt_export_sec,
+        asr_startup_sec,
+        total_elapsed_sec,
+        total_dur,
+        preprocess_note,
+        model_override,
+        use_gpu,
+        cores,
+        threads,
+        output_format,
+    } = input;
+    let video_duration = if let Some(d) = total_dur {
+        d
+    } else {
+        crate::subtitle::timeline_end(segments)
+    };
+    // 由字幕时间区间求并集，得到有声覆盖时长；不能使用 vad_sec，后者只是 VAD 算法耗时。
+    let voiced_duration_sec = clamp_voiced_to_media(covered_duration(segments), video_duration);
+
+    let audio_process_name = caps.audio_process_name(preprocess_note);
+
+    let vad_engine_name = caps.vad_engine_name(vad_sec);
+
+    let asr_detail_name = caps.asr_detail_name(cores, model_override, use_gpu, threads);
+
+    let export_name = format!("{} 标准字幕格式写出", output_format.to_uppercase());
+
+    let metrics = crate::core::PipelinePerformanceMetrics {
+        video_duration,
+        voiced_duration_sec,
+        ffmpeg_audio_sec: ffmpeg_audio_sec + preprocess_sec,
+        audio_process_name: Some(audio_process_name),
+        vad_sec,
+        vad_engine_name: Some(vad_engine_name.to_string()),
+        whisper_sec: pure_whisper_sec,
+        rescue_sec,
+        rescue_span_count,
+        asr_engine_name: Some(asr_detail_name),
+        qwen_sec,
+        polish_engine_name,
+        diarization_sec,
+        srt_export_sec,
+        export_name: Some(export_name),
+        segment_count: segments.len(),
+        asr_startup_sec,
+        total_elapsed_sec,
+    };
+
+    let summary = metrics.format_summary_block();
+    // 同一份报告会被两条路径各写一次：`println!` 直接写 stdout，而 `trace_backend`
+    // 的日志 writer（`DualWriter`）把 `info!` 同时写进 stdout 与 logs/*.txt。
+    // 结果同一条多行统计在控制台出现两遍、日志文件里也占两份，批量转写时刷屏。
+    // 两条路径共用一次「打印名额」判定：先到的打印、后到的丢弃，始终只出现一份。
+    if metrics.take_print_slot() {
+        if summary_to_stderr() {
+            eprintln!("{summary}");
+        } else {
+            println!("{summary}");
+        }
+        info!("{}", summary);
+    }
+    metrics
 }
 
 /// 自动导出的格式推断：**与 `SubtitleWriter::write_to_file` 内部的判定同源**
@@ -2878,7 +3422,12 @@ fn resume_fingerprint(
 ) -> ResumeFingerprint {
     let (source_len, source_modified_ms) = source_file_signature(input_file);
     let highpass_hz = preprocess.filters.highpass_hz;
+    let mut compaction = preprocess.compaction;
+    compaction.noise_percentile = sanitize_f64(compaction.noise_percentile);
+    compaction.speech_margin_db = sanitize_f64(compaction.speech_margin_db);
+    compaction.abs_floor_db = sanitize_f64(compaction.abs_floor_db);
     ResumeFingerprint {
+        version: 1,
         model: model_override
             .map(|p| normalize_media_path(&p.display().to_string()))
             .unwrap_or_default(),
@@ -2894,6 +3443,9 @@ fn resume_fingerprint(
             0
         },
         preprocess_compact: preprocess.compact,
+        preprocess_vocal_sep: preprocess.vocal_sep,
+        preprocess_min_saving: sanitize_f64(preprocess.min_saving),
+        preprocess_compaction: compaction,
         rescue_logprob: sanitize_f64(rescue_logprob),
         diarization_enabled: diarization.enabled,
         diarization_speakers: diarization.speakers,
@@ -3468,6 +4020,41 @@ mod tests {
             Arc::new(LLMEngine::new("llama-cli", "model.gguf", 2048, 4)),
             None,
         )
+    }
+
+    #[test]
+    fn vocal_sep_obeys_switch_resume_and_cancellation() {
+        let pipeline = test_pipeline();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for (enabled, skip_post) in [(false, false), (false, true), (true, true)] {
+            let (wav, note) = block_on(pipeline.run_vocal_sep_stage(
+                Path::new("missing.wav"),
+                10.0,
+                enabled,
+                skip_post,
+                &tx,
+            ));
+            assert!(wav.is_none());
+            assert!(note.is_none(), "关闭或已恢复成品时不应执行或提示降级");
+            assert!(rx.try_recv().is_err());
+        }
+        let (_, note) = block_on(pipeline.run_vocal_sep_stage(
+            Path::new("missing.wav"),
+            10.0,
+            true,
+            false,
+            &tx,
+        ));
+        assert!(note.as_deref().is_some_and(|n| n.contains("未装配")));
+        pipeline.cancel();
+        let (_, note) = block_on(pipeline.run_vocal_sep_stage(
+            Path::new("missing.wav"),
+            10.0,
+            true,
+            false,
+            &tx,
+        ));
+        assert!(note.is_none(), "取消后不应再启动分离或提示降级");
     }
 
     /// 用当前线程跑一段 future（不依赖 `#[tokio::test]`，与线程化用例共用同一套构造）。
@@ -4278,6 +4865,80 @@ mod tests {
     //
     // 修复前：信封只记输入路径，换模型 / 换语言 / 开分离后仍命中旧产物，
     // `07_write.json` 一命中就 `skip_post`，新参数静默无效。
+
+    #[test]
+    fn resume_fingerprint_tracks_preprocessing_and_rejects_old_schema() {
+        let dir = tmp_dir("preprocess_fingerprint");
+        let source = dir.join("talk.wav");
+        std::fs::write(&source, b"media").unwrap();
+        let fingerprint = |preprocess: &PreprocessOptions| {
+            resume_fingerprint(
+                &source,
+                None,
+                None,
+                1.0,
+                0.5,
+                preprocess,
+                0.0,
+                DiarizationOptions::default(),
+                false,
+                None,
+            )
+        };
+        let options = PreprocessOptions::default();
+        let base = fingerprint(&options);
+        let writer = StageArtifacts::owned_by(dir.clone(), source.display().to_string())
+            .with_fingerprint(base.clone());
+        let segments = vec![Segment::new(1, 0.0, 1.0, "字幕")];
+        writer.write_segments(Stage::Write, &segments).unwrap();
+        assert_eq!(writer.read_segments(Stage::Write).unwrap(), Some(segments));
+
+        let mut variants = vec![options; 10];
+        variants[0].vocal_sep = true;
+        variants[1].min_saving = 0.25;
+        variants[2].compaction.frame_ms += 1;
+        variants[3].compaction.noise_percentile += 0.1;
+        variants[4].compaction.speech_margin_db += 1.0;
+        variants[5].compaction.abs_floor_db += 1.0;
+        variants[6].compaction.min_speech_ms += 1;
+        variants[7].compaction.min_gap_ms += 1;
+        variants[8].compaction.pad_ms += 1;
+        variants[9].compaction.keep_gap_ms += 1;
+        for (i, changed) in variants.iter().enumerate() {
+            let changed = fingerprint(changed);
+            assert_ne!(base, changed, "预处理参数 {i} 未参与指纹");
+            let reader = StageArtifacts::owned_by(dir.clone(), source.display().to_string())
+                .with_fingerprint(changed);
+            assert!(reader.read_segments(Stage::Write).unwrap().is_none());
+        }
+
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(writer.path(Stage::Write)).unwrap()).unwrap();
+        let old = envelope["fingerprint"].as_object_mut().unwrap();
+        for field in [
+            "version",
+            "preprocess_vocal_sep",
+            "preprocess_min_saving",
+            "preprocess_compaction",
+        ] {
+            old.remove(field);
+        }
+        std::fs::write(
+            writer.path(Stage::Write),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+        assert!(writer.read_segments(Stage::Write).unwrap().is_none());
+        assert!(writer.exists(Stage::Write), "旧产物只忽略，不能删除");
+        assert!(
+            StageArtifacts::owned_by(dir.clone(), source.display().to_string())
+                .read_segments(Stage::Write)
+                .unwrap()
+                .is_some(),
+            "旧格式仍须可读"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// 指纹覆盖所有会改变产物的参数；任一变化都不得复用旧产物，
     /// 旧信封（缺指纹）仍可解析但同样不复用，且都不删除文件。

@@ -39,59 +39,31 @@ function Get-RemoteFile {
     Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec
 }
 
-function Expand-ZipTo {
-    param(
-        [Parameter(Mandatory = $true)][string]$ZipPath,
-        [Parameter(Mandatory = $true)][string]$DestDir
-    )
-    New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
-    $tmp = Join-Path $env:TEMP ("v2w_unpack_" + [guid]::NewGuid().ToString("N"))
-    try {
-        Expand-Archive -LiteralPath $ZipPath -DestinationPath $tmp -Force
-        # zip 内可能是扁平的，也可能是 Release/ 一层包装：都摊平到目标目录。
-        $files = Get-ChildItem -LiteralPath $tmp -Recurse -File
-        $nested = $files | Where-Object { $_.DirectoryName -ne $tmp }
-        foreach ($f in $files) {
-            $rel = $f.FullName.Substring($tmp.Length).TrimStart('\','/')
-            # 剥掉顶层那一层包装目录（Release/、llama.cpp-b9637-win-cpu-x64/ …）。
-            $parts = $rel -split '[\\/]'
-            if ($parts.Count -gt 1) { $rel = ($parts[1..($parts.Count - 1)] -join '\') }
-            $target = Join-Path $DestDir $rel
-            $targetDir = Split-Path -Parent $target
-            if ($targetDir -and -not (Test-Path $targetDir)) {
-                New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-            }
-            Copy-Item -LiteralPath $f.FullName -Destination $target -Force
-        }
-        Write-Host ("解压完成：{0} 个文件 -> {1}" -f $files.Count, $DestDir)
-    } finally {
-        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-# 版式无关的解压：在解出来的目录树里**递归找 exe/dll**，扁平拷进目标目录。
-#
-# 为什么不能复用 Expand-ZipTo：那个函数会「剥掉每层路径的第一段」，本意是去掉
-# zip 自带的包装目录（whisper 的 Release/、llama 的 llama-xxx/）。但 BtbN 的
-# ffmpeg 包版式是 ffmpeg-master-.../bin/ffmpeg.exe —— 剥一段之后变成 bin/ffmpeg.exe，
-# 落盘到 tools/bin/ 下，而程序找的是 tools/ffmpeg.exe，等于没装。
-# 这里改成「不管它在哪一层，只按文件名摊平」，三种包都能正确落位。
+# 按文件名递归提取 exe/dll，不按 TEMP 字符串长度截取相对路径。
+# CI 的 TEMP 可能含 8.3 短名，FileInfo.FullName 却是长名，截取会残留包装目录。
+# 同一实现供 FFmpeg、llama.cpp、Whisper 使用。
 function Expand-ZipFlat {
     param(
         [Parameter(Mandatory = $true)][string]$ZipPath,
         [Parameter(Mandatory = $true)][string]$DestDir
     )
-    $tmp = Join-Path $env:TEMP ("v2w_flat_" + [guid]::NewGuid().ToString("N"))
+    $tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd([char[]]'\/')
+    $tmp = [IO.Path]::GetFullPath((Join-Path $tempRoot ("v2w_flat_" + [guid]::NewGuid().ToString("N"))))
+    if ([IO.Path]::GetDirectoryName($tmp).TrimEnd([char[]]'\/') -ne $tempRoot) {
+        throw "临时解压路径超出 TEMP：$tmp"
+    }
+    New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
     try {
         Expand-Archive -LiteralPath $ZipPath -DestinationPath $tmp -Force
-        $copied = 0
-        Get-ChildItem -LiteralPath $tmp -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in @('.exe', '.dll') } |
-            ForEach-Object {
-                Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $DestDir $_.Name) -Force
-                $copied++
-            }
-        Write-Host ("解压完成（扁平）：{0} 个 exe/dll -> {1}" -f $copied, $DestDir)
+        $files = @(Get-ChildItem -LiteralPath $tmp -Recurse -File |
+            Where-Object { $_.Extension -in @('.exe', '.dll') })
+        if ($files.Count -eq 0) { throw "压缩包内没有 exe/dll：$ZipPath" }
+        $duplicates = @($files | Group-Object Name | Where-Object Count -gt 1)
+        if ($duplicates.Count -gt 0) { throw "压缩包有同名组件，无法安全摊平：$($duplicates.Name -join ', ')" }
+        foreach ($file in $files) {
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $DestDir $file.Name) -Force
+        }
+        Write-Host ("解压完成（扁平）：{0} 个 exe/dll -> {1}" -f $files.Count, $DestDir)
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -297,7 +269,7 @@ if ($Force -or -not (Test-Complete -EntryExe $llamaExe -RequiredDlls $llamaDlls 
             Remove-Item -Force -ErrorAction SilentlyContinue
         Get-ChildItem -LiteralPath $tools -Filter 'ggml*' -File -ErrorAction SilentlyContinue |
             Remove-Item -Force -ErrorAction SilentlyContinue
-        Expand-ZipTo -ZipPath $zip -DestDir $tools
+        Expand-ZipFlat -ZipPath $zip -DestDir $tools
     } catch {
         Write-Warning "llama.cpp 预取失败（安装包将不带离线翻译组件，客户机需在界面内一键下载）：$($_.Exception.Message)"
     } finally {
@@ -329,13 +301,23 @@ if (Test-IsVulkanOnlyBuild -DllDir $whisperDir) {
 if ($Force -or $whisperIncomplete) {
     $zip = Join-Path $env:TEMP "v2w_whisper.zip"
     try {
-        Get-RemoteFile -Url "https://gh-proxy.com/https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/whisper-bin-x64.zip" -OutFile $zip
+        try {
+            Get-RemoteFile -Url "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/whisper-bin-x64.zip" -OutFile $zip
+        } catch {
+            Write-Warning "Whisper 官方源下载失败，尝试镜像：$($_.Exception.Message)"
+            Get-RemoteFile -Url "https://gh-proxy.com/https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/whisper-bin-x64.zip" -OutFile $zip
+        }
         # **先清空目标目录**：开发机上那份自编译 Vulkan 版会残留同名文件
         # （ggml-vulkan.dll 等），混进包里就等于「包内容取决于打包机的历史状态」。
         if (Test-Path $whisperDir) {
+            $expectedWhisperDir = [IO.Path]::GetFullPath((Join-Path $root 'tools\whisper-vulkan\whisper-1.8.4-windows-x64'))
+            if ([IO.Path]::GetFullPath($whisperDir) -ne $expectedWhisperDir -or
+                ((Get-Item -LiteralPath $whisperDir).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw "拒绝清理非预期 Whisper 目录：$whisperDir"
+            }
             Remove-Item -LiteralPath $whisperDir -Recurse -Force
         }
-        Expand-ZipTo -ZipPath $zip -DestDir $whisperDir
+        Expand-ZipFlat -ZipPath $zip -DestDir $whisperDir
     } catch {
         Write-Warning "whisper.cpp 预取失败（安装包将不带 Whisper 组件，客户机需在界面内一键下载）：$($_.Exception.Message)"
     } finally {

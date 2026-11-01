@@ -5,6 +5,215 @@
 
 ---
 
+## 0.2.27（2026-11-01）
+
+### 发布包
+
+- 安装包与便携 ZIP 同步发布；ZIP 补齐 CLI、VC++ 运行库和四个 Python 运行器，默认配置从本次二进制生成。
+- 修复 CI 预取组件的路径截取问题，Whisper、llama.cpp 与 FFmpeg 统一按文件名提取；拒绝同名组件，发布前运行压缩包布局回归。
+- 增加发行附件的 SHA256SUMS.txt；打包或安装包编译失败时停止发布。
+
+### 缺陷复查（2026-11-01）
+
+- 翻译回填保留精确起点，并按原文消歧；修复同起点或相邻毫秒字幕串译，无法区分的重复字幕保留原样。
+- 翻译冲突校验改用后台快照序号；删句重排后可继续接收正确译文，修改过的原文与手写译文受保护。
+- 人声分离遵守开关与取消状态，成品断点续跑不再重复执行；仅恢复识别结果时仍保留后续救场所需的人声轨处理。
+- 断点指纹补齐人声分离、压实收益阈值和全部压实参数；旧版不完整指纹失效重算，原文件保留。
+- 补齐便携包的配音、人声分离运行器及安装包的人声分离运行器；缺少仓库脚本时停止便携包打包，完整性检查同时覆盖四个运行器。
+- MCP 协议测试同步十种已支持的字幕格式。
+- CLI 装配 ONNX 引擎时与界面一致按模型路径识别模型族，避免将 Paraformer、Dolphin 等误设为 SenseVoice。
+
+### 下载与更新可靠性（2026-11-01）
+
+- 修正 Whisper GGML 文件头的小端字节序校验，正常模型不再被误判为损坏。
+- 模型下载与已就位检测核对文件格式，拒绝错误页和 Git LFS 指针；移除日志中已确认 404 的 Turbo Q5 下载源。
+- 续传记录源、ETag/Last-Modified 与完整长度，核验 Range，换源或版本变化时重新下载；中断文件不再仅凭大小当成完整模型。
+- 压缩包先在临时目录解压与检查入口、伴生文件，再安装；安装中失败恢复旧文件，取消不覆盖可用组件。
+- ONNX 大模型仍必须带齐词表，不再被大小判据误认成无需伴生文件的“自包含程序”，缺件时可正常补下载。
+- 更新下载复用续传与长度校验，并校验官方附件大小/摘要；取消后等待后台任务结束，清除旧安装包状态，隔离迟到的进度事件。
+- 更新只对 Setup 安装包提供安装按钮；便携版显示替换说明，无可用附件时打开发行页面，排除 CLI 附件并保留下载文件原扩展名。
+- 新增本地 HTTP 故障回归，覆盖断线续传、错误响应、版本变化、取消、摘要不符及安装回滚。
+
+### 新增功能
+
+- **跨块上下文取文（切块并行链路的第一步）**：`chunked_whisper::context_tail` 从已转写
+  片段里取**末尾**若干句压成一行（空白/换行折叠、按 `char` 边界截尾、空句跳过），
+  作为「下一块 initial prompt」的素材；3 个单测钉住取尾、折叠与截断。接线与 A/B 未做，
+  原因写在 `docs/切块跨块上下文-设计与测量.md`：本仓库 `whisper.rs:964` 有实测反向
+  证据（`--carry-initial-prompt` 中文 CER 净亏已移除），跨块提示必须先测 CER 与专名
+  一致率再决定默认值，不能凭直觉改 ASR 主链路。
+- **链接导入（`download` 子命令 + yt-dlp 组件）**：`engines::ytdlp` 按既有进程契约
+  （双端抽干、有界等待 30 分钟、取消即 kill）调起 `tools/yt-dlp.exe`，用
+  `--print after_move:filepath` 拿**真实产物路径**（不靠「到目录里找最新文件」猜），
+  `--ffmpeg-location` 指向本项目 `tools` 目录解决音视频分流合并。CLI
+  `download -u <链接> [-o <目录>]`：stdout 只打印路径、进度走 stderr，便于
+  `$p = voice2word download -u URL; voice2word transcribe $p` 串联。「模型与组件」
+  新增 `yt-dlp` 下载项（gh-proxy 双源、`required=false`）。3 个单测覆盖参数组装、
+  路径解析（只取最后一条非 `[...]` 行）、缺组件与非 http 链接的报错。
+  注：官方下载地址已实测可达（HEAD 200，17,880,111 字节）；端到端下载未在本机跑，
+  因为目标站点在当前网络下不可达。
+- **文件夹监听（新素材自动入队）**：`utils::watch_folder` 纯函数扫描器（扩展名白名单、
+  「落定窗口」过滤正在复制/下载的半截文件、跨轮次去重、可选递归），批量队列侧栏新增
+  开关与目录选择，扫描由 UI 协程按 `[watch].interval_secs`（默认 3s）常驻轮询，
+  关闭时只读一次配置、不碰磁盘。默认关闭，配置段 `[watch]`（enabled/dir/recursive/
+  interval_secs/settle_secs）。4 个单测覆盖大小写扩展名、空文件与新鲜文件不落定、
+  只报新文件、目录不存在静默。
+- **智能切片竖屏成片（9:16 + 烧字幕）**：切片卡新增「竖屏成片 9:16」——每条切片导出
+  1080×1920（`scale` 覆盖 + 居中 `crop`），并把该区间字幕按**切片相对时间轴**重写后
+  烧入（逐条临时 ASS，样式/导出模式沿用用户设置）。输入侧 `-ss` + `-t` 定位，编码
+  `libx264 veryfast crf20 + aac 192k + faststart`。真机验证：1080×1920 / h264 / 4.04s，
+  抽帧确认字幕已烧在画面下方居中；3 个参数组装单测钉住裁切串、`-ss` 先于 `-i`、
+  单引号转义与退化时间兜底。设计见 `docs/竖屏切片成片-设计与实现.md`。
+- **断句与词级对齐优化**：长句自动拆分的**切分时刻改用真实词级时间戳**（累计字数
+  最接近切点的词边界），不再一律用「字数比例 × 时长」插值——语速不均时旧算法会把
+  切点落在词中间，拆分后的逐词高亮/卡拉 OK 随之错位；无词级信息时仍回退插值。
+  断句选择引入**标点强度**（句末 3 / 分号冒号 2 / 逗号 1，每级折 2 字符距离折扣）与
+  **括号/引号保护**（内部标点不作为切点），避免「为了近一个字符把整句劈开」和
+  「把（补充说明）从中间切开」。4 个新单测钉住行为，设计见
+  `docs/词级对齐与语义断句-设计与实现.md`（模型级强制对齐列为后续，方案已写明）。
+- **配音闭环（多角色 TTS + 时间轴对齐 + 替换/混音出片）**：`subtitle::dub` 纯函数
+  规划器把「每句自然时长」摆到字幕时间轴上——超窗句子先算所需语速（`--rate` 百分数，
+  2% 容差、上限可配），只对这批句子**第二遍提速合成**；仍超窗则允许溢出到句间空隙，
+  只在会压到下一句起点时留 30ms 余量截断；重叠处相加并 `i16` 饱和，不做归一化。
+  `core::dub_flow` 串起流程（组任务 → 批量合成 → 解码测长 → 二遍提速 → 混音 →
+  `replace_video_audio`），音轨长度取媒体真实时长（避免 `-shortest` 截断画面）。
+  音色按说话人在预设里轮换（`voice_zh`/`voice_en` 可覆盖），文本取译文、空则回退
+  原文。入口：「统计与导出」面板「配音」卡（模式切换 + 进度 + 取消 + 产物提示）、
+  CLI `--dub` / `--dub-mode` / `--dub-bgm`、配置 `[dub]`。设计见
+  `docs/配音闭环-设计与实现.md`，14 个规划/选项单测钉住边界（浮点 ceil、溢出判定、
+  末句不截断、总长兜底）。
+- **智能切片（高光片段自动选取 + 批量成片）**：`subtitle::clips` 纯函数规划器按句界
+  生成 15~90 秒候选窗，按疑问/感叹密度（0.35）、置信度（0.20）、语速甜区（0.15）、
+  章节边界（0.15）、时长贴合（0.15）加权打分、gap 去重后取前 N 条；「统计与导出」
+  面板新增「智能切片」卡：生成建议 → 点行跳转核对 → 一键批量导出视频/音频片段
+  （`{片名}_clip{序号}_{起点秒}s`，复用 `plan_segment_clip`/`export_clip`，一败不
+  断整批）。同输入必得同结果，12 个规划器单测钉住约束与确定性。
+- **人声分离前置（UVR MDX-Net）**：BGM/背景人声重的素材先拆出人声轨再识别。
+  `tools/vocal_sep_runner.py`（numpy 手写 STFT/切块融合/ISTFT + onnxruntime）+
+  `engines::VocalSepEngine`（双端抽干、有界等待、取消、ChildReaper 全套进程契约）；
+  管线新增「阶段 1.2」，成功后所有音频消费点改读人声轨（时间轴不变），失败/缺件
+  **显式告警并回退原始音频**。真机验证：纯 330Hz 正弦压掉 95%，混音组正弦 −90%
+  而语音带保留；runner 自测含 DSP 往返（140dB）、融合常数和、分片≡整段、干/湿声
+  方向四组合。配置 `pipeline.preprocess_vocal_sep`（默认关）+ `paths.vocal_model`，
+  UI「性能设置 → 音频预处理」开关、CLI `--vocal-sep`、「模型与组件」下载项齐备。
+  注意：`UVR-MDX-NET-Inst_*` 是伴奏模型，人声取「原声 − 模型输出」（真机踩过极性
+  反向的坑，已由 `resolve_output_side` 四组合测试钉住）。
+
+### 缺陷修复（第二轮）
+
+- **时间轴终点统一取 `max(end)`**：此前 15 处各自写 `segments.last().end`（假定输入
+  按时间升序），乱序表（手动编辑 / 导入外部字幕）会让 FCPXML / Premiere / 剪映
+  工程时长算短、末句被裁，JSON `total`、历史库 `duration`、播放窗口时长同样失真。
+  新增 `subtitle::timeline_end(_or)` 统一口径并逐处替换；Premiere 总帧同时从 ceil
+  改为与段帧同口径的 round（旧写法「总帧 ceil、段帧 round」会让最后一段越过总帧被
+  Premiere 裁掉）。
+- **剪映草稿写盘原子化 + 注册互斥**：`draft_content.json` / `draft_meta_info.json` /
+  `root_meta_info.json` 从 `File::create` 直写改为 `.part` + rename（进程被杀 / 磁盘
+  满不再留下半截 JSON 让剪映判损坏）；root_meta 的「读改写」加进程内互斥（并发注入
+  互不丢登记）。
+- **流式拆句的分片编号**：whisper / sensevoice 推流出口拆长句后 index 全 0，清单行
+  标识 / 选中跳转 / 翻译定位错乱；新增 `reindex_split_pieces` 从原句 index 起递增。
+- **`plan_time_edit` 兜底注释与实现对齐**：兜底「顶回下限」在前后句都贴脸的死锁
+  场景确实会与后句少量重叠——这是三选一（丢句 / 拒绝微调 / 少量重叠）里最不坏的
+  取舍（重叠由 `optimize_segments` 下次载入消重叠收敛，不丢内容），原注释写的
+  「拒绝微调」与实现不符，已改写并补取舍回归测试。
+- **摘录（`sample_text`）读写同口径**：读侧 `row_to_task` 用未 trim 的
+  `display_text()`、写侧 `summarize_segments` trim 后判空——同一条记录在列表页与
+  缓存命中两条路径上摘录不一致（含「polished 全空白」的判空分歧）。收敛为唯一函数
+  `sample_text_of`，补两路口径一致性回归测试。
+- **`update_task_segments(_json)` 的 duration 口径**：随 `segments_json` 刷新的
+  段末时间同改 `max(end)`（原 `last().end` 乱序时虚低）；`MAX(COALESCE(duration,0), ?2)`
+  的「只增不减」语义**经复核为有意设计**（媒体时长不因删字幕变短），未改动。
+- 复核排除两项疑似缺陷：`sync_segments_to_db` 吞写库错误（此前已修，见该函数
+  doc）；`find_cached_task` 判空走反序列化（调用方需要 segments 本体，且「最新行
+  为空 = 用户删空字幕」时判空**不可**下推 SQL——否则旧字幕会被缓存复活）。
+
+### 缺陷修复（第一轮）
+
+- **拆句不再丢定稿锁与多语言包**。自动拆句（`optimize_segments` / 流式预览）与手动
+  拆句（拆分选中句）此前都把 `locked` 清成 `false`，自动拆句还把 `translations`
+  语言包整张丢弃：锁定的长句被拆开后悄悄解锁，「重译全部」即可覆盖用户校对定稿；
+  语言包丢了之后切语言再也切不回旧译文。现在两半继承 `locked`、语言包按同一比例
+  切开，两处共用 `split_translations_pack` 一份实现。
+- **SRT 导入不再静默丢行**。cue 正文夹空行（多段台词 / 歌词换段）会被 `split_blocks`
+  拦腰切开、后半截当坏块丢弃。现在无时间轴的正文续段并回原 cue（保留段落分隔）；
+  首行是纯数字序号行的孤儿块仍按坏块丢弃（历史行为不变，两种块的区分依据见
+  `merge_continuation_blocks`）。
+
+### 取消与子进程
+
+- **取消不再误报「未能识别出任何有效字幕」**。终态事件此前只认 `cancel_requested`
+  （用户点「终止」），管线被其它路径取消时会落进空结果分支：吓用户一次，还把队列项
+  记成失败。现在取消判定连管线自身的取消位一起看（Finished / Error 两分支同口径）。
+- **TTS（Edge-TTS）旁路纳入统一有界等待**。修前 `cmd.output()` 无限期阻塞（联网服务，
+  网络一挂就是永久卡死）且无法取消。现在：等待预算 60s + 每 20 字 1s（封顶 300s）、
+  超时杀进程、可取消（`cancel` / `begin_task`）、stdout/stderr 双端抽干防管道互等、
+  Python 环境清洗与 punc/sensevoice 同口径、临时文件名带进程号防并发覆盖。
+- **`cancel_async` 连点去重**：杀进程动作收敛为单条后台线程，在飞期间重复点击直接
+  返回（取消标志照常置位），线程收尾复位。
+- **标点协议容忍缺字段**：runner 输出的 `count` / `elapsed_sec` 是元信息，缺键不再让
+  整批「解析标点输出 JSON 失败」、全部句子退回无标点原文（`results` 缺失仍报错）。
+- **`TaskPipeline::set_artifact_dir` / `artifact_dir` 中毒容忍**与全仓口径一致
+  （`unwrap_or_else(into_inner)`）：一次持锁 panic 不再让断点续跑开关连环 panic。
+- **`supports_temperature` 按标识段匹配**：`o1x-custom` 这类第三方模型名不再被
+  `starts_with("o1")` 误伤，`openai/o3-mini` 这类带前缀部署名不再漏判（漏判的代价是
+  服务端 400 整批失败）。
+
+### 性能与体验
+
+- **同步落库不再 2ms 轮询空转**。关窗 / 换工程 / 导出等在飞后台写时，渲染线程原来
+  按 2ms 轮询最多 2s；现在用 Condvar 停车位（`PendingWait`）等归零唤醒（通知方持锁，
+  不丢唤醒）。顺序保证（写入闸 + 同工程水位）与超时语义不变。
+
+### 代码结构治理（行为不变）
+
+- **`ChildReaper` 四份副本合一**：`engines/punc.rs` 的完整版与 `core/pipeline.rs` 里三份
+  内联在函数体中的迷你版，收敛为 `utils/child_registry.rs` 一份；改一处不再漏三处。
+- **Esc 优先级抽成可单测的纯函数**：`ui/dialogs/keyboard::esc_target`（与回车侧
+  `topmost_dialog` 同一套模式），`ui/mod.rs` 的 `CancelOrClose` 手写 if 链改为按判定
+  分发。历史顺序逐层有测试钉住，含两处「与渲染 z 序不一致」的既有行为说明（命令面板
+  先于速查面板、输入框聚焦只跳过硬件引导）。
+- **whisper.rs 模型预检合一**：重复的两遍 `exists` 与两层 `.onnx` 守卫（两套文案）
+  收敛为「存在性 → 扩展名分诊」一次判定，`.onnx` 保留对症文案（引擎/档位不配套，
+  不是模型损坏）。
+- **`state.rs`（约 8750 行）按主题拆分为 `src/app/state/` 目录模块**：
+  `mod`（类型 + 配置/工作区域）、`queue`（批量队列 + 步骤看板）、`writes`（字幕后台写入
+  子系统）、`edit`（撤销/拆合/查找替换/清理）、`translate`（翻译合并）、`tests` 两个
+  测试文件。纯代码移动 + 必要的 `pub(super)` 可见性调整，公开路径一个未变
+  （`crate::app::state::…` 全部可用），1746 测试全绿为门禁。
+- **thread_local 游离状态收敛进窗口字段**：`editor.rs` 的五个线程局部静态
+  （替换面板三开关、时间轴平移量/手动锚点/拖拽会话/点击守卫）改为
+  `MainWindow::replace_toggles` / `MainWindow::timeline_session`，字段保留 `Cell`
+  语义使所有签名零改动。收益：**每窗口实例一份**——thread_local 是每线程一份，
+  同线程的第二个窗口（独立播放窗）与并行测试会读到别人的会话。键盘层的焦点句柄表
+  （`KEYBOARD` / `HOTWORDS_INPUT`）是跨帧身份缓存而非会话态，保留并注明理由。
+- **`run_with_options`（约 1310 行）拆成 9 个阶段函数**：`run_extract_audio_stage` /
+  `resolve_engine_setup` / `run_preprocess_stage` / `prepare_audio_channel` /
+  `run_rescue_stage` / `apply_punctuate_polish` / `run_diarization_stage` /
+  `export_final_output` / `report_stage_metrics`，配 5 个输出契约结构体
+  （EngineSetup / PreprocessOutcome / RescueOutcome / PolishOutcome / StageMetricsInput）。
+  主函数降到约 559 行；事件发送次数与顺序、取消检查点、断点续跑状态机原样保留。
+- **`render_subtitle_inspector`（约 2170 行单函数）拆成 8 个渲染子方法**：
+  搜索/过滤行、子表头、虚拟列表容器、单行 item、行内就地编辑框、面板标头、
+  样式卡、单句编辑卡。主函数降到约 108 行编排层；元素树、id、修饰符链逐一对齐原实现。
+- **`actions.rs` 重复骨架收敛**：15 处「rfd 对话框 → 后台干活 → 回写」迁入
+  `run_after_dialog`（DialogSpec 纯数据声明对话框、线程策略由调用点自定），
+  8 处「后台干活 → 回写」迁入 `spawn_background_work`；18 处异形 spawn（事件泵 /
+  进度通道 / 长任务线程 / 嵌套 spawn）如实保留不动线程语义。MainWindow 字段零增减。
+- **ci.yml 的 clippy 基线注释对齐现状**：「约 34 warning、job 会红」是历史过渡期说法，
+  基线已 0 warning，注释改为现状并保留过渡期绕法作历史备注。
+
+### 文档与集成资产对齐实现
+
+- `integrations/voice2word-skill/`、`integrations/mcp-server/`、`docs/headless.md`、
+  `docs/企业级升级路线图.md`、`docs/集成说明-CLI与MCP.md`、`README.md` 与源码对齐：
+  格式清单 7→10 种（srt/ass/vtt/json/txt/ttml/ttal/sbv/lrc/txt-ts）、`--translate`
+  已真翻译（离线 Qwen / 在线 API）、exe 定位改为 `voice2word-cli.exe` 优先（GUI 子系统
+  重定向拿空输出）、输入=文件或目录（目录批量）、`--tool-call` 实际两次网络请求、
+  路线图 P0-4 与 release.yml 对齐（无 `src/bin/setup.rs`）。
+
+---
+
 ## 0.2.26
 
 本轮专治「**本机好使、别人电脑不好使**」：打包缺件、只读目录启动即死、

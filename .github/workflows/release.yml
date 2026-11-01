@@ -72,6 +72,10 @@ jobs:
             throw "版本号不匹配！Git Tag 为 $tagVersion，但 Cargo.toml 为 $cargoVersion。请统一版本号后再打 Tag 发布！"
           }
 
+      - name: Packaging archive regression tests
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/test_release_packaging.ps1
+
       # ---------------------------------------------------------------
       # 发布前最低验证：lib 单测（单线程，规避已知 wgpu 偶发崩溃）。
       # ---------------------------------------------------------------
@@ -191,6 +195,16 @@ jobs:
           if (-not (Test-Path $setupExe)) {
             throw "Inno Setup 编译完成但未找到产物：$setupExe"
           }
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败（exit=$LASTEXITCODE）" }
+
+          pwsh -NoProfile -File scripts/package_release.ps1 -SkipBuild
+          if ($LASTEXITCODE -ne 0) { throw "便携包打包失败（exit=$LASTEXITCODE）" }
+          $assets = @($setupExe, 'dist/voice2word.exe', 'dist/voice2word-cli.exe', "dist/voice2word-v$version-win64-lite.zip")
+          $checksums = foreach ($asset in $assets) {
+            $hash = Get-FileHash -LiteralPath $asset -Algorithm SHA256
+            '{0}  {1}' -f $hash.Hash.ToLowerInvariant(), (Split-Path -Leaf $asset)
+          }
+          Set-Content -LiteralPath dist/SHA256SUMS.txt -Value $checksums -Encoding utf8
           Write-Host "Release Assets prepared successfully:" -ForegroundColor Green
           Get-ChildItem dist
 
@@ -203,16 +217,26 @@ jobs:
           name: Voice2Word ${{ github.ref_name }}
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: true
           generate_release_notes: true
           files: |
             dist/Voice2Word-*-Setup.exe
             dist/voice2word.exe
             dist/voice2word-cli.exe
+            dist/voice2word-v*-win64-lite.zip
+            dist/SHA256SUMS.txt
           body: |
+            ### 本次修复
+            - 修复正常 Whisper 模型被误判损坏、下载错误页、续传混入不同版本及更新取消竞态。
+            - 修复字幕翻译回填串译、删句重排错位，保留用户编辑与手写译文。
+            - 修复人声分离开关与断点缓存参数校验，补齐发布包的运行脚本。
+
             ### 📦 发行文件说明
             • Voice2Word-${{ github.ref_name }}-Setup.exe：标准向导安装包（推荐），支持自定义安装目录与创建桌面快捷方式
-            • voice2word.exe：绿色便携版，单文件直接运行（免安装）
+            • voice2word-${{ github.ref_name }}-win64-lite.zip：便携版，含启动运行库、CLI 与运行脚本，解压到可写目录后运行；模型和外部工具在应用内补齐
+            • voice2word.exe：已有便携目录升级用，替换前退出程序，新用户请下载安装包或 ZIP
             • voice2word-cli.exe：后台命令行无头程序，供脚本与自动化批处理调用
+            • SHA256SUMS.txt：发行文件 SHA-256 校验值
 
             ### 💡 首次使用提示
             1. 推荐下载并运行 Voice2Word-Setup 安装向导完成安装；

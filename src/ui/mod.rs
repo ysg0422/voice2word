@@ -722,6 +722,27 @@ pub struct MainWindow {
     pub(crate) focused_replace_field: Option<ReplaceField>,
     /// 替换输入框的光标位置（同一时刻只有一个框聚焦，共用一份）
     pub(crate) replace_cursor: usize,
+    /// 替换面板「正则 / 整词 / 范围」三项会话态（本轮结构治理从 thread_local 收敛而来，
+    /// 定义在 [`editor::ReplacePanelToggles`]；字段继续用 `Cell`，渲染路径 `&self` 读、
+    /// 点击处理器写，签名一律不动）。
+    pub(crate) replace_toggles: editor::ReplacePanelToggles,
+    /// 时间轴拖拽 / 平移的交互会话（定义在 [`editor::TimelineInteraction`]，同上从
+    /// thread_local 收敛而来：每窗口实例一份，多窗口 / 并行测试不再互相串）。
+    pub(crate) timeline_session: editor::TimelineInteraction,
+    /// 智能切片候选（`subtitle::clips` 的规划产物；「生成建议」后填，导出遍历它）。
+    pub(crate) clips: Vec<crate::subtitle::clips::ClipCandidate>,
+    /// 智能切片卡的提示行（`(是否成功, 文案)`）。
+    pub(crate) clips_notice: Option<(bool, String)>,
+    /// 切片规划是否在后台生成中（防重复派发）。
+    pub(crate) clips_generating: bool,
+    /// 配音是否在跑（挡重复点击，同时作为进度轮询的存活判据）。
+    pub(crate) dub_busy: bool,
+    /// 配音卡的提示行（`(是否成功, 文案)`）。
+    pub(crate) dub_notice: Option<(bool, String)>,
+    /// 配音进度（阶段文案, 0.0~1.0），由后台线程写、UI 轮询读取。
+    pub(crate) dub_progress: Option<(String, f32)>,
+    /// 配音取消位（仅任务在跑时存在；取消后置位并清空）。
+    pub(crate) dub_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// 可保存 / 复用 / 导入导出的替换规则集（磁盘上是与 `config.toml` 同目录的
     /// `replace_rules.json`，见 [`ReplaceRuleSet`]）。
     pub(crate) replace_rule_sets: Vec<ReplaceRuleSet>,
@@ -1506,7 +1527,7 @@ pub(crate) fn glossary_violations_cached(
 }
 
 impl MainWindow {
-    pub fn new(state: AppState, cx: &mut Context<Self>) -> Self {
+    pub fn new(mut state: AppState, cx: &mut Context<Self>) -> Self {
         let metrics_rx = crate::utils::SystemMonitor::spawn_background_monitor();
         let text_focus = cx.focus_handle();
         let subtitle_search_focus = cx.focus_handle();
@@ -1529,6 +1550,9 @@ impl MainWindow {
         // 导出格式同样是长期偏好，也必须在 `state` 被 move 进结构体之前取出。
         let export_format_initial =
             EditorExportFormat::from_config_str(&state.config.ui.export_format);
+        // 启动时的一次性提示（如历史库隔离重建）：与「另一个实例在运行」共用
+        // 同一条中性提示条；有启动事件时优先展示它。
+        let startup_notice = state.startup_notice.take();
         // 启动即绑定全局子进程作业对象：此后所有转写/转码/预览子进程都挂在它名下，
         // 本进程一旦消失（正常退出、关窗、崩溃、被任务管理器结束），Windows 会连根
         // 清掉整棵进程树。这是唯一能覆盖「父进程被强杀」的兜底 —— 单靠退出路径里的
@@ -1563,9 +1587,12 @@ impl MainWindow {
             update_modal_open: false,
             // 启动时若检测到另一个实例，直接把提示摆到界面上（而不是只写日志）。
             // 用户不会去翻 logs/，但一定会看到窗口顶部那条横幅。
-            notice: crate::utils::other_instance_running().then(|| {
-                "检测到另一个 Voice2Word 实例正在运行：两个窗口会同时写同一份历史库，".to_string()
-                    + "互相覆盖对方的编辑。建议只保留一个窗口。"
+            notice: startup_notice.or_else(|| {
+                crate::utils::other_instance_running().then(|| {
+                    "检测到另一个 Voice2Word 实例正在运行：两个窗口会同时写同一份历史库，"
+                        .to_string()
+                        + "互相覆盖对方的编辑。建议只保留一个窗口。"
+                })
             }),
             last_export_path: None,
             translate_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1617,6 +1644,15 @@ impl MainWindow {
             replace_with_focus: cx.focus_handle(),
             focused_replace_field: None,
             replace_cursor: 0,
+            replace_toggles: editor::ReplacePanelToggles::new(),
+            timeline_session: editor::TimelineInteraction::default(),
+            clips: Vec::new(),
+            clips_notice: None,
+            clips_generating: false,
+            dub_busy: false,
+            dub_notice: None,
+            dub_progress: None,
+            dub_cancel: None,
             replace_rule_sets,
             replace_rule_selected,
             replace_rules_open: false,
@@ -1698,7 +1734,63 @@ impl MainWindow {
             window.ensure_waveform(cx);
         }
 
+        window.start_watch_folder_loop(cx);
+
         window
+    }
+
+    /// 文件夹监听的常驻轮询。
+    ///
+    /// 只在 `[watch].enabled = true` 时真正扫目录；关闭状态下每轮只是读一次配置，
+    /// 开销可以忽略。用 UI 协程而不是独立线程：入队要改 `AppState` 并触发渲染，
+    /// 回到 UI 线程反而更简单，也不会因为窗口关闭留下野线程。
+    fn start_watch_folder_loop(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            // 间隔取配置值（下限 1 秒）；配置改了下一轮就生效。
+            let interval = this
+                .update(cx, |this, _| {
+                    this.state.config.watch.interval_secs.clamp(1, 3600)
+                })
+                .unwrap_or(3);
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(interval))
+                .await;
+            let keep = this
+                .update(cx, |this, cx| {
+                    if !this.state.config.watch.enabled {
+                        return true;
+                    }
+                    let dir = this.state.config.watch.dir.trim().to_string();
+                    if dir.is_empty() {
+                        return true;
+                    }
+                    let settle =
+                        std::time::Duration::from_secs(this.state.config.watch.settle_secs.max(1));
+                    let found = crate::utils::watch_folder::scan_watch_dir(
+                        std::path::Path::new(&dir),
+                        this.state.config.watch.recursive,
+                        &mut this.state.watch_seen,
+                        std::time::SystemTime::now(),
+                        settle,
+                    );
+                    if found.is_empty() {
+                        return true;
+                    }
+                    let added = this.state.enqueue_files(found);
+                    if added > 0 {
+                        this.state.persist_queue();
+                        this.notice =
+                            Some(format!("监听目录「{dir}」新增 {added} 个文件到批量队列"));
+                        cx.notify();
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        .detach();
     }
 
     /// 检测上次运行的崩溃并生成一条待显示的中性提示（无崩溃则 `None`）。
@@ -3090,83 +3182,74 @@ impl Render for MainWindow {
             )
             .on_action(
                 cx.listener(|this, _: &shortcuts::CancelOrClose, window, cx| {
-                    // 优先级：确认弹窗 → 命令面板 → 浮层 → 导出下拉 → 搜索框 → 终止任务。
-                    // Esc 在没有可取消对象时不应有任何副作用。
+                    // Esc 优先级判定收敛在 `dialogs::keyboard::esc_target`（纯函数，
+                    // 逐层有测试钉住）：确认弹窗 → 硬件引导 → 命令面板 → 速查面板 →
+                    // 完成/基准框 → 下拉 → 搜索框清空 → 终止任务。
                     //
-                    // 确认弹窗排在最前，是因为它是最上层模态，且「清空批量队列」这类
-                    // 待确认操作**本身**会终止正在跑的转写：少了这一刀，用户在这个确认框上
-                    // 按 Esc 想关掉弹窗，弹窗纹丝不动、转写却被穿透终止了——弹窗上的
-                    // 「取消」按钮反而成了唯一的正确出口。
-                    if this.confirm_dialog.take().is_some() {
-                        cx.notify();
-                        return;
+                    // 历史教训都在那边的测试注释里：确认框必须最先（它的待确认操作本身
+                    // 会终止转写，漏了就是穿透误伤）；命令面板必须先于「终止任务」
+                    // （面板里按 Esc 只该关面板）。改优先级请改 `esc_target`，别在本
+                    // 分支里再插 if——这条链以前就是手写 if 串，与键盘层各写各的。
+                    let ctx = dialogs::keyboard::EscContext {
+                        confirm: this.confirm_dialog.is_some(),
+                        hardware_setup: !this.state.config.gpu.hardware_init_completed,
+                        input_focused: this.any_input_focused(window, cx),
+                        command_palette: this.command_palette.is_some(),
+                        shortcuts_help: this.shortcuts_help_open,
+                        completion: this.completion_dialog.is_some(),
+                        benchmark: this.benchmark_dialog.is_some(),
+                        dropdown_open: this.is_export_dropdown_open
+                            || this.outline_dropdown_open
+                            || this.bg_style_dropdown_open
+                            || this.library_sort_dropdown_open,
+                        search_focused: this.subtitle_search_focus.contains_focused(window, cx),
+                        search_has_text: !this.subtitle_search.is_empty(),
+                    };
+                    match dialogs::keyboard::esc_target(ctx) {
+                        dialogs::keyboard::EscTarget::Confirm => {
+                            this.confirm_dialog.take();
+                            cx.notify();
+                        }
+                        // 硬件引导框与确认框同为阻塞模态，但除了「我有 GPU / 无 GPU」还
+                        // 需要一个「稍后再说」出口：Esc 与该按钮同义——只把向导标完成，
+                        // 不动硬件档位、不跑检测（输入框聚焦时由 esc_target 跳过）。
+                        dialogs::keyboard::EscTarget::HardwareSetup => {
+                            this.state.defer_hardware_setup();
+                            cx.notify();
+                        }
+                        dialogs::keyboard::EscTarget::CommandPalette => {
+                            this.close_command_palette(cx);
+                        }
+                        dialogs::keyboard::EscTarget::ShortcutsHelp => {
+                            this.close_shortcuts_help(cx);
+                        }
+                        dialogs::keyboard::EscTarget::CompletionOrBenchmark => {
+                            // 保持历史短路语义：完成框在场时只关它，不顺手把基准框也摘掉。
+                            if this.completion_dialog.take().is_some()
+                                || this.benchmark_dialog.take().is_some()
+                            {
+                                cx.notify();
+                            }
+                        }
+                        dialogs::keyboard::EscTarget::Dropdowns => {
+                            this.is_export_dropdown_open = false;
+                            this.outline_dropdown_open = false;
+                            this.bg_style_dropdown_open = false;
+                            this.library_sort_dropdown_open = false;
+                            cx.notify();
+                        }
+                        // 搜索框聚焦且有关键字时 Esc 先清空过滤词：全局键位把 escape 绑给
+                        // 了本动作，分发早于 `on_key_down` 且命中后停止冒泡，搜索框自己的
+                        // Esc 清空分支收不到事件，必须在这里补一刀。
+                        dialogs::keyboard::EscTarget::SearchClear => {
+                            this.subtitle_search.clear();
+                            this.subtitle_search_cursor = 0;
+                            cx.notify();
+                        }
+                        dialogs::keyboard::EscTarget::CancelProcessing => {
+                            this.request_cancel_processing(cx);
+                        }
                     }
-                    // 首次启动硬件引导框：它与确认框一样是**阻塞式模态**（遮罩 `occlude()`），
-                    // 但此前只有「我有 GPU / 无 GPU」两个出口，Esc 完全关不掉——想先看看
-                    // 界面再决定的用户被逼着表态。这里补一刀，与「稍后再说」按钮同义：
-                    // 只把向导标记为完成，不动硬件档位、不跑检测。
-                    //
-                    // 焦点在输入框时不生效（同裸键那套约定）：那种场合 Esc 的语义是
-                    // 「清空当前输入」，不该顺手关掉整个模态。
-                    if !this.state.config.gpu.hardware_init_completed
-                        && !this.any_input_focused(window, cx)
-                    {
-                        this.state.defer_hardware_setup();
-                        cx.notify();
-                        return;
-                    }
-
-                    // 命令面板紧随其后（渲染顺序上它也在确认框之下、其它浮层之上）。
-                    // 为什么不是最前：确认框是**阻塞式**的，出现时用户除了「确认/取消」
-                    // 没有别的出口；面板则是随时可关的轻量浮层，而且面板打开时遮罩把
-                    // 底下界面全挡住、用户根本点不出新的确认框，两者实际不会同时在场。
-                    // 万一并存（例如某条命令间接触发了确认框），先关掉视觉上更上层的
-                    // 确认框才符合「Esc 关掉最上面那层」的直觉。
-                    // 为什么必须在「终止任务」之前：面板打开时 Esc 的语义是「关面板」，
-                    // 少了这一刀，用户在面板里按 Esc 会连面板带正在跑的转写一起终止
-                    // （面板本身并没有「终止」这个含义，属于典型的穿透误伤）。
-                    if this.command_palette.is_some() {
-                        this.close_command_palette(cx);
-                        return;
-                    }
-                    // 速查面板比命令面板「更薄」（纯展示、无输入焦点），关它的优先级
-                    // 也低一格，排在命令面板之后、确认框之前。
-                    if this.shortcuts_help_open {
-                        this.close_shortcuts_help(cx);
-                        return;
-                    }
-                    if this.completion_dialog.take().is_some()
-                        || this.benchmark_dialog.take().is_some()
-                    {
-                        cx.notify();
-                        return;
-                    }
-                    if this.is_export_dropdown_open
-                        || this.outline_dropdown_open
-                        || this.bg_style_dropdown_open
-                        || this.library_sort_dropdown_open
-                    {
-                        this.is_export_dropdown_open = false;
-                        this.outline_dropdown_open = false;
-                        this.bg_style_dropdown_open = false;
-                        this.library_sort_dropdown_open = false;
-                        cx.notify();
-                        return;
-                    }
-                    // 搜索框聚焦且有关键字时，Esc 先清空过滤词。
-                    // 全局键位表把 escape 绑给了本动作，而 GPUI 的动作分发早于 `on_key_down`
-                    // 且命中动作后默认停止冒泡，搜索框自己的 Esc 清空分支根本收不到事件。
-                    // 不在这里补一刀，用户在搜索框里按 Esc 不但清不掉过滤词，
-                    // 还会顺手把正在跑的转写给终止掉（界面提示「Esc 清空」与实际行为不符）。
-                    if this.subtitle_search_focus.contains_focused(window, cx)
-                        && !this.subtitle_search.is_empty()
-                    {
-                        this.subtitle_search.clear();
-                        this.subtitle_search_cursor = 0;
-                        cx.notify();
-                        return;
-                    }
-                    this.request_cancel_processing(cx);
                 }),
             )
             .on_action(

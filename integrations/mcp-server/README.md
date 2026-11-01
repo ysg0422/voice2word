@@ -22,7 +22,7 @@ python integrations\mcp-server\voice2word_mcp.py
 
 ```powershell
 # 显式指定 voice2word 可执行文件
-python integrations\mcp-server\voice2word_mcp.py --exe <repo>\target\release\voice2word.exe
+python integrations\mcp-server\voice2word_mcp.py --exe <repo>\target\release\voice2word-cli.exe
 ```
 
 也可以用环境变量 `VOICE2WORD_EXE` 达到同样效果（详见第 6、7 节）。
@@ -66,7 +66,7 @@ MCP 客户端通过 `command` + `args` 拉起本服务器，因此注册信息�
     "voice2word": {
       "command": "python",
       "args": ["<repo>\\integrations\\mcp-server\\voice2word_mcp.py"],
-      "env": { "VOICE2WORD_EXE": "<repo>\\target\\release\\voice2word.exe" }
+      "env": { "VOICE2WORD_EXE": "<repo>\\target\\release\\voice2word-cli.exe" }
     }
   }
 }
@@ -121,7 +121,7 @@ Codex 的 MCP 服务器配置放在 `~/.codex/config.toml` 的 `[mcp_servers]` �
 command = "python"
 args = ["<repo>/integrations/mcp-server/voice2word_mcp.py"]
 # 可选：固定可执行文件，等价于命令行 --exe
-# env = { VOICE2WORD_EXE = "<repo>/target/release/voice2word.exe" }
+# env = { VOICE2WORD_EXE = "<repo>/target/release/voice2word-cli.exe" }
 ```
 
 如果 `python` 不在 PATH 中，把 `command` 换成解释器绝对路径，例如
@@ -170,7 +170,7 @@ $lines | python integrations\mcp-server\voice2word_mcp.py
 **`tools/list`**（恰好 3 个工具）
 
 ```json
-{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"transcribe","description":"...","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"output":{"type":"string"},"format":{"type":"string","enum":["srt","ass","vtt","json","txt","ttml","ttal"]},"language":{"type":"string"},"threads":{"type":"integer","minimum":1},"polish":{"type":"boolean"},"resume":{"type":"boolean"},"artifact_dir":{"type":"string"}},"required":["input"]}},{"name":"probe","description":"...","inputSchema":{"type":"object","properties":{}}},{"name":"version","description":"...","inputSchema":{"type":"object","properties":{}}}]}}
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"transcribe","description":"...","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"output":{"type":"string"},"format":{"type":"string","enum":["srt","ass","vtt","json","txt","ttml","ttal","sbv","lrc","txt-ts"]},"language":{"type":"string"},"threads":{"type":"integer","minimum":1},"polish":{"type":"boolean"},"resume":{"type":"boolean"},"artifact_dir":{"type":"string"}},"required":["input"]}},{"name":"probe","description":"...","inputSchema":{"type":"object","properties":{}}},{"name":"version","description":"...","inputSchema":{"type":"object","properties":{}}}]}}
 ```
 
 **`tools/call` → `probe`**
@@ -221,7 +221,7 @@ $lines | python integrations\mcp-server\voice2word_mcp.py
 | --- | --- | --- | --- | --- |
 | `input` | string | 是 | 输入音视频文件路径 | 位置参数 `<输入文件>` |
 | `output` | string | 否 | 输出字幕文件路径；缺省时与输入同目录、同名、换成目标格式后缀 | `-o` / `--output` |
-| `format` | string（枚举 `srt` / `ass` / `vtt` / `json` / `txt` / `ttml` / `ttal`） | 否 | 输出字幕格式，默认 `srt` | `--format` |
+| `format` | string（枚举 `srt` / `ass` / `vtt` / `json` / `txt` / `ttml` / `ttal` / `sbv` / `lrc` / `txt-ts`） | 否 | 输出字幕格式，默认 `srt` | `--format` |
 | `language` | string | 否 | 源语言代码（如 `zh` / `en` / `ja` / `auto`），默认取 `config.toml` | `--lang` / `--language` |
 | `threads` | integer（最小值 1） | 否 | 推理线程数，覆盖 `config.toml` | `--threads` |
 | `polish` | boolean | 否 | 强制开启润色 / 标点，默认沿用 `config.toml` | `--polish` |
@@ -297,10 +297,16 @@ $lines | python integrations\mcp-server\voice2word_mcp.py
 
 1. 启动参数 `--exe <路径>`；
 2. 环境变量 `VOICE2WORD_EXE`；
-3. 仓库内 `target/release/voice2word.exe`；
-4. 仓库内 `target/debug/voice2word.exe`；
-5. 仓库根目录下的 `voice2word.exe`；
-6. PATH 上的 `voice2word`。
+3. 仓库内 `target/release/voice2word-cli.exe`；
+4. 仓库内 `target/debug/voice2word-cli.exe`；
+5. 仓库内 `target/release/voice2word.exe`；
+6. 仓库内 `target/debug/voice2word.exe`；
+7. 仓库根目录下的 `voice2word-cli.exe`；
+8. 仓库根目录下的 `voice2word.exe`；
+9. PATH 上的 `voice2word-cli`，再退回 `voice2word`。
+
+自动候选**控制台构建 `voice2word-cli.exe` 优先**、GUI 构建 `voice2word.exe` 兜底：
+GUI 子系统程序在输出重定向下拿不到 stdout（os error 232），而两者命令完全一致。
 
 因此开发期直接 `cargo build --release` 后无需任何配置即可被找到；
 若把可执行文件放到别处，用 `--exe` 或 `VOICE2WORD_EXE` 显式指定：
@@ -308,7 +314,7 @@ $lines | python integrations\mcp-server\voice2word_mcp.py
 补充说明：
 
 - 第 1、2 项（`--exe` / `VOICE2WORD_EXE`）属于**显式指定**，只要文件存在就直接采用，不再做任何检查。
-- 第 3~6 项是自动候选。若某个候选存在但**不支持 CLI**（例如仓库里遗留的、只带图形界面的旧构建：
+- 第 3~9 项是自动候选。若某个候选存在但**不支持 CLI**（例如仓库里遗留的、只带图形界面的旧构建：
   它不认 `transcribe` 子命令，被选中后会弹窗挂住），会被自动跳过，改用顺序中的下一个候选。
   跳过判断是纯读文件检查（比对二进制里的 CLI 标记字符串），**不启动进程、无副作用**。
 - 若所有候选都没通过该检查，则**回退**为顺序中的第一个存在的候选，即完全不筛选。
@@ -319,17 +325,17 @@ $lines | python integrations\mcp-server\voice2word_mcp.py
 
 ```powershell
 # 方式一：启动参数
-python integrations\mcp-server\voice2word_mcp.py --exe <repo>\target\release\voice2word.exe
+python integrations\mcp-server\voice2word_mcp.py --exe <repo>\target\release\voice2word-cli.exe
 
 # 方式二：环境变量（当前会话）
-$env:VOICE2WORD_EXE = "<repo>\target\release\voice2word.exe"
+$env:VOICE2WORD_EXE = "<repo>\target\release\voice2word-cli.exe"
 python integrations\mcp-server\voice2word_mcp.py
 ```
 
 在客户端配置里则写成：
 
 ```json
-"env": { "VOICE2WORD_EXE": "<repo>\\target\\release\\voice2word.exe" }
+"env": { "VOICE2WORD_EXE": "<repo>\\target\\release\\voice2word-cli.exe" }
 ```
 
 ## 7. 底层 CLI 事实
@@ -337,7 +343,7 @@ python integrations\mcp-server\voice2word_mcp.py
 MCP 工具最终调用的是 Voice2Word 的无头模式：
 
 ```text
-voice2word transcribe <输入文件> [-o <输出>] [--format ...] [--lang <代码>] [--threads N] [--polish] [--resume] [--artifact-dir <路径>]
+voice2word transcribe <输入文件或目录> [-o <输出>] [--format ...] [--lang <代码>] [--threads N] [--polish] [--resume] [--artifact-dir <路径>]
 
 # 本机自检（只读：不改配置、不写字幕、不访问网络），逐项结论 + 修复建议
 voice2word doctor [--json]
@@ -345,7 +351,8 @@ voice2word doctor [--json]
 # 顶层形式：voice2word [--gui] | --help/-h | --version/-V（另接受裸子命令 help / version）
 ```
 
-`transcribe` 另支持 `--translate <语言>`（目标语言，当前仅记录、翻译阶段未接入）与
+`transcribe` 另支持 `--translate <语言>`（目标语言，会真正翻译：离线 Qwen / 在线 API 两条链路，
+由 `--translate-mode` 或 `config.toml` 的 `[translate].mode` 选择，`--glossary` 附加术语表）与
 `--model <路径>`（覆盖 Whisper 模型文件）；顶层还有 `--gui`（启动图形界面，无参数时等同）、
 `--help`/`-h`、`--version`/`-V`。这些选项**不在** MCP `transcribe` 工具的入参里，需要时请直接调用 CLI。
 

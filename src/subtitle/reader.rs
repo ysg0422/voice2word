@@ -104,7 +104,9 @@ impl SubtitleFormat {
 pub fn parse_srt(content: &str) -> Result<Vec<Segment>> {
     let text = normalize_newlines(strip_bom(content));
     let mut segments = Vec::new();
-    for block in split_blocks(&text) {
+    // 先把「正文里夹空行」的 cue 并回整块，再逐块解析：见
+    // [`merge_continuation_blocks`]。
+    for block in merge_continuation_blocks(split_blocks(&text)) {
         if let Some(seg) = parse_srt_block(&block) {
             segments.push(seg);
         }
@@ -287,6 +289,50 @@ fn split_blocks(content: &str) -> Vec<Vec<&str>> {
     blocks
 }
 
+/// 把「没有时间轴行的块」并回上一个有效块的正文，修「cue 正文里夹空行丢行」。
+///
+/// SRT 的 cue 以空行分隔，但手改/第三方工具产出的文件里**正文夹空行**很常见
+/// （多段台词、歌词换段）。[`split_blocks`] 会把这种 cue 拦腰切成两块，后半截
+/// 没有时间轴行，按坏块跳过就**静默丢行**。本仓库的导出侧写 SRT 前会折叠空行
+/// （见 writer），所以只有导入**外部**文件会踩到。
+///
+/// 与「缺时间轴的坏 cue」的区分：坏 cue 的块首行是**纯数字序号行**（SRT 的 cue
+/// 约定），正文续段则是裸文本。首行纯数字的孤儿块保持独立、仍按坏块丢弃——
+/// 这是历史行为（见 `srt_skips_malformed_blocks_but_keeps_good_ones`），不能把它
+/// 的垃圾文本并进上一条正文。代价：正文续段若恰好以「一行纯数字」开头会被误判，
+/// 属可接受的取舍（正文极少出现独占一行的纯数字）。
+///
+/// 合并时插回一个空行，保留段落分隔；文件开头没有前块可并的孤儿块仍按坏块
+/// 丢弃（多为封面/说明文字）。只给 SRT 用：WebVTT 有 NOTE/STYLE/REGION 元数据块
+/// （本身就是无时间轴的多行块），同样的合并会把注释并进上一条 cue 的正文。
+fn merge_continuation_blocks(blocks: Vec<Vec<&str>>) -> Vec<Vec<&str>> {
+    let mut merged: Vec<Vec<&str>> = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        if block.iter().any(|l| l.contains("-->")) {
+            merged.push(block);
+        } else if looks_like_cue_start(&block) {
+            // 缺时间轴的坏 cue：独立成块，交给块解析按坏块丢弃。
+            merged.push(block);
+        } else if let Some(prev) = merged.last_mut() {
+            prev.push(""); // 还原被 split_blocks 吃掉的那个空行
+            prev.extend(block);
+        }
+    }
+    merged
+}
+
+/// 块的首行是否是 cue 序号行（纯数字）：是则这是一条**缺时间轴的坏 cue**，
+/// 而不是上一条 cue 的正文续段（见 [`merge_continuation_blocks`]）。
+fn looks_like_cue_start(block: &[&str]) -> bool {
+    block
+        .first()
+        .map(|l| {
+            let t = l.trim();
+            !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())
+        })
+        .unwrap_or(false)
+}
+
 /// 解析一个 SRT 块。
 ///
 /// 时间轴行之前的内容（通常是数字序号）一律丢弃：手工编辑后的序号经常错乱甚至
@@ -442,13 +488,13 @@ fn finalize_segments(mut segments: Vec<Segment>, what: &str) -> Result<Vec<Segme
 /// JSON 既是 Voice2Word 自己的导出格式（见 [`super::json::JsonSubtitleExporter`]），
 /// 也是二次加工最常用的中间格式，因此导入必须与导出**往返无损**：
 ///
-/// - 导出侧的 `raw_text` 写的是 [`Segment::display_text`]（优先润色文本），而
-///   `text` 是按导出模式渲染后的结果（双语时含译文）。导入因此**优先取
-///   `raw_text`**：它才是干净原文，拿 `text` 会把双语拼接或润色结果混进正文。
-/// - 正文落在 `text`、`polished` 保持空，所以导入结果的 [`Segment::display_text`]
-///   与导出前一致，再次导出 SRT/JSON 不会串行。
-/// - `polished` 不是导出字段，往返后一律为空。这是**有意接受**的信息损失：
-///   润色结果是本机产物，导出文件里没有它，也就无从恢复。
+/// - 导出侧同时写三种正文：`source_text`（原始识别文本）、`polished`（润色结果）、
+///   `raw_text`（[`Segment::display_text`]，润色优先）、`text`（按导出模式渲染）。
+///   导入**优先取 `source_text`**，再回退 `raw_text` → `text`：前两者才是干净正文，
+///   拿 `text` 会把双语拼接混进正文。
+/// - 编辑状态（`polished` / `locked` / `translations` / `speaker_name`）一并导出与
+///   回读，导出→导入往返后 [`Segment`] 的文本与定稿状态不变。老文件缺这些字段时
+///   按空值处理。
 ///
 /// 文档结构收两种：导出器产出的根对象（取其中的 `segments`）与裸数组。裸数组是
 /// 为了兼容手写 / 第三方工具产出的简化文档——它们通常直接给一个片段列表，没有
@@ -496,14 +542,31 @@ pub fn parse_json(content: &str) -> Result<Vec<Segment>> {
         if end < start {
             continue;
         }
-        // 正文优先 `raw_text`；两者都取不到时说明这块没有可用内容，跳过。
-        let Some(body) = pick_body_text(input.raw_text.as_ref(), input.text.as_ref()) else {
+        // 正文优先 `source_text`（原始识别文本）；老文件没有该字段时回退
+        // `raw_text` → `text`。三者都取不到说明这块没有可用内容，跳过。
+        let Some(body) = opt_body(input.source_text.as_ref())
+            .or_else(|| pick_body_text(input.raw_text.as_ref(), input.text.as_ref()))
+        else {
             continue;
         };
 
         // `index` 一律传 0：输入里的序号只当分块标记，最终由 [`finalize_segments`]
         // 按出现顺序重排为 1..n（手改过的 JSON 序号经常错乱甚至重复）。
         let mut seg = Segment::new(0, start, end, body);
+        seg.polished = opt_body(input.polished.as_ref()).unwrap_or_default();
+        seg.locked = input
+            .locked
+            .as_ref()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        seg.translations = input
+            .translations
+            .as_ref()
+            .and_then(|v| {
+                serde_json::from_value::<std::collections::BTreeMap<String, String>>(v.clone()).ok()
+            })
+            .unwrap_or_default();
+        seg.speaker_name = opt_body(input.speaker_name.as_ref());
         seg.translation = opt_body(input.translation.as_ref());
         seg.translation_lang = opt_identifier(input.translation_lang.as_ref());
         seg.language = opt_identifier(input.language.as_ref());
@@ -519,7 +582,6 @@ pub fn parse_json(content: &str) -> Result<Vec<Segment>> {
             .words
             .and_then(|v| serde_json::from_value::<Vec<super::segment::WordTiming>>(v).ok())
             .unwrap_or_default();
-        // `polished` 保持 Segment::new 的空值：它不是导出字段，没有可恢复的来源。
         segments.push(seg);
     }
     finalize_segments(segments, "JSON")
@@ -540,6 +602,13 @@ struct JsonSegmentIn {
     end: Option<serde_json::Value>,
     text: Option<serde_json::Value>,
     raw_text: Option<serde_json::Value>,
+    /// 原始识别文本（导出时写 `Segment::text`）。老文件没有该字段。
+    source_text: Option<serde_json::Value>,
+    /// 润色结果（导出时写 `Segment::polished`）。
+    polished: Option<serde_json::Value>,
+    locked: Option<serde_json::Value>,
+    translations: Option<serde_json::Value>,
+    speaker_name: Option<serde_json::Value>,
     translation: Option<serde_json::Value>,
     translation_lang: Option<serde_json::Value>,
     language: Option<serde_json::Value>,
@@ -1464,6 +1533,60 @@ mod tests {
         dir
     }
 
+    /// JSON 导出 → 导入必须还原编辑状态：原文、润色、定稿锁、多语言包、说话人。
+    ///
+    /// 此前导出只写渲染后的 `text` / `raw_text`，往返一次就丢掉润色版本、定稿锁与
+    /// 多语言包——「导出给同事看一眼再导回来」等于把工程打回未定稿状态。
+    #[test]
+    fn json_round_trip_preserves_editing_state() {
+        use crate::subtitle::json::JsonSubtitleExporter;
+        use crate::subtitle::segment::WordTiming;
+        use crate::subtitle::ExportMode;
+
+        let mut a = Segment::new(1, 0.0, 1.5, "原始识别");
+        a.polished = "润色后的文本。".to_string();
+        a.locked = true;
+        a.speaker = Some(1);
+        a.speaker_name = Some("张三".to_string());
+        a.translations
+            .insert("en".to_string(), "English text".to_string());
+        a.translation = Some("English text".to_string());
+        a.translation_lang = Some("en".to_string());
+        a.words = vec![WordTiming {
+            word: "原始".to_string(),
+            start: 0.0,
+            end: 0.5,
+        }];
+
+        let dir = temp_dir("json_roundtrip");
+        let path = dir.join("a.json");
+        JsonSubtitleExporter::write_to_file(
+            std::slice::from_ref(&a),
+            &path,
+            Some("a.mp4"),
+            ExportMode::RawOnly,
+            Some("en"),
+        )
+        .expect("导出 JSON");
+
+        let back = read_subtitle_file(&path).expect("回读 JSON");
+        assert_eq!(back.len(), 1);
+        let b = &back[0];
+        assert_eq!(b.text, "原始识别", "原始识别文本不能与润色结果混在一起");
+        assert_eq!(b.polished, "润色后的文本。");
+        assert!(b.locked, "定稿锁必须往返保留");
+        assert_eq!(b.speaker_name.as_deref(), Some("张三"));
+        assert_eq!(
+            b.translations.get("en").map(String::as_str),
+            Some("English text"),
+            "多语言包必须往返保留"
+        );
+        assert_eq!(b.translation.as_deref(), Some("English text"));
+        assert_eq!(b.translation_lang.as_deref(), Some("en"));
+        assert_eq!(b.words.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 最基础的一条：三块标准 SRT 必须解析出三条，时间与文本都要对得上。
     /// 这是导入功能的「hello world」，任何字段错位都会在这里暴露。
     #[test]
@@ -1622,6 +1745,52 @@ mod tests {
         let content = "1\n00:00:01,000 --> 00:00:02,000\n第一行   \n  第二行\n";
         let segs = parse_srt(content).unwrap();
         assert_eq!(segs[0].text, "第一行\n  第二行");
+    }
+
+    /// 回归：cue 正文里夹空行不能把后半截丢掉。手改/第三方文件里「一条 cue
+    /// 两段台词」很常见，`split_blocks` 会把它切成两块，后半截没有时间轴行，
+    /// 修前被当坏块**静默丢行**。合并回原块后段落分隔（空行）保留为 `\n\n`；
+    /// 文件开头的孤儿块仍按坏块丢弃。
+    #[test]
+    fn srt_blank_line_inside_cue_text_is_not_dropped() {
+        let content = "\
+1
+00:00:01,000 --> 00:00:04,000
+第一段台词
+
+第二段台词
+
+2
+00:00:05,000 --> 00:00:06,000
+下一句
+";
+        let segs = parse_srt(content).unwrap();
+        assert_eq!(
+            segs.len(),
+            2,
+            "夹空行的 cue 应仍是两条，而不是碎成三块丢一块"
+        );
+        assert_eq!(
+            segs[0].text, "第一段台词\n\n第二段台词",
+            "空行后的内容必须保留，且段落分隔不丢"
+        );
+        assert_eq!(segs[1].text, "下一句");
+    }
+
+    /// 合并续块只往**上一个有效块**并：开头的孤儿块（封面/说明文字）仍要丢弃，
+    /// 不能凭空造出一条字幕。
+    #[test]
+    fn srt_leading_orphan_block_stays_dropped() {
+        let content = "\
+片头说明文字
+
+1
+00:00:01,000 --> 00:00:02,000
+正文
+";
+        let segs = parse_srt(content).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "正文");
     }
 
     /// VTT：头部、NOTE、STYLE 要跳过；cue 的可选标识行与行尾 cue 设置要忽略；

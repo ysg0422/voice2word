@@ -1277,7 +1277,9 @@ impl MainWindow {
                                 // 否则会把哨兵值当字节数渲染成 16 EB。
                                 let unpacking =
                                     done == crate::utils::model_download::PROGRESS_UNPACKING;
-                                let ratio = if unpacking {
+                                let validating =
+                                    done == crate::utils::model_download::PROGRESS_VALIDATING;
+                                let ratio = if unpacking || validating {
                                     1.0
                                 } else if total > 0 {
                                     (done as f32 / total as f32).clamp(0.0, 1.0)
@@ -1297,6 +1299,8 @@ impl MainWindow {
                                             .text_color(Theme::text_muted())
                                             .child(if unpacking {
                                                 "解压中…（大包需要一两分钟）".to_string()
+                                            } else if validating {
+                                                "正在校验文件…".to_string()
                                             } else if total > 0 {
                                                 format!(
                                                     "{} / {}",

@@ -6,8 +6,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -29,6 +28,11 @@ pub struct JianYingExporter;
 pub struct DraftMedia {
     pub path: Option<PathBuf>,
     pub duration_secs: Option<f64>,
+    /// 画布与帧率：由调用方从源媒体探测；探测不到时用 30fps / 1920×1080。
+    ///
+    /// 剪映草稿的 `canvas_config` 与 `fps` 必须与素材一致，否则竖屏素材会被塞进
+    /// 横屏画布、非 30fps 素材的时间轴会逐句漂移。
+    pub format: super::ProjectFormat,
 }
 
 impl DraftMedia {
@@ -37,6 +41,7 @@ impl DraftMedia {
         Self {
             path,
             duration_secs,
+            format: super::ProjectFormat::default(),
         }
     }
 
@@ -57,10 +62,39 @@ impl DraftMedia {
     }
 }
 
-/// 字幕轨的末句终点（旧行为里被误当成媒体时长的那一项）。
+/// 字幕轨的终点（旧行为里被误当成媒体时长的那一项）。
+///
+/// 取所有句 `end` 的最大值而不是「最后一句」：segments 不保证按时间排序，
+/// 乱序表会把草稿时长算短、末尾字幕被裁。
 fn subtitle_end(segments: &[Segment]) -> f64 {
-    segments.last().map(|s| s.end).unwrap_or(0.0)
+    crate::subtitle::timeline_end(segments)
 }
+
+/// JSON 文件原子写：先写同目录 `.part`，写完 rename 覆盖。
+///
+/// 剪映的 `draft_content.json` / `draft_meta_info.json` 不能半截：直写（旧实现）
+/// 在进程被杀 / 磁盘满时留下截断 JSON，剪映打开草稿直接报损坏，
+/// 用户也不知道是哪一环写坏的。rename 在同目录内是原子替换，任何时刻目标文件
+/// 要么是旧的完整内容、要么是新的完整内容。
+fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
+    let body = serde_json::to_string_pretty(value)?;
+    let tmp = path.with_extension(format!(
+        "{}.part",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("json")
+    ));
+    fs::write(&tmp, body.as_bytes())
+        .with_context(|| format!("写入临时文件 {} 失败", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| {
+        let _ = fs::remove_file(&tmp);
+        format!("替换 {} 失败", path.display())
+    })
+}
+
+/// `root_meta_info.json` 读改写的进程内互斥：草稿注册是「读全文 → 头插 → 写回」，
+/// 并发注入（批量导出 / 双击两次）会互相覆盖对方那条登记。跨进程（两个程序实例）
+/// 由 [`write_json_atomic`] 的原子替换兜底成「整份旧 or 整份新」，不会出半截文件；
+/// 同进程内这条锁把丢登记也挡掉。
+static ROOT_META_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 秒 → 微秒。负值 / NaN / inf 一律记 0，绝不写出一个巨大的垃圾时长。
 fn secs_to_micros(secs: f64) -> u64 {
@@ -163,6 +197,7 @@ impl JianYingExporter {
         let media = DraftMedia {
             path: video_path.map(Path::to_path_buf),
             duration_secs: Some(total_duration_sec).filter(|d| d.is_finite() && *d > 0.0),
+            format: Default::default(),
         };
         Self::build_draft_content_with_media(segments, &media, mode)
     }
@@ -365,7 +400,7 @@ impl JianYingExporter {
                 "formula_id": "",
                 "freeze": null,
                 "has_audio": true,
-                "height": 1080,
+                "height": media.format.height,
                 "id": video_id,
                 "intensifies_audio_path": "",
                 "intensifies_path": "",
@@ -408,7 +443,7 @@ impl JianYingExporter {
                     "quality_enhance": null,
                     "time_range": null
                 },
-                "width": 1920
+                "width": media.format.width
             }));
 
             speeds.push(json!({
@@ -509,9 +544,9 @@ impl JianYingExporter {
 
         json!({
             "canvas_config": {
-                "height": 1080,
+                "height": media.format.height,
                 "ratio": "original",
-                "width": 1920
+                "width": media.format.width
             },
             "color_space": 0,
             "config": {
@@ -539,7 +574,7 @@ impl JianYingExporter {
             "create_time": 0,
             "duration": duration_us,
             "extra_info": null,
-            "fps": 30.0,
+            "fps": media.format.fps,
             "free_render_index_mode_on": false,
             "group_container": null,
             "id": Uuid::new_v4().to_string().to_uppercase(),
@@ -659,6 +694,7 @@ impl JianYingExporter {
         let media = DraftMedia {
             path: video_path.map(Path::to_path_buf),
             duration_secs: None,
+            format: Default::default(),
         };
         Self::export_to_folder_with_media(segments, &media, target_dir, draft_name, mode)
     }
@@ -707,11 +743,8 @@ impl JianYingExporter {
         let content_path = target_dir.join("draft_content.json");
         let meta_path = target_dir.join("draft_meta_info.json");
 
-        let mut content_file = File::create(&content_path)?;
-        content_file.write_all(serde_json::to_string_pretty(&content_json)?.as_bytes())?;
-
-        let mut meta_file = File::create(&meta_path)?;
-        meta_file.write_all(serde_json::to_string_pretty(&meta_json)?.as_bytes())?;
+        write_json_atomic(&content_path, &content_json)?;
+        write_json_atomic(&meta_path, &meta_json)?;
 
         Ok(())
     }
@@ -729,6 +762,7 @@ impl JianYingExporter {
         let media = DraftMedia {
             path: video_path.map(Path::to_path_buf),
             duration_secs: None,
+            format: Default::default(),
         };
         Self::inject_to_local_jianying_with_media(segments, &media, base_name, mode)
     }
@@ -768,11 +802,8 @@ impl JianYingExporter {
         let content_path = project_dir.join("draft_content.json");
         let meta_path = project_dir.join("draft_meta_info.json");
 
-        let mut content_file = File::create(&content_path)?;
-        content_file.write_all(serde_json::to_string_pretty(&content_json)?.as_bytes())?;
-
-        let mut meta_file = File::create(&meta_path)?;
-        meta_file.write_all(serde_json::to_string_pretty(&meta_json)?.as_bytes())?;
+        write_json_atomic(&content_path, &content_json)?;
+        write_json_atomic(&meta_path, &meta_json)?;
 
         // 注册到剪映的 root_meta_info.json 中。
         //
@@ -828,6 +859,10 @@ impl JianYingExporter {
     /// 写盘失败）都必须冒泡成 `Err`，调用方才能如实告诉用户「没登记进首页」，
     /// 而不是像以前那样 `let _ = fs::write` 吞掉、UI 却报成功。
     fn register_into_root_meta(root_meta_file: &Path, entry: Value) -> Result<()> {
+        // 读改写全程持锁（见 [`ROOT_META_LOCK`]）：并发注入互不丢登记。
+        let _guard = ROOT_META_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let content = fs::read_to_string(root_meta_file)
             .with_context(|| format!("读取剪映索引 {} 失败", root_meta_file.display()))?;
         let mut root_val: Value = serde_json::from_str(&content)
@@ -843,15 +878,31 @@ impl JianYingExporter {
             root_val["draft_ids"] = json!(ids + 1);
         }
 
-        fs::write(root_meta_file, serde_json::to_string_pretty(&root_val)?)
-            .with_context(|| format!("写入剪映索引 {} 失败", root_meta_file.display()))?;
-        Ok(())
+        write_json_atomic(root_meta_file, &root_val)
+            .with_context(|| format!("写入剪映索引 {} 失败", root_meta_file.display()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 草稿画布与帧率必须取素材探测结果：竖屏 1080×1920 / 60fps 不能被写成
+    /// 横屏 1920×1080 / 30fps，否则字幕位置与时间轴都会错。
+    #[test]
+    fn draft_uses_media_canvas_and_fps() {
+        let segs = vec![Segment::new(1, 0.0, 2.0, "竖屏")];
+        let media = DraftMedia {
+            path: Some(PathBuf::from("v.mp4")),
+            duration_secs: Some(10.0),
+            format: crate::subtitle::ProjectFormat::new(60.0, 1080, 1920),
+        };
+        let val =
+            JianYingExporter::build_draft_content_with_media(&segs, &media, ExportMode::RawOnly);
+        assert_eq!(val["canvas_config"]["width"], 1080);
+        assert_eq!(val["canvas_config"]["height"], 1920);
+        assert_eq!(val["fps"], 60.0);
+    }
 
     #[test]
     fn test_jianying_draft_generation() {
@@ -894,6 +945,7 @@ mod tests {
         let media = DraftMedia {
             path: Some(PathBuf::from(r"C:\media\long_video.mp4")),
             duration_secs: Some(3600.0),
+            format: Default::default(),
         };
         let val =
             JianYingExporter::build_draft_content_with_media(&segs, &media, ExportMode::RawOnly);
@@ -948,6 +1000,7 @@ mod tests {
         let no_path = DraftMedia {
             path: None,
             duration_secs: Some(3600.0),
+            format: Default::default(),
         };
         let val =
             JianYingExporter::build_draft_content_with_media(&segs, &no_path, ExportMode::RawOnly);
@@ -970,6 +1023,7 @@ mod tests {
         let empty_path = DraftMedia {
             path: Some(PathBuf::new()),
             duration_secs: Some(3600.0),
+            format: Default::default(),
         };
         let val = JianYingExporter::build_draft_content_with_media(
             &segs,
@@ -1098,6 +1152,71 @@ mod tests {
         let meta = dir.join("does_not_exist.json");
 
         assert!(JianYingExporter::register_into_root_meta(&meta, json!({})).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 原子写：目标文件被完整替换、目录里不留 `.part` 残留（截断 JSON 会让剪映
+    /// 直接判草稿损坏，这是换掉 `File::create` 直写的原因）。
+    #[test]
+    fn write_json_atomic_replaces_file_without_part_leftover() {
+        let dir = std::env::temp_dir().join(format!("v2w_jy_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("draft_meta_info.json");
+        fs::write(&target, r#"{"old": true}"#).unwrap();
+
+        write_json_atomic(&target, &json!({"new": 1})).unwrap();
+
+        let val: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(val["new"], 1, "目标文件应被完整替换为新内容");
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应残留 .part: {leftovers:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 并发注册：读改写全程持 [`ROOT_META_LOCK`]，两条登记都不能丢。
+    /// 无锁时后写者会把前者的头插覆盖掉（`all_draft_store` 少一条）。
+    #[test]
+    fn register_into_root_meta_concurrent_keeps_both_entries() {
+        let dir = std::env::temp_dir().join(format!("v2w_jy_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let meta = dir.join("root_meta_info.json");
+        fs::write(&meta, r#"{"draft_ids": 0, "all_draft_store": []}"#).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|name| {
+                let meta = meta.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    JianYingExporter::register_into_root_meta(&meta, json!({"draft_name": name}))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let val: Value = serde_json::from_str(&fs::read_to_string(&meta).unwrap()).unwrap();
+        let store = val["all_draft_store"].as_array().unwrap();
+        let names: Vec<&str> = store
+            .iter()
+            .filter_map(|e| e["draft_name"].as_str())
+            .collect();
+        assert_eq!(names.len(), 2, "并发注册不得丢条目: {names:?}");
+        assert!(
+            names.contains(&"first") && names.contains(&"second"),
+            "{names:?}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
